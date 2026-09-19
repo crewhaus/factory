@@ -1,5 +1,5 @@
 /**
- * The floor the seven tools stand on, tested directly.
+ * The floor the tools stand on, tested directly.
  *
  * Two things here are load-bearing beyond their size. The endpoint guard is
  * what stops a model-supplied URL from becoming a request to a metadata
@@ -31,6 +31,7 @@ import {
   setRpcEndpointPolicy,
   vetEndpoint,
 } from "./lib/endpoint";
+import { UNKNOWN_UNITS, calendarDate, collectHistory, toMinorUnits } from "./lib/history";
 import { parseSuggestedSpan, projectLog, scanLogs, shouldNarrow } from "./lib/logs";
 import { ChainReadError, hexToBigint, toBigint, toHexQuantity, unixToIso } from "./lib/quantity";
 import { type RpcClient, type RpcOutcome, _setFetch, openRpc } from "./lib/rpc";
@@ -40,6 +41,7 @@ import {
   TOPIC_SIGNATURES,
   TRANSFER_SINGLE_TOPIC,
   TRANSFER_TOPIC,
+  addressToTopic,
   decodeApproval,
   decodeTransfer,
   feeBreakdown,
@@ -977,5 +979,234 @@ describe("what a transaction cost", () => {
 describe("refusals carry their reason", () => {
   test("a ChainReadError is recognisable, so a caller can tell a refusal from a crash", () => {
     expect(() => hexToBigint("nope", "x")).toThrow(ChainReadError);
+  });
+});
+
+describe("a chain amount as a ledger's minor units", () => {
+  const units = (decimals: number | null, minor: number | null) => ({
+    decimals,
+    minorUnitDecimals: minor,
+    symbol: null,
+  });
+
+  test("with no declared decimals the base units ARE the minor units, exactly", () => {
+    // Not a guess at eighteen. A token's base unit is its smallest unit by
+    // definition, so using it unchanged is the one conversion that cannot be
+    // wrong — it just may not be the unit the ledger keeps.
+    expect(toMinorUnits(4_242n, UNKNOWN_UNITS)).toEqual({ ok: true, value: 4_242 });
+  });
+
+  test("a whole number of minor units divides exactly", () => {
+    expect(toMinorUnits(1_000_000n, units(6, 2))).toEqual({ ok: true, value: 100 });
+  });
+
+  test("dust below the ledger's smallest unit is a refusal, not a rounding", () => {
+    const result = toMinorUnits(1_234_567n, units(6, 2));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected a refusal");
+    expect(result.reason).toBe("belowMinorUnit");
+    expect(result.why).toContain("the chain does not contain");
+  });
+
+  test("one coin in wei does not fit the row's number field, and says so by name", () => {
+    // 1e18 is two hundred times MAX_SAFE_INTEGER. Number(1e18 wei) is a value
+    // that has already lost its low digits before anything else touches it.
+    const result = toMinorUnits(10n ** 18n, units(18, 18));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected a refusal");
+    expect(result.reason).toBe("exceedsSafeInteger");
+  });
+
+  test("the boundary itself is representable, and one past it is not", () => {
+    expect(toMinorUnits(9_007_199_254_740_991n, UNKNOWN_UNITS)).toEqual({
+      ok: true,
+      value: 9_007_199_254_740_991,
+    });
+    expect(toMinorUnits(9_007_199_254_740_992n, UNKNOWN_UNITS).ok).toBe(false);
+  });
+
+  test("a minor unit finer than the asset has no digits to come from", () => {
+    expect(() => toMinorUnits(1n, units(6, 8))).toThrow(/no digits there to scale up into/);
+  });
+});
+
+describe("a block timestamp as the row's date", () => {
+  test("an ordinary instant becomes the YYYY-MM-DD the row shape wants", () => {
+    expect(calendarDate(unixToIso(1_700_000_000n))).toBe("2023-11-14");
+  });
+
+  test("a year outside four digits is refused, not sliced into something shaped like a date", () => {
+    // toISOString switches to the EXPANDED year format outside 0000-9999, and
+    // the first ten characters of "+033658-09-27T..." are "+033658-0" — not a
+    // date, and rejected at the far end of the pipeline rather than here.
+    const iso = unixToIso(1_000_000_000_000n);
+    expect(String(iso).startsWith("+")).toBe(true);
+    expect(calendarDate(iso)).toBe(null);
+  });
+
+  test("an instant past what a Date holds at all is refused too", () => {
+    expect(calendarDate(unixToIso(10n ** 18n))).toBe(null);
+  });
+});
+
+describe("an address as a topic, and back", () => {
+  test("it is left-padded to a full word, because that is what getLogs compares", () => {
+    // Unpadded or mixed-case, the filter matches nothing — and an empty result
+    // reads exactly like an address that never moved anything.
+    const topic = addressToTopic("0xAbCdEf0123456789AbCdEf0123456789AbCdEf01");
+    expect(topic).toBe("0x000000000000000000000000abcdef0123456789abcdef0123456789abcdef01");
+    expect(topicToAddress(topic)).toBe("0xabcdef0123456789abcdef0123456789abcdef01");
+  });
+
+  test("anything that is not a 20-byte address is refused rather than padded", () => {
+    expect(() => addressToTopic("0x1234")).toThrow(ChainReadError);
+  });
+});
+
+describe("a history assembled from two sources", () => {
+  test("the two sources disagreeing about a block's hash is a reorg, and a refusal", async () => {
+    // The log scan and the hydrated block see the chain at different moments.
+    // This is the one place that difference becomes visible, and a statement
+    // assembled from two histories reconciles against neither.
+    const chain = makeChain({ blocks: 6 });
+    chain.logs.push({
+      blockNumber: 2n,
+      logIndex: 0,
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, topicFor(ALICE), topicFor(BOB)],
+      data: `0x${word(5n)}`,
+      transactionHash: hash32("tx-1"),
+    });
+    const stub = rpcStub(chain);
+    _setFetch(async (req, ip) => {
+      const res = await stub.fetch(req, ip);
+      const body = (await res.json()) as { result?: unknown };
+      if (Array.isArray(body.result)) {
+        body.result = (body.result as Array<Record<string, unknown>>).map((log) => ({
+          ...log,
+          blockHash: hash32("reorged"),
+        }));
+      }
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    const rpc = await openRpc(RPC_URL);
+    await expect(
+      collectHistory(rpc, {
+        address: ALICE,
+        from: 0n,
+        to: 5n,
+        includeTokens: true,
+        includeNative: true,
+        includeFees: true,
+        tokenUnits: new Map(),
+        onlyKnownTokens: false,
+        nativeUnits: UNKNOWN_UNITS,
+        span: 8n,
+        suspectAt: 1_000,
+        maxRows: 1_000,
+        maxHydratedBlocks: 64,
+        maxCalls: 512,
+      }),
+    ).rejects.toThrow(/reorganised while this sync was running/);
+  });
+
+  test("an inverted range is refused before anything is dialled", async () => {
+    const { rpc, stub } = await connect(makeChain({ blocks: 4 }));
+    await expect(
+      collectHistory(rpc, {
+        address: ALICE,
+        from: 3n,
+        to: 1n,
+        includeTokens: true,
+        includeNative: false,
+        includeFees: false,
+        tokenUnits: new Map(),
+        onlyKnownTokens: false,
+        nativeUnits: UNKNOWN_UNITS,
+        span: 8n,
+        suspectAt: 1_000,
+        maxRows: 1_000,
+        maxHydratedBlocks: 64,
+        maxCalls: 512,
+      }),
+    ).rejects.toThrow(/inverted/);
+    expect(stub.requests.length).toBe(0);
+  });
+});
+
+describe("a history that will not fit in its own ceilings", () => {
+  /** The options every case below varies one field of. */
+  const base = {
+    address: ALICE,
+    includeTokens: false,
+    includeNative: true,
+    includeFees: true,
+    tokenUnits: new Map(),
+    onlyKnownTokens: false,
+    nativeUnits: UNKNOWN_UNITS,
+    span: 8n,
+    suspectAt: 1_000,
+    maxRows: 1_000,
+    maxHydratedBlocks: 64,
+    maxCalls: 512,
+  };
+
+  /** A chain where ALICE sends `count` plain payments, one per block from block 1. */
+  function payingChain(count: number, value = 5n): Chain {
+    const chain = makeChain({ blocks: count + 4 });
+    for (let i = 0; i < count; i++) {
+      const at = BigInt(i + 1);
+      chain.txs.set(hash32(`pay-${i}`), {
+        hash: hash32(`pay-${i}`),
+        from: ALICE,
+        to: BOB,
+        value,
+        nonce: BigInt(i),
+        input: "0x",
+        blockNumber: at,
+      });
+      chain.receipts.set(hash32(`pay-${i}`), {
+        hash: hash32(`pay-${i}`),
+        blockNumber: at,
+        status: "0x1",
+        gasUsed: 21_000n,
+        effectiveGasPrice: 1_000_000_000n,
+        logs: [],
+      });
+    }
+    return chain;
+  }
+
+  test("more movements than maxRows is refused, never sliced", async () => {
+    const { rpc } = await connect(payingChain(4));
+    await expect(collectHistory(rpc, { ...base, from: 0n, to: 6n, maxRows: 3 })).rejects.toThrow(
+      /more than maxRows \(3\) movements/,
+    );
+  });
+
+  test("the ones that could not be written as a row count against the ceiling too", async () => {
+    // Parking is not a way round maxRows: the same movements are being handed
+    // back, in a second array, and a caller reading all of them has the same
+    // problem either way. One whole coin in wei is past the row's number field,
+    // so every one of these is parked rather than emitted.
+    const { rpc } = await connect(payingChain(4, 10n ** 18n));
+    const under = await collectHistory(rpc, { ...base, from: 0n, to: 6n, maxRows: 8 });
+    expect({ rows: under.rows.length, parked: under.unrepresentable.length }).toEqual({
+      rows: 4,
+      parked: 4,
+    });
+    await expect(collectHistory(rpc, { ...base, from: 0n, to: 6n, maxRows: 5 })).rejects.toThrow(
+      /4 row\(s\) and 4 that could not be written as one/,
+    );
+  });
+
+  test("a sync that needs more requests than maxCalls refuses rather than stopping short", async () => {
+    // The refusal has to name the budget: a sync that stopped early and said
+    // nothing would be a statement missing every block after the one it
+    // stopped at, and nothing in it would say which.
+    const { rpc } = await connect(payingChain(2));
+    await expect(collectHistory(rpc, { ...base, from: 0n, to: 6n, maxCalls: 3 })).rejects.toThrow(
+      /more than maxCalls \(3\) requests and stopped before/,
+    );
   });
 });

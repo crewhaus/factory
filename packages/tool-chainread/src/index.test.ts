@@ -19,6 +19,7 @@ import {
   TOKEN,
   TRANSFER_TOPIC,
   addTransferLogs,
+  address20,
   hash32,
   makeChain,
   rpcStub,
@@ -27,6 +28,7 @@ import {
 } from "./fixtures";
 import {
   CHAINREAD_TOOLS,
+  TRANSFER_SINGLE_TOPIC,
   _setClock,
   _setDnsLookup,
   _setFetch,
@@ -37,6 +39,7 @@ import {
   evmRpcHealth,
   evmTransactionSummary,
   evmWaitForReceipt,
+  onchainTransactionsSync,
   setRpcEndpointPolicy,
   virtualClock,
 } from "./index";
@@ -184,7 +187,7 @@ function busyChain(): Chain {
 
 describe("package-wide contract", () => {
   test("every tool is exported in CHAINREAD_TOOLS, with a unique PascalCase name", () => {
-    expect(CHAINREAD_TOOLS.length).toBe(7);
+    expect(CHAINREAD_TOOLS.length).toBe(8);
     const names = CHAINREAD_TOOLS.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
     for (const name of names) expect(name).toMatch(/^[A-Z][A-Za-z0-9]*$/);
@@ -239,13 +242,33 @@ describe("package-wide contract", () => {
 
     const chain = busyChain();
     serve(chain);
-    await call(evmGetBlock, { rpcUrl: RPC });
-    await call(evmBlockAtTimestamp, { rpcUrl: RPC, timestamp: (START + 120n).toString() });
-    await call(evmRpcHealth, { rpcUrl: RPC });
-    await call(evmNonceStatus, { rpcUrl: RPC, address: ALICE });
-    await call(evmWaitForReceipt, { rpcUrl: RPC, txHash: hash32("tx-ok") });
-    await call(evmTransactionSummary, { rpcUrl: RPC, txHash: hash32("tx-ok") });
-    await call(evmEventScan, { rpcUrl: RPC, fromBlock: 90, toBlock: 110 });
+    // EVERY tool's traffic, not most of it: a claim about what leaves this
+    // package is worth what the request log covers, and a tool added without a
+    // line here would be a tool the claim was never about. The coverage check
+    // below is what makes that impossible to forget.
+    const exercised: ReadonlyArray<[(typeof CHAINREAD_TOOLS)[number], unknown]> = [
+      [evmGetBlock, { rpcUrl: RPC }],
+      [evmBlockAtTimestamp, { rpcUrl: RPC, timestamp: (START + 120n).toString() }],
+      [evmRpcHealth, { rpcUrl: RPC }],
+      [evmNonceStatus, { rpcUrl: RPC, address: ALICE }],
+      [evmWaitForReceipt, { rpcUrl: RPC, txHash: hash32("tx-ok") }],
+      [evmTransactionSummary, { rpcUrl: RPC, txHash: hash32("tx-ok") }],
+      [evmEventScan, { rpcUrl: RPC, fromBlock: 90, toBlock: 110 }],
+      [
+        onchainTransactionsSync,
+        {
+          rpcUrl: RPC,
+          address: ALICE,
+          fromBlock: 100,
+          toBlock: 101,
+          native: { decimals: 18, minorUnitDecimals: 9 },
+        },
+      ],
+    ];
+    expect(exercised.map(([tool]) => tool.name).sort()).toEqual(
+      CHAINREAD_TOOLS.map((tool) => tool.name).sort(),
+    );
+    for (const [tool, input] of exercised) await call(tool, input);
 
     const sending = stub.requests
       .map((r) => r.method)
@@ -1154,5 +1177,1159 @@ describe("EvmEventScan", () => {
     await expect(
       call(evmEventScan, { rpcUrl: RPC, fromBlock: 15, confirmations: 12 }),
     ).rejects.toThrow(/nothing to scan/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+/**
+ * A wallet with the four things a statement has to get right: a coin payment
+ * too large for the row's number field, a swap whose gas must be charged once
+ * however many logs the wallet appears in, an incoming payment, and a revert
+ * that moved nothing and still cost money.
+ */
+function walletChain(): Chain {
+  const chain = makeChain({ blocks: 40, startTimestamp: START, blockTime: 12n });
+  const usdc = TOKEN;
+  const other = address20("token2");
+
+  chain.txs.set(hash32("tx-send"), {
+    hash: hash32("tx-send"),
+    from: ALICE,
+    to: BOB,
+    // One whole coin. 1e18 wei is two hundred times Number.MAX_SAFE_INTEGER,
+    // which is the entire reason this tool cannot just put wei in a row.
+    value: 1_000_000_000_000_000_000n,
+    nonce: 1n,
+    input: "0x",
+    blockNumber: 10n,
+  });
+  chain.receipts.set(hash32("tx-send"), {
+    hash: hash32("tx-send"),
+    blockNumber: 10n,
+    status: "0x1",
+    gasUsed: 21_000n,
+    effectiveGasPrice: 1_000_000_000n,
+    logs: [],
+  });
+
+  // One transaction, three logs the wallet is a party to. A fee attributed per
+  // log would charge this gas three times.
+  const swapLogs = [
+    {
+      blockNumber: 12n,
+      logIndex: 0,
+      address: usdc,
+      topics: [TRANSFER_TOPIC, topicFor(ALICE), topicFor(ROUTER)],
+      data: `0x${word(1_000_000n)}`,
+      transactionHash: hash32("tx-swap"),
+    },
+    {
+      blockNumber: 12n,
+      logIndex: 1,
+      address: other,
+      topics: [TRANSFER_TOPIC, topicFor(ROUTER), topicFor(ALICE)],
+      data: `0x${word(2_000_000n)}`,
+      transactionHash: hash32("tx-swap"),
+    },
+    {
+      blockNumber: 12n,
+      logIndex: 2,
+      address: usdc,
+      topics: [TRANSFER_TOPIC, topicFor(ROUTER), topicFor(ALICE)],
+      data: `0x${word(3_000_000n)}`,
+      transactionHash: hash32("tx-swap"),
+    },
+    // Two other parties entirely: it must not reach the rows, and the filter is
+    // what keeps it out.
+    {
+      blockNumber: 12n,
+      logIndex: 3,
+      address: usdc,
+      topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ROUTER)],
+      data: `0x${word(9_000_000n)}`,
+      transactionHash: hash32("tx-swap"),
+    },
+  ];
+  chain.logs.push(...swapLogs);
+  chain.txs.set(hash32("tx-swap"), {
+    hash: hash32("tx-swap"),
+    from: ALICE,
+    to: ROUTER,
+    value: 0n,
+    nonce: 2n,
+    input: "0x38ed1739",
+    blockNumber: 12n,
+  });
+  chain.receipts.set(hash32("tx-swap"), {
+    hash: hash32("tx-swap"),
+    blockNumber: 12n,
+    status: "0x1",
+    gasUsed: 150_000n,
+    effectiveGasPrice: 1_000_000_000n,
+    logs: swapLogs,
+  });
+
+  chain.txs.set(hash32("tx-recv"), {
+    hash: hash32("tx-recv"),
+    from: BOB,
+    to: ALICE,
+    value: 2_000_000_000n,
+    nonce: 0n,
+    input: "0x",
+    blockNumber: 14n,
+  });
+  chain.receipts.set(hash32("tx-recv"), {
+    hash: hash32("tx-recv"),
+    blockNumber: 14n,
+    status: "0x1",
+    gasUsed: 21_000n,
+    effectiveGasPrice: 1_000_000_000n,
+    logs: [],
+  });
+
+  chain.txs.set(hash32("tx-fail"), {
+    hash: hash32("tx-fail"),
+    from: ALICE,
+    to: ROUTER,
+    // Non-zero on purpose: a reverted transfer that carried nothing proves
+    // nothing about whether the revert was accounted for.
+    value: 4_000_000_000n,
+    nonce: 3n,
+    input: "0x38ed1739",
+    blockNumber: 16n,
+  });
+  chain.receipts.set(hash32("tx-fail"), {
+    hash: hash32("tx-fail"),
+    blockNumber: 16n,
+    status: "0x0",
+    gasUsed: 45_000n,
+    effectiveGasPrice: 1_000_000_000n,
+    logs: [],
+  });
+
+  return chain;
+}
+
+const ROW_FIELDS = [
+  "amountMinor",
+  "balanceMinor",
+  "date",
+  "description",
+  "direction",
+  "id",
+  "reference",
+];
+
+type SyncResult = {
+  readonly rows: ReadonlyArray<Record<string, unknown>>;
+  readonly detail: ReadonlyArray<Record<string, unknown>>;
+  readonly unrepresentable: ReadonlyArray<Record<string, unknown>>;
+  readonly coverage: Record<string, string>;
+  readonly cursor: Record<string, string>;
+  readonly paging: Record<string, unknown>;
+  readonly rowCount: number;
+  readonly selfTransfers: number;
+  readonly complete: boolean;
+};
+
+async function sync(input: Record<string, unknown>): Promise<SyncResult> {
+  return call<SyncResult>(onchainTransactionsSync, input);
+}
+
+const NATIVE_GWEI = { decimals: 18, minorUnitDecimals: 9, symbol: "ETH" };
+
+describe("OnchainTransactionsSync", () => {
+  test("a row is tool-money's Transaction, field for field and nothing else", async () => {
+    // The shape is not this package's to extend. A row with one extra key is a
+    // row LedgerReconcile's strict schema rejects, and the reconciliation this
+    // tool exists for never runs.
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    expect(result.rows.length).toBeGreaterThan(0);
+    for (const row of result.rows) {
+      expect(Object.keys(row).sort()).toEqual(ROW_FIELDS);
+      expect(typeof row.amountMinor).toBe("number");
+      expect(Number.isSafeInteger(row.amountMinor)).toBe(true);
+      expect(String(row.date)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    }
+  });
+
+  test("money leaving is a debit with a NEGATIVE amount, money arriving is a credit", async () => {
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    for (const row of result.rows) {
+      const amount = row.amountMinor as number;
+      expect({ direction: row.direction, negative: amount < 0 }).toEqual({
+        direction: amount < 0 ? "debit" : "credit",
+        negative: amount < 0,
+      });
+    }
+    const sent = result.rows.find((r) => r.id === `${hash32("tx-send")}:native`);
+    expect(sent?.amountMinor).toBe(-1_000_000_000);
+    const received = result.rows.find((r) => r.id === `${hash32("tx-recv")}:native`);
+    expect(received?.amountMinor).toBe(2);
+  });
+
+  test("the exact uint256 travels BESIDE the row, because it does not fit inside one", async () => {
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    const detail = result.detail.find((d) => d.id === `${hash32("tx-send")}:native`);
+    expect(detail?.rawAmount).toBe("1000000000000000000");
+    expect(detail?.blockNumber).toBe("10");
+  });
+
+  test("a coin payment past MAX_SAFE_INTEGER is PARKED with its exact amount, not rounded", async () => {
+    // 1e18 wei against a ledger that keeps wei. Rounding it to the nearest
+    // representable double would put a number in the books the chain does not
+    // contain, and a reconciliation that balanced against it would be wrong by
+    // however much the double lost.
+    serve(walletChain());
+    const result = await sync({ rpcUrl: RPC, address: ALICE, fromBlock: 0, toBlock: 20 });
+    const parked = result.unrepresentable.find((p) => p.id === `${hash32("tx-send")}:native`);
+    expect(parked?.reason).toBe("exceedsSafeInteger");
+    expect(parked?.rawAmount).toBe("1000000000000000000");
+    expect(result.rows.some((r) => r.id === `${hash32("tx-send")}:native`)).toBe(false);
+    // And it is not silence: the caller is told the rows are short and why.
+    expect(String((result as unknown as Record<string, unknown>).unrepresentableWarning)).toContain(
+      "could not be written as a row without rounding",
+    );
+  });
+
+  test("naming the ledger's unit brings the same payment into range", async () => {
+    // The parked row and this row are the same movement. The difference is
+    // entirely the caller saying what unit the books keep, which is a thing
+    // only the caller knows.
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    expect(result.unrepresentable.length).toBe(0);
+    expect(result.rows.find((r) => r.id === `${hash32("tx-send")}:native`)?.amountMinor).toBe(
+      -1_000_000_000,
+    );
+  });
+
+  test("dust below the ledger's minor unit is parked rather than rounded away", async () => {
+    const chain = makeChain({ blocks: 10, startTimestamp: START, blockTime: 12n });
+    chain.logs.push({
+      blockNumber: 4n,
+      logIndex: 0,
+      address: TOKEN,
+      // Six-decimal token, two-decimal ledger: 1.234567 is not a whole number
+      // of cents and no rounding of it is the amount that moved.
+      topics: [TRANSFER_TOPIC, topicFor(ALICE), topicFor(BOB)],
+      data: `0x${word(1_234_567n)}`,
+      transactionHash: hash32("tx-dust"),
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 9,
+      include: ["tokenTransfers"],
+      tokens: [{ token: TOKEN, decimals: 6, minorUnitDecimals: 2, symbol: "USDC" }],
+    });
+    expect(result.rows.length).toBe(0);
+    expect(result.unrepresentable[0]?.reason).toBe("belowMinorUnit");
+    expect(result.unrepresentable[0]?.rawAmount).toBe("1234567");
+  });
+
+  test("a whole number of minor units scales exactly", async () => {
+    const chain = makeChain({ blocks: 10, startTimestamp: START, blockTime: 12n });
+    chain.logs.push({
+      blockNumber: 4n,
+      logIndex: 0,
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ALICE)],
+      data: `0x${word(1_000_000n)}`,
+      transactionHash: hash32("tx-clean"),
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 9,
+      include: ["tokenTransfers"],
+      tokens: [{ token: TOKEN, decimals: 6, minorUnitDecimals: 2, symbol: "USDC" }],
+    });
+    expect(result.rows.length).toBe(1);
+    expect({ amount: result.rows[0]?.amountMinor, direction: result.rows[0]?.direction }).toEqual({
+      amount: 100,
+      direction: "credit",
+    });
+    expect(String(result.rows[0]?.description)).toContain("USDC");
+  });
+
+  test("gas is charged ONCE per transaction, however many logs the wallet is in", async () => {
+    // The swap puts this wallet in three logs of one transaction. A fee row per
+    // log triples the gas, and the reconciliation is off by exactly that.
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 12,
+      toBlock: 12,
+      native: NATIVE_GWEI,
+    });
+    const fees = result.rows.filter((r) => String(r.id).endsWith(":fee"));
+    expect(fees.length).toBe(1);
+    expect(fees[0]?.amountMinor).toBe(-150_000);
+    expect(result.rows.filter((r) => String(r.id).includes(":log:")).length).toBe(3);
+  });
+
+  test("a reverted transaction moved nothing, and still cost the fee", async () => {
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 16,
+      toBlock: 16,
+      native: NATIVE_GWEI,
+    });
+    expect(result.rows.some((r) => r.id === `${hash32("tx-fail")}:native`)).toBe(false);
+    const fee = result.rows.find((r) => r.id === `${hash32("tx-fail")}:fee`);
+    expect(fee?.amountMinor).toBe(-45_000);
+    expect(String(fee?.description)).toContain("reverted");
+  });
+
+  test("a transfer to oneself is not a row, because it moved no balance", async () => {
+    const chain = makeChain({ blocks: 10, startTimestamp: START, blockTime: 12n });
+    chain.logs.push({
+      blockNumber: 3n,
+      logIndex: 0,
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, topicFor(ALICE), topicFor(ALICE)],
+      data: `0x${word(500n)}`,
+      transactionHash: hash32("tx-self"),
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 9,
+      include: ["tokenTransfers"],
+    });
+    expect({ rows: result.rows.length, self: result.selfTransfers }).toEqual({ rows: 0, self: 1 });
+  });
+
+  test("a token whose decimals nobody stated is base units, never a guessed eighteen", async () => {
+    const chain = makeChain({ blocks: 10, startTimestamp: START, blockTime: 12n });
+    chain.logs.push({
+      blockNumber: 2n,
+      logIndex: 0,
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ALICE)],
+      data: `0x${word(4_242n)}`,
+      transactionHash: hash32("tx-unknown"),
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 9,
+      include: ["tokenTransfers"],
+    });
+    expect(result.rows[0]?.amountMinor).toBe(4_242);
+    expect({
+      decimals: result.detail[0]?.assetDecimals,
+      symbol: result.detail[0]?.symbol,
+    }).toEqual({ decimals: null, symbol: null });
+  });
+
+  test("an endpoint truncating its log answers silently is caught, and the rows are complete", async () => {
+    const chain = makeChain({ blocks: 64, startTimestamp: START, blockTime: 12n });
+    for (let block = 0; block < 8; block++) {
+      for (let i = 0; i < 5; i++) {
+        chain.logs.push({
+          blockNumber: BigInt(block),
+          logIndex: i,
+          address: TOKEN,
+          topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ALICE)],
+          data: `0x${word(BigInt(100 + i))}`,
+          transactionHash: hash32(`tx-${block}-${i}`),
+        });
+      }
+    }
+    serve(chain, { silentLogCap: 10 });
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 63,
+      include: ["tokenTransfers"],
+      maxSpan: 64,
+      suspectAt: 10,
+    });
+    expect(result.rowCount).toBe(40);
+    expect(Number(result.paging.silentTruncations)).toBeGreaterThan(0);
+    expect(String(result.paging.warning)).toContain("truncated with nothing in the response");
+  });
+
+  test("a truncation that cannot be disproved is REFUSED, not returned as a short statement", async () => {
+    const chain = makeChain({ blocks: 4, startTimestamp: START, blockTime: 12n });
+    for (let i = 0; i < 40; i++) {
+      chain.logs.push({
+        blockNumber: 2n,
+        logIndex: i,
+        address: TOKEN,
+        topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ALICE)],
+        data: `0x${word(BigInt(i + 1))}`,
+        transactionHash: hash32(`tx-many-${i}`),
+      });
+    }
+    serve(chain, { silentLogCap: 10 });
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 0,
+        toBlock: 3,
+        include: ["tokenTransfers"],
+        maxSpan: 4,
+        suspectAt: 10,
+      }),
+    ).rejects.toThrow(/refuses rather than returning a set it cannot vouch for/);
+  });
+
+  test("an endpoint that ignores fullTransactions is a refusal, not an empty native history", async () => {
+    // The dangerous shape for this path: a block answered as a list of HASHES
+    // matches nothing when filtered on `from`, and an empty result reads
+    // exactly like a block this wallet was never in.
+    const chain = walletChain();
+    const stubbed = rpcStub(chain);
+    _setFetch(async (req, ip) => {
+      const res = await stubbed.fetch(req, ip);
+      const body = (await res.json()) as { result?: unknown };
+      const block = body.result;
+      if (typeof block === "object" && block !== null && "transactions" in block) {
+        const asRecord = block as Record<string, unknown>;
+        const txs = asRecord.transactions;
+        if (Array.isArray(txs)) {
+          asRecord.transactions = txs.map((t) =>
+            typeof t === "object" && t !== null ? (t as Record<string, unknown>).hash : t,
+          );
+        }
+      }
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    await expect(
+      sync({ rpcUrl: RPC, address: ALICE, fromBlock: 10, toBlock: 10, native: NATIVE_GWEI }),
+    ).rejects.toThrow(/ignores the fullTransactions flag/);
+  });
+
+  test("a range too wide to hydrate is refused, not answered with token rows only", async () => {
+    serve(walletChain());
+    await expect(
+      sync({ rpcUrl: RPC, address: ALICE, fromBlock: 0, toBlock: 39, maxHydratedBlocks: 8 }),
+    ).rejects.toThrow(/over maxHydratedBlocks/);
+  });
+
+  test("a mined transaction with no receipt is refused rather than booked as having moved", async () => {
+    // Without the status there is no way to know whether the value transfer
+    // happened, and a reverted one did not. Guessing either way books a
+    // movement that may not exist.
+    const chain = walletChain();
+    chain.receipts.delete(hash32("tx-send"));
+    serve(chain);
+    await expect(
+      sync({ rpcUrl: RPC, address: ALICE, fromBlock: 10, toBlock: 10, native: NATIVE_GWEI }),
+    ).rejects.toThrow(/whether it reverted cannot be read/);
+  });
+
+  test("a Transfer between two other parties means the endpoint answered a different question", async () => {
+    const chain = walletChain();
+    const stubbed = rpcStub(chain);
+    _setFetch(async (req, ip) => {
+      const res = await stubbed.fetch(req, ip);
+      const body = (await res.json()) as { result?: unknown };
+      if (Array.isArray(body.result)) {
+        body.result = (body.result as Array<Record<string, unknown>>).map((log) => ({
+          ...log,
+          topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ROUTER)],
+        }));
+      }
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 12,
+        toBlock: 12,
+        include: ["tokenTransfers"],
+      }),
+    ).rejects.toThrow(/not answering the question that was asked/);
+  });
+
+  test("what was left out is named in the output, not only in the docs", async () => {
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      include: ["tokenTransfers"],
+    });
+    expect(result.coverage.nativeTransfers).toContain("excluded");
+    expect(result.coverage.fees).toContain("excluded");
+    expect(result.coverage.internalNativeTransfers).toContain("excluded");
+    expect(result.coverage.erc1155).toContain("excluded");
+    expect(result.coverage.tokenMetadata).toContain("not resolved");
+    // And nothing native was collected, so no native row can have slipped in.
+    expect(result.rows.every((r) => String(r.id).includes(":log:"))).toBe(true);
+  });
+
+  test("the cursor names the block this run finished at, not the head", async () => {
+    // A cursor taken from the head at the end of the run skips every block
+    // mined while it ran. This one is the pinned upper bound plus one.
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      confirmations: 10,
+      include: ["tokenTransfers"],
+    });
+    expect({ next: result.cursor.nextFromBlock, through: result.cursor.scannedThrough }).toEqual({
+      next: "30",
+      through: "29",
+    });
+  });
+
+  test("listing tokens narrows the filter the endpoint sees, before anything is decoded", async () => {
+    // The spam gate is the request, not a filter applied to the answer: an
+    // unrestricted scan of a busy wallet fetches every airdrop that ever
+    // touched it.
+    const stub = serve(walletChain());
+    await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      include: ["tokenTransfers"],
+      tokens: [{ token: TOKEN, decimals: 6, symbol: "USDC" }],
+    });
+    const scans = stub.requests.filter((r) => r.method === "eth_getLogs");
+    expect(scans.length).toBeGreaterThan(0);
+    for (const scan of scans) {
+      const filter = scan.params[0] as Record<string, unknown>;
+      // One address goes on the wire bare and several go as an array; both are
+      // the same filter, and what matters is that it is on the REQUEST.
+      const addresses = Array.isArray(filter.address) ? filter.address : [filter.address];
+      expect(addresses).toEqual([TOKEN]);
+    }
+  });
+
+  test("onlyKnownTokens with nothing to know is refused, not a complete-looking empty statement", async () => {
+    serve(walletChain());
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 0,
+        toBlock: 20,
+        include: ["tokenTransfers"],
+        onlyKnownTokens: true,
+      }),
+    ).rejects.toThrow(/would scan for nothing and report it as a complete history/);
+  });
+
+  test("one token cannot be given two sets of decimals", async () => {
+    serve(walletChain());
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 0,
+        toBlock: 20,
+        tokens: [
+          { token: TOKEN, decimals: 6 },
+          { token: TOKEN, decimals: 18 },
+        ],
+      }),
+    ).rejects.toThrow(/twice/);
+  });
+
+  test("a minor unit finer than the asset itself is refused rather than invented", async () => {
+    serve(walletChain());
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 0,
+        toBlock: 20,
+        native: { decimals: 18, minorUnitDecimals: 24 },
+      }),
+    ).rejects.toThrow(/no digits there to scale up into/);
+  });
+
+  test("the same range twice produces byte-identical rows", async () => {
+    // Nothing in the ordering depends on which order the endpoint answered in,
+    // and nothing depends on a clock.
+    serve(walletChain());
+    const first = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    serve(walletChain());
+    const second = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    expect(JSON.stringify(second.rows)).toBe(JSON.stringify(first.rows));
+    expect(first.rows.map((r) => r.id)).toEqual([
+      `${hash32("tx-send")}:native`,
+      `${hash32("tx-send")}:fee`,
+      `${hash32("tx-swap")}:log:0`,
+      `${hash32("tx-swap")}:log:1`,
+      `${hash32("tx-swap")}:log:2`,
+      `${hash32("tx-swap")}:fee`,
+      `${hash32("tx-recv")}:native`,
+      `${hash32("tx-fail")}:fee`,
+    ]);
+  });
+
+  test("every row carries its transaction hash as the reference a reconciler groups on", async () => {
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    for (const row of result.rows) {
+      expect(String(row.reference)).toMatch(/^0x[0-9a-f]{64}$/);
+      expect(String(row.id).startsWith(String(row.reference))).toBe(true);
+      // No running balance is claimed: there is no opening balance to run it
+      // from, and a computed one is a number a reconciliation would trust.
+      expect(row.balanceMinor).toBe(null);
+    }
+  });
+
+  test("an inverted range after confirmations is a refusal that explains the arithmetic", async () => {
+    serve(makeChain({ blocks: 20, startTimestamp: START, blockTime: 12n }));
+    await expect(
+      sync({ rpcUrl: RPC, address: ALICE, fromBlock: 15, confirmations: 12 }),
+    ).rejects.toThrow(/nothing to sync/);
+  });
+});
+
+describe("OnchainTransactionsSync — a date the row shape cannot hold", () => {
+  test("a block stamped outside four-digit years parks the row instead of dating it wrong", async () => {
+    // The row's date is YYYY-MM-DD. A block in the year 33658 serialises with
+    // an expanded year, and ten characters off the front of that is a string
+    // that looks like a date and is not one.
+    const chain = makeChain({ blocks: 6, startTimestamp: 1_000_000_000_000n, blockTime: 12n });
+    chain.logs.push({
+      blockNumber: 2n,
+      logIndex: 0,
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ALICE)],
+      data: `0x${word(7n)}`,
+      transactionHash: hash32("tx-far-future"),
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 5,
+      include: ["tokenTransfers"],
+    });
+    expect(result.rows.length).toBe(0);
+    expect(result.unrepresentable[0]?.reason).toBe("timestampOutOfRange");
+  });
+});
+
+describe("OnchainTransactionsSync — what is not a fungible amount", () => {
+  test("an NFT is one token, whatever decimals the caller declared for that contract", async () => {
+    // Three topics is a fungible transfer and four is one specific NFT. A count
+    // of one divided by a token's decimals is dust, and a token id read as an
+    // amount is a five-hundred-quintillion-unit row.
+    const chain = makeChain({ blocks: 8, startTimestamp: START, blockTime: 12n });
+    chain.logs.push({
+      blockNumber: 3n,
+      logIndex: 0,
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, topicFor(BOB), topicFor(ALICE), `0x${word(7n)}`],
+      data: "0x",
+      transactionHash: hash32("tx-nft"),
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 7,
+      include: ["tokenTransfers"],
+      tokens: [{ token: TOKEN, decimals: 18, symbol: "PUNK" }],
+    });
+    expect(result.rows.length).toBe(1);
+    expect({ amount: result.rows[0]?.amountMinor, direction: result.rows[0]?.direction }).toEqual({
+      amount: 1,
+      direction: "credit",
+    });
+    expect({
+      standard: result.detail[0]?.standard,
+      tokenId: result.detail[0]?.tokenId,
+      decimals: result.detail[0]?.assetDecimals,
+    }).toEqual({ standard: "erc721", tokenId: "7", decimals: null });
+    expect(String(result.rows[0]?.description)).toContain("#7");
+  });
+
+  test("an ERC-1155 answered to an ERC-20 filter is a refusal, not a row labelled erc20", async () => {
+    const chain = walletChain();
+    const stubbed = rpcStub(chain);
+    _setFetch(async (req, ip) => {
+      const res = await stubbed.fetch(req, ip);
+      const body = (await res.json()) as { result?: unknown };
+      if (Array.isArray(body.result) && body.result.length > 0) {
+        body.result = (body.result as Array<Record<string, unknown>>).map((log) => ({
+          ...log,
+          topics: [TRANSFER_SINGLE_TOPIC, topicFor(ROUTER), topicFor(ALICE), topicFor(BOB)],
+          data: `0x${word(9n)}${word(5n)}`,
+        }));
+      }
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 12,
+        toBlock: 12,
+        include: ["tokenTransfers"],
+      }),
+    ).rejects.toThrow(/ERC-1155 TransferSingle .* not answering the question that was asked/);
+  });
+});
+
+describe("OnchainTransactionsSync — a receipt that does not say", () => {
+  test("a pre-Byzantium receipt does not decide the row, and the row says so", async () => {
+    // It carries a state root instead of a status and simply does not record
+    // whether the call reverted. The value is counted as moved — a convention,
+    // not a reading — and the caveat rides on the row, which is what a
+    // bookkeeper actually sees.
+    const chain = makeChain({ blocks: 8, startTimestamp: START, blockTime: 12n });
+    chain.txs.set(hash32("tx-old"), {
+      hash: hash32("tx-old"),
+      from: ALICE,
+      to: BOB,
+      value: 3_000_000_000n,
+      nonce: 0n,
+      input: "0x",
+      blockNumber: 4n,
+    });
+    chain.receipts.set(hash32("tx-old"), {
+      hash: hash32("tx-old"),
+      blockNumber: 4n,
+      status: null,
+      root: hash32("state-root"),
+      gasUsed: 21_000n,
+      effectiveGasPrice: 1_000_000_000n,
+      logs: [],
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 4,
+      toBlock: 4,
+      include: ["native"],
+      native: NATIVE_GWEI,
+    });
+    expect(result.rows.length).toBe(1);
+    expect(result.rows[0]?.amountMinor).toBe(-3);
+    expect(String(result.rows[0]?.description)).toContain("whether the call reverted is not known");
+    expect(result.detail[0]?.status).toBe("unknown");
+  });
+
+  test("a contract creation names the contract it funded, not an unnamed party", async () => {
+    const created = address20("newcontract");
+    const chain = makeChain({ blocks: 8, startTimestamp: START, blockTime: 12n });
+    chain.txs.set(hash32("tx-deploy"), {
+      hash: hash32("tx-deploy"),
+      from: ALICE,
+      // A contract creation is the one transaction with no `to`.
+      to: null,
+      value: 5_000_000_000n,
+      nonce: 0n,
+      input: "0x60806040",
+      blockNumber: 5n,
+    });
+    chain.receipts.set(hash32("tx-deploy"), {
+      hash: hash32("tx-deploy"),
+      blockNumber: 5n,
+      status: "0x1",
+      gasUsed: 100_000n,
+      effectiveGasPrice: 1_000_000_000n,
+      contractAddress: created,
+      logs: [],
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 5,
+      toBlock: 5,
+      include: ["native"],
+      native: NATIVE_GWEI,
+    });
+    const row = result.rows.find((r) => r.id === `${hash32("tx-deploy")}:native`);
+    expect(String(row?.description)).toContain(created);
+    expect(result.detail.find((d) => d.id === `${hash32("tx-deploy")}:native`)?.counterparty).toBe(
+      created,
+    );
+  });
+});
+
+describe("OnchainTransactionsSync — the endpoint answering a different question", () => {
+  /** Serve `chain`, with every answer rewritten on the way out as a broken provider's would be. */
+  function serveRewritten(
+    chain: Chain,
+    rewrite: (method: string, result: unknown) => unknown,
+    dropFilterKey?: string,
+  ): RpcStub {
+    const stubbed = rpcStub(chain);
+    stub = stubbed;
+    _setFetch(async (req, ip) => {
+      const body = (await req.json()) as {
+        id: number;
+        method: string;
+        params?: ReadonlyArray<unknown>;
+      };
+      let params = body.params ?? [];
+      if (dropFilterKey !== undefined && body.method === "eth_getLogs") {
+        const filter = { ...(params[0] as Record<string, unknown>) };
+        filter[dropFilterKey] = undefined;
+        params = [filter];
+      }
+      const res = await stubbed.fetch(
+        new Request(req.url, {
+          method: "POST",
+          headers: req.headers,
+          body: JSON.stringify({ ...body, params }),
+        }),
+        ip,
+      );
+      const envelope = (await res.json()) as Record<string, unknown>;
+      if ("result" in envelope) envelope.result = rewrite(body.method, envelope.result);
+      return new Response(JSON.stringify(envelope), { status: 200 });
+    });
+    return stubbed;
+  }
+
+  test("a token nobody listed, from an endpoint that ignored the allow-list, is refused", async () => {
+    // The allow-list goes out in the filter — and is checked on the way back,
+    // because a filter is a request and not a proof. An endpoint that drops it
+    // answers with every airdrop that ever touched the wallet, and those rows
+    // would land in a reconciliation under a `coverage` line saying they were
+    // never scanned for. The same trap as a Transfer between two strangers,
+    // one field over.
+    const chain = makeChain({ blocks: 12, startTimestamp: START, blockTime: 12n });
+    const spam = address20("spamtoken");
+    for (const [i, token] of [TOKEN, spam].entries()) {
+      chain.logs.push({
+        blockNumber: 4n,
+        logIndex: i,
+        address: token,
+        topics: [TRANSFER_TOPIC, topicFor(ROUTER), topicFor(ALICE)],
+        data: `0x${word(BigInt(1_000_000 * (i + 1)))}`,
+        transactionHash: hash32(`tx-${i}`),
+      });
+    }
+    serveRewritten(chain, (_method, result) => result, "address");
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 0,
+        toBlock: 8,
+        include: ["tokenTransfers"],
+        tokens: [{ token: TOKEN, decimals: 6, symbol: "USDC" }],
+      }),
+    ).rejects.toThrow(/is not one of them — it is not answering the question that was asked/);
+  });
+
+  test("the listed token still reconciles when the endpoint honours the filter", async () => {
+    // The other half of the check above: it refuses an answer it did not ask
+    // for, and nothing else.
+    const chain = makeChain({ blocks: 12, startTimestamp: START, blockTime: 12n });
+    chain.logs.push({
+      blockNumber: 4n,
+      logIndex: 0,
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, topicFor(ROUTER), topicFor(ALICE)],
+      data: `0x${word(1_000_000n)}`,
+      transactionHash: hash32("tx-0"),
+    });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 8,
+      include: ["tokenTransfers"],
+      tokens: [{ token: TOKEN, decimals: 6, symbol: "USDC" }],
+    });
+    expect(result.rowCount).toBe(1);
+    expect(result.rows[0]?.amountMinor).toBe(1_000_000);
+  });
+
+  test("a block answered with a different block's body is refused, not dated from it", async () => {
+    // Every row's date and every entry in the reorg map is keyed by the number
+    // in the REQUEST while its contents come out of the RESPONSE.
+    const chain = walletChain();
+    serveRewritten(chain, (method, result) => {
+      if (method !== "eth_getBlockByNumber" || result === null) return result;
+      const block = result as Record<string, unknown>;
+      return block.number === "0xa" ? { ...block, number: "0x1f4" } : result;
+    });
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 10,
+        toBlock: 10,
+        include: ["native"],
+        native: NATIVE_GWEI,
+      }),
+    ).rejects.toThrow(/block 10 was asked for and the endpoint answered with block 500/);
+  });
+});
+
+describe("OnchainTransactionsSync — what the blocks held, checked against the nonce", () => {
+  test("a hydrated block that came back short is caught, and refused", async () => {
+    // The log scan proves a chunk was not truncated by splitting it. A block
+    // cannot be split — it is one response — so the account's own nonce is the
+    // oracle: it rises once per transaction sent, and a block that dropped one
+    // leaves the two numbers apart. Without this the statement is simply short
+    // by a payment and a fee, and says `complete: true`.
+    const chain = makeChain({ blocks: 12, startTimestamp: START, blockTime: 12n });
+    for (const [i, label] of ["tx-a", "tx-b"].entries()) {
+      chain.txs.set(hash32(label), {
+        hash: hash32(label),
+        from: ALICE,
+        to: BOB,
+        value: 2_000_000_000n,
+        nonce: BigInt(i),
+        input: "0x",
+        blockNumber: 4n,
+      });
+      chain.receipts.set(hash32(label), {
+        hash: hash32(label),
+        blockNumber: 4n,
+        status: "0x1",
+        gasUsed: 21_000n,
+        effectiveGasPrice: 1_000_000_000n,
+        logs: [],
+      });
+    }
+    const stubbed = rpcStub(chain);
+    stub = stubbed;
+    _setFetch(async (req, ip) => {
+      const res = await stubbed.fetch(req, ip);
+      const body = (await res.json()) as { result?: unknown };
+      const block = body.result;
+      if (typeof block === "object" && block !== null && "transactions" in block) {
+        const txs = (block as Record<string, unknown>).transactions;
+        // The dangerous shape: a 200, a well-formed block, and one transaction
+        // fewer than it holds. Nothing in the response says so.
+        if (Array.isArray(txs) && txs.length > 1) {
+          (block as Record<string, unknown>).transactions = [txs[0]];
+        }
+      }
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    await expect(
+      sync({
+        rpcUrl: RPC,
+        address: ALICE,
+        fromBlock: 0,
+        toBlock: 8,
+        include: ["native", "fees"],
+        native: NATIVE_GWEI,
+      }),
+    ).rejects.toThrow(
+      /nonce for that account rose by 2 across the same range — at least 1 transaction it sent is missing/,
+    );
+  });
+
+  test("an intact range is proved, and the proof travels with the rows", async () => {
+    // The other side of the same check: it has to pass on a chain that is
+    // whole, or the refusal above is just a tool that never works.
+    serve(walletChain());
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    expect((result as unknown as Record<string, unknown>).sentProof).toEqual({
+      outcome: "proved",
+      sent: 3,
+    });
+    expect(result.coverage.nativeTransfers).toContain(
+      "proved complete against this account's nonce",
+    );
+    expect(result.coverage.fees).toContain("proved complete against this account's nonce");
+  });
+
+  test("an endpoint that will not serve a historical nonce cannot prove it, and says so", async () => {
+    // A pruned endpoint answers state from before its window with an error.
+    // That is not evidence that the blocks were whole, and reporting it as one
+    // would be the whole point of this check thrown away — so the verdict is
+    // "not proved", named, in the output the caller reads.
+    const chain = walletChain();
+    // A head far past the range, because pruning is about distance from the
+    // head: 128 blocks is what every full node keeps.
+    for (let i = 40; i < 200; i++) {
+      chain.blocks.push({
+        number: BigInt(i),
+        timestamp: START + BigInt(i) * 12n,
+        hash: hash32(`block-${i}`),
+        baseFeePerGas: 1_000_000_000n,
+      });
+    }
+    chain.head = 199n;
+    serve(chain, { archive: "no" });
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 10,
+      toBlock: 16,
+      native: NATIVE_GWEI,
+    });
+    const proof = (result as unknown as Record<string, unknown>).sentProof as Record<
+      string,
+      unknown
+    >;
+    expect(proof.outcome).toBe("unproved");
+    expect(String(proof.why)).toContain("would not serve this account's nonce");
+    expect(result.coverage.nativeTransfers).toContain("NOT proved");
+    // And the rows are still there: an unprovable count is not a reason to
+    // throw away a sync, only a reason not to call it proved.
+    expect(result.rowCount).toBeGreaterThan(0);
+  });
+
+  test("a rollup's system transactions are more than the nonce, and that is not a refusal", async () => {
+    // A deposit or system transaction appears in a block without raising an
+    // ordinary nonce. Refusing there would make this unusable on the chains it
+    // is most often pointed at, and nothing is missing in that direction.
+    const chain = walletChain();
+    // The nonce map says ALICE has sent one transaction ever; the blocks show
+    // three. That is the rollup shape, in the direction that loses nothing.
+    chain.nonces.set(ALICE, { latest: 1n, pending: 1n });
+    serve(chain);
+    const result = await sync({
+      rpcUrl: RPC,
+      address: ALICE,
+      fromBlock: 0,
+      toBlock: 20,
+      native: NATIVE_GWEI,
+    });
+    const proof = (result as unknown as Record<string, unknown>).sentProof as Record<
+      string,
+      unknown
+    >;
+    expect({ outcome: proof.outcome, sent: proof.sent, nonce: proof.nonceAccountsFor }).toEqual({
+      outcome: "moreThanTheNonce",
+      sent: 3,
+      nonce: 1,
+    });
+    expect(result.rows.some((r) => String(r.id).endsWith(":fee"))).toBe(true);
+  });
+});
+
+describe("OnchainTransactionsSync — an order that is the chain's, not the provider's", () => {
+  /** Two payments in ONE block, numbered by the chain 0 and 1. */
+  function twoInOneBlock(): Chain {
+    const chain = makeChain({ blocks: 12, startTimestamp: START, blockTime: 12n });
+    for (const [i, label] of ["tx-first", "tx-second"].entries()) {
+      chain.txs.set(hash32(label), {
+        hash: hash32(label),
+        from: ALICE,
+        to: BOB,
+        value: BigInt(i + 1) * 1_000_000_000n,
+        nonce: BigInt(i),
+        input: "0x",
+        blockNumber: 4n,
+      });
+      chain.receipts.set(hash32(label), {
+        hash: hash32(label),
+        blockNumber: 4n,
+        status: "0x1",
+        gasUsed: 21_000n,
+        effectiveGasPrice: 1_000_000_000n,
+        transactionIndex: i,
+        logs: [],
+      });
+    }
+    return chain;
+  }
+
+  const ROWS = { rpcUrl: RPC, address: ALICE, fromBlock: 0, toBlock: 8, include: ["native"] };
+
+  test("a provider that reverses a block's transaction list gets the same rows in the same order", async () => {
+    // The position in the array is the ENDPOINT's choice; `transactionIndex` is
+    // the chain's. Sorting on the first makes the row order a property of which
+    // provider answered, and two syncs of one range then differ in a diff for
+    // no reason on the chain.
+    serve(twoInOneBlock());
+    const straight = await sync({ ...ROWS, native: NATIVE_GWEI });
+    const stubbed = rpcStub(twoInOneBlock());
+    stub = stubbed;
+    _setFetch(async (req, ip) => {
+      const res = await stubbed.fetch(req, ip);
+      const body = (await res.json()) as { result?: unknown };
+      const block = body.result;
+      if (typeof block === "object" && block !== null && "transactions" in block) {
+        const txs = (block as Record<string, unknown>).transactions;
+        if (Array.isArray(txs))
+          (block as Record<string, unknown>).transactions = [...txs].reverse();
+      }
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    const reversed = await sync({ ...ROWS, native: NATIVE_GWEI });
+    expect(straight.rows.map((r) => r.id)).toEqual([
+      `${hash32("tx-first")}:native`,
+      `${hash32("tx-second")}:native`,
+    ]);
+    expect(JSON.stringify(reversed.rows)).toBe(JSON.stringify(straight.rows));
   });
 });

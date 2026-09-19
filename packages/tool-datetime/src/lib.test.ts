@@ -21,6 +21,7 @@ import {
   isBusinessDay,
 } from "./lib/arithmetic";
 import {
+  MAX_EPOCH_MS,
   civilFromDays,
   civilFromEpochMsUTC,
   dateFromDayOfYear,
@@ -35,6 +36,7 @@ import {
   isoDateFromEpochMs,
   isoFromEpochMs,
   isoWeek,
+  nextOffsetTransition,
   pad,
   quarterOfMonth,
   resolveWallClock,
@@ -42,6 +44,7 @@ import {
   wallClockInZone,
   weekdayFromEpochDay,
   zoneOffsetMinutes,
+  zoneOffsetProfile,
 } from "./lib/civil";
 import { cronNext, describeCron, parseCron } from "./lib/cron";
 import { decompose, formatDuration, parseDuration } from "./lib/duration";
@@ -240,6 +243,135 @@ describe("civil: timezones", () => {
 
   test("UTC takes the fast path and never reports a transition", () => {
     expect(resolveWallClock(wall(2026, 3, 8, 2, 30), "UTC").resolution).toBe("unique");
+  });
+});
+
+describe("civil: offset profiles and transitions", () => {
+  // Zones and dates are literals from tzdb, never computed from the function
+  // under test. Every offset below is checkable by hand.
+
+  test("a northern zone reads above its yearly low in July and at it in January", () => {
+    const july = zoneOffsetProfile(Date.UTC(2026, 6, 15, 12), "America/New_York");
+    if (july === undefined) throw new Error("expected a profile");
+    expect({
+      at: july.offsetMinutes,
+      low: july.lowestMinutes,
+      high: july.highestMinutes,
+    }).toEqual({ at: -240, low: -300, high: -240 });
+
+    const january = zoneOffsetProfile(Date.UTC(2026, 0, 15, 12), "America/New_York");
+    if (january === undefined) throw new Error("expected a profile");
+    expect(january.offsetMinutes).toBe(january.lowestMinutes);
+  });
+
+  test("the southern hemisphere reads the same way round — the January/July shortcut does not", () => {
+    // Sydney is on its raised offset in January and its low one in July, the
+    // opposite of New York. Comparing two fixed months would call one of them
+    // backwards; comparing against the year's lowest offset calls both right.
+    const january = zoneOffsetProfile(Date.UTC(2026, 0, 15, 12), "Australia/Sydney");
+    const july = zoneOffsetProfile(Date.UTC(2026, 6, 15, 12), "Australia/Sydney");
+    if (january === undefined || july === undefined) throw new Error("expected profiles");
+    expect({ at: january.offsetMinutes, low: january.lowestMinutes }).toEqual({
+      at: 660,
+      low: 600,
+    });
+    expect({ at: july.offsetMinutes, low: july.lowestMinutes }).toEqual({ at: 600, low: 600 });
+  });
+
+  test("a zone that never changes offset reports one offset for the whole window", () => {
+    const tokyo = zoneOffsetProfile(Date.UTC(2026, 2, 7, 12), "Asia/Tokyo");
+    if (tokyo === undefined) throw new Error("expected a profile");
+    expect({ low: tokyo.lowestMinutes, high: tokyo.highestMinutes }).toEqual({
+      low: 540,
+      high: 540,
+    });
+  });
+
+  test("the window is probed daily, so a month-long shift cannot fall between samples", () => {
+    const p = zoneOffsetProfile(Date.UTC(2026, 6, 15, 12), "America/New_York");
+    if (p === undefined) throw new Error("expected a profile");
+    // 183 days either side of the instant, one sample a day: 367 instants, and
+    // the instant itself is one of them rather than an extra. `samples` is
+    // printed as the evidence behind the reading, so it has to be countable.
+    expect({ step: p.stepDays, samples: p.samples, truncated: p.truncated }).toEqual({
+      step: 1,
+      samples: 367,
+      truncated: false,
+    });
+  });
+
+  test("a zone that went up and came back changed twice; one that moved for good changed once", () => {
+    // The distinction the DST reading turns on. New York left EST and returned
+    // to it inside the window. Volgograd sat on UTC+4 all autumn 2020 with no
+    // DST whatsoever and dropped to UTC+3 for good on 27 December — one change
+    // and no way back — so "highest !== lowest" alone calls it a clock change.
+    const newYork = zoneOffsetProfile(Date.UTC(2026, 6, 15, 12), "America/New_York");
+    const volgograd = zoneOffsetProfile(Date.UTC(2020, 10, 1, 12), "Europe/Volgograd");
+    const tokyo = zoneOffsetProfile(Date.UTC(2026, 2, 7, 12), "Asia/Tokyo");
+    if (newYork === undefined || volgograd === undefined || tokyo === undefined) {
+      throw new Error("expected profiles");
+    }
+    expect(newYork.offsetChanges).toBe(2);
+    expect({
+      changes: volgograd.offsetChanges,
+      at: volgograd.offsetMinutes,
+      low: volgograd.lowestMinutes,
+      high: volgograd.highestMinutes,
+    }).toEqual({ changes: 1, at: 240, low: 180, high: 240 });
+    expect(tokyo.offsetChanges).toBe(0);
+  });
+
+  test("a window the calendar cuts short says so — a short window is weaker evidence", () => {
+    // 275760-09-13 is the last instant a date can hold, so there is no forward
+    // half of the window to probe. The reading is still worth having; passing
+    // it off as a full year of evidence is not.
+    const edge = zoneOffsetProfile(MAX_EPOCH_MS, "America/New_York");
+    if (edge === undefined) throw new Error("expected a profile");
+    expect(edge.truncated).toBe(true);
+    expect(edge.samples).toBeLessThan(367);
+    expect(edge.toEpochMs).toBe(MAX_EPOCH_MS);
+  });
+
+  test("an unrepresentable instant has no profile, which is not an offset of zero", () => {
+    expect(zoneOffsetProfile(9e15, "America/New_York")).toBeUndefined();
+    expect(nextOffsetTransition(9e15, "America/New_York")).toBeUndefined();
+  });
+
+  test("the next transition is found to the minute, not the day", () => {
+    const t = nextOffsetTransition(Date.UTC(2026, 2, 7, 12), "America/New_York");
+    if (t === undefined) throw new Error("expected a transition");
+    expect(isoFromEpochMs(t.epochMs, 0)).toBe("2026-03-08T07:00:00Z");
+    expect({ before: t.beforeMinutes, after: t.afterMinutes }).toEqual({
+      before: -300,
+      after: -240,
+    });
+    // The local readings either side are the ones an operator would see.
+    expect(isoFromEpochMs(t.epochMs - 1, t.beforeMinutes)).toBe("2026-03-08T01:59:59.999-05:00");
+    expect(isoFromEpochMs(t.epochMs, t.afterMinutes)).toBe("2026-03-08T03:00:00-04:00");
+  });
+
+  test("a fall-back transition is found the same way", () => {
+    const t = nextOffsetTransition(Date.UTC(2026, 9, 1, 12), "America/New_York");
+    if (t === undefined) throw new Error("expected a transition");
+    expect(isoFromEpochMs(t.epochMs, 0)).toBe("2026-11-01T06:00:00Z");
+    expect(t.afterMinutes - t.beforeMinutes).toBe(-60);
+  });
+
+  test("a half-hour change is reported as thirty minutes, not rounded to an hour", () => {
+    // Lord Howe shifts by 30 minutes. A tool that assumed DST means an hour
+    // would put every meeting there half an hour out.
+    const t = nextOffsetTransition(Date.UTC(2026, 8, 30, 12), "Australia/Lord_Howe");
+    if (t === undefined) throw new Error("expected a transition");
+    expect(t.afterMinutes - t.beforeMinutes).toBe(30);
+    expect(isoFromEpochMs(t.epochMs, 0)).toBe("2026-10-03T15:30:00Z");
+  });
+
+  test("no transition inside the horizon is undefined, and undefined is not zero", () => {
+    expect(nextOffsetTransition(Date.UTC(2026, 2, 7, 12), "Asia/Tokyo")).toBeUndefined();
+    expect(nextOffsetTransition(Date.UTC(2026, 2, 7, 12), "UTC")).toBeUndefined();
+    // Shortening the horizon past the known transition must also find nothing,
+    // which is what proves the horizon is honoured rather than ignored.
+    expect(nextOffsetTransition(Date.UTC(2026, 2, 7, 12), "America/New_York", 0)).toBeUndefined();
   });
 });
 

@@ -80,6 +80,10 @@ export type FixtureReceipt = {
   readonly l1Fee?: bigint;
   readonly gasUsedForL1?: bigint;
   readonly root?: string;
+  /** Set only by a contract creation, which is the one case a transaction has no `to`. */
+  readonly contractAddress?: string;
+  /** The transaction's place in its block, as the chain numbers it. Default 0. */
+  readonly transactionIndex?: number;
   readonly logs: ReadonlyArray<FixtureLog>;
 };
 
@@ -210,7 +214,7 @@ function renderReceipt(receipt: FixtureReceipt): Record<string, unknown> {
     transactionHash: receipt.hash,
     blockNumber: hex(receipt.blockNumber),
     blockHash: hash32(`block-${receipt.blockNumber}`),
-    transactionIndex: "0x0",
+    transactionIndex: hex(BigInt(receipt.transactionIndex ?? 0)),
     gasUsed: hex(receipt.gasUsed),
     ...(receipt.status === null ? {} : { status: receipt.status }),
     ...(receipt.root === undefined ? {} : { root: receipt.root }),
@@ -219,7 +223,7 @@ function renderReceipt(receipt: FixtureReceipt): Record<string, unknown> {
       : { effectiveGasPrice: hex(receipt.effectiveGasPrice) }),
     ...(receipt.l1Fee === undefined ? {} : { l1Fee: hex(receipt.l1Fee) }),
     ...(receipt.gasUsedForL1 === undefined ? {} : { gasUsedForL1: hex(receipt.gasUsedForL1) }),
-    contractAddress: null,
+    contractAddress: receipt.contractAddress ?? null,
     logs: receipt.logs.map(renderLog),
   };
 }
@@ -328,11 +332,29 @@ function dispatch(
       return { result: receipt === undefined ? null : renderReceipt(receipt) };
     }
     case "eth_getTransactionCount": {
-      const account = chain.nonces.get((params[0] as string).toLowerCase()) ?? {
-        latest: 0n,
-        pending: 0n,
-      };
-      const wantsPending = params[1] === "pending";
+      const who = (params[0] as string).toLowerCase();
+      const account = chain.nonces.get(who) ?? { latest: 0n, pending: 0n };
+      const tag = params[1];
+      if (typeof tag === "string" && tag.startsWith("0x")) {
+        // A HISTORICAL nonce, which is account state and not a counter the node
+        // keeps lying around: a pruned endpoint refuses it exactly as it
+        // refuses a historical balance, and a sync that proves its block
+        // coverage against this has to cope with both answers.
+        const at = BigInt(tag);
+        if (options.archive === "no" && chain.head - at > 128n) {
+          return { error: { code: -32000, message: "missing trie node 0xabc (path )" } };
+        }
+        const mined = [...chain.txs.values()].filter(
+          (t) => t.blockNumber !== null && t.from.toLowerCase() === who,
+        );
+        // Derived from the chain's own transactions so the two answers cannot
+        // disagree by accident: a test that wants them to disagree says so.
+        const base = chain.nonces.has(who) ? account.latest : BigInt(mined.length);
+        const after = mined.filter((t) => (t.blockNumber as bigint) > at).length;
+        const value = base - BigInt(after);
+        return { result: hex(value < 0n ? 0n : value) };
+      }
+      const wantsPending = tag === "pending";
       // An endpoint with no mempool view answers both tags with the mined
       // count, which is the case that makes a naive "pending === latest means
       // clear" read wrong.

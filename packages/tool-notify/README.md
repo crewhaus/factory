@@ -25,6 +25,8 @@ tools:
 | `ChatReact` | Add an emoji reaction |
 | `EmailSend` | Send over SMTP: EHLO, STARTTLS, AUTH, MAIL FROM, RCPT TO, DATA |
 | `EmailCompose` | Build the RFC 5322 bytes without sending them |
+| `EmailSendPreflight` | Check a message the way `EmailSend` would build it, and send nothing |
+| `DeliverabilityCheck` | Read a sending domain's SPF, DMARC and named DKIM selectors out of public DNS |
 | `WebhookPost` | POST JSON to an allow-listed URL, optionally HMAC-signed, retrying 5xx |
 | `SmsSend` | SMS through a REST gateway the operator described |
 | `PushNotify` | Push notification through a REST provider the operator described |
@@ -54,11 +56,16 @@ Every tool that sends is `destructive: true` **and**
 `requireJustification: true`. Putting text in front of a person is a side
 effect that deleting the message does not undo, because it has already been
 read — that is precisely what the intent gate is for, and nothing here opts
-out of it. `DeliveryCheck` is the one outbound tool that only reads, so it is
-`readOnly` and carries no justification. The five pure tools are `readOnly`,
-`scope: "internal"`, declare no io capability, and are concurrency-safe.
-`src/index.test.ts` asserts all of this per tool, so a future addition that
-forgets cannot land quietly.
+out of it. `DeliveryCheck` and `DeliverabilityCheck` are the outbound tools that only
+read, so they are `readOnly` and carry no justification. The six pure tools
+are `readOnly`, `scope: "internal"`, declare no io capability, and are
+concurrency-safe. `src/index.test.ts` asserts all of this per tool, so a
+future addition that forgets cannot land quietly.
+
+The two `…Check` names sit uncomfortably close, so: `DeliveryCheck` asks a
+PROVIDER what became of one message it accepted. `DeliverabilityCheck` asks
+public DNS what a DOMAIN publishes about itself, and knows nothing about any
+particular message.
 
 ## The outbound posture
 
@@ -93,6 +100,7 @@ tool_config:
     allowed_origins: ["https://hooks.slack.com", "https://slack.com"]
     allowed_recipients: ["ops@example.com", "*@team.example.com"]
     allowed_smtp_hosts: ["smtp.example.com"]
+    allowed_sender_domains: ["example.com"]
 ```
 
 ```jsonc
@@ -159,6 +167,35 @@ checked from the file's own metadata *before* it is read — and counted as the
 base64 it will become, not as the bytes on disk — so an oversized attachment
 never reaches memory.
 
+## Before the send
+
+`EmailSendPreflight` takes the same arguments as `EmailSend` and runs the
+same composer, and sends nothing. It exists because `EmailSend` answers one
+refusal at a time, at the moment somebody has already decided to send, and
+because some of what is wrong with a message is not a refusal at all: an
+empty body composes perfectly and delivers nothing, a `{{placeholder}}` that
+never got filled goes out as written, the same mailbox on To and Bcc is one
+copy rather than two. The result is a row per check, and the verdict has
+three values rather than two — a check that could not run comes back
+`unknown`, and a message with an attachment nobody could read is
+`incomplete`, which is neither ready nor blocked.
+
+`DeliverabilityCheck` reads what a sending domain publishes: its SPF record,
+its DMARC policy, and the DKIM key record at each selector the caller names.
+It reports facts rather than a score, because the facts decide different
+things — no DMARC record at all and a DMARC record with `p=none` score the
+same and are not the same situation, and a lookup that failed is a third
+answer again, reported as `unknown` with its reason. There is no way to
+enumerate DKIM selectors, so it checks the ones you name and guesses none.
+
+DNS is not an HTTP request and so does not pass through `allowed_origins`,
+but the name queried is still chosen by the caller and still leaves the
+machine. `allowed_sender_domains` is that surface's allow-list, fail-closed
+like the others: empty denies everything. The `_dmarc.` and `._domainkey.`
+names are derived from the canonicalised domain after it passes, so there is
+no spelling that clears the gate and a different one that reaches the
+resolver.
+
 ## What is deliberately not here
 
 - **`SendMessage`.** That is `@crewhaus/tool-message-channel`'s, for the
@@ -169,6 +206,19 @@ never reaches memory.
 - **CRAM-MD5, XOAUTH2, DSN, pipelining, connection reuse.** PLAIN and LOGIN
   over TLS cover submission to every service that matters; the rest would be
   surface without users.
+- **DKIM signature verification.** `DeliverabilityCheck` reads the KEY
+  record a selector publishes — its type, its size, whether it has been
+  revoked. It does not verify that a message's signature validates: that
+  needs relaxed/simple canonicalisation, header selection and body hashing,
+  which is `mailauth`'s job and a dependency this package does not take. A
+  half-built verifier that can answer "pass" is a security control that
+  controls nothing, so there is no partial one here.
+- **Walking SPF includes.** `dnsTermsInThisRecord` counts the DNS-querying
+  terms in the record it read, and says so. The RFC's limit of ten counts
+  the whole evaluation, with its own sub-limits for `a` and `mx` and a
+  separate void-lookup cap; a walker that got those wrong would report a
+  confident total that is not the receiver's. It would also mean querying
+  domains the caller never named.
 - **Reading messages.** Nothing here receives; it only sends.
 - **Vendor SDKs.** `SmsSend`, `PushNotify` and `DeliveryCheck` speak a provider
   shape the operator writes in `tool_config`. Changing gateway is a config
@@ -191,12 +241,31 @@ Stated rather than papered over:
   the provider, which is the first.
 - **`ChatUpdate` does not return the previous text,** because the platform
   does not give it back.
+- **`EmailSendPreflight` does not fold provider-specific aliases.** Two
+  recipients count as duplicates on their exact spelling, case aside. Gmail
+  treats `a.b@` and `ab@` as one mailbox and strips `+tags`; most providers
+  do neither, so folding them here would report two separate people as one
+  on every domain that keeps them apart. Which domains fold is configuration
+  this package does not carry. Two spellings of one mailbox that differ only
+  in case are reported as a **warning that they will each get their own
+  `RCPT TO`** — `composeMessage` builds its envelope from the exact
+  addresses, so that is what the send does, and the preflight reports the
+  composer's count rather than its own comparison key's.
+- **`DeliverabilityCheck` does not walk up to the organizational domain.**
+  RFC 7489 6.6.3 has a receiver that finds no `_dmarc` record fall back to
+  the organizational domain's, so a subdomain with nothing of its own can
+  still be covered. Naming that domain needs the Public Suffix List —
+  `example.co.uk` is an organizational domain and `mail.example.com` is not,
+  and nothing in the name says which — which is a dependency this package
+  does not take. So a domain with more than two labels and no record of its
+  own gets a note saying which lookup was not made, and the answer stops at
+  the name that was asked.
 
 ## Layout
 
 `src/lib/` holds the pure functions — escaping and block rendering, templates,
-digests, quiet hours, rate limiting, MIME — and is where the behaviour is
-tested. `src/net.ts` is the outbound gate, `src/paths.ts` the path gate,
+digests, quiet hours, rate limiting, MIME, the preflight rules and the SPF,
+DMARC and DKIM record parsers — and is where the behaviour is tested. `src/net.ts` is the outbound gate, `src/paths.ts` the path gate,
 `src/smtp.ts` the SMTP client, and `src/index.ts` wraps all of it as tools. A
 bug in quoted-printable encoding reads better as a failing unit than as a
 failing tool call.

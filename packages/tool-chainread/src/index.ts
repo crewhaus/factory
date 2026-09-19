@@ -1,7 +1,7 @@
 /**
  * @crewhaus/tool-chainread — what the chain actually recorded.
  *
- * Seven read-only questions about an EVM chain, answered over a public
+ * Eight read-only questions about an EVM chain, answered over a public
  * JSON-RPC endpoint the caller names. `@crewhaus/tool-onchain` next door does
  * the arithmetic offline; this package is the half that dials.
  *
@@ -28,9 +28,15 @@
  *     endpoint that might or might not serve archive state is not an endpoint
  *     that does not.
  *   - `EvmTransactionSummary` says in its output which movements it cannot see.
+ *   - `OnchainTransactionsSync` hands back `@crewhaus/tool-money`'s
+ *     `Transaction` — the row shape a statement parses into — rather than a
+ *     second one of its own, and PARKS a movement it cannot write as a row
+ *     instead of rounding one to fit.
  *
  * Every chain quantity — wei, token amounts, nonces, block numbers — crosses
- * this boundary as a decimal STRING. A uint256 does not fit in a double.
+ * this boundary as a decimal STRING. A uint256 does not fit in a double. The
+ * one place a `number` is unavoidable is the statement row's `amountMinor`,
+ * which is not this package's field, and that is exactly where the parking is.
  */
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
@@ -44,6 +50,7 @@ import {
 } from "./lib/blocks";
 import { nowMs, sleep } from "./lib/clock";
 import { getRpcEndpointPolicy } from "./lib/endpoint";
+import { type AssetUnits, type SentProof, UNKNOWN_UNITS, collectHistory } from "./lib/history";
 import { type LogFilter, projectLog, scanLogs } from "./lib/logs";
 import {
   type BlockTag,
@@ -83,11 +90,21 @@ export {
 export { ChainReadError } from "./lib/quantity";
 export { parseSuggestedSpan, shouldNarrow, type RawLog } from "./lib/logs";
 export {
+  type AssetUnits,
+  type HistoryReport,
+  type ParkedRow,
+  type RowDetail,
+  type SentProof,
+  collectHistory,
+  toMinorUnits,
+} from "./lib/history";
+export {
   TRANSFER_TOPIC,
   APPROVAL_TOPIC,
   APPROVAL_FOR_ALL_TOPIC,
   TRANSFER_SINGLE_TOPIC,
   TOPIC_SIGNATURES,
+  addressToTopic,
   decodeApproval,
   decodeTransfer,
   feeBreakdown,
@@ -106,6 +123,14 @@ const LIMITS = {
   hardMaxLogs: 100_000,
   defaultSpan: 2_000n,
   searchProbes: 64,
+  /** Assets a caller may declare units for in one sync. */
+  assets: 64,
+  /** Native value costs one request per block, so the range a sync will hydrate is bounded. */
+  defaultHydratedBlocks: 256,
+  hardHydratedBlocks: 10_000,
+  defaultRows: 5_000,
+  hardRows: 50_000,
+  syncCalls: 4_096,
 } as const;
 
 const rpcUrlField = z
@@ -1251,6 +1276,332 @@ function normalizeTopics(
 
 const minBig = (a: bigint, b: bigint): bigint => (a < b ? a : b);
 
+const unitsField = z
+  .object({
+    symbol: z
+      .string()
+      .min(1)
+      .max(32)
+      .optional()
+      .describe("a label for the description text; nothing is read off the chain to check it"),
+    decimals: z
+      .number()
+      .int()
+      .min(0)
+      .max(36)
+      .optional()
+      .describe("the asset's own decimals, e.g. 18 for ether, 6 for USDC"),
+    minorUnitDecimals: z
+      .number()
+      .int()
+      .min(0)
+      .max(36)
+      .optional()
+      .describe("the ledger's minor unit for this asset; default: the asset's own base units"),
+  })
+  .strict();
+
+export const onchainTransactionsSync: RegisteredTool = buildTool({
+  name: "OnchainTransactionsSync",
+  description:
+    "Pull one address's onchain history over a block range and return it as the same normalized rows a bank statement parses into, so a wallet can be reconciled against a ledger instead of read as raw logs. It emits the row shape StatementParse produces and LedgerReconcile consumes — id, date, description, amountMinor, direction, reference, balanceMinor — with the exact uint256 kept alongside each row rather than rounded into it. Use it to close the books on a wallet, or to sync incrementally: it returns a cursor pinned to the block it actually finished at. It refuses rather than under-reporting, the way EvmEventScan does, and it says in the output which movements it cannot see at all: internal native transfers need a trace, and ERC-1155 is not collected.",
+  inputSchema: z
+    .object({
+      rpcUrl: rpcUrlField,
+      address: addressField.describe(
+        "the one account to build a statement for; a statement row has no account column, so this is deliberately not a list",
+      ),
+      fromBlock: blockField,
+      toBlock: blockField.optional().describe('default "latest"'),
+      confirmations: z
+        .number()
+        .int()
+        .min(0)
+        .max(10_000)
+        .optional()
+        .describe("stop this many blocks short of the head, so the cursor is behind any reorg"),
+      include: z
+        .array(z.enum(["tokenTransfers", "native", "fees"]))
+        .min(1)
+        .max(3)
+        .optional()
+        .describe('what to collect; default all three. Dropping one is reported in "coverage"'),
+      tokens: z
+        .array(
+          z
+            .object({
+              token: addressField,
+              decimals: z.number().int().min(0).max(36),
+              symbol: z.string().min(1).max(32).optional(),
+              minorUnitDecimals: z.number().int().min(0).max(36).optional(),
+            })
+            .strict(),
+        )
+        .max(LIMITS.assets)
+        .optional()
+        .describe("the tokens whose decimals you know; nothing is read from a token contract"),
+      onlyKnownTokens: z
+        .boolean()
+        .optional()
+        .describe("scan only the tokens listed above; default true when any are listed"),
+      native: unitsField
+        .optional()
+        .describe('units for the chain\'s own coin; default 18 decimals, symbol "native value"'),
+      maxHydratedBlocks: z
+        .number()
+        .int()
+        .min(1)
+        .max(LIMITS.hardHydratedBlocks)
+        .optional()
+        .describe("native value costs one request per block; refuse past this many. Default 256"),
+      maxRows: z
+        .number()
+        .int()
+        .min(1)
+        .max(LIMITS.hardRows)
+        .optional()
+        .describe("refuse past this many rows rather than truncating; default 5000"),
+      maxSpan: z
+        .number()
+        .int()
+        .min(1)
+        .max(1_000_000)
+        .optional()
+        .describe("blocks per log request to start from; default 2000, narrowed automatically"),
+      suspectAt: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("log count at which a chunk is re-checked for silent truncation; default 1000"),
+      timeoutMs: timeoutField,
+    })
+    .strict(),
+  readOnly: true,
+  concurrencySafe: true,
+  scope: "external",
+  ioCapability: "network",
+  execute: async (input, ctx) => {
+    const rpc = await client(input, ctx);
+    const address = requireAddress(input.address, "address");
+
+    const include = input.include ?? ["tokenTransfers", "native", "fees"];
+    const includeTokens = include.includes("tokenTransfers");
+    const includeNative = include.includes("native");
+    const includeFees = include.includes("fees");
+
+    const tokenUnits = declaredTokenUnits(input.tokens);
+    const nativeUnits = declaredNativeUnits(input.native);
+    const onlyKnownTokens = input.onlyKnownTokens ?? tokenUnits.size > 0;
+    if (input.onlyKnownTokens === true && tokenUnits.size === 0) {
+      throw new ChainReadError(
+        "onlyKnownTokens is true but no tokens were listed, which would scan for nothing and report it as a complete history — list the tokens, or leave onlyKnownTokens off",
+      );
+    }
+
+    const head = await headNumber(rpc);
+    const confirmations = BigInt(input.confirmations ?? 0);
+    const from = await resolveBlockNumber(rpc, input.fromBlock, "fromBlock");
+    const requestedTo =
+      input.toBlock === undefined ? head : await resolveBlockNumber(rpc, input.toBlock, "toBlock");
+    // Pinned to numbers before the first query, exactly as EvmEventScan does it:
+    // the cursor handed back has to name a block, and a run that stopped at
+    // "latest" stopped somewhere nobody can resume from.
+    const to = confirmations > 0n ? minBig(requestedTo, head - confirmations) : requestedTo;
+
+    if (to < from) {
+      throw new ChainReadError(
+        `there is nothing to sync: fromBlock ${from} is after toBlock ${to}${
+          confirmations > 0n
+            ? ` (the head is ${head}, and ${confirmations} confirmations put the upper bound at ${head - confirmations})`
+            : ""
+        }`,
+      );
+    }
+
+    const report = await collectHistory(rpc, {
+      address,
+      from,
+      to,
+      includeTokens,
+      includeNative,
+      includeFees,
+      tokenUnits,
+      onlyKnownTokens,
+      nativeUnits,
+      span: input.maxSpan === undefined ? LIMITS.defaultSpan : BigInt(input.maxSpan),
+      suspectAt: input.suspectAt ?? 1_000,
+      maxRows: input.maxRows ?? LIMITS.defaultRows,
+      maxHydratedBlocks: input.maxHydratedBlocks ?? LIMITS.defaultHydratedBlocks,
+      maxCalls: LIMITS.syncCalls,
+    });
+
+    return json({
+      address,
+      // Only ever true, and only ever about the sources under `coverage`. A set
+      // that could not be proved complete is an error, not a shorter list.
+      complete: true,
+      completeWhy:
+        "every included source was collected over the whole pinned range or this would have been a refusal; what each source rests on, and what was not collected at all, is named in coverage",
+      range: {
+        fromBlock: from.toString(),
+        toBlock: to.toString(),
+        head: head.toString(),
+        confirmations: confirmations.toString(),
+      },
+      // Resumable because it names the block this run actually finished at, not
+      // the head at the moment it ended: the head has moved, and a cursor set
+      // from it skips every block mined during the run.
+      cursor: {
+        nextFromBlock: (to + 1n).toString(),
+        scannedThrough: to.toString(),
+        note: "pass nextFromBlock as fromBlock to continue without re-reading or skipping a block",
+      },
+      rowCount: report.rows.length,
+      /** Exactly `@crewhaus/tool-money`'s `Transaction`: feed it to LedgerReconcile as kind "lines". */
+      rows: report.rows,
+      /** The same rows keyed by id, with the uint256 that would not fit in one. */
+      detail: report.detail,
+      // Movements that are on the chain and cannot be written as a row. Not an
+      // empty list because nothing happened — a list because something did.
+      unrepresentable: report.unrepresentable,
+      ...(report.unrepresentable.length > 0
+        ? {
+            unrepresentableWarning: `${report.unrepresentable.length} movement(s) could not be written as a row without rounding. They are listed above with the exact raw amount; give the asset's decimals and the ledger's minorUnitDecimals to bring them into range.`,
+          }
+        : {}),
+      selfTransfers: report.selfTransfers,
+      // The evidence for the half of `coverage` that is a claim rather than a
+      // disclaimer, in the output next to it: a caller that reconciles on these
+      // rows can see what the sent side was checked against.
+      ...(report.sentProof === undefined ? {} : { sentProof: report.sentProof }),
+      coverage: coverageOf(
+        includeTokens,
+        includeNative,
+        includeFees,
+        onlyKnownTokens,
+        report.sentProof,
+      ),
+      paging: {
+        logChunks: report.logChunks,
+        logCalls: report.logCalls,
+        verifications: report.verifications,
+        silentTruncations: report.silentTruncations,
+        hydratedBlocks: report.hydratedBlocks,
+        receiptsRead: report.receiptsRead,
+        ...(report.silentTruncations > 0
+          ? {
+              warning: `${report.silentTruncations} log chunk(s) came back truncated with nothing in the response saying so. The missing transfers were recovered by re-querying in halves and the rows above are complete, but this endpoint will do it again — prefer one that reports its limits, or keep maxSpan small.`,
+            }
+          : {}),
+      },
+      calls: rpc.calls,
+    });
+  },
+});
+
+/** The caller's token table, checked for the two ways it can be self-contradictory. */
+function declaredTokenUnits(
+  tokens:
+    | ReadonlyArray<{
+        readonly token: string;
+        readonly decimals: number;
+        readonly symbol?: string;
+        readonly minorUnitDecimals?: number;
+      }>
+    | undefined,
+): ReadonlyMap<string, AssetUnits> {
+  const units = new Map<string, AssetUnits>();
+  for (const entry of tokens ?? []) {
+    const token = requireAddress(entry.token, "tokens[].token");
+    if (units.has(token)) {
+      throw new ChainReadError(
+        `tokens lists ${token} twice — two sets of decimals for one token is two different answers for every row of it`,
+      );
+    }
+    const minor = entry.minorUnitDecimals ?? entry.decimals;
+    if (minor > entry.decimals) {
+      throw new ChainReadError(
+        `tokens[${token}]: minorUnitDecimals (${minor}) is finer than the token's own decimals (${entry.decimals}) — there are no digits there to scale up into`,
+      );
+    }
+    units.set(token, {
+      decimals: entry.decimals,
+      minorUnitDecimals: minor,
+      symbol: entry.symbol ?? null,
+    });
+  }
+  return units;
+}
+
+function declaredNativeUnits(
+  native:
+    | { readonly symbol?: string; readonly decimals?: number; readonly minorUnitDecimals?: number }
+    | undefined,
+): AssetUnits {
+  if (native === undefined) return UNKNOWN_UNITS;
+  // 18 is the EVM native decimal count everywhere it is not overridden, and it
+  // is only a default for the SCALE — the symbol is still whatever the caller
+  // said, because this package never asks a chain what its coin is called.
+  const decimals = native.decimals ?? 18;
+  const minor = native.minorUnitDecimals ?? decimals;
+  if (minor > decimals) {
+    throw new ChainReadError(
+      `native.minorUnitDecimals (${minor}) is finer than native.decimals (${decimals}) — there are no digits there to scale up into`,
+    );
+  }
+  return { decimals, minorUnitDecimals: minor, symbol: native.symbol ?? null };
+}
+
+/**
+ * What is in these rows and what is not, in the output rather than only in the
+ * docs.
+ *
+ * Three of these are permanent — a receipt has no trace in it, ERC-1155 puts
+ * its parties where this filter does not look, and a public endpoint has no
+ * address index — and a caller who reconciles against rows that silently
+ * omitted them balances to a number that is wrong by exactly what was omitted.
+ */
+function coverageOf(
+  tokens: boolean,
+  native: boolean,
+  fees: boolean,
+  onlyKnownTokens: boolean,
+  sentProof: SentProof | undefined,
+): Record<string, unknown> {
+  // What the two block-sourced lines below may claim, and no more. A hydrated
+  // block is one response that cannot be split, so the log scan's split-and-
+  // compare proof has nothing to work with here — the account's nonce is the
+  // only evidence there is, and it is evidence about the SENT side only.
+  const sent =
+    sentProof === undefined
+      ? "not read"
+      : sentProof.outcome === "proved"
+        ? `proved complete against this account's nonce (${sentProof.sent} transaction(s))`
+        : sentProof.outcome === "moreThanTheNonce"
+          ? `${sentProof.sent} transaction(s), more than the nonce accounts for — a rollup's system transactions look like this, and nothing is missing`
+          : `NOT proved: ${sentProof.why}`;
+  return {
+    tokenTransfers: tokens
+      ? onlyKnownTokens
+        ? "complete for the tokens listed in `tokens`, checked on the answer and not only in the filter; transfers of any other token were not scanned for"
+        : "complete: every ERC-20 and ERC-721 Transfer log with this address as a party"
+      : 'excluded: "tokenTransfers" was not in include',
+    nativeTransfers: native
+      ? `top-level value transfers, read from the blocks themselves. Sent: ${sent}. Received: whatever this endpoint's blocks contained — a block cannot be re-asked in halves, so a short one cannot be told from a quiet one`
+      : 'excluded: "native" was not in include, so a plain coin payment is NOT in these rows',
+    fees: fees
+      ? `one row per transaction this address sent, charged once per transaction and never once per log. Sent: ${sent}`
+      : 'excluded: "fees" was not in include, so gas spend is NOT in these rows',
+    internalNativeTransfers:
+      "excluded: coin moved by a CONTRACT during a call leaves no log and no receipt field. It is only visible in a trace, and debug_traceTransaction is neither on a public endpoint's free tier nor on this package's read-only allow-list",
+    erc1155:
+      "excluded: TransferSingle carries the operator where this filter looks for the sender, and TransferBatch keeps its amounts in data where no topic filter reaches. Neither is scanned for, rather than scanned for badly",
+    tokenMetadata:
+      "not resolved: decimals and symbols are only ever the ones you supplied. Reading decimals() costs an eth_call per token and a token contract is free to report whatever it likes, which turns an airdrop's dust into a five-figure row",
+  };
+}
+
 /** Every tool this package registers, in the order a catalog should list them. */
 export const CHAINREAD_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   evmBlockAtTimestamp,
@@ -1260,4 +1611,5 @@ export const CHAINREAD_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   evmRpcHealth,
   evmTransactionSummary,
   evmWaitForReceipt,
+  onchainTransactionsSync,
 ]);

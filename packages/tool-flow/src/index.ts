@@ -8,27 +8,30 @@
  *
  * Every library under `./lib` is pure — the clock is a parameter, never a
  * call — so the same inputs give the same answer in a test, in a replay and
- * in production. Two of the tool wrappers do read the real clock, because
- * their whole job is to know what time it is: `DeadlineCheck` always, and
- * `ErrorClassify` only to resolve a `Retry-After` given as a date. Both take
- * an explicit `now` that overrides it, and that is the only impurity in the
- * package.
+ * in production. Three of the tool wrappers do read the real clock, because
+ * knowing the time is part of their job: `DeadlineCheck` always,
+ * `ErrorClassify` only to resolve a `Retry-After` given as a date, and
+ * `SequenceRun` only to decide whether a step's `after` gate has passed. All
+ * three take an explicit `now` that overrides it, and that is the only
+ * impurity in the package.
  *
  * The condition vocabulary is `@crewhaus/tool-schema`'s: `Branch`,
- * `DecisionTable` and `RuleScore` all evaluate the same `checks` the
- * `Assert` tool does, through the same evaluator. An operator learns one
- * grammar.
+ * `DecisionTable`, `RuleScore`, `LeadAssign` and `SequenceRun` all evaluate
+ * the same `checks` the `Assert` tool does, through the same evaluator. An
+ * operator learns one grammar.
  */
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { ASSERT_OPS, type Check } from "@crewhaus/tool-schema";
 import { z } from "zod";
+import { ASSIGN_STRATEGIES, type Roster, assignOwner } from "./lib/assign";
 import { type BranchRule, evaluateBranches } from "./lib/branch";
 import { type ConsensusOptions, VOTE_MODES, type Vote, tallyVotes } from "./lib/consensus";
 import { checkDeadline } from "./lib/deadline";
 import { type DecisionTable, HIT_POLICIES, evaluateTable } from "./lib/decision";
 import { ERROR_CLASSES, type ErrorRule, NEXT_ACTIONS, classifyError } from "./lib/errors";
 import { type ScoreModel, scoreValue } from "./lib/score";
+import { type SequenceStep, planSequence } from "./lib/sequence";
 import { type Snapshot, detectStall } from "./lib/stall";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
@@ -43,6 +46,8 @@ const LIMITS = {
   votes: 512,
   history: 512,
   signals: 64,
+  owners: 256,
+  steps: 256,
 } as const;
 
 const checkSchema = z.object({
@@ -63,17 +68,37 @@ const matchField = z
   .describe("whether every check must hold, or any one of them; default all");
 
 /**
+ * The largest epoch millisecond value a `Date` represents, per ECMAScript.
+ * Beyond it every `Date` is invalid, and `toISOString` throws.
+ */
+const MAX_TIME_VALUE = 8.64e15;
+
+/**
  * An instant, as epoch milliseconds or an ISO-8601 string.
  *
  * A string without an offset is rejected rather than guessed at. Per
  * ECMAScript, `Date.parse("2026-01-01T00:00:00")` is *local* time while the
  * date-only form is UTC, so the same spec would mean different instants on
  * two machines — the exact class of bug this package exists to remove.
+ *
+ * This is the one place an instant is turned into a number, so it is also
+ * the one place that has the field name to put in the message. An epoch
+ * outside the representable range used to pass straight through and surface
+ * later as a bare `RangeError: Invalid Date` from whichever consumer
+ * rendered it — `DeadlineCheck`'s `deadline`, `SequenceRun`'s
+ * `not due until …` — naming neither the field nor the value, in a spec that
+ * may carry a dozen instants. The string form was already caught, because
+ * `Date.parse` returns NaN out there; only the numeric form got this far.
  */
 function parseInstant(value: string | number, field: string): number {
   if (typeof value === "number") {
     if (!Number.isFinite(value))
       throw new Error(`${field} is not a finite epoch-millisecond value`);
+    if (Math.abs(value) > MAX_TIME_VALUE) {
+      throw new Error(
+        `${field} (${value}) is outside the range a date can represent (±8.64e15 epoch milliseconds)`,
+      );
+    }
     return value;
   }
   const text = value.trim();
@@ -369,6 +394,124 @@ export const ruleScore: RegisteredTool = buildTool({
   },
 });
 
+export const leadAssign: RegisteredTool = buildTool({
+  name: "LeadAssign",
+  description:
+    "Route a record to an owner from a declared roster: territory and segment as the same conditions Assert and RuleScore use, plus capacity, an out-of-office flag, and a strategy — declaration order, most specific territory, least loaded, or round robin. Use it to keep lead routing in versioned rules instead of in a prompt, and to be able to tell a rep exactly why a lead went elsewhere. It decides only: the load figures come in and the advanced rotation cursor goes back out, because this package does not persist anything.",
+  inputSchema: z.object({
+    value: z.unknown().describe("the record being routed"),
+    strategy: z.enum(ASSIGN_STRATEGIES).describe("first | specific | least_loaded | round_robin"),
+    version: z.string().optional().describe("echoed into the answer, so it is attributable"),
+    owners: z
+      .array(
+        z.object({
+          id: z.string().min(1).describe("what gets written on the record; must be unique"),
+          when: checksField,
+          match: matchField,
+          load: z
+            .number()
+            .nonnegative()
+            .optional()
+            .describe("assignments already held; required by least_loaded and by capacity"),
+          capacity: z.number().nonnegative().optional().describe("skip this owner at or above it"),
+          available: z
+            .boolean()
+            .optional()
+            .describe("false takes the owner out; absent means no out-of-office record"),
+        }),
+      )
+      .min(1)
+      .max(LIMITS.owners),
+    cursor: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "round_robin: where the last call left off; the answer carries the next one, or null when nothing was picked from the roster and the old cursor still stands",
+      ),
+    fallback: z
+      .object({ id: z.string().min(1) })
+      .optional()
+      .describe(
+        "owner of last resort when nobody is eligible; never used for an undecidable roster",
+      ),
+    verbose: z
+      .boolean()
+      .optional()
+      .describe(
+        "include the per-owner report of why each was in, out, or undetermined (eligible: null)",
+      ),
+  }),
+  readOnly: true,
+  concurrencySafe: true,
+  execute: async (input) => {
+    const { considered, ...rest } = assignOwner(input.value, input as unknown as Roster);
+    return json(input.verbose ? { ...rest, considered } : rest);
+  },
+});
+
+export const sequenceRun: RegisteredTool = buildTool({
+  name: "SequenceRun",
+  description:
+    "Work out what a declared multi-step sequence should do next — the steps whose prerequisites are complete, whose scheduled time has arrived and whose conditions hold, each with the parameters to run it with — plus what is still waiting, what can no longer happen because a step it needs failed or was ruled out, and what its own conditions ruled out. The flow's state is one of ready, blocked, finished or halted, so a flow that died is never reported as one that completed. It returns a plan and runs nothing: invoking a tool needs the executor, which no tool package has. Use it to drive a cadence or a fix-up flow from versioned data, with the caller executing each step the plan hands back.",
+  inputSchema: z.object({
+    value: z.unknown().describe("the context the step conditions are tested against"),
+    version: z.string().optional().describe("echoed into the plan, so a change is attributable"),
+    steps: z
+      .array(
+        z.object({
+          id: z.string().min(1).describe("must be unique; what needs and progress refer to"),
+          when: checksField
+            .optional()
+            .describe("the step's own gate; omit it for a step that is always due"),
+          match: matchField,
+          needs: z
+            .array(z.string().min(1))
+            .max(LIMITS.steps)
+            .optional()
+            .describe("ids that must be completed first"),
+          params: z.unknown().describe("returned verbatim in the plan, for the caller to act on"),
+          after: instantField.optional().describe("not due before this instant"),
+        }),
+      )
+      .min(1)
+      .max(LIMITS.steps),
+    completed: z
+      .array(z.string().min(1))
+      .max(LIMITS.steps)
+      .optional()
+      .describe("ids already done; the caller keeps this, the tool does not"),
+    failed: z
+      .array(z.string().min(1))
+      .max(LIMITS.steps)
+      .optional()
+      .describe("ids that failed; their dependents are reported unreachable, not waiting"),
+    now: instantField.optional().describe("overrides the real clock, for tests and replays"),
+  }),
+  readOnly: true,
+  concurrencySafe: true,
+  execute: async (input) => {
+    const nowMs = input.now === undefined ? Date.now() : parseInstant(input.now, "now");
+    // Each `after` is parsed here and dropped, so the planner can only read
+    // the parsed number: a step can never end up gated on an offset-less
+    // string that means one instant on the operator's laptop and another in
+    // CI, because the string does not reach it.
+    const steps: SequenceStep[] = input.steps.map(({ after, ...step }) => ({
+      ...step,
+      afterMs: after === undefined ? undefined : parseInstant(after, `step "${step.id}" after`),
+      when: step.when as ReadonlyArray<Check> | undefined,
+    }));
+    return json(
+      planSequence(
+        input.value,
+        { version: input.version, steps },
+        { nowMs, completed: input.completed, failed: input.failed },
+      ),
+    );
+  },
+});
+
 /** Every tool this package registers, in the order a catalog should list them. */
 export const FLOW_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   branch,
@@ -376,7 +519,9 @@ export const FLOW_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   deadlineCheck,
   decisionTable,
   errorClassify,
+  leadAssign,
   ruleScore,
+  sequenceRun,
   stallDetect,
 ]);
 

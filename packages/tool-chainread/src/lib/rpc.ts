@@ -7,7 +7,7 @@
  *      `assertReadOnlyMethod` from `@crewhaus/chain-adapter-base` — the same
  *      allow-list the adapters use — before a socket is opened. That makes the
  *      "this package only reads" claim structural rather than a promise about
- *      the seven call sites: `eth_sendRawTransaction` throws here even if some
+ *      the call sites: `eth_sendRawTransaction` throws here even if some
  *      future edit asks for it. `index.test.ts` asserts it.
  *   2. **Failures are returned, not thrown.** A tool that polls, pages or
  *      probes several endpoints needs to branch on WHY a call failed — a

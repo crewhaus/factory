@@ -135,6 +135,7 @@ describe("dispatch through executeTool", () => {
       EvmWaitForReceipt: { rpcUrl: RPC, txHash: hash32("tx-ok") },
       EvmTransactionSummary: { rpcUrl: RPC, txHash: hash32("tx-ok") },
       EvmEventScan: { rpcUrl: RPC, fromBlock: 100, toBlock: 150 },
+      OnchainTransactionsSync: { rpcUrl: RPC, address: ALICE, fromBlock: 118, toBlock: 122 },
     };
     for (const tool of CHAINREAD_TOOLS) {
       const result = await executeTool(lookup(tool.name), inputs[tool.name], {
@@ -214,7 +215,7 @@ describe("dispatch through executeTool", () => {
   });
 });
 
-describe("the question these seven answer together", () => {
+describe("the question these tools answer together", () => {
   test("pin a moment to a block, scan that window, then explain what one transaction did", async () => {
     // The workflow the package is for: a period becomes a block range, the
     // range becomes a set of logs, and one of those logs becomes a settled

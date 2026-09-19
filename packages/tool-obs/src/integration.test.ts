@@ -216,6 +216,100 @@ describe("dispatch through executeTool", () => {
   });
 });
 
+describe("EmitTraceEvent through the executor", () => {
+  test("a tool-only pass leaves a record the reading tools pick up", async () => {
+    const emitted = await executeTool(
+      lookup("EmitTraceEvent"),
+      {
+        sessionId: "sess_1111111111111111",
+        name: "budget_checked",
+        message: "under the cap",
+        tsMs: T0 + 500,
+        fields: { remainingUsdMicros: 12 },
+      },
+      { toolUseId: "e1" },
+    );
+    expect(emitted.isError).toBe(false);
+    expect(JSON.parse(String(emitted.content)).kind).toBe("custom.budget_checked");
+
+    const read = await executeTool(
+      lookup("EventQuery"),
+      { sessionId: "sess_1111111111111111", kinds: ["custom.budget_checked"] },
+      { toolUseId: "e2" },
+    );
+    const page = JSON.parse(String(read.content));
+    expect(page.matched).toBe(1);
+    expect(page.results[0].payload).toContain('"emittedBy":"EmitTraceEvent"');
+  });
+
+  test("a nested field value is rejected by the schema before execute runs", async () => {
+    const result = await executeTool(
+      lookup("EmitTraceEvent"),
+      { sessionId: "sess_1111111111111111", name: "x", fields: { nested: { a: 1 } } },
+      { toolUseId: "e3" },
+    );
+    expect(result.isError).toBe(true);
+    expect(String(result.content)).toContain('invalid input for tool "EmitTraceEvent"');
+  });
+
+  test("with no run context and no session named, the refusal is a readable result", async () => {
+    const result = await executeTool(lookup("EmitTraceEvent"), { name: "x" }, { toolUseId: "e4" });
+    expect(result.isError).toBe(false);
+    expect(String(result.content)).toContain("pass sessionId");
+  });
+
+  test("the runtime's own run context supplies the session and the attribution", async () => {
+    const result = await executeTool(
+      lookup("EmitTraceEvent"),
+      { name: "checkpoint", tsMs: T0 },
+      {
+        toolUseId: "e5",
+        // `ExecutionContext` has no `runContext` field — at THIS seam the run
+        // context only ever arrives on the opaque bridge, which is why the
+        // tool reads both carriers rather than just `ctx.runContext`. A tool
+        // that read only the direct field would lose its provenance on every
+        // call dispatched through the executor.
+        bridge: {
+          runContext: { runId: "run_1", sessionId: "sess_1111111111111111", turnNumber: 4 },
+        },
+      },
+    );
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(String(result.content))).toMatchObject({
+      session: "sess_1111111111111111",
+      runId: "run_1",
+      runIdSource: "context",
+      runContext: "present",
+    });
+  });
+
+  test("a bridge carrying a run context it cannot read says unusable, not present", async () => {
+    // The context is read STRUCTURALLY so this package takes no dependency on
+    // `@crewhaus/run-context`. The cost of that is drift: a renamed field
+    // yields an object nothing can be extracted from. Reporting it as
+    // `present` would put a provenance on the line that nothing supplied.
+    const result = await executeTool(
+      lookup("EmitTraceEvent"),
+      { sessionId: "sess_1111111111111111", name: "checkpoint", tsMs: T0 },
+      { toolUseId: "e6", bridge: { runContext: { id: "run_1", session: "sess_x" } } },
+    );
+    expect(result.isError).toBe(false);
+    const report = JSON.parse(String(result.content));
+    expect(report.runContext).toBe("unusable");
+    expect(report.runId).toBeUndefined();
+  });
+
+  test("an empty sessionId is rejected by the schema, not turned into a dot-file", async () => {
+    const result = await executeTool(
+      lookup("EmitTraceEvent"),
+      { sessionId: "", name: "x", create: true },
+      { toolUseId: "e7" },
+    );
+    expect(result.isError).toBe(true);
+    expect(String(result.content)).toContain('invalid input for tool "EmitTraceEvent"');
+  });
+});
+
 describe("tool_config through the executor", () => {
   test("a per-candidate obs block is what the call runs under", async () => {
     // Nothing is registered at boot, so only the override can make this work.

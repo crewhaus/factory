@@ -47,6 +47,9 @@ Everything lives under `.crewhaus/state` in the workspace by default; every
 tool takes `stateDir` to point somewhere else, and that path is contained the
 same way (see **Containment**).
 
+There is one more tool, and it is not one of the twenty — see
+**[VectorDelete](#vectordelete-the-one-tool-that-leaves-the-workspace)**.
+
 ## The four properties
 
 **Containment.** Every caller-supplied path — the state directory, and the
@@ -87,14 +90,18 @@ as empty and would block the call for ever. Nothing throws out of `execute`
 because the last run died badly.
 
 **Honest safety flags.** The ten writers are `destructive: true`; the ten
-readers are `readOnly: true` and `concurrencySafe`. Every tool is
-`scope: "internal"` and declares no `ioCapability`, because nothing in this
-package opens a socket or spawns a process — `packages/tool-state/src/index.test.ts`
-asserts that for all twenty, so a future tool that reaches outward cannot slip
-in unlabelled. None sets `requireJustification`, because none has an outward
-side effect: the whole package writes to one directory the operator chose, and
+readers are `readOnly: true` and `concurrencySafe`. Every tool in `STATE_TOOLS`
+is `scope: "internal"` and declares no `ioCapability`, because nothing in that
+list opens a socket or spawns a process — `packages/tool-state/src/index.test.ts`
+asserts it for all twenty, so a future tool that reaches outward cannot slip in
+unlabelled. None of the twenty sets `requireJustification`, because none has an
+outward side effect: they write to one directory the operator chose, and
 `DedupeMark` exists precisely so that the tools which *do* reach outward are
 called once.
+
+That test is why `VectorDelete` is not in the list. It reaches a store the host
+registered, which may be remote, so it declares `scope: "external"` with
+`ioCapability: "network"` and does take a justification.
 
 ## Concurrency, precisely
 
@@ -147,6 +154,79 @@ escalation path.
 snapshot and watches nothing; `IndexSearch` compares each hit's size and mtime
 against the index and reports `stale` rather than pretending otherwise.
 
+## VectorDelete, the one tool that leaves the workspace
+
+| Tool | What it does |
+|---|---|
+| `VectorDelete` | Delete entries from the registered vector store by id, and say exactly how little can be known about the result |
+
+It is exported, and listed in `VECTOR_TOOLS` — **not** in `STATE_TOOLS`. The
+twenty above promise that nothing crosses a process or network boundary and a
+test enforces that over the list's membership; a vector store may be a qdrant,
+pinecone or weaviate collection over HTTP, so this one is labelled
+`scope: "external"` with `ioCapability: "network"`, takes a justification, and
+is kept out of a list whose meaning it would quietly dilute.
+
+**It needs a store handed to it.** This package does not depend on
+`@crewhaus/vector-store` and cannot build a store from a backend name; the host
+registers the one it already built, the way `@crewhaus/tool-retrieve` is wired:
+
+```ts
+import { registerVectorTarget } from "@crewhaus/tool-state";
+
+registerVectorTarget({
+  store: vectorStore,          // any VectorStore — structurally typed, no import
+  collection: "chunks",        // needed before a protection list can mean anything
+  protectedCollections: ["audit"],
+  countConsistency: "eventual", // optional; otherwise inferred from the backend
+});
+```
+
+With nothing registered the tool refuses. It will not fall back to an empty
+in-process store, which would let an erasure request come back as a clean
+success having deleted nothing.
+
+The registration is checked there and then, not at the first call: a store
+missing `delete`/`count`, a `collection` that is not a usable name, a
+`protectedCollections` that is not an array of names, or a `countConsistency`
+that is neither word, each throws `VectorTargetError` at boot. Every one of
+them would otherwise fail *open* — a bare string protection list reads one
+character at a time and protects nothing it names, and an unrecognised
+`countConsistency` used to make `countAfter` sound authoritative.
+
+**What it will not claim.** The store interface exposes no `exists` and no
+`get`, so per-id truth is unobtainable. The result therefore reports
+`deletesAttempted` and `deletesAcknowledged` — acknowledged meaning the store
+accepted the request — and carries `perIdOutcome: "unavailable"`. There is no
+deleted/missing split anywhere in it, because there is no way to earn one.
+
+`countBefore` and `countAfter` are two observations, never a measurement of
+what was deleted. Between settling-then-recounting and saying so, this tool
+**says so**: `countAfterIsIndicative` is true on every backend but the
+in-process one. Settling would mean sleeping on the system clock, which no tool
+in this package does, and a settle loop cannot tell "the backend has not caught
+up" from "the delete did not land" — it would convert an honest unknown into a
+confident wrong answer. A count that could not be read at all comes back as
+`null` with the reason beside it, never as `0`.
+
+**The gate runs once.** `protectedCollections` — the caller's, the
+registration's and any `tool_config` block's (both spellings of the key, also
+unioned), because a deny-list that could be narrowed by a later source is not a
+gate — is checked before the
+selection, before the first count, before the first delete. A refusal means the
+store was never touched, which is the only way `dryRun` can promise anything
+about a real run; the dry run runs the same selection code and predicts the
+same refusal. Two fail-closed rules: a store registered with no collection name
+refuses while a protection list is in play (it cannot be *shown* not to be the
+protected one), and a name differing from a protected one only in case is
+refused rather than guessed.
+
+**Two limits worth knowing.** The collection name is asserted by the host at
+registration; the store offers no way to confirm it, which `expectCollection`
+mitigates but cannot remove. And containment does not reach through the seam:
+if a host registers a lance store pointed outside the workspace, that is the
+host's path, resolved by the store, not by this package's gate.
+
 ## What is deliberately not here
 
 No server, no replication, no cross-machine coordination, no queue. No
@@ -165,7 +245,10 @@ thin wrapper that turns those into tools. `src/paths.ts` is the containment
 gate: it started as a copy of `@crewhaus/tool-fsx`'s, and refuses everything
 that one refuses, plus two cases this package's own layout needs — a dangling
 symlink, and a symlink on an interior path beneath an already-approved root
-(`resolveWithin`).
+(`resolveWithin`). `src/vector.ts` is `VectorDelete`'s seam — the structural
+store interface, the registration, the selection and the two observations —
+kept in its own file so the one tool that leaves the workspace is visible as
+such, and so moving it to a package of its own is a file move.
 
 ## On disk
 

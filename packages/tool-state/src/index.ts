@@ -26,9 +26,16 @@
  *      and the reason, as a normal result. Nothing throws out of `execute`
  *      because a previous run was killed mid-write.
  *   4. SAFETY FLAGS THAT MEAN SOMETHING. Reads are `readOnly`; anything that
- *      writes is `destructive`. Every tool is `scope: "internal"` with no
- *      declared io capability, because nothing here opens a socket or spawns
- *      a process — files under the workspace are all it touches.
+ *      writes is `destructive`. Every tool in `STATE_TOOLS` is
+ *      `scope: "internal"` with no declared io capability, because nothing in
+ *      that list opens a socket or spawns a process — files under the
+ *      workspace are all they touch.
+ *
+ * The one exception is `VectorDelete` (`vector.ts`), which deletes from a
+ * vector store the host registers and may therefore reach a remote
+ * collection. It is labelled `scope: "external"` + `ioCapability: "network"`
+ * and listed in `VECTOR_TOOLS`, NOT in `STATE_TOOLS`, so the promise the
+ * twenty make stays exactly as strong as it was.
  *
  * Concurrency is taken seriously but not magically: compare-and-set, counter
  * increments and sequence allocation run under a machine-local lock file with
@@ -108,6 +115,19 @@ import {
   writeBuffer,
   writeJsonAtomic,
 } from "./store";
+import {
+  MAX_VECTOR_IDS,
+  applyVectorDeletes,
+  capList,
+  checkCollection,
+  countIsIndicative,
+  describeBackend,
+  getVectorTarget,
+  observeCount,
+  readVectorToolConfig,
+  selectVectorIds,
+  unionProtected,
+} from "./vector";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
 const json = (value: unknown): string => JSON.stringify(value);
@@ -1891,7 +1911,157 @@ export const dedupeMark: RegisteredTool = stateTool({
   },
 });
 
-/** Every tool this package registers, in the order a catalog should list them. */
+// ---------------------------------------------------------------------------
+// vector store — the one tool here that leaves the workspace
+// ---------------------------------------------------------------------------
+
+export const vectorDelete: RegisteredTool = stateTool({
+  name: "VectorDelete",
+  description:
+    "Delete entries from the registered vector store by id, reporting how many deletes were ATTEMPTED and what the store's count was before and after. Use it to erase indexed content on request, and read the result exactly as it is worded: the store offers no way to ask whether an id exists, so nothing here can tell you an id was present or is now gone, and on an eventually-consistent backend `countAfter` is one indicative observation rather than proof.",
+  inputSchema: z.object({
+    ids: z
+      .array(z.string())
+      .min(1)
+      .max(MAX_VECTOR_IDS)
+      .describe("ids to delete, exactly as the store holds them — nothing is trimmed or folded"),
+    expectCollection: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("refuse unless the registered store is bound to this collection"),
+    protectedCollections: z
+      .array(z.string().min(1))
+      .max(100)
+      .optional()
+      .describe("collections that must never be deleted from; checked once, before any delete"),
+    requireChunkIdShape: z
+      .boolean()
+      .optional()
+      .describe("refuse any id that is not '<docId>:<index>:<startOffset>', as chunker builds it"),
+    dryRun: z
+      .boolean()
+      .optional()
+      .describe(
+        "select through the same code and report what would be attempted, deleting nothing",
+      ),
+  }),
+  destructive: true,
+  // Two of these in flight against one store interleave their counts, and the
+  // before/after pair stops meaning anything at all.
+  concurrencySafe: false,
+  // The registered store may be a qdrant/pinecone/weaviate collection over
+  // HTTP. Nothing in this file can tell, so it is labelled for the worst case:
+  // the egress classifier has to see the ids before they leave.
+  scope: "external",
+  ioCapability: "network",
+  requireJustification: true,
+  execute: async (input, ctx) => {
+    const target = getVectorTarget();
+    if (target === undefined) {
+      return "VectorDelete has no vector store registered, and will not invent one — the host registers the store it already built with registerVectorTarget({ store, collection }). Nothing was deleted.";
+    }
+
+    const policy = readVectorToolConfig(ctx?.toolConfig);
+    if (!policy.ok) {
+      return `VectorDelete refused: ${policy.reason} — an unreadable protection list is not an empty one, so nothing was deleted`;
+    }
+    const protectedCollections = unionProtected(
+      input.protectedCollections,
+      target.protectedCollections,
+      policy.protectedCollections,
+    );
+
+    // ONCE, here: before the selection, before the first count, before the
+    // first delete. A refusal means the store was never touched — which is
+    // the only way a dry run can promise anything about a real run.
+    const refusal = checkCollection({
+      collection: target.collection,
+      protectedCollections,
+      expectCollection: input.expectCollection,
+    });
+    if (refusal !== undefined) {
+      return json({
+        refused: true,
+        reasonCode: refusal.code,
+        reason: refusal.message,
+        dryRun: input.dryRun === true,
+        deletesAttempted: 0,
+        collection: target.collection ?? null,
+        protectedCollections,
+      });
+    }
+
+    const dryRun = input.dryRun === true;
+    const selection = selectVectorIds(input.ids, {
+      requireChunkIdShape: input.requireChunkIdShape === true,
+    });
+    const before = await observeCount(target.store);
+    const applied = dryRun
+      ? undefined
+      : await applyVectorDeletes(target.store, selection.ids, ctx?.signal);
+    const after = dryRun ? undefined : await observeCount(target.store);
+
+    const rejected = capList(selection.rejected);
+    const errored = capList(applied?.errors ?? []);
+    const indicative = countIsIndicative(target);
+    return json({
+      // Stated, not implied by the absence of the refusal shape's `refused`:
+      // a caller should not have to read a missing key as an answer.
+      refused: false,
+      dryRun,
+      // Only a non-empty STRING is a backend name. Echoing `store.backend`
+      // straight through put a whole object in the result for a store that
+      // reported one, and "unknown" is the honest reading of a self-report
+      // that is not a name — the same reading `countAfterIsIndicative` makes.
+      backend: describeBackend(target.store),
+      // Declared by the host at registration; the store exposes no way to
+      // confirm it, which is why an absent one refuses rather than assumes.
+      collection: target.collection ?? null,
+      collectionSource: target.collection === undefined ? "none" : "registration",
+      idsRequested: input.ids.length,
+      // The selected ids are not echoed: the caller sent them, and a thousand
+      // of them back is a thousand ids of context. Selected = `ids` minus
+      // `idsRejected` minus repeats.
+      idsSelected: selection.ids.length,
+      duplicatesCollapsed: selection.duplicatesCollapsed,
+      ...(rejected.listed.length > 0 ? { idsRejected: rejected.listed } : {}),
+      ...(rejected.truncated ? { idsRejectedTruncated: true } : {}),
+      deletesAttempted: applied?.attempted ?? 0,
+      deletesAcknowledged: applied?.acknowledged ?? 0,
+      ...(errored.listed.length > 0 ? { deletesErrored: errored.listed } : {}),
+      ...(errored.truncated ? { deletesErroredTruncated: true } : {}),
+      ...(applied?.halted === true
+        ? { halted: "aborted — ids after the last attempted one were left alone" }
+        : {}),
+      countBefore: before.count,
+      ...(before.error !== undefined ? { countBeforeError: before.error } : {}),
+      countAfter: after?.count ?? null,
+      ...(after?.error !== undefined ? { countAfterError: after.error } : {}),
+      ...(dryRun
+        ? { countAfterSkipped: "dry run — nothing was deleted, so nothing to re-count" }
+        : {}),
+      countAfterIsIndicative: indicative,
+      perIdOutcome: "unavailable",
+      caveats: [
+        "an acknowledged delete means the store accepted the request; it exposes no existence check, so no id here can be reported as found-and-deleted or as already-absent",
+        indicative
+          ? "countAfter is a single observation on a store whose count is eventually consistent — it may not reflect these deletes yet, and its difference from countBefore is not a count of what was deleted"
+          : "countBefore and countAfter are two observations of a store other writers may also be changing — their difference is not a count of what this call deleted",
+      ],
+    });
+  },
+});
+
+/**
+ * Every tool this package registers that keeps to the workspace, in the order
+ * a catalog should list them.
+ *
+ * `vectorDelete` is deliberately absent: membership of this list is what the
+ * "nothing here crosses a process or network boundary" test checks, and that
+ * tool crosses one by design. It is listed in {@link VECTOR_TOOLS} instead —
+ * see `vector.ts` for why the two are kept apart.
+ */
 export const STATE_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   blackboardPost,
   blackboardRead,
@@ -1915,5 +2085,29 @@ export const STATE_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   stateImport,
 ]);
 
+/**
+ * The tools here that reach a store outside the workspace — today, one.
+ *
+ * Kept apart from {@link STATE_TOOLS} rather than folded into it: the two
+ * lists carry different promises, and a catalog registering both is saying so
+ * explicitly instead of inheriting the wrong one.
+ */
+export const VECTOR_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([vectorDelete]);
+
 export { ToolPermissionError } from "./paths";
 export { DEFAULT_STATE_DIR } from "./store";
+export {
+  MAX_VECTOR_IDS,
+  VectorTargetError,
+  _resetVectorTarget,
+  countIsIndicative,
+  getVectorTarget,
+  parseChunkId,
+  registerVectorTarget,
+  selectVectorIds,
+  type ChunkId,
+  type VectorCountConsistency,
+  type VectorDeleteTarget,
+  type VectorSelection,
+  type VectorTargetRegistration,
+} from "./vector";

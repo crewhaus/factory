@@ -10,6 +10,7 @@ Did the thing actually work.
 | `AcceptanceCheck` | is the task's definition of done met |
 | `MarkdownLinkCheck` | do these docs point at anything real |
 | `CitationLint` | does every claim have a source behind it |
+| `FactCrossCheck` | does the cited source actually say it |
 
 These are the gates between doing something and claiming it is done. Each is
 the kind of check a model performs plausibly and incompletely: it will read
@@ -57,11 +58,62 @@ re-derive them:
   filesystem and lists external ones as unchecked. A link checker that made
   requests would be a crawler, and would tell whoever is watching which
   documents are being reviewed. A link whose target is outside the workspace
-  is reported rather than followed.
-- **It does not judge quality.** Nothing scores prose, and `CitationLint`
-  checks that a source exists, never that it says what the sentence claims.
+  is reported rather than followed — including one that only leaves through a
+  symlink, because `resolve` does not follow links and `statSync` does.
+- **It does not judge quality, or truth.** Nothing here scores prose, and
+  nothing decides whether a claim is correct. `CitationLint` checks that a
+  source exists; `FactCrossCheck` checks that the source contains the words of
+  the claim citing it. Neither reads for meaning.
 - **It does not diff structurally.** `GoldenCompare` is line-based; a JSON
   document whose keys were reordered will differ. Normalize it first.
+
+## Saying it and being true are different questions
+
+`FactCrossCheck` locates a claim's words — or the exact span it puts in
+quotation marks — inside the sources cited for it. That is all it does, and
+every verdict is worded so it cannot be read as more:
+
+- **supported** — the source contains the assertion. Not that it is true.
+  When the claim puts something in quotation marks, that span is what was
+  located and the words around it are the author's framing, so `mode` reads
+  `quote` and the verdict covers the quotation alone.
+- **misquoted** — the source has a nearly identical span, but not the words
+  inside the quotation marks. The differing words are reported both ways, so
+  "we expected" for "anyone expected" is visible rather than merely flagged.
+- **polarityConflict** — every word is there and the span carrying them is
+  negated where the claim is not. This is as close to "it says the opposite"
+  as counting words can honestly get, and it is reported as something to read.
+- **notFound** — the words could not be located. This is **not** a finding
+  that the source disagrees, and not a finding that the claim is false; a
+  different tense or a different spelling of a figure lands here too, which is
+  why the words that were missing are always listed.
+- **unreadable** / **unchecked** / **noSource** — no verdict was reached,
+  with the reason named. A cited URL is unchecked, never fetched, and a source
+  that could not be opened leaves the claim undetermined rather than
+  unsupported: a claim is only reported as absent from its sources once every
+  one of them was actually read.
+
+`ok` is true only when every claim was located in a source that could be read.
+A claim nobody could check is not a claim that passed — and neither is a claim
+nobody looked at, so a run that stopped at its `limit` reports `truncated`,
+`ok: false` and how many were left over, rather than a pass covering the ones
+that fit.
+
+A citation's destination is read the way a Markdown link's is: `./report.md`
+and `./report.md#findings` name the same file, and `CitationLint` and
+`MarkdownLinkCheck` ask the same two rules — where a source is declared, and
+which file a destination names — so the three tools cannot disagree about what
+a marker has behind it. The fragment itself is not honoured: narrowing the
+search to one section would decide which span of a source a claim is allowed
+to be in, and getting that wrong reports a source that does say the thing as
+one that does not.
+
+Two rules inside the matcher are narrow on purpose, because the generous
+version of each would manufacture support. Only an unambiguous thousands
+grouping is collapsed (`1,200,000` is `1200000`; `1.200` is left alone,
+because a dot is a decimal point in one locale and a group separator in
+another). And the only word-ending rule is a plural `s`, never stemming —
+"completed" does not answer for "complete".
 
 `GoldenUpdate` is the only tool here that writes. It overwrites a reviewed
 baseline, so it is destructive and justification-gated, and it writes through

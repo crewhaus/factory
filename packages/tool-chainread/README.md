@@ -11,6 +11,7 @@ What the chain actually recorded, read over a public RPC endpoint you name.
 | `EvmWaitForReceipt` | did it land, did it revert, or is it still pending |
 | `EvmTransactionSummary` | what did this transaction actually move |
 | `EvmEventScan` | every log matching this filter over this range |
+| `OnchainTransactionsSync` | this address's history, as the rows a reconciler already reads |
 
 `@crewhaus/tool-onchain` next door does the arithmetic offline — calldata, digests,
 checksums, token units. This package is the half that dials.
@@ -18,7 +19,7 @@ checksums, token units. This package is the half that dials.
 ## Nothing here signs or sends
 
 No schema accepts a private key, a mnemonic, a keystore or a signed payload, and no
-code path can reach `eth_sendRawTransaction`. That is not a promise about the seven
+code path can reach `eth_sendRawTransaction`. That is not a promise about the
 call sites: **every** method name goes through `assertReadOnlyMethod` from
 `@crewhaus/chain-adapter-base` — the same allow-list the chain adapters use — before a
 socket is opened, so a write method throws inside the transport whatever asks for it.
@@ -134,6 +135,104 @@ different hashes, which is the chain reorganising mid-scan.
 The range is resolved to numbers before the first query, so `toBlock: "latest"` is
 pinned once; a scan whose upper bound keeps moving is not one anybody can call
 complete. `confirmations` keeps the whole range behind the head by that many blocks.
+
+## `OnchainTransactionsSync` borrows the row shape rather than inventing one
+
+The rows it returns are `@crewhaus/tool-money`'s `Transaction` — the same shape
+`StatementParse` produces and `LedgerReconcile` consumes — imported, not
+re-declared. A second declaration of it is a shape that drifts the first time a
+field is added, and an onchain history that cannot be matched against a bank
+statement is the whole point of the tool gone.
+
+That shape has one field this package would never have written: `amountMinor` is
+a JS `number`. A uint256 is not, and `Number.MAX_SAFE_INTEGER` is about nine
+thousandths of one coin in wei — so a plain payment does not fit in the field at
+all. Nothing is rounded to make it. A movement that cannot be written exactly is
+**parked**, in an `unrepresentable` list, with the raw amount and the reason:
+
+| Reason | What it means |
+|---|---|
+| `exceedsSafeInteger` | the amount is past what the row's number field holds. Name the asset's `decimals` and the ledger's `minorUnitDecimals` and it scales into range |
+| `belowMinorUnit` | 1.234567 USDC against a ledger kept in cents. No rounding of it is the amount that moved |
+| `timestampOutOfRange` | the block's timestamp is past what a calendar date can express, so the row has no date |
+| `undecodable` | a log carrying the Transfer topic without a Transfer's topics |
+
+The exact uint256 also travels beside every row it *did* fit, in `detail`, keyed
+by the row's id. A reconciler reads `rows`; an auditor reads `detail`.
+
+### Three sources, and the ones there are not
+
+A public endpoint has no index by address, so a history has to be reconstructed:
+
+1. **Logged token transfers**, from `eth_getLogs` with the address in the from
+   or the to topic position — two scans, merged and deduped. Paged by the same
+   `scanLogs` that `EvmEventScan` uses, so the silent-truncation proof, the
+   reorg check and the refusal-rather-than-a-prefix behaviour are the tested
+   ones and not a second implementation of them.
+2. **Native value and gas**, by hydrating every block in the range and picking
+   out the transactions this address was a party to. That is one request per
+   block, so the range is bounded by `maxHydratedBlocks` and a range past it is
+   a **refusal** — returning the token rows alone and calling it a history would
+   leave every coin payment out of a statement that says it is complete.
+3. Nothing else, and the output says so rather than the docs alone:
+   **internal native transfers** need a trace, **ERC-1155** puts its parties in
+   topic positions this filter does not look at and its batch amounts in data no
+   filter reaches, and **token metadata** is never read off a token contract —
+   an airdrop whose `decimals()` returns 2 turns dust into a five-figure row, so
+   decimals arrive from the caller or the raw base units are used unchanged.
+
+`tokens` is an allow-list, and it is applied twice: in the `eth_getLogs` filter,
+so an airdrop is never fetched, and again against the logs that come back. A
+filter is a request, not a proof — an endpoint that ignores it answers with every
+token that ever touched the wallet, and those rows would land in a
+reconciliation under a `coverage` line saying they were never scanned for.
+
+The block path has its own version of the truncation trap. An endpoint that
+ignores `fullTransactions: true` answers with a list of hashes; filtering hashes
+on `from` matches nothing, and that empty result is indistinguishable from a
+block this wallet was never in. It is refused by name.
+
+### What the blocks held, checked against the nonce
+
+A block is one response and cannot be re-asked in halves, so the split-and-
+compare proof the log scan uses has nothing to work with here. The account's own
+nonce is the oracle instead: it rises once per transaction sent, so its rise
+across the range is how many of them those blocks must contain.
+
+Fewer is a **refusal** — each one missed is a fee row and possibly a payment.
+More is not: a rollup's system and deposit transactions appear in blocks without
+raising an ordinary nonce, and nothing is missing in that direction. A pruned
+endpoint that will not serve a historical nonce leaves the check unrun, and
+`sentProof` says `unproved` with the reason rather than reporting a completeness
+nothing established. What the address *received* has no such oracle at all, and
+`coverage.nativeTransfers` says so in the output.
+
+### The things that double-count
+
+**Gas is charged once per transaction.** A wallet can appear in a dozen logs of
+one swap, and a fee attributed per log charges the gas a dozen times — the
+reconciliation is then off by exactly that. Fee rows come only from the block
+path, keyed on the transaction, so it cannot happen.
+
+**A reverted transaction moved nothing.** Its value transfer is discarded with
+the rest of its state changes and only the fee is charged, so a receipt is read
+for every matching transaction — for the status as much as for the fee. A mined
+transaction whose receipt this endpoint does not have is a refusal, because
+booking the movement either way is a guess.
+
+**A transfer to oneself is not a row.** It changes no balance; one row would be
+a debit that never happened.
+
+### The cursor names where it stopped
+
+`cursor.nextFromBlock` is the pinned upper bound plus one — not the head at the
+end of the run, which has moved, and a cursor set from it skips every block
+mined while the sync ran. `confirmations` keeps the whole range behind the head.
+
+Dates are UTC calendar dates, because a block timestamp is UTC and nothing on
+the chain knows the ledger's timezone. `balanceMinor` is always `null`: there is
+no opening balance here to run one from, and a computed one is a number a
+reconciliation would trust.
 
 ## `EvmRpcHealth` says unknown when it means unknown
 

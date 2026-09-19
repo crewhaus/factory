@@ -40,8 +40,9 @@
  * cookie jar, and no certificate handling beyond the runtime's own.
  */
 import { Buffer } from "node:buffer";
-import { lookup as dnsLookup } from "node:dns/promises";
+import { lookup as dnsLookup, resolveTxt } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import { joinTxtChunks, normalizeDomain } from "./lib/dns-records";
 
 /** Refusal by the allow-list, the SSRF gate, or a redirect rule. */
 export class NotifyPermissionError extends CrewhausError {
@@ -113,6 +114,18 @@ export type NotifyConfig = {
   readonly allowedRecipients: readonly string[];
   /** SMTP hosts the client may dial. Empty denies every one. */
   readonly allowedSmtpHosts: ReadonlySet<string>;
+  /**
+   * Domains this harness may ask public DNS about, canonicalised. Empty
+   * denies every one, which makes `DeliverabilityCheck` unusable until an
+   * operator says which domains are theirs.
+   *
+   * A DNS query is not an HTTP request and so does not pass through the
+   * origin allow-list — but the name queried is still chosen by the caller
+   * and still leaves the machine, which is the shape of an exfiltration
+   * channel. This is the gate for that surface, and it is fail-closed like
+   * every other one here.
+   */
+  readonly allowedSenderDomains: ReadonlySet<string>;
   /** Named REST providers for SMS, push and delivery lookups. */
   readonly providers: ReadonlyMap<string, ProviderProfile>;
 };
@@ -124,6 +137,8 @@ export type NotifyConfigInput = {
   readonly allowedRecipients?: readonly string[];
   readonly allowed_smtp_hosts?: readonly string[];
   readonly allowedSmtpHosts?: readonly string[];
+  readonly allowed_sender_domains?: readonly string[];
+  readonly allowedSenderDomains?: readonly string[];
   readonly providers?: Readonly<Record<string, ProviderProfile>>;
 };
 
@@ -131,6 +146,7 @@ const EMPTY_CONFIG: NotifyConfig = {
   allowedOrigins: new Set<string>(),
   allowedRecipients: [],
   allowedSmtpHosts: new Set<string>(),
+  allowedSenderDomains: new Set<string>(),
   providers: new Map<string, ProviderProfile>(),
 };
 
@@ -151,6 +167,23 @@ export function buildNotifyConfig(input: NotifyConfigInput): NotifyConfig {
     const trimmed = host.trim().toLowerCase();
     if (trimmed !== "") smtpHosts.add(trimmed);
   }
+  const senderDomains = new Set<string>();
+  for (const domain of input.allowedSenderDomains ?? input.allowed_sender_domains ?? []) {
+    if (domain.trim() === "") continue;
+    // Canonicalised by the SAME function the tool runs on its argument, so
+    // an operator writing `München.DE` and a caller writing `xn--mnchen-3ya.de`
+    // name the same domain rather than two that never match. A malformed
+    // entry throws here rather than sitting in the set matching nothing,
+    // which is how a misconfiguration surfaces at boot and not at the first
+    // lookup.
+    const normalized = normalizeDomain(domain);
+    if (!normalized.ok) {
+      throw new NotifyPermissionError(
+        `invalid entry in allowed_sender_domains: ${normalized.reason}`,
+      );
+    }
+    senderDomains.add(normalized.name);
+  }
   const providers = new Map<string, ProviderProfile>();
   for (const [name, profile] of Object.entries(input.providers ?? {})) {
     providers.set(name, profile);
@@ -159,6 +192,7 @@ export function buildNotifyConfig(input: NotifyConfigInput): NotifyConfig {
     allowedOrigins: origins,
     allowedRecipients: recipients,
     allowedSmtpHosts: smtpHosts,
+    allowedSenderDomains: senderDomains,
     providers,
   };
 }
@@ -288,6 +322,25 @@ export function assertSmtpHostAllowed(host: string, cfg: NotifyConfig): void {
 }
 
 /**
+ * Refuse a domain no operator named. Empty list ⇒ refuse everything.
+ *
+ * `domain` must ALREADY be the canonical form — the caller normalises once
+ * and then uses that one value for the gate, for the names it derives and
+ * for what it reports, so there is no spelling that passes the check and a
+ * different one that reaches the resolver.
+ */
+export function assertSenderDomainAllowed(domain: string, cfg: NotifyConfig): void {
+  if (cfg.allowedSenderDomains.size === 0) {
+    throw new NotifyPermissionError(
+      `denied: "${domain}" is not in allowed_sender_domains (empty allow-list = deny all). An operator lists the domains this harness may ask public DNS about`,
+    );
+  }
+  if (!cfg.allowedSenderDomains.has(domain)) {
+    throw new NotifyPermissionError(`denied: "${domain}" is not in allowed_sender_domains`);
+  }
+}
+
+/**
  * Does `address` match an allow-list entry?
  *
  * An entry is either a whole address or `*@domain`. A bare domain is NOT
@@ -326,6 +379,137 @@ let dnsLookupFn: DnsLookupFn = defaultDnsLookup;
 /** Test-only resolver injection, as in `@crewhaus/tool-http`. */
 export function _setDnsLookup(fn: DnsLookupFn | undefined): void {
   dnsLookupFn = fn ?? defaultDnsLookup;
+}
+
+// ---------------------------------------------------------------------------
+// TXT lookups
+// ---------------------------------------------------------------------------
+
+/**
+ * Every TXT record at a name, each still split into the character-strings
+ * DNS carried it in. The joining rule belongs to the parser, not here, so
+ * the seam a test injects hands back exactly what a resolver hands back.
+ */
+export type DnsTxtFn = (name: string) => Promise<ReadonlyArray<ReadonlyArray<string>>>;
+
+const defaultDnsTxt: DnsTxtFn = (name) => resolveTxt(name);
+let dnsTxtFn: DnsTxtFn = defaultDnsTxt;
+
+/** Test-only resolver injection. No test in this package may reach real DNS. */
+export function _setDnsTxtResolver(fn: DnsTxtFn | undefined): void {
+  dnsTxtFn = fn ?? defaultDnsTxt;
+}
+
+/**
+ * What a TXT lookup found — with "nothing is published" and "the question
+ * could not be answered" kept apart.
+ *
+ * This is the whole reason the type has four arms rather than returning
+ * `string[]`. "No SPF record" is a finding about a domain; "the resolver
+ * returned SERVFAIL" is a finding about the lookup, and reporting the second
+ * as the first tells somebody their DNS is fine when nobody asked it
+ * anything.
+ */
+export type TxtAnswer =
+  | { readonly outcome: "records"; readonly records: readonly string[] }
+  /** The name exists and publishes no TXT record. */
+  | { readonly outcome: "none" }
+  /** The name does not exist at all. */
+  | { readonly outcome: "nxdomain" }
+  | { readonly outcome: "unknown"; readonly reason: string };
+
+/**
+ * What this package will read back from a name, and report.
+ *
+ * A DKIM key at 4096 bits is about 800 characters, so these are generous;
+ * what they stop is an answer nobody can use ending up in a transcript, a
+ * trace and an eval report. The bound is on what is REPORTED — the resolver
+ * has already buffered whatever it received by the time this sees it, which
+ * is the one place in this package where a cap cannot come first.
+ */
+const MAX_TXT_RECORDS = 32;
+const MAX_TXT_RECORD_CHARS = 8192;
+
+/**
+ * Race a lookup against the call's deadline.
+ *
+ * `dns.promises` takes no signal, so the deadline is applied here instead.
+ * The losing lookup is left to finish on its own — its rejection is already
+ * attached below, so it cannot surface later as an unhandled one.
+ */
+function withDeadline<T>(work: Promise<T>, deadline: Deadline): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const signal = deadline.signal;
+    const fail = (): void => reject(new Error("aborted"));
+    if (signal.aborted) {
+      fail();
+      return;
+    }
+    const onAbort = (): void => fail();
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
+/**
+ * Ask for the TXT records at `name`.
+ *
+ * The two codes that ARE answers are mapped to answers: c-ares reports
+ * NXDOMAIN as `ENOTFOUND` and "the name exists but has no record of this
+ * type" as `ENODATA`, and both of those genuinely mean nothing is published.
+ * Everything else — SERVFAIL, a refused query, a timeout, a resolver that is
+ * not reachable — is `unknown` WITH the reason, because a lookup that did
+ * not happen must not read as a domain that published nothing.
+ */
+export async function lookupTxt(name: string, deadline: Deadline): Promise<TxtAnswer> {
+  let raw: ReadonlyArray<ReadonlyArray<string>>;
+  try {
+    raw = await withDeadline(dnsTxtFn(name), deadline);
+  } catch (err) {
+    if (deadline.expired()) {
+      return { outcome: "unknown", reason: `the lookup of "${name}" hit the deadline` };
+    }
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOTFOUND") return { outcome: "nxdomain" };
+    if (code === "ENODATA") return { outcome: "none" };
+    const detail = err instanceof Error ? err.message : String(err);
+    return {
+      outcome: "unknown",
+      reason: `the lookup of "${name}" failed: ${code === undefined ? detail : code}`,
+    };
+  }
+  // Answer order is not stable — a resolver may rotate records between
+  // queries — so the list is sorted before anybody reads it, and a repeated
+  // call reports the same bytes. Order WITHIN a record is untouched: an SPF
+  // record's terms are evaluated left to right and mean different things
+  // rearranged.
+  const records = raw.map((chunks) => joinTxtChunks([...chunks])).sort(byString);
+  // Over the cap is `unknown`, never a truncated record: a parser handed the
+  // first 8192 characters of an SPF record would report the `-all` it did
+  // not see as missing, which is a wrong answer where this is a missing one.
+  if (records.length > MAX_TXT_RECORDS) {
+    return {
+      outcome: "unknown",
+      reason: `"${name}" has ${records.length} TXT records, more than the ${MAX_TXT_RECORDS} this tool will read`,
+    };
+  }
+  const oversized = records.find((record) => record.length > MAX_TXT_RECORD_CHARS);
+  if (oversized !== undefined) {
+    return {
+      outcome: "unknown",
+      reason: `"${name}" has a TXT record of ${oversized.length} characters, over the ${MAX_TXT_RECORD_CHARS} this tool will read`,
+    };
+  }
+  return records.length === 0 ? { outcome: "none" } : { outcome: "records", records };
 }
 
 /**

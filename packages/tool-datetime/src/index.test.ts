@@ -7,7 +7,8 @@
  * that, each tool gets the behaviour tests that matter for it — including the
  * package's defining property, that nothing reads the clock.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { type HostZoneReading, _resetHostSeams, _setHostZone } from "./host";
 import {
   DATETIME_TOOLS,
   businessDays,
@@ -23,6 +24,7 @@ import {
   durationFormat,
   durationParse,
   isLeapYear,
+  localTime,
   quarterOf,
   recurrenceExpand,
   timestampConvert,
@@ -47,7 +49,7 @@ async function text(tool: (typeof DATETIME_TOOLS)[number], input: unknown): Prom
 
 describe("package-wide contract", () => {
   test("every tool is exported in DATETIME_TOOLS", () => {
-    expect(DATETIME_TOOLS.length).toBe(17);
+    expect(DATETIME_TOOLS.length).toBe(18);
   });
 
   test("names are unique", () => {
@@ -120,6 +122,7 @@ describe("package-wide contract", () => {
       DateRange: { start: far, end: far },
       DayOfYear: { date: far },
       IsLeapYear: { date: far },
+      LocalTime: { instant: far, timeZone: "Asia/Tokyo" },
       QuarterOf: { date: far },
       RecurrenceExpand: { rule: "FREQ=DAILY", start: far },
       TimestampConvert: { value: 8.64e15 + 1, from: "millis" },
@@ -194,6 +197,54 @@ describe("package-wide contract", () => {
         });
       }
     }
+  });
+
+  test("the host seam is the only file that reads the environment, and it reads two names", async () => {
+    // `host.ts` is the deliberate exception to the test above: `LocalTime`
+    // answers for the operator's zone, and that is a fact about the machine.
+    // The exception is kept to one file and two variable names here, so it
+    // cannot quietly widen into a clock, a home directory or a config read.
+    const source = await Bun.file(new URL("host.ts", import.meta.url)).text();
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+    const reads = [
+      ...code.matchAll(/\bprocess\s*\.\s*(\w+)\s*(?:\.\s*(\w+)|\[\s*"(\w+)"\s*\])?/g),
+    ].map((m) => `${m[1]}.${m[2] ?? m[3] ?? "*"}`);
+    // A scanner that matched nothing would pass this vacuously; assert it hit.
+    expect(reads.length).toBeGreaterThan(0);
+    expect([...new Set(reads)].sort()).toEqual(["env.NODE_ENV", "env.TZ"]);
+
+    for (const { what, pattern } of [
+      { what: "Date.now()", pattern: /Date\.now\s*\(/ },
+      { what: "new Date() with no argument", pattern: /new Date\s*\(\s*\)/ },
+      { what: "Math.random()", pattern: /Math\s*\.\s*random\s*\(/ },
+      { what: "fetch()", pattern: /(^|[^.\w])fetch\s*\(/m },
+      { what: "a node: or fs import", pattern: /from\s*["'](?:node:|fs|path|child_process)/ },
+      { what: "Bun.file or another host read", pattern: /\bBun\s*\./ },
+    ]) {
+      expect({ reaches: what, hit: pattern.test(code) }).toEqual({ reaches: what, hit: false });
+    }
+  });
+
+  test("nothing under lib/ imports the host seam — the pure core stays pure", async () => {
+    const libFiles = [
+      "lib/civil.ts",
+      "lib/parse.ts",
+      "lib/format.ts",
+      "lib/arithmetic.ts",
+      "lib/duration.ts",
+      "lib/cron.ts",
+      "lib/recurrence.ts",
+    ];
+    let scanned = 0;
+    for (const file of libFiles) {
+      const source = await Bun.file(new URL(file, import.meta.url)).text();
+      scanned += 1;
+      expect({ file, importsHost: /from\s*["']\.\.\/host["']/.test(source) }).toEqual({
+        file,
+        importsHost: false,
+      });
+    }
+    expect(scanned).toBe(libFiles.length);
   });
 });
 
@@ -937,5 +988,616 @@ describe("TimestampConvert", () => {
     expect(timestampConvert.inputSchema.safeParse({ value: 1, from: "fortnights" }).success).toBe(
       false,
     );
+  });
+});
+
+describe("LocalTime", () => {
+  // Not one test here learns anything about the machine it runs on. The zone
+  // is either injected or passed, because the alternative is a suite that
+  // takes one branch on the author's laptop (America/Los_Angeles) and another
+  // on CI (UTC) — which is the bug this tool exists to make visible.
+  afterEach(() => {
+    _resetHostSeams();
+  });
+
+  const fixture = (timeZone: string, source: "env" | "system"): HostZoneReading => ({
+    ok: true,
+    timeZone,
+    source,
+    detail: `test fixture: ${source}`,
+  });
+
+  test("with nothing injected and no zone passed it refuses, and names the gate", async () => {
+    // The hostile default: under `bun test` the un-injected read does not fall
+    // through to the real machine. A forgotten seam fails identically on every
+    // box instead of passing here and branching differently on CI.
+    const out = await run(localTime, { instant: "2026-06-15T12:00:00Z" });
+    expect(out.ok).toBe(false);
+    expect(out.zoneSource).toBe("none");
+    expect(out.reason).toContain("NODE_ENV=test");
+    expect(out.remedy).toContain("timeZone");
+    // And emphatically not a quiet UTC answer with the right shape.
+    expect(out.at).toBeUndefined();
+  });
+
+  test("the zone and where it came from travel with the answer", async () => {
+    _setHostZone({
+      ok: true,
+      timeZone: "Europe/Berlin",
+      source: "env",
+      detail: "the TZ environment variable, set to Europe/Berlin",
+      tzEnv: "Europe/Berlin",
+    });
+    const out = await run(localTime, { instant: "2026-06-15T12:00:00Z" });
+    expect(out.ok).toBe(true);
+    expect({ zone: out.zone.timeZone, source: out.zone.source, tz: out.zone.tzEnv }).toEqual({
+      zone: "Europe/Berlin",
+      source: "env",
+      tz: "Europe/Berlin",
+    });
+    expect(out.at.local).toBe("2026-06-15T14:00:00+02:00");
+  });
+
+  test("a TZ the runtime threw away is reported as the system zone, with the thrown-away value named", async () => {
+    // Recorded on bun 1.3.14: TZ="EST5EDT,M3.2.0,M11.1.0" is legal POSIX, is
+    // not an IANA id, and is silently replaced by the system zone. The
+    // operator who set it gets someone else's timezone back and cannot tell
+    // from the timestamps — so the answer has to say it.
+    _setHostZone({
+      ok: true,
+      timeZone: "America/Los_Angeles",
+      source: "system",
+      detail:
+        'the system zone (America/Los_Angeles); TZ is set to "EST5EDT,M3.2.0,M11.1.0", which is not an IANA zone this runtime knows, so the runtime ignored it',
+      tzEnv: "EST5EDT,M3.2.0,M11.1.0",
+    });
+    const out = await run(localTime, { instant: "2026-06-15T12:00:00Z" });
+    expect(out.zone.source).toBe("system");
+    expect(out.zone.tzEnv).toBe("EST5EDT,M3.2.0,M11.1.0");
+    expect(out.zone.detail).toContain("ignored it");
+  });
+
+  test("a caller-supplied zone wins and the host is not consulted at all", async () => {
+    // The injected host would fail loudly if it were read; the answer is fine,
+    // which is the proof that the override path never touches it.
+    _setHostZone({ ok: false, source: "system", reason: "the host must not be read on this path" });
+    const out = await run(localTime, {
+      instant: "2026-06-15T12:00:00Z",
+      timeZone: "Asia/Tokyo",
+    });
+    expect(out.ok).toBe(true);
+    expect({ zone: out.zone.timeZone, source: out.zone.source }).toEqual({
+      zone: "Asia/Tokyo",
+      source: "override",
+    });
+  });
+
+  test("an unreadable host zone names the reason — unreadable is not UTC", async () => {
+    _setHostZone({
+      ok: false,
+      source: "system",
+      reason: "this runtime's Intl did not resolve a default timezone",
+    });
+    const out = await run(localTime, { instant: "2026-06-15T12:00:00Z" });
+    expect(out.ok).toBe(false);
+    expect(out.zoneSource).toBe("system");
+    expect(out.reason).toContain("did not resolve");
+  });
+
+  test("a host zone this runtime cannot format with is refused, not thrown", async () => {
+    // An injected seam can hand back anything, so the zone that is about to be
+    // used is validated here rather than trusted from wherever it came.
+    _setHostZone(fixture("Mars/Olympus", "env"));
+    const out = await run(localTime, { instant: "2026-06-15T12:00:00Z" });
+    expect(out.ok).toBe(false);
+    expect(out.reason).toContain("not an IANA timezone");
+  });
+
+  test("midnight reads as hour 0 — the ICU 'hour 24' trap has no way in", async () => {
+    // `Intl` with hour12:false renders midnight as "24" on some ICU builds
+    // (durable-execution/src/schedule.ts carries the same note). Every clock
+    // field here comes from the package's own formatter over an already-parsed
+    // wall clock, so the trap cannot reach the output.
+    const out = await run(localTime, {
+      instant: "2026-06-15T04:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect(out.at.hour).toBe(0);
+    expect(out.clock).toContain("at 00:00");
+  });
+
+  test("clocks-forward is measured against the year's lowest offset, both hemispheres", async () => {
+    const july = await run(localTime, {
+      instant: "2026-07-15T12:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect(july.clocksForward.aboveLowestByMinutes).toBe(60);
+    expect(july.clocksForward.reading).toContain("clocks are forward");
+
+    const january = await run(localTime, {
+      instant: "2026-01-15T12:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect(january.clocksForward.aboveLowestByMinutes).toBe(0);
+    expect(january.clocksForward.reading).toContain("not forward");
+
+    // Sydney in January is the case a January-versus-July shortcut gets
+    // backwards: it is on its raised offset while New York is not.
+    const sydney = await run(localTime, {
+      instant: "2026-01-15T12:00:00Z",
+      timeZone: "Australia/Sydney",
+    });
+    expect(sydney.clocksForward.aboveLowestByMinutes).toBe(60);
+  });
+
+  test("a zone with no seasonal change says so, and says how far it looked", async () => {
+    const out = await run(localTime, {
+      instant: "2026-03-07T12:00:00Z",
+      timeZone: "Asia/Tokyo",
+    });
+    expect(out.clocksForward.zoneChangesOffsetInWindow).toBe(false);
+    expect(out.nextOffsetChange.found).toBe(false);
+    expect(out.nextOffsetChange.searchedDays).toBe(400);
+    expect(out.nextOffsetChange.note).toContain("400 days");
+  });
+
+  test("the next clock change is reported to the minute, with both local readings", async () => {
+    const out = await run(localTime, {
+      instant: "2026-03-07T12:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect(out.nextOffsetChange).toEqual({
+      found: true,
+      utc: "2026-03-08T07:00:00Z",
+      localBefore: "2026-03-08T01:59:59.999-05:00",
+      localAfter: "2026-03-08T03:00:00-04:00",
+      fromOffsetMinutes: -300,
+      toOffsetMinutes: -240,
+      shiftMinutes: 60,
+      direction: "forward",
+      minutesAway: 1140,
+    });
+  });
+
+  test("before-open, open, after-close and a non-working day are four answers, not two", async () => {
+    const at = async (instant: string): Promise<string> =>
+      (await run(localTime, { instant, timeZone: "Europe/Berlin" })).schedule.phase;
+    expect(await at("2026-09-16T08:00:00")).toBe("before-open");
+    expect(await at("2026-09-16T12:00:00")).toBe("open");
+    expect(await at("2026-09-16T18:00:00")).toBe("after-close");
+    expect(await at("2026-09-19T12:00:00")).toBe("non-working-day");
+  });
+
+  test("inside the window it says when it closes, not when it next opens", async () => {
+    const out = await run(localTime, {
+      instant: "2026-09-16T12:00:00",
+      timeZone: "Europe/Berlin",
+    });
+    expect(out.schedule.closesAt.local).toBe("2026-09-16T17:00:00+02:00");
+    expect(out.schedule.closesAt.minutesFromHere).toBe(300);
+    expect(out.schedule.nextOpen).toBeUndefined();
+  });
+
+  test("after close on a Friday the next window opens on Monday", async () => {
+    const out = await run(localTime, {
+      instant: "2026-09-18T18:00:00",
+      timeZone: "Europe/Berlin",
+    });
+    expect(out.schedule.nextOpen.local).toBe("2026-09-21T09:00:00+02:00");
+    expect(out.schedule.nextOpen.minutesFromHere).toBe(3780);
+  });
+
+  test("a holiday on Monday moves the next window to Tuesday", async () => {
+    const out = await run(localTime, {
+      instant: "2026-09-18T18:00:00",
+      timeZone: "Europe/Berlin",
+      holidays: ["2026-09-21"],
+    });
+    expect(out.schedule.holidaysConsidered).toBe(1);
+    expect(out.schedule.nextOpen.local).toBe("2026-09-22T09:00:00+02:00");
+  });
+
+  test("a weekend of 'none' makes Saturday a working day", async () => {
+    const out = await run(localTime, {
+      instant: "2026-09-19T12:00:00",
+      timeZone: "Europe/Berlin",
+      weekend: "none",
+    });
+    expect({ working: out.schedule.isWorkingDay, phase: out.schedule.phase }).toEqual({
+      working: true,
+      phase: "open",
+    });
+  });
+
+  test("a window that opens inside a spring-forward gap says so rather than shifting quietly", async () => {
+    // Havana springs forward at midnight, so 00:00 on 8 March 2026 is a wall
+    // clock that does not exist. A shift starting at midnight there has to be
+    // told, not silently moved to 01:00.
+    const out = await run(localTime, {
+      instant: "2026-03-07T20:00:00",
+      timeZone: "America/Havana",
+      businessHours: { start: "00:00", end: "08:00" },
+      weekend: "none",
+    });
+    expect(out.schedule.phase).toBe("after-close");
+    expect(out.schedule.nextOpen.wallClockResolution).toBe("nonexistent");
+    expect(out.schedule.nextOpen.resolutionNote).toContain("sprang forward");
+    expect(out.schedule.nextOpen.local).toBe("2026-03-08T01:00:00-04:00");
+  });
+
+  test("a working window past the end of the calendar is a reason, not a fabricated date", async () => {
+    // 275760-09-13 is the last instant a date can hold. The next working
+    // window after it is two days later, which nothing can represent — and
+    // `isoFromEpochMs` is pure arithmetic, so it would have rendered that
+    // without complaint. Found by walking the boundary, not by review.
+    const out = await run(localTime, { instant: "275760-09-13T00:00:00Z", timeZone: "UTC" });
+    expect(out.ok).toBe(true);
+    expect(out.schedule.nextOpen.determined).toBe(false);
+    expect(out.schedule.nextOpen.reason).toContain("representable range");
+    expect(out.schedule.nextOpen.local).toBeUndefined();
+  });
+
+  test("an overnight window is refused by name, not wrapped around midnight", async () => {
+    const out = await text(localTime, {
+      instant: "2026-09-16T12:00:00",
+      timeZone: "Europe/Berlin",
+      businessHours: { start: "22:00", end: "06:00" },
+    });
+    expect(out).toContain("overnight window is not supported");
+  });
+
+  test("a business hour that is not HH:MM names the field and the spelling wanted", async () => {
+    for (const bad of [
+      { start: "9am", end: "17:00" },
+      { start: "09:00", end: "24:00" },
+    ]) {
+      const out = await text(localTime, {
+        instant: "2026-09-16T12:00:00",
+        timeZone: "Europe/Berlin",
+        businessHours: bad,
+      });
+      expect({ bad, says: /must be written HH:MM/.test(out) }).toEqual({ bad, says: true });
+    }
+  });
+
+  test("every weekday marked as weekend is refused rather than searched forever", async () => {
+    expect(
+      await text(localTime, {
+        instant: "2026-09-16T12:00:00",
+        timeZone: "Europe/Berlin",
+        weekend: [0, 1, 2, 3, 4, 5, 6],
+      }),
+    ).toContain("no working window");
+  });
+
+  test("the cron block runs on the operator's clock across a DST boundary", async () => {
+    const out = await run(localTime, {
+      instant: "2026-03-07T12:00:00Z",
+      timeZone: "America/New_York",
+      cron: "0 9 * * *",
+      cronCount: 2,
+    });
+    expect(out.cron.firings.map((f: { local: string }) => f.local)).toEqual([
+      "2026-03-07T09:00:00-05:00",
+      "2026-03-08T09:00:00-04:00",
+    ]);
+    // 23 hours apart in real time, because the clocks moved between them.
+    expect(out.cron.firings[1].minutesAway - out.cron.firings[0].minutesAway).toBe(23 * 60);
+  });
+
+  test("a bad cron expression is a readable result, not an exception", async () => {
+    const out = await run(localTime, {
+      instant: "2026-03-07T12:00:00Z",
+      timeZone: "America/New_York",
+      cron: "not a cron",
+    });
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("cron:");
+  });
+
+  test("the same instant elsewhere carries the difference and whether the date has turned", async () => {
+    const out = await run(localTime, {
+      instant: "2026-03-07T20:30:00Z",
+      timeZone: "America/New_York",
+      compareTimeZones: ["Asia/Tokyo", "Europe/Berlin"],
+    });
+    expect(out.elsewhere[0]).toEqual({
+      timeZone: "Asia/Tokyo",
+      local: "2026-03-08T05:30:00+09:00",
+      offset: "+09:00",
+      offsetMinutes: 540,
+      abbreviation: "GMT+9",
+      differenceMinutes: 840,
+      differenceHours: 14,
+      sameCalendarDay: false,
+    });
+    expect(out.elsewhere[1].sameCalendarDay).toBe(true);
+  });
+
+  test("an unknown zone in compareTimeZones is named, not skipped", async () => {
+    expect(
+      await text(localTime, {
+        instant: "2026-03-07T20:30:00Z",
+        timeZone: "America/New_York",
+        compareTimeZones: ["Asia/Tokyo", "Mars/Olympus"],
+      }),
+    ).toContain("not an IANA timezone");
+  });
+
+  test("the schema rejects a missing instant, too many zones and a zero cron count", () => {
+    expect(localTime.inputSchema.safeParse({}).success).toBe(false);
+    expect(localTime.inputSchema.safeParse({ instant: "" }).success).toBe(false);
+    expect(
+      localTime.inputSchema.safeParse({
+        instant: "2026-01-01",
+        compareTimeZones: Array.from({ length: 13 }, () => "UTC"),
+      }).success,
+    ).toBe(false);
+    expect(localTime.inputSchema.safeParse({ instant: "2026-01-01", cronCount: 0 }).success).toBe(
+      false,
+    );
+  });
+
+  // ── the answers a fall-back repeat used to get wrong ──────────────────────
+  // New York falls back on 2026-11-01 at 06:00Z: 02:00 EDT becomes 01:00 EST,
+  // so every wall clock from 01:00 to 01:59 happens twice. `resolveWallClock`
+  // returns the earlier of the two by the package's rule, which is right for
+  // reading a timestamp and wrong for "when does the window open/close" — at
+  // 01:30 EST, the second pass, the earlier instant has already gone by.
+
+  test("a window closing inside a fall-back repeat closes ahead of here, not behind it", async () => {
+    const out = await run(localTime, {
+      // 06:30Z is 01:30 EST — the SECOND pass of that clock.
+      instant: "2026-11-01T06:30:00Z",
+      timeZone: "America/New_York",
+      weekend: "none",
+      businessHours: { start: "01:00", end: "01:45" },
+    });
+    expect(out.schedule.phase).toBe("open");
+    expect(out.schedule.closesAt.utc).toBe("2026-11-01T06:45:00Z");
+    expect(out.schedule.closesAt.minutesFromHere).toBe(15);
+    expect(out.schedule.closesAt.wallClockResolution).toBe("ambiguous");
+    expect(out.schedule.closesAt.resolutionNote).toContain("second one is used");
+  });
+
+  test("a window opening inside a fall-back repeat opens ahead of here too", async () => {
+    const out = await run(localTime, {
+      // 06:05Z is 01:05 EST, five minutes into the repeated hour's second pass.
+      instant: "2026-11-01T06:05:00Z",
+      timeZone: "America/New_York",
+      weekend: "none",
+      businessHours: { start: "01:30", end: "23:00" },
+    });
+    expect(out.schedule.phase).toBe("before-open");
+    expect(out.schedule.nextOpen.utc).toBe("2026-11-01T06:30:00Z");
+    expect(out.schedule.nextOpen.minutesFromHere).toBe(25);
+  });
+
+  test("the first pass of a repeated hour still takes the first instant", async () => {
+    // The fix must not reach cases it was not for: at 01:30 EDT — the first
+    // pass — the 01:45 close is the EDT one, fifteen minutes away, and the
+    // note still says the earlier instant was used.
+    const out = await run(localTime, {
+      instant: "2026-11-01T05:30:00Z",
+      timeZone: "America/New_York",
+      weekend: "none",
+      businessHours: { start: "01:00", end: "01:45" },
+    });
+    expect(out.schedule.closesAt.utc).toBe("2026-11-01T05:45:00Z");
+    expect(out.schedule.closesAt.minutesFromHere).toBe(15);
+    expect(out.schedule.closesAt.resolutionNote).toContain("earlier instant is used");
+  });
+
+  test("no working window this tool reports is ever already in the past", async () => {
+    // The property behind the two tests above, stated once across the whole
+    // of a fall-back morning rather than at the two instants that happened
+    // to break. Each call probes a year of offsets through Intl, so the
+    // budget is generous: CI is a loaded two-core box, and the cost here is
+    // 60 tool calls, not a stopwatch reading.
+    for (const zone of ["America/New_York", "America/Havana", "Australia/Lord_Howe"]) {
+      for (let minutes = 0; minutes <= 285; minutes += 15) {
+        const instant = new Date(Date.UTC(2026, 10, 1, 4, 0) + minutes * 60_000).toISOString();
+        const out = await run(localTime, {
+          instant,
+          timeZone: zone,
+          weekend: "none",
+          businessHours: { start: "00:30", end: "23:30" },
+        });
+        const window = out.schedule.closesAt ?? out.schedule.nextOpen;
+        if (window.determined === false) continue;
+        expect({ zone, instant, ahead: window.minutesFromHere >= 0 }).toEqual({
+          zone,
+          instant,
+          ahead: true,
+        });
+      }
+    }
+  }, 30_000);
+
+  // ── a morning that is not a working morning ───────────────────────────────
+
+  test("a Saturday morning opens on Monday, not at nine o'clock that Saturday", async () => {
+    // Before the window's start hour on a day that is not worked at all: the
+    // "today, at opening time" shortcut only applies when today is a working
+    // day, and nothing else in this file was early enough in the day to tell.
+    const out = await run(localTime, {
+      instant: "2026-09-19T08:00:00",
+      timeZone: "Europe/Berlin",
+    });
+    expect(out.schedule.phase).toBe("non-working-day");
+    expect(out.schedule.nextOpen.local).toBe("2026-09-21T09:00:00+02:00");
+  });
+
+  test("a holiday morning opens on the next working day, not later the same morning", async () => {
+    const out = await run(localTime, {
+      instant: "2026-09-21T08:00:00",
+      timeZone: "Europe/Berlin",
+      holidays: ["2026-09-21"],
+    });
+    expect(out.schedule.nextOpen.local).toBe("2026-09-22T09:00:00+02:00");
+  });
+
+  test("the window is closed at its closing minute, not still open", async () => {
+    const phase = async (instant: string): Promise<string> =>
+      (await run(localTime, { instant, timeZone: "Europe/Berlin" })).schedule.phase;
+    expect(await phase("2026-09-16T16:59:00")).toBe("open");
+    expect(await phase("2026-09-16T17:00:00")).toBe("after-close");
+    // And the opening minute is inside it, so the two boundaries are not the
+    // same rule written twice.
+    expect(await phase("2026-09-16T08:59:00")).toBe("before-open");
+    expect(await phase("2026-09-16T09:00:00")).toBe("open");
+  });
+
+  test("a window that starts and ends at the same minute is refused, not silently empty", async () => {
+    // Zero minutes long is not a working window; accepting it would make
+    // `phase` unable to return "open" while nothing said why.
+    const out = await text(localTime, {
+      instant: "2026-09-16T12:00:00",
+      timeZone: "Europe/Berlin",
+      businessHours: { start: "09:00", end: "09:00" },
+    });
+    expect(out).toContain("must be later in the day");
+  });
+
+  test("the default window says it is the default, and a supplied one says that", async () => {
+    const byDefault = await run(localTime, {
+      instant: "2026-09-16T12:00:00",
+      timeZone: "Europe/Berlin",
+    });
+    expect(byDefault.schedule.businessHours).toEqual({
+      start: "09:00",
+      end: "17:00",
+      source: "default 09:00-17:00",
+    });
+    const supplied = await run(localTime, {
+      instant: "2026-09-16T12:00:00",
+      timeZone: "Europe/Berlin",
+      businessHours: { start: "08:30", end: "16:30" },
+    });
+    expect(supplied.schedule.businessHours).toEqual({
+      start: "08:30",
+      end: "16:30",
+      source: "caller-supplied",
+    });
+  });
+
+  test("a holiday is the calendar date in the answering zone, as it is for BusinessDays", async () => {
+    // 01:00 on Monday in Berlin is still Sunday in UTC. Reading the holiday
+    // list in the wrong zone would move this one off the Monday it names and
+    // leave Monday worked — and would quietly disagree with BusinessDays,
+    // which the README promises it cannot.
+    const holiday = "2026-09-21T01:00:00+02:00";
+    const out = await run(localTime, {
+      instant: "2026-09-18T18:00:00",
+      timeZone: "Europe/Berlin",
+      holidays: [holiday],
+    });
+    expect(out.schedule.nextOpen.local).toBe("2026-09-22T09:00:00+02:00");
+    const viaBusinessDays = await run(businessDays, {
+      mode: "add",
+      start: "2026-09-18",
+      days: 1,
+      holidays: [holiday],
+      timeZone: "Europe/Berlin",
+    });
+    expect(viaBusinessDays.result).toBe("2026-09-22");
+  });
+
+  test("holidaysConsidered counts what BusinessDays counts under that name", async () => {
+    // Same field name in two tools documented to share a calendar. One of them
+    // counting entries while the other counted distinct days is exactly how a
+    // shared rule becomes two rules.
+    const input = {
+      holidays: ["2026-09-21", "2026-09-21T10:00:00", "2026-12-25"],
+      timeZone: "Europe/Berlin",
+    };
+    const here = await run(localTime, { instant: "2026-09-18T18:00:00", ...input });
+    const there = await run(businessDays, {
+      mode: "count",
+      start: "2026-09-18",
+      end: "2026-12-31",
+      ...input,
+    });
+    expect(here.schedule.holidaysConsidered).toBe(there.holidaysConsidered);
+    expect(here.schedule.holidaysConsidered).toBe(3);
+  });
+
+  // ── what the clocks-forward reading may and may not claim ─────────────────
+
+  test("a fall-back is reported as a step back, with a negative shift", async () => {
+    // The spring-forward case is covered above; without this one the direction
+    // and the sign of the shift could both be constants and nothing would say.
+    const out = await run(localTime, {
+      instant: "2026-10-30T12:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect({
+      direction: out.nextOffsetChange.direction,
+      shift: out.nextOffsetChange.shiftMinutes,
+      utc: out.nextOffsetChange.utc,
+    }).toEqual({ direction: "back", shift: -60, utc: "2026-11-01T06:00:00Z" });
+  });
+
+  test("a zone that moved its offset for good is not called a clock change", async () => {
+    // Volgograd had no DST at all in 2020: it sat on UTC+4 and dropped to
+    // UTC+3 on 27 December and stayed. "Higher than the lowest offset seen"
+    // is true and "the clocks are forward" is not, so the reading has to
+    // separate a zone that came back from one that did not.
+    const out = await run(localTime, {
+      instant: "2020-11-01T12:00:00Z",
+      timeZone: "Europe/Volgograd",
+    });
+    expect(out.clocksForward.offsetChangesInWindow).toBe(1);
+    expect(out.clocksForward.wentBackDown).toBe(false);
+    expect(out.clocksForward.reading).toContain("redefining its offset");
+    expect(out.clocksForward.reading).not.toContain("the clocks are forward");
+    // New York in July is the case that may say it.
+    const newYork = await run(localTime, {
+      instant: "2026-07-15T12:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect({
+      changes: newYork.clocksForward.offsetChangesInWindow,
+      back: newYork.clocksForward.wentBackDown,
+    }).toEqual({ changes: 2, back: true });
+    expect(newYork.clocksForward.reading).toContain("the clocks are forward");
+  });
+
+  test("a window the calendar cut short says so beside the reading", async () => {
+    // At the last representable instant there is no forward half to probe, so
+    // "no seasonal clock change near this date" rests on half the evidence it
+    // claims. The claim stays; the shortfall is printed with it.
+    const out = await run(localTime, {
+      instant: "275760-09-13T00:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect(out.clocksForward.determined).toBe(true);
+    expect(out.clocksForward.window.truncated).toBe(true);
+    expect(out.clocksForward.window.truncationNote).toContain("cut this window short");
+    // An ordinary date says nothing of the sort.
+    const ordinary = await run(localTime, {
+      instant: "2026-07-15T12:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect(ordinary.clocksForward.window.truncated).toBeUndefined();
+  });
+
+  test("a cron that can never fire says why, as CronNext does", async () => {
+    // `exhausted: true` beside an empty firings list is a search that ran out,
+    // not a schedule that never fires, and the two need telling apart.
+    const out = await run(localTime, {
+      instant: "2026-03-07T12:00:00Z",
+      timeZone: "America/New_York",
+      cron: "0 0 30 2 *",
+    });
+    expect(out.cron.firings).toEqual([]);
+    expect(out.cron.exhausted).toBe(true);
+    expect(out.cron.note).toContain("can never fire");
+    const viaCronNext = await run(cronNext, {
+      expression: "0 0 30 2 *",
+      after: "2026-03-07T12:00:00Z",
+      timeZone: "America/New_York",
+    });
+    expect(out.cron.note).toBe(viaCronNext.note);
   });
 });

@@ -6,7 +6,7 @@
  * failing unit than as a failing tool call, so each of those is exercised
  * here directly and `index.test.ts` is left to test the tools.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildChatPayload,
   clampToPlatform,
@@ -15,6 +15,16 @@ import {
   renderBlocks,
 } from "./lib/blocks";
 import { buildDigest, digestToBlocks, digestToText } from "./lib/digest";
+import {
+  inspectDkimKey,
+  joinTxtChunks,
+  normalizeDomain,
+  normalizeSelector,
+  parseDkim,
+  parseDmarc,
+  parseSpf,
+  parseTagValue,
+} from "./lib/dns-records";
 import {
   addressDomain,
   boundaryFor,
@@ -28,20 +38,25 @@ import {
   formatMailbox,
   isValidAddress,
 } from "./lib/mime";
+import { draftChecks, envelopeFolding, leftoverPlaceholders, verdictFrom } from "./lib/preflight";
+import type { Check, Draft } from "./lib/preflight";
 import { parseClock, quietDecision, validateSchedule } from "./lib/quiet";
 import { rateLimitGate } from "./lib/ratelimit";
 import { formatSignatureHeader, hmacHex, signedPayload } from "./lib/sign";
 import { renderTemplate, templatePlaceholders } from "./lib/template";
 import {
+  _setDnsTxtResolver,
   assertNotSsrf,
   buildNotifyConfig,
   canonicalizeOrigin,
   expandIpv6,
   isPrivateIp,
+  lookupTxt,
   normalizeIpv4,
   recipientAllowed,
   redactorFor,
   safeUrlLabel,
+  startDeadline,
 } from "./net";
 
 describe("escapeFor", () => {
@@ -956,5 +971,481 @@ describe("the outbound gate's pure half", () => {
   test("a very short secret is left alone rather than mangling every result", () => {
     expect(redactorFor(["ab"])("a cab")).toBe("a cab");
     expect(redactorFor([undefined])("anything")).toBe("anything");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the records a sending domain publishes
+// ---------------------------------------------------------------------------
+
+/** Public keys, generated once and pinned here: a test must not spend a keygen. */
+const RSA_1024_SPKI =
+  "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDQmBxciE5J1duwFEv9tRWr1MZ6WcVHqnUbBUwcSzdvFNmTkVBn5Tnp9c4J0VfumF2TfQpQELJUlRj05q1kExYtTiSFZewbgN1rfBwiiFawkZ5IttHVAHrdXwhOo9Soykela7wk+M4Q+7MIwRVPra0uQ8HxIFgVCH5PNP8zUNJ7PQIDAQAB";
+const RSA_512_SPKI =
+  "MFwwDQYJKoZIhvcNAQEBBQADSwAwSAJBAMi0Ofl1yq89AxiTLVz8+8KInpjDA1NyhINbyotuFVJ2+yVcCasNTcpQucZlzF7rcck1k/dnGdU4baMz8HSiyu0CAwEAAQ==";
+/** RFC 8463: the raw 32-byte key, not a SubjectPublicKeyInfo. */
+const ED25519_RAW = "FyS+JtmKXhxSb3pmmVPv10Ci+qHEGllfqya+fOAnoHc=";
+
+describe("normalizeDomain", () => {
+  test("an internationalised domain becomes the A-label a resolver can be asked", () => {
+    expect(normalizeDomain("münchen.de")).toEqual({ ok: true, name: "xn--mnchen-3ya.de" });
+  });
+
+  test("case and a trailing dot do not make two different domains", () => {
+    expect(normalizeDomain("EXAMPLE.COM.")).toEqual({ ok: true, name: "example.com" });
+  });
+
+  test("the shapes domainToASCII hands back unchanged are still refused", () => {
+    // It is an IDNA converter, not a validator: each of these comes back
+    // verbatim, so the label grammar has to run on its OUTPUT.
+    for (const bad of ["a..b.com", "-bad.com", "bad-.com", "exa mple.com"]) {
+      expect({ bad, ok: normalizeDomain(bad).ok }).toEqual({ bad, ok: false });
+    }
+  });
+
+  test("an IP literal is not a domain that can publish TXT records", () => {
+    expect(normalizeDomain("1.2.3.4").ok).toBe(false);
+  });
+
+  test("a single label cannot publish SPF or DMARC", () => {
+    expect(normalizeDomain("localhost").ok).toBe(false);
+  });
+
+  test("a refusal says which of the reasons it was", () => {
+    const refusal = normalizeDomain("localhost");
+    expect(refusal.ok).toBe(false);
+    expect(refusal.ok === false ? refusal.reason : "").toContain("single label");
+  });
+});
+
+describe("normalizeSelector", () => {
+  test("a selector may carry dots, because it is a sub-domain sequence", () => {
+    expect(normalizeSelector("s1.key")).toEqual({ ok: true, name: "s1.key" });
+  });
+
+  test("a selector that is not letters, digits, hyphens and dots is refused", () => {
+    // The selector becomes part of a DNS name this package queries, so the
+    // grammar is the containment.
+    for (const bad of ["a/b", "a b", "a_b", ""]) {
+      expect({ bad, ok: normalizeSelector(bad).ok }).toEqual({ bad, ok: false });
+    }
+  });
+
+  test("a selector longer than the cap is refused rather than truncated", () => {
+    expect(normalizeSelector("a".repeat(101)).ok).toBe(false);
+  });
+});
+
+describe("joinTxtChunks", () => {
+  test("chunks join with nothing between them — a long key is ALWAYS split", () => {
+    // DNS caps a character-string at 255 octets, so an RSA key arrives in
+    // pieces. A space between them makes the key unreadable and a first-chunk
+    // read makes it look truncated; neither reads as "this is a valid key".
+    expect(joinTxtChunks(["v=DKIM1; p=AAAA", "BBBB"])).toBe("v=DKIM1; p=AAAABBBB");
+  });
+});
+
+describe("lookupTxt", () => {
+  // The resolver is injected for every test here and reset afterwards: this
+  // file must not reach real DNS, and a seam left set would leak into the
+  // next one.
+  afterEach(() => {
+    _setDnsTxtResolver(undefined);
+  });
+
+  const answer = async (records: ReadonlyArray<ReadonlyArray<string>>) => {
+    _setDnsTxtResolver(() => Promise.resolve(records));
+    const deadline = startDeadline(5_000);
+    try {
+      return await lookupTxt("example.com", deadline);
+    } finally {
+      deadline.cancel();
+    }
+  };
+
+  test("records come back sorted, whatever order the resolver rotated them into", async () => {
+    // Asserted HERE rather than only through the tool, because every parser
+    // downstream sorts its own multi-record answer — so a tool-level test
+    // stays green with this sort removed and proves nothing about it. A
+    // resolver rotating its answers must not change a byte of the result.
+    const forward = await answer([["b=second"], ["a=first"]]);
+    const reverse = await answer([["a=first"], ["b=second"]]);
+    expect(forward).toEqual({ outcome: "records", records: ["a=first", "b=second"] });
+    expect(forward).toEqual(reverse);
+  });
+
+  test("an RRset over the cap is unknown naming the cap, not the first 32 records", async () => {
+    // The same rule as the per-record cap: a caller handed 32 of 40 records
+    // and told they are all of them would read a missing SPF record where
+    // there is one. Missing is a fine answer; wrong is not.
+    const records = Array.from({ length: 33 }, (_, i) => [`x=${String(i).padStart(3, "0")}`]);
+    expect(await answer(records)).toEqual({
+      outcome: "unknown",
+      reason: '"example.com" has 33 TXT records, more than the 32 this tool will read',
+    });
+    // And exactly at the cap it still answers.
+    const atCap = await answer(records.slice(0, 32));
+    expect(atCap.outcome).toBe("records");
+  });
+
+  test("an empty answer is none, not an empty record list", async () => {
+    expect(await answer([])).toEqual({ outcome: "none" });
+  });
+});
+
+describe("parseSpf", () => {
+  test("TXT records with no SPF among them are absent, not empty", () => {
+    expect(parseSpf(["google-site-verification=abc"])).toEqual({ status: "absent" });
+  });
+
+  test("the version token is case-insensitive and needs a delimiter after it", () => {
+    expect(parseSpf(["V=SPF1 -all"]).status).toBe("found");
+    // `v=spf1extra` is not an SPF record, and treating it as one would report
+    // a policy the domain does not have.
+    expect(parseSpf(["v=spf1extra -all"])).toEqual({ status: "absent" });
+  });
+
+  test("two SPF records are their own answer, because a receiver permerrors", () => {
+    const answer = parseSpf(["v=spf1 -all", "v=spf1 ~all"]);
+    expect(answer.status).toBe("multiple");
+    expect(answer.status === "multiple" ? answer.records.length : 0).toBe(2);
+  });
+
+  test("the all qualifier is reported as written, and a bare all is +all", () => {
+    const soft = parseSpf(["v=spf1 ~all"]);
+    expect(soft.status === "found" ? soft.parsed.all : null).toBe("~all");
+    const bare = parseSpf(["v=spf1 all"]);
+    expect(bare.status === "found" ? bare.parsed.all : null).toBe("+all");
+  });
+
+  test("only the terms that cost a DNS query are counted", () => {
+    // ip4 and ip6 are free; include, a, mx, ptr and exists are not.
+    const answer = parseSpf([
+      "v=spf1 ip4:1.2.3.4 ip6:2001:db8::1 include:a.test a:b.test mx exists:c.test -all",
+    ]);
+    expect(answer.status === "found" ? answer.parsed.dnsTermsHere : -1).toBe(4);
+  });
+
+  test("redirect counts as a lookup only when there is no all to ignore it", () => {
+    const redirected = parseSpf(["v=spf1 redirect=_spf.example.com"]);
+    expect(redirected.status === "found" ? redirected.parsed.dnsTermsHere : -1).toBe(1);
+    const both = parseSpf(["v=spf1 -all redirect=_spf.example.com"]);
+    expect(both.status === "found" ? both.parsed.dnsTermsHere : -1).toBe(0);
+    expect(both.status === "found" ? both.parsed.notes.join(" ") : "").toContain(
+      "redirect is ignored when all is present",
+    );
+  });
+
+  test("a mechanism after all is reported as unreachable rather than listed as policy", () => {
+    const answer = parseSpf(["v=spf1 -all include:late.test"]);
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain(
+      "never reached",
+    );
+  });
+
+  test("a record with no all and no redirect is called out as no policy at all", () => {
+    const answer = parseSpf(["v=spf1 ip4:1.2.3.4"]);
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain("neutral");
+  });
+
+  test("a term that is not an SPF mechanism makes the record unreadable, not partly parsed", () => {
+    const answer = parseSpf(["v=spf1 include:a.test bogusmech -all"]);
+    expect(answer.status).toBe("unreadable");
+    expect(answer.status === "unreadable" ? answer.reason : "").toContain("permerror");
+  });
+
+  test("ptr is reported as deprecated, because a receiver may ignore it", () => {
+    const answer = parseSpf(["v=spf1 ptr -all"]);
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain("5.5");
+  });
+});
+
+describe("parseTagValue", () => {
+  test("whitespace around a tag and its value is not part of either", () => {
+    const parsed = parseTagValue(" v = DKIM1 ; p = abc ; ");
+    expect(parsed.ok ? parsed.tags : {}).toEqual({ v: "DKIM1", p: "abc" });
+  });
+
+  test("a repeated tag makes the record invalid rather than last-one-wins", () => {
+    const parsed = parseTagValue("v=DMARC1; p=none; p=reject");
+    expect(parsed.ok).toBe(false);
+    expect(parsed.ok === false ? parsed.reason : "").toContain("more than once");
+  });
+
+  test("a segment that is not a pair is refused rather than skipped", () => {
+    expect(parseTagValue("v=DMARC1; nonsense").ok).toBe(false);
+  });
+});
+
+describe("parseDmarc", () => {
+  test("no DMARC record and a p=none record are different answers", () => {
+    expect(parseDmarc([]).status).toBe("absent");
+    const none = parseDmarc(["v=DMARC1; p=none; rua=mailto:d@example.com"]);
+    expect(none.status === "found" ? none.parsed.policy : null).toBe("none");
+    expect(none.status === "found" ? none.parsed.notes.join(" ") : "").toContain(
+      "it reports, it does not protect",
+    );
+  });
+
+  test("v=DMARC1 has to be the FIRST tag, as RFC 7489 requires", () => {
+    expect(parseDmarc(["p=reject; v=DMARC1"]).status).toBe("absent");
+  });
+
+  test("two DMARC records mean the domain publishes none", () => {
+    const answer = parseDmarc(["v=DMARC1; p=reject", "v=DMARC1; p=none"]);
+    expect(answer.status).toBe("multiple");
+  });
+
+  test("a record with no p= is reported as one a receiver discards", () => {
+    const answer = parseDmarc(["v=DMARC1; rua=mailto:d@example.com"]);
+    expect(answer.status === "found" ? answer.parsed.policy : "x").toBe(null);
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain("no p= tag");
+  });
+
+  test("pct and sp come back as the facts they are", () => {
+    const answer = parseDmarc(["v=DMARC1; p=reject; sp=NONE; pct=20"]);
+    expect(
+      answer.status === "found"
+        ? { p: answer.parsed.policy, sp: answer.parsed.subdomainPolicy, pct: answer.parsed.percent }
+        : {},
+    ).toEqual({ p: "reject", sp: "none", pct: "20" });
+  });
+
+  test("a policy word that is not one of the three is reported, not mapped", () => {
+    const answer = parseDmarc(["v=DMARC1; p=quarantaine"]);
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain("ignores it");
+  });
+});
+
+describe("parseDkim", () => {
+  test("no record at the selector is absent", () => {
+    expect(parseDkim([]).status).toBe("absent");
+  });
+
+  test("an empty p= is a REVOKED key, which is not a missing selector", () => {
+    const answer = parseDkim(["v=DKIM1; k=rsa; p="]);
+    expect(answer.status === "found" ? answer.parsed.revoked : false).toBe(true);
+    expect(answer.status === "found" ? answer.parsed.key : "x").toBe(null);
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain("revoked");
+  });
+
+  test("an RSA key's size is read out of the key itself", () => {
+    const answer = parseDkim([`v=DKIM1; k=rsa; p=${RSA_1024_SPKI}`]);
+    expect(answer.status === "found" ? answer.parsed.key : null).toEqual({
+      kind: "rsa",
+      bits: 1024,
+    });
+  });
+
+  test("a key under the RFC 8301 floor is reported with its size", () => {
+    const answer = parseDkim([`v=DKIM1; p=${RSA_512_SPKI}`]);
+    expect(answer.status === "found" ? answer.parsed.key : null).toEqual({
+      kind: "rsa",
+      bits: 512,
+    });
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain("RFC 8301");
+  });
+
+  test("an ed25519 key is 32 raw bytes, not a SubjectPublicKeyInfo", () => {
+    const answer = parseDkim([`v=DKIM1; k=ed25519; p=${ED25519_RAW}`]);
+    expect(answer.status === "found" ? answer.parsed.key : null).toEqual({
+      kind: "ed25519",
+      bytes: 32,
+    });
+  });
+
+  test("folding whitespace inside p= is stripped, and the stripped value is what is decoded", () => {
+    const split = `${RSA_1024_SPKI.slice(0, 40)} ${RSA_1024_SPKI.slice(40)}`;
+    const answer = parseDkim([`v=DKIM1; p=${split}`]);
+    expect(answer.status === "found" ? answer.parsed.key : null).toEqual({
+      kind: "rsa",
+      bits: 1024,
+    });
+  });
+
+  test("a p= that is not base64 is unreadable — Node's decoder would have ignored the junk", () => {
+    // `Buffer.from("!!!!", "base64")` is empty rather than an error, so the
+    // grammar has to be checked before the decoder is trusted.
+    expect(inspectDkimKey("rsa", "!!!!")).toEqual({
+      kind: "unreadable",
+      reason: "the p= tag is not base64",
+    });
+  });
+
+  test("a key that is not the type the record claims is unreadable, never 'ok'", () => {
+    expect(inspectDkimKey("ed25519", RSA_1024_SPKI).kind).toBe("unreadable");
+    expect(inspectDkimKey("rsa", ED25519_RAW).kind).toBe("unreadable");
+  });
+
+  test("a version that is not DKIM1 makes the record unreadable", () => {
+    const answer = parseDkim([`v=DKIM2; p=${RSA_1024_SPKI}`]);
+    expect(answer.status).toBe("unreadable");
+  });
+
+  test("t=y is reported, because it tells receivers to ignore a failure", () => {
+    const answer = parseDkim([`v=DKIM1; t=y:s; p=${RSA_1024_SPKI}`]);
+    expect(answer.status === "found" ? answer.parsed.notes.join(" ") : "").toContain(
+      "testing mode",
+    );
+  });
+
+  test("two records at one selector are reported as two, not resolved to one", () => {
+    const answer = parseDkim([`v=DKIM1; p=${RSA_1024_SPKI}`, "v=DKIM1; p="]);
+    expect(answer.status).toBe("multiple");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the preflight rules
+// ---------------------------------------------------------------------------
+
+const DRAFT: Draft = {
+  from: { address: "ci@example.com" },
+  to: [{ address: "ops@example.com" }],
+  cc: [],
+  bcc: [],
+  replyTo: [],
+  subject: "nightly run",
+  text: "everything is fine",
+  date: "2026-09-17T09:30:00Z",
+};
+
+const row = (checks: readonly Check[], name: string): Check =>
+  checks.find((c) => c.check === name) ?? { check: name, status: "unknown", detail: "missing" };
+
+describe("preflight rules", () => {
+  test("a clean draft passes every rule it has", () => {
+    const checks = draftChecks(DRAFT);
+    expect(checks.every((c) => c.status === "pass")).toBe(true);
+    expect(verdictFrom(checks)).toBe("ready");
+  });
+
+  test("a body that is empty by accident is a failure, not a quiet success", () => {
+    // EmailSend would happily deliver this: the composer accepts an empty
+    // text part, and the recipient gets a blank message.
+    const checks = draftChecks({ ...DRAFT, text: "   \n  " });
+    expect(row(checks, "body").status).toBe("fail");
+    expect(verdictFrom(checks)).toBe("blocked");
+  });
+
+  test("an html-only message is a warning, because a text client shows nothing", () => {
+    const checks = draftChecks({ ...DRAFT, text: "", html: "<p>hi</p>" });
+    expect(row(checks, "body").status).toBe("warn");
+    expect(verdictFrom(checks)).toBe("ready");
+  });
+
+  test("no recipients at all is a failure with a reason, not an empty envelope", () => {
+    const checks = draftChecks({ ...DRAFT, to: [] });
+    expect(row(checks, "envelope").status).toBe("fail");
+    expect(row(checks, "envelope").detail).toContain("no recipients");
+  });
+
+  test("a spelling that differs only in case is NOT promised as one copy", () => {
+    // The composer's envelope is `new Set(exact addresses)`, so these two
+    // survive as two RCPT TO. Saying "one copy, not two" here — which is
+    // what a case-folded comparison key invites — is the preflight being
+    // wrong about the very send it exists to predict.
+    const checks = draftChecks({ ...DRAFT, bcc: [{ address: "OPS@example.com" }] });
+    expect(row(checks, "envelope").status).toBe("warn");
+    expect(row(checks, "envelope").detail).toContain("OPS@example.com");
+    expect(row(checks, "envelope").detail).toContain("ops@example.com");
+    expect(row(checks, "envelope").detail).toContain("2 envelope recipients");
+    expect(row(checks, "envelope").detail).not.toContain("one copy is sent, not two");
+  });
+
+  test("an IDENTICAL spelling twice IS one copy, and says so", () => {
+    const checks = draftChecks({
+      ...DRAFT,
+      bcc: [{ address: "ops@example.com" }],
+    });
+    expect(row(checks, "envelope").status).toBe("warn");
+    expect(row(checks, "envelope").detail).toContain("one copy is sent, not two");
+    // One entry, because that is what the composer's Set will hold.
+    expect(row(checks, "envelope").detail).toContain("1 envelope recipient");
+  });
+
+  test("a repeat inside one list is not described as spanning to/cc/bcc", () => {
+    const checks = draftChecks({
+      ...DRAFT,
+      to: [{ address: "ops@example.com" }, { address: "ops@example.com" }],
+    });
+    expect(row(checks, "envelope").detail).toContain("1 envelope recipient");
+  });
+
+  test("the folding counted is the composer's, not the comparison key's", () => {
+    const folding = envelopeFolding([
+      [{ address: "A@Example.com" }, { address: "a@example.com" }],
+      [{ address: "a@example.com" }],
+    ]);
+    // Two spellings of one mailbox: the composer issues two RCPT TO, and the
+    // repeat of the second spelling folds into one.
+    expect(folding).toEqual({
+      folded: ["a@example.com"],
+      variants: [["A@Example.com", "a@example.com"]],
+      envelopeSize: 2,
+    });
+  });
+
+  test("every header fault comes back at once, sorted — the composer stops at the first", () => {
+    const checks = draftChecks({
+      ...DRAFT,
+      headers: { Bcc: "sneaky@example.com", "not a name": "x" },
+      inReplyTo: "<a@b> <c@d>",
+      references: ["nobrackets@example.com"],
+    });
+    const headers = row(checks, "headers");
+    expect(headers.status).toBe("fail");
+    for (const fragment of ["Bcc", "not a name", "inReplyTo", "references"]) {
+      expect(headers.detail).toContain(fragment);
+    }
+  });
+
+  test("an unfilled placeholder is a warning naming the placeholder", () => {
+    const checks = draftChecks({ ...DRAFT, subject: "deploy of {{service}}", text: "at {{when}}" });
+    expect(row(checks, "placeholders").status).toBe("warn");
+    expect(row(checks, "placeholders").detail).toContain("{{service}}");
+    expect(row(checks, "placeholders").detail).toContain("{{when}}");
+  });
+
+  test("a date the composer cannot read is a failure naming the value", () => {
+    const checks = draftChecks({ ...DRAFT, date: "last tuesday" });
+    expect(row(checks, "date").status).toBe("fail");
+    expect(row(checks, "date").detail).toContain("last tuesday");
+  });
+
+  test("an unparseable From says there is no domain for a Message-ID either", () => {
+    const checks = draftChecks({ ...DRAFT, from: { address: "not an address" } });
+    expect(row(checks, "sender").status).toBe("fail");
+    expect(row(checks, "sender").detail).toContain("Message-ID");
+  });
+
+  test("mailboxes are compared case-insensitively and nothing is rewritten", () => {
+    const folding = envelopeFolding([
+      [{ address: "A@Example.com" }],
+      [{ address: "a@example.com" }],
+    ]);
+    // One mailbox by the comparison key, and both spellings come back
+    // untouched: the key is a comparison, never a rewrite.
+    expect(folding.variants).toEqual([["A@Example.com", "a@example.com"]]);
+    expect(folding.folded).toEqual([]);
+  });
+
+  test("leftover placeholders are collected from subject, text and html together", () => {
+    expect(
+      leftoverPlaceholders({ ...DRAFT, subject: "{{b}}", text: "{{a}}", html: "{{c}}" }),
+    ).toEqual(["a", "b", "c"]);
+  });
+
+  test("a check that could not run makes the verdict incomplete, never ready", () => {
+    // The distinction the whole result shape exists for: an unanswered
+    // question is not a passed one.
+    expect(verdictFrom([{ check: "x", status: "unknown", detail: "" }])).toBe("incomplete");
+    expect(
+      verdictFrom([
+        { check: "x", status: "unknown", detail: "" },
+        { check: "y", status: "fail", detail: "" },
+      ]),
+    ).toBe("blocked");
+    expect(verdictFrom([{ check: "x", status: "warn", detail: "" }])).toBe("ready");
   });
 });

@@ -394,6 +394,156 @@ export function zoneAbbreviation(epochMs: number, timeZone: string): string {
 }
 
 /**
+ * The offsets a zone actually used over a window around an instant.
+ *
+ * This exists because `Intl` does not expose tzdb's own DST flag, and every
+ * cheap substitute for it is wrong somewhere. Comparing January against July
+ * is backwards south of the equator. Comparing against "the zone's standard
+ * offset" only moves the question, since nothing here can name that offset
+ * either. So the honest measurement is the one taken: probe the zone across a
+ * window and report the offsets seen, letting the caller say "this instant is
+ * 60 minutes above the lowest offset this zone used in the surrounding year"
+ * — a statement about observed data, not an inference about tzdb's intent.
+ *
+ * The step is daily rather than weekly because a shift can be short: Morocco's
+ * Ramadan pause is about a month, and a weekly probe that straddles it would
+ * report a zone with no offset change at all.
+ *
+ * Returns `undefined` for an instant outside the representable range, where
+ * there is nothing to probe. Probes are clamped to that range, so a window
+ * that runs off the end is short rather than throwing.
+ */
+export interface ZoneOffsetProfile {
+  /** The offset at the instant itself. */
+  offsetMinutes: number;
+  lowestMinutes: number;
+  highestMinutes: number;
+  /** Distinct instants probed. The instant itself is counted exactly once. */
+  samples: number;
+  /**
+   * How many times one probe disagreed with the one before it.
+   *
+   * This is the field that separates a seasonal clock change from a zone
+   * rewriting its offset: a zone on DST goes up and comes back, so a window
+   * wide enough to hold both sees two or more changes, while a zone that moved
+   * once and stayed there sees exactly one. Without it `highest !== lowest` —
+   * the only other evidence here — says "the clocks are forward" about
+   * `Europe/Volgograd` in late 2020, which had no DST at all and was simply
+   * sitting on the offset it abandoned that December.
+   *
+   * On a daily grid this counts days whose offset differs from the previous
+   * day's, so two transitions less than one step apart read as one.
+   */
+  offsetChanges: number;
+  fromEpochMs: number;
+  toEpochMs: number;
+  stepDays: number;
+  /**
+   * True when the representable range cut the window short of the one asked
+   * for. A short window is a weaker reading, not a different one, so it is
+   * reported rather than silently answered over.
+   */
+  truncated: boolean;
+}
+
+export function zoneOffsetProfile(
+  epochMs: number,
+  timeZone: string,
+  halfWindowDays = 183,
+  stepDays = 1,
+): ZoneOffsetProfile | undefined {
+  if (!isRepresentableInstant(epochMs)) return undefined;
+  const clamp = (ms: number): number => Math.max(-MAX_EPOCH_MS, Math.min(MAX_EPOCH_MS, ms));
+  const step = Math.max(1, Math.trunc(stepDays)) * MS_PER_DAY;
+  const wantedFrom = epochMs - halfWindowDays * MS_PER_DAY;
+  const wantedTo = epochMs + halfWindowDays * MS_PER_DAY;
+  const from = clamp(wantedFrom);
+  const to = clamp(wantedTo);
+  const here = zoneOffsetMinutes(epochMs, timeZone);
+  let lowest = here;
+  let highest = here;
+  // The probe grid starts at `from` and steps by whole days, so it lands on
+  // `epochMs` itself whenever the window was not clamped. Counting the instant
+  // unconditionally made `samples` one higher than the number of instants
+  // actually looked at — a count offered as evidence that did not add up.
+  let samples = (epochMs - from) % step === 0 ? 0 : 1;
+  let offsetChanges = 0;
+  let previous: number | undefined;
+  for (let probe = from; probe <= to; probe += step) {
+    const offset = zoneOffsetMinutes(probe, timeZone);
+    if (offset < lowest) lowest = offset;
+    if (offset > highest) highest = offset;
+    if (previous !== undefined && offset !== previous) offsetChanges += 1;
+    previous = offset;
+    samples += 1;
+  }
+  return {
+    offsetMinutes: here,
+    lowestMinutes: lowest,
+    highestMinutes: highest,
+    samples,
+    offsetChanges,
+    fromEpochMs: from,
+    toEpochMs: to,
+    stepDays: Math.max(1, Math.trunc(stepDays)),
+    truncated: from !== wantedFrom || to !== wantedTo,
+  };
+}
+
+/** A moment a zone's UTC offset changed, and what it changed between. */
+export interface OffsetTransition {
+  epochMs: number;
+  beforeMinutes: number;
+  afterMinutes: number;
+}
+
+/**
+ * The next instant strictly after `epochMs` at which the zone's offset
+ * changes, or `undefined` when there is none inside the horizon.
+ *
+ * A daily scan finds the day, then a bisection finds the minute. Every probe
+ * is minute-aligned, because tzdb transitions are: that keeps the bisection's
+ * final interval exactly one minute wide, so the returned instant is the
+ * transition itself and not "somewhere in this second".
+ *
+ * `undefined` here means "no change within the horizon" — a zone that has
+ * abolished DST returns it, and so does a search that ran into the end of the
+ * representable range. The caller has to distinguish those from the window it
+ * asked for; this returns a fact, not a promise that the zone is stable.
+ */
+export function nextOffsetTransition(
+  epochMs: number,
+  timeZone: string,
+  horizonDays = 400,
+): OffsetTransition | undefined {
+  if (!isRepresentableInstant(epochMs)) return undefined;
+  const start = Math.floor(epochMs / MS_PER_MINUTE) * MS_PER_MINUTE;
+  const limit = Math.min(MAX_EPOCH_MS, start + horizonDays * MS_PER_DAY);
+  const base = zoneOffsetMinutes(start, timeZone);
+  let lo = start;
+  let hi: number | undefined;
+  for (let probe = start + MS_PER_DAY; probe <= limit; probe += MS_PER_DAY) {
+    if (zoneOffsetMinutes(probe, timeZone) === base) {
+      lo = probe;
+      continue;
+    }
+    hi = probe;
+    break;
+  }
+  if (hi === undefined) return undefined;
+  // Invariant: `lo` still has the base offset, `upper` does not. Both are
+  // minute-aligned and stay so, since the midpoint is floored to a minute.
+  let upper = hi;
+  while (upper - lo > MS_PER_MINUTE) {
+    const mid = lo + Math.floor((upper - lo) / 2 / MS_PER_MINUTE) * MS_PER_MINUTE;
+    if (mid === lo) break;
+    if (zoneOffsetMinutes(mid, timeZone) === base) lo = mid;
+    else upper = mid;
+  }
+  return { epochMs: upper, beforeMinutes: base, afterMinutes: zoneOffsetMinutes(upper, timeZone) };
+}
+
+/**
  * True when an instant can be represented at all. Beyond +/-8.64e15 ms `Date`
  * and `Intl` stop working, and `Intl.DateTimeFormat.formatToParts` throws a
  * bare `RangeError` rather than returning anything a caller could read — so

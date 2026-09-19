@@ -3,7 +3,7 @@
  *
  * The package-wide block is the contract the runtime relies on: the safety
  * flags, the schemas that actually reject bad input, and the one documented
- * impurity — two tools read the clock, and both take an override.
+ * impurity — three tools read the clock, and all of them take an override.
  */
 import { describe, expect, test } from "bun:test";
 import {
@@ -13,7 +13,9 @@ import {
   deadlineCheck,
   decisionTable,
   errorClassify,
+  leadAssign,
   ruleScore,
+  sequenceRun,
   stallDetect,
 } from "./index";
 
@@ -32,7 +34,7 @@ async function call<T = Record<string, unknown>>(
 
 describe("package-wide contract", () => {
   test("every tool is exported in FLOW_TOOLS", () => {
-    expect(FLOW_TOOLS.length).toBe(7);
+    expect(FLOW_TOOLS.length).toBe(9);
   });
 
   test("names are unique and PascalCase", () => {
@@ -106,7 +108,9 @@ describe("package-wide contract", () => {
         rows: [{ id: "r", when: [{ op: "exists" }], outputs: {} }],
       },
       ErrorClassify: { status: 500 },
+      LeadAssign: { value: 1, strategy: "first", owners: [{ id: "o", when: [{ op: "exists" }] }] },
       RuleScore: { value: 1, rules: [{ id: "r", when: [{ op: "exists" }], points: 1 }] },
+      SequenceRun: { value: 1, steps: [{ id: "s" }], now: 0 },
       StallDetect: { history: [{ a: "1" }] },
     };
     for (const t of FLOW_TOOLS) {
@@ -118,11 +122,16 @@ describe("package-wide contract", () => {
     }
   });
 
-  test("the two clock-reading tools accept an explicit now, so a replay is reproducible", async () => {
+  test("the clock-reading tools accept an explicit now, so a replay is reproducible", async () => {
     const a = await call(deadlineCheck, { budgetMs: 60_000, startedAt: 0, now: 30_000 });
     const b = await call(deadlineCheck, { budgetMs: 60_000, startedAt: 0, now: 30_000 });
     expect(a).toEqual(b);
     expect(a.remainingMs).toBe(30_000);
+
+    // SequenceRun joined these two when `after` gates arrived: it reads the
+    // clock only to decide whether a step is due, and the same override.
+    const plan = { value: 1, steps: [{ id: "due", after: 5_000 }], now: 1_000 };
+    expect(await call(sequenceRun, plan)).toEqual(await call(sequenceRun, plan));
   });
 });
 
@@ -292,6 +301,15 @@ describe("DeadlineCheck", () => {
       /no UTC offset/,
     );
   });
+
+  test("an epoch no date can represent is named, not left to throw an Invalid Date", async () => {
+    // The string form is caught by Date.parse; the numeric form was not, and
+    // fell through to `new Date(...).toISOString()`, whose RangeError names
+    // neither the field nor the value.
+    await expect(call(deadlineCheck, { deadline: 1e16, now: 0 })).rejects.toThrow(
+      /deadline \(10000000000000000\) is outside the range a date can represent/,
+    );
+  });
 });
 
 describe("ConsensusVote", () => {
@@ -384,5 +402,162 @@ describe("RuleScore", () => {
     };
     expect((await call(ruleScore, input)).missed).toBeUndefined();
     expect((await call(ruleScore, { ...input, includeMissed: true })).missed).toHaveLength(1);
+  });
+});
+
+describe("LeadAssign", () => {
+  const owners = [
+    {
+      id: "ana",
+      when: [
+        { path: "country", op: "equals", expected: "DE" },
+        { path: "segment", op: "equals", expected: "enterprise" },
+      ],
+    },
+    { id: "bo", when: [{ path: "country", op: "equals", expected: "DE" }] },
+  ];
+
+  test("routes a record and names the eligible owners", async () => {
+    const result = await call(leadAssign, {
+      value: { country: "DE", segment: "enterprise" },
+      strategy: "specific",
+      version: "territories-v3",
+      owners,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      assigned: true,
+      owner: "ana",
+      version: "territories-v3",
+    });
+    expect(result.eligible).toEqual(["ana", "bo"]);
+  });
+
+  test("the per-owner report is there when asked for", async () => {
+    const input = { value: { country: "FR" }, strategy: "first", owners };
+    expect((await call(leadAssign, input)).considered).toBeUndefined();
+    const loud = await call<{ considered: Array<{ id: string; reason: string }> }>(leadAssign, {
+      ...input,
+      verbose: true,
+    });
+    expect(loud.considered).toHaveLength(2);
+    expect(loud.considered[0]?.reason).not.toBe("");
+  });
+
+  test("a roster it cannot rank says so instead of guessing", async () => {
+    const result = await call(leadAssign, {
+      value: { country: "DE" },
+      strategy: "least_loaded",
+      owners: [{ id: "bo", when: [{ path: "country", op: "equals", expected: "DE" }] }],
+    });
+    expect(result).toMatchObject({ ok: false, assigned: false, owner: null });
+    expect(result.conflict).toContain("bo");
+  });
+
+  test("the rotation cursor comes back for the caller to keep", async () => {
+    const result = await call(leadAssign, {
+      value: { country: "DE" },
+      strategy: "round_robin",
+      owners,
+      cursor: 1,
+    });
+    expect(result).toMatchObject({ owner: "bo", cursor: 0 });
+  });
+
+  test("the schema requires a strategy and rejects an unknown one", () => {
+    expect(leadAssign.inputSchema.safeParse({ value: 1, owners }).success).toBe(false);
+    expect(
+      leadAssign.inputSchema.safeParse({ value: 1, strategy: "whoever", owners }).success,
+    ).toBe(false);
+  });
+
+  test("the schema rejects an owner with no conditions", () => {
+    expect(
+      leadAssign.inputSchema.safeParse({
+        value: 1,
+        strategy: "first",
+        owners: [{ id: "x", when: [] }],
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("SequenceRun", () => {
+  const steps = [
+    { id: "draft", params: { template: "intro" } },
+    { id: "review", needs: ["draft"] },
+    { id: "send", needs: ["review"], after: "2026-01-01T00:00:00Z" },
+  ];
+
+  test("hands back a plan and says what it is waiting on", async () => {
+    const result = await call(sequenceRun, {
+      value: {},
+      version: "cadence-v2",
+      steps,
+      now: "2025-12-31T00:00:00Z",
+    });
+    expect(result).toMatchObject({ version: "cadence-v2", state: "ready" });
+    expect(result.ready).toEqual([{ id: "draft", index: 0, params: { template: "intro" } }]);
+    expect(result.next).toMatchObject({ id: "draft" });
+  });
+
+  test("the params travel to the caller, because the caller is what runs the step", async () => {
+    const result = await call<{ ready: Array<{ id: string; params: unknown }> }>(sequenceRun, {
+      value: {},
+      steps,
+      completed: ["draft", "review"],
+      now: "2026-01-02T00:00:00Z",
+    });
+    expect(result.ready.map((r) => r.id)).toEqual(["send"]);
+  });
+
+  test("a step whose time has not come reports how long is left", async () => {
+    const result = await call<{ state: string; waiting: Array<{ id: string; dueInMs: number }> }>(
+      sequenceRun,
+      { value: {}, steps, completed: ["draft", "review"], now: "2025-12-31T23:59:00Z" },
+    );
+    expect(result.waiting[0]).toMatchObject({ id: "send", dueInMs: 60_000 });
+    expect(result.state).toBe("blocked");
+  });
+
+  test("a failed step's dependents can never happen, and say so", async () => {
+    const result = await call<{ unreachable: Array<{ id: string; reason: string }> }>(sequenceRun, {
+      value: {},
+      steps,
+      failed: ["draft"],
+      now: 0,
+    });
+    expect(result.unreachable.map((u) => u.id)).toEqual(["review", "send"]);
+    expect(result.unreachable[0]?.reason).toContain("draft");
+  });
+
+  test("an offset-less after is rejected rather than read as local time", async () => {
+    await expect(
+      call(sequenceRun, { value: {}, steps: [{ id: "s", after: "2026-01-01T00:00:00" }], now: 0 }),
+    ).rejects.toThrow(/no UTC offset/);
+  });
+
+  test("an after no date can represent names the step, not an Invalid Date", async () => {
+    // A plan can carry many instants; a bare RangeError from deep inside
+    // `new Date(...).toISOString()` tells the caller which of them was bad.
+    await expect(
+      call(sequenceRun, { value: {}, steps: [{ id: "s", after: 1e16 }], now: 0 }),
+    ).rejects.toThrow(/step "s" after \(10000000000000000\) is outside the range/);
+  });
+
+  test("without an explicit now it reads the real clock, like DeadlineCheck", async () => {
+    // Gated on the epoch, so this asserts only that the clock is later than
+    // 1970 — never how long anything took.
+    const result = await call(sequenceRun, { value: {}, steps: [{ id: "s", after: 0 }] });
+    expect(result.ready).toHaveLength(1);
+  });
+
+  test("the schema rejects an explicitly empty condition list", () => {
+    expect(
+      sequenceRun.inputSchema.safeParse({ value: 1, steps: [{ id: "s", when: [] }] }).success,
+    ).toBe(false);
+    expect(sequenceRun.inputSchema.safeParse({ value: 1, steps: [{ id: "s" }] }).success).toBe(
+      true,
+    );
   });
 });

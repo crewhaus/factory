@@ -1363,13 +1363,30 @@ describe("publicGate (crewhaus.control.v1 on the public port)", () => {
 
 describe("listen().close() — the drain contract (M2 review)", () => {
   /** A handler that takes `ms` to answer, standing in for a real turn. */
-  function slowServer(ms: number, closeGraceMs?: number): ReturnType<typeof createGatewayServer> {
+  /**
+   * `onStart` fires once the turn is genuinely in flight, and `onFinish` once
+   * the handler has returned.
+   *
+   * Both exist so the drain tests below can wait for a FACT instead of
+   * sleeping. "Sleep 50ms and assume the request reached the handler" is a bet
+   * on the runner, and a drain test that loses that bet closes an empty server
+   * and still passes — proving nothing at all.
+   */
+  type SlowHooks = { readonly onStart?: () => void; readonly onFinish?: () => void };
+
+  function slowServer(
+    ms: number,
+    closeGraceMs?: number,
+    hooks: SlowHooks = {},
+  ): ReturnType<typeof createGatewayServer> {
     const tenantA = buildTenant("tenant-a", { tenantsRoot: tmp });
     return createGatewayServer({
       jwtSecret: SECRET,
       tenantsRoot: tmp,
       handler: async ({ tenant }) => {
+        hooks.onStart?.();
         await Bun.sleep(ms);
+        hooks.onFinish?.();
         return { runId: "run_slow", tenantId: tenant.id };
       },
       tenantOverrides: { "tenant-a": tenantA },
@@ -1394,39 +1411,61 @@ describe("listen().close() — the drain contract (M2 review)", () => {
   }
 
   test("close() waits for an in-flight turn instead of resolving instantly", async () => {
-    const HANDLER_MS = 400;
-    const server = slowServer(HANDLER_MS);
+    // WHAT IS BEING PINNED IS AN ORDER, NOT A DURATION. The contract is that
+    // close() does not resolve while a turn is still running; how many
+    // milliseconds that takes is the runner's business. The earlier version
+    // compared stopwatch readings (closedAt >= HANDLER_MS * 0.7, and
+    // closedAt >= respondedAt - 50) and failed on a loaded CI runner while
+    // passing on every local attempt — it was measuring the machine. The
+    // order is now recorded directly and the clock is never read.
+    const order: string[] = [];
+    let started: () => void = () => undefined;
+    const inHandler = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const server = slowServer(200, undefined, {
+      onStart: () => started(),
+      onFinish: () => order.push("turn-finished"),
+    });
     const { port, close } = await server.listen(0);
-    const t0 = Date.now();
-    let respondedAt = -1;
     let body: unknown;
     const inFlight = submit(`http://127.0.0.1:${port}`).then(async (res) => {
       body = await res.json();
-      respondedAt = Date.now() - t0;
     });
-    // Let the request reach the handler, then drain underneath it.
-    await Bun.sleep(50);
+    // Wait for the turn to BE in flight rather than betting 50ms that it is.
+    await inHandler;
     await close();
-    const closedAt = Date.now() - t0;
+    order.push("close-resolved");
     await inFlight;
-    // Without the await inside close(), `closedAt` is ~50ms — the drain would
-    // call exit(0) here and the tenant's turn would die mid-flight.
-    expect(closedAt).toBeGreaterThanOrEqual(HANDLER_MS * 0.7);
-    expect(respondedAt).toBeGreaterThan(0);
-    expect(closedAt).toBeGreaterThanOrEqual(respondedAt - 50);
+    // Without the await inside closeGracefully, "close-resolved" lands first:
+    // the drain would call exit(0) there and the tenant's turn would die
+    // mid-flight.
+    expect(order).toEqual(["turn-finished", "close-resolved"]);
     expect(body).toMatchObject({ result: { runId: "run_slow" } });
   });
 
   test("close() is BOUNDED — a wedged connection cannot hold the drain open forever", async () => {
-    // graceMs 0 is the degenerate bound: force immediately. The real guarantee
-    // being pinned is that close() always returns, whatever is still attached.
-    const server = slowServer(400, 0);
+    // graceMs 0 is the degenerate bound: force immediately. The guarantee is
+    // that close() returns WITHOUT waiting for what is still attached, which
+    // is again an order rather than a duration — the old `< 200ms` bound was
+    // the same bet on the runner as the test above.
+    const order: string[] = [];
+    let started: () => void = () => undefined;
+    const inHandler = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const server = slowServer(400, 0, {
+      onStart: () => started(),
+      onFinish: () => order.push("turn-finished"),
+    });
     const { port, close } = await server.listen(0);
     const inFlight = submit(`http://127.0.0.1:${port}`).catch(() => undefined);
-    await Bun.sleep(50);
-    const t0 = Date.now();
+    await inHandler;
     await close();
-    expect(Date.now() - t0).toBeLessThan(200);
+    order.push("close-resolved");
+    // close() did not wait for the turn: it is first, and on a bound that
+    // waited it would be second.
+    expect(order[0]).toBe("close-resolved");
     await inFlight;
   });
 });
