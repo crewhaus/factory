@@ -544,7 +544,14 @@ describe("OPTIMIZABLE_PATHS ⊆ spec schema (subset-of-schema guard)", () => {
         // The concrete instance is admitted by the matcher (exact match).
         expect(isOptimizable(target, hit.path)).toBe(true);
       }
-    });
+      // DECLARED, because this one is slow by construction and bun's default
+      // is 5000ms. For each optimizable path it asks `declaring()`, which
+      // re-parses the target's fixtures until one concretizes — so the work
+      // is entries x fixtures full YAML parses, and `cli` has the most of
+      // both. It measures ~26ms here and timed out at 5708ms on a CI runner
+      // running eight package suites at once; the runner is the variable, not
+      // the code, so the deadline is declared rather than the fixture cut.
+    }, 30_000);
   }
 });
 
@@ -593,7 +600,10 @@ describe("OPTIMIZABLE_PATHS × applySpecEdits (optimizer-surface round-trip)", (
           `re-setting [${hit.path.join(", ")}] to its own value drifted the parsed spec`,
         ).toEqual([]);
       }
-    });
+      // Same shape as the guard above, and more work per entry: every path
+      // also makes an edit and diffs the result. It has the same implicit
+      // 5000ms and the same reason to declare one.
+    }, 30_000);
   }
 
   test("a wildcard entry round-trips through validatePatch too (string-indexed path)", () => {
