@@ -772,6 +772,12 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["cronList", "cronDelete"],
   },
 
+  distribution: {
+    title:
+      "Render the package manifests for a released binary, and verify a published one points at assets that exist and hash correctly",
+    tools: ["packageManifestGenerate", "packageManifestVerify"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -791,6 +797,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "registry",
       "supplychain",
       "containers",
+      "distribution",
     ],
   },
   filesystem: {

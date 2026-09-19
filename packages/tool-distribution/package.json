@@ -1,0 +1,45 @@
+{
+  "name": "@crewhaus/tool-distribution",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Deterministic release-manifest generation and verification: Homebrew, Debian, Scoop and winget for a released binary",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/single-binary-cli": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-encode": "workspace:*",
+    "@crewhaus/tool-fetch": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/tool-executor": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-distribution"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-distribution#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

@@ -408,3 +408,79 @@ ManifestVersion: 1.4.0
     );
   });
 });
+
+describe("the renderers serve a product that is not crewhaus", () => {
+  /**
+   * The goldens above prove the refactor moved no bytes for crewhaus. This
+   * proves the parameter is real rather than decorative — a `ProductIdentity`
+   * nothing exercises is a type that compiles and does nothing.
+   */
+  const OTHER: ProductIdentity = {
+    binaryName: "widgetd",
+    formulaClass: "Widgetd",
+    shortDescription: "A widget daemon",
+    license: "MIT",
+    debian: {
+      section: "net",
+      maintainer: "Widget Co <ops@widget.example>",
+      depends: "libc6 (>= 2.34)",
+      longDescription: ["Serves widgets.", "Nothing more."],
+    },
+    winget: {
+      packageIdentifier: "WidgetCo.Widgetd",
+      publisher: "Widget Co",
+      author: "Widget Co",
+      longDescription: "Serves widgets.",
+      tags: ["widgets"],
+    },
+    // No macOS note: the Rosetta/AVX caveat is a fact about Bun-compiled
+    // binaries, and this one is not.
+  };
+  const INPUTS_OTHER: ManifestInputs = {
+    version: "0.9.0",
+    homepage: "https://widget.example",
+    downloadBaseUrl: "https://widget.example/dl/0.9.0",
+    sha256: {
+      "macos-arm64": "1".repeat(64),
+      "macos-x64": "2".repeat(64),
+      "linux-arm64": "3".repeat(64),
+      "linux-x64": "4".repeat(64),
+      "windows-x64": "5".repeat(64),
+    },
+    product: OTHER,
+  };
+
+  test("homebrew takes the class, the binary name and drops an absent note", () => {
+    const out = renderHomebrewFormula(INPUTS_OTHER);
+    expect(out).toContain("class Widgetd < Formula");
+    expect(out).toContain('license "MIT"');
+    expect(out).toContain("/widgetd-macos-arm64-0.9.0");
+    expect(out).toContain('bin.install Dir["*"].first => "widgetd"');
+    // Nothing of crewhaus survives — including the AVX note, which is opt-in.
+    expect(out).not.toContain("crewhaus");
+    expect(out).not.toContain("Crewhaus");
+    expect(out).not.toContain("Rosetta");
+    // And the block it lived in is still well-formed with no comment at all.
+    expect(out).toContain("  on_macos do\n    if Hardware::CPU.physical_cpu_arm64?");
+  });
+
+  test("debian keeps the one leading space on every continuation line", () => {
+    const out = renderDebianControl(INPUTS_OTHER);
+    expect(out).toContain("Package: widgetd");
+    expect(out).toContain("Section: net");
+    // The space is the whole format. Asserting the exact two lines is the only
+    // way to catch it being dropped or doubled.
+    expect(out).toContain("Description: A widget daemon\n Serves widgets.\n Nothing more.\n");
+    expect(out).not.toContain("crewhaus");
+  });
+
+  test("scoop and winget carry the product through", () => {
+    const scoop = renderScoopManifest(INPUTS_OTHER) as Record<string, unknown>;
+    expect(scoop["bin"]).toBe("widgetd.exe");
+    expect(scoop["license"]).toBe("MIT");
+    const winget = renderWingetManifest(INPUTS_OTHER);
+    expect(winget).toContain("PackageIdentifier: WidgetCo.Widgetd");
+    expect(winget).toContain("Tags:\n  - widgets\nInstallers:");
+    expect(winget).not.toContain("crewhaus");
+  });
+});
