@@ -296,7 +296,7 @@ export const START_LOCK_MAX_AGE_MS = 120_000;
 export function startLockIsStale(
   lock: StartLock | undefined,
   probe: {
-    readonly isAlive: (pid: number) => boolean;
+    readonly isAlive: (pid: number) => boolean | undefined;
     readonly startTimeMs: (pid: number) => number | undefined;
   },
   now: number,
@@ -305,7 +305,11 @@ export function startLockIsStale(
 ): boolean {
   if (lock === undefined) return true;
   if (now - lock.at > maxAgeMs) return true;
-  if (!probe.isAlive(lock.pid)) return true;
+  // Only an explicit `false` frees the lock. An undefined probe is "the
+  // platform would not say", and treating that as death hands the slot to a
+  // second manager while the first is still running — the same reasoning the
+  // start-time check below already applies.
+  if (probe.isAlive(lock.pid) === false) return true;
   if (lock.pidStartTimeMs !== undefined) {
     const observed = probe.startTimeMs(lock.pid);
     // Unknown start time errs toward "held": refusing a start is safer than

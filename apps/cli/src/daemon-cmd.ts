@@ -1046,7 +1046,12 @@ async function daemonStatus(
   const harness = resolveHarness(args.positional[0], opts);
   const ops = opts.ops ?? createProcessOps();
   const runfile = readRunfile(harness.dir);
-  const alive = runfile !== undefined && ops.isAlive(runfile.pid);
+  const aliveness = runfile === undefined ? false : ops.isAlive(runfile.pid);
+  // A status verb reports what it observed. `undefined` means the probe did
+  // not answer, which is neither "running" nor "not running" — see the note
+  // on ProcessOps.isAlive.
+  const alive = aliveness === true;
+  const alivenessUnknown = aliveness === undefined;
   const runs = recentRuns(harness.dir, 5).reverse();
   const runClass = runClassFor(harness.target);
   let controlPort = knownControlPort(runfile?.controlPort);
@@ -1132,6 +1137,10 @@ async function daemonStatus(
   const lines: string[] = [];
   if (runfile === undefined) {
     lines.push(`${harness.specName}: not running (no runfile) · class ${runClass}`);
+  } else if (alivenessUnknown) {
+    lines.push(
+      `${harness.specName}: pid ${runfile.pid} — could not determine whether it is running · run ${runfile.runId} · since ${runfile.startedAt}`,
+    );
   } else if (alive) {
     lines.push(
       `${harness.specName}: running · pid ${runfile.pid} · run ${runfile.runId} · since ${runfile.startedAt}`,
@@ -1484,7 +1493,9 @@ async function daemonLogs(
     for (;;) {
       if (interrupted) break;
       const rf = readRunfile(harness.dir);
-      const alive = rf !== undefined && ops.isAlive(rf.pid);
+      // Only stop following on an observed exit; an unanswered probe keeps
+      // the follower attached rather than truncating a live daemon's output.
+      const alive = rf !== undefined && ops.isAlive(rf.pid) !== false;
       // Read AFTER the liveness check on the last pass too: a daemon that
       // exits mid-poll still wrote its final lines, and dropping them is how
       // a crash's last words disappear.

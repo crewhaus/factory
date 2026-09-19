@@ -458,7 +458,11 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       drainPump();
       // An ADOPTED run is not ours to await — we never held its exit
       // promise — so the pump tick doubles as its liveness poll.
-      if (adopted && pid !== undefined && !options.ops.isAlive(pid)) {
+      // `=== false` and not `!`: an undefined probe means the platform would
+      // not say, and declaring an adopted run exited on that basis ends a
+      // daemon that is still running. Keep polling instead; a real exit still
+      // reports false on the next tick.
+      if (adopted && pid !== undefined && options.ops.isAlive(pid) === false) {
         onExit(null, null);
         return;
       }
