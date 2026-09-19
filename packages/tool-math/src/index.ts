@@ -1008,6 +1008,19 @@ export { CURRENCY_MINOR_UNITS, KNOWN_CURRENCIES };
  */
 export * as statsKernel from "./lib/stats-kernel";
 
+/**
+ * The exact-decimal and minor-unit money kernels, exported as namespaces for
+ * the same reason `statsKernel` is: a package that has to do money arithmetic
+ * of its own (`@crewhaus/tool-ledger` posting a balanced entry, converting a
+ * foreign line at an fx rate, rendering an invoice total) must do it with THIS
+ * arithmetic rather than a second hand-rolled copy. Re-exporting the modules
+ * rather than flattening them keeps `decimalKernel.parseDecimal` distinct from
+ * anything a consumer already has under that name, and registers no tool —
+ * these are library calls, not model turns.
+ */
+export * as decimalKernel from "./lib/decimal";
+export * as moneyKernel from "./lib/money";
+
 /** Every tool this package registers, in the order a catalog should list them. */
 export const MATH_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   amortize,
