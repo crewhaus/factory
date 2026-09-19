@@ -266,10 +266,17 @@ test("RouteControl refuses a scoreboard whose path it cannot resolve, and does n
   const r = await callJson(routeControl, { action: "status" });
   expect(r["status"]).toBe("refused");
   expect(r["code"]).toBe("unreadable");
-  // The reason separates the three answers that a fail-closed containment
-  // check would otherwise collapse into one: absent, escaping, unresolvable.
-  expect(String(r["reason"])).toContain("could not resolve");
-  expect(String(r["reason"])).toContain("not an escape");
+  // The property is that the refusal NAMES the obstruction and rules out the
+  // benign reading — not which stage hit it. A chmod-000 file fails at
+  // realpath on macOS ("could not resolve ... not an escape") and at open on
+  // Linux ("could not be read ... not an empty scoreboard"), because the two
+  // kernels differ about resolving a path whose final component is
+  // unreadable. Pinning one phrasing tests the platform, and CI is Linux
+  // while this is usually written on macOS.
+  const reason = String(r["reason"]);
+  expect(reason).toMatch(/could not (resolve|be read|be listed)/);
+  // ...and it must not let the caller read this as "there is nothing here".
+  expect(reason).toMatch(/not an escape|not an empty/);
 });
 
 // ---------------------------------------------------------------------------
@@ -793,7 +800,10 @@ test("FlywheelStatus refuses a workflows directory it cannot resolve, and does n
   const r = await callJson(flywheelStatus, {});
   expect(r["status"]).toBe("refused");
   expect(r["code"]).toBe("unreadable");
-  expect(String(r["reason"])).toContain("could not resolve");
+  // Either stage may catch it — see the note on the RouteControl case above.
+  const reason = String(r["reason"]);
+  expect(reason).toMatch(/could not (resolve|be read|be listed)/);
+  expect(reason).toMatch(/not an escape|not an empty|not unscaffolded/);
 });
 
 test("FlywheelStatus flags the shadowing case and refuses to guess the registry fact", async () => {
@@ -996,7 +1006,10 @@ test("WatchmeReport degrades the routing half when the scoreboard path cannot be
   const r = await callJson(watchmeReport, {});
   expect(r["status"]).toBe("ok");
   expect(at(r, "routing", "read")).toBe(false);
-  expect(String(at(r, "routing", "reason"))).toContain("could not be resolved");
+  // Either stage may catch it — see the note on the RouteControl case above.
+  expect(String(at(r, "routing", "reason"))).toMatch(
+    /could not (be resolved|resolve|be read|be listed)/,
+  );
 });
 
 test("WatchmeReport can be asked not to open the routing store at all, and says which it is", async () => {
