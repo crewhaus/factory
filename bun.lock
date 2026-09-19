@@ -124,6 +124,7 @@
         "@crewhaus/tool-codehost": "workspace:*",
         "@crewhaus/tool-containers": "workspace:*",
         "@crewhaus/tool-crewhaus": "workspace:*",
+        "@crewhaus/tool-cron": "workspace:*",
         "@crewhaus/tool-data": "workspace:*",
         "@crewhaus/tool-datetime": "workspace:*",
         "@crewhaus/tool-defi": "workspace:*",
@@ -136,6 +137,8 @@
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-fsx": "workspace:*",
         "@crewhaus/tool-git": "workspace:*",
+        "@crewhaus/tool-host": "workspace:*",
+        "@crewhaus/tool-hostfs": "workspace:*",
         "@crewhaus/tool-html": "workspace:*",
         "@crewhaus/tool-http": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
@@ -160,6 +163,7 @@
         "@crewhaus/tool-retrieve": "workspace:*",
         "@crewhaus/tool-schema": "workspace:*",
         "@crewhaus/tool-screen-capture": "workspace:*",
+        "@crewhaus/tool-secrets": "workspace:*",
         "@crewhaus/tool-secure": "workspace:*",
         "@crewhaus/tool-sql": "workspace:*",
         "@crewhaus/tool-state": "workspace:*",
@@ -2284,6 +2288,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-cron": {
+      "name": "@crewhaus/tool-cron",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-datetime": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-data": {
       "name": "@crewhaus/tool-data",
       "version": "0.6.0",
@@ -2491,6 +2509,32 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/sandbox": "workspace:*",
+      },
+    },
+    "packages/tool-host": {
+      "name": "@crewhaus/tool-host",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-hostfs": {
+      "name": "@crewhaus/tool-hostfs",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-html": {
@@ -2857,6 +2901,20 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-secrets": {
+      "name": "@crewhaus/tool-secrets",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/harness-supervisor": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-secure": {
@@ -3594,6 +3652,8 @@
 
     "@crewhaus/tool-crewhaus": ["@crewhaus/tool-crewhaus@workspace:packages/tool-crewhaus"],
 
+    "@crewhaus/tool-cron": ["@crewhaus/tool-cron@workspace:packages/tool-cron"],
+
     "@crewhaus/tool-data": ["@crewhaus/tool-data@workspace:packages/tool-data"],
 
     "@crewhaus/tool-datetime": ["@crewhaus/tool-datetime@workspace:packages/tool-datetime"],
@@ -3625,6 +3685,10 @@
     "@crewhaus/tool-git": ["@crewhaus/tool-git@workspace:packages/tool-git"],
 
     "@crewhaus/tool-harness-synthesizer": ["@crewhaus/tool-harness-synthesizer@workspace:packages/tool-harness-synthesizer"],
+
+    "@crewhaus/tool-host": ["@crewhaus/tool-host@workspace:packages/tool-host"],
+
+    "@crewhaus/tool-hostfs": ["@crewhaus/tool-hostfs@workspace:packages/tool-hostfs"],
 
     "@crewhaus/tool-html": ["@crewhaus/tool-html@workspace:packages/tool-html"],
 
@@ -3685,6 +3749,8 @@
     "@crewhaus/tool-schema-sanitizer": ["@crewhaus/tool-schema-sanitizer@workspace:packages/tool-schema-sanitizer"],
 
     "@crewhaus/tool-screen-capture": ["@crewhaus/tool-screen-capture@workspace:packages/tool-screen-capture"],
+
+    "@crewhaus/tool-secrets": ["@crewhaus/tool-secrets@workspace:packages/tool-secrets"],
 
     "@crewhaus/tool-secure": ["@crewhaus/tool-secure@workspace:packages/tool-secure"],
 

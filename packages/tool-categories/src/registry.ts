@@ -748,6 +748,30 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["objectPresign"],
   },
 
+  host: {
+    title:
+      "Read-only facts about the machine a harness is running on: system, network and listening ports",
+    tools: ["systemInfo", "networkInfo", "portInspect"],
+  },
+
+  secrets: {
+    title:
+      "Resolve secret references and maintain .env files, reporting presence and provenance rather than values",
+    tools: ["secretLookup", "envFileUpsert", "secretRotate"],
+  },
+
+  hostfs: {
+    title:
+      "Host filesystem beyond read and write: watching a path, recoverable deletion and the OS file index",
+    tools: ["watchPath", "trashPath", "osIndexSearch"],
+  },
+
+  cron: {
+    title:
+      "Inspect and remove entries in the host's own scheduler: crontab, launchd and systemd timers",
+    tools: ["cronList", "cronDelete"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",
@@ -771,7 +795,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   filesystem: {
     title: "Everything that touches files: the core five plus trees, hashes, copies and archives",
-    includes: ["fs", "fsx"],
+    includes: ["fs", "fsx", "hostfs"],
   },
   memory: {
     title: "Everything a harness remembers between turns and between runs",
@@ -783,7 +807,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   safety: {
     title: "Finding and removing what must not leave the system, and proving what did not change",
-    includes: ["secure", "verify"],
+    includes: ["secure", "verify", "secrets"],
   },
   outreach: {
     title: "Everything that puts something in front of a person outside the harness",
@@ -791,7 +815,17 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   operations: {
     title: "Running and supervising harnesses: telemetry, cost, incidents, specs and fleets",
-    includes: ["obs", "crewhaus", "money", "ledger", "einvoice", "kyc", "objectstore"],
+    includes: [
+      "obs",
+      "crewhaus",
+      "money",
+      "ledger",
+      "einvoice",
+      "kyc",
+      "objectstore",
+      "host",
+      "cron",
+    ],
   },
   chain: {
     title: "Everything that touches a blockchain, offline arithmetic and live reads alike",
