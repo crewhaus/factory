@@ -3672,6 +3672,11 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     distribution,
     pkgmgr,
     desktop,
+    specops,
+    evalops,
+    dataset,
+    approvals,
+    lifecycle,
   ] = await Promise.all([
     import("@crewhaus/tool-fs"),
     import("@crewhaus/tool-bash"),
@@ -3730,6 +3735,11 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     import("@crewhaus/tool-distribution"),
     import("@crewhaus/tool-pkgmgr"),
     import("@crewhaus/tool-desktop"),
+    import("@crewhaus/tool-specops"),
+    import("@crewhaus/tool-evalops"),
+    import("@crewhaus/tool-dataset"),
+    import("@crewhaus/tool-approvals"),
+    import("@crewhaus/tool-lifecycle"),
   ]);
   const map: Record<string, RegisteredTool> = {
     read: fs.read,
@@ -3760,6 +3770,31 @@ async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
     codegraphCallers: codegraph.codegraphCallers,
     codegraphCallees: codegraph.codegraphCallees,
     codegraphImpact: codegraph.codegraphImpact,
+    // @crewhaus/tool-lifecycle
+    harnessRetire: lifecycle.harnessRetire,
+    storeMigrate: lifecycle.storeMigrate,
+    retentionEnforce: lifecycle.retentionEnforce,
+    knowledgeSync: lifecycle.knowledgeSync,
+    // @crewhaus/tool-approvals
+    approvalStatus: approvals.approvalStatus,
+    approvalsInbox: approvals.approvalsInbox,
+    permissionsSuggest: approvals.permissionsSuggest,
+    // @crewhaus/tool-dataset
+    datasetPut: dataset.datasetPut,
+    datasetInspect: dataset.datasetInspect,
+    datasetLint: dataset.datasetLint,
+    datasetMine: dataset.datasetMine,
+    // @crewhaus/tool-evalops
+    evalHistory: evalops.evalHistory,
+    evalAggregate: evalops.evalAggregate,
+    evalBaselinePin: evalops.evalBaselinePin,
+    evalCoverage: evalops.evalCoverage,
+    graderMetaTest: evalops.graderMetaTest,
+    // @crewhaus/tool-specops
+    specPatchApply: specops.specPatchApply,
+    specUpgrade: specops.specUpgrade,
+    specAdvise: specops.specAdvise,
+    doctorFix: specops.doctorFix,
     // @crewhaus/tool-desktop
     clipboardRead: desktop.clipboardRead,
     clipboardWrite: desktop.clipboardWrite,

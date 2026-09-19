@@ -140,7 +140,22 @@ export function normalizedTokens(text: string): Set<string> {
   );
 }
 
-function jaccard(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
+/**
+ * The near-duplicate rule's own measure: Jaccard overlap of two
+ * {@link normalizedTokens} sets.
+ *
+ * Exported (additively, set-level rather than text-level so the all-pairs
+ * scan in {@link findNearDuplicates} still tokenizes once per sample rather
+ * than once per pair) because a SECOND surface asks the same question about
+ * one pair at a time: `DatasetMine` in `@crewhaus/tool-dataset` dedupes a
+ * mined candidate against an existing corpus. Scoring that pair with a
+ * different tokenizer — even at this module's own threshold — makes the two
+ * tools disagree about what a duplicate IS: `well-known` vs `well known`
+ * scores 1.00 here and 0.62 under a tokenizer that keeps hyphens, so one
+ * tool proposes a candidate as new and the other immediately flags it as a
+ * near-duplicate of the row it just became.
+ */
+export function tokenOverlap(a: ReadonlySet<string>, b: ReadonlySet<string>): number {
   if (a.size === 0 && b.size === 0) return 0;
   let inter = 0;
   const [small, large] = a.size <= b.size ? [a, b] : [b, a];
@@ -179,7 +194,7 @@ export function findNearDuplicates(
       // set is under threshold × the larger (Jaccard ≤ min/max).
       const [lo, hi] = a.size <= b.size ? [a.size, b.size] : [b.size, a.size];
       if (hi === 0 || lo / hi < threshold) continue;
-      const overlap = jaccard(a, b);
+      const overlap = tokenOverlap(a, b);
       if (overlap < threshold) continue;
       const idA = (eligible[i] as Sample).id;
       const idB = (eligible[j] as Sample).id;
