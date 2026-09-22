@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/run-context",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Per-run identity, abort signal, and logger threaded through the runtime",
   "main": "src/index.ts",

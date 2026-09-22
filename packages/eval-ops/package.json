@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/eval-ops",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Eval run operations: coverage of production behaviour, run history with baselines and gates, and grader-vs-human agreement testing",
   "main": "src/index.ts",

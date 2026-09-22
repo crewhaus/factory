@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/qr-code",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Dependency-free QR Code encoder and terminal renderer (ISO/IEC 18004, byte mode)",
   "main": "src/index.ts",

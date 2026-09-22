@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-chaincall",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic EVM contract reads: batched calls, contract introspection, gas market and simulation",
   "main": "src/index.ts",

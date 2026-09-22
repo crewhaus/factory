@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/dataset-ops",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Eval dataset operations: reference resolution and splits, lint, PII/secret audit, mining and synthesis from session logs, and grader suggestion from failures",
   "main": "src/index.ts",

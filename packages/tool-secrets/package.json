@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-secrets",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic secret resolution and .env maintenance, reporting presence and provenance without returning secret values",
   "main": "src/index.ts",

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-flow",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic control-flow tools: branching, decision tables, error classification, deadlines, consensus, stall detection, rule scoring, record routing and sequence planning",
   "main": "src/index.ts",
@@ -33,7 +33,11 @@
     "directory": "packages/tool-flow"
   },
   "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-flow#readme",
-  "bugs": { "url": "https://github.com/crewhaus/factory/issues" },
-  "publishConfig": { "access": "public" },
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

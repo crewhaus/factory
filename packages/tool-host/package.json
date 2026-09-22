@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-host",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic read-only facts about the machine a harness is running on: system, network and listening ports",
   "main": "src/index.ts",

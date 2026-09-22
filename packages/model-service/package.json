@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/model-service",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "0.6.0 composition root (plan §2 stance 4, brief 308): wireModels(fragment, deps) turns the lowered model-routing IR into the runChatLoop options fragment — one stable call replacing the per-emitter routing codegen",
   "main": "src/index.ts",

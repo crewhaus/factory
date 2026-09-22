@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-distribution",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic release-manifest generation and verification: Homebrew, Debian, Scoop and winget for a released binary",
   "main": "src/index.ts",

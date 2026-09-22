@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/harness-lifecycle",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "The back half of a harness's life: retirement and archival, data-retention sweeps over sessions and audit logs, and knowledge sync across harnesses",
   "main": "src/index.ts",

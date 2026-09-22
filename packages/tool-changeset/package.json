@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-changeset",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic change-set review: lint only the added lines of a diff, and check that documented symbols still exist",
   "main": "src/index.ts",

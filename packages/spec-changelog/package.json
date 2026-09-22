@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/spec-changelog",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "A spec's version history and the upgrade that writes the next entry: the append-only changelog ledger plus the migration planner behind `crewhaus upgrade`",
   "main": "src/index.ts",

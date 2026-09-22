@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-approvals",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic approval inspection: what is parked waiting for a human, what has been asked before, and the permission rules that would stop the asking",
   "main": "src/index.ts",

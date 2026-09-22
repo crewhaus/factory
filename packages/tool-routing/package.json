@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-routing",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic routing and experiment inspection: route control, experiment ledger, flywheel status and observational-learning reports",
   "main": "src/index.ts",
