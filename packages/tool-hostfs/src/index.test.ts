@@ -53,6 +53,7 @@ import {
   _resetHostSeams,
   _setClock,
   _setIdentity,
+  _setMonotonicClock,
   _setPathProbe,
   _setPlatform,
   _setRenamer,
@@ -486,7 +487,33 @@ describe("WatchPath: what it reports", () => {
 
   test("the same recovery works when the temp file arrives as two events", async () => {
     // Linux reports the create and the delete separately, macOS coalesces
-    // them into one. Both shapes have to reach the same answer.
+    // them into one. Both shapes have to reach the same answer — and unlike
+    // the test above, the temp file is OBSERVED TO EXIST when the first event
+    // arrives. That is what this one adds: a runtime that watched the temp
+    // appear and then vanish must still fold it into a single transient, not
+    // report the disappearance of a file it saw created.
+    //
+    // TWO THINGS HERE ARE LOAD-BEARING, and this test had neither. It failed
+    // once on a loaded CI runner, reporting `doc.md.tmpABC` as the save.
+    //
+    // First, the monotonic clock is DRIVEN rather than measured. Both emits
+    // have to land in one settle window, and the version that failed relied
+    // on the `writeFileSync` and `rmSync` between them finishing inside 20ms
+    // of real time. On a busy runner they did not, the window closed between
+    // the two events, and the temp file's group was folded while it was still
+    // on disk. `host.ts` states the rule that version was breaking: never
+    // assert wall-clock timing.
+    //
+    // Second, the cap is not 1. With `maxEvents: 1` this test passed for the
+    // WRONG REASON: two events reach the fold — the temp's group and the
+    // reconciled save — and the save happened to take the single slot while
+    // the temp was turned away by the cap (`droppedByCap: 1`, and no
+    // `transientDropped`). Which of two events wins one slot is the
+    // scheduler's business, not this package's. With room for both, the
+    // assertion is the real claim: the save is reported, and the temp is
+    // dropped BECAUSE it is transient.
+    let mono = 1_000;
+    _setMonotonicClock(() => mono);
     writeFileSync(join(workspace, "doc.md"), "one");
     scriptedWatcher((emit) => {
       writeFileSync(join(workspace, "doc.md.tmpABC"), "x");
@@ -494,16 +521,23 @@ describe("WatchPath: what it reports", () => {
       writeFileSync(join(workspace, "doc.md"), "a much longer second version");
       rmSync(join(workspace, "doc.md.tmpABC"));
       emit("rename", "doc.md.tmpABC");
+      // Only now may the window close. However long those two lines took,
+      // both events carry the same stamp and fold together.
+      mono += 1_000;
     });
     const result = await callJson(watchPath, {
       path: ".",
-      timeoutMs: 5_000,
-      maxEvents: 1,
+      timeoutMs: 400,
+      maxEvents: 5,
       settleMs: 20,
     });
     const events = result["events"] as Array<Record<string, unknown>>;
     expect(events.map((event) => event["path"])).toEqual(["doc.md"]);
     expect(events[0]?.["kind"]).toBe("modified");
+    // Not incidental: this is the difference between this test and the one
+    // above, and it is what the old cap of 1 was hiding.
+    expect(result["transientDropped"]).toBe(1);
+    expect(result["droppedByCap"]).toBeUndefined();
   }, 20_000);
 
   test("reconciliation invents nothing when only the temp file happened", async () => {
@@ -1474,7 +1508,7 @@ describe("OsIndexSearch: input and other platforms", () => {
   test("a control character in the query is refused before any command runs", async () => {
     _setPlatform("darwin");
     serve({ mdfind: ok("") });
-    const result = await call(osIndexSearch, { query: "a b" });
+    const result = await call(osIndexSearch, { query: "a\u0000b" });
     expect(result).toContain("control character");
     expect(commands.length).toBe(0);
   });
