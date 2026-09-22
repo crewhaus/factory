@@ -16,10 +16,11 @@
  *     reported honestly rather than faked.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { classifyCellError, datasetFilterMatches, describeCellCrash, wilson95 } from "./evals-ops";
 import { makeFixtureHarness } from "./fixture";
+import { SCAFFOLDED_WORKFLOWS, WORKFLOWS_DIR_SEGMENTS } from "./scaffolded-workflows";
 import { type TestServer, bootTestServer } from "./testkit";
 
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
@@ -448,5 +449,102 @@ describe("empty states", () => {
     // applicable", never an empty panel it cannot interpret.
     const voice = await t.api(`/api/h/${id}/evals/voice`);
     expect(voice.body["applicable"]).toBe(false);
+  });
+});
+
+describe("the flywheel's workflow listing", () => {
+  /** Write one `.github/workflows` entry into a harness tree. */
+  function writeWorkflow(dir: string, filename: string): void {
+    const wf = join(dir, ...WORKFLOWS_DIR_SEGMENTS);
+    mkdirSync(wf, { recursive: true });
+    writeFileSync(join(wf, filename), `name: ${filename}\non: [workflow_dispatch]\n`);
+  }
+
+  // The regression this file exists for: the endpoint used to filter on
+  // `/crewhaus-(flywheel|eval-gate|sentinel)/`, which matches ONE of the five
+  // filenames anything actually writes. Every scaffolder gets its own case,
+  // so adding a sixth workflow without teaching the endpoint fails here.
+  for (const [concept, filename] of Object.entries(SCAFFOLDED_WORKFLOWS)) {
+    test(`lists ${filename} (the ${concept} workflow)`, async () => {
+      const t = boot();
+      const dir = makeFixtureHarness(join(t.harnessesRoot, `wf-${concept}`), { specName: "wf" });
+      writeWorkflow(dir, filename);
+      const id = await register(t, dir);
+      const { status, body } = await t.api(`/api/h/${id}/evals/flywheel`);
+      expect(status).toBe(200);
+      expect(body["workflows"]).toEqual([filename]);
+      // A scaffolded harness is never reported as unscaffolded, even with no
+      // `.crewhaus/flywheel` state dir: `init --sentinel` writes a workflow
+      // and nothing else, and that used to land in the absent() branch.
+      expect(`${filename}:${body["present"]}`).toBe(`${filename}:true`);
+      expect(String(body["note"] ?? "")).not.toContain("no flywheel scaffolding");
+    });
+  }
+
+  test("`init --ci --sentinel` reports BOTH workflows, not just a flywheel", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wf-both"), { specName: "wf" });
+    writeWorkflow(dir, SCAFFOLDED_WORKFLOWS.evalGate);
+    writeWorkflow(dir, SCAFFOLDED_WORKFLOWS.sentinel);
+    const id = await register(t, dir);
+    const { body } = await t.api(`/api/h/${id}/evals/flywheel`);
+    expect([...(body["workflows"] as string[])].sort()).toEqual(
+      [SCAFFOLDED_WORKFLOWS.evalGate, SCAFFOLDED_WORKFLOWS.sentinel].sort(),
+    );
+  });
+
+  test("claims only what CrewHaus wrote — an exact basename, never a prefix", async () => {
+    const t = boot();
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "wf-foreign"), { specName: "wf" });
+    writeWorkflow(dir, "ci.yml");
+    // Someone else's file whose name STARTS with ours. A substring match
+    // would adopt it and offer `flywheel run` over a workflow we do not own.
+    writeWorkflow(dir, "crewhaus-eval-nightly.yml");
+    const id = await register(t, dir);
+    const { body } = await t.api(`/api/h/${id}/evals/flywheel`);
+    expect(body["workflows"]).toEqual([]);
+    expect(body["present"]).toBe(false);
+    expect(String(body["note"])).toContain("no flywheel scaffolding");
+  });
+
+  /**
+   * The drift guard, in the shape `cli-twins.test.ts` established: the CLI
+   * source is READ, never imported (`apps/cli` depends on this package, not
+   * the other way round). Each scaffolder constant must be DERIVED from
+   * `SCAFFOLDED_WORKFLOWS` — re-hardcoding a filename in either file is how
+   * the endpoint and the scaffolders came apart in the first place.
+   */
+  test("every CLI scaffolder derives its path from SCAFFOLDED_WORKFLOWS", () => {
+    const cliSrc = join(import.meta.dir, "..", "..", "..", "apps", "cli", "src");
+    const sources: Record<string, string> = {
+      "flywheel.ts": readFileSync(join(cliSrc, "flywheel.ts"), "utf8"),
+      "ci-scaffold.ts": readFileSync(join(cliSrc, "ci-scaffold.ts"), "utf8"),
+    };
+    const derivations: ReadonlyArray<readonly [string, string, keyof typeof SCAFFOLDED_WORKFLOWS]> =
+      [
+        ["flywheel.ts", "FLYWHEEL_WORKFLOW_RELPATH", "flywheel"],
+        ["flywheel.ts", "MODEL_PLAN_WORKFLOW_RELPATH", "modelPlan"],
+        ["ci-scaffold.ts", "EVAL_CI_WORKFLOW_RELPATH", "evalGate"],
+        ["ci-scaffold.ts", "SENTINEL_WORKFLOW_RELPATH", "sentinel"],
+        ["ci-scaffold.ts", "DREAM_WORKFLOW_RELPATH", "dream"],
+      ];
+    for (const [file, constant, key] of derivations) {
+      const decl = new RegExp(`export const ${constant} = join\\(([^;]*?)\\);`, "s");
+      const match = decl.exec(sources[file] as string);
+      expect(`${constant}:declared`).toBe(`${constant}:${match === null ? "missing" : "declared"}`);
+      // Whitespace- and trailing-comma-insensitive: the formatter collapses
+      // a short call onto one line, and that is not drift.
+      const args = (match?.[1] ?? "").replace(/\s+/g, " ").trim().replace(/,$/, "").trim();
+      expect(`${constant}:${args}`).toBe(
+        `${constant}:...WORKFLOWS_DIR_SEGMENTS, SCAFFOLDED_WORKFLOWS.${key}`,
+      );
+    }
+    // …and both files take the names from the leaf subpath, so importing
+    // them never drags the Hangar server into the CLI's eager graph.
+    for (const [file, text] of Object.entries(sources)) {
+      expect(`${file}:imports`).toBe(
+        `${file}:${text.includes('from "@crewhaus/hangar-server/scaffolded-workflows"') ? "imports" : "missing"}`,
+      );
+    }
   });
 });

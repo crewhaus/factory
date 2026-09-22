@@ -43,6 +43,13 @@ export {
   SESSION_ID_RE,
   SSE_IDLE_TIMEOUT_SECONDS,
 } from "./constants";
+export {
+  isScaffoldedWorkflow,
+  SCAFFOLDED_WORKFLOW_FILENAMES,
+  SCAFFOLDED_WORKFLOWS,
+  scaffoldedWorkflowPath,
+  WORKFLOWS_DIR_SEGMENTS,
+} from "./scaffolded-workflows";
 export { ensureToken, isAuthorized, TOKEN_FILENAME, tokenEquals, type TokenSetup } from "./auth";
 export { mergedSpawnEnv, parseEnvText, readHarnessEnvFiles } from "./env-file";
 export { readJsonlCapped, readTextCapped, type JsonlRead } from "./jsonl";

@@ -30,6 +30,10 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { gateRuns } from "@crewhaus/eval-ops/eval-history";
 import type { EvalRunSummary } from "@crewhaus/eval-runner";
+import {
+  SCAFFOLDED_WORKFLOWS,
+  WORKFLOWS_DIR_SEGMENTS,
+} from "@crewhaus/hangar-server/scaffolded-workflows";
 
 /** Thrown on invalid knobs/defaults and scaffold refusals. The CLI entry
  *  file catches it and routes the message through `die()`; tests assert on
@@ -578,7 +582,18 @@ export function formatFlywheelReport(
 
 // -------- scaffolding (`flywheel init`) --------
 
-export const FLYWHEEL_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-flywheel.yml");
+/**
+ * Derived from `@crewhaus/hangar-server`'s `SCAFFOLDED_WORKFLOWS`, which is
+ * the single source of truth for these filenames: the Hangar flywheel
+ * endpoint reports what it finds in `.github/workflows`, and when it kept
+ * its own hand-written list of names the two drifted apart silently. The
+ * `join` stays here — this is a path on THIS machine's disk, and the server
+ * matches on the basename.
+ */
+export const FLYWHEEL_WORKFLOW_RELPATH = join(
+  ...WORKFLOWS_DIR_SEGMENTS,
+  SCAFFOLDED_WORKFLOWS.flywheel,
+);
 
 export type ScaffoldResult = { readonly path: string; readonly action: "wrote" };
 
@@ -809,7 +824,10 @@ function suiteFlywheelStep(suite: string | undefined): string {
  * the roster, they have different failure modes and different reviewers, and
  * a red audit must still be able to open the replacement PR.
  */
-export const MODEL_PLAN_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-model-plan.yml");
+export const MODEL_PLAN_WORKFLOW_RELPATH = join(
+  ...WORKFLOWS_DIR_SEGMENTS,
+  SCAFFOLDED_WORKFLOWS.modelPlan,
+);
 
 /**
  * 0.6.0 §9.1 (loop 7) — the nightly `models audit --propose` / `route propose`
