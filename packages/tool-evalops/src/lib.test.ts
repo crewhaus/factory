@@ -292,14 +292,24 @@ test("a row that is not a usable run is named, with the reason", () => {
   const reasons = read.value.unusable.map((u) => u.reason).sort();
   console.log(`UNUSABLE ${JSON.stringify(read.value.unusable)}`);
   expect(read.value.entries.length).toBe(1);
-  // `42` parses as JSON and is not a run; the 1.4 pass rate is not a rate.
-  expect(reasons).toEqual(["not a JSON object", "passRate 1.4 is outside 0..1"]);
+  // Two different kinds of bad line, accounted in two different places. A row
+  // that COULD be a run but whose 1.4 pass rate is not a rate is named here,
+  // with its reason. `42` never reaches this fold: the shared reader skips a
+  // line that parses but is not a JSON object, so it lands in the
+  // unreadable-line count instead of arriving as a row typed as a run.
+  expect(reasons).toEqual(["passRate 1.4 is outside 0..1"]);
+  expect(read.value.unparsedLines).toBe(1);
+  expect(read.value.parsedRows).toBe(2);
 });
 
-test("a `null` line degrades the supersede collapse instead of crashing the read", () => {
-  // `readRunIndex` accepts the line (JSON.parse("null") does not throw) and
-  // `readRunIndexLatest` then dereferences `.runId` on it. This is the guard
-  // for that upstream sharp edge: an answer, plus the reason it is degraded.
+test("a `null` line is skipped upstream — the collapse still runs", () => {
+  // This used to be the guard for an upstream sharp edge: `readRunIndex`
+  // accepted the line (JSON.parse("null") does not throw) and
+  // `readRunIndexLatest` threw dereferencing `.runId` on it, so the read was
+  // degraded to raw rows and said so. The shared reader now skips a line that
+  // parses but is not a JSON object, so the answer is no longer degraded at
+  // all: the collapse runs, and the bad line is simply one the reader could
+  // not read as a run.
   writeIndex(root, [
     row({ runId: "r1", ts: "2026-01-01T00:00:00Z" }),
     "null",
@@ -308,13 +318,36 @@ test("a `null` line degrades the supersede collapse instead of crashing the read
   const read = readIndex("T", EVALS_DIR, 1024 * 1024);
   expect(read.ok).toBe(true);
   if (!read.ok) return;
-  console.log(`COLLAPSE ${read.value.collapseFailed}`);
   expect(read.value.entries.map((e) => e.runId)).toEqual(["r1", "r2"]);
-  expect(read.value.collapseFailed).toMatch(/supersede collapse/);
-  expect(read.value.unusable[0]?.reason).toBe("not a JSON object");
+  expect(read.value.collapseFailed).toBeUndefined();
+  expect(read.value.unusable).toEqual([]);
+  // Accounted, not hidden: 3 non-blank lines in, 2 readable as runs.
+  expect(read.value.lines).toBe(3);
+  expect(read.value.parsedRows).toBe(2);
+  expect(read.value.unparsedLines).toBe(1);
+});
+
+test("a superseded run still collapses when the file also holds a `null` line", () => {
+  // The regression that matters. Before the upstream fix this file threw, so
+  // the read fell back to RAW rows and reported r1 twice; the collapse has to
+  // survive a stray line for the fallback to stay unreached.
+  writeIndex(root, [
+    row({ runId: "r1", passRate: 0.25, ts: "2026-01-01T00:00:00Z" }),
+    "null",
+    row({ runId: "r1", passRate: 0.9, ts: "2026-01-03T00:00:00Z" }),
+  ]);
+  const read = readIndex("T", EVALS_DIR, 1024 * 1024);
+  if (!read.ok) throw new Error(read.message);
+  expect(read.value.entries.map((e) => e.runId)).toEqual(["r1"]);
+  expect(read.value.entries[0]?.passRate).toBe(0.9);
+  expect(read.value.supersededRows).toBe(1);
+  expect(read.value.collapseFailed).toBeUndefined();
 });
 
 test("rowProblem rejects the shapes a cast would let through", () => {
+  // The shared reader skips `null` and `[]` before they get here, so these
+  // two cases are this predicate's own contract rather than a live path —
+  // it takes `unknown` precisely so it does not depend on that promise.
   expect(rowProblem(null)).toBe("not a JSON object");
   expect(rowProblem([])).toBe("not a JSON object");
   expect(rowProblem({ ...row({ runId: "r", ts: "t" }), passRate: "high" })).toMatch(/passRate/);
