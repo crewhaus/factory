@@ -194,7 +194,7 @@ function indexAccounting(index: IndexRead): Record<string, unknown> {
     ...(index.unparsedLines > 0
       ? {
           unparsedLinesNote:
-            "lines in index.jsonl that did not parse. The shared reader skips them by design; they are counted here because a run that was recorded and cannot be read is not a run that never happened.",
+            "lines in index.jsonl the shared reader could not read as a run — they did not parse, or they parsed as something that is not a JSON object. It skips them by design; they are counted here because a run that was recorded and cannot be read is not a run that never happened.",
         }
       : {}),
   };
@@ -481,7 +481,7 @@ export const evalAggregate: RegisteredTool = buildTool({
       if (row === undefined) {
         return refusal({
           code: "missing",
-          message: `no run "${renderPath(input.runId)}" in ${renderPath(dirRel)} — it may predate the index, or its line may be one of the ${index.value.unparsedLines} that did not parse`,
+          message: `no run "${renderPath(input.runId)}" in ${renderPath(dirRel)} — it may predate the index, or its line may be one of the ${index.value.unparsedLines} the reader could not read as a run`,
         });
       }
       const resolved = runDirRelative(row.runId, row.outDir);
