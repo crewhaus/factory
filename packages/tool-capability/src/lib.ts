@@ -78,7 +78,10 @@ export function unknownCategoryMessage(
   const known = knownCategories(registry);
   const near = known.filter((k) => k.includes(name) || name.includes(k)).slice(0, 3);
   const hint = near.length > 0 ? ` Did you mean ${near.map((k) => `all-${k}`).join(", ")}?` : "";
-  return `unknown tool category "${raw}".${hint} There are ${known.length} categories; ask with no category to see them on the rows.`;
+  // The note rides on this too. A reader who asked for a category that does
+  // not exist is one step from concluding the category has no tools, and the
+  // categories here cover builtins only.
+  return `unknown tool category "${raw}".${hint} There are ${known.length} categories; ask with no category to see them on the rows. ${MCP_NOTE}`;
 }
 
 /** The first sentence, which is what a list needs. `ListTools` does the same. */
@@ -193,7 +196,7 @@ export function buildRegistryAnswer(args: {
 
   if (live === undefined && only !== "all") {
     return {
-      error: `ToolRegistry could not read this runtime's live tool catalog, so it cannot answer only: "${only}". Ask again without \`only\` to get the tools that exist, or call ListTools for what is bound right now.`,
+      error: `ToolRegistry could not read this runtime's live tool catalog, so it cannot answer only: "${only}". Ask again without \`only\` to get the tools that exist, or call ListTools for what is bound right now. ${MCP_NOTE}`,
     };
   }
 
@@ -208,7 +211,13 @@ export function buildRegistryAnswer(args: {
   // A single key is a detail lookup, not a search: it answers with the whole
   // description rather than the first sentence, and ignores the other filters.
   if (input.key !== undefined) {
-    const entry = registry[input.key];
+    // `Object.hasOwn`, not a bare index: `TOOL_REGISTRY` is an object literal,
+    // so a bare lookup reaches Object.prototype and `key: "constructor"` comes
+    // back as a function rather than as `undefined`. The row built from it
+    // would name a tool called "Object" and tell the reader to ask an operator
+    // to add "constructor" to `tools:` — a confabulated tool from the one tool
+    // whose whole job is saying truthfully what exists.
+    const entry = Object.hasOwn(registry, input.key) ? registry[input.key] : undefined;
     if (entry === undefined) {
       const near = Object.keys(registry)
         .filter((k) => k.toLowerCase().includes(input.key?.toLowerCase() ?? ""))

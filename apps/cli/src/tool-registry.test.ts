@@ -668,3 +668,72 @@ describe("the generated tool manifest matches the tools it describes", () => {
     expect(manifestKeys.filter((k) => k.startsWith("mcp__"))).toEqual([]);
   });
 });
+
+/**
+ * The 455 KB stays where it was declared.
+ *
+ * `collectCrewhausDeps` pins whole PACKAGES into a bundle's `package.json`, so
+ * a package that imports the manifest hands the manifest to every bundle that
+ * grants any of its tools — importing one small export does not help, because
+ * nothing tree-shakes at that boundary. That is why `capability` was given no
+ * roll-up: a broad `all-<category>` grant must not drag the description prose
+ * into a harness that never asked for it.
+ *
+ * `toolInventory` defeated that once already. It needs the builtin KEY SET,
+ * took it from the manifest, and `@crewhaus/tool-crewhaus` sits in the
+ * `crewhaus` leaf — which IS inside the `all-operations` roll-up. So a plain
+ * `all-operations` grant paid the 455 KB through the back door, for prose it
+ * never reads. It reads `BUILTIN_TOOL_MAP` instead: the same keys, already in
+ * its dependency closure, no prose. The key sets being identical is asserted
+ * above, in both directions, on every run.
+ *
+ * This is the test that keeps the next import from re-opening the door.
+ */
+describe("the tool manifest is carried only by bundles that asked for it", () => {
+  const ROOT = join(import.meta.dir, "..", "..", "..");
+  const MANIFEST = "@crewhaus/tool-registry-manifest";
+
+  function deps(pkg: string): ReadonlyArray<string> {
+    const file = join(ROOT, "packages", pkg.replace("@crewhaus/", ""), "package.json");
+    if (!existsSync(file)) return [];
+    const parsed = JSON.parse(readFileSync(file, "utf-8")) as {
+      dependencies?: Record<string, string>;
+    };
+    return Object.keys(parsed.dependencies ?? {});
+  }
+
+  /** Every `@crewhaus/*` package a bundle granting `root`'s tools installs. */
+  function closure(root: string): ReadonlySet<string> {
+    const seen = new Set<string>();
+    const queue = [root];
+    while (queue.length > 0) {
+      const next = queue.pop();
+      if (next === undefined || seen.has(next) || !next.startsWith("@crewhaus/")) continue;
+      seen.add(next);
+      queue.push(...deps(next));
+    }
+    return seen;
+  }
+
+  test("only @crewhaus/tool-capability pulls it in", () => {
+    const carriers = readdirSync(join(ROOT, "packages"))
+      .filter((name) => name.startsWith("tool-") && name !== "tool-registry-manifest")
+      .filter((name) => deps(`@crewhaus/${name}`).includes(MANIFEST));
+    // The sweep found tool packages to look at, and the one legitimate carrier.
+    expect(carriers.length).toBeGreaterThan(0);
+    expect(carriers).toEqual(["tool-capability"]);
+  });
+
+  test("a tool-crewhaus bundle does not install it", () => {
+    const reach = closure("@crewhaus/tool-crewhaus");
+    // `target-cli` is what it reads the key set from, and it was already there.
+    expect(reach.has("@crewhaus/target-cli")).toBe(true);
+    expect(reach.has(MANIFEST)).toBe(false);
+    // And the closure was really walked, not empty.
+    expect(reach.size).toBeGreaterThan(20);
+  });
+
+  test("a tool-capability bundle does install it, so the check can fail", () => {
+    expect(closure("@crewhaus/tool-capability").has(MANIFEST)).toBe(true);
+  });
+});

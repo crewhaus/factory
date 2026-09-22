@@ -60,6 +60,38 @@ describe("every row is well formed", () => {
     expect(thin).toEqual([]);
   });
 
+  /**
+   * The flags actually vary, which is the one thing the staleness check in
+   * apps/cli cannot tell you.
+   *
+   * That check compares a fresh `projectRegistryEntry` against these rows, so
+   * both sides run the SAME projection: a projection that stopped reading
+   * `tool.readOnly` and wrote a constant would regenerate cleanly and match
+   * itself, and 550 rows would claim to be read-only with CI green. It is the
+   * same vacuity the >=500 floor above exists for — a check over nothing, or
+   * over a constant, passes — and it wants the same kind of answer: a floor
+   * that lives here, outside the shared projection.
+   */
+  test("the boolean flags carry real values, not one constant", () => {
+    const collapsed: string[] = [];
+    for (const field of [
+      "readOnly",
+      "destructive",
+      "requiresSandbox",
+      "requireJustification",
+    ] as const) {
+      const values = new Set(entries.map(([, entry]) => entry[field]));
+      if (values.size < 2) collapsed.push(`${field}: every row says ${[...values][0]}`);
+    }
+    // `scope` and `categories` are not booleans, but collapse the same way.
+    if (new Set(entries.map(([, e]) => e.scope)).size < 2) collapsed.push("scope: one value");
+    if (new Set(entries.map(([, e]) => e.categories.join(","))).size < 10)
+      collapsed.push("categories: near-identical across rows");
+    expect(collapsed).toEqual([]);
+    // And the sweep had rows to look at.
+    expect(entries.length).toBeGreaterThanOrEqual(500);
+  });
+
   test("keys are spec casing and names are session-log casing", () => {
     const wrong = entries.filter(
       ([key, entry]) =>

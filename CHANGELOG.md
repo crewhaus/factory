@@ -57,11 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ToolInventory` checks builtin names without being asked.** Its own
   docstring named the gap: a builtin key could only be checked against a
   `knownTools` list you passed, because the builtin registry lived in the
-  compiled bundle rather than in the spec. With the manifest in the tree that
-  is obsolete — the check is now the default, `unknown` is always reported, and
-  the "not checked" note is gone. An explicit `knownTools` still wins, for a
-  spec being checked against a different release's runtime, and the answer says
-  which list it used.
+  compiled bundle rather than in the spec. With the builtin set in the tree
+  that is obsolete — the check is now the default, `unknown` is always
+  reported, and the "not checked" note is gone. An explicit `knownTools` still
+  wins, for a spec being checked against a different release's runtime, and the
+  answer says which list it used. The set comes from `BUILTIN_TOOL_MAP`, which
+  this package already reaches and which is keys without prose, so no bundle
+  granting a `tool-crewhaus` tool pays for the manifest's 455 KB.
 
 ## [0.7.0] - 2026-09-22
 

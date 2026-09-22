@@ -2407,9 +2407,9 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
-        "@crewhaus/tool-registry-manifest": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {

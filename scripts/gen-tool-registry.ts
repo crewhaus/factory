@@ -52,6 +52,17 @@ const keys = Object.keys(BUILTIN_TOOL_MAP).sort();
 if (keys.length === 0)
   throw new Error("BUILTIN_TOOL_MAP is empty — refusing to write an empty manifest");
 
+// The generated file says MCP tools "cannot be added". Make that true of the
+// generator rather than only of the tests that read its output: nothing about
+// `Record<string, BuiltinToolEntry>` stops an `mcp__` key being put there, and
+// one such row would turn "this is the builtin set" into "this is the set".
+const mcpKeys = keys.filter((k) => k.startsWith("mcp__"));
+if (mcpKeys.length > 0) {
+  throw new Error(
+    `BUILTIN_TOOL_MAP has mcp__ keys, which this manifest cannot describe — a spec declares an MCP server, not its tools: ${mcpKeys.join(", ")}`,
+  );
+}
+
 // Both halves of the wiring, checked here rather than left to a later test:
 // this script's whole claim is that the manifest covers the builtin set.
 const onlyInRuntime = CLI_RUNTIME_TOOL_KEYS.filter((k) => !(k in BUILTIN_TOOL_MAP));

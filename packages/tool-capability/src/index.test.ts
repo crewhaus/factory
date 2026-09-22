@@ -6,6 +6,7 @@ import {
   MCP_NOTE,
   type RegistryAnswer,
   buildRegistryAnswer,
+  firstSentence,
   knownCategories,
   liveToolNames,
   normalizeCategory,
@@ -51,7 +52,9 @@ describe("the tool's posture", () => {
    * claiming otherwise would be describing something that is not there.
    *
    * The word list is checked against the strings a model and an operator
-   * actually read — the description and every note the tool can emit.
+   * actually read. Those are collected by DRIVING the tool across every
+   * answer shape, rather than from a list of surfaces kept by hand — the
+   * list version checked two strings and missed the other five.
    */
   test("nothing the model reads calls this a control", () => {
     const CONTROL_WORDS = [
@@ -67,11 +70,69 @@ describe("the tool's posture", () => {
       "authorization",
       "permission boundary",
     ];
+    // The surfaces are COLLECTED BY RUNNING the tool, not listed by hand.
+    // A hand-written list is a list that drifts: it named the description and
+    // MCP_NOTE, while `howToRequest`, the unreachable-catalog note and all
+    // three error strings — every one of them text a model reads — went
+    // unchecked. Driving the input matrix instead means a string added later
+    // is covered the day it becomes reachable.
     const surfaces: Array<{ where: string; text: string }> = [
       { where: "description", text: toolRegistry.description },
-      { where: "note", text: MCP_NOTE },
+      { where: "MCP_NOTE", text: MCP_NOTE },
     ];
-    expect(surfaces.length).toBeGreaterThanOrEqual(2);
+    const live = bridgeWith(["Read", "mcp__notes__search"]);
+    const matrix: Array<[string, unknown, unknown]> = [
+      ["list", { limit: 3 }, live],
+      ["list/unlisted", { limit: 3, only: "unlisted" }, live],
+      ["list/granted", { limit: 3, only: "granted" }, live],
+      ["key hit (granted)", { key: "read" }, live],
+      ["key hit (unlisted)", { key: "bash" }, live],
+      ["key miss", { key: "noSuchTool" }, live],
+      ["key is an mcp name", { key: "mcp__notes__search" }, live],
+      ["unknown category", { category: "all-nonsense" }, live],
+      ["category hit", { category: "all-fs", limit: 3 }, live],
+      ["query", { query: "file", limit: 3 }, live],
+      ["no catalog", { limit: 3 }, undefined],
+      ["no catalog + only", { limit: 3, only: "unlisted" }, undefined],
+    ];
+    // Prose this tool BORROWED from the manifest is the 550 other tools' own
+    // descriptions, and a secrets or approvals tool may legitimately say
+    // "enforce". Only text `ToolRegistry` itself authors is in scope, so the
+    // borrowed strings are subtracted rather than the authored ones listed.
+    const borrowed = new Set<string>();
+    for (const entry of Object.values(TOOL_REGISTRY)) {
+      borrowed.add(entry.key);
+      borrowed.add(entry.name);
+      borrowed.add(entry.description);
+      borrowed.add(firstSentence(entry.description));
+      borrowed.add(entry.package);
+      borrowed.add(entry.scope);
+      if (entry.ioCapability !== undefined) borrowed.add(entry.ioCapability);
+      for (const c of entry.categories) borrowed.add(c);
+      for (const k of entry.keywords) borrowed.add(k);
+    }
+    for (const [where, input, bridge] of matrix) {
+      const answer = buildRegistryAnswer({
+        registry: TOOL_REGISTRY,
+        version: "0.0.0",
+        live: liveToolNames(bridge),
+        input: input as Parameters<typeof buildRegistryAnswer>[0]["input"],
+      });
+      // Every string anywhere in the answer, however deeply nested.
+      const walk = (v: unknown, path: string): void => {
+        if (typeof v === "string") {
+          if (!borrowed.has(v)) surfaces.push({ where: `${where}${path}`, text: v });
+        } else if (Array.isArray(v)) v.forEach((x, i) => walk(x, `${path}[${i}]`));
+        else if (typeof v === "object" && v !== null)
+          for (const [k, x] of Object.entries(v)) walk(x, `${path}.${k}`);
+      };
+      walk(answer, "");
+    }
+    // The sweep reached every shape, including all three error strings.
+    expect(matrix.length).toBe(12);
+    expect(surfaces.length).toBeGreaterThan(20);
+    expect(surfaces.filter((s) => s.text.startsWith("Not bound here.")).length).toBeGreaterThan(0);
+    expect(surfaces.filter((s) => s.text.includes("could not read")).length).toBeGreaterThan(0);
     const offenders: string[] = [];
     for (const { where, text } of surfaces) {
       const lower = text.toLowerCase();
@@ -180,6 +241,66 @@ describe("MCP is declared, not buried", () => {
     const text = await ask({ key: "mcp__notes__search" }, bridgeWith(["mcp__notes__search"]));
     expect(text).toStartWith("[ToolRegistry]");
     expect(text).toContain("Builtin tools only");
+  });
+
+  /**
+   * The refusals carry it too, and they are the ones that most need it.
+   * A reader told "that category does not exist" is a step from concluding
+   * the category is empty, and a reader told the catalog is unreadable has
+   * just been handed the one answer with no `granted` field at all. Both
+   * previously ended without the note; only the key-miss error had it.
+   */
+  test("the refusals carry the note, not only the successful answers", async () => {
+    const cases: Array<[string, unknown, unknown]> = [
+      ["unknown category", { category: "all-nonsense" }, bridgeWith(["Read"])],
+      ["unreadable catalog + only", { only: "unlisted" }, undefined],
+      ["key miss", { key: "noSuchToolAnywhere" }, bridgeWith(["Read"])],
+    ];
+    const missing: string[] = [];
+    for (const [label, input, bridge] of cases) {
+      const text = await ask(input, bridge);
+      expect(text).toStartWith("[ToolRegistry]");
+      if (!text.includes("Builtin tools only")) missing.push(label);
+    }
+    expect(cases.length).toBe(3);
+    expect(missing).toEqual([]);
+  });
+});
+
+/**
+ * A key the manifest does not have must come back as a miss — including the
+ * ones every JavaScript object answers to.
+ *
+ * `TOOL_REGISTRY` is an object literal, so a bare `registry[key]` lookup
+ * reaches `Object.prototype`: `key: "constructor"` returned a truthy value
+ * and the answer described a tool named "Object", telling the reader to ask
+ * an operator to add "constructor" to `tools:`. A tool whose entire purpose
+ * is saying truthfully which tools exist must not invent one.
+ */
+describe("a key that is not a tool is a miss", () => {
+  test("inherited Object.prototype names do not become tools", async () => {
+    const inherited = [
+      "constructor",
+      "toString",
+      "valueOf",
+      "hasOwnProperty",
+      "isPrototypeOf",
+      "propertyIsEnumerable",
+      "toLocaleString",
+      "__proto__",
+    ];
+    const fabricated: string[] = [];
+    for (const key of inherited) {
+      const text = await ask({ key }, bridgeWith(["Read"]));
+      if (!text.startsWith("[ToolRegistry] no builtin tool has the key")) fabricated.push(key);
+    }
+    expect(inherited.length).toBe(8);
+    expect(fabricated).toEqual([]);
+  });
+
+  test("a real key still resolves, so the miss is not refusing everything", async () => {
+    const answer = parse(await ask({ key: "read" }, bridgeWith(["Read"])));
+    expect((answer.granted ?? []).map((r) => r.key)).toEqual(["read"]);
   });
 });
 

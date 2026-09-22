@@ -47,9 +47,9 @@ import {
   runPreflight,
 } from "@crewhaus/preflight";
 import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
+import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { TOOL_REGISTRY } from "@crewhaus/tool-registry-manifest";
 import { z } from "zod";
 import { HARNESS_SPEC_FILENAME, discoverHarnesses } from "./discover";
 import {
@@ -511,13 +511,27 @@ export const toolInventory: RegisteredTool = buildTool({
     const servers = new Set(Object.keys(asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {}));
     // The builtin set used to be uncheckable from here: the registry lived in
     // the compiled bundle, so this tool could only compare against a list the
-    // caller happened to pass, and said so in a note. `@crewhaus/tool-registry-manifest`
-    // puts that set in the tree, so the default is now the real one and every
-    // answer carries `unknown`. An explicit `knownTools` still wins, because
-    // a spec can legitimately be checked against a runtime that is not this
-    // one — a bundle compiled from another release has a different builtin set.
+    // caller happened to pass, and said so in a note. The set is in the tree
+    // now, so the default is the real one and every answer carries `unknown`.
+    // An explicit `knownTools` still wins, because a spec can legitimately be
+    // checked against a runtime that is not this one — a bundle compiled from
+    // another release has a different builtin set.
+    //
+    // The set comes from `BUILTIN_TOOL_MAP` and NOT from
+    // `@crewhaus/tool-registry-manifest`, although the manifest has the same
+    // keys. This tool needs the key SET; the manifest is 455 KB of key set
+    // plus description prose, and `collectCrewhausDeps` pins whole packages,
+    // so importing it here would put that prose into every bundle granting
+    // any tool-crewhaus tool — and `crewhaus` sits inside the `all-operations`
+    // roll-up, so a plain `all-operations` grant would pay it too. `target-cli`
+    // is already in this package's dependency closure via `@crewhaus/compiler`,
+    // so this costs nothing. That the two key sets are identical is not an
+    // assumption: `apps/cli/src/tool-registry.test.ts` asserts it in both
+    // directions on every run.
     const usedCallerList = input.knownTools !== undefined;
-    const known = usedCallerList ? new Set(input.knownTools) : new Set(Object.keys(TOOL_REGISTRY));
+    const known = usedCallerList
+      ? new Set(input.knownTools)
+      : new Set(Object.keys(BUILTIN_TOOL_MAP));
 
     const builtin: string[] = [];
     const mcp: Array<{ tool: string; server: string; declared: boolean }> = [];
