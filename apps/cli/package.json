@@ -112,6 +112,7 @@
     "@crewhaus/trace-event-bus": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-capability": "workspace:*",
     "@crewhaus/tool-discovery": "workspace:*",
     "@crewhaus/tool-routing": "workspace:*",
     "@crewhaus/tool-deploy": "workspace:*",
@@ -215,6 +216,7 @@
     "@crewhaus/adapter-openai": "workspace:*"
   },
   "devDependencies": {
+    "@crewhaus/tool-registry-manifest": "workspace:*",
     "zod": "^3.23.8"
   },
   "license": "Apache-2.0",

@@ -49,6 +49,7 @@ import {
 import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { TOOL_REGISTRY } from "@crewhaus/tool-registry-manifest";
 import { z } from "zod";
 import { HARNESS_SPEC_FILENAME, discoverHarnesses } from "./discover";
 import {
@@ -480,14 +481,14 @@ export const specDiff: RegisteredTool = buildTool({
 export const toolInventory: RegisteredTool = buildTool({
   name: "ToolInventory",
   description:
-    "List the tools a spec grants, split into builtins and MCP tools, with `all-<category>` selectors expanded the way the compiler expands them. Use to answer what a harness can reach before granting it more. An MCP tool naming a server the spec does not declare is flagged as dangling; a builtin key can only be checked against `knownTools` if you pass one, because the builtin registry lives in the compiled bundle rather than in the spec.",
+    "List the tools a spec grants, split into builtins and MCP tools, with `all-<category>` selectors expanded the way the compiler expands them. Use to answer what a harness can reach before granting it more. An MCP tool naming a server the spec does not declare is flagged as dangling, and a builtin key that is not a real tool is reported as unknown — checked against this release's builtin manifest unless you pass `knownTools` for a different runtime.",
   inputSchema: z.object({
     ...specSourceFields,
     knownTools: z
       .array(z.string())
       .optional()
       .describe(
-        "the tool names that actually exist in the target runtime (e.g. from a bundle's registered catalog); granted tools outside this list are reported as unknown",
+        "the tool names that exist in a DIFFERENT target runtime (e.g. a bundle compiled from another release); omit to check against this release's builtins",
       ),
   }),
   readOnly: true,
@@ -508,7 +509,15 @@ export const toolInventory: RegisteredTool = buildTool({
     const declared = buildSpecView(parsed.value, []);
     const resolved = buildSpecView(expanded, []);
     const servers = new Set(Object.keys(asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {}));
-    const known = input.knownTools !== undefined ? new Set(input.knownTools) : undefined;
+    // The builtin set used to be uncheckable from here: the registry lived in
+    // the compiled bundle, so this tool could only compare against a list the
+    // caller happened to pass, and said so in a note. `@crewhaus/tool-registry-manifest`
+    // puts that set in the tree, so the default is now the real one and every
+    // answer carries `unknown`. An explicit `knownTools` still wins, because
+    // a spec can legitimately be checked against a runtime that is not this
+    // one — a bundle compiled from another release has a different builtin set.
+    const usedCallerList = input.knownTools !== undefined;
+    const known = usedCallerList ? new Set(input.knownTools) : new Set(Object.keys(TOOL_REGISTRY));
 
     const builtin: string[] = [];
     const mcp: Array<{ tool: string; server: string; declared: boolean }> = [];
@@ -520,7 +529,7 @@ export const toolInventory: RegisteredTool = buildTool({
         continue;
       }
       builtin.push(tool);
-      if (known !== undefined && !known.has(tool) && !known.has(toRegisteredName(tool))) {
+      if (!known.has(tool) && !known.has(toRegisteredName(tool))) {
         unknown.push(tool);
       }
     }
@@ -532,14 +541,10 @@ export const toolInventory: RegisteredTool = buildTool({
       builtin,
       mcp,
       dangling: mcp.filter((m) => !m.declared).map((m) => m.tool),
-      ...(known !== undefined ? { unknown } : {}),
+      unknown,
+      checkedAgainst: usedCallerList ? "the knownTools you passed" : "this release's builtins",
       sites: resolved.toolSites,
       declaredSelectors: declared.toolSites,
-      ...(known === undefined
-        ? {
-            note: "builtin tool names were not checked for existence — pass knownTools (the target runtime's registered tool names) to have them verified",
-          }
-        : {}),
     });
   },
 });

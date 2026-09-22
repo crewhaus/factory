@@ -1,0 +1,38 @@
+{
+  "name": "@crewhaus/tool-registry-manifest",
+  "version": "0.7.0",
+  "type": "module",
+  "description": "Generated data-only manifest of every builtin tool — key, name, description, flags, categories and keywords — so a compiled bundle can describe a tool it was not given",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@crewhaus/target-cli": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-registry-manifest"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-registry-manifest#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

@@ -858,6 +858,11 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["marketplaceSearch", "federationDiscover"],
   },
 
+  capability: {
+    title: "See which builtin tools this harness is running, and which ones it is not",
+    tools: ["toolRegistry"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",

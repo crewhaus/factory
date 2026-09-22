@@ -24,7 +24,13 @@ import {
   toolsInCategory,
 } from "@crewhaus/tool-categories";
 import { isPrivateIp } from "@crewhaus/tool-fetch";
-import { CLI_RUNTIME_TOOL_KEYS, buildCategoryRows, diffToolMapKeys } from "./tools-cli";
+import { TOOL_REGISTRY, projectRegistryEntry } from "@crewhaus/tool-registry-manifest";
+import {
+  CLI_RUNTIME_TOOL_KEYS,
+  TOOL_KEYWORDS,
+  buildCategoryRows,
+  diffToolMapKeys,
+} from "./tools-cli";
 
 describe("category registry vs. the real builtin set", () => {
   test("every categorized key is a real builtin", () => {
@@ -560,5 +566,105 @@ describe("every copy of the private-address classifier is the same classifier", 
     // internet is removed by whoever it blocks, and then nothing guards.
     const overBlocked = MUST_STAY_PUBLIC.filter((host) => isPrivateIp(host));
     expect(overBlocked).toEqual([]);
+  });
+});
+
+/**
+ * The generated manifest must not go stale.
+ *
+ * `@crewhaus/tool-registry-manifest` exists so a compiled bundle can describe
+ * a tool it is NOT running — the question `ListTools` cannot answer, because
+ * the live catalog only knows what is bound. Its contents are a projection of
+ * the tools themselves, produced by `scripts/gen-tool-registry.ts`, so the
+ * only way it can be wrong is by being old: a builtin added, renamed,
+ * recategorised or reworded since the last run of that script.
+ *
+ * This file is where that is checkable, for the same reason it is where the
+ * category registry is checked — it can import every builtin, and no
+ * `packages/*` may.
+ *
+ * THREE CHECKS, IN THIS ORDER, AND ALL THREE ARE LOAD-BEARING:
+ *
+ *   1. the COUNT. A manifest missing a row has the right keys for every row
+ *      it still has, so a set comparison alone reports the shape of the
+ *      failure and not its size. Counting first is what makes "one tool
+ *      disappeared" fail as "one tool disappeared".
+ *   2. the KEY SETS, both directions. A renamed key keeps the count and
+ *      changes the answer.
+ *   3. the CONTENTS, byte for byte against a fresh projection. A reworded
+ *      description keeps both the count and the keys, and is the most likely
+ *      drift of the three because it needs no wiring change at all.
+ *
+ * Each has been mutation-tested: deleting a row fails (1), renaming a key
+ * fails (2) with (1) still green, and editing a description fails (3) with
+ * (1) and (2) still green.
+ */
+describe("the generated tool manifest matches the tools it describes", () => {
+  const manifestKeys = Object.keys(TOOL_REGISTRY).sort();
+  const emitterKeys = Object.keys(BUILTIN_TOOL_MAP).sort();
+
+  test("the manifest, the emitter map and the runtime key list are all the same size", () => {
+    // Deliberately three numbers rather than two: the manifest is projected
+    // FROM the emitter map, so those two agreeing proves only that the
+    // projection ran. The runtime list is the independent third party, and a
+    // spec key that compiles but cannot run (or the reverse) is the failure
+    // the other two cannot see.
+    expect({
+      manifest: manifestKeys.length,
+      emitter: emitterKeys.length,
+      runtime: CLI_RUNTIME_TOOL_KEYS.length,
+    }).toEqual({
+      manifest: emitterKeys.length,
+      emitter: emitterKeys.length,
+      runtime: emitterKeys.length,
+    });
+    // And a floor, so an empty tree cannot satisfy "all three agree".
+    expect(manifestKeys.length).toBeGreaterThanOrEqual(500);
+  });
+
+  test("the key sets are equal in both directions", () => {
+    const { onlyInA, onlyInB } = diffToolMapKeys(manifestKeys, emitterKeys);
+    expect({ onlyInManifest: onlyInA, onlyInEmitter: onlyInB }).toEqual({
+      onlyInManifest: [],
+      onlyInEmitter: [],
+    });
+  });
+
+  test("every row is byte-identical to a freshly generated projection", async () => {
+    const stale: Array<{ key: string; expected: string; actual: string }> = [];
+    let projected = 0;
+    for (const key of emitterKeys) {
+      const entry = BUILTIN_TOOL_MAP[key];
+      if (entry === undefined) throw new Error(`no BUILTIN_TOOL_MAP entry for ${key}`);
+      const mod = (await import(entry.package)) as Record<string, unknown>;
+      const tool = mod[entry.export] as Parameters<typeof projectRegistryEntry>[0]["tool"];
+      const fresh = projectRegistryEntry({
+        key,
+        tool,
+        categories: categoriesForTool(key),
+        package: entry.package,
+        keywords: TOOL_KEYWORDS[key] ?? [],
+      });
+      projected += 1;
+      const expected = JSON.stringify(fresh);
+      const actual = JSON.stringify(TOOL_REGISTRY[key]);
+      if (expected !== actual) stale.push({ key, expected, actual });
+    }
+    // The sweep's own hit count. Without it, an import that silently yields
+    // nothing would leave this loop comparing an empty set and reporting
+    // green over a manifest nobody looked at.
+    expect(projected).toBe(emitterKeys.length);
+    expect(
+      stale.map((s) => s.key),
+      `re-run \`bun run scripts/gen-tool-registry.ts\` — ${stale.length} row(s) no longer match the tool they describe`,
+    ).toEqual([]);
+  }, 60_000);
+
+  test("no row describes an MCP tool", () => {
+    // A spec declares an MCP SERVER and the server's tool list only exists
+    // once it is connected, so this manifest can never cover MCP. One
+    // `mcp__` row would make an MCP-free answer look complete.
+    expect(manifestKeys.length).toBeGreaterThanOrEqual(500);
+    expect(manifestKeys.filter((k) => k.startsWith("mcp__"))).toEqual([]);
   });
 });
