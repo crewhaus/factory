@@ -70,6 +70,7 @@ import type { M3Context, M3Handler } from "./m3";
 import { isDryRun, requireBoolean, requireString, requireTypedConfirm } from "./m3";
 import { maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
+import { SCAFFOLDED_WORKFLOWS, scaffoldedWorkflowPath } from "./scaffolded-workflows";
 import { readSpecYaml } from "./schedulers";
 
 // ---------------------------------------------------------------------------
@@ -1575,7 +1576,7 @@ export const dreamScaffold: M3Handler = (ctx) => {
     specs,
     overdue: specs.some((s) => s["overdue"] === true),
     cron,
-    workflowPath: ".github/workflows/crewhaus-dream.yml",
+    workflowPath: scaffoldedWorkflowPath(SCAFFOLDED_WORKFLOWS.dream),
     workflow: dreamWorkflow(cron, everyMs),
   };
 };

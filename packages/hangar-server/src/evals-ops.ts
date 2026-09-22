@@ -62,6 +62,7 @@ import { readJsonlCapped, readTextCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
 import { jobArg, requireString } from "./m3";
 import { maskText } from "./mask";
+import { WORKFLOWS_DIR_SEGMENTS, isScaffoldedWorkflow } from "./scaffolded-workflows";
 
 // ---------------------------------------------------------------------------
 // The read envelope + the tolerant filesystem probes this area shares
@@ -1424,8 +1425,15 @@ export const optimizerArtifacts: M3Handler = (ctx) => {
 export const flywheel: M3Handler = (ctx) => {
   const stateDir = safeContain(ctx, [".crewhaus", "flywheel"]);
   const scaffolded = isDirAt(stateDir);
-  const workflows = listNames(safeContain(ctx, [".github", "workflows"])).filter((name) =>
-    /crewhaus-(flywheel|eval-gate|sentinel)/.test(name),
+  // Keyed on SCAFFOLDED_WORKFLOWS, never a hand-written pattern. The regex
+  // that used to stand here (`/crewhaus-(flywheel|eval-gate|sentinel)/`)
+  // matched two names nothing ever writes — `crewhaus-eval-gate` and
+  // `crewhaus-sentinel` are systemd unit labels, not workflow files — so the
+  // eval gate (`crewhaus-eval.yml`), the sentinel (`sentinel-drift.yml`),
+  // the model-plan and the dream workflows were all invisible here, and the
+  // `absent(...)` branch below fired on harnesses that ARE scaffolded.
+  const workflows = listNames(safeContain(ctx, WORKFLOWS_DIR_SEGMENTS)).filter(
+    isScaffoldedWorkflow,
   );
   const precedence = datasetPrecedenceWarning(ctx);
   const shadow = {
