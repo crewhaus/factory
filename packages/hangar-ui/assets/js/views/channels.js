@@ -28,6 +28,51 @@ import { api } from "../api.js";
 import { clear, collapsible, dot, el, jsonPre, numberedCode, skeleton, toast } from "../dom.js";
 import { m3, m3Card, m3Empty } from "./creds.js";
 
+/**
+ * True when `hostname` names this machine — the browser-side half of the
+ * CLI's `isLoopbackHost`, deliberately re-implemented rather than imported:
+ * the console's JS is hand-written browser ES modules with no build step and
+ * no imports out of `assets/`.
+ *
+ * `location.hostname` hands IPv6 literals over WITHOUT their brackets, so
+ * `::1` arrives bare; both spellings are accepted. An empty hostname (a
+ * `file://` document) is NOT loopback — falling through to the honest note
+ * is the safe direction to be wrong in.
+ */
+export function isLoopbackHostname(hostname) {
+  const host = typeof hostname === "string" ? hostname.trim().toLowerCase() : "";
+  if (host === "") return false;
+  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (bare === "localhost") return true;
+  if (bare === "::1" || bare === "0:0:0:0:0:0:0:1") return true;
+  // The whole of 127.0.0.0/8 — a daemon on 127.0.0.2 is every bit as local.
+  const octets = bare.split(".");
+  if (octets.length !== 4) return false;
+  if (!octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)) return false;
+  return octets[0] === "127";
+}
+
+/**
+ * Whether to OFFER the daemon's dashboard as a link, or just name it.
+ *
+ * The daemon's control-UI port is loopback by design — `service-setup`
+ * never tunnels it and it carries no auth — so the address the server sends
+ * is only usable by a browser sitting at that machine. Since
+ * `crewhaus hangar --lan` puts this console on a phone, "usable" is now a
+ * question with two answers, and only the browser can tell which: it knows
+ * the host it reached the console on.
+ *
+ * A link that quietly goes nowhere is worse than a line of text that says
+ * where the thing is, so a remote viewer gets the address and the reason
+ * instead of a dead anchor.
+ */
+export function dashboardReach(dashboardUrl, viewerHostname) {
+  if (typeof dashboardUrl !== "string" || dashboardUrl === "") return null;
+  return isLoopbackHostname(viewerHostname)
+    ? { reachable: true, url: dashboardUrl }
+    : { reachable: false, url: dashboardUrl };
+}
+
 export async function renderChannels(root, ctx) {
   clear(root).appendChild(skeleton(5));
   const [channelsAnswer, gatewayAnswer] = await Promise.all([
@@ -431,16 +476,28 @@ function gatewayCard(body) {
         : null,
     ]),
   ];
-  if (typeof body.dashboardUrl === "string") {
+  const reach = dashboardReach(body.dashboardUrl, window.location.hostname);
+  if (reach !== null) {
     nodes.push(
-      el("p", null, [
-        el("a", {
-          href: body.dashboardUrl,
-          target: "_blank",
-          rel: "noreferrer",
-          text: "open the daemon's own dashboard",
-        }),
-      ]),
+      el(
+        "p",
+        null,
+        reach.reachable
+          ? [
+              el("a", {
+                href: reach.url,
+                target: "_blank",
+                rel: "noreferrer",
+                text: "open the daemon's own dashboard",
+              }),
+            ]
+          : [
+              el("span", {
+                class: "muted",
+                text: `the daemon's own dashboard is at ${reach.url} — it binds loopback and is not tunnelled, so it opens only from the machine running the daemon, not from here`,
+              }),
+            ],
+      ),
     );
   }
   if (body.status !== null && body.status !== undefined) {

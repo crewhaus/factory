@@ -286,6 +286,7 @@
     { "path": "./packages/harness-advice" },
     { "path": "./packages/harness-lifecycle" },
     { "path": "./packages/spec-changelog" },
+    { "path": "./packages/qr-code" },
     { "path": "./apps/cli" }
   ]
 }

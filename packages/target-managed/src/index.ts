@@ -1429,6 +1429,12 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 ${renderObservabilityEnv(ir)}const TENANTS_ROOT = process.env.CREWHAUS_TENANTS_ROOT ?? "/tmp/crewhaus-tenants";
 const PORT = Number(process.env.PORT ?? 3000);
+// Bind every interface unless told otherwise. gateway.listen defaults to
+// 127.0.0.1 — right for a library, wrong here: this is the daemon's only
+// listener, it carries /healthz, and the shape ships in an EXPOSE 8080 image.
+// A loopback bind refuses every probe from outside the container while the
+// in-container healthcheck still passes. Set HOST=127.0.0.1 to narrow it.
+const HOST = process.env.HOST ?? "0.0.0.0";
 const ENV_JWT_SECRET = process.env.CREWHAUS_GATEWAY_JWT_SECRET;
 if (ENV_JWT_SECRET !== undefined && ENV_JWT_SECRET.length < 16) {
   console.error(
@@ -1702,8 +1708,8 @@ ${feedbackHandlerBlock}    if (method === "audit.tail") {
   },
 });
 
-const handle = await gateway.listen(PORT);
-console.error(\`[managed] gateway listening on :\${handle.port}\`);
+const handle = await gateway.listen(PORT, HOST);
+console.error(\`[managed] gateway listening on \${HOST}:\${handle.port}\`);
 ${scheduleWake.helpers}${scheduleWake.block}${controlDrain}${controlStart}
 process.on("SIGTERM", async () => {
   console.error("[managed] SIGTERM — closing gateway");

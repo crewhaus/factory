@@ -32,11 +32,28 @@
  * `scaffoldWorkflowFile` writer.
  */
 import { join } from "node:path";
+import {
+  SCAFFOLDED_WORKFLOWS,
+  WORKFLOWS_DIR_SEGMENTS,
+} from "@crewhaus/hangar-server/scaffolded-workflows";
 import { normalizeHarnessDir } from "./flywheel";
 
-export const EVAL_CI_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-eval.yml");
-export const SENTINEL_WORKFLOW_RELPATH = join(".github", "workflows", "sentinel-drift.yml");
-export const DREAM_WORKFLOW_RELPATH = join(".github", "workflows", "crewhaus-dream.yml");
+/**
+ * Derived from `@crewhaus/hangar-server`'s `SCAFFOLDED_WORKFLOWS` — see the
+ * note on `FLYWHEEL_WORKFLOW_RELPATH`. Neither of these two filenames
+ * contains the word an operator uses for the job (`eval-gate`, `sentinel`),
+ * which is precisely how the Hangar endpoint came to match names nothing
+ * writes.
+ */
+export const EVAL_CI_WORKFLOW_RELPATH = join(
+  ...WORKFLOWS_DIR_SEGMENTS,
+  SCAFFOLDED_WORKFLOWS.evalGate,
+);
+export const SENTINEL_WORKFLOW_RELPATH = join(
+  ...WORKFLOWS_DIR_SEGMENTS,
+  SCAFFOLDED_WORKFLOWS.sentinel,
+);
+export const DREAM_WORKFLOW_RELPATH = join(...WORKFLOWS_DIR_SEGMENTS, SCAFFOLDED_WORKFLOWS.dream);
 
 /**
  * v0.3.0 PR 14 (§6.3) — the scheduled-consolidation cron workflow,
