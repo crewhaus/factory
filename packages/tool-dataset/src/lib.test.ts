@@ -497,7 +497,7 @@ describe("sessions", () => {
   });
 
   test("a session id that is really a path is refused", () => {
-    for (const bad of ["../escape", "a/b", "..", "a b", ""]) {
+    for (const bad of ["../escape", "a/b", "..", "a\u0000b", ""]) {
       const checked = checkSessionId(bad);
       expect({ bad, ok: checked.ok }).toEqual({ bad, ok: false });
     }
@@ -550,8 +550,8 @@ describe("registry root", () => {
 
 describe("echoing caller input", () => {
   test("control characters are neutralised and long strings are bounded", () => {
-    const rendered = renderGiven(`a bc\n${"x".repeat(500)}`);
-    expect(rendered).not.toContain(" ");
+    const rendered = renderGiven(`a\u0000bc\n${"x".repeat(500)}`);
+    expect(rendered).not.toContain("\u0000");
     expect(rendered).not.toContain("");
     expect(rendered).not.toContain("\n");
     expect(rendered.length).toBeLessThanOrEqual(201);

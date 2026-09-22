@@ -4761,12 +4761,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     if (opts.settingsDir === null) return base;
     const diskSettings = loadSettingsRules(opts.settingsDir ?? process.cwd());
     if (diskSettings.length === 0) return base;
-    const seen = new Set(base.settings.map((r: PermissionRule) => `${r.type} ${r.pattern}`));
+    const seen = new Set(base.settings.map((r: PermissionRule) => `${r.type}\u0000${r.pattern}`));
     return {
       ...base,
       settings: [
         ...base.settings,
-        ...diskSettings.filter((r) => !seen.has(`${r.type} ${r.pattern}`)),
+        ...diskSettings.filter((r) => !seen.has(`${r.type}\u0000${r.pattern}`)),
       ],
     };
   })();

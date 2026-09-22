@@ -426,14 +426,14 @@ export function dedupeExperimentOutcomes(records: ReadonlyArray<ExperimentOutcom
   for (let i = 0; i < records.length; i += 1) {
     const rec = records[i] as ExperimentOutcomeRecord;
     if (rec.source !== "eval" || rec.requestKey === undefined) continue;
-    lastIndex.set(`${rec.version} ${rec.requestKey}`, i);
+    lastIndex.set(`${rec.version}\u0000${rec.requestKey}`, i);
   }
   const kept: ExperimentOutcomeRecord[] = [];
   let collapsed = 0;
   for (let i = 0; i < records.length; i += 1) {
     const rec = records[i] as ExperimentOutcomeRecord;
     if (rec.source === "eval" && rec.requestKey !== undefined) {
-      if (lastIndex.get(`${rec.version} ${rec.requestKey}`) !== i) {
+      if (lastIndex.get(`${rec.version}\u0000${rec.requestKey}`) !== i) {
         collapsed += 1;
         continue;
       }
