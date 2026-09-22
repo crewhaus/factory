@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-specops",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic spec maintenance: CST-preserving patches, post-release migrations, advisory findings and the mechanical repairs doctor only prints",
   "main": "src/index.ts",

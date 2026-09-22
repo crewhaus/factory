@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-discovery",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic discovery: search the local template marketplace and enumerate reachable federation peers",
   "main": "src/index.ts",

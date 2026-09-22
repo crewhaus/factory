@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-kyc",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic counterparty checks against public registries and sanctions lists, with versioned evidence",
   "main": "src/index.ts",

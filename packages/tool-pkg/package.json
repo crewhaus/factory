@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-pkg",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic packaging tools: semver resolution, lockfile diffing, license rollups, tarball inspection and publish preflight",
   "main": "src/index.ts",
@@ -33,7 +33,11 @@
     "directory": "packages/tool-pkg"
   },
   "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-pkg#readme",
-  "bugs": { "url": "https://github.com/crewhaus/factory/issues" },
-  "publishConfig": { "access": "public" },
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

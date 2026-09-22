@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-dataset",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic eval-dataset operations: version, inspect, validate and grow a dataset from local files and recorded sessions",
   "main": "src/index.ts",

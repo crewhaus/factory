@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-registry",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic package-registry reads: what a public registry knows about a package, what is newest, and writing that back into a manifest",
   "main": "src/index.ts",

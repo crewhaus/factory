@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-containers",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic OCI registry reads: resolve an image tag to its digest and list tags, with no daemon and no pull",
   "main": "src/index.ts",

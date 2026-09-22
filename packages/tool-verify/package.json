@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-verify",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic verification tools: golden comparison, checksum manifests, acceptance checks, Markdown link checking, citation linting, offline claim-to-source cross-checking and an on-page SEO and readability gate",
   "main": "src/index.ts",

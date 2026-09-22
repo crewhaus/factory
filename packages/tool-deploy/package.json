@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-deploy",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic spec deployment within the local registry: pin a version to an environment, roll back, and report what is pinned where",
   "main": "src/index.ts",

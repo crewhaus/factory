@@ -5,9 +5,144 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-09-22
+
+**Tools a harness can run without spending a token.** A CrewHaus harness could
+call 22 builtin tools; it can now call 549. They read chains and ledgers, drive
+git and package managers, gate a page before it publishes, operate a fleet, and
+answer the hundreds of small questions a run used to spend a model call on —
+none of them makes one, and a spec turns them on a capability group at a time
+rather than a name at a time. Two of the fixes below are worth reading even if
+you upgrade nothing: an SSRF classifier that compared address text, found by
+auditing all ten copies of it, and a daemon status page that had been binding
+the wildcard rather than loopback.
 
 ### Added
+
+- **Fifty-seven new `@crewhaus/tool-*` packages** (#453, #454, #458, #459,
+  #462, #463, #465, #466, #467, #469, #470, #471, #472). Each is an ordinary
+  builtin — it takes a typed input, does the work in-process, and returns a
+  result — so the work it does costs no tokens and cannot drift between runs.
+  Broadly:
+
+  - **Pure computation, no I/O at all.** Text, structured data (JSON, YAML,
+    TOML, CSV, XML), encoding and hashing, dates and schedules, maths and
+    exact money, schema validation, control flow, and tabular intake:
+    `tool-text`, `tool-data`, `tool-encode`, `tool-datetime`, `tool-math`,
+    `tool-schema`, `tool-flow`, `tool-table`.
+  - **The working tree and the toolchain.** Files and archives, processes,
+    git, GitHub and GitLab, SQLite, documents, HTML, packaging and lockfiles,
+    code intelligence, and the gates you run before a change lands —
+    `tool-fsx`, `tool-proc`, `tool-git`, `tool-codehost`, `tool-sql`,
+    `tool-docs`, `tool-html`, `tool-pkg`, `tool-code`, `tool-verify`,
+    `tool-changeset`, `tool-buildperf`, `tool-supplychain`, `tool-registry`,
+    `tool-containers`, `tool-distribution`.
+  - **What a harness remembers and what it reports.** Durable state, secrets
+    handling, messaging, observability and cost: `tool-state`, `tool-secure`,
+    `tool-secrets`, `tool-notify`, `tool-obs`, `tool-media`.
+  - **Money and chains, reading only.** ABI encoding and EIP-712 digests,
+    live EVM reads, token and DeFi queries, a hash-chained local ledger,
+    e-invoices, payment files and counterparty checks: `tool-onchain`,
+    `tool-chainread`, `tool-chaincall`, `tool-token`, `tool-defi`,
+    `tool-ledger`, `tool-einvoice`, `tool-kyc`, `tool-money`,
+    `tool-objectstore`.
+  - **The operator's own machine.** System and network facts, scheduled jobs,
+    filesystem watches, the system package manager and the desktop:
+    `tool-host`, `tool-hostfs`, `tool-cron`, `tool-pkgmgr`, `tool-desktop`.
+  - **CrewHaus operating itself.** Specs, evals, datasets, approvals, harness
+    lifecycle, fleets, deployments, routing and discovery: `tool-specops`,
+    `tool-evalops`, `tool-dataset`, `tool-approvals`, `tool-lifecycle`,
+    `tool-fleet`, `tool-deploy`, `tool-routing`, `tool-discovery`,
+    `tool-crewhaus`.
+
+  **What these tools deliberately will not do matters as much as what they
+  do,** because each of these was a capability that would have been easy to
+  add and wrong to ship:
+
+  - **None of these tools signs or sends a transaction.** They read. No
+    schema among them takes a private key, and each of the five chain
+    packages refuses `eth_sendTransaction` and `eth_sendRawTransaction` at
+    the RPC seam by assertion rather than by omission. (The separate
+    `@crewhaus/tool-evm-tx`, which does sign, is wired per shape and is not
+    one of the 549.)
+  - **Nothing moves money.** `PaymentFileBuild` writes a payment file and
+    `InvoiceRender` renders an invoice; transmitting either is a human's job
+    through their own bank. No schema takes a banking credential.
+  - **Nothing acquires privilege.** `PackageInstall` never runs `sudo`,
+    `doas`, `runas` or `pkexec`, and no schema has a password field. A
+    manager that needs root refuses and hands back the exact command an
+    operator would run; Homebrew, which does not, proceeds.
+  - **`SecretLookup` does not return the secret.** A tool result reaches a
+    model's context, then a transcript, a trace and a log, so it reports
+    presence, backend, length and a truncated fingerprint. There is no
+    reveal option.
+  - **Nothing a caller supplies becomes program text.** `osascript -e` takes
+    source code and a Windows toast body is XML, so `tool-desktop` passes
+    every caller value as an argument the script reads by index, never
+    interpolated into a statement.
+  - **`DeployPromote` was not built.** Its `protected_envs` guard cannot be
+    enforced by a tool, which never sees how the permission engine resolved
+    the target environment; with a standing allow the guard would be
+    decorative. The reasoning is kept in a docblock rather than lost.
+
+- **`tools:` gains a grammar for turning on a capability group** (#453).
+
+      tools:
+        - all-code        # every tool in the code roll-up
+        - -bash           # ...except this one
+        - webFetch        # plus one tool by name
+
+  Order does not matter: every include is unioned, then every exclude is
+  subtracted, so an exclusion always wins and a reader never has to simulate
+  the list top to bottom. A category is either a leaf, owning tool keys and
+  mapping 1:1 to the package that implements them, or a roll-up owning other
+  categories and expanding transitively — one mechanism for both `all-fs` and
+  `all-code`. Expansion happens once, at lowering, so the IR only ever carries
+  concrete names and no target emitter changed. A spec that uses no category
+  syntax is returned by reference, so every bundle written before this existed
+  still compiles byte-identically.
+
+  Two mistakes fail the compile with the offending path rather than passing
+  quietly: an unknown category, and an exclusion that removes nothing — a
+  `-gitPush` matching no included tool is almost always a typo, and ignoring
+  it would leave the author believing a tool is gated when it is not.
+
+  Because a category system is only as good as being able to see inside it:
+  `crewhaus tools categories`, `tools show <tool>`, `tools search <query>` and
+  `tools list --category`. The registry is the new `@crewhaus/tool-categories`,
+  which is data only and imports no tool package — the compiler imports it and
+  codegen has to stay offline.
+
+- **`crewhaus hangar --lan` prints a QR code you can scan** (#455). It binds
+  this machine's LAN address instead of loopback and renders the console's
+  URL, token and all, as a QR code in the terminal. Scan it and the fleet
+  view, the run feed and the Advisor open on your phone — which is the point,
+  because they are exactly what you want on a second screen while a terminal
+  is busy, and nobody types a 64-character token into a phone twice.
+
+  The encoder is a new dependency-free package, `@crewhaus/qr-code`. A
+  package rather than an install because `apps/cli` carries exactly one
+  non-workspace dependency by policy, and because `bun build --compile`
+  embeds only statically-referenced imports — a QR library that loads a data
+  file at runtime would pass `bun test` and brick the released binary. This
+  one has no data files at all.
+
+  Two things a terminal renderer meets that a PNG renderer never does. A
+  terminal cell is twice as tall as it is wide, so half-block characters
+  carry two module rows per text row and the modules come out square. And a
+  terminal has no fixed background, so every line carries an explicit
+  black-on-white colour pair; without it the same characters read as a QR
+  code on a dark theme and as its photographic negative on a light one. With
+  colour disabled the mapping inverts instead, because the only remaining way
+  to make light modules light is to draw them and let the terminal's dark
+  background be the ink.
+
+  Picking the address is its own problem: `os.networkInterfaces()` offers no
+  ranking, and on a laptop most of what it offers is useless to a phone — VPN
+  tunnels, Apple's peer-to-peer radios, container bridges, self-assigned
+  169.254 addresses. The ranking prefers RFC 1918 on a physical-looking
+  interface, and ties break on the interface name so the answer is stable
+  across boots.
 
 - **`crewhaus services setup` — the external services a harness needs, in one
   command.** A spec declares *that* it wants a Slack channel, a public URL and
@@ -61,6 +196,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One private-address classifier, parsed rather than pattern-matched, in
+  all ten copies** (#460). Ten packages guard an outbound request against a
+  private destination, each carried its own copy, and the copies had drifted.
+  An audit of all ten — a runnable proof required per claim, then an
+  independent pass whose job was to refute each one — found six confirmed
+  exploitable.
+
+  A guard that classifies IPv6 by comparing address **text** never sees what
+  a URL parser produces: `new URL("http://[::ffff:169.254.169.254]/")` has
+  hostname `[::ffff:a9fe:a9fe]`, so a check written for the dotted spelling
+  waves it through. And `64:ff9b::a9fe:a9fe` *is* 169.254.169.254 on any
+  network running DNS64/NAT64 — which on a cloud host is the metadata service
+  that hands out credentials. Parsing numerically is necessary but not
+  sufficient: one copy already parsed and was still exploitable, because it
+  knew `64:ff9b::/96` and not the `64:ff9b:1::/48` variant.
+
+  The worst instance was proven end to end. `computer-use-driver`'s SSRF
+  proxy read its `CONNECT` target from a regex on `req.url`, so that host
+  never passed through `new URL()` and uncompressed spellings survived
+  intact: `CONNECT [0:0:0:0:0:0:0:1]:<port>` opened a tunnel to a local
+  service, and the module's own docstring claimed it "cannot be leveraged by
+  other local processes to reach internal services". It could.
+
+  The classifier is now one block, byte-identical in all ten, parsing IPv4
+  (decimal, hex, octal, packed and short forms) and IPv6 numerically and
+  extracting the embedded IPv4 from every family a URL parser or a DNS64
+  answer can produce. The guard that keeps them identical **executes** the
+  classifier against a table of spellings rather than comparing source text —
+  the first version compared text, which is the original vulnerability
+  reproduced in the thing meant to catch it.
+
+- **A liveness probe that did not answer is no longer read as a dead
+  process** (#461). `ProcessOps.isAlive` returned a boolean, so it had no way
+  to say "the platform would not tell me". On Windows the probe is
+  `powershell.exe` under a `spawnSync` timeout, and on timeout the runner
+  returns undefined, which `isAlive` turned into `false`. Three callers then
+  acted on a slow machine as though a daemon had died: adoption reported
+  `pid-dead` with `verified: true`, the run-file lock treated it as
+  permission to break a live start lock, and the supervisor called `onExit`
+  on an adopted run that had not exited.
+
+  `isAlive` now returns true, false or undefined, and every caller branches
+  on `=== false`. POSIX never returns undefined and the contract says so:
+  `kill(pid, 0)` is a syscall that decides. The probe budget was also one
+  constant for both platforms — 5,000ms, a POSIX assumption applied to
+  PowerShell, which routinely takes one to three seconds and much longer on a
+  loaded host; Windows now gets 20,000ms, named separately so the reason
+  survives. Visibly, `daemon status` prints "could not determine whether it
+  is running" instead of "not running", and `daemon logs --follow` stays
+  attached on an unanswered probe rather than truncating a live daemon's
+  output.
+
+- **A harness with a `gateway:` block published its status page to the whole
+  network** (#455). `Bun.serve` with no `hostname` binds the wildcard, and the
+  channel daemon's control-UI listener omitted it — so the harness name,
+  shape, boot time, wired channel list and turn and heartbeat counts were
+  served unauthenticated to anything that could reach the port, along with the
+  HTML dashboard. No secrets and no write surface, so this is reconnaissance
+  rather than compromise, but it was on by default and nothing announced it.
+
+  What made it invisible is that `server.hostname` then reports
+  `"localhost"` — a getter, not the bound interface. `lsof` showed
+  `TCP *:<port>` and a fetch to the machine's LAN address answered 200. The
+  emitted boot banner said `http://localhost:<port>` for the same reason and
+  was equally wrong. Everything else about this port already said local: the
+  `gateway:` block is strict with no bind field, so an operator could not
+  have opted in or out; no image publishes it; and both in-repo readers dial
+  127.0.0.1. The listener now matches what four other subsystems already
+  assert, and the banner is true.
+
+- **A containerized `managed` daemon answered nothing from outside its own
+  network namespace** (#455). `gateway.listen(PORT)` took `gateway-server`'s
+  `127.0.0.1` default — the right default for a library and the wrong bind
+  for this shape, which has exactly one listener and rides `/healthz` on the
+  same socket. So every probe and every request from outside the namespace
+  was refused: Docker, the Helm chart's liveness and readiness probes, and
+  all four PaaS adapters, each of which maps `managed` to `web`. The bind is
+  now `HOST`, which pairs with the bare `PORT` this emit already reads and
+  was already allow-listed beside it in the supervisor's non-secret
+  environment keys.
+
+- **The Hangar's flywheel view matched two workflow names that nothing ever
+  writes** (#475). The endpoint filtered `.github/workflows` through a
+  hand-written pattern, `/crewhaus-(flywheel|eval-gate|sentinel)/`, and
+  `crewhaus-eval-gate` and `crewhaus-sentinel` are systemd unit labels rather
+  than filenames — plausible-looking siblings of the real ones, which is why
+  the pattern could sit there looking correct. The eval gate
+  (`crewhaus-eval.yml`), the sentinel (`sentinel-drift.yml`), the model-plan
+  and the dream workflows were all invisible, so a harness scaffolded with
+  `init --sentinel` reported no workflows and was told it had no flywheel
+  scaffolding. The filenames now have one owner that both the scaffolders and
+  the endpoint read, and matching is on the exact basename.
+
+- **One unreadable line in an eval run index no longer hides every run in the
+  file** (#474). `readRunIndex` already skipped a line it could not parse —
+  the index is an append-only log and one torn write must not hide the rest —
+  but `JSON.parse` does not throw on `null`, `42` or `[]`, so a line holding
+  any of those was passed through as a run. The first `.runId` read off it
+  threw and took the whole read down. Field-level validation is deliberately
+  still absent: an object-shaped row with a nonsense `passRate` comes back, so
+  the reports that name such rows can keep naming them.
+
 - **A `.env` value containing a `"` or a `\` no longer changes shape on a
   write/read round trip.** `encodeEnvValue` escapes both characters whenever
   it has to quote a value, but nothing reversed that: `upsertEnvVar(path, "K",
@@ -87,6 +324,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an app created from it rendered approval cards whose Approve/Deny buttons
   reached nothing — the gateway routes clicks on `/<adapter>/actions`, a
   separate webhook from `/<adapter>/events`.
+
+### Changed
+
+- **Five modules moved out of `apps/cli` into packages of their own** (#468).
+  No behaviour changed and no tool shipped in that change — it exists because
+  thirteen deterministic tools could not be written while the logic they need
+  lived in an app, and no `packages/tool-*` may depend on one. The new
+  packages are `@crewhaus/harness-advice`, `@crewhaus/dataset-ops`,
+  `@crewhaus/eval-ops`, `@crewhaus/spec-changelog` and
+  `@crewhaus/harness-lifecycle`; the CLI now imports what it used to own. If
+  you imported any of those modules from `apps/cli` directly, they have
+  moved.
+
+- **The audit envelope derives its wrapping key once per DEK version instead
+  of once per record** (#456). `encryptPayload` minted a fresh scrypt salt for
+  every record, so the derivation could never be cached: ~52ms and ~64MB per
+  record, about 19 records a second.
+
+  A per-record salt buys nothing here. A salt's job is to make precomputation
+  against *this* KEK worthless, and one random salt does that completely —
+  an attacker testing a passphrase guess picks any single record and computes
+  one scrypt, whether the corpus holds one salt or a million. Salt diversity
+  pays when you are stretching *different* secrets; here there is one KEK and,
+  per tenant, one DEK. Spent on a higher cost parameter instead, the same CPU
+  budget actually multiplies an attacker's work.
+
+  The wrap cache is keyed on the KEK reference, the DEK version **and the DEK
+  bytes** — a store shared with another process can hand back different bytes
+  under an unchanged version, and pairing a stale wrap with fresh bytes would
+  emit a record that never decrypts. The wrap's ciphertext is reused rather
+  than re-encrypted under a stable key, which keeps exactly one key and IV
+  pair in play and so spends no GCM nonce budget. Records written with the
+  old per-record salt still decrypt, and there is a test that says so.
 
 ## [0.6.0] - 2026-09-08
 

@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/harness-advice",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic advice read out of a harness's own logs: routing/tool/context rules, shadow-lane arithmetic, doctor checks and their fixes, and permission-rule suggestions",
   "main": "src/index.ts",

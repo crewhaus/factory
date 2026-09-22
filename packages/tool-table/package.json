@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-table",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic tabular tools: profiling, drift detection, keyed reconciliation, record linkage, contact normalization, reshaping, sharding and fixed-width parsing",
   "main": "src/index.ts",

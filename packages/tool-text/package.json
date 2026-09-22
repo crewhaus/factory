@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-text",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic text tools: regex extraction, diffing, unified-diff parsing, budget truncation, log compaction, outlining, templating, rule classification, normalization, similarity, and escaping",
   "main": "src/index.ts",
@@ -32,7 +32,11 @@
     "directory": "packages/tool-text"
   },
   "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-text#readme",
-  "bugs": { "url": "https://github.com/crewhaus/factory/issues" },
-  "publishConfig": { "access": "public" },
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": ["src", "README.md", "LICENSE", "NOTICE"]
 }

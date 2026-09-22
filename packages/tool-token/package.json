@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-token",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Deterministic token and address resolution: ERC-20 and ERC-721 reads with impostor flagging",
   "main": "src/index.ts",

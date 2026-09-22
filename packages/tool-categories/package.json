@@ -1,6 +1,6 @@
 {
   "name": "@crewhaus/tool-categories",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Tool category registry and the all-<category> / -<tool> selector grammar a spec's tools: list accepts",
   "main": "src/index.ts",
