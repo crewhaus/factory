@@ -1614,7 +1614,7 @@ import {
 
 const logger = createLogger({ bindings: { app: "crewhaus" } });
 
-const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
+import { SESSION_ID_REGEX, rankedSessionLogs } from "./session-logs";
 
 const VALID_PERMISSION_MODES = ["default", "plan", "auto", "bypass"] as const;
 type CliPermissionMode = (typeof VALID_PERMISSION_MODES)[number];
@@ -7611,17 +7611,7 @@ function runDoctorContextPressure(args: ParsedArgs): void {
     die(`invalid --sessions "${args.flags["sessions"]}" — must be a positive integer`);
   }
 
-  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
-  const files = existsSync(sessionsDir)
-    ? readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"))
-    : [];
-  const recent = files
-    .map((f) => {
-      const file = join(sessionsDir, f);
-      return { file, sessionId: f.replace(/\.jsonl$/, ""), mtimeMs: statSync(file).mtimeMs };
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs)
-    .slice(0, limit);
+  const recent = rankedSessionLogs(join(process.cwd(), ".crewhaus", "sessions")).slice(0, limit);
   const sessions: SessionEvents[] = recent.map((r) => ({
     sessionId: r.sessionId,
     objects: parseAdviseJsonl(readFileSync(r.file, "utf-8")),
@@ -15136,15 +15126,7 @@ async function runAdvise(args: ParsedArgs): Promise<void> {
  * empty list; the caller decides whether that is an error.
  */
 function readRecentSessionEvents(limit: number | "all"): SessionEvents[] {
-  const sessionsDir = join(process.cwd(), ".crewhaus", "sessions");
-  if (!existsSync(sessionsDir)) return [];
-  const files = readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"));
-  const ranked = files
-    .map((f) => {
-      const file = join(sessionsDir, f);
-      return { file, sessionId: f.replace(/\.jsonl$/, ""), mtimeMs: statSync(file).mtimeMs };
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const ranked = rankedSessionLogs(join(process.cwd(), ".crewhaus", "sessions"));
   const chosen = limit === "all" ? ranked : ranked.slice(0, limit);
   return chosen.map((r) => ({
     sessionId: r.sessionId,
@@ -21103,16 +21085,7 @@ async function runMcpDoctor(args: ParsedArgs): Promise<void> {
   const wantProbe = args.flags["probe"] === true;
 
   // 1. Health scoring — read mcp_stats from the N most-recent session logs.
-  const sessionsDir = join(cwd, ".crewhaus", "sessions");
-  const files = existsSync(sessionsDir)
-    ? readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"))
-    : [];
-  const recent = files
-    .map((f) => {
-      const file = join(sessionsDir, f);
-      return { file, mtimeMs: statSync(file).mtimeMs };
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+  const recent = rankedSessionLogs(join(cwd, ".crewhaus", "sessions"))
     .slice(0, limit)
     // Re-sort ASCENDING by mtime so records fold in chronological order (the
     // consecutive-error-streak proxy depends on order).
@@ -21816,17 +21789,10 @@ async function runPiiTune(args: ParsedArgs): Promise<void> {
 
   const units: ScanUnit[] = [];
   let sessionCount = 0;
-  if (existsSync(sessionsDir)) {
-    const files = readdirSync(sessionsDir)
-      .filter((f) => f.endsWith(".jsonl"))
-      .map((f) => ({
-        file: join(sessionsDir, f),
-        id: f.replace(/\.jsonl$/, ""),
-        mtimeMs: statSync(join(sessionsDir, f)).mtimeMs,
-      }))
-      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  {
+    const files = rankedSessionLogs(sessionsDir);
     const chosen = limit === "all" ? files : files.slice(0, limit);
-    for (const { file, id } of chosen) {
+    for (const { file, sessionId: id } of chosen) {
       sessionCount += 1;
       const objects = parseAdviseJsonl(readFileSync(file, "utf-8"));
       // Feedback lives in the session event log too (`user_feedback`); merge it
