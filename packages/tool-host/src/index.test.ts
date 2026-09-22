@@ -1375,7 +1375,7 @@ describe("argv is a constant", () => {
     "a b\nc",
     "../../etc/passwd",
     "--",
-    " ",
+    "\u0000",
   ];
 
   test("no caller value reaches a command line", async () => {
@@ -1394,8 +1394,8 @@ describe("argv is a constant", () => {
       seen.push(...calls);
     }
 
-    const permitted = new Set(Object.values(HOST_COMMANDS).map((argv) => argv.join(" ")));
-    const built = seen.filter((argv) => !permitted.has(argv.join(" ")));
+    const permitted = new Set(Object.values(HOST_COMMANDS).map((argv) => argv.join("\u0000")));
+    const built = seen.filter((argv) => !permitted.has(argv.join("\u0000")));
     expect(built).toEqual([]);
     // And the hostile strings appear nowhere in any argv, in any form.
     const flat = seen.flat().join(" ");

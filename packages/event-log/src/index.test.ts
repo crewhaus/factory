@@ -376,7 +376,7 @@ describe("event-log — security invariants", () => {
       "sess_0123456789abcdeg", // non-hex char
       "sess_0123456789ABCDEF", // uppercase hex not allowed
       "sess_0123456789abcdef0", // 17 hex (too long)
-      "sess_ 000000000000",
+      "sess_\u0000000000000000",
       "../escape",
     ]) {
       await expect(openEventLog(bad, { rootDir })).rejects.toThrow(/invalid sessionId/);

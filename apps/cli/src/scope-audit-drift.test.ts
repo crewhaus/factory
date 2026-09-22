@@ -389,7 +389,7 @@ describe("auditBoundarySite — anchored reply paths", () => {
     if (verifier === undefined) throw new Error("verifier site missing");
     expect(verifier.pending).toBeDefined();
     const src = readFileSync(join(root, verifier.path), "utf8");
-    expect(src.includes(verifier.anchor ?? " ")).toBe(true);
+    expect(src.includes(verifier.anchor ?? "\u0000")).toBe(true);
     for (const f of auditBoundarySite(verifier, src)) {
       expect(f.pass).toBe(true); // never fails plain doctor while pending
     }

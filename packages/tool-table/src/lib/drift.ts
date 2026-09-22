@@ -592,7 +592,10 @@ export function compareDrift(
     options.thresholds,
   );
 
-  if (reference.driftCapture.nullTokens.join(" ") !== current.driftCapture.nullTokens.join(" ")) {
+  if (
+    reference.driftCapture.nullTokens.join("\u0000") !==
+    current.driftCapture.nullTokens.join("\u0000")
+  ) {
     notes.push(
       "the two profiles were taken under different null-token lists, so every null-rate figure below is partly a difference between those lists rather than a difference in the data",
     );

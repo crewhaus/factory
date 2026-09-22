@@ -463,7 +463,7 @@ describe("ids are acted on exactly as given", () => {
   test("an unusable id is rejected with its reason, and the rest still run", async () => {
     const fake = store(["a"]);
     registerVectorTarget({ store: fake, collection: "chunks" });
-    const out = await run({ ids: ["a", "", "bad id"] });
+    const out = await run({ ids: ["a", "", "bad\u0000id"] });
     expect(out.idsRejected).toHaveLength(2);
     expect(out.idsRejected[1].reason).toContain("control characters");
     expect(fake.deleted).toEqual(["a"]);
