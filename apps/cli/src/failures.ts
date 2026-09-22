@@ -19,7 +19,10 @@
  * `FailureTaxonomyEntry` shape + specificity floor so a drafted pattern is
  * exactly what `optimize --from-advice` / the recovery engine already accept.
  */
-import { type FailureTaxonomyEntry, taxonomyPatternTooBroad } from "./advise-rules";
+import {
+  type FailureTaxonomyEntry,
+  taxonomyPatternTooBroad,
+} from "@crewhaus/harness-advice/advise-rules";
 
 /** The `run_failed` class values are the errors package's `FailureClass`; an
  *  incident contributes its trigger `kind`. Kept as a bare string so this

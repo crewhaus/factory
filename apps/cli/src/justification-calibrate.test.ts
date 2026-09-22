@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
 import type { JustificationJudge } from "@crewhaus/permission-engine";
-import type { SessionEvents } from "./advise-rules";
 import {
   type JustificationRecord,
   buildToolOutcomes,

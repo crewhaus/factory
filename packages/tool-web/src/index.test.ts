@@ -6,6 +6,7 @@ import {
   _setRawFetch,
   getWebFetchConfig,
   htmlToMarkdown,
+  isPrivateIp,
   registerWebFetchConfig,
   webFetch,
   webSearch,
@@ -771,4 +772,72 @@ describe("WebFetch — production default fetch/dns wrappers", () => {
       _setRawFetch(undefined);
     }
   });
+});
+
+// Six copies of this classifier were confirmed exploitable on 2026-09-18
+// because they compared address TEXT. One address has many spellings, and the
+// one a guard was written against is rarely the one that arrives: the WHATWG
+// parser rewrites `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`, and
+// `64:ff9b::a9fe:a9fe` IS 169.254.169.254 on any network running DNS64/NAT64 —
+// which on a cloud host is the credential-issuing metadata service. This table
+// is the property, not an example list: every row is a spelling that reached
+// the guard in the audit, so it stays a test rather than a one-off proof.
+describe("private-address classifier — spelling matrix", () => {
+  const PRIVATE_SPELLINGS: ReadonlyArray<readonly [string, string]> = [
+    ["169.254.169.254", "metadata service, dotted"],
+    ["2852039166", "metadata service, packed decimal"],
+    ["0xA9FEA9FE", "metadata service, hex"],
+    ["0251.0376.0251.0376", "metadata service, octal"],
+    ["127.1", "loopback, inet_aton short form"],
+    ["::ffff:169.254.169.254", "IPv4-mapped, dotted"],
+    ["::ffff:a9fe:a9fe", "IPv4-mapped, hex — what `new URL` actually produces"],
+    ["0:0:0:0:0:ffff:a9fe:a9fe", "IPv4-mapped, uncompressed"],
+    ["0:0:0:0:0:ffff:169.254.169.254", "IPv4-mapped, uncompressed + dotted"],
+    ["64:ff9b::a9fe:a9fe", "NAT64 well-known prefix"],
+    ["64:ff9b::169.254.169.254", "NAT64, dotted tail"],
+    ["64:ff9b:1::a9fe:a9fe", "NAT64 local-use prefix 64:ff9b:1::/48"],
+    ["64:ff9b:1:0:0:0:a9fe:a9fe", "NAT64 local-use, uncompressed"],
+    ["::a9fe:a9fe", "IPv4-compatible IPv6"],
+    ["::ffff:0:a9fe:a9fe", "IPv4-translated ::ffff:0:0:0/96"],
+    ["2002:a9fe:a9fe::", "6to4"],
+    ["127.0.0.1", "loopback"],
+    ["::1", "IPv6 loopback"],
+    ["0:0:0:0:0:0:0:1", "IPv6 loopback, uncompressed"],
+    ["64:ff9b::7f00:1", "loopback behind NAT64"],
+    ["fe80::1", "link-local"],
+    ["febf::1", "link-local, top of fe80::/10"],
+    ["fd00::1", "unique-local"],
+    ["::", "unspecified"],
+    ["0:0:0:0:0:0:0:0", "unspecified, uncompressed"],
+    ["10.0.0.1", "RFC1918"],
+    ["192.168.1.1", "RFC1918"],
+    ["172.16.0.1", "RFC1918"],
+    ["100.64.0.1", "CGNAT"],
+    ["198.18.0.1", "benchmarking"],
+    ["224.0.0.1", "multicast"],
+    ["255.255.255.255", "broadcast"],
+    ["0.0.0.0", "this-network"],
+  ];
+
+  for (const [address, why] of PRIVATE_SPELLINGS) {
+    test(`blocks ${address} (${why})`, () => {
+      expect(isPrivateIp(address)).toBe(true);
+    });
+  }
+
+  // The other half of the property: a guard that blocks everything is not a
+  // guard, it is an outage.
+  const PUBLIC_ADDRESSES = [
+    "8.8.8.8",
+    "1.1.1.1",
+    "93.184.216.34",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+  ] as const;
+
+  for (const address of PUBLIC_ADDRESSES) {
+    test(`allows the public address ${address}`, () => {
+      expect(isPrivateIp(address)).toBe(false);
+    });
+  }
 });

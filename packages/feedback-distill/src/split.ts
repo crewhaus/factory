@@ -4,7 +4,7 @@
  * teardown auto-distill, and the D39 daemon janitor step) must agree on.
  *
  * Extracted here so a compiled daemon bundle registers the SAME splits the
- * toolchain would; `apps/cli/src/datasets.ts` re-exports these.
+ * toolchain would; `packages/dataset-ops/src/datasets.ts` re-exports these.
  */
 import { createHash } from "node:crypto";
 import type { Sample } from "@crewhaus/eval-dataset";

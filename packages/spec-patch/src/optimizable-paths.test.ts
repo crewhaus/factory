@@ -497,13 +497,27 @@ function concretize(
   return walk(parsed, 0, []);
 }
 
+/**
+ * One parse per fixture, not one per (fixture, optimizable path). `declaring`
+ * is called once per entry by each of the two guards below, so parsing inside
+ * it costs entries x fixtures full YAML parses per target. `parse` is a pure
+ * function of the text and `concretize` only reads the tree it walks — the
+ * parsed document never escapes `declaring`, which returns the yaml STRING —
+ * so one shared document per fixture is safe to hand to every entry.
+ */
+const PARSED_FIXTURES = new Map<string, unknown>();
+function parseFixture(yaml: string): unknown {
+  if (!PARSED_FIXTURES.has(yaml)) PARSED_FIXTURES.set(yaml, parse(yaml));
+  return PARSED_FIXTURES.get(yaml);
+}
+
 /** The first fixture of `target` that carries `entry`, with the concrete path. */
 function declaring(
   target: Spec["target"],
   entry: ReadonlyArray<string>,
 ): { yaml: string; path: ReadonlyArray<SpecEditPathSegment> } | undefined {
   for (const yaml of FIXTURES[target]) {
-    const path = concretize(parse(yaml), entry);
+    const path = concretize(parseFixture(yaml), entry);
     if (path !== undefined) return { yaml, path };
   }
   return undefined;
@@ -544,7 +558,22 @@ describe("OPTIMIZABLE_PATHS ⊆ spec schema (subset-of-schema guard)", () => {
         // The concrete instance is admitted by the matcher (exact match).
         expect(isOptimizable(target, hit.path)).toBe(true);
       }
-    });
+      // DECLARED, because bun's default is 5000ms and this one is slow by
+      // construction: it checks every optimizable path of the target, and
+      // `cli` has the most (39). The repeated-work half is gone —
+      // `parseFixture` memoizes, which took the whole file from 576 fixture
+      // parses to 17 and this test from ~79ms to ~52ms — but the parses were
+      // never the bulk of it, and what remains is the per-entry specHasPath
+      // and isOptimizable work the guard exists to do.
+      //
+      // The deadline stays because CONTENTION, not this code, is what fails:
+      // it timed out at 5708ms on a runner fanning `bun run --filter` out
+      // over 220 packages. Measured under load rather than on a quiet
+      // stopwatch (8-core M1, memoized, CPU oversubscribed to imitate a
+      // 2-core runner): 16 spinners 520ms, 64 spinners 2097ms, 128 spinners
+      // 4025ms — near-linear in the contention, and already at bun's default
+      // before reaching the CI runner's load. Lowering this buys a flake.
+    }, 30_000);
   }
 });
 
@@ -593,7 +622,18 @@ describe("OPTIMIZABLE_PATHS × applySpecEdits (optimizer-surface round-trip)", (
           `re-setting [${hit.path.join(", ")}] to its own value drifted the parsed spec`,
         ).toEqual([]);
       }
-    });
+      // Same shape as the guard above, and more work per entry: every path
+      // also makes an edit and diffs the result. It has the same implicit
+      // 5000ms and the same reason to declare one.
+      //
+      // This is the family memoizing `parseFixture` did NOT speed up, which
+      // is the evidence that it is slow by construction rather than by
+      // repeated work: dropping its share of the 576 fixture parses moved it
+      // by noise (~175ms to ~170ms quiet), because the cost is the
+      // applySpecEdits + diffSpecYaml round trip run once per optimizable
+      // path — the thing under test. It is the slowest test in the file, so
+      // it reaches bun's default under contention sooner than the guard does.
+    }, 30_000);
   }
 
   test("a wildcard entry round-trips through validatePatch too (string-indexed path)", () => {

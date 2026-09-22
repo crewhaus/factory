@@ -3,13 +3,16 @@
  *
  * The package has two halves, and they are deliberately not mixed.
  *
- * **Local.** Nine tools read a harness's OWN telemetry: the JSONL session logs
- * `@crewhaus/event-log` writes under `.crewhaus/sessions`. They touch no
+ * **Local.** Ten tools work on a harness's OWN telemetry: the JSONL session
+ * logs `@crewhaus/event-log` writes under `.crewhaus/sessions`. They touch no
  * network, every path goes through `./paths` containment, every file is
  * byte-capped on disk before a byte is read, and every parse is event-capped
  * so the cap bounds MEMORY rather than being applied after buffering. Two of
  * them (`BudgetCheck`, `SloEvaluate`) are pure arithmetic and touch nothing at
- * all. One of them (`IncidentBundle`) writes a single contained file.
+ * all. Two of them write: `IncidentBundle` produces a single contained file,
+ * and `EmitTraceEvent` appends one line to a session log — the only writer
+ * onto the bus the other eight read, which is why the shape of that line and
+ * the provenance on it are `./lib/emit`'s whole subject.
  *
  * **Remote.** Six tools query an external platform. Every outbound byte goes
  * through `./net` — fail-closed origin allow-list, SSRF refusal, IP pinning,
@@ -36,7 +39,17 @@
  * string rather than an exception.
  */
 import { Buffer } from "node:buffer";
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
@@ -45,11 +58,14 @@ import { budgetCheck as budgetCheckFn } from "./lib/budget";
 import { costReport as costReportFn } from "./lib/cost";
 import type { ModelRate } from "./lib/cost";
 import { countEvents, toolCallStats as toolCallStatsFn } from "./lib/counts";
+import { type AmbientContext, buildEmittedEvent, findForbidden, refuseForbidden } from "./lib/emit";
 import {
   type EventFilter,
   type FieldPredicate,
   type ObsEvent,
   PREDICATE_OPS,
+  asNumber,
+  asString,
   byString,
   compareEvents,
   filterEvents,
@@ -812,6 +828,284 @@ export const incidentBundle: RegisteredTool = buildTool({
       eventsIncluded: Math.min(matched.length, limit),
       errorGroups: bundle.errors.groups.length,
     });
+  },
+});
+
+// ---------------------------------------------------------------------------
+// local: writing one line back onto the bus
+// ---------------------------------------------------------------------------
+
+/**
+ * The run this call is executing inside, narrowed to the three facts that go
+ * on the line.
+ *
+ * The runtime threads its `RunContext` through `ctx.runContext`, with the
+ * opaque bridge as the older carrier — the same two places `tool-wiki` and
+ * `tool-plan` look, for the same reason: a tool that reads only one of them
+ * silently loses provenance on the runs that use the other.
+ *
+ * Read STRUCTURALLY and re-validated field by field rather than through the
+ * `RunContext` type, because importing that type would mean adding
+ * `@crewhaus/run-context` to this package's dependencies, and the bridge
+ * carrier is `unknown` at this seam anyway. Everything that survives is
+ * checked, so a bridge holding some other shape contributes nothing rather
+ * than putting a non-string on the line.
+ */
+type AmbientRead = {
+  /** A run context was attached to the call, whatever it turned out to hold. */
+  readonly attached: boolean;
+  /** The facts that survived validation; absent when NONE of them did. */
+  readonly context?: AmbientContext;
+};
+
+function ambientFrom(ctx: ToolExecuteContext | undefined): AmbientRead {
+  const carrier = (ctx?.runContext ??
+    (ctx?.bridge as { runContext?: unknown } | undefined)?.runContext) as
+    | { runId?: unknown; sessionId?: unknown; turnNumber?: unknown }
+    | undefined;
+  if (carrier === undefined || carrier === null) return { attached: false };
+  const runId = asString(carrier.runId);
+  const sessionId = asString(carrier.sessionId);
+  const turnNumber = asNumber(carrier.turnNumber);
+  // "A context was attached" and "the context told us something" are different
+  // answers, and the structural read is exactly what makes the second one fail
+  // on its own: a runtime that renamed a field hands this an object every
+  // extraction misses. Collapsing the two would report a provenance nothing
+  // supplied, on the very drift reading structurally invites.
+  if (runId === undefined && sessionId === undefined && turnNumber === undefined) {
+    return { attached: true };
+  }
+  return {
+    attached: true,
+    context: {
+      ...(runId !== undefined ? { runId } : {}),
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      ...(turnNumber !== undefined ? { turnNumber } : {}),
+    },
+  };
+}
+
+/**
+ * True when the log does not end in a newline, so the append must start with
+ * one.
+ *
+ * A transcript cut short by a killed process ends mid-line — the readers here
+ * already count that line as malformed, and it is the normal case during an
+ * incident. An append that ignored it would glue this event onto the tail of
+ * that half line: one unreadable line would become one unreadable line and one
+ * LOST event, and the loss would be silent. Exactly one byte is read, at a
+ * known offset, so this costs nothing on a large log and never buffers it.
+ *
+ * A writer that appends between the size and the read makes this answer about
+ * a byte that is no longer last. The cost of being wrong is one blank line,
+ * which `parseLog` skips without counting it as malformed — the check fails
+ * towards a harmless line rather than towards a lost event.
+ */
+function endsWithoutNewline(real: string, size: number, shown: string): Loaded<boolean> {
+  let fd: number | undefined;
+  try {
+    fd = openSync(real, "r");
+    const tail = Buffer.alloc(1);
+    const read = readSync(fd, tail, 0, 1, size - 1);
+    return { ok: true, value: read === 1 && tail[0] !== 0x0a };
+  } catch {
+    return { ok: false, message: `"${shown}" could not be read to find its last line` };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+export const emitTraceEvent: RegisteredTool = buildTool({
+  name: "EmitTraceEvent",
+  description:
+    "Append one custom event to a harness's own JSONL session log, so a workflow that never calls a model still leaves a record EventQuery, EventCounts and RunTimeline can read back. Use it to mark what a tool-only run did — a milestone reached, a threshold crossed, a check that passed — at the moment it happened, rather than leaving a human to infer it from side effects. The event is written in the runtime's own wire shape but under the kind custom.<name>, a namespace no runtime event can occupy, and the payload records whether a live run context supplied the attribution or the caller merely claimed it, so a line a tool wrote is never mistaken for a line the runtime wrote. Your own fields are nested one level down where no kind-agnostic reader will read them as the runtime's, control characters and invisible or direction-changing text are refused rather than escaped, and the finished line is capped; it records no time of its own, so pass tsMs for the event to carry one.",
+  inputSchema: z.object({
+    name: z
+      .string()
+      .min(1)
+      .describe(
+        "the event name, lower snake case (e.g. `deploy_started`); written as the kind `custom.<name>`",
+      ),
+    message: z
+      .string()
+      .optional()
+      .describe("one line a human can read; no control characters, no line breaks"),
+    level: z
+      .enum(["info", "warn", "error"])
+      .optional()
+      .describe("default info; error also marks the entry as an error in a timeline"),
+    fields: z
+      .record(z.union([z.string(), z.number(), z.boolean()]))
+      .optional()
+      .describe("scalar key/values recorded under `fields`; no nested objects, no arrays"),
+    tsMs: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        "epoch ms to stamp the event with; omitted means the event carries no time and no time-bounded query will match it",
+      ),
+    runId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "the run this belongs to; ignored in favour of the live run context when there is one, and kept as claimedRunId",
+      ),
+    dir: z
+      .string()
+      .optional()
+      .describe(
+        `sessions directory, relative to the working directory (default ${DEFAULT_SESSIONS_DIR})`,
+      ),
+    sessionId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("the session log to append to; defaults to the session this call is running in"),
+    create: z
+      .boolean()
+      .optional()
+      .describe("start the log if it does not exist yet (default false)"),
+    dryRun: z
+      .boolean()
+      .optional()
+      .describe("run every check and return the exact line, without appending it"),
+  }),
+  destructive: true,
+  execute: async (input, ctx) => {
+    const ambient = ambientFrom(ctx);
+    const sessionId = input.sessionId ?? ambient.context?.sessionId;
+    if (sessionId === undefined) {
+      // Which of the two is missing, rather than one message for both: a run
+      // context that is there and has no session is a different fault from no
+      // run context at all, and only the first is the runtime's.
+      return ambient.attached
+        ? "pass sessionId — the run context on this call carries no sessionId, so there is no session log to append to by default"
+        : "pass sessionId — this call carries no run context, so there is no session log to append to by default";
+    }
+    // Checked BEFORE `sessionFileName`, whose own refusal echoes the id: a
+    // refusal that pastes a bidi override into the text a model reads back is
+    // the attack it was meant to refuse.
+    const idChar = findForbidden(sessionId);
+    if (idChar !== undefined) return refuseForbidden("sessionId", idChar);
+    const file = sessionFileName(sessionId);
+    if (!file.ok) return file.message;
+    // The canonical id is the FILE's name without its suffix — the same
+    // derivation `loadEvents` uses when it reads this line back, so
+    // `sess_x` and `sess_x.jsonl` cannot disagree about which session this is.
+    const canonicalSession = file.value.replace(/\.jsonl$/, "");
+    // Checked on the DERIVED id, not on the input: `""` and `"."` both survive
+    // `sessionFileName` and land on `.jsonl` and `..jsonl` — dot-files this
+    // package would sweep up as sessions named `""` and `"."`, created by a
+    // call that was really asking for the default session and did not get it.
+    if (canonicalSession === "" || canonicalSession.startsWith(".")) {
+      return `"${renderPath(sessionId)}" is not a session id — it names a hidden file rather than a session`;
+    }
+    const dirRel = input.dir ?? DEFAULT_SESSIONS_DIR;
+    const rel = toPosix(path.join(dirRel, file.value));
+    // The gate is on the path that is ACTED on, so `dir` is covered by the
+    // same rule as `sessionId` and nothing a derivation added can slip past.
+    // This tool CREATES names; a directory or a log whose name carries a line
+    // break or a direction override is one a human cannot read in a listing
+    // and cannot safely paste back, and the name is echoed into the result.
+    const pathChar = findForbidden(rel);
+    if (pathChar !== undefined) return refuseForbidden("the session log path", pathChar);
+    const shown = renderPath(rel);
+    // The path CONTAINED is the file that gets opened, not the directory the
+    // caller named: `join` is lexical, and an in-workspace `sessions` symlink
+    // pointing somewhere else is exactly what this check exists to catch.
+    let target: SafePath;
+    try {
+      target = resolveSafe("EmitTraceEvent", rel);
+    } catch (err) {
+      if (err instanceof ToolPermissionError) return err.message;
+      throw err;
+    }
+
+    let size: number | undefined;
+    try {
+      const stat = statSync(target.real);
+      if (!stat.isFile()) return `"${shown}" is not a file`;
+      size = stat.size;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // "Missing" and "unreadable" are different answers, and only one of them
+      // is fixable by passing `create`.
+      if (code !== "ENOENT") {
+        return `"${shown}" could not be read${code !== undefined ? ` (${code})` : ""}`;
+      }
+      if (input.create !== true) {
+        return `no session log at "${shown}" — check the sessionId, or pass create: true to start one`;
+      }
+    }
+    if (size !== undefined && size > MAX_LOG_BYTES) {
+      // Writing into a log this package's own readers refuse to open would be
+      // writing the event into a place it can never be read back from.
+      return `"${shown}" is ${size} bytes, over the ${MAX_LOG_BYTES} limit the readers here apply — an event appended to it could not be read back by EventQuery`;
+    }
+
+    const repair =
+      size === undefined || size === 0
+        ? { ok: true as const, value: false }
+        : endsWithoutNewline(target.real, size, shown);
+    if (!repair.ok) return repair.message;
+
+    const built = buildEmittedEvent({
+      name: input.name,
+      ...(input.message !== undefined ? { message: input.message } : {}),
+      ...(input.level !== undefined ? { level: input.level } : {}),
+      ...(input.fields !== undefined ? { fields: input.fields } : {}),
+      ...(input.tsMs !== undefined ? { tsMs: input.tsMs } : {}),
+      ...(input.runId !== undefined ? { runId: input.runId } : {}),
+      targetSessionId: canonicalSession,
+      ...(ambient.context !== undefined ? { ambient: ambient.context } : {}),
+      ...(ambient.attached ? { contextAttached: true } : {}),
+    });
+    if (!built.ok) return built.message;
+
+    const text = repair.value ? `\n${built.value.line}` : built.value.line;
+    const report = {
+      session: canonicalSession,
+      file: toPosix(target.rel),
+      kind: built.value.kind,
+      bytes: Buffer.byteLength(text, "utf8"),
+      // Read off the built event rather than recomputed: the same rule spelled
+      // twice is the one that drifts, and this is the field that says whether
+      // the attribution on the line came from a live run at all.
+      runContext: built.value.runContext,
+      ...(built.value.runId !== undefined
+        ? { runId: built.value.runId, runIdSource: built.value.runIdSource }
+        : {}),
+      ...(built.value.ts !== undefined ? { ts: built.value.ts } : { timestamped: false }),
+      ...(repair.value ? { precededByNewline: true } : {}),
+      ...(built.value.ts === undefined
+        ? {
+            note: "no tsMs was supplied, so this event carries no timestamp — it keeps its place in log order but sinceTs/untilTs will never match it",
+          }
+        : {}),
+    };
+
+    // The dry run is the real path with the last statement skipped: same
+    // containment, same existence and size checks, same newline probe, same
+    // builder, same bytes. A preview computed any other way is a preview of
+    // something else.
+    if (input.dryRun === true) return json({ dryRun: true, ...report, line: text });
+
+    try {
+      if (size === undefined) {
+        const parent = path.dirname(target.real);
+        if (parent !== target.real) mkdirSync(parent, { recursive: true });
+      }
+      // Mode and append semantics are `@crewhaus/event-log`'s: owner-only, and
+      // one O_APPEND write per line so a runtime appending to the same log
+      // concurrently cannot end up interleaved with this one.
+      appendFileSync(target.real, text, { mode: 0o600 });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return `"${shown}" could not be appended to${code !== undefined ? ` (${code})` : ""}`;
+    }
+    return json({ appended: true, ...report });
   },
 });
 
@@ -1586,6 +1880,7 @@ export const OBS_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   alertList,
   budgetCheck,
   costReport,
+  emitTraceEvent,
   errorCluster,
   eventCounts,
   eventQuery,

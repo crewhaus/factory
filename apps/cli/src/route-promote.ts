@@ -45,6 +45,7 @@
  */
 import { join } from "node:path";
 import type { AuditKind } from "@crewhaus/audit-log";
+import { gateRuns } from "@crewhaus/eval-ops/eval-history";
 import {
   type BaselineEntry,
   type LoadedRun,
@@ -56,7 +57,6 @@ import {
 } from "@crewhaus/eval-report";
 import type { EvalRoutingMode } from "@crewhaus/eval-runner";
 import { type PromoteResult, promoteLanes, readRouteFreeze } from "@crewhaus/routing-store";
-import { gateRuns } from "./eval-history";
 
 /** The verdict on whether a promotion is authorized, and by which run. */
 export type PromotionGate = {

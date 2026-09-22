@@ -2,7 +2,7 @@
   "name": "@crewhaus/tool-flow",
   "version": "0.6.0",
   "type": "module",
-  "description": "Deterministic control-flow tools: branching, decision tables, error classification, deadlines, consensus, stall detection and rule scoring",
+  "description": "Deterministic control-flow tools: branching, decision tables, error classification, deadlines, consensus, stall detection, rule scoring, record routing and sequence planning",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

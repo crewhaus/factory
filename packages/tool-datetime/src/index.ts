@@ -21,6 +21,7 @@
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { readHostZone } from "./host";
 import {
   ALL_UNITS,
   type Unit,
@@ -32,6 +33,7 @@ import {
   diffCalendarDays,
   diffCalendarMonths,
   expandRange,
+  isBusinessDay,
 } from "./lib/arithmetic";
 import {
   type CivilDateTime,
@@ -48,16 +50,22 @@ import {
   daysInYear,
   formatOffset,
   isLeapYear as isLeapYearFn,
+  isRepresentableInstant,
   isValidTimeZone,
   isoDateFromEpochMs,
   isoFromEpochMs,
   isoWeek,
+  nextOffsetTransition,
+  outOfRangeMessage,
+  pad,
   quarterOfMonth,
+  resolveWallClock,
   simpleWeek,
   wallClockInZone,
   weekdayFromEpochDay,
   zoneAbbreviation,
   zoneOffsetMinutes,
+  zoneOffsetProfile,
 } from "./lib/civil";
 import { CRON_HORIZON_YEARS, cronNext as cronNextFn, describeCron, parseCron } from "./lib/cron";
 import { type DurationStyle, type FixedUnit, formatDuration, parseDuration } from "./lib/duration";
@@ -1203,6 +1211,445 @@ export const timestampConvert: RegisteredTool = buildTool({
   },
 });
 
+// ---------------------------------------------------------------------------
+
+/** `HH:MM` on a 24-hour clock — the only spelling the business-hours fields take. */
+const HOUR_MINUTE_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+/** Minutes past local midnight, or a sentence saying why the text is not a time. */
+function readHourMinute(label: string, text: string): number | string {
+  const match = HOUR_MINUTE_RE.exec(text);
+  if (match === null) {
+    return `${label} must be written HH:MM on a 24-hour clock, e.g. "09:00" or "17:30" — got "${text}"`;
+  }
+  // Act on the parsed groups, never on the original string: a second parse of
+  // the same text is a second chance to disagree with the first.
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+const DEFAULT_BUSINESS_START = 9 * 60;
+const DEFAULT_BUSINESS_END = 17 * 60;
+
+/** How far ahead `LocalTime` looks for the zone's next offset change. */
+const OFFSET_HORIZON_DAYS = 400;
+
+export const localTime: RegisteredTool = buildTool({
+  name: "LocalTime",
+  description:
+    "Answer what an instant looks like where the operator is — their timezone, wall clock, UTC offset, whether their clocks are on a raised offset and when they next change — and what that means for a schedule: whether this lands inside working hours, when the next working window opens, when a cron next fires on their clock, and what the same moment reads as in other zones. Use before proposing a meeting, a maintenance window or an on-call page. The instant is always an input, as everywhere in this package; the zone is the one thing taken from the host, and the answer says which source it came from.",
+  inputSchema: z.object({
+    instant: z
+      .string()
+      .min(1)
+      .max(MAX_TEXT)
+      .describe(
+        "the moment to answer for — this tool never reads the clock, so 'now' has to be passed in",
+      ),
+    timeZone: zoneField.describe(
+      "IANA zone to answer for, instead of the host's; pass it to make the call fully deterministic",
+    ),
+    compareTimeZones: z
+      .array(z.string().min(1).max(64))
+      .max(12)
+      .optional()
+      .describe("other IANA zones to read the same instant in"),
+    businessHours: z
+      .object({
+        start: z.string().min(1).max(5).describe("local start, HH:MM on a 24-hour clock"),
+        end: z.string().min(1).max(5).describe("local end, HH:MM; must be later the same day"),
+      })
+      .optional()
+      .describe("the working window in the answering zone; defaults to 09:00-17:00"),
+    weekend: z
+      .union([
+        z.enum(["sat-sun", "fri-sat", "thu-fri", "sun-only", "fri-only", "none"]),
+        z.array(z.number().int().min(0).max(6)).max(7),
+      ])
+      .optional()
+      .describe("weekend preset, or weekday numbers with 0 = Sunday; defaults to sat-sun"),
+    holidays: z
+      .array(z.string().max(MAX_TEXT))
+      .max(2000)
+      .optional()
+      .describe("dates that are not worked, in any format DateParse accepts"),
+    cron: z
+      .string()
+      .min(1)
+      .max(200)
+      .optional()
+      .describe("a 5-field cron expression to read on the operator's wall clock"),
+    cronCount: z
+      .number()
+      .int()
+      .min(1)
+      .max(20)
+      .optional()
+      .describe("firings to return for 'cron'; defaults to 3"),
+  }),
+  readOnly: true,
+  concurrencySafe: true,
+  execute: async (input) => {
+    // ── the zone, and where it came from ───────────────────────────────────
+    // A wrong zone does not look like an error, it looks like a correct time,
+    // so the provenance travels with the answer instead of being assumed.
+    let timeZone: string;
+    let zone: Record<string, unknown>;
+    if (input.timeZone !== undefined) {
+      const bad = zoneError(input.timeZone);
+      if (bad !== undefined) return bad;
+      timeZone = input.timeZone;
+      zone = {
+        timeZone,
+        source: "override",
+        detail: "supplied by the caller, so the host was not consulted at all",
+      };
+    } else {
+      const reading = readHostZone();
+      if (!reading.ok) {
+        return json({
+          ok: false,
+          error: "the host's timezone could not be determined",
+          zoneSource: reading.source,
+          reason: reading.reason,
+          ...(reading.tzEnv !== undefined ? { tzEnv: reading.tzEnv } : {}),
+          ...(reading.runtimeZone !== undefined ? { runtimeZone: reading.runtimeZone } : {}),
+          remedy: "pass timeZone to answer for a zone explicitly",
+        });
+      }
+      // Validate the zone that will actually be used, not the one that was
+      // asked for: an injected seam can hand back anything, and every lookup
+      // below would otherwise throw a bare RangeError out of Intl.
+      const bad = zoneError(reading.timeZone);
+      if (bad !== undefined) {
+        // `tzEnv` and `runtimeZone` travel on this branch too: an operator
+        // whose TZ is the unusable name needs to see it here most of all.
+        return json({
+          ok: false,
+          error: "the host named a timezone this runtime cannot use",
+          zoneSource: reading.source,
+          reason: bad,
+          ...(reading.tzEnv !== undefined ? { tzEnv: reading.tzEnv } : {}),
+          ...(reading.runtimeZone !== undefined ? { runtimeZone: reading.runtimeZone } : {}),
+          remedy: "pass timeZone to answer for a zone explicitly",
+        });
+      }
+      timeZone = reading.timeZone;
+      zone = {
+        timeZone,
+        source: reading.source,
+        detail: reading.detail,
+        ...(reading.tzEnv !== undefined ? { tzEnv: reading.tzEnv } : {}),
+        ...(reading.runtimeZone !== undefined ? { runtimeZone: reading.runtimeZone } : {}),
+        ...(reading.conflict !== undefined ? { conflict: reading.conflict } : {}),
+      };
+    }
+
+    const instant = readInstant(input.instant, timeZone);
+    if (typeof instant === "string") return `could not read 'instant': ${instant}`;
+    const epochMs = instant.epochMs;
+    const wall = wallClockInZone(epochMs, timeZone);
+    const offsetMinutes = zoneOffsetMinutes(epochMs, timeZone);
+    const notes = [...instant.notes];
+
+    // The package's own formatter, not `Intl` — which matters at midnight.
+    // `Intl` with `hour12: false` renders 00:00 as hour "24" on some ICU
+    // builds (recorded in durable-execution's schedule.ts); this token
+    // formatter derives every clock field from the already-parsed wall clock,
+    // so that trap has no way in here.
+    const clock = formatWallClock("dddd, D MMMM YYYY [at] HH:mm zz", {
+      wall,
+      offsetMinutes,
+      epochMs,
+      abbreviation: zoneAbbreviation(epochMs, timeZone),
+      locale: "en-US",
+    });
+
+    // ── is the clock raised, and when does it next move ────────────────────
+    const profile = zoneOffsetProfile(epochMs, timeZone);
+    const clocksForward =
+      profile === undefined
+        ? {
+            determined: false,
+            reason:
+              "the surrounding year could not be probed for this instant, so whether the clock is raised is unknown — not 'no'",
+          }
+        : {
+            determined: true,
+            aboveLowestByMinutes: profile.offsetMinutes - profile.lowestMinutes,
+            zoneChangesOffsetInWindow: profile.highestMinutes !== profile.lowestMinutes,
+            // A zone that went up and came back changed twice; one that moved
+            // once and stayed changed once. Without this number the reading
+            // below calls a redefinition of a zone's offset a clock change.
+            offsetChangesInWindow: profile.offsetChanges,
+            wentBackDown: profile.offsetChanges >= 2,
+            lowestOffsetMinutes: profile.lowestMinutes,
+            highestOffsetMinutes: profile.highestMinutes,
+            window: {
+              from: isoFromEpochMs(profile.fromEpochMs, 0),
+              to: isoFromEpochMs(profile.toEpochMs, 0),
+              stepDays: profile.stepDays,
+              samples: profile.samples,
+              // Near either end of what a date can hold the window is clamped,
+              // and a reading over half a window is weaker than one over a
+              // whole one. Saying so beats letting "no seasonal change near
+              // this date" stand on 183 days of evidence dressed as 366.
+              ...(profile.truncated
+                ? {
+                    truncated: true,
+                    truncationNote:
+                      "the end of the representable range cut this window short, so the reading covers fewer days than were asked for",
+                  }
+                : {}),
+            },
+            reading:
+              profile.highestMinutes === profile.lowestMinutes
+                ? "this zone used a single offset across the whole window, so there is no seasonal clock change near this date"
+                : profile.offsetChanges < 2
+                  ? `this zone changed offset once in the window and never changed back, which is a zone redefining its offset rather than a seasonal clock change; this instant is ${profile.offsetMinutes - profile.lowestMinutes} minutes above the lower of the two`
+                  : profile.offsetMinutes > profile.lowestMinutes
+                    ? `this instant sits ${profile.offsetMinutes - profile.lowestMinutes} minutes above the lowest offset this zone used in the window — the clocks are forward`
+                    : "this zone does change offset in the window, but this instant is at its lowest offset — the clocks are not forward",
+            method:
+              "offsets observed by probing the zone daily across the window, compared against the lowest one seen and counting how often the zone moved",
+            caveat:
+              "Intl does not expose tzdb's own DST flag, so this reports the clock rather than the flag. They part company twice: where a zone records its winter as the DST period (Europe/Dublin), and where a zone moved its offset for good inside the window and was never on DST at all (Europe/Volgograd, which left UTC+4 in December 2020) — which is what offsetChangesInWindow is here to tell you",
+          };
+
+    const transition = nextOffsetTransition(epochMs, timeZone, OFFSET_HORIZON_DAYS);
+    const nextOffsetChange =
+      transition === undefined
+        ? {
+            found: false,
+            searchedDays: OFFSET_HORIZON_DAYS,
+            note: `no offset change within ${OFFSET_HORIZON_DAYS} days of this instant — either the zone has none, or the search ran into the end of the representable range`,
+          }
+        : {
+            found: true,
+            utc: isoFromEpochMs(transition.epochMs, 0),
+            localBefore: isoFromEpochMs(transition.epochMs - 1, transition.beforeMinutes),
+            localAfter: isoFromEpochMs(transition.epochMs, transition.afterMinutes),
+            fromOffsetMinutes: transition.beforeMinutes,
+            toOffsetMinutes: transition.afterMinutes,
+            shiftMinutes: transition.afterMinutes - transition.beforeMinutes,
+            direction: transition.afterMinutes > transition.beforeMinutes ? "forward" : "back",
+            minutesAway: Math.round((transition.epochMs - epochMs) / MS_PER_MINUTE),
+          };
+
+    // ── what it means for a schedule ───────────────────────────────────────
+    const startMinutes =
+      input.businessHours === undefined
+        ? DEFAULT_BUSINESS_START
+        : readHourMinute("businessHours.start", input.businessHours.start);
+    if (typeof startMinutes === "string") return startMinutes;
+    const endMinutes =
+      input.businessHours === undefined
+        ? DEFAULT_BUSINESS_END
+        : readHourMinute("businessHours.end", input.businessHours.end);
+    if (typeof endMinutes === "string") return endMinutes;
+    if (endMinutes <= startMinutes) {
+      // Refused by name rather than wrapped around midnight. An overnight
+      // shift is a real thing, but it belongs to two calendar days at once and
+      // "which day is a business day" stops having one answer — so it is out
+      // of the grammar instead of being guessed at.
+      return `businessHours.end (${input.businessHours?.end}) must be later in the day than businessHours.start (${input.businessHours?.start}); an overnight window is not supported`;
+    }
+
+    const weekendList =
+      input.weekend === undefined
+        ? WEEKEND_PRESETS["sat-sun"]
+        : typeof input.weekend === "string"
+          ? WEEKEND_PRESETS[input.weekend]
+          : input.weekend;
+    const weekend = new Set(weekendList ?? [6, 0]);
+    if (weekend.size === 7) {
+      return "every weekday is marked as weekend, so there is no working window to report";
+    }
+    // The same reader BusinessDays uses, so a holiday means the same thing to
+    // both tools: a calendar date in the answering zone, not an instant.
+    const holidays = new Set<number>();
+    for (const text of input.holidays ?? []) {
+      const parsed = readInstant(text, timeZone);
+      if (typeof parsed === "string") return `could not read holiday "${text}": ${parsed}`;
+      const holidayWall = wallClockInZone(parsed.epochMs, timeZone);
+      holidays.add(daysFromCivil(holidayWall.year, holidayWall.month, holidayWall.day));
+    }
+    const calendar = { weekend, holidays };
+
+    const epochDay = daysFromCivil(wall.year, wall.month, wall.day);
+    const minuteOfDay = wall.hour * 60 + wall.minute;
+    const working = isBusinessDay(epochDay, calendar);
+    const phase = !working
+      ? "non-working-day"
+      : minuteOfDay < startMinutes
+        ? "before-open"
+        : minuteOfDay < endMinutes
+          ? "open"
+          : "after-close";
+
+    /**
+     * A local wall clock on a given day, back as an instant. `resolveWallClock`
+     * is the package's existing answer to the two DST cases, and it reports
+     * which one it hit instead of silently picking — so a working day that
+     * opens inside a spring-forward gap says so rather than quietly shifting.
+     */
+    const atLocalTime = (day: number, minutes: number): Record<string, unknown> => {
+      const civil = civilFromDays(day);
+      const resolved = resolveWallClock(
+        {
+          year: civil.year,
+          month: civil.month,
+          day: civil.day,
+          hour: Math.floor(minutes / 60),
+          minute: minutes % 60,
+          second: 0,
+          millisecond: 0,
+        },
+        timeZone,
+      );
+      // A fall-back repeat maps this wall clock to TWO instants, and
+      // `resolveWallClock` hands back the earlier one. That is the right rule
+      // for reading a timestamp and the wrong answer to "when does this next
+      // happen": asked at 01:30 EST — the second pass of that clock — the
+      // 01:45 close resolved to 01:45 EDT, forty-five minutes in the PAST, and
+      // `minutesFromHere` came back negative. So pick the first candidate that
+      // has not gone by, out of the candidate list `resolveWallClock` already
+      // computed; resolving the wall clock a second time under a different
+      // rule is how two answers to the same question start to drift.
+      let epoch = resolved.epochMs;
+      let usedOffset = resolved.offsetMinutes;
+      let usedSecondPass = false;
+      if (resolved.resolution === "ambiguous" && epoch < epochMs) {
+        const later = resolved.candidates.find((candidate) => candidate >= epochMs);
+        if (later !== undefined) {
+          epoch = later;
+          usedOffset = zoneOffsetMinutes(later, timeZone);
+          usedSecondPass = true;
+        }
+      }
+      // A working window can fall off the end of what a date can hold: ask for
+      // the next open from the last representable day and the answer is two
+      // days past it. `isoFromEpochMs` is pure arithmetic and would render that
+      // happily, which is the silent-wrong-answer case this package refuses
+      // everywhere else — so it is a reason here, not an instant.
+      if (!isRepresentableInstant(epoch)) {
+        return { determined: false, reason: outOfRangeMessage("this working window") };
+      }
+      return {
+        local: isoFromEpochMs(epoch, usedOffset),
+        utc: isoFromEpochMs(epoch, 0),
+        minutesFromHere: Math.round((epoch - epochMs) / MS_PER_MINUTE),
+        ...(resolved.resolution !== "unique"
+          ? {
+              wallClockResolution: resolved.resolution,
+              resolutionNote:
+                resolved.resolution === "nonexistent"
+                  ? "this wall clock does not exist on that date — the clocks sprang forward over it, so the instant just after the gap is used"
+                  : usedSecondPass
+                    ? "this wall clock happens twice on that date — the clocks fell back over it, and the first pass has already gone by, so the second one is used"
+                    : "this wall clock happens twice on that date — the clocks fell back over it; the earlier instant is used",
+            }
+          : {}),
+      };
+    };
+
+    // `addBusinessDays` never counts the start day, so moving one from a
+    // Friday, a Saturday or a holiday all land on the next working day.
+    const nextOpenDay =
+      working && minuteOfDay < startMinutes
+        ? epochDay
+        : addBusinessDays(epochDay, 1, calendar).epochDay;
+
+    const schedule = {
+      businessHours: {
+        start: `${pad(Math.floor(startMinutes / 60), 2)}:${pad(startMinutes % 60, 2)}`,
+        end: `${pad(Math.floor(endMinutes / 60), 2)}:${pad(endMinutes % 60, 2)}`,
+        source: input.businessHours === undefined ? "default 09:00-17:00" : "caller-supplied",
+      },
+      weekend: [...weekend].sort((a, b) => a - b),
+      // The entries the caller handed over, not the distinct days they fell
+      // on — the same count BusinessDays reports under this name. Two tools
+      // that promise the same calendar must not answer the same question with
+      // different numbers when a holiday is listed twice.
+      holidaysConsidered: input.holidays?.length ?? 0,
+      isWorkingDay: working,
+      phase,
+      ...(phase === "open"
+        ? { closesAt: atLocalTime(epochDay, endMinutes) }
+        : { nextOpen: atLocalTime(nextOpenDay, startMinutes) }),
+      note: "working days and hours are the caller's calendar, not a jurisdiction's — pass weekend and holidays to match the operator's",
+    };
+
+    // ── the optional blocks ────────────────────────────────────────────────
+    let cron: Record<string, unknown> | undefined;
+    if (input.cron !== undefined) {
+      const parsed = parseCron(input.cron);
+      if (!parsed.ok) return json({ ok: false, error: `cron: ${parsed.error}` });
+      // The same walker CronNext drives, on the zone resolved above, so the
+      // two tools cannot drift into different answers for the same schedule.
+      const result = cronNextFn(parsed.fields, epochMs, timeZone, input.cronCount ?? 3);
+      cron = {
+        expression: parsed.fields.normalized,
+        description: describeCron(parsed.fields),
+        timeZone,
+        firings: result.firings.map((f) => ({
+          utc: isoFromEpochMs(f.epochMs, 0),
+          local: isoFromEpochMs(f.epochMs, zoneOffsetMinutes(f.epochMs, timeZone)),
+          minutesAway: Math.round((f.epochMs - epochMs) / MS_PER_MINUTE),
+          ...(f.note !== undefined ? { note: f.note } : {}),
+        })),
+        ...(result.skippedForDst.length > 0
+          ? {
+              skippedForDst: result.skippedForDst,
+              skippedNote:
+                "these wall clocks do not exist because the clocks sprang forward, so the job does not run",
+            }
+          : {}),
+        ...(result.exhausted
+          ? {
+              exhausted: true,
+              note: `no further firing within ${CRON_HORIZON_YEARS} years — check the day-of-month and month fields (0 0 30 2 * can never fire)`,
+            }
+          : {}),
+      };
+    }
+
+    let elsewhere: Record<string, unknown>[] | undefined;
+    if (input.compareTimeZones !== undefined && input.compareTimeZones.length > 0) {
+      elsewhere = [];
+      for (const other of input.compareTimeZones) {
+        const bad = zoneError(other);
+        if (bad !== undefined) return `compareTimeZones: ${bad}`;
+        const theirOffset = zoneOffsetMinutes(epochMs, other);
+        const theirWall = wallClockInZone(epochMs, other);
+        elsewhere.push({
+          timeZone: other,
+          local: isoFromEpochMs(epochMs, theirOffset),
+          offset: formatOffset(theirOffset, "extended"),
+          offsetMinutes: theirOffset,
+          abbreviation: zoneAbbreviation(epochMs, other),
+          differenceMinutes: theirOffset - offsetMinutes,
+          differenceHours: (theirOffset - offsetMinutes) / 60,
+          sameCalendarDay:
+            daysFromCivil(theirWall.year, theirWall.month, theirWall.day) === epochDay,
+        });
+      }
+    }
+
+    return json({
+      ok: true,
+      zone,
+      clock,
+      at: describeInstant(epochMs, timeZone),
+      clocksForward,
+      nextOffsetChange,
+      schedule,
+      ...(cron !== undefined ? { cron } : {}),
+      ...(elsewhere !== undefined ? { elsewhere } : {}),
+      ...(notes.length > 0 ? { notes } : {}),
+    });
+  },
+});
+
 /** Every tool this package registers, in the order a catalog should list them. */
 export const DATETIME_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   businessDays,
@@ -1218,6 +1665,7 @@ export const DATETIME_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   durationFormat,
   durationParse,
   isLeapYear,
+  localTime,
   quarterOf,
   recurrenceExpand,
   timestampConvert,

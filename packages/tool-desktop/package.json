@@ -1,0 +1,43 @@
+{
+  "name": "@crewhaus/tool-desktop",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Deterministic access to the operator's desktop: clipboard, notifications, opening a document, printing, windows, presence and sleep \u2014 failing closed on a headless host",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-proc": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/tool-executor": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-desktop"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-desktop#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

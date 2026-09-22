@@ -76,9 +76,19 @@ export type SpawnRequest = {
 export type ProcessOps = {
   readonly platform: "posix" | "windows";
   spawn(req: SpawnRequest): SpawnedProcess;
-  /** True when a process with this pid exists (EPERM counts as alive: it
-   *  exists, we just may not signal it). */
-  isAlive(pid: number): boolean;
+  /**
+   * True when a process with this pid exists, false when it certainly does
+   * not, and **undefined when the platform would not say** (EPERM counts as
+   * alive: it exists, we just may not signal it).
+   *
+   * The third state is not decoration. On POSIX this never returns undefined,
+   * because `kill(pid, 0)` is a syscall that decides. On Windows the probe is
+   * `powershell.exe`, which can simply fail to answer in time — and a probe
+   * that timed out is NOT a dead process. Collapsing the two is how a
+   * supervisor concludes that a live daemon has died and starts a second one
+   * beside it. Callers must branch on `=== false`, never on falsiness.
+   */
+  isAlive(pid: number): boolean | undefined;
   /** Epoch ms the process started, or undefined when it is gone/unknown. */
   startTimeMs(pid: number): number | undefined;
   /** The running process's command line, or undefined when it is gone or
@@ -97,16 +107,32 @@ export type ProcessOps = {
  *  fails or is unavailable. Always argv-array based; never a shell string. */
 export type CommandRunner = (cmd: string, args: readonly string[]) => string | undefined;
 
-const defaultCommandRunner: CommandRunner = (cmd, args) => {
-  const opts: SpawnSyncOptions = { encoding: "utf8", timeout: 5_000, windowsHide: true };
-  try {
-    const res = spawnSync(cmd, [...args], opts);
-    if (res.status !== 0 || typeof res.stdout !== "string") return undefined;
-    return res.stdout;
-  } catch {
-    return undefined;
-  }
-};
+/**
+ * How long a probe command may take before we give up on it.
+ *
+ * POSIX probes are `ps` and `kill`, which are cheap. The Windows ones are
+ * `powershell.exe`, which routinely takes one to three seconds just to start
+ * an interpreter, and considerably longer on a loaded machine. The former
+ * 5,000ms applied to both, so on a busy Windows host the liveness probe timed
+ * out and the supervisor read that as "the process is gone".
+ */
+const POSIX_PROBE_TIMEOUT_MS = 5_000;
+const WINDOWS_PROBE_TIMEOUT_MS = 20_000;
+
+function commandRunner(timeoutMs: number): CommandRunner {
+  return (cmd, args) => {
+    const opts: SpawnSyncOptions = { encoding: "utf8", timeout: timeoutMs, windowsHide: true };
+    try {
+      const res = spawnSync(cmd, [...args], opts);
+      if (res.status !== 0 || typeof res.stdout !== "string") return undefined;
+      return res.stdout;
+    } catch {
+      return undefined;
+    }
+  };
+}
+
+const defaultCommandRunner: CommandRunner = commandRunner(POSIX_PROBE_TIMEOUT_MS);
 
 // ---------------------------------------------------------------------------
 // argv fingerprint
@@ -378,7 +404,7 @@ export type WindowsProcessOpsOptions = {
  * is the signal-free control.v1 drain endpoint, with `taskkill` behind it.
  */
 export function createWindowsProcessOps(opts: WindowsProcessOpsOptions = {}): ProcessOps {
-  const run = opts.run ?? defaultCommandRunner;
+  const run = opts.run ?? commandRunner(WINDOWS_PROBE_TIMEOUT_MS);
   return {
     platform: "windows",
     spawn: (req) => nodeSpawnAdapter(req, true),
@@ -389,7 +415,15 @@ export function createWindowsProcessOps(opts: WindowsProcessOpsOptions = {}): Pr
         "-Command",
         `if (Get-Process -Id ${pid} -ErrorAction SilentlyContinue) { "1" } else { "0" }`,
       ]);
-      return out !== undefined && out.trim() === "1";
+      // A successful probe always prints "1" or "0". `undefined` means the
+      // probe itself failed — timed out, or powershell was unavailable — and
+      // that is not evidence the process is gone. Returning false here made a
+      // slow host indistinguishable from a dead daemon.
+      if (out === undefined) return undefined;
+      const answer = out.trim();
+      if (answer === "1") return true;
+      if (answer === "0") return false;
+      return undefined;
     },
     startTimeMs: (pid) => {
       if (!Number.isInteger(pid) || pid <= 0) return undefined;

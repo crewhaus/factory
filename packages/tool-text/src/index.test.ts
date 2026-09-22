@@ -11,6 +11,7 @@ import {
   TEXT_TOOLS,
   compactLog,
   countTokens,
+  diffParse,
   escapeString,
   extractEntities,
   extractKeywords,
@@ -43,7 +44,7 @@ async function run(tool: (typeof TEXT_TOOLS)[number], input: unknown): Promise<a
 
 describe("package-wide contract", () => {
   test("every tool is exported in TEXT_TOOLS", () => {
-    expect(TEXT_TOOLS.length).toBe(18);
+    expect(TEXT_TOOLS.length).toBe(19);
   });
 
   test("names are unique", () => {
@@ -155,6 +156,73 @@ describe("TextDiff", () => {
     const out = await run(textDiff, { a: "x", b: "y", statsOnly: true });
     expect(out.added).toBe(1);
     expect(out.diff).toBeUndefined();
+  });
+});
+
+describe("DiffParse", () => {
+  const sample = [
+    "diff --git a/src/app.ts b/src/app.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/app.ts",
+    "+++ b/src/app.ts",
+    "@@ -10,4 +10,5 @@ function boot() {",
+    " const a = 1;",
+    "-const b = 2;",
+    "+const b = 3;",
+    "+const c = 4;",
+    " return a;",
+    " }",
+    "",
+  ].join("\n");
+
+  test("every line carries its number in the new file", async () => {
+    const out = await run(diffParse, { diff: sample });
+    const lines = out.files[0].hunks[0].lines;
+    expect(lines.map((l: { newLine: number | null }) => l.newLine)).toEqual([
+      10,
+      null,
+      11,
+      12,
+      13,
+      14,
+    ]);
+    expect(out.files[0].newPath).toBe("src/app.ts");
+    expect({ added: out.added, removed: out.removed }).toEqual({ added: 2, removed: 1 });
+  });
+
+  test("the hunk's section heading survives", async () => {
+    const out = await run(diffParse, { diff: sample });
+    expect(out.files[0].hunks[0].section).toBe("function boot() {");
+  });
+
+  test("changedOnly drops context, keeping the line numbers it computed", async () => {
+    const out = await run(diffParse, { diff: sample, changedOnly: true });
+    expect(out.files[0].hunks[0].lines).toEqual([
+      { kind: "removed", oldLine: 11, newLine: null, text: "const b = 2;" },
+      { kind: "added", oldLine: null, newLine: 11, text: "const b = 3;" },
+      { kind: "added", oldLine: null, newLine: 12, text: "const c = 4;" },
+    ]);
+  });
+
+  test("summaryOnly replaces the hunks with their count", async () => {
+    const out = await run(diffParse, { diff: sample, summaryOnly: true });
+    expect(out.files[0].hunks).toBe(1);
+  });
+
+  test("path selects one file and reports the others when it misses", async () => {
+    const hit = await run(diffParse, { diff: sample, path: "src/app.ts" });
+    expect(hit.files.length).toBe(1);
+    const miss = await run(diffParse, { diff: sample, path: "nope.ts" });
+    expect(miss).toEqual({ found: false, path: "nope.ts", available: ["src/app.ts"] });
+  });
+
+  test("an empty diff is an empty result, not an error", async () => {
+    expect(await run(diffParse, { diff: "" })).toEqual({
+      files: [],
+      added: 0,
+      removed: 0,
+      warnings: [],
+    });
   });
 });
 

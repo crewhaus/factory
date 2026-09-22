@@ -21,10 +21,10 @@
  * `source: "failure-arbiter"` provenance.
  */
 import { createHash } from "node:crypto";
+import { nextVersion, overallDatasetHash } from "@crewhaus/dataset-ops/datasets";
 import { type DatasetRegistry, latestVersion } from "@crewhaus/dataset-registry";
 import type { Sample } from "@crewhaus/eval-dataset";
 import { diffReports, loadRun } from "@crewhaus/eval-report";
-import { nextVersion, overallDatasetHash } from "./datasets";
 
 /** The per-spec regression suite's registry name. */
 export function regressionSuiteName(specName: string): string {

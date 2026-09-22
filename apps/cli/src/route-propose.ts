@@ -34,13 +34,17 @@
  *
  * Pure: arms, priors and the spec come in; proposals go out.
  */
+import type { AdviceFinding, SuggestionsFile } from "@crewhaus/harness-advice/advise-rules";
+import { buildSuggestionsFile } from "@crewhaus/harness-advice/advise-rules";
+import {
+  declaredShadowCandidate,
+  shadowCandidateN,
+  splitShadowLane,
+} from "@crewhaus/harness-advice/shadow-lane";
 import type { ArmStats } from "@crewhaus/routing-store";
 import { isObserveOnlyLane } from "@crewhaus/routing-store";
 import type { Spec } from "@crewhaus/spec";
 import { type SpecPatch, validatePatch } from "@crewhaus/spec-patch";
-import type { AdviceFinding, SuggestionsFile } from "./advise-rules";
-import { buildSuggestionsFile } from "./advise-rules";
-import { declaredShadowCandidate, shadowCandidateN, splitShadowLane } from "./shadow-lane";
 
 /** One mined proposal: a whitelisted patch plus the evidence behind it. */
 export type RouteProposal = {

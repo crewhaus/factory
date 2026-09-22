@@ -52,8 +52,18 @@ import {
 } from "./lib/blocks";
 import { buildDigest, digestToBlocks, digestToText } from "./lib/digest";
 import type { DigestEvent } from "./lib/digest";
+import type { DkimAnswer, DmarcAnswer, SpfAnswer } from "./lib/dns-records";
+import {
+  normalizeDomain,
+  normalizeSelector,
+  parseDkim,
+  parseDmarc,
+  parseSpf,
+} from "./lib/dns-records";
 import type { Attachment, Mailbox } from "./lib/mime";
 import { composeMessage, isValidAddress } from "./lib/mime";
+import type { Check, CheckStatus } from "./lib/preflight";
+import { draftChecks, verdictFrom } from "./lib/preflight";
 import { quietDecision } from "./lib/quiet";
 import type { QuietSchedule, Weekday } from "./lib/quiet";
 import { rateLimitGate as evaluateRateLimit } from "./lib/ratelimit";
@@ -69,12 +79,14 @@ import {
   applyAuth,
   assertNotSsrf,
   assertOriginAllowed,
+  assertSenderDomainAllowed,
   assertSmtpHostAllowed,
   byString,
   describeFailure,
   json,
   ledgerLookup,
   ledgerRecord,
+  lookupTxt,
   openRequest,
   parseUrl,
   readCapped,
@@ -88,7 +100,7 @@ import {
   sleep,
   startDeadline,
 } from "./net";
-import type { AuthProfile, Deadline, NotifyConfig, ProviderProfile } from "./net";
+import type { AuthProfile, Deadline, NotifyConfig, ProviderProfile, TxtAnswer } from "./net";
 import { resolveSafe } from "./paths";
 import { sendMail } from "./smtp";
 
@@ -97,6 +109,7 @@ export {
   _resetIdempotencyLedger,
   _resetNotifyConfig,
   _setDnsLookup,
+  _setDnsTxtResolver,
   _setRawFetch,
   __setPrivateHostsAllowedForTest,
   buildNotifyConfig,
@@ -1270,6 +1283,306 @@ export const emailSend: RegisteredTool = buildTool({
 });
 
 // ---------------------------------------------------------------------------
+// preflight — the email tool that sends nothing
+// ---------------------------------------------------------------------------
+
+type AttachmentRow = {
+  readonly path: string;
+  readonly status: CheckStatus;
+  readonly detail: string;
+  readonly bytes?: number;
+};
+
+type AttachmentSurvey = {
+  readonly rows: readonly AttachmentRow[];
+  readonly bytes: number;
+  /** False when at least one file could not be read AS GIVEN. */
+  readonly allReadable: boolean;
+};
+
+/**
+ * Stat every attachment through the path gate, and keep going after the
+ * first problem.
+ *
+ * `loadAttachments` stops at the first fault because it is on the way to a
+ * send; this is the report, so each file gets its own row. Both resolve the
+ * path with `resolveSafe` and both stat `safe.real` — the location the read
+ * would actually land on, symlinks already followed. Statting the path the
+ * caller wrote and reading the one the resolver returns is how a file
+ * outside the workspace gets measured as one inside it.
+ */
+function surveyAttachments(
+  specs: ComposeArgs["attachments"],
+  perAttachmentBytes: number,
+): AttachmentSurvey {
+  const rows: AttachmentRow[] = [];
+  let bytes = 0;
+  let allReadable = true;
+  for (const spec of specs ?? []) {
+    let safe: ReturnType<typeof resolveSafe>;
+    try {
+      safe = resolveSafe("EmailSendPreflight", spec.path);
+    } catch (err) {
+      allReadable = false;
+      rows.push({ path: spec.path, status: "fail", detail: (err as Error).message });
+      continue;
+    }
+    let stat: ReturnType<typeof statSync>;
+    try {
+      stat = statSync(safe.real);
+    } catch (err) {
+      // Missing, unreadable and "a directory component is not a directory"
+      // are different answers, and none of them is "the attachment is fine".
+      // The errno is carried through rather than flattened, because it is
+      // what tells the caller whether to fix a path or a permission.
+      allReadable = false;
+      const code = (err as NodeJS.ErrnoException).code ?? "unknown";
+      rows.push({
+        path: spec.path,
+        status: "unknown",
+        detail: `could not be read (${code}), so whether this message can be sent is not known`,
+      });
+      continue;
+    }
+    if (!stat.isFile()) {
+      allReadable = false;
+      rows.push({ path: spec.path, status: "fail", detail: "is not a regular file" });
+      continue;
+    }
+    bytes += stat.size;
+    rows.push({
+      path: spec.path,
+      status: stat.size > perAttachmentBytes ? "fail" : "pass",
+      detail:
+        stat.size > perAttachmentBytes
+          ? `${stat.size} bytes, over the ${perAttachmentBytes}-byte per-attachment budget`
+          : `${stat.size} bytes`,
+      bytes: stat.size,
+    });
+  }
+  return { rows, bytes, allReadable };
+}
+
+export const emailSendPreflight: RegisteredTool = buildTool({
+  name: "EmailSendPreflight",
+  description:
+    "Check a message the way EmailSend would build it, and send nothing. Use it before a send to find out in one call what would otherwise come back one refusal at a time: whether the From parses, whether there is an envelope at all, whether a recipient is outside the operator's allow-list, whether a header would be refused, whether the body is accidentally empty, whether a {{placeholder}} never got filled, and whether the attachments are readable and inside the size budget you state. It takes the SAME arguments as EmailSend and runs the SAME composer, so a message this reports as ready is a message that assembles; the Message-ID and byte count it returns are the real ones. It never opens a socket — not to a mail server, not to DNS — and a check that could not run comes back as unknown with its reason rather than as a pass.",
+  inputSchema: z.object({
+    ...composeShape,
+    host: z
+      .string()
+      .min(1)
+      .max(255)
+      .optional()
+      .describe(
+        "the SMTP host the send would use, checked against allowed_smtp_hosts only — no connection is made and no name is resolved",
+      ),
+    maxMessageBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_MESSAGE_BYTES)
+      .optional()
+      .describe(
+        `the budget the assembled message must fit, e.g. the receiving provider's limit (default ${MAX_MESSAGE_BYTES}, which is this package's own cap)`,
+      ),
+    maxAttachmentBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_ATTACHMENT_BYTES)
+      .optional()
+      .describe(`the budget any single attachment must fit (default ${MAX_ATTACHMENT_BYTES})`),
+  }),
+  scope: "internal",
+  readOnly: true,
+  concurrencySafe: true,
+  execute: async (input, ctx) => {
+    const args = input as ComposeArgs & {
+      host?: string;
+      maxMessageBytes?: number;
+      maxAttachmentBytes?: number;
+    };
+    const cfg = resolveNotifyConfig(ctx?.toolConfig);
+    const messageBudget = args.maxMessageBytes ?? MAX_MESSAGE_BYTES;
+    const attachmentBudget = args.maxAttachmentBytes ?? MAX_ATTACHMENT_BYTES;
+
+    const checks: Check[] = draftChecks({
+      from: args.from,
+      to: args.to ?? [],
+      cc: args.cc ?? [],
+      bcc: args.bcc ?? [],
+      replyTo: args.replyTo ?? [],
+      subject: args.subject,
+      text: args.text,
+      html: args.html,
+      date: args.date,
+      inReplyTo: args.inReplyTo,
+      references: args.references,
+      headers: args.headers,
+    });
+
+    // The same predicate EmailSend gates on, asked ahead of time. An empty
+    // allow-list refuses everyone, and saying so here is the point.
+    const everyone = [...(args.to ?? []), ...(args.cc ?? []), ...(args.bcc ?? [])];
+    const refused = everyone
+      .map((m) => m.address)
+      .filter((address) => !recipientAllowed(address, cfg))
+      .sort(byString);
+    checks.push(
+      everyone.length === 0
+        ? {
+            check: "recipients-allowed",
+            status: "unknown",
+            detail: "there are no recipients to check against allowed_recipients",
+          }
+        : refused.length === 0
+          ? {
+              check: "recipients-allowed",
+              status: "pass",
+              detail: `all ${everyone.length} recipients are in allowed_recipients`,
+            }
+          : {
+              check: "recipients-allowed",
+              status: "fail",
+              detail: `${refused.join(", ")} ${refused.length === 1 ? "is" : "are"} not in allowed_recipients${cfg.allowedRecipients.length === 0 ? " (the allow-list is empty, which refuses everyone)" : ""}`,
+            },
+    );
+
+    if (args.host !== undefined) {
+      try {
+        assertSmtpHostAllowed(args.host, cfg);
+        checks.push({
+          check: "smtp-host",
+          status: "pass",
+          detail: `"${args.host}" is in allowed_smtp_hosts. Whether it resolves, and to what, is not checked here — that needs DNS`,
+        });
+      } catch (err) {
+        checks.push({
+          check: "smtp-host",
+          status: "fail",
+          detail: describeFailure(err),
+        });
+      }
+    }
+
+    const survey = surveyAttachments(args.attachments, attachmentBudget);
+    // A "fail" row is either a path the gate refused or a file over the
+    // stated budget; both are reported with their own reason rather than
+    // summarised into one, because they are fixed differently.
+    const refusedFiles = survey.rows.filter((row) => row.status === "fail");
+    const unreadable = survey.rows.filter((row) => row.status === "unknown");
+    // A refusal OUTRANKS an unknown, and this order is the whole point: one
+    // refused path already decides the answer, and reporting "somebody has
+    // to look" for a message that is settled is the same defect as reporting
+    // an unanswered question as a pass, pointed the other way. The unknown
+    // rows are still named, because they are a second thing to fix.
+    const unreadableNames = unreadable.map((row) => `"${row.path}"`).join(", ");
+    checks.push(
+      survey.rows.length === 0
+        ? { check: "attachments", status: "pass", detail: "no attachments" }
+        : refusedFiles.length > 0
+          ? {
+              check: "attachments",
+              status: "fail",
+              detail: `${refusedFiles.map((row) => `"${row.path}": ${row.detail}`).join("; ")}${
+                unreadable.length > 0 ? `; and ${unreadableNames} could not be read` : ""
+              }`,
+            }
+          : unreadable.length > 0
+            ? {
+                check: "attachments",
+                status: "unknown",
+                detail: `${unreadableNames} could not be read, so the message cannot be judged`,
+              }
+            : {
+                check: "attachments",
+                status: "pass",
+                detail: `${survey.rows.length} file${survey.rows.length === 1 ? "" : "s"}, ${survey.bytes} bytes before encoding`,
+              },
+    );
+
+    // Assembly is attempted only when every attachment could be read as
+    // given: building the message without one would validate a DIFFERENT
+    // message than the one that would be sent, and reporting it as ready
+    // would be a lie about bytes nobody has seen.
+    const built = survey.allReadable ? buildMessage("EmailSendPreflight", args) : null;
+    if (built === null) {
+      // Same precedence as the row above: a refused path is a settled "no",
+      // and it stays a "no" however many other attachments were merely
+      // unreadable. Only an unknown with NO refusal beside it is an unknown.
+      const refusedAny = refusedFiles.length > 0;
+      const reason = refusedAny ? "was refused" : "could not be read";
+      checks.push({
+        check: "assembly",
+        status: refusedAny ? "fail" : "unknown",
+        detail: `not attempted: an attachment ${reason}, so the bytes that would be sent cannot be built`,
+      });
+      checks.push({
+        check: "size",
+        status: "unknown",
+        detail: "the message was not assembled, so its size is not known",
+      });
+      checks.push({
+        check: "message-id",
+        status: "unknown",
+        detail: "the message was not assembled, so no Message-ID was derived",
+      });
+    } else if (!built.ok) {
+      checks.push({
+        check: "assembly",
+        status: "fail",
+        detail: `the composer refused this message: ${built.message}`,
+      });
+      checks.push({
+        check: "size",
+        status: "unknown",
+        detail: "the message was not assembled, so its size is not known",
+      });
+      checks.push({
+        check: "message-id",
+        status: "unknown",
+        detail: "the message was not assembled, so no Message-ID was derived",
+      });
+    } else {
+      checks.push({
+        check: "assembly",
+        status: "pass",
+        detail: `the message assembles, to ${built.envelopeTo.length} envelope recipient${built.envelopeTo.length === 1 ? "" : "s"}`,
+      });
+      checks.push(
+        built.bytes > messageBudget
+          ? {
+              check: "size",
+              status: "fail",
+              detail: `${built.bytes} bytes, over the ${messageBudget}-byte budget`,
+            }
+          : {
+              check: "size",
+              status: "pass",
+              detail: `${built.bytes} bytes, inside the ${messageBudget}-byte budget`,
+            },
+      );
+      checks.push({
+        check: "message-id",
+        status: "pass",
+        detail: `${built.messageId}, derived from the message's own content and the sender's domain`,
+      });
+    }
+
+    return json({
+      verdict: verdictFrom(checks),
+      checks,
+      ...(survey.rows.length > 0 ? { attachments: survey.rows } : {}),
+      ...(built?.ok === true
+        ? { messageId: built.messageId, bytes: built.bytes, envelopeTo: built.envelopeTo }
+        : {}),
+      budget: { message: messageBudget, perAttachment: attachmentBudget },
+    });
+  },
+});
+
+// ---------------------------------------------------------------------------
 // webhook
 // ---------------------------------------------------------------------------
 
@@ -1842,6 +2155,293 @@ export const deliveryCheck: RegisteredTool = buildTool({
 });
 
 // ---------------------------------------------------------------------------
+// what a sending domain publishes about itself
+// ---------------------------------------------------------------------------
+
+/** The four TXT outcomes, folded into the shape a record answer has. */
+function absentOrUnknown(
+  answer: TxtAnswer,
+  what: string,
+): { status: "absent"; detail: string } | { status: "unknown"; detail: string } {
+  if (answer.outcome === "unknown") {
+    return {
+      status: "unknown",
+      detail: `${answer.reason} — this is not the same as "${what}", and nothing here should be read as one`,
+    };
+  }
+  return {
+    status: "absent",
+    detail:
+      answer.outcome === "nxdomain"
+        ? "the name does not exist, so nothing is published there"
+        : "the name exists and publishes no TXT record",
+  };
+}
+
+/**
+ * The SPF record as a result object.
+ *
+ * `absent` here means something narrower than the outer one: the domain DOES
+ * publish TXT records and none of them is an SPF record. Keeping the two
+ * apart matters when a domain's TXT set was replaced by something that
+ * dropped the SPF line.
+ */
+function describeSpf(answer: SpfAnswer): Record<string, unknown> {
+  if (answer.status === "absent") {
+    return {
+      status: "absent",
+      detail: "the domain publishes TXT records and none of them is an SPF record",
+    };
+  }
+  if (answer.status === "multiple") {
+    return {
+      status: "multiple",
+      records: answer.records,
+      detail:
+        "more than one SPF record: RFC 7208 4.5 makes a receiver return permerror, which fails every sender rather than the wrong ones",
+    };
+  }
+  if (answer.status === "unreadable") {
+    return { status: "unreadable", record: answer.record, detail: answer.reason };
+  }
+  const parsed = answer.parsed;
+  const notes = [...parsed.notes];
+  if (parsed.dnsTermsHere > 0) {
+    // Said plainly rather than left for the reader to assume: each include:
+    // pulls in a record whose own terms count toward the same limit of ten,
+    // and this tool does not follow them — it queries only the domain it was
+    // given. A walked total that got the void-lookup and sub-limit rules
+    // wrong would be a worse answer than an honest floor.
+    notes.push(
+      "dnsTermsInThisRecord counts only the terms in this record; each include: or redirect= pulls in another record whose terms count toward the same limit of ten, and those are not followed",
+    );
+  }
+  return {
+    status: "found",
+    record: parsed.record,
+    all: parsed.all,
+    mechanisms: parsed.mechanisms,
+    modifiers: parsed.modifiers,
+    dnsTermsInThisRecord: parsed.dnsTermsHere,
+    ...(notes.length > 0 ? { notes } : {}),
+  };
+}
+
+function describeDmarc(answer: DmarcAnswer): Record<string, unknown> {
+  if (answer.status === "absent") {
+    return {
+      status: "absent",
+      // Stops at the name that was asked. "…so the domain has no DMARC
+      // policy" was the conclusion here before, and it is one query short of
+      // true: RFC 7489 6.6.3 has a receiver fall back to the ORGANIZATIONAL
+      // domain's record, so a subdomain with nothing of its own can still be
+      // governed by a p=reject two labels up. The note on the result says so
+      // whenever that fallback could apply.
+      detail:
+        "there are TXT records at _dmarc and none of them begins with v=DMARC1, which RFC 7489 6.6.3 requires — so no DMARC record is published at this name",
+    };
+  }
+  if (answer.status === "multiple") {
+    return {
+      status: "multiple",
+      records: answer.records,
+      detail:
+        "more than one v=DMARC1 record: RFC 7489 6.6.3 says the domain is then treated as publishing none at all",
+    };
+  }
+  if (answer.status === "unreadable") {
+    return { status: "unreadable", record: answer.record, detail: answer.reason };
+  }
+  const parsed = answer.parsed;
+  return {
+    status: "found",
+    record: parsed.record,
+    policy: parsed.policy,
+    subdomainPolicy: parsed.subdomainPolicy,
+    percent: parsed.percent,
+    tags: parsed.tags,
+    ...(parsed.notes.length > 0 ? { notes: parsed.notes } : {}),
+  };
+}
+
+/**
+ * The DKIM KEY record as a result object.
+ *
+ * Note what is not in it: any claim about a signature. This describes the
+ * key a selector publishes — its type, its size, whether it has been revoked
+ * — which is what a caller can act on without a verifier. `mailauth` is what
+ * would be needed to answer the other question, and half of that answer is
+ * worse than none.
+ */
+function describeDkim(answer: DkimAnswer): Record<string, unknown> {
+  if (answer.status === "absent") {
+    return { status: "absent", detail: "no TXT record at this selector's _domainkey name" };
+  }
+  if (answer.status === "multiple") {
+    return {
+      status: "multiple",
+      records: answer.records,
+      detail:
+        "more than one TXT record at this selector, so which key a receiver uses is not decided here",
+    };
+  }
+  if (answer.status === "unreadable") {
+    return { status: "unreadable", record: answer.record, detail: answer.reason };
+  }
+  const parsed = answer.parsed;
+  // The verbatim record is NOT repeated here the way it is for SPF and
+  // DMARC: a key record is exactly its tags, and `p` alone is a few hundred
+  // characters, so printing both spends a caller's context twice on the same
+  // base64. A record that could not be parsed is the case where the verbatim
+  // text is the only thing worth having, and that branch above prints it.
+  return {
+    status: "found",
+    keyType: parsed.keyType,
+    revoked: parsed.revoked,
+    ...(parsed.key === null ? {} : { key: parsed.key }),
+    tags: parsed.tags,
+    ...(parsed.notes.length > 0 ? { notes: parsed.notes } : {}),
+  };
+}
+
+export const deliverabilityCheck: RegisteredTool = buildTool({
+  name: "DeliverabilityCheck",
+  description:
+    "Read what a sending domain publishes about itself in public DNS — its SPF record, its DMARC policy, and the DKIM key record at each selector you name — and report what each one says. Use it to answer why mail from a domain is being refused or filtered, or to check a domain before a campaign leans on it. It reports facts rather than a score, because the facts differ in what you do next: no DMARC record at all and a DMARC record with p=none are the same score and completely different situations, and a lookup that failed is a third thing again — reported as unknown with its reason, never as 'nothing published'. It does NOT verify a message's DKIM signature: that needs canonicalisation this package does not implement, and a partial check that can answer 'pass' is worse than no check. Only domains an operator put in allowed_sender_domains are looked up.",
+  inputSchema: z.object({
+    domain: z
+      .string()
+      .min(1)
+      .max(253)
+      .describe(
+        "the sending domain, e.g. example.com — the domain in the From address, not a recipient's. It must appear in tool_config.notify.allowed_sender_domains",
+      ),
+    dkimSelectors: z
+      .array(z.string().min(1).max(100))
+      .max(10)
+      .optional()
+      .describe(
+        'selectors to look for, e.g. ["s1", "google"]. A DKIM key lives at <selector>._domainkey.<domain> and there is no way to enumerate selectors, so this tool checks the ones you name and guesses none',
+      ),
+    timeoutMs: timeoutSchema,
+  }),
+  scope: "external",
+  ioCapability: "network",
+  readOnly: true,
+  execute: async (input, ctx) => {
+    const args = input as { domain: string; dkimSelectors?: string[]; timeoutMs?: number };
+    const cfg = resolveNotifyConfig(ctx?.toolConfig);
+
+    // Parse first, then use the PARSED value everywhere: the allow-list is
+    // checked against it, the `_dmarc.` and `._domainkey.` names are built
+    // from it, and it is what comes back in the result. A gate that reads
+    // one spelling while the resolver is handed another guards nothing.
+    const domain = normalizeDomain(args.domain);
+    if (!domain.ok) return `nothing was looked up: ${domain.reason}`;
+
+    const selectors: string[] = [];
+    for (const raw of args.dkimSelectors ?? []) {
+      const selector = normalizeSelector(raw);
+      if (!selector.ok) return `nothing was looked up: ${selector.reason}`;
+      const name = `${selector.name}._domainkey.${domain.name}`;
+      if (name.length > 253) {
+        return `nothing was looked up: "${name}" is longer than the 253 octets a DNS name may carry`;
+      }
+      selectors.push(selector.name);
+    }
+    // Sorted and de-duplicated, so the same call asks the same questions in
+    // the same order and a repeated selector is one lookup rather than two.
+    const unique = [...new Set(selectors)].sort(byString);
+
+    const deadline = startDeadline(args.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
+    try {
+      assertSenderDomainAllowed(domain.name, cfg);
+      const names = [
+        domain.name,
+        `_dmarc.${domain.name}`,
+        ...unique.map((selector) => `${selector}._domainkey.${domain.name}`),
+      ];
+      // In parallel, assembled by index: the answers are read back in the
+      // order the names were built, so which lookup finished first cannot
+      // change a byte of the result.
+      const answers = await Promise.all(names.map((name) => lookupTxt(name, deadline)));
+      const apex = answers[0] as TxtAnswer;
+      const dmarcAnswer = answers[1] as TxtAnswer;
+
+      const spf =
+        apex.outcome === "records"
+          ? describeSpf(parseSpf(apex.records))
+          : absentOrUnknown(apex, "the domain publishes no SPF record");
+      const dmarcParsed =
+        dmarcAnswer.outcome === "records" ? parseDmarc(dmarcAnswer.records) : null;
+      const dmarc =
+        dmarcParsed === null
+          ? absentOrUnknown(dmarcAnswer, "the domain publishes no DMARC record")
+          : describeDmarc(dmarcParsed);
+      // True when the lookup ANSWERED and the answer was "no policy here" —
+      // never when the lookup itself failed, which is its own report.
+      const noDmarcHere =
+        dmarcParsed === null
+          ? dmarcAnswer.outcome === "none" || dmarcAnswer.outcome === "nxdomain"
+          : dmarcParsed.status === "absent" || dmarcParsed.status === "multiple";
+
+      const dkim = unique.map((selector, index) => {
+        const answer = answers[index + 2] as TxtAnswer;
+        return {
+          selector,
+          ...(answer.outcome === "records"
+            ? describeDkim(parseDkim(answer.records))
+            : absentOrUnknown(answer, "this selector publishes no key")),
+        };
+      });
+
+      const notes: string[] = [];
+      // "No DMARC record here" is not "no DMARC policy applies here". RFC
+      // 7489 6.6.3 says a receiver that finds nothing at _dmarc.<name> asks
+      // _dmarc.<organizational domain> next, so mail from a subdomain can be
+      // covered by a policy this tool never queried. Naming the organizational
+      // domain needs the Public Suffix List — `example.co.uk` is one and
+      // `mail.example.com` is not, and nothing in a name says which — which
+      // is a dependency this package does not take. So the gap is stated
+      // rather than guessed at.
+      if (noDmarcHere && domain.name.split(".").length > 2) {
+        notes.push(
+          `"${domain.name}" has more than two labels, so it may be a subdomain: RFC 7489 6.6.3 has a receiver fall back to the organizational domain's _dmarc record, which was not looked up here. Identifying that domain needs the Public Suffix List, which this package does not carry — ask for it by name to see its policy`,
+        );
+      }
+      if (apex.outcome === "nxdomain") {
+        // Said as the fact it is, not as a conclusion about the other names:
+        // each of those was asked separately and reports its own answer.
+        notes.push(
+          "the domain itself returned NXDOMAIN, so there is no name for an SPF record to be published at",
+        );
+      }
+      if (unique.length === 0) {
+        notes.push(
+          "no DKIM selector was named, so none was checked — a selector cannot be discovered from DNS, only asked for by name",
+        );
+      }
+
+      return json({
+        domain: domain.name,
+        spf,
+        dmarc,
+        dkim,
+        lookups: names.map((name, index) => ({
+          name,
+          outcome: (answers[index] as TxtAnswer).outcome,
+        })),
+        ...(notes.length > 0 ? { notes } : {}),
+      });
+    } catch (err) {
+      return describeFailure(err, deadline);
+    } finally {
+      deadline.cancel();
+    }
+  },
+});
+
+// ---------------------------------------------------------------------------
 // pure tools
 // ---------------------------------------------------------------------------
 
@@ -2107,9 +2707,11 @@ export const NOTIFY_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   chatPost,
   chatReact,
   chatUpdate,
+  deliverabilityCheck,
   deliveryCheck,
   emailCompose,
   emailSend,
+  emailSendPreflight,
   messageTemplate,
   notifyDigest,
   pushNotify,

@@ -11,6 +11,19 @@ import { budgetCheck } from "./lib/budget";
 import { costReport, priceTokens, utcDay } from "./lib/cost";
 import { countEvents, nearestRankPercentile, toolCallStats } from "./lib/counts";
 import {
+  type BuildResult,
+  type BuiltEvent,
+  EMITTED_BY,
+  type EmitRequest,
+  MAX_EVENT_BYTES,
+  MAX_FIELDS,
+  MAX_FIELD_VALUE_CHARS,
+  MAX_MESSAGE_CHARS,
+  MAX_NAME_CHARS,
+  MAX_RUN_ID_CHARS,
+  buildEmittedEvent,
+} from "./lib/emit";
+import {
   type ObsEvent,
   compareEvents,
   decodeCursor,
@@ -535,6 +548,286 @@ describe("buildTimeline", () => {
 });
 
 // ---------------------------------------------------------------------------
+// emitting a line back onto the bus
+// ---------------------------------------------------------------------------
+
+/**
+ * A character by code point, never as a literal in this file.
+ *
+ * Half of what `findForbidden` refuses is invisible, and a fixture nobody can
+ * see is a fixture nobody can review — a stray raw byte pasted into a test
+ * would look exactly like a correct one. Naming the code point also means the
+ * assertion and the refusal are talking about the same character.
+ */
+function ch(code: number): string {
+  return String.fromCharCode(code);
+}
+
+/** The happy path, reduced to the fields a test actually varies. */
+function build(over: Partial<EmitRequest> = {}): BuildResult {
+  return buildEmittedEvent({ name: "deploy_started", targetSessionId: "sess_a", ...over });
+}
+
+function built(over: Partial<EmitRequest> = {}): BuiltEvent {
+  const result = build(over);
+  if (!result.ok) throw new Error(`expected a built event, got: ${result.message}`);
+  return result.value;
+}
+
+function refusal(over: Partial<EmitRequest>): string {
+  const result = build(over);
+  if (result.ok) throw new Error("expected a refusal");
+  return result.message;
+}
+
+describe("buildEmittedEvent: the wire shape", () => {
+  test("the line is one the package's own reader parses back", () => {
+    const event = built({ tsMs: 1000, message: "rolling out" });
+    const parsed = parseLog("sess_a", event.line);
+    expect(parsed.malformedLines).toBe(0);
+    expect(parsed.events.length).toBe(1);
+    expect(parsed.events[0]).toMatchObject({ kind: "custom.deploy_started", ts: 1000 });
+    // The envelope `@crewhaus/event-log` writes, key for key.
+    expect(JSON.parse(event.line)).toMatchObject({ ts: 1000, version: 1, kind: event.kind });
+    expect(event.line.endsWith("\n")).toBe(true);
+  });
+
+  test("RunTimeline labels it with the name it was emitted under", () => {
+    const event = built({ tsMs: 1000, name: "checkpoint" });
+    const [parsed] = parseLog("sess_a", event.line).events;
+    const timeline = buildTimeline([parsed as ObsEvent]);
+    expect(timeline.entries[0]).toMatchObject({ kind: "custom.checkpoint", label: "checkpoint" });
+  });
+
+  test("an event with no tsMs carries no timestamp rather than an invented one", () => {
+    const event = built();
+    expect(event.ts).toBeUndefined();
+    expect(Object.keys(JSON.parse(event.line))).toEqual(["version", "kind", "payload"]);
+  });
+
+  test("the same request twice is the same bytes, whatever order the fields came in", () => {
+    const a = built({ tsMs: 7, fields: { b: 2, a: 1 } });
+    const b = built({ tsMs: 7, fields: { a: 1, b: 2 } });
+    expect(a.line).toBe(b.line);
+  });
+
+  test("level error marks the entry as an error a timeline can draw", () => {
+    expect(built({ level: "error" }).payload["isError"]).toBe(true);
+    expect(built({ level: "warn" }).payload["isError"]).toBeUndefined();
+  });
+});
+
+describe("buildEmittedEvent: provenance", () => {
+  test("no name a caller can choose produces a kind the runtime could have written", () => {
+    // `run_failed` is the record a run dies with; asking for it by name gets
+    // the namespace, not the kind.
+    expect(built({ name: "run_failed" }).kind).toBe("custom.run_failed");
+    expect(refusal({ name: "run_failed.x" })).toContain("not a usable event name");
+    expect(refusal({ name: "Deploy" })).toContain("lower snake case");
+    expect(refusal({ name: "9lives" })).toContain("lower snake case");
+  });
+
+  test("the payload says who wrote it, and says so first", () => {
+    const event = built({ message: "text a reader should not reach before the marker" });
+    expect(Object.keys(event.payload)[0]).toBe("emittedBy");
+    expect(event.payload["emittedBy"]).toBe(EMITTED_BY);
+    // A small payload budget truncates from the TAIL, so provenance survives
+    // and the free text is what gets cut.
+    const [parsed] = parseLog("sess_a", event.line).events;
+    const rendered = renderEvent(parsed as ObsEvent, 40);
+    expect(String(rendered["payload"])).toContain("EmitTraceEvent");
+    expect(rendered["payloadTruncated"]).toBe(true);
+  });
+
+  test("the live run context wins the attribution and the caller's claim is kept", () => {
+    const event = built({ runId: "run_claimed", ambient: { runId: "run_real" } });
+    expect(event.runId).toBe("run_real");
+    expect(event.runIdSource).toBe("context");
+    expect(event.payload["emittedFrom"]).toMatchObject({
+      runContext: "present",
+      claimedRunId: "run_claimed",
+    });
+  });
+
+  test("with no run context the caller's runId is used and labelled as claimed", () => {
+    const event = built({ runId: "run_claimed" });
+    expect(event.runId).toBe("run_claimed");
+    expect(event.runIdSource).toBe("caller");
+    expect(event.payload["emittedFrom"]).toMatchObject({ runContext: "absent" });
+  });
+
+  test("a line written into somebody else's session log says so", () => {
+    const away = built({ ambient: { sessionId: "sess_other" } });
+    expect(away.payload["emittedFrom"]).toMatchObject({
+      sessionId: "sess_other",
+      crossSession: true,
+    });
+    const home = built({ ambient: { sessionId: "sess_a" } });
+    expect(
+      (home.payload["emittedFrom"] as Record<string, unknown>)["crossSession"],
+    ).toBeUndefined();
+  });
+
+  test("caller fields cannot reach a key a kind-agnostic reader trusts", () => {
+    // `buildTimeline` sums `durationMs` on every kind and `IncidentBundle`
+    // takes the first `specName` in log order — neither checks the kind, so
+    // the nesting is the only thing keeping a caller out of both.
+    const event = built({
+      tsMs: 1000,
+      fields: { durationMs: 999_999, specName: "someone-elses-bot", isError: true },
+    });
+    expect(event.payload["durationMs"]).toBeUndefined();
+    expect(event.payload["specName"]).toBeUndefined();
+    expect(event.payload["isError"]).toBeUndefined();
+    expect(event.payload["fields"]).toEqual({
+      durationMs: 999_999,
+      isError: true,
+      specName: "someone-elses-bot",
+    });
+    const [parsed] = parseLog("sess_a", event.line).events;
+    expect(buildTimeline([parsed as ObsEvent]).measuredByKind).toEqual([]);
+  });
+});
+
+describe("buildEmittedEvent: text that must not reach the line", () => {
+  test("a line break is refused, and the refusal names the character", () => {
+    const message = refusal({ message: `done${ch(0x0a)}fake entry` });
+    expect(message).toContain("U+000A");
+    expect(message).toContain("index 4");
+    expect(message).toContain("one event is one line");
+    expect(refusal({ message: ch(0x0d) })).toContain("U+000D");
+  });
+
+  test("an escape is refused as a terminal control sequence, not as bad UTF-8", () => {
+    expect(refusal({ message: `${ch(0x1b)}[2K` })).toContain("terminal");
+  });
+
+  test("text that renders differently from how it was written is refused", () => {
+    expect(refusal({ message: `a${ch(0x202e)}b` })).toContain("bidirectional");
+    expect(refusal({ message: `a${ch(0x200b)}b` })).toContain("zero-width");
+    expect(refusal({ message: `a${ch(0x2028)}b` })).toContain("line separator");
+    expect(refusal({ message: `a${ch(0x9)}b` })).toContain("tab");
+    expect(refusal({ message: `a${ch(0x85)}b` })).toContain("C1 control");
+  });
+
+  test("the same refusal covers a field value, not just the message", () => {
+    expect(refusal({ fields: { note: `x${ch(0x0a)}y` } })).toContain('field "note"');
+  });
+
+  test("ordinary text, including astral characters, is left alone", () => {
+    const event = built({ message: "shipped 🎉 — 100% of shards", fields: { emoji: "🎉" } });
+    expect(event.payload["message"]).toBe("shipped 🎉 — 100% of shards");
+    expect(parseLog("sess_a", event.line).malformedLines).toBe(0);
+  });
+});
+
+describe("buildEmittedEvent: the claimed run id is caller text too", () => {
+  test("a direction override or a zero-width character in runId is refused", () => {
+    // `EventQuery` renders a payload with `JSON.stringify`, which escapes
+    // control characters but NOT U+202E or U+200B — so a runId carrying one
+    // reaches a human's terminal exactly as written, which is the whole thing
+    // the message and field rules exist to prevent. Refusing it in one place
+    // and allowing it in the other is not a rule.
+    const bidi = refusal({ runId: `run_1${ch(0x202e)}` });
+    expect(bidi).toContain("runId");
+    expect(bidi).toContain("U+202E");
+    expect(bidi).toContain("bidirectional");
+    expect(refusal({ runId: `run_1${ch(0x200b)}2` })).toContain("zero-width");
+    expect(refusal({ runId: `run${ch(0x0a)}1` })).toContain("U+000A");
+  });
+
+  test("an over-long runId is refused rather than spending the line on it", () => {
+    expect(refusal({ runId: "r".repeat(MAX_RUN_ID_CHARS + 1) })).toContain(
+      `over the ${MAX_RUN_ID_CHARS} cap`,
+    );
+  });
+
+  test("an empty runId is no attribution rather than an attribution to nothing", () => {
+    // `runIdOf` reads ids back through `asString`, which treats "" as absent.
+    // Reporting `runIdSource: "caller"` for one would be an attribution every
+    // reader that filters by run disagrees with.
+    const event = built({ runId: "" });
+    expect(event.runId).toBeUndefined();
+    expect(event.runIdSource).toBeUndefined();
+    expect(event.payload["runId"]).toBeUndefined();
+    expect(runIdOf({ session: "sess_a", line: 1, kind: event.kind, payload: event.payload })).toBe(
+      undefined,
+    );
+  });
+
+  test("an empty runId on the run context does not beat a real caller claim", () => {
+    const event = built({ runId: "run_claimed", ambient: { runId: "" } });
+    expect(event.runId).toBe("run_claimed");
+    expect(event.runIdSource).toBe("caller");
+  });
+});
+
+describe("buildEmittedEvent: what the run context was worth", () => {
+  test("a context that yielded nothing is unusable, which is neither present nor absent", () => {
+    // The run context is read structurally, so a runtime that renamed its
+    // fields hands the tool an object it can extract nothing from. "present"
+    // would claim a provenance nothing supplied; "absent" would hide a
+    // carrier that was really there.
+    const empty = built({ contextAttached: true });
+    expect(empty.runContext).toBe("unusable");
+    expect(empty.payload["emittedFrom"]).toMatchObject({ runContext: "unusable" });
+    expect(built({ ambient: { runId: "run_1" } }).runContext).toBe("present");
+    expect(built().runContext).toBe("absent");
+  });
+});
+
+describe("buildEmittedEvent: bounds", () => {
+  test("a line over the cap is refused even when every part of it is legal", () => {
+    // Each piece is inside its own cap; the line they add up to is not. That
+    // is why the finished bytes are checked as well as the parts.
+    const fields: Record<string, string> = {};
+    for (let i = 0; i < 8; i++) fields[`f${i}`] = "x".repeat(MAX_FIELD_VALUE_CHARS);
+    const message = refusal({ message: "x".repeat(MAX_MESSAGE_CHARS), fields });
+    expect(message).toContain(String(MAX_EVENT_BYTES));
+    expect(message).toContain("shorten message or drop fields");
+  });
+
+  test("an over-long message is refused before the line is ever built", () => {
+    expect(refusal({ message: "x".repeat(MAX_MESSAGE_CHARS + 1) })).toContain("not a transcript");
+  });
+
+  test("too many fields, an unusable field name, and an over-long value are each refused", () => {
+    const many: Record<string, string> = {};
+    for (let i = 0; i <= MAX_FIELDS; i++) many[`f${i}`] = "v";
+    expect(refusal({ fields: many })).toContain(`over the ${MAX_FIELDS} cap`);
+    expect(refusal({ fields: { "not a name": "v" } })).toContain("is not usable");
+    // A dotted name is one `EventQuery`'s `where.path` cannot address: it
+    // would report a field this tool accepted as MISSING, which is a
+    // confidently wrong answer rather than a missing feature.
+    expect(refusal({ fields: { "a.b": "v" } })).toContain("where.path");
+    // A computed key, so the fixture itself does not set a prototype. The
+    // grammar requires a leading letter, which is what keeps this out of an
+    // assignment that would be a silent no-op rather than a recorded field.
+    expect(refusal({ fields: { ["__proto__"]: "v" } })).toContain("is not usable");
+    expect(refusal({ fields: { v: "x".repeat(MAX_FIELD_VALUE_CHARS + 1) } })).toContain(
+      "a log line is not",
+    );
+  });
+
+  test("a nested value is refused rather than flattened or stringified", () => {
+    expect(refusal({ fields: { nested: { a: 1 } as unknown as string } })).toContain("no bound");
+    expect(refusal({ fields: { list: [1, 2] as unknown as string } })).toContain("no bound");
+  });
+
+  test("a non-finite number is refused rather than written as null", () => {
+    // `JSON.stringify(Infinity)` is `null`: the value on disk would not be the
+    // value the caller passed.
+    expect(refusal({ fields: { ratio: Number.POSITIVE_INFINITY } })).toContain("finite");
+  });
+
+  test("an over-long name is refused by length before it is refused by grammar", () => {
+    expect(refusal({ name: "a".repeat(MAX_NAME_CHARS + 1) })).toContain(
+      `over the ${MAX_NAME_CHARS} cap`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // cost
 // ---------------------------------------------------------------------------
 
@@ -988,16 +1281,19 @@ describe("the SSRF classifier", () => {
     }
   });
 
-  test("the local-use NAT64 prefix is refused whole, because its IPv4 has no fixed position", () => {
-    // RFC 8215's 64:ff9b:1::/48 puts the translated address at an offset that
-    // depends on the translator's prefix length. Reading the last two groups
-    // the way 64:ff9b::/96 allows would call this loopback-through-a-local-
-    // translator a public address.
-    expect(isPrivateIp("64:ff9b:1::7f00:1")).toBe(true);
-    expect(isPrivateIp("64:ff9b:1:ffff::a9fe:a9fe")).toBe(true);
-    expect(isPrivateIp("64:ff9b:1::")).toBe(true);
-    // The neighbouring prefix is a different, ordinary global range.
-    expect(isPrivateIp("64:ff9b:2::1")).toBe(false);
+  test("the local-use NAT64 prefix is judged by the IPv4 it carries, like the well-known one", () => {
+    // RFC 8215's 64:ff9b:1::/48 is the prefix a `64:ff9b::/96` test misses, and
+    // the one six copies of this classifier were confirmed reachable through.
+    // The synchronised block treats the whole of 64:ff9b::/32 as NAT64 and
+    // reads the last two groups, so each of these is refused for the address it
+    // carries rather than for the prefix it wears.
+    expect(isPrivateIp("64:ff9b:1::7f00:1")).toBe(true); // 127.0.0.1
+    expect(isPrivateIp("64:ff9b:1:ffff::a9fe:a9fe")).toBe(true); // 169.254.169.254
+    expect(isPrivateIp("64:ff9b:1::")).toBe(true); // 0.0.0.0
+    expect(isPrivateIp("64:ff9b:2::1")).toBe(true); // 0.0.0.1, inside 0.0.0.0/8
+    // Carrying a PUBLIC address is what keeps this from being a wall: the
+    // prefix is not the verdict, the embedded address is.
+    expect(isPrivateIp("64:ff9b::808:808")).toBe(false); // 8.8.8.8
   });
 
   test("a public address is not refused, or the gate would be a wall", () => {
@@ -1006,14 +1302,91 @@ describe("the SSRF classifier", () => {
     }
   });
 
-  test("an IPv6-shaped string the parser cannot expand is refused, not waved through", () => {
-    expect(isPrivateIp("::ffff:999.1.1.1")).toBe(true);
-    expect(isPrivateIp("1:2:3")).toBe(true);
+  test("an IPv6-shaped host the parser cannot expand is refused, not dialled", async () => {
+    // The predicate answers "not a private address" for a string that is not an
+    // address at all, so the fail-closed step is the GATE's: a host with a colon
+    // in it that will not expand is one nothing could classify, and it is
+    // refused rather than handed to the resolver.
+    for (const host of ["::ffff:999.1.1.1", "1:2:3", "fe80:::1"]) {
+      expect(isPrivateIp(host)).toBe(false);
+      await expect(assertNotSsrf(host)).rejects.toThrow("not a valid IPv6 address");
+    }
   });
 
   test("a zone id cannot dress a link-local address up as an unrecognised one", () => {
     expect(isPrivateIp("fe80::1%eth0")).toBe(true);
     expect(isPrivateIp("fe80::1%25eth0")).toBe(true);
+  });
+
+  /**
+   * The audit matrix, kept as a test rather than as a one-off proof.
+   *
+   * These are the spellings the 2026-09-18 audit ran against every copy of the
+   * private-address classifier: one address written every way a URL parser, a
+   * DNS64 resolver or an `inet_aton` bypass can write it. The sharp ones are
+   * the IPv6 forms of 169.254.169.254 — `a9fe:a9fe` IS the cloud metadata
+   * service, and `new URL("http://[::ffff:169.254.169.254]/")` hands a guard
+   * `::ffff:a9fe:a9fe`, so a check that compares TEXT never sees the spelling
+   * it was written for. This copy already parsed numerically, and leaked
+   * exactly one of them: `::ffff:0:a9fe:a9fe`, the RFC 6145 translated
+   * `::ffff:0:0:0/96` form, which its IPv4-mapped test did not cover.
+   */
+  test("every spelling in the audit matrix is blocked, and no real address is", () => {
+    const leaked = [
+      "169.254.169.254",
+      "2852039166", // 32-bit integer
+      "0xA9FEA9FE", // hex
+      "0251.0376.0251.0376", // octal
+      "127.1", // short form: 127.0.0.1, not 127.1.0.0
+      "::ffff:169.254.169.254", // IPv4-mapped, as written
+      "::ffff:a9fe:a9fe", // IPv4-mapped, as the URL parser re-serialises it
+      "0:0:0:0:0:ffff:a9fe:a9fe",
+      "0:0:0:0:0:ffff:169.254.169.254",
+      "64:ff9b::a9fe:a9fe", // NAT64 well-known prefix
+      "64:ff9b::169.254.169.254",
+      "64:ff9b:1::a9fe:a9fe", // NAT64 /48 variant
+      "64:ff9b:1:0:0:0:a9fe:a9fe",
+      "::a9fe:a9fe", // IPv4-compatible
+      "::ffff:0:a9fe:a9fe", // translated ::ffff:0:0:0/96 — what this copy missed
+      "2002:a9fe:a9fe::", // 6to4
+      "127.0.0.1",
+      "::1",
+      "0:0:0:0:0:0:0:1",
+      "64:ff9b::7f00:1", // NAT64 of loopback
+      "fe80::1",
+      "febf::1", // the top of fe80::/10, which a "fe80:" prefix test misses
+      "fd00::1",
+      "::",
+      "0:0:0:0:0:0:0:0",
+      "10.0.0.1",
+      "192.168.1.1",
+      "172.16.0.1",
+      "100.64.0.1", // CGNAT
+      "198.18.0.1", // benchmarking
+      "224.0.0.1", // multicast
+      "255.255.255.255", // broadcast
+      "0.0.0.0",
+    ].filter((ip) => !isPrivateIp(ip));
+    expect(leaked).toEqual([]);
+
+    // Over-blocking is the other way to get this wrong, and it breaks real
+    // usage rather than announcing itself.
+    const overBlocked = [
+      "8.8.8.8",
+      "1.1.1.1",
+      "93.184.216.34",
+      "2606:4700:4700::1111",
+      "2001:4860:4860::8888",
+    ].filter((ip) => isPrivateIp(ip));
+    expect(overBlocked).toEqual([]);
+
+    // `fec0::1` (deprecated site-local) and `100::1` (discard-only) were
+    // covered by this package's own classifier before the synchronised block
+    // replaced it. The block does not cover those two ranges, and it is
+    // byte-identical across packages, so they cannot be re-asserted here —
+    // they have to be added to the block, for every copy at once. Nothing is
+    // asserted about them either way, so a later fix in the block does not
+    // have to come back and delete an assertion.
   });
 
   test("a hostname that RESOLVES to a private address is refused", async () => {

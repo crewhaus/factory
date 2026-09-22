@@ -15,13 +15,7 @@ import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import {
-  type LockedVersion,
-  parseBunLock,
-  parseCargoLock,
-  parsePackageLock,
-  parseYarnLock,
-} from "@crewhaus/tool-code";
+import { LOCKFILE_NAMES, type LockedVersion, parseLockfileDetailed } from "@crewhaus/tool-code";
 import { z } from "zod";
 import { type LicenseFinding, declaredLicense, splitExpression, summarize } from "./lib/license";
 import { diffLocks } from "./lib/lockdiff";
@@ -50,18 +44,45 @@ function readCapped(abs: string, limit: number, what: string): Buffer {
   return readFileSync(abs);
 }
 
-/** Pick a lockfile parser from the filename, since the formats are distinct. */
+/**
+ * Pick a lockfile reader from the filename.
+ *
+ * The filename-to-reader mapping is NOT re-derived here. This function used
+ * to keep its own copy, and the copy drifted: it sent `pnpm-lock.yaml` to the
+ * yarn reader, whose entry grammar no pnpm generation matches, and the BINARY
+ * `bun.lockb` to a text reader. Neither threw. Both returned zero entries, so
+ * comparing two pnpm lockfiles produced all-zero counts — a wrong answer
+ * wearing the shape of a right one, which is the worst thing a tool that
+ * exists to be trusted without checking can do.
+ *
+ * `bun.lockb` is still refused, because it is the one format named in the
+ * description that genuinely cannot be read as text.
+ *
+ * The name is matched as a SUFFIX, which the exact-basename lookup behind
+ * `parseLockfileDetailed` is not: comparing two lockfiles means having two of
+ * them at once, so one of the pair is normally a renamed copy
+ * (`before-package-lock.json`). The names come from the same module as the
+ * readers, so this stays a question about spelling rather than a second
+ * opinion about which format is readable.
+ */
 function parseLock(name: string, text: string): LockedVersion[] {
   const base = name.toLowerCase();
-  if (base.endsWith("bun.lock") || base.endsWith("bun.lockb")) return parseBunLock(text);
-  if (base.endsWith("package-lock.json") || base.endsWith("npm-shrinkwrap.json")) {
-    return parsePackageLock(text);
+  if (base.endsWith("bun.lockb")) {
+    throw new Error(
+      `"${name}" is bun's BINARY lockfile and cannot be read as text — run \`bun install --save-text-lockfile\` to get a bun.lock this tool can read`,
+    );
   }
-  if (base.endsWith("yarn.lock") || base.endsWith("pnpm-lock.yaml")) return parseYarnLock(text);
-  if (base.endsWith("cargo.lock")) return parseCargoLock(text);
-  throw new Error(
-    `cannot tell what kind of lockfile "${name}" is — expected bun.lock, package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml or Cargo.lock`,
-  );
+  const canonical = LOCKFILE_NAMES.find((known) => base.endsWith(known.toLowerCase()));
+  const locked = canonical === undefined ? undefined : parseLockfileDetailed(canonical, text);
+  if (locked === undefined) {
+    throw new Error(
+      `cannot tell what kind of lockfile "${name}" is — expected ${LOCKFILE_NAMES.join(", ")}`,
+    );
+  }
+  // Narrowed on the way out: `diffLocks` rebuilds its own entries, but the
+  // wide records also carry an integrity hash, and this tool's output has
+  // never contained one.
+  return locked.map(({ name: dep, version }) => ({ name: dep, version }));
 }
 
 // ---------------------------------------------------------------------------

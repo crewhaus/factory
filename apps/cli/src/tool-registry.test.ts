@@ -23,6 +23,7 @@ import {
   leafCategories,
   toolsInCategory,
 } from "@crewhaus/tool-categories";
+import { isPrivateIp } from "@crewhaus/tool-fetch";
 import { CLI_RUNTIME_TOOL_KEYS, buildCategoryRows, diffToolMapKeys } from "./tools-cli";
 
 describe("category registry vs. the real builtin set", () => {
@@ -112,41 +113,130 @@ describe("buildCategoryRows", () => {
  * that exists but cannot be switched on is not shipped.
  */
 describe("every exported tool is reachable from a spec", () => {
-  const PACKAGES = [
-    "tool-text",
-    "tool-data",
-    "tool-encode",
-    "tool-datetime",
-    "tool-schema",
-    "tool-git",
-    "tool-fsx",
-    "tool-proc",
-    "tool-http",
-    "tool-state",
-    "tool-crewhaus",
-    "tool-code",
-    "tool-codehost",
-    "tool-sql",
-    "tool-docs",
-    "tool-secure",
-    "tool-math",
-  ];
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+
+  /**
+   * Every `tool-*` package on disk, not a list of them.
+   *
+   * This WAS a hand-maintained array of seventeen names, which made it the
+   * very thing it exists to catch: a second list that drifts. By the time it
+   * was noticed the repository held 92 tool packages, so the guard covered
+   * under a fifth of them and passed loudly while saying nothing about the
+   * rest — a package could be built, exported and never wired, and this test
+   * would still be green. Reading the directory cannot fall behind.
+   */
+  const PACKAGES = readdirSync(join(repoRoot, "packages"))
+    .filter((name) => name.startsWith("tool-"))
+    .filter((name) => existsSync(join(repoRoot, "packages", name, "src", "index.ts")))
+    .sort();
+
+  /**
+   * The guard's own hit count.
+   *
+   * A sweep that matches nothing passes. Both halves are asserted: that the
+   * directory walk found packages, and that the export regex actually matched
+   * inside them. If `RegisteredTool` is ever renamed, or the entrypoint moves,
+   * these fail HERE — with the reason — instead of leaving the check above
+   * silently vacuous.
+   */
+  test("the sweep actually reads the packages it claims to", () => {
+    expect(PACKAGES.length).toBeGreaterThanOrEqual(80);
+    expect(PACKAGES).toContain("tool-verify");
+    expect(PACKAGES).toContain("tool-notify");
+    expect(PACKAGES).toContain("tool-math");
+    let exportsSeen = 0;
+    for (const pkg of PACKAGES) {
+      const text = readFileSync(join(repoRoot, "packages", pkg, "src", "index.ts"), "utf-8");
+      exportsSeen += [...text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)].length;
+    }
+    expect(exportsSeen).toBeGreaterThanOrEqual(400);
+  });
+
+  /**
+   * The packages a spec reaches through a different target, not through
+   * `target-cli`'s builtin map.
+   *
+   * Four of the 92 export a `RegisteredTool` that is deliberately absent from
+   * `BUILTIN_TOOL_MAP`: the chain-call pair and the message channel are
+   * emitted by `target-graph`, `target-crew`, `target-workflow` and the
+   * cf-worker targets, and `Retrieve` is registered programmatically per
+   * corpus by `apps/cli/src/knowledge-ingest.ts`. Naming them is unavoidable;
+   * leaving the name unchecked is not, so the test below re-derives the reason
+   * each one is here. An exemption whose justification stops being true fails
+   * rather than going on exempting.
+   */
+  const REACHED_BY_ANOTHER_TARGET: Readonly<Record<string, string>> = {
+    "tool-evm": "target-graph, target-crew and target-workflow emit it",
+    "tool-evm-tx": "target-graph, target-crew and target-workflow emit it",
+    "tool-message-channel": "the channel-bot and cf-worker targets emit it",
+    "tool-retrieve": "apps/cli/src/knowledge-ingest.ts registers it per corpus",
+  };
+
+  const exportNames = new Set(
+    Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
+  );
+
+  test("every exemption still has the reason it was granted for", () => {
+    const targets = readdirSync(join(repoRoot, "packages")).filter((n) => n.startsWith("target-"));
+    expect(targets.length).toBeGreaterThanOrEqual(5);
+    for (const pkg of Object.keys(REACHED_BY_ANOTHER_TARGET)) {
+      // Still a package, and still exporting something — an exemption for a
+      // package that has been deleted or emptied is dead weight.
+      const entry = join(repoRoot, "packages", pkg, "src", "index.ts");
+      expect(existsSync(entry)).toBe(true);
+      expect(PACKAGES).toContain(pkg);
+
+      // And still reached: some OTHER package that emits or registers tools
+      // imports it by name. `tool-retrieve` is the one reached from the CLI
+      // itself rather than from a target, so both places are searched.
+      const importers: string[] = [];
+      for (const other of [...targets.map((t) => join("packages", t, "src")), "apps/cli/src"]) {
+        const dir = join(repoRoot, other);
+        if (!existsSync(dir)) continue;
+        for (const file of readdirSync(dir)) {
+          if (!file.endsWith(".ts") || file.includes(".test.")) continue;
+          if (readFileSync(join(dir, file), "utf-8").includes(`@crewhaus/${pkg}`)) {
+            importers.push(join(other, file));
+          }
+        }
+      }
+      expect(
+        importers.length,
+        `${pkg} is exempt because ${REACHED_BY_ANOTHER_TARGET[pkg]}, and nothing imports it any more`,
+      ).toBeGreaterThan(0);
+
+      // And still NEEDS the exemption. "Some target imports it" is true of
+      // nearly every tool package, so on its own it would let a name sit here
+      // for ever. This is the tight half: an exempt package's tools must
+      // actually be absent from the builtin map. The moment one is wired
+      // properly, the exemption is dead weight and this says so — which is
+      // also what stops a package being parked here to silence the sweep.
+      const wiredHere = [
+        ...readFileSync(entry, "utf-8").matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm),
+      ]
+        .map((m) => m[1] as string)
+        .filter((name) => CLI_RUNTIME_TOOL_KEYS.includes(name) || exportNames.has(name));
+      expect(wiredHere.length).toBeGreaterThanOrEqual(0);
+      expect(
+        wiredHere,
+        `${pkg} is listed as reached by another target, but ${wiredHere.join(", ")} is wired into the builtin map — drop it from REACHED_BY_ANOTHER_TARGET so the sweep covers this package`,
+      ).toEqual([]);
+    }
+  });
 
   test("no package exports a tool that is not wired", () => {
-    const repoRoot = join(import.meta.dir, "..", "..", "..");
     const unreachable: Array<{ pkg: string; tool: string }> = [];
+    // Every `export const <name>: RegisteredTool` in the package entrypoint.
+    // A tool whose natural name collides with a library function in its own
+    // module is exported under a suffix, so the spec key and the export name
+    // can differ; resolve through the emitter map rather than assuming they
+    // match, and treat an export no key points at as unreachable.
+    const exportsWired = new Set(
+      Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
+    );
     for (const pkg of PACKAGES) {
-      const source = join(repoRoot, "packages", pkg, "src", "index.ts");
-      if (!existsSync(source)) continue;
-      const text = readFileSync(source, "utf-8");
-      // Every `export const <name>: RegisteredTool` in the package entrypoint.
-      // A tool whose natural name collides with a library function in its own
-      // module is exported under a suffix, so the spec key and the export name
-      // can differ; resolve through the emitter map rather than assuming they
-      // match, and treat an export no key points at as unreachable.
-      const exportsWired = new Set(
-        Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
-      );
+      if (pkg in REACHED_BY_ANOTHER_TARGET) continue;
+      const text = readFileSync(join(repoRoot, "packages", pkg, "src", "index.ts"), "utf-8");
       for (const m of text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)) {
         const name = m[1] as string;
         if (!CLI_RUNTIME_TOOL_KEYS.includes(name) && !exportsWired.has(name)) {
@@ -314,5 +404,161 @@ describe("the CLI can actually load every tool package it names", () => {
       (p) => p.startsWith("@crewhaus/tool-") && !imported.has(p),
     );
     expect(unrunnable).toEqual([]);
+  });
+});
+
+describe("every copy of the private-address classifier is the same classifier", () => {
+  /**
+   * Ten packages guard an outbound request against a private destination, and
+   * each carries the classifier as a byte-identical block rather than importing
+   * it — these are otherwise independent per-package networking layers, and a
+   * guard proving the copies are identical is cheaper than the import graph a
+   * shared package would need across `crawler`, `computer-use-driver` and eight
+   * tools.
+   *
+   * That only works if something checks. On 2026-09-18 an audit of the copies
+   * found SIX confirmed exploitable — each with a runnable proof — because they
+   * had drifted into comparing address TEXT. `new URL()` rewrites
+   * `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`, so a text check never
+   * sees the spelling it was written for, and `64:ff9b::a9fe:a9fe` IS
+   * 169.254.169.254 wherever DNS64/NAT64 runs. One copy parsed numerically and
+   * was still exploitable, because it knew `64:ff9b::/96` and not the
+   * `64:ff9b:1::/48` variant.
+   */
+  const MARKER_START = "// BEGIN SYNCHRONISED BLOCK";
+  const MARKER_END = "// END SYNCHRONISED BLOCK";
+
+  /**
+   * RECURSIVE on purpose. The sibling resolver guard above walks only
+   * `packages/<pkg>/src/*.ts`, and this block also lives at
+   * `tool-chainread/src/lib/endpoint.ts` — one level deeper. A sweep that
+   * stops at the first level would miss it and still report green, which is
+   * how the resolver guard went vacuous twice.
+   */
+  function classifierCopies(): Array<{ pkg: string; file: string; block: string }> {
+    const pkgDir = join(import.meta.dir, "..", "..", "..", "packages");
+    const found: Array<{ pkg: string; file: string; block: string }> = [];
+    const walk = (pkg: string, dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === "node_modules" || entry.name === "dist") continue;
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(pkg, full);
+          continue;
+        }
+        if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
+        const text = readFileSync(full, "utf-8");
+        const from = text.indexOf(MARKER_START);
+        if (from === -1) continue;
+        const to = text.indexOf(MARKER_END, from);
+        // A start marker with no end is a truncated block, not an absent one.
+        expect(to).toBeGreaterThan(from);
+        found.push({ pkg, file: full, block: text.slice(from, to + MARKER_END.length) });
+      }
+    };
+    for (const pkg of readdirSync(pkgDir)) {
+      const src = join(pkgDir, pkg, "src");
+      if (existsSync(src)) walk(pkg, src);
+    }
+    return found;
+  }
+
+  test("the sweep finds every copy it is meant to guard", () => {
+    const copies = classifierCopies();
+    // The count assertion is the line that turns "passed" into "actually
+    // looked". Without it, a rename or a moved file silently shrinks the sweep
+    // to nothing and this whole describe reports green over an empty set.
+    expect(copies.length).toBeGreaterThanOrEqual(10);
+    // And the specific packages, because a count alone survives one copy
+    // disappearing while an unrelated one is added.
+    const pkgs = new Set(copies.map((c) => c.pkg));
+    for (const required of [
+      "computer-use-driver",
+      "crawler",
+      "tool-chainread",
+      "tool-codehost",
+      "tool-fetch",
+      "tool-http",
+      "tool-navigate",
+      "tool-notify",
+      "tool-obs",
+      "tool-web",
+    ]) {
+      expect({ required, present: pkgs.has(required) }).toEqual({ required, present: true });
+    }
+  });
+
+  test("every copy is byte-identical", () => {
+    const copies = classifierCopies();
+    const distinct = new Map<string, string[]>();
+    for (const { file, block } of copies) {
+      const existing = distinct.get(block);
+      if (existing) existing.push(file);
+      else distinct.set(block, [file]);
+    }
+    // One distinct block, or the failure names which files disagree.
+    expect([...distinct.values()].map((files) => files.length).sort((a, b) => b - a)).toEqual([
+      copies.length,
+    ]);
+  });
+
+  /**
+   * RUN the classifier rather than reading it.
+   *
+   * The first version of this test asserted the block's TEXT — that it
+   * contained `g[0] === 0x64 && g[1] === 0xff9b`, and so on. Mutation-testing
+   * it showed that was worthless: narrowing the NAT64 arm to
+   * `g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0` — which reopens the
+   * `64:ff9b:1::/48` hole that shipped exploitable — STILL CONTAINS that
+   * substring, so the assertion passed over a broken classifier in all ten
+   * copies at once. Matching on text was the original bug; asserting on text
+   * reproduced it in the guard.
+   *
+   * Executing one copy plus proving the copies identical covers all of them.
+   */
+  const MUST_BE_PRIVATE = [
+    "169.254.169.254", // the metadata service, plainly
+    "2852039166", // ...as a packed integer
+    "0xA9FEA9FE", // ...as hex
+    "0251.0376.0251.0376", // ...as octal
+    "127.1", // inet_aton short form
+    "::ffff:169.254.169.254", // IPv4-mapped, dotted
+    "::ffff:a9fe:a9fe", // what `new URL()` turns the line above into
+    "0:0:0:0:0:ffff:a9fe:a9fe", // ...uncompressed, which a CONNECT target keeps
+    "64:ff9b::a9fe:a9fe", // NAT64 /96 — this IS 169.254.169.254 under DNS64
+    "64:ff9b:1::a9fe:a9fe", // NAT64 /48 — the variant that shipped exploitable
+    "::a9fe:a9fe", // IPv4-compatible, deprecated but still routed
+    "2002:a9fe:a9fe::", // 6to4
+    "127.0.0.1",
+    "::1",
+    "0:0:0:0:0:0:0:1", // loopback uncompressed — tunnelled a real proxy
+    "fe80::1",
+    "febf::1", // still fe80::/10; a `startsWith("fe80:")` check misses it
+    "fd00::1",
+    "::",
+    "10.0.0.1",
+    "192.168.1.1",
+    "172.16.0.1",
+    "100.64.0.1", // carrier-grade NAT
+    "198.18.0.1", // benchmarking
+    "224.0.0.1", // multicast
+    "255.255.255.255",
+    "0.0.0.0",
+  ];
+  const MUST_STAY_PUBLIC = [
+    "8.8.8.8",
+    "1.1.1.1",
+    "93.184.216.34",
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+  ];
+
+  test("the shared classifier, executed, blocks every spelling and over-blocks none", () => {
+    const leaked = MUST_BE_PRIVATE.filter((host) => !isPrivateIp(host));
+    expect(leaked).toEqual([]);
+    // Over-blocking is the other failure: a guard that refuses the real
+    // internet is removed by whoever it blocks, and then nothing guards.
+    const overBlocked = MUST_STAY_PUBLIC.filter((host) => isPrivateIp(host));
+    expect(overBlocked).toEqual([]);
   });
 });

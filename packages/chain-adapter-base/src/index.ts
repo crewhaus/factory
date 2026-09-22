@@ -96,6 +96,10 @@ const READ_ONLY_RPC_METHODS: ReadonlySet<string> = new Set([
   "eth_getLogs",
   "eth_getTransactionByHash",
   "eth_getTransactionReceipt",
+  // A nonce is public state — any explorer will hand it to you. The method
+  // name says "transaction", which is what makes it look write-class; it
+  // only counts the transactions an account has already sent.
+  "eth_getTransactionCount",
   "eth_getBlockByNumber",
   "eth_getBlockByHash",
   "eth_blockNumber",
@@ -104,6 +108,10 @@ const READ_ONLY_RPC_METHODS: ReadonlySet<string> = new Set([
   "eth_getCode",
   "eth_getStorageAt",
   "eth_estimateGas",
+  // Same trust class as eth_call, one block-overlay wider: it evaluates
+  // calls against a block and returns what they WOULD do. Nothing is
+  // submitted, no signature is required, and the node keeps no state.
+  "eth_simulateV1",
   "eth_feeHistory",
   "eth_gasPrice",
   "net_version",

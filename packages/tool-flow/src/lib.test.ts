@@ -7,12 +7,14 @@
  * `index.test.ts` test the contract; this tests the thinking.
  */
 import { describe, expect, test } from "bun:test";
+import { assignOwner } from "./lib/assign";
 import { evaluateBranches } from "./lib/branch";
 import { jaccard, normalizeValue, tallyVotes } from "./lib/consensus";
 import { checkDeadline } from "./lib/deadline";
 import { evaluateTable, hashTable } from "./lib/decision";
 import { classifyError, parseRetryAfter } from "./lib/errors";
 import { scoreValue } from "./lib/score";
+import { planSequence } from "./lib/sequence";
 import { detectStall } from "./lib/stall";
 
 describe("evaluateBranches", () => {
@@ -777,5 +779,528 @@ describe("scoreValue", () => {
 
   test("an empty model is rejected", () => {
     expect(() => scoreValue({}, { rules: [] })).toThrow(/no rules/);
+  });
+});
+
+describe("assignOwner", () => {
+  const roster = [
+    {
+      id: "ana",
+      when: [
+        { path: "country", op: "equals" as const, expected: "DE" },
+        { path: "state", op: "equals" as const, expected: "BY" },
+      ],
+    },
+    { id: "bo", when: [{ path: "country", op: "equals" as const, expected: "DE" }] },
+    { id: "cy", when: [{ path: "country", op: "equals" as const, expected: "FR" }] },
+  ];
+  const lead = { country: "DE", state: "BY" };
+
+  test("first takes the earliest eligible owner", () => {
+    const result = assignOwner(lead, { strategy: "first", owners: roster });
+    expect(result).toMatchObject({ ok: true, assigned: true, owner: "ana", fallback: false });
+    expect(result.eligible).toEqual(["ana", "bo"]);
+  });
+
+  test("specific prefers the narrower territory, whatever order it was written in", () => {
+    const reversed = [roster[1] as (typeof roster)[number], roster[0] as (typeof roster)[number]];
+    expect(assignOwner(lead, { strategy: "specific", owners: reversed }).owner).toBe("ana");
+  });
+
+  test("two equally specific territories are a conflict, not a coin toss", () => {
+    const result = assignOwner(lead, {
+      strategy: "specific",
+      owners: [
+        { id: "ana", when: [{ path: "country", op: "equals", expected: "DE" }] },
+        { id: "bo", when: [{ path: "state", op: "equals", expected: "BY" }] },
+      ],
+    });
+    expect(result).toMatchObject({ ok: false, assigned: false, owner: null });
+    expect(result.conflict).toContain("ana");
+    expect(result.conflict).toContain("bo");
+  });
+
+  test("specific ranks the territory as declared, not whatever the record happened to satisfy", () => {
+    // A `match: "any"` owner requires exactly one condition however many
+    // happen to hold, so counting the holders ranks the record rather than
+    // the roster: the same two territories would swap places lead by lead
+    // over fields neither of them asked for.
+    const owners = [
+      {
+        id: "broad",
+        match: "any" as const,
+        when: [
+          { path: "country", op: "equals" as const, expected: "DE" },
+          { path: "language", op: "equals" as const, expected: "de" },
+          { path: "tier", op: "equals" as const, expected: "smb" },
+        ],
+      },
+      {
+        id: "narrow",
+        when: [
+          { path: "country", op: "equals" as const, expected: "DE" },
+          { path: "state", op: "equals" as const, expected: "BY" },
+        ],
+      },
+    ];
+    const bavarian = { country: "DE", state: "BY" };
+    expect(
+      assignOwner({ ...bavarian, language: "de", tier: "smb" }, { strategy: "specific", owners })
+        .owner,
+    ).toBe("narrow");
+    expect(
+      assignOwner(
+        { ...bavarian, language: "fr", tier: "enterprise" },
+        { strategy: "specific", owners },
+      ).owner,
+    ).toBe("narrow");
+  });
+
+  test("an owner whose room could not be worked out is not reported as eligible", () => {
+    // The per-owner report is what a rep is shown when they ask why a lead
+    // went elsewhere. Recording "eligible, no reason" for the very owner the
+    // roster could not rank states a fact the tool does not have.
+    const result = assignOwner(lead, {
+      strategy: "first",
+      owners: [
+        { id: "ana", when: [{ path: "country", op: "equals", expected: "DE" }], capacity: 20 },
+        { id: "bo", when: [{ path: "country", op: "equals", expected: "DE" }], load: 1 },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.considered[0]).toMatchObject({ id: "ana", eligible: null });
+    expect(result.considered[0]?.reason).toContain("capacity");
+    expect(result.eligible).toEqual(["bo"]);
+  });
+
+  test("least_loaded takes the lightest, and a tie goes to the earlier declaration", () => {
+    const owners = [
+      { id: "ana", when: [{ path: "country", op: "equals" as const, expected: "DE" }], load: 4 },
+      { id: "bo", when: [{ path: "country", op: "equals" as const, expected: "DE" }], load: 1 },
+      { id: "cy", when: [{ path: "country", op: "equals" as const, expected: "DE" }], load: 1 },
+    ];
+    expect(assignOwner(lead, { strategy: "least_loaded", owners }).owner).toBe("bo");
+  });
+
+  test("an eligible owner with no load makes least_loaded refuse rather than rank them as zero", () => {
+    const result = assignOwner(lead, {
+      strategy: "least_loaded",
+      owners: [
+        { id: "ana", when: [{ path: "country", op: "equals", expected: "DE" }], load: 7 },
+        { id: "bo", when: [{ path: "country", op: "equals", expected: "DE" }] },
+      ],
+    });
+    expect(result).toMatchObject({ ok: false, assigned: false, owner: null });
+    expect(result.conflict).toContain("bo");
+    expect(result.conflict).toContain("least_loaded");
+  });
+
+  test("an undecidable roster does not fall through to the catch-all owner", () => {
+    // Routing "I could not work out who" to the fallback would bury a broken
+    // roster in one rep's inbox until somebody audited the quarter.
+    const result = assignOwner(lead, {
+      strategy: "least_loaded",
+      owners: [{ id: "bo", when: [{ path: "country", op: "equals", expected: "DE" }] }],
+      fallback: { id: "queue" },
+    });
+    expect(result).toMatchObject({ ok: false, owner: null, fallback: false });
+  });
+
+  test("a missing load on an owner who was ruled out anyway is not a problem", () => {
+    const result = assignOwner(lead, {
+      strategy: "least_loaded",
+      owners: [
+        { id: "ana", when: [{ path: "country", op: "equals", expected: "DE" }], load: 7 },
+        { id: "cy", when: [{ path: "country", op: "equals", expected: "FR" }] },
+      ],
+    });
+    expect(result).toMatchObject({ ok: true, owner: "ana" });
+  });
+
+  test("an owner at capacity is skipped, with the numbers in the reason", () => {
+    const result = assignOwner(lead, {
+      strategy: "first",
+      owners: [
+        {
+          id: "ana",
+          when: [{ path: "country", op: "equals", expected: "DE" }],
+          load: 20,
+          capacity: 20,
+        },
+        { id: "bo", when: [{ path: "country", op: "equals", expected: "DE" }] },
+      ],
+    });
+    expect(result.owner).toBe("bo");
+    expect(result.considered[0]).toMatchObject({ id: "ana", eligible: false });
+    expect(result.considered[0]?.reason).toContain("20 of 20");
+  });
+
+  test("a capacity with no load is undetermined, not room to spare", () => {
+    const result = assignOwner(lead, {
+      strategy: "first",
+      owners: [
+        { id: "ana", when: [{ path: "country", op: "equals", expected: "DE" }], capacity: 20 },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    expect(result.conflict).toContain("capacity");
+  });
+
+  test("available:false takes an owner out; an absent flag does not", () => {
+    const owners = [
+      {
+        id: "ana",
+        when: [{ path: "country", op: "equals" as const, expected: "DE" }],
+        available: false,
+      },
+      { id: "bo", when: [{ path: "country", op: "equals" as const, expected: "DE" }] },
+    ];
+    const result = assignOwner(lead, { strategy: "first", owners });
+    expect(result.owner).toBe("bo");
+    expect(result.considered[0]?.reason).toBe("unavailable");
+  });
+
+  test("round_robin walks the declared roster and hands back where it got to", () => {
+    const owners = ["ana", "bo", "cy"].map((id) => ({
+      id,
+      when: [{ path: "country", op: "equals" as const, expected: "DE" }],
+    }));
+    const seen: string[] = [];
+    let cursor: number | undefined;
+    for (let i = 0; i < 4; i++) {
+      const result = assignOwner(lead, { strategy: "round_robin", owners, cursor });
+      seen.push(result.owner as string);
+      cursor = result.cursor as number;
+    }
+    expect(seen).toEqual(["ana", "bo", "cy", "ana"]);
+  });
+
+  test("an owner going out of office does not re-deal everybody else's turn", () => {
+    // The cursor counts positions in the declared roster, so with "bo" out
+    // the rotation still resumes at "cy" rather than sliding a place.
+    const owners = [
+      { id: "ana", when: [{ path: "country", op: "equals" as const, expected: "DE" }] },
+      {
+        id: "bo",
+        when: [{ path: "country", op: "equals" as const, expected: "DE" }],
+        available: false,
+      },
+      { id: "cy", when: [{ path: "country", op: "equals" as const, expected: "DE" }] },
+    ];
+    const result = assignOwner(lead, { strategy: "round_robin", owners, cursor: 1 });
+    expect(result).toMatchObject({ owner: "cy", cursor: 0 });
+  });
+
+  test("round_robin wraps past the end of the roster", () => {
+    const owners = [
+      { id: "ana", when: [{ path: "country", op: "equals" as const, expected: "DE" }] },
+      { id: "cy", when: [{ path: "country", op: "equals" as const, expected: "FR" }] },
+    ];
+    expect(assignOwner(lead, { strategy: "round_robin", owners, cursor: 1 })).toMatchObject({
+      owner: "ana",
+      cursor: 1,
+    });
+  });
+
+  test("a rotation that picked nobody leaves the cursor alone", () => {
+    // The fallback is not in the rotation, so returning a new position would
+    // skip a rep's turn every time a lead fell through to the queue.
+    const result = assignOwner(
+      { country: "JP" },
+      {
+        strategy: "round_robin",
+        owners: [{ id: "ana", when: [{ path: "country", op: "equals", expected: "DE" }] }],
+        cursor: 0,
+        fallback: { id: "queue" },
+      },
+    );
+    expect(result).toMatchObject({ owner: "queue", fallback: true, cursor: null });
+  });
+
+  test("nobody eligible with a fallback routes to the fallback", () => {
+    const result = assignOwner(
+      { country: "JP" },
+      {
+        strategy: "first",
+        owners: roster,
+        fallback: { id: "queue" },
+      },
+    );
+    expect(result).toMatchObject({ ok: true, assigned: true, owner: "queue", fallback: true });
+  });
+
+  test("nobody eligible without a fallback is a settled no, not a failure", () => {
+    const result = assignOwner({ country: "JP" }, { strategy: "first", owners: roster });
+    expect(result).toMatchObject({ ok: true, assigned: false, owner: null, conflict: null });
+    expect(result.considered).toHaveLength(3);
+  });
+
+  test("match:any lets one condition carry the owner", () => {
+    const result = assignOwner(
+      { country: "JP", language: "de" },
+      {
+        strategy: "first",
+        owners: [
+          {
+            id: "ana",
+            match: "any" as const,
+            when: [
+              { path: "country", op: "equals" as const, expected: "DE" },
+              { path: "language", op: "equals" as const, expected: "de" },
+            ],
+          },
+        ],
+      },
+    );
+    expect(result.owner).toBe("ana");
+  });
+
+  test("an owner with no conditions is rejected, not treated as a catch-all", () => {
+    expect(() => assignOwner(lead, { strategy: "first", owners: [{ id: "x", when: [] }] })).toThrow(
+      /no conditions/,
+    );
+  });
+
+  test("two owners with one id are rejected", () => {
+    const dup = { id: "same", when: [{ path: "a", op: "exists" as const }] };
+    expect(() => assignOwner(lead, { strategy: "first", owners: [dup, dup] })).toThrow(
+      /share the id/,
+    );
+  });
+
+  test("a non-finite load is rejected rather than compared", () => {
+    expect(() =>
+      assignOwner(lead, {
+        strategy: "least_loaded",
+        owners: [{ id: "x", when: [{ op: "exists" }], load: Number.NaN }],
+      }),
+    ).toThrow(/non-finite load/);
+  });
+
+  test("a fractional cursor is rejected", () => {
+    expect(() =>
+      assignOwner(lead, {
+        strategy: "round_robin",
+        owners: [{ id: "x", when: [{ op: "exists" }] }],
+        cursor: 1.5,
+      }),
+    ).toThrow(/whole number/);
+  });
+
+  test("an empty roster is an error", () => {
+    expect(() => assignOwner(lead, { strategy: "first", owners: [] })).toThrow(/no owners/);
+  });
+});
+
+describe("planSequence", () => {
+  const steps = [
+    { id: "fetch", params: { url: "/a" } },
+    { id: "parse", needs: ["fetch"] },
+    { id: "store", needs: ["parse"] },
+  ];
+  const at = (nowMs: number) => ({ nowMs });
+
+  test("the plan is the steps that can run now, and nothing else", () => {
+    const plan = planSequence({}, { steps }, at(0));
+    expect(plan.ready).toEqual([{ id: "fetch", index: 0, params: { url: "/a" } }]);
+    expect(plan.next).toMatchObject({ id: "fetch" });
+    expect(plan.waiting.map((w) => w.id)).toEqual(["parse", "store"]);
+    expect(plan).toMatchObject({ state: "ready", total: 3 });
+  });
+
+  test("completing a step unlocks the next one", () => {
+    const plan = planSequence({}, { steps }, { nowMs: 0, completed: ["fetch"] });
+    expect(plan.ready.map((r) => r.id)).toEqual(["parse"]);
+    expect(plan.completed).toEqual(["fetch"]);
+  });
+
+  test("a failed prerequisite makes a step unreachable, not waiting", () => {
+    // A flow that reports "waiting" here hangs forever on a step that died
+    // three turns ago.
+    const plan = planSequence({}, { steps }, { nowMs: 0, failed: ["fetch"] });
+    expect(plan.waiting).toEqual([]);
+    expect(plan.unreachable.map((u) => u.id)).toEqual(["parse", "store"]);
+    expect(plan.unreachable[0]?.reason).toContain("fetch");
+    expect(plan.state).toBe("halted");
+  });
+
+  test("unreachability is transitive through the chain", () => {
+    const plan = planSequence(
+      { mode: "cold" },
+      {
+        steps: [
+          { id: "a", when: [{ path: "mode", op: "equals" as const, expected: "warm" }] },
+          { id: "b", needs: ["a"] },
+          { id: "c", needs: ["b"] },
+        ],
+      },
+      at(0),
+    );
+    expect(plan.skipped.map((s) => s.id)).toEqual(["a"]);
+    expect(plan.unreachable.map((u) => u.id)).toEqual(["b", "c"]);
+    expect(plan.unreachable[1]?.reason).toContain("unreachable");
+  });
+
+  test("a waiting step's own conditions are not evaluated yet", () => {
+    // `parse` gates on a field `fetch` has not produced. Evaluating it now
+    // would report a settled "skipped" about a context that does not exist.
+    const plan = planSequence(
+      {},
+      {
+        steps: [
+          { id: "fetch" },
+          {
+            id: "parse",
+            needs: ["fetch"],
+            when: [{ path: "body", op: "isNotEmpty" as const }],
+          },
+        ],
+      },
+      at(0),
+    );
+    expect(plan.waiting.map((w) => w.id)).toEqual(["parse"]);
+    expect(plan.skipped).toEqual([]);
+  });
+
+  test("a step that is not due yet is waiting, with how long is left", () => {
+    const plan = planSequence({}, { steps: [{ id: "retry", afterMs: 5_000 }] }, at(1_000));
+    expect(plan.waiting[0]).toMatchObject({ id: "retry", dueInMs: 4_000 });
+    expect(plan.state).toBe("blocked");
+  });
+
+  test("the same step is in the plan once its time has come", () => {
+    const plan = planSequence({}, { steps: [{ id: "retry", afterMs: 5_000 }] }, at(5_000));
+    expect(plan.ready.map((r) => r.id)).toEqual(["retry"]);
+  });
+
+  test("the clock gate is read before the conditions, so a pending step is never a settled skip", () => {
+    const plan = planSequence(
+      { ok: false },
+      {
+        steps: [
+          {
+            id: "later",
+            afterMs: 9_000,
+            when: [{ path: "ok", op: "equals" as const, expected: true }],
+          },
+        ],
+      },
+      at(1_000),
+    );
+    expect(plan.waiting.map((w) => w.id)).toEqual(["later"]);
+    expect(plan.skipped).toEqual([]);
+  });
+
+  test("everything finished is done, and nothing is left to plan", () => {
+    const plan = planSequence({}, { steps }, { nowMs: 0, completed: ["fetch", "parse", "store"] });
+    expect(plan).toMatchObject({ state: "finished", next: null });
+    expect(plan.ready).toEqual([]);
+  });
+
+  test("a flow that ran out is finished; one that died is halted", () => {
+    // A step whose conditions said no is a settled decision, so a flow that
+    // only skipped is finished. A failed step is not, and calling both "done"
+    // reports a cadence that died on its second step as one that completed.
+    const skippedOnly = planSequence(
+      { mode: "cold" },
+      { steps: [{ id: "a", when: [{ path: "mode", op: "equals" as const, expected: "warm" }] }] },
+      at(0),
+    );
+    expect(skippedOnly.state).toBe("finished");
+
+    const died = planSequence({}, { steps: [{ id: "a" }] }, { nowMs: 0, failed: ["a"] });
+    expect(died.state).toBe("halted");
+  });
+
+  test("the plan keeps the order the steps were declared in", () => {
+    // The topological walk would put "b" before "c"; the caller wrote them
+    // the other way round and a reshuffled plan reads as a reordering.
+    const plan = planSequence(
+      {},
+      { steps: [{ id: "c", needs: ["a"] }, { id: "a" }, { id: "b" }] },
+      { nowMs: 0, completed: ["a"] },
+    );
+    expect(plan.ready.map((r) => r.id)).toEqual(["c", "b"]);
+  });
+
+  test("a condition that cannot be evaluated reads as one that did not hold, and says why", () => {
+    // Pinning the shared evaluator's behaviour rather than endorsing it: a
+    // regex that will not compile is reported as a failing check, so the step
+    // is skipped and its dependents are unreachable. The reason is the one
+    // thing that distinguishes it, and it has to survive the cascade.
+    const plan = planSequence(
+      { name: "ana" },
+      {
+        steps: [
+          { id: "a", when: [{ path: "name", op: "matches" as const, expected: "([a-" }] },
+          { id: "b", needs: ["a"] },
+        ],
+      },
+      at(0),
+    );
+    expect(plan.skipped[0]?.reason).toContain("invalid regex");
+    expect(plan.unreachable.map((u) => u.id)).toEqual(["b"]);
+  });
+
+  test("a step with no params carries none", () => {
+    const plan = planSequence({}, { steps: [{ id: "bare" }] }, at(0));
+    expect(plan.ready[0]).toEqual({ id: "bare", index: 0 });
+  });
+
+  test("steps that depend on each other are rejected, not walked forever", () => {
+    expect(() =>
+      planSequence(
+        {},
+        {
+          steps: [
+            { id: "a", needs: ["b"] },
+            { id: "b", needs: ["a"] },
+          ],
+        },
+        at(0),
+      ),
+    ).toThrow(/cycle/);
+  });
+
+  test("a need naming a step that does not exist is rejected", () => {
+    expect(() => planSequence({}, { steps: [{ id: "a", needs: ["ghost"] }] }, at(0))).toThrow(
+      /not a step in this sequence/,
+    );
+  });
+
+  test("a step that needs itself is rejected", () => {
+    expect(() => planSequence({}, { steps: [{ id: "a", needs: ["a"] }] }, at(0))).toThrow(
+      /needs itself/,
+    );
+  });
+
+  test("progress naming a step that does not exist is rejected", () => {
+    // A typo here would silently re-run a step the caller believes is done.
+    expect(() =>
+      planSequence({}, { steps: [{ id: "a" }] }, { nowMs: 0, completed: ["A"] }),
+    ).toThrow(/completed names "A"/);
+  });
+
+  test("a step that is both completed and failed is rejected", () => {
+    expect(() =>
+      planSequence({}, { steps: [{ id: "a" }] }, { nowMs: 0, completed: ["a"], failed: ["a"] }),
+    ).toThrow(/both completed and failed/);
+  });
+
+  test("an empty condition list is rejected, though an absent one is fine", () => {
+    expect(() => planSequence({}, { steps: [{ id: "a", when: [] }] }, at(0))).toThrow(
+      /empty condition list/,
+    );
+    expect(planSequence({}, { steps: [{ id: "a" }] }, at(0)).ready).toHaveLength(1);
+  });
+
+  test("two steps with one id are rejected", () => {
+    expect(() => planSequence({}, { steps: [{ id: "a" }, { id: "a" }] }, at(0))).toThrow(
+      /share the id/,
+    );
+  });
+
+  test("an empty sequence is an error", () => {
+    expect(() => planSequence({}, { steps: [] }, at(0))).toThrow(/no steps/);
   });
 });

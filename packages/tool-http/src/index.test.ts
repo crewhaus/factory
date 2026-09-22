@@ -508,6 +508,44 @@ describe("refusals", () => {
     _setDnsLookup(undefined);
   });
 
+  test("the NAT64 /48 prefix is refused on the ANSWER path, not just as a literal", async () => {
+    __setPrivateHostsAllowedForTest(false);
+    registerHttpConfig({ allowed_origins: ["https://looks-fine.example.com"] });
+    // 64:ff9b:1::/48 is the NAT64 prefix a `64:ff9b::/96` test misses, and it
+    // is the spelling this package leaked before the classifier was replaced.
+    for (const address of [
+      "64:ff9b:1::a9fe:a9fe",
+      "64:ff9b:1:0:0:0:a9fe:a9fe",
+      "::ffff:0:a9fe:a9fe",
+    ]) {
+      _setDnsLookup(async () => ({ address, family: 6 }));
+      const result = await run(httpRequest, { url: "https://looks-fine.example.com/" });
+      expect({ address, refused: typeof result === "string" && result.includes("SSRF") }).toEqual({
+        address,
+        refused: true,
+      });
+    }
+    _setDnsLookup(undefined);
+  });
+
+  test("a resolver answer that is not a valid IPv6 address is refused, not pinned", async () => {
+    __setPrivateHostsAllowedForTest(false);
+    registerHttpConfig({ allowed_origins: ["https://looks-fine.example.com"] });
+    // The classifier is a PREDICATE: it answers "not private" for a string
+    // that is not an address at all. The gate has to read that as "could not
+    // classify", the same way it already does for an IPv6 literal it cannot
+    // expand — otherwise an unclassifiable answer becomes the pinned target.
+    for (const address of ["2002:184.226.129.88", "fe80:::1", "1:2:3:4:5:6:7:8:9"]) {
+      _setDnsLookup(async () => ({ address, family: 6 }));
+      const result = await run(httpRequest, { url: "https://looks-fine.example.com/" });
+      expect({ address, refused: typeof result === "string" && result.includes("SSRF") }).toEqual({
+        address,
+        refused: true,
+      });
+    }
+    _setDnsLookup(undefined);
+  });
+
   test("a URL carrying user:password@ is refused instead of echoed back", async () => {
     const result = await run(httpRequest, {
       url: `http://alice:hunter2@127.0.0.1:${main.port}/echo`,
@@ -1520,13 +1558,24 @@ describe("DnsLookup / TlsInspect", () => {
     // says. The distinction is visible in WHICH error each type reports.
     expect(result.records).toEqual({});
     expect(Object.keys(result.errors).sort()).toEqual(["A", "AAAA", "CNAME", "MX", "NS", "TXT"]);
-    expect(result.errors.A).toContain("exceeded 1ms");
-    for (const type of ["AAAA", "CNAME", "MX", "NS", "TXT"]) {
-      expect({ type, error: result.errors[type] }).toEqual({
-        type,
-        error: "the 1ms lookup budget elapsed before this record type was asked for",
-      });
-    }
+
+    // The distinction that matters is AT MOST ONE type ever got as far as a
+    // lookup. Six private budgets would have started all six and reported
+    // "exceeded 1ms" six times; one shared budget can only be spent once.
+    //
+    // Which type that is — or whether even the first one wins the race to
+    // start — is scheduling, not behaviour. This used to assert that `A`
+    // specifically reported the mid-lookup timeout, and on a loaded CI runner
+    // the 1ms was gone before `A` was issued, so every type reported "never
+    // asked" and a correct result failed.
+    const NEVER_ASKED = "the 1ms lookup budget elapsed before this record type was asked for";
+    const all = ["A", "AAAA", "CNAME", "MX", "NS", "TXT"] as const;
+    const started = all.filter((t) => String(result.errors[t]).includes("exceeded 1ms"));
+    const neverAsked = all.filter((t) => result.errors[t] === NEVER_ASKED);
+    expect(started.length).toBeLessThanOrEqual(1);
+    // ...and every type is accounted for by exactly one of the two answers, so
+    // a third, vaguer error cannot slip through unnoticed.
+    expect(started.length + neverAsked.length).toBe(all.length);
   });
 
   test("TlsInspect refuses a host no allow-listed origin names", async () => {

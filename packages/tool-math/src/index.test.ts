@@ -35,6 +35,7 @@ import {
   percentile,
   round,
   statistics,
+  statsKernel,
   unitConvert,
 } from "./index";
 
@@ -71,6 +72,19 @@ describe("package-wide contract", () => {
 
   test("the export is frozen, so a caller cannot mutate the registry", () => {
     expect(Object.isFrozen(MATH_TOOLS)).toBe(true);
+  });
+
+  test("the stats kernel is reachable from the package entry and registers nothing", () => {
+    // Four CI gates import it as a library. It is deliberately NOT a tool: a
+    // gate that spends a model turn to learn whether 3/5 is significant has
+    // spent a model turn on arithmetic, and got a different answer each run.
+    expect(typeof statsKernel.wilsonScoreInterval).toBe("function");
+    expect(typeof statsKernel.mannWhitneyU).toBe("function");
+    expect(typeof statsKernel.cohensKappa).toBe("function");
+    expect(typeof statsKernel.populationStabilityIndex).toBe("function");
+    expect(MATH_TOOLS.some((t) => /wilson|mannwhitney|kappa|psi|stability/i.test(t.name))).toBe(
+      false,
+    );
   });
 
   test("every tool is read-only, non-destructive and internal — this package touches nothing", () => {

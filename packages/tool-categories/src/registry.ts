@@ -90,6 +90,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "textSimilarity",
       "truncateToBudget",
       "wrapText",
+      "diffParse",
     ],
   },
 
@@ -217,6 +218,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "isLeapYear",
       "quarterOf",
       "timestampConvert",
+      "localTime",
     ],
   },
 
@@ -346,6 +348,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "stateExport",
       "stateImport",
       "dedupeMark",
+      "vectorDelete",
     ],
   },
 
@@ -543,6 +546,8 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "quietHours",
       "rateLimitGate",
       "messageTemplate",
+      "emailSendPreflight",
+      "deliverabilityCheck",
     ],
   },
 
@@ -565,6 +570,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "alertAck",
       "statusPagePost",
       "healthProbe",
+      "emitTraceEvent",
     ],
   },
 
@@ -579,6 +585,8 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "errorClassify",
       "ruleScore",
       "stallDetect",
+      "leadAssign",
+      "sequenceRun",
     ],
   },
 
@@ -649,6 +657,8 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "goldenCompare",
       "goldenUpdate",
       "markdownLinkCheck",
+      "factCrossCheck",
+      "seoLint",
     ],
   },
 
@@ -663,7 +673,189 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "tableProfile",
       "tableReshape",
       "tableShard",
+      "dataDriftCheck",
     ],
+  },
+
+  changeset: {
+    title:
+      "Decide everything you can about a change set from the diff alone, before it becomes a PR",
+    tools: ["diffLint", "docsSymbolCheck"],
+  },
+
+  buildperf: {
+    title: "Measure this build against its baseline: bundle size, benchmark timings and flakiness",
+    tools: ["bundleSizeCheck", "benchmarkCompare", "flakyTestDetect"],
+  },
+
+  registry: {
+    title:
+      "Ask the public package registries what exists and what is newest, and write it back into a manifest",
+    tools: ["registryPackageInfo", "registrySearch", "registryOutdated", "manifestDependencySet"],
+  },
+
+  supplychain: {
+    title: "Known vulnerabilities from a lockfile, and supply-chain hygiene in a CI workflow",
+    tools: ["dependencyAudit", "ciWorkflowAudit"],
+  },
+
+  containers: {
+    title:
+      "Resolve image tags to digests and list tags over the OCI distribution API, with no daemon and no pull",
+    tools: ["containerImageInspect", "containerImageTags"],
+  },
+
+  chainread: {
+    title:
+      "Read what an EVM chain recorded: blocks, transactions, receipts, logs, nonces and endpoint health",
+    tools: [
+      "evmGetBlock",
+      "evmBlockAtTimestamp",
+      "evmRpcHealth",
+      "evmNonceStatus",
+      "evmWaitForReceipt",
+      "evmTransactionSummary",
+      "evmEventScan",
+      "onchainTransactionsSync",
+    ],
+  },
+
+  chaincall: {
+    title:
+      "Ask an EVM contract what it knows and what a call would cost: batched reads, introspection, gas and simulation",
+    tools: ["evmMulticall", "contractInspect", "evmSimulateBundle", "gasMarketRead"],
+  },
+
+  token: {
+    title: "Resolve tokens and read balances, with ambiguity refused and impostors flagged",
+    tools: ["tokenResolve", "erc20Balance", "erc721TokenInfo"],
+  },
+
+  defi: {
+    title: "Value what you hold, with provenance and an explicit unpriced bucket",
+    tools: ["priceQuote", "oraclePriceRead", "defiPositionRead", "portfolioValuation"],
+  },
+
+  ledger: {
+    title: "A hash-chained double-entry ledger, with queries, reconciliation and invoice rendering",
+    tools: ["ledgerPost", "ledgerQuery", "ledgerReconcile", "invoiceRender"],
+  },
+
+  einvoice: {
+    title:
+      "Fixed-format financial files banks and tax authorities parse byte-exactly: e-invoice XML and payment batches",
+    tools: ["eInvoiceBuild", "eInvoiceParse", "paymentFileBuild"],
+  },
+
+  kyc: {
+    title:
+      "Counterparty checks against public registries and sanctions lists, reporting signals and evidence rather than a verdict",
+    tools: ["vatIdValidate", "entityRegistryLookup", "sanctionsScreen"],
+  },
+
+  objectstore: {
+    title: "Object-store URL signing: time-limited SigV4 GET and PUT computed offline",
+    tools: ["objectPresign"],
+  },
+
+  host: {
+    title:
+      "Read-only facts about the machine a harness is running on: system, network and listening ports",
+    tools: ["systemInfo", "networkInfo", "portInspect"],
+  },
+
+  secrets: {
+    title:
+      "Resolve secret references and maintain .env files, reporting presence and provenance rather than values",
+    tools: ["secretLookup", "envFileUpsert", "secretRotate"],
+  },
+
+  hostfs: {
+    title:
+      "Host filesystem beyond read and write: watching a path, recoverable deletion and the OS file index",
+    tools: ["watchPath", "trashPath", "osIndexSearch"],
+  },
+
+  cron: {
+    title:
+      "Inspect and remove entries in the host's own scheduler: crontab, launchd and systemd timers",
+    tools: ["cronList", "cronDelete"],
+  },
+
+  distribution: {
+    title:
+      "Render the package manifests for a released binary, and verify a published one points at assets that exist and hash correctly",
+    tools: ["packageManifestGenerate", "packageManifestVerify"],
+  },
+
+  pkgmgr: {
+    title:
+      "Ask the system package manager what is installed and available, and install from it without acquiring privilege",
+    tools: ["packageQuery", "packageInstall"],
+  },
+
+  desktop: {
+    title:
+      "The operator's actual desktop: clipboard, notifications, opening a document, printing, windows, presence and sleep — failing closed on a headless host",
+    tools: [
+      "clipboardRead",
+      "clipboardWrite",
+      "desktopNotify",
+      "openExternal",
+      "printDocument",
+      "windowList",
+      "userPresence",
+      "powerAssertion",
+    ],
+  },
+
+  specops: {
+    title:
+      "Change a harness spec safely: CST-preserving patches, migrations, advisory findings and mechanical repairs",
+    tools: ["specPatchApply", "specUpgrade", "specAdvise", "doctorFix"],
+  },
+
+  evalops: {
+    title: "Recompute, trend, pin and sanity-check eval results without running an eval",
+    tools: ["evalHistory", "evalAggregate", "evalBaselinePin", "evalCoverage", "graderMetaTest"],
+  },
+
+  dataset: {
+    title: "Version, inspect, validate and grow eval datasets",
+    tools: ["datasetPut", "datasetInspect", "datasetLint", "datasetMine"],
+  },
+
+  approvals: {
+    title:
+      "Read what is parked waiting for a human, and propose the permission rules that would stop the asking",
+    tools: ["approvalStatus", "approvalsInbox", "permissionsSuggest"],
+  },
+
+  lifecycle: {
+    title:
+      "Harness lifecycle: retirement, store migration, retention enforcement and knowledge sync",
+    tools: ["harnessRetire", "storeMigrate", "retentionEnforce", "knowledgeSync"],
+  },
+
+  fleet: {
+    title: "Register, recompile, version-pin and inspect the harnesses on this machine",
+    tools: ["harnessRegister", "harnessJobStatus", "compileBundle", "cliVersionPin", "hooksManage"],
+  },
+
+  deploy: {
+    title:
+      "Move a spec version between environments in the local registry, and report what is pinned where",
+    tools: ["specPin", "deployRollback", "deployInspect"],
+  },
+
+  routing: {
+    title: "Read and steer model routing, experiments and observational learning",
+    tools: ["routeControl", "experimentLedger", "flywheelStatus", "watchmeReport"],
+  },
+
+  discovery: {
+    title: "Search the local template marketplace and enumerate reachable federation peers",
+    tools: ["marketplaceSearch", "federationDiscover"],
   },
 
   // ---- roll-ups ----
@@ -680,11 +872,17 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "codehost",
       "toolchain",
       "packaging",
+      "changeset",
+      "buildperf",
+      "registry",
+      "supplychain",
+      "containers",
+      "distribution",
     ],
   },
   filesystem: {
     title: "Everything that touches files: the core five plus trees, hashes, copies and archives",
-    includes: ["fs", "fsx"],
+    includes: ["fs", "fsx", "hostfs"],
   },
   memory: {
     title: "Everything a harness remembers between turns and between runs",
@@ -696,7 +894,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   safety: {
     title: "Finding and removing what must not leave the system, and proving what did not change",
-    includes: ["secure", "verify"],
+    includes: ["secure", "verify", "secrets", "approvals"],
   },
   outreach: {
     title: "Everything that puts something in front of a person outside the harness",
@@ -704,11 +902,54 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
   },
   operations: {
     title: "Running and supervising harnesses: telemetry, cost, incidents, specs and fleets",
-    includes: ["obs", "crewhaus", "money"],
+    includes: [
+      "obs",
+      "crewhaus",
+      "money",
+      "ledger",
+      "einvoice",
+      "kyc",
+      "objectstore",
+      "host",
+      "cron",
+      "pkgmgr",
+      "desktop",
+      "specops",
+      "evalops",
+      "dataset",
+      "lifecycle",
+      "fleet",
+      "deploy",
+      "routing",
+      "discovery",
+    ],
+  },
+  chain: {
+    title: "Everything that touches a blockchain, offline arithmetic and live reads alike",
+    // `onchain` is the pure half — ABI coding, EIP-712 digests, checksums — and the other three
+    // read a node. They are grouped here because "what can this harness do with a chain" is a
+    // question people actually ask, and answering it with four separate selectors is worse.
+    // Nothing in any of them signs or submits; that is asserted per package, not assumed.
+    includes: ["onchain", "chainread", "chaincall", "token", "defi"],
   },
   network: {
     title: "Everything that reaches the network",
-    includes: ["web", "http"],
+    // A leaf may sit in more than one roll-up — `text` is in both `compute`
+    // and `content`. These three are listed under `code` because that is what
+    // they are FOR, and here because of what they DO: a registry read, an OSV
+    // query and an OCI manifest fetch all leave the machine, and a roll-up
+    // that claims "everything that reaches the network" has to mean it.
+    includes: [
+      "web",
+      "http",
+      "registry",
+      "supplychain",
+      "containers",
+      "chainread",
+      "chaincall",
+      "token",
+      "defi",
+    ],
   },
   compute: {
     title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",

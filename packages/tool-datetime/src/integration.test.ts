@@ -6,10 +6,12 @@
  * A tool that works when called directly but fails here is a tool the runtime
  * cannot actually use, which is why this file exists separately.
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
 import { executeTool } from "@crewhaus/tool-executor";
+import { _allowRealHost, _resetHostSeams, _setHostZone, readHostZone, realHostZone } from "./host";
 import { DATETIME_TOOLS } from "./index";
+import { isValidTimeZone } from "./lib/civil";
 
 let catalog: ToolCatalog;
 
@@ -103,6 +105,7 @@ describe("dispatch through executeTool", () => {
       DurationFormat: { seconds: 5415 },
       DurationParse: { text: "2h30m" },
       IsLeapYear: { year: 2026 },
+      LocalTime: { instant: "2026-09-17T14:30:00Z", timeZone: "Europe/Berlin" },
       QuarterOf: { date: "2026-11-15" },
       RecurrenceExpand: { rule: "FREQ=DAILY;COUNT=3", start: "2026-01-01T09:00:00Z" },
       TimestampConvert: { value: 1_789_655_400 },
@@ -140,6 +143,7 @@ describe("dispatch through executeTool", () => {
       DateAdd: { instant: "2026-01-31", months: 1 },
       DateDiff: { from: "2026-01-01", to: "2026-03-01" },
       DateRange: { start: "2026-09-01", end: "2026-09-05" },
+      LocalTime: { instant: "2026-09-17T14:30:00Z", timeZone: "Europe/Berlin" },
       RecurrenceExpand: { rule: "FREQ=WEEKLY;COUNT=5", start: "2026-01-01T09:00:00Z" },
       TimestampConvert: { value: "2026-09-17T14:30:00Z" },
     };
@@ -192,5 +196,154 @@ describe("dispatch through executeTool", () => {
       { toolUseId: "c3" },
     );
     expect(formatted.content).toBe("28 February 2026");
+  });
+});
+
+/**
+ * The one place in this package allowed near the real machine.
+ *
+ * `LocalTime` answers for the operator's zone, so somebody has to check that
+ * the un-injected path really does read the host — otherwise the hostile
+ * default in `host.ts` would be indistinguishable from a package that refuses
+ * everywhere. Every assertion below holds for any zone any box could be set
+ * to: nothing here asserts a particular timezone, because the author's laptop
+ * and CI are not in the same one.
+ */
+describe("the host zone seam, against the real machine", () => {
+  afterEach(() => {
+    _resetHostSeams();
+  });
+
+  test("the un-injected read is gated off under bun test, and names the gate", () => {
+    const reading = readHostZone();
+    expect(reading.ok).toBe(false);
+    if (reading.ok) throw new Error("unreachable");
+    expect({ source: reading.source, says: /NODE_ENV=test/.test(reading.reason) }).toEqual({
+      source: "none",
+      says: true,
+    });
+  });
+
+  test("with the gate opened it reads the machine, and says which source it used", () => {
+    try {
+      _allowRealHost(true);
+      const reading = readHostZone();
+      if (!reading.ok) {
+        // A runtime with no tzdata is a legitimate answer here, but it has to
+        // arrive as a reason rather than as a zone nobody checked.
+        expect(reading.reason.length).toBeGreaterThan(20);
+        return;
+      }
+      expect(["env", "system"]).toContain(reading.source);
+      expect(isValidTimeZone(reading.timeZone)).toBe(true);
+      expect(reading.detail.length).toBeGreaterThan(10);
+    } finally {
+      _allowRealHost(false);
+    }
+  });
+
+  test("an injected zone wins over the machine even with the gate open", () => {
+    try {
+      _allowRealHost(true);
+      _setHostZone({ ok: true, timeZone: "Pacific/Chatham", source: "env", detail: "fixture" });
+      const reading = readHostZone();
+      expect(reading.ok && reading.timeZone).toBe("Pacific/Chatham");
+    } finally {
+      _allowRealHost(false);
+      _setHostZone(undefined);
+    }
+  });
+
+  test("TZ is believed when it names a zone, and named when it does not", () => {
+    // The only test that touches the environment. It sets TZ itself and puts
+    // it back, and asserts nothing about what the box underneath is set to —
+    // the properties below hold for every possible system zone.
+    const before = process.env["TZ"];
+    try {
+      process.env["TZ"] = "Asia/Kolkata";
+      const believed = realHostZone();
+      expect(believed.ok && { zone: believed.timeZone, source: believed.source }).toEqual({
+        zone: "Asia/Kolkata",
+        source: "env",
+      });
+
+      // Legal POSIX, not an IANA identifier: the runtime discards it silently
+      // and uses the system zone. The discarded value has to survive into the
+      // answer, because the operator who set it cannot tell from the clock.
+      process.env["TZ"] = "EST5EDT,M3.2.0,M11.1.0";
+      const ignored = realHostZone();
+      if (!ignored.ok) {
+        expect(ignored.tzEnv).toBe("EST5EDT,M3.2.0,M11.1.0");
+        return;
+      }
+      expect({
+        source: ignored.source,
+        tz: ignored.tzEnv,
+        usable: isValidTimeZone(ignored.timeZone),
+        kept: ignored.timeZone === "EST5EDT,M3.2.0,M11.1.0",
+      }).toEqual({
+        source: "system",
+        tz: "EST5EDT,M3.2.0,M11.1.0",
+        usable: true,
+        kept: false,
+      });
+      expect(ignored.detail).toContain("ignored it");
+    } finally {
+      // `Reflect.deleteProperty`, not `delete` (biome's noDelete) and
+      // emphatically not `= undefined`, which writes the literal string
+      // "undefined" into TZ and leaves every later test in this process
+      // holding a timezone the runtime will silently discard.
+      if (before === undefined) Reflect.deleteProperty(process.env, "TZ");
+      else process.env["TZ"] = before;
+    }
+  });
+
+  test("an empty TZ is not a zone — it falls through to the system one", () => {
+    const before = process.env["TZ"];
+    try {
+      process.env["TZ"] = "   ";
+      const reading = realHostZone();
+      if (!reading.ok) {
+        expect(reading.source).toBe("system");
+        return;
+      }
+      expect(reading.source).toBe("system");
+      expect(reading.tzEnv).toBeUndefined();
+    } finally {
+      // `Reflect.deleteProperty`, not `delete` (biome's noDelete) and
+      // emphatically not `= undefined`, which writes the literal string
+      // "undefined" into TZ and leaves every later test in this process
+      // holding a timezone the runtime will silently discard.
+      if (before === undefined) Reflect.deleteProperty(process.env, "TZ");
+      else process.env["TZ"] = before;
+    }
+  });
+
+  test("LocalTime through the runtime reports the zone it actually used", async () => {
+    const catalogTool = catalog.get("LocalTime");
+    if (!catalogTool) throw new Error("expected LocalTime to be registered");
+    try {
+      _allowRealHost(true);
+      const result = await executeTool(
+        catalogTool,
+        { instant: "2026-09-17T14:30:00Z" },
+        { toolUseId: "host-1" },
+      );
+      expect(result.isError).toBe(false);
+      const body = JSON.parse(result.content) as {
+        ok: boolean;
+        zone?: { timeZone: string; source: string };
+        reason?: string;
+      };
+      if (!body.ok) {
+        expect(typeof body.reason).toBe("string");
+        return;
+      }
+      if (body.zone === undefined) throw new Error("expected a zone block");
+      expect(["env", "system"]).toContain(body.zone.source);
+      expect(isValidTimeZone(body.zone.timeZone)).toBe(true);
+    } finally {
+      _allowRealHost(false);
+    }
   });
 });

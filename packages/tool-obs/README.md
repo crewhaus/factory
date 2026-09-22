@@ -1,7 +1,7 @@
 # @crewhaus/tool-obs
 
-Observability and cost, without a model turn. Fifteen tools in two clearly
-separated halves: nine that read a harness's **own** telemetry off local disk,
+Observability and cost, without a model turn. Sixteen tools in two clearly
+separated halves: ten that work on a harness's **own** telemetry on local disk,
 and six that query an **external** platform over an allow-listed API.
 
 The separation is the point. The local tools open no socket and are flagged
@@ -18,7 +18,7 @@ tools:
 ## Local — a harness's own telemetry
 
 `@crewhaus/event-log` writes one JSON object per line to
-`.crewhaus/sessions/<sessionId>.jsonl`. These read it.
+`.crewhaus/sessions/<sessionId>.jsonl`. Nine of these read it; one writes to it.
 
 | Tool | What it does |
 |---|---|
@@ -31,6 +31,7 @@ tools:
 | `BudgetCheck` | Pure: spend against a budget, with threshold crossings |
 | `SloEvaluate` | Pure: success rate, latency percentile or error budget against an objective |
 | `IncidentBundle` | One failed run assembled into a contained JSON file a human can be handed |
+| `EmitTraceEvent` | One custom event appended to a session log, so a tool-only run leaves a record the readers above pick up |
 
 Every path goes through the same workspace containment as `@crewhaus/tool-fs`,
 including the symlink-aware check, so an in-workspace link pointing at `/etc` is
@@ -170,11 +171,59 @@ deployment declared cannot be overwritten from a tool call.
 
 **They will not unpublish.** A `StatusPagePost` is public the moment it lands.
 
+**They will not let a written line pass for a recorded one.** `EmitTraceEvent`
+writes the runtime's own wire shape — `{ ts, version, kind, payload }` — because
+a second shape is a line `RunTimeline` could not draw. But the kind is always
+`custom.<name>`, a namespace no runtime kind can occupy (every kind in
+`@crewhaus/event-log`'s union is bare `[a-z_]+`, with no dot), the payload
+records whether a live run context supplied the attribution or the caller
+merely claimed it, and the caller's own fields sit one level down under
+`fields`. That nesting is load-bearing rather than tidy: `RunTimeline` sums
+`durationMs` on every kind and `IncidentBundle` takes the first `specName` in
+log order, and neither looks at the kind first — a caller-supplied
+`durationMs` at the top level would enter a total documented as the runtime's
+own measurement, and a `specName` would retitle somebody else's bundle.
+
+**They will not write a character a reader cannot trust.** The text on an
+emitted line arrived through a tool call, and it lands in a file a human reads
+during an incident and a model re-reads on the next turn. Line breaks, escapes,
+other control characters, Unicode line separators, bidirectional overrides and
+zero-width characters are refused — by code point, with the refusal naming
+which one and where — rather than escaped and left to render as a second entry
+nobody wrote, as a terminal control sequence, or as a sentence whose displayed
+order is not its written order. The rule covers every caller string, not just
+the obvious one: the message, each field, the claimed `runId` (which `EventQuery`
+renders inside a JSON payload, and JSON escapes control characters but not
+U+202E or U+200B), and the `sessionId` and `dir` that become a FILENAME this
+tool may create and a path it echoes back. A rule that held for the message and
+not for the id would be the same trick through the door nobody guarded. The
+name, the message, each field, the field count, the claimed `runId` and the
+finished line are all capped; the line cap keeps one append inside the window
+`@crewhaus/event-log` relies on for concurrent writers.
+
+**They will not report a provenance nothing supplied.** `emittedFrom.runContext`
+has three values, not two. The run context is read structurally — this package
+takes no dependency on `@crewhaus/run-context` — so a runtime that renamed a
+field hands the tool a carrier it can extract nothing from: that is `unusable`,
+which is neither the `present` that would claim an attribution nor the `absent`
+that would hide the carrier. An empty `runId` is no attribution either, because
+`runIdOf` reads ids back through a non-empty check and every reader that filters
+by run would disagree with a result that reported one.
+
+**They will not silently complete somebody else's half-written line.** A
+transcript cut short by a killed process ends mid-line. `EmitTraceEvent` reads
+the last byte before appending and starts with a newline when it has to, so the
+broken line stays broken and the new event stays an event, rather than being
+swallowed by it.
+
 ## Determinism
 
 Same inputs against the same world state, same bytes out. Listings are sorted
 with a locale-free comparator, Prometheus series are re-sorted by label set so
 two replicas answering the same query return the same bytes, nothing is random,
-and two `IncidentBundle` runs over the same log produce byte-identical files.
+and two `IncidentBundle` runs over the same log produce byte-identical files. An
+emitted event is the same bytes twice as well — its fields are written in
+sorted order, and its timestamp is an argument, so the line does not depend on
+the order a caller happened to spell an object or on when the call ran.
 `HealthProbe`'s `latencyMs` and the live answers of a remote platform are the
 world state, not the tool.

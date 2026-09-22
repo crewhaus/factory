@@ -1,6 +1,6 @@
+import type { AdviceFinding, AdviceSuggestion } from "@crewhaus/harness-advice/advise-rules";
 import type { Spec } from "@crewhaus/spec";
 import { type SpecPatch, validatePatch } from "@crewhaus/spec-patch";
-import type { AdviceFinding, AdviceSuggestion } from "./advise-rules";
 
 /**
  * AUTOMATION-OPPORTUNITIES.md item 20 — `crewhaus egress review [--propose]`:

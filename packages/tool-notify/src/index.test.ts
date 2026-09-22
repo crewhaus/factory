@@ -13,7 +13,7 @@
  * server that will not offer STARTTLS, and a deadline that fires.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { type Server, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -22,13 +22,16 @@ import {
   __setPrivateHostsAllowedForTest,
   _resetIdempotencyLedger,
   _resetNotifyConfig,
+  _setDnsTxtResolver,
   chatDelete,
   chatPost,
   chatReact,
   chatUpdate,
+  deliverabilityCheck,
   deliveryCheck,
   emailCompose,
   emailSend,
+  emailSendPreflight,
   messageTemplate,
   notifyDigest,
   pushNotify,
@@ -144,6 +147,38 @@ function startSmtpServer(
 }
 
 // ---------------------------------------------------------------------------
+// DNS, recorded
+// ---------------------------------------------------------------------------
+
+/**
+ * Every TXT lookup in this file is answered from here.
+ *
+ * A test that asked the real resolver what example.com publishes would be
+ * asserting on the internet rather than on this code, and would pass or fail
+ * by the week. So the seam is injected for every test, a name nobody
+ * recorded throws WITH ITS OWN NAME — a lookup that was not meant to happen
+ * fails loudly instead of quietly going out — and `dnsAsked` lets a test
+ * assert that a refusal happened before anything was queried at all.
+ */
+type TxtFixture = ReadonlyArray<ReadonlyArray<string>> | Error | "hangs";
+let dnsFixtures: Map<string, TxtFixture>;
+let dnsAsked: string[];
+
+/** An error carrying the code c-ares sets, which is what the mapping reads. */
+function failure(code: string): Error {
+  const err = new Error(`queryTxt ${code}`) as NodeJS.ErrnoException;
+  err.code = code;
+  return err;
+}
+
+/** The name does not exist at all, as distinct from having no TXT record. */
+const nxdomain = (): Error => failure("ENOTFOUND");
+
+/** A published RSA public key. Pinned, because a keygen is not a test cost. */
+const DKIM_KEY =
+  "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDQmBxciE5J1duwFEv9tRWr1MZ6WcVHqnUbBUwcSzdvFNmTkVBn5Tnp9c4J0VfumF2TfQpQELJUlRj05q1kExYtTiSFZewbgN1rfBwiiFawkZ5IttHVAHrdXwhOo9Soykela7wk+M4Q+7MIwRVPra0uQ8HxIFgVCH5PNP8zUNJ7PQIDAQAB";
+
+// ---------------------------------------------------------------------------
 // harness
 // ---------------------------------------------------------------------------
 
@@ -185,6 +220,30 @@ beforeEach(() => {
   process.chdir(tmp);
   requests = [];
   failuresLeft = 0;
+  dnsAsked = [];
+  dnsFixtures = new Map<string, TxtFixture>([
+    // Split mid-token, which is what makes the join rule visible: the two
+    // character-strings concatenate with NOTHING between them, and a space
+    // would turn one include: into two terms, neither of which parses.
+    ["example.com", [["v=spf1 include:_spf.examp", "le.com -all"]]],
+    ["_dmarc.example.com", [["v=DMARC1; p=reject; rua=mailto:dmarc@example.com"]]],
+    // Split into two character-strings, as a real key always is: DNS caps
+    // one at 255 octets.
+    [
+      "s1._domainkey.example.com",
+      [[`v=DKIM1; k=rsa; p=${DKIM_KEY.slice(0, 120)}`, DKIM_KEY.slice(120)]],
+    ],
+  ]);
+  _setDnsTxtResolver((name) => {
+    dnsAsked.push(name);
+    const fixture = dnsFixtures.get(name);
+    if (fixture === undefined) {
+      return Promise.reject(new Error(`no DNS fixture recorded for "${name}"`));
+    }
+    // "hangs" is a resolver that never answers — the case the deadline is for.
+    if (fixture === "hangs") return new Promise<never>(() => undefined);
+    return fixture instanceof Error ? Promise.reject(fixture) : Promise.resolve(fixture);
+  });
 
   http = Bun.serve({
     port: 0,
@@ -263,6 +322,7 @@ beforeEach(() => {
     allowed_origins: [origin],
     allowed_recipients: ["ops@example.com", "*@team.test"],
     allowed_smtp_hosts: ["127.0.0.1"],
+    allowed_sender_domains: ["example.com"],
     providers: {
       gateway: {
         endpoint: `${origin}/sms`,
@@ -291,6 +351,7 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
   _resetNotifyConfig();
   _resetIdempotencyLedger();
+  _setDnsTxtResolver(undefined);
   __setPrivateHostsAllowedForTest(false);
   for (const name of [
     WEBHOOK_VAR,
@@ -320,15 +381,19 @@ const SENDING_TOOLS = new Set([
 ]);
 const PURE_TOOLS = new Set([
   "EmailCompose",
+  "EmailSendPreflight",
   "MessageTemplate",
   "NotifyDigest",
   "QuietHours",
   "RateLimitGate",
 ]);
 
+/** Outbound and read-only: they ask a service or a resolver and change nothing. */
+const READING_TOOLS = new Set(["DeliveryCheck", "DeliverabilityCheck"]);
+
 describe("package-wide contract", () => {
   test("NOTIFY_TOOLS holds every tool, and is frozen", () => {
-    expect(NOTIFY_TOOLS.length).toBe(14);
+    expect(NOTIFY_TOOLS.length).toBe(16);
     expect(Object.isFrozen(NOTIFY_TOOLS)).toBe(true);
   });
 
@@ -368,13 +433,24 @@ describe("package-wide contract", () => {
     }
   });
 
-  test("DeliveryCheck is the one outbound tool that only reads", () => {
-    expect({
-      readOnly: deliveryCheck.readOnly,
-      destructive: deliveryCheck.destructive,
-      scope: deliveryCheck.scope,
-      io: deliveryCheck.ioCapability,
-    }).toEqual({ readOnly: true, destructive: false, scope: "external", io: "network" });
+  test("the outbound tools that only read carry no justification gate", () => {
+    for (const tool of [deliveryCheck, deliverabilityCheck]) {
+      expect({
+        name: tool.name,
+        readOnly: tool.readOnly,
+        destructive: tool.destructive,
+        justified: tool.requireJustification,
+        scope: tool.scope,
+        io: tool.ioCapability,
+      }).toEqual({
+        name: tool.name,
+        readOnly: true,
+        destructive: false,
+        justified: false,
+        scope: "external",
+        io: "network",
+      });
+    }
   });
 
   test("the pure tools are read-only, internal and declare no io capability", () => {
@@ -398,14 +474,12 @@ describe("package-wide contract", () => {
     }
   });
 
-  test("every tool accounted for: each is either a send, a pure tool, or DeliveryCheck", () => {
+  test("every tool accounted for: each one sends, reads, or touches nothing", () => {
     for (const tool of NOTIFY_TOOLS) {
       expect({
         name: tool.name,
         known:
-          SENDING_TOOLS.has(tool.name) ||
-          PURE_TOOLS.has(tool.name) ||
-          tool.name === "DeliveryCheck",
+          SENDING_TOOLS.has(tool.name) || PURE_TOOLS.has(tool.name) || READING_TOOLS.has(tool.name),
       }).toEqual({ name: tool.name, known: true });
     }
   });
@@ -850,7 +924,7 @@ describe("EmailSend", () => {
       // ...and the tool result does not contain it in any form.
       expect(text).not.toContain("sup3rs3cretmailpassword");
       expect(text).not.toContain(
-        Buffer.from(" mailer@example.com sup3rs3cretmailpassword").toString("base64"),
+        Buffer.from("\u0000mailer@example.com\u0000sup3rs3cretmailpassword").toString("base64"),
       );
     } finally {
       server.close();
@@ -1508,5 +1582,445 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
       now: "2026-01-15T23:30:00Z",
     };
     expect(await quietHours.execute(args)).toBe(await quietHours.execute(args));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EmailSendPreflight
+// ---------------------------------------------------------------------------
+
+const DRAFT = {
+  from: { address: "ci@example.com" },
+  to: [{ address: "ops@example.com" }],
+  subject: "nightly run",
+  text: "everything is fine",
+  date: "2026-09-17T09:30:00Z",
+};
+
+/** The row for one check, so an assertion names the check it is about. */
+function check(
+  result: { checks: Array<{ check: string; status: string; detail: string }> },
+  name: string,
+) {
+  return (
+    result.checks.find((row) => row.check === name) ?? {
+      check: name,
+      status: "MISSING",
+      detail: "",
+    }
+  );
+}
+
+describe("EmailSendPreflight", () => {
+  test("a clean message is ready, and carries the Message-ID the composer will use", async () => {
+    const result = await run(emailSendPreflight, DRAFT);
+    expect(result.verdict).toBe("ready");
+    // The same composer, not a second opinion: a preflight that agreed with
+    // itself and not with EmailCompose would be worth nothing.
+    const composed = await run(emailCompose, DRAFT);
+    expect(result.messageId).toBe(composed.messageId);
+    expect(result.bytes).toBe(composed.bytes);
+  });
+
+  test("it sends nothing and resolves nothing — no request, no lookup", async () => {
+    await run(emailSendPreflight, { ...DRAFT, host: "127.0.0.1" });
+    expect(requests.length).toBe(0);
+    expect(dnsAsked).toEqual([]);
+  });
+
+  test("a recipient outside the allow-list blocks it, and EmailSend then refuses the same message", async () => {
+    const draft = { ...DRAFT, to: [{ address: "stranger@elsewhere.test" }] };
+    const result = await run(emailSendPreflight, draft);
+    expect(result.verdict).toBe("blocked");
+    expect(check(result, "recipients-allowed").status).toBe("fail");
+    expect(check(result, "recipients-allowed").detail).toContain("stranger@elsewhere.test");
+    // The prediction is the point: what the preflight blocks, the send refuses.
+    const sent = await run(emailSend, { ...draft, host: "127.0.0.1", port: 1, timeoutMs: 500 });
+    expect(String(sent)).toContain("not in allowed_recipients");
+  });
+
+  test("an empty body is a failure the composer itself would have allowed through", async () => {
+    const result = await run(emailSendPreflight, { ...DRAFT, text: "" });
+    expect(check(result, "body").status).toBe("fail");
+    expect(result.verdict).toBe("blocked");
+    // The composer builds it happily, which is exactly why this check exists.
+    expect((await run(emailCompose, { ...DRAFT, text: "" })).messageId).toBeTruthy();
+  });
+
+  test("every header fault is reported in one call, not one send at a time", async () => {
+    const result = await run(emailSendPreflight, {
+      ...DRAFT,
+      headers: { Bcc: "sneaky@example.com", "not a name": "x" },
+    });
+    expect(check(result, "headers").status).toBe("fail");
+    expect(check(result, "headers").detail).toContain("Bcc");
+    expect(check(result, "headers").detail).toContain("not a name");
+  });
+
+  test("an attachment that escapes the workspace blocks it, and nothing is assembled", async () => {
+    const result = await run(emailSendPreflight, {
+      ...DRAFT,
+      attachments: [{ path: "../escape.bin" }],
+    });
+    expect(result.verdict).toBe("blocked");
+    expect(result.attachments[0].detail).toContain("escapes the workspace root");
+    expect(check(result, "assembly").detail).toContain("not attempted");
+    expect(result.messageId).toBeUndefined();
+  });
+
+  test("an attachment that could not be read is UNKNOWN, never a pass and never a refusal", async () => {
+    const result = await run(emailSendPreflight, {
+      ...DRAFT,
+      attachments: [{ path: "missing.bin" }],
+    });
+    // The whole distinction: nobody knows whether this message can be sent.
+    expect(result.verdict).toBe("incomplete");
+    expect(result.attachments[0].status).toBe("unknown");
+    expect(result.attachments[0].detail).toContain("ENOENT");
+    expect(check(result, "size").status).toBe("unknown");
+    expect(check(result, "message-id").status).toBe("unknown");
+  });
+
+  test("a dangling symlink is judged where it would land, not by the name it was given", async () => {
+    // `existsSync` follows links and answers false here; the survey has to
+    // stat the resolved location, so the answer is "could not be read" and
+    // not "a file of unknown size that is probably fine".
+    symlinkSync(path.join(tmp, "nowhere.bin"), path.join(tmp, "dangling.bin"));
+    const result = await run(emailSendPreflight, {
+      ...DRAFT,
+      attachments: [{ path: "dangling.bin" }],
+    });
+    expect(result.attachments[0].status).toBe("unknown");
+    expect(result.verdict).toBe("incomplete");
+  });
+
+  test("an attachment over the stated budget is refused by size, with the size", async () => {
+    writeFileSync(path.join(tmp, "big.bin"), "x".repeat(2000));
+    const result = await run(emailSendPreflight, {
+      ...DRAFT,
+      attachments: [{ path: "big.bin" }],
+      maxAttachmentBytes: 1000,
+    });
+    expect(result.verdict).toBe("blocked");
+    expect(result.attachments[0].bytes).toBe(2000);
+    expect(check(result, "attachments").detail).toContain("2000 bytes");
+  });
+
+  test("the message budget is judged on the assembled bytes, which are also reported", async () => {
+    const result = await run(emailSendPreflight, { ...DRAFT, maxMessageBytes: 10 });
+    expect(check(result, "assembly").status).toBe("pass");
+    expect(check(result, "size").status).toBe("fail");
+    expect(check(result, "size").detail).toContain(String(result.bytes));
+  });
+
+  test("an SMTP host outside the allow-list is reported without a connection being tried", async () => {
+    const result = await run(emailSendPreflight, { ...DRAFT, host: "smtp.elsewhere.test" });
+    expect(check(result, "smtp-host").status).toBe("fail");
+    expect(check(result, "smtp-host").detail).toContain("allowed_smtp_hosts");
+    expect(requests.length).toBe(0);
+  });
+
+  test("a warning does not block: an unfilled placeholder is still worth saying", async () => {
+    const result = await run(emailSendPreflight, { ...DRAFT, subject: "deploy of {{service}}" });
+    expect(result.verdict).toBe("ready");
+    expect(check(result, "placeholders").status).toBe("warn");
+  });
+
+  test("the envelope count it predicts is the envelope the composer builds", async () => {
+    // The trap: comparing recipients on a case-folded key and then making a
+    // claim about a composer whose envelope is a Set of the EXACT strings.
+    // One mailbox by the key, two RCPT TO in fact — and a caller told "one
+    // copy, not two" gets two.
+    const draft = {
+      ...DRAFT,
+      to: [{ address: "ops@example.com" }],
+      bcc: [{ address: "OPS@example.com" }],
+    };
+    const result = await run(emailSendPreflight, draft);
+    const composed = await run(emailCompose, draft);
+    expect(composed.envelopeTo.length).toBe(2);
+    expect(result.envelopeTo).toEqual(composed.envelopeTo);
+    expect(check(result, "envelope").detail).toContain("2 envelope recipients");
+    expect(check(result, "envelope").detail).not.toContain("one copy is sent, not two");
+  });
+
+  test("a refused attachment beside an unreadable one is BLOCKED, not incomplete", async () => {
+    // A settled "no" must not be downgraded by an unknown standing next to
+    // it: the path gate refused one of these outright, so no amount of
+    // looking at the other one makes the message sendable.
+    const result = await run(emailSendPreflight, {
+      ...DRAFT,
+      attachments: [{ path: "../escape.bin" }, { path: "missing.bin" }],
+    });
+    expect(result.verdict).toBe("blocked");
+    expect(check(result, "attachments").status).toBe("fail");
+    expect(check(result, "assembly").status).toBe("fail");
+    // And the unknown is still named, because it is a second thing to fix.
+    expect(check(result, "attachments").detail).toContain("missing.bin");
+    expect(check(result, "attachments").detail).toContain("escapes the workspace root");
+  });
+
+  test("an attachment reached through a symlink pointing OUT of the workspace is refused", async () => {
+    // `join` does not resolve symlinks and `statSync` follows them, so the
+    // path that is contained must be the one the read would land on — not
+    // the one the caller wrote.
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-outside-"));
+    writeFileSync(path.join(outside, "secret.bin"), "not yours");
+    try {
+      symlinkSync(outside, path.join(tmp, "escape-dir"));
+      const result = await run(emailSendPreflight, {
+        ...DRAFT,
+        attachments: [{ path: "escape-dir/secret.bin" }],
+      });
+      expect(result.verdict).toBe("blocked");
+      expect(result.attachments[0].status).toBe("fail");
+      expect(result.attachments[0].detail).toContain("escapes the workspace root");
+      expect(check(result, "assembly").detail).toContain("not attempted");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("the same draft twice gives the same bytes", async () => {
+    const a = await emailSendPreflight.execute(DRAFT);
+    const b = await emailSendPreflight.execute(DRAFT);
+    expect(a).toBe(b);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DeliverabilityCheck
+// ---------------------------------------------------------------------------
+
+describe("DeliverabilityCheck", () => {
+  test("reports the SPF record, the DMARC policy and the key at a named selector", async () => {
+    const result = await run(deliverabilityCheck, {
+      domain: "example.com",
+      dkimSelectors: ["s1"],
+    });
+    expect(result.domain).toBe("example.com");
+    expect(result.spf.status).toBe("found");
+    expect(result.spf.all).toBe("-all");
+    expect(result.dmarc.policy).toBe("reject");
+    // The DKIM fixture arrives in two character-strings, as a real key always
+    // does: joined with nothing between them it is a key, joined with a space
+    // it is not.
+    expect(result.dkim[0]).toMatchObject({ selector: "s1", status: "found" });
+    expect(result.dkim[0].key).toEqual({ kind: "rsa", bits: 1024 });
+    expect(dnsAsked).toEqual(["example.com", "_dmarc.example.com", "s1._domainkey.example.com"]);
+  });
+
+  test("no DMARC record and a DMARC record saying p=none are different answers", async () => {
+    dnsFixtures.set("_dmarc.example.com", nxdomain());
+    const absent = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(absent.dmarc.status).toBe("absent");
+    expect(absent.dmarc.detail).toContain("does not exist");
+
+    dnsFixtures.set("_dmarc.example.com", [["v=DMARC1; p=none"]]);
+    const none = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(none.dmarc.status).toBe("found");
+    expect(none.dmarc.policy).toBe("none");
+  });
+
+  test("a lookup that FAILED is unknown with its reason, never 'nothing is published'", async () => {
+    // The dominant way a checker like this lies: a resolver that could not
+    // answer, reported as a domain that published nothing.
+    dnsFixtures.set("_dmarc.example.com", failure("ESERVFAIL"));
+    const result = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(result.dmarc.status).toBe("unknown");
+    expect(result.dmarc.detail).toContain("ESERVFAIL");
+    expect(
+      result.lookups.find((l: { name: string }) => l.name === "_dmarc.example.com").outcome,
+    ).toBe("unknown");
+  });
+
+  test("a name that exists with no TXT reads differently from one that does not exist", async () => {
+    dnsFixtures.set("_dmarc.example.com", failure("ENODATA"));
+    const noData = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(noData.dmarc.status).toBe("absent");
+    expect(noData.dmarc.detail).toContain("publishes no TXT record");
+  });
+
+  test("a selector nobody named is not guessed at", async () => {
+    const result = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(result.dkim).toEqual([]);
+    expect(String(result.notes)).toContain("no DKIM selector was named");
+    // And only the two names that do not depend on a selector were asked.
+    expect(dnsAsked.length).toBe(2);
+  });
+
+  test("a domain the operator did not allow is refused BEFORE any lookup", async () => {
+    const result = await run(deliverabilityCheck, { domain: "elsewhere.test" });
+    expect(String(result)).toContain("allowed_sender_domains");
+    expect(dnsAsked).toEqual([]);
+  });
+
+  test("an empty allow-list denies every domain", async () => {
+    _resetNotifyConfig();
+    const result = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(String(result)).toContain("empty allow-list = deny all");
+    expect(dnsAsked).toEqual([]);
+  });
+
+  test("a domain that is not a domain is refused before any lookup", async () => {
+    for (const bad of ["not a domain", "1.2.3.4", "localhost"]) {
+      const result = await run(deliverabilityCheck, { domain: bad });
+      expect({ bad, refused: String(result).startsWith("nothing was looked up") }).toEqual({
+        bad,
+        refused: true,
+      });
+    }
+    expect(dnsAsked).toEqual([]);
+  });
+
+  test("a selector that is not a selector is refused before any lookup", async () => {
+    const result = await run(deliverabilityCheck, {
+      domain: "example.com",
+      dkimSelectors: ["../../evil"],
+    });
+    expect(String(result)).toContain("nothing was looked up");
+    expect(dnsAsked).toEqual([]);
+  });
+
+  test("the domain is canonicalised once, and that one value is what gets queried", async () => {
+    const result = await run(deliverabilityCheck, { domain: "EXAMPLE.com." });
+    expect(result.domain).toBe("example.com");
+    expect(dnsAsked).toEqual(["example.com", "_dmarc.example.com"]);
+  });
+
+  test("a repeated selector is one lookup, and the order asked does not depend on the caller", async () => {
+    dnsFixtures.set("s2._domainkey.example.com", [["v=DKIM1; p="]]);
+    const result = await run(deliverabilityCheck, {
+      domain: "example.com",
+      dkimSelectors: ["s2", "s1", "s2"],
+    });
+    expect(result.dkim.map((d: { selector: string }) => d.selector)).toEqual(["s1", "s2"]);
+    expect(dnsAsked.filter((name) => name.startsWith("s2.")).length).toBe(1);
+  });
+
+  test("a revoked key is reported as revoked, not as a missing selector", async () => {
+    dnsFixtures.set("s2._domainkey.example.com", [["v=DKIM1; k=rsa; p="]]);
+    const result = await run(deliverabilityCheck, {
+      domain: "example.com",
+      dkimSelectors: ["s2"],
+    });
+    expect(result.dkim[0].status).toBe("found");
+    expect(result.dkim[0].revoked).toBe(true);
+  });
+
+  test("the answer does not depend on the order a resolver returns records in", async () => {
+    dnsFixtures.set("example.com", [["v=spf1 -all"], ["google-site-verification=abc"]]);
+    const first = await deliverabilityCheck.execute({ domain: "example.com" });
+    dnsFixtures.set("example.com", [["google-site-verification=abc"], ["v=spf1 -all"]]);
+    const second = await deliverabilityCheck.execute({ domain: "example.com" });
+    expect(first).toBe(second);
+  });
+
+  test("two SPF records are reported as the permerror they are", async () => {
+    dnsFixtures.set("example.com", [["v=spf1 -all"], ["v=spf1 ~all"]]);
+    const result = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(result.spf.status).toBe("multiple");
+    expect(result.spf.detail).toContain("permerror");
+  });
+
+  test("the DNS-term count says out loud that it does not follow includes", async () => {
+    const result = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(result.spf.dnsTermsInThisRecord).toBe(1);
+    expect(String(result.spf.notes)).toContain("not followed");
+  });
+
+  test("no DMARC record at a subdomain is not the claim that no policy applies", async () => {
+    // RFC 7489 6.6.3: a receiver that finds nothing at _dmarc.<name> falls
+    // back to the ORGANIZATIONAL domain, which this tool never queried. The
+    // old wording concluded "the domain has no DMARC policy" from one lookup
+    // short of that — a definite answer to a question that was not asked.
+    registerNotifyConfig({
+      allowed_origins: [origin],
+      allowed_recipients: ["ops@example.com"],
+      allowed_smtp_hosts: ["127.0.0.1"],
+      allowed_sender_domains: ["mail.example.com"],
+    });
+    dnsFixtures.set("mail.example.com", [["v=spf1 -all"]]);
+    dnsFixtures.set("_dmarc.mail.example.com", [["google-site-verification=abc"]]);
+    const result = await run(deliverabilityCheck, { domain: "mail.example.com" });
+    expect(result.dmarc.status).toBe("absent");
+    expect(result.dmarc.detail).not.toContain("the domain has no DMARC policy");
+    expect(String(result.notes)).toContain("organizational domain");
+    // And the dependency that would be needed to name it is named, rather
+    // than a public-suffix rule being guessed at here.
+    expect(String(result.notes)).toContain("Public Suffix List");
+  });
+
+  test("a two-label domain gets no organizational-domain note, because there is none above it", async () => {
+    dnsFixtures.set("_dmarc.example.com", nxdomain());
+    const result = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(result.dmarc.status).toBe("absent");
+    expect(String(result.notes ?? "")).not.toContain("organizational domain");
+  });
+
+  test("a subdomain that publishes its own policy is not sent looking upward", async () => {
+    // The note is about a gap. A subdomain with its own v=DMARC1 record has
+    // no gap: RFC 7489 6.6.3 only walks up when nothing is published here,
+    // and telling somebody their policy might be somewhere else when it is
+    // right in front of them is noise where the tool's whole job is signal.
+    registerNotifyConfig({
+      allowed_origins: [origin],
+      allowed_recipients: ["ops@example.com"],
+      allowed_smtp_hosts: ["127.0.0.1"],
+      allowed_sender_domains: ["mail.example.com"],
+    });
+    dnsFixtures.set("mail.example.com", [["v=spf1 -all"]]);
+    dnsFixtures.set("_dmarc.mail.example.com", [["v=DMARC1; p=reject; rua=mailto:a@b.co"]]);
+    const result = await run(deliverabilityCheck, { domain: "mail.example.com" });
+    expect(result.dmarc.policy).toBe("reject");
+    expect(String(result.notes ?? "")).not.toContain("organizational domain");
+  });
+
+  test("a DMARC lookup that FAILED gets no fallback note either", async () => {
+    // The note is about an answered question. A SERVFAIL is not an answer,
+    // and pairing it with "but the organizational domain might cover you"
+    // would read as reassurance about a lookup that never happened.
+    registerNotifyConfig({
+      allowed_origins: [origin],
+      allowed_recipients: ["ops@example.com"],
+      allowed_smtp_hosts: ["127.0.0.1"],
+      allowed_sender_domains: ["mail.example.com"],
+    });
+    dnsFixtures.set("mail.example.com", [["v=spf1 -all"]]);
+    dnsFixtures.set("_dmarc.mail.example.com", failure("ESERVFAIL"));
+    const result = await run(deliverabilityCheck, { domain: "mail.example.com" });
+    expect(result.dmarc.status).toBe("unknown");
+    expect(String(result.notes ?? "")).not.toContain("organizational domain");
+  });
+
+  test("nothing in a DKIM answer claims a signature was verified", async () => {
+    const result = await run(deliverabilityCheck, {
+      domain: "example.com",
+      dkimSelectors: ["s1"],
+    });
+    // The parked capability, asserted rather than trusted to stay parked.
+    expect(JSON.stringify(result.dkim).toLowerCase()).not.toContain("verified");
+    expect(deliverabilityCheck.description).toContain("does NOT verify");
+  });
+
+  test("a resolver that never answers ends as unknown, naming the deadline", async () => {
+    // A hung resolver must not hang the tool, and the answer it produces must
+    // say WHY it has no records — a failure that could equally be "nothing is
+    // published" would be the same defect this whole result shape exists to
+    // prevent. The assertion is on the reason, never on how long it took.
+    dnsFixtures.set("example.com", "hangs");
+    const result = await run(deliverabilityCheck, { domain: "example.com", timeoutMs: 50 });
+    expect(result.spf.status).toBe("unknown");
+    expect(result.spf.detail).toContain("hit the deadline");
+  });
+
+  test("a record too long to read is unknown, not a record with its tail cut off", async () => {
+    // A parser handed the first 8192 characters of an SPF record would report
+    // the -all it never saw as missing — a wrong answer where this is a
+    // missing one.
+    dnsFixtures.set("example.com", [["v=spf1 ", `${"a".repeat(9000)} -all`]]);
+    const result = await run(deliverabilityCheck, { domain: "example.com" });
+    expect(result.spf.status).toBe("unknown");
+    expect(result.spf.detail).toContain("over the 8192");
   });
 });

@@ -511,6 +511,25 @@ export const glCodeSuggest: RegisteredTool = buildTool({
     ),
 });
 
+/**
+ * The normalized statement row, and the parser that produces it.
+ *
+ * `StatementParse` is the contract every reconciler in this repo matches
+ * against, so the TYPE has to be importable — `@crewhaus/tool-ledger`'s
+ * `LedgerReconcile` consumes exactly this shape, and a second declaration of
+ * it somewhere else is a shape that drifts the first time a field is added.
+ * The parser goes with it so a reconciler reading a CSV gets byte-identical
+ * behaviour, date-ambiguity refusal included, rather than its own CSV reader.
+ */
+export {
+  type DateOrder,
+  type ParseOptions,
+  type ParseResult,
+  type StatementFormat,
+  type Transaction,
+  parseStatement,
+} from "./lib/statement";
+
 /** Every tool this package registers, in the order a catalog should list them. */
 export const MONEY_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
   costBasisCompute,

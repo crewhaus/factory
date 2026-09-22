@@ -1,0 +1,45 @@
+{
+  "name": "@crewhaus/tool-deploy",
+  "version": "0.6.0",
+  "type": "module",
+  "description": "Deterministic spec deployment within the local registry: pin a version to an environment, roll back, and report what is pinned where",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/deployment-controller": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/spec-changelog": "workspace:*",
+    "@crewhaus/spec-registry": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/tool-executor": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-deploy"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-deploy#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"]
+}

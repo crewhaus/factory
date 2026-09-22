@@ -1,0 +1,40 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../adapter-anthropic"
+    },
+    {
+      "path": "../dataset-ops"
+    },
+    {
+      "path": "../eval-dataset"
+    },
+    {
+      "path": "../eval-grader"
+    },
+    {
+      "path": "../eval-judge"
+    },
+    {
+      "path": "../eval-report"
+    },
+    {
+      "path": "../eval-runner"
+    },
+    {
+      "path": "../feedback-distill"
+    },
+    {
+      "path": "../harness-advice"
+    },
+    {
+      "path": "../regression-runner"
+    }
+  ],
+  "include": ["src/**/*"]
+}

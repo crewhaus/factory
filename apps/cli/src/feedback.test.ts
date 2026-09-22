@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { auditSamples, redactDatasetText } from "@crewhaus/dataset-ops/dataset-audit";
 import { SampleSchema } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
-import { auditSamples, redactDatasetText } from "./dataset-audit";
 import {
   type FeedbackRecord,
   type LoggedEvent,

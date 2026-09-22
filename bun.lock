@@ -35,6 +35,7 @@
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/crewhaus-cloud": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
+        "@crewhaus/dataset-ops": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/docker-images": "workspace:*",
@@ -45,6 +46,7 @@
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/eval-ops": "workspace:*",
         "@crewhaus/eval-optimizer-orchestrator": "workspace:*",
         "@crewhaus/eval-report": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
@@ -55,7 +57,9 @@
         "@crewhaus/grader-safety-classifiers": "workspace:*",
         "@crewhaus/hangar-server": "workspace:*",
         "@crewhaus/hangar-ui": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
         "@crewhaus/harness-inventory": "workspace:*",
+        "@crewhaus/harness-lifecycle": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
@@ -98,6 +102,7 @@
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/smoke-harness": "workspace:*",
         "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-changelog": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/sub-agent-spawner": "workspace:*",
@@ -110,29 +115,50 @@
         "@crewhaus/template-marketplace-client": "workspace:*",
         "@crewhaus/template-registry": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-approvals": "workspace:*",
         "@crewhaus/tool-bash": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-buildperf": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
+        "@crewhaus/tool-chaincall": "workspace:*",
+        "@crewhaus/tool-chainread": "workspace:*",
+        "@crewhaus/tool-changeset": "workspace:*",
         "@crewhaus/tool-code": "workspace:*",
         "@crewhaus/tool-code-execution": "workspace:*",
         "@crewhaus/tool-codegraph": "workspace:*",
         "@crewhaus/tool-codehost": "workspace:*",
+        "@crewhaus/tool-containers": "workspace:*",
         "@crewhaus/tool-crewhaus": "workspace:*",
+        "@crewhaus/tool-cron": "workspace:*",
         "@crewhaus/tool-data": "workspace:*",
+        "@crewhaus/tool-dataset": "workspace:*",
         "@crewhaus/tool-datetime": "workspace:*",
+        "@crewhaus/tool-defi": "workspace:*",
+        "@crewhaus/tool-deploy": "workspace:*",
+        "@crewhaus/tool-desktop": "workspace:*",
+        "@crewhaus/tool-discovery": "workspace:*",
+        "@crewhaus/tool-distribution": "workspace:*",
         "@crewhaus/tool-docs": "workspace:*",
         "@crewhaus/tool-document-ingest": "workspace:*",
+        "@crewhaus/tool-einvoice": "workspace:*",
         "@crewhaus/tool-encode": "workspace:*",
+        "@crewhaus/tool-evalops": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-fleet": "workspace:*",
         "@crewhaus/tool-flow": "workspace:*",
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-fsx": "workspace:*",
         "@crewhaus/tool-git": "workspace:*",
+        "@crewhaus/tool-host": "workspace:*",
+        "@crewhaus/tool-hostfs": "workspace:*",
         "@crewhaus/tool-html": "workspace:*",
         "@crewhaus/tool-http": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
         "@crewhaus/tool-image-generation": "workspace:*",
+        "@crewhaus/tool-kyc": "workspace:*",
+        "@crewhaus/tool-ledger": "workspace:*",
+        "@crewhaus/tool-lifecycle": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
         "@crewhaus/tool-media": "workspace:*",
@@ -141,21 +167,29 @@
         "@crewhaus/tool-mouse-keyboard": "workspace:*",
         "@crewhaus/tool-navigate": "workspace:*",
         "@crewhaus/tool-notify": "workspace:*",
+        "@crewhaus/tool-objectstore": "workspace:*",
         "@crewhaus/tool-obs": "workspace:*",
         "@crewhaus/tool-onchain": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-pkg": "workspace:*",
+        "@crewhaus/tool-pkgmgr": "workspace:*",
         "@crewhaus/tool-proc": "workspace:*",
+        "@crewhaus/tool-registry": "workspace:*",
         "@crewhaus/tool-retrieve": "workspace:*",
+        "@crewhaus/tool-routing": "workspace:*",
         "@crewhaus/tool-schema": "workspace:*",
         "@crewhaus/tool-screen-capture": "workspace:*",
+        "@crewhaus/tool-secrets": "workspace:*",
         "@crewhaus/tool-secure": "workspace:*",
+        "@crewhaus/tool-specops": "workspace:*",
         "@crewhaus/tool-sql": "workspace:*",
         "@crewhaus/tool-state": "workspace:*",
+        "@crewhaus/tool-supplychain": "workspace:*",
         "@crewhaus/tool-table": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-text": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
+        "@crewhaus/tool-token": "workspace:*",
         "@crewhaus/tool-verify": "workspace:*",
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
@@ -638,6 +672,22 @@
         "@crewhaus/errors": "workspace:*",
       },
     },
+    "packages/dataset-ops": {
+      "name": "@crewhaus/dataset-ops",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/pii-redactor": "workspace:*",
+        "@crewhaus/prompt-injection-detector": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+      },
+    },
     "packages/dataset-registry": {
       "name": "@crewhaus/dataset-registry",
       "version": "0.6.0",
@@ -776,6 +826,23 @@
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
         "zod-to-json-schema": "^3.23.5",
+      },
+    },
+    "packages/eval-ops": {
+      "name": "@crewhaus/eval-ops",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/dataset-ops": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/regression-runner": "workspace:*",
+        "zod": "^3.23.8",
       },
     },
     "packages/eval-optimizer-orchestrator": {
@@ -1061,6 +1128,24 @@
       "name": "@crewhaus/hangar-ui",
       "version": "0.6.0",
     },
+    "packages/harness-advice": {
+      "name": "@crewhaus/harness-advice",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/routing-store": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+      },
+      "devDependencies": {
+        "zod": "^3.23.8",
+      },
+    },
     "packages/harness-inventory": {
       "name": "@crewhaus/harness-inventory",
       "version": "0.6.0",
@@ -1071,6 +1156,15 @@
       },
       "devDependencies": {
         "@crewhaus/eval-report": "workspace:*",
+      },
+    },
+    "packages/harness-lifecycle": {
+      "name": "@crewhaus/harness-lifecycle",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/data-retention-engine": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
       },
     },
     "packages/harness-registry": {
@@ -1695,6 +1789,20 @@
         "zod-to-json-schema": "^3.23.5",
       },
     },
+    "packages/spec-changelog": {
+      "name": "@crewhaus/spec-changelog",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/migration-engine": "workspace:*",
+        "@crewhaus/migration-runner": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
+        "yaml": "^2.6.0",
+      },
+      "devDependencies": {
+        "@crewhaus/spec": "workspace:*",
+      },
+    },
     "packages/spec-patch": {
       "name": "@crewhaus/spec-patch",
       "version": "0.6.0",
@@ -2056,6 +2164,21 @@
         "@anthropic-ai/sdk": "^0.96.0",
       },
     },
+    "packages/tool-approvals": {
+      "name": "@crewhaus/tool-approvals",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-bash": {
       "name": "@crewhaus/tool-bash",
       "version": "0.6.0",
@@ -2081,6 +2204,20 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-buildperf": {
+      "name": "@crewhaus/tool-buildperf",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-catalog": {
       "name": "@crewhaus/tool-catalog",
       "version": "0.6.0",
@@ -2095,6 +2232,52 @@
       "version": "0.6.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+      },
+    },
+    "packages/tool-chaincall": {
+      "name": "@crewhaus/tool-chaincall",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-onchain": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-chainread": {
+      "name": "@crewhaus/tool-chainread",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-money": "workspace:*",
+        "@crewhaus/tool-onchain": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-changeset": {
+      "name": "@crewhaus/tool-changeset",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-code": "workspace:*",
+        "@crewhaus/tool-text": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-code": {
@@ -2171,6 +2354,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-containers": {
+      "name": "@crewhaus/tool-containers",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-contract-gateway": {
       "name": "@crewhaus/tool-contract-gateway",
       "version": "0.6.0",
@@ -2198,11 +2395,41 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-cron": {
+      "name": "@crewhaus/tool-cron",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-datetime": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-data": {
       "name": "@crewhaus/tool-data",
       "version": "0.6.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-dataset": {
+      "name": "@crewhaus/tool-dataset",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/dataset-ops": "workspace:*",
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
@@ -2218,6 +2445,83 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-defi": {
+      "name": "@crewhaus/tool-defi",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
+        "@crewhaus/tool-onchain": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-deploy": {
+      "name": "@crewhaus/tool-deploy",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/deployment-controller": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/spec-changelog": "workspace:*",
+        "@crewhaus/spec-registry": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-desktop": {
+      "name": "@crewhaus/tool-desktop",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-proc": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-discovery": {
+      "name": "@crewhaus/tool-discovery",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/federation-discovery": "workspace:*",
+        "@crewhaus/template-registry": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-distribution": {
+      "name": "@crewhaus/tool-distribution",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/single-binary-cli": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-encode": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2247,6 +2551,22 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-einvoice": {
+      "name": "@crewhaus/tool-einvoice",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-data": "workspace:*",
+        "@crewhaus/tool-datetime": "workspace:*",
+        "@crewhaus/tool-money": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-encode": {
       "name": "@crewhaus/tool-encode",
       "version": "0.6.0",
@@ -2254,6 +2574,24 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-evalops": {
+      "name": "@crewhaus/tool-evalops",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/eval-ops": "workspace:*",
+        "@crewhaus/eval-report": "workspace:*",
+        "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2309,6 +2647,22 @@
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-validate": "workspace:*",
+      },
+    },
+    "packages/tool-fleet": {
+      "name": "@crewhaus/tool-fleet",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/harness-registry": "workspace:*",
+        "@crewhaus/harness-supervisor": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-flow": {
@@ -2375,6 +2729,32 @@
         "@crewhaus/sandbox": "workspace:*",
       },
     },
+    "packages/tool-host": {
+      "name": "@crewhaus/tool-host",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-hostfs": {
+      "name": "@crewhaus/tool-hostfs",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-html": {
       "name": "@crewhaus/tool-html",
       "version": "0.6.0",
@@ -2424,6 +2804,51 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-kyc": {
+      "name": "@crewhaus/tool-kyc",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-text": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-ledger": {
+      "name": "@crewhaus/tool-ledger",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-datetime": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
+        "@crewhaus/tool-money": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-lifecycle": {
+      "name": "@crewhaus/tool-lifecycle",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/harness-lifecycle": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-loop-detection": {
@@ -2548,6 +2973,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-objectstore": {
+      "name": "@crewhaus/tool-objectstore",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-encode": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-obs": {
       "name": "@crewhaus/tool-obs",
       "version": "0.6.0",
@@ -2605,6 +3044,20 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-pkgmgr": {
+      "name": "@crewhaus/tool-pkgmgr",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-proc": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-plan": {
       "name": "@crewhaus/tool-plan",
       "version": "0.6.0",
@@ -2624,6 +3077,21 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-registry": {
+      "name": "@crewhaus/tool-registry",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-code": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2651,6 +3119,23 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/vector-store": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/tool-routing": {
+      "name": "@crewhaus/tool-routing",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/canary-controller": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/routing-store": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
+        "@crewhaus/watchme-store": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/tool-schema": {
@@ -2681,11 +3166,42 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/tool-secrets": {
+      "name": "@crewhaus/tool-secrets",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/harness-supervisor": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-secure": {
       "name": "@crewhaus/tool-secure",
       "version": "0.6.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
+    "packages/tool-specops": {
+      "name": "@crewhaus/tool-specops",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/spec-changelog": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
@@ -2720,6 +3236,21 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-supplychain": {
+      "name": "@crewhaus/tool-supplychain",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-code": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-table": {
       "name": "@crewhaus/tool-table",
       "version": "0.6.0",
@@ -2728,6 +3259,7 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-data": "workspace:*",
+        "@crewhaus/tool-math": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2779,6 +3311,22 @@
         "@crewhaus/tool-validate": "workspace:*",
       },
     },
+    "packages/tool-token": {
+      "name": "@crewhaus/tool-token",
+      "version": "0.6.0",
+      "dependencies": {
+        "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-onchain": "workspace:*",
+        "@crewhaus/tool-text": "workspace:*",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
+    },
     "packages/tool-validate": {
       "name": "@crewhaus/tool-validate",
       "version": "0.6.0",
@@ -2795,6 +3343,8 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-html": "workspace:*",
+        "@crewhaus/tool-text": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3086,6 +3636,8 @@
 
     "@crewhaus/data-retention-engine": ["@crewhaus/data-retention-engine@workspace:packages/data-retention-engine"],
 
+    "@crewhaus/dataset-ops": ["@crewhaus/dataset-ops@workspace:packages/dataset-ops"],
+
     "@crewhaus/dataset-registry": ["@crewhaus/dataset-registry@workspace:packages/dataset-registry"],
 
     "@crewhaus/default-skills": ["@crewhaus/default-skills@workspace:packages/default-skills"],
@@ -3113,6 +3665,8 @@
     "@crewhaus/eval-grader": ["@crewhaus/eval-grader@workspace:packages/eval-grader"],
 
     "@crewhaus/eval-judge": ["@crewhaus/eval-judge@workspace:packages/eval-judge"],
+
+    "@crewhaus/eval-ops": ["@crewhaus/eval-ops@workspace:packages/eval-ops"],
 
     "@crewhaus/eval-optimizer-orchestrator": ["@crewhaus/eval-optimizer-orchestrator@workspace:packages/eval-optimizer-orchestrator"],
 
@@ -3162,7 +3716,11 @@
 
     "@crewhaus/hangar-ui": ["@crewhaus/hangar-ui@workspace:packages/hangar-ui"],
 
+    "@crewhaus/harness-advice": ["@crewhaus/harness-advice@workspace:packages/harness-advice"],
+
     "@crewhaus/harness-inventory": ["@crewhaus/harness-inventory@workspace:packages/harness-inventory"],
+
+    "@crewhaus/harness-lifecycle": ["@crewhaus/harness-lifecycle@workspace:packages/harness-lifecycle"],
 
     "@crewhaus/harness-registry": ["@crewhaus/harness-registry@workspace:packages/harness-registry"],
 
@@ -3292,6 +3850,8 @@
 
     "@crewhaus/spec": ["@crewhaus/spec@workspace:packages/spec"],
 
+    "@crewhaus/spec-changelog": ["@crewhaus/spec-changelog@workspace:packages/spec-changelog"],
+
     "@crewhaus/spec-patch": ["@crewhaus/spec-patch@workspace:packages/spec-patch"],
 
     "@crewhaus/spec-registry": ["@crewhaus/spec-registry@workspace:packages/spec-registry"],
@@ -3352,13 +3912,23 @@
 
     "@crewhaus/token-budget": ["@crewhaus/token-budget@workspace:packages/token-budget"],
 
+    "@crewhaus/tool-approvals": ["@crewhaus/tool-approvals@workspace:packages/tool-approvals"],
+
     "@crewhaus/tool-bash": ["@crewhaus/tool-bash@workspace:packages/tool-bash"],
 
     "@crewhaus/tool-builder": ["@crewhaus/tool-builder@workspace:packages/tool-builder"],
 
+    "@crewhaus/tool-buildperf": ["@crewhaus/tool-buildperf@workspace:packages/tool-buildperf"],
+
     "@crewhaus/tool-catalog": ["@crewhaus/tool-catalog@workspace:packages/tool-catalog"],
 
     "@crewhaus/tool-categories": ["@crewhaus/tool-categories@workspace:packages/tool-categories"],
+
+    "@crewhaus/tool-chaincall": ["@crewhaus/tool-chaincall@workspace:packages/tool-chaincall"],
+
+    "@crewhaus/tool-chainread": ["@crewhaus/tool-chainread@workspace:packages/tool-chainread"],
+
+    "@crewhaus/tool-changeset": ["@crewhaus/tool-changeset@workspace:packages/tool-changeset"],
 
     "@crewhaus/tool-code": ["@crewhaus/tool-code@workspace:packages/tool-code"],
 
@@ -3370,19 +3940,39 @@
 
     "@crewhaus/tool-consult": ["@crewhaus/tool-consult@workspace:packages/tool-consult"],
 
+    "@crewhaus/tool-containers": ["@crewhaus/tool-containers@workspace:packages/tool-containers"],
+
     "@crewhaus/tool-contract-gateway": ["@crewhaus/tool-contract-gateway@workspace:packages/tool-contract-gateway"],
 
     "@crewhaus/tool-crewhaus": ["@crewhaus/tool-crewhaus@workspace:packages/tool-crewhaus"],
 
+    "@crewhaus/tool-cron": ["@crewhaus/tool-cron@workspace:packages/tool-cron"],
+
     "@crewhaus/tool-data": ["@crewhaus/tool-data@workspace:packages/tool-data"],
 
+    "@crewhaus/tool-dataset": ["@crewhaus/tool-dataset@workspace:packages/tool-dataset"],
+
     "@crewhaus/tool-datetime": ["@crewhaus/tool-datetime@workspace:packages/tool-datetime"],
+
+    "@crewhaus/tool-defi": ["@crewhaus/tool-defi@workspace:packages/tool-defi"],
+
+    "@crewhaus/tool-deploy": ["@crewhaus/tool-deploy@workspace:packages/tool-deploy"],
+
+    "@crewhaus/tool-desktop": ["@crewhaus/tool-desktop@workspace:packages/tool-desktop"],
+
+    "@crewhaus/tool-discovery": ["@crewhaus/tool-discovery@workspace:packages/tool-discovery"],
+
+    "@crewhaus/tool-distribution": ["@crewhaus/tool-distribution@workspace:packages/tool-distribution"],
 
     "@crewhaus/tool-docs": ["@crewhaus/tool-docs@workspace:packages/tool-docs"],
 
     "@crewhaus/tool-document-ingest": ["@crewhaus/tool-document-ingest@workspace:packages/tool-document-ingest"],
 
+    "@crewhaus/tool-einvoice": ["@crewhaus/tool-einvoice@workspace:packages/tool-einvoice"],
+
     "@crewhaus/tool-encode": ["@crewhaus/tool-encode@workspace:packages/tool-encode"],
+
+    "@crewhaus/tool-evalops": ["@crewhaus/tool-evalops@workspace:packages/tool-evalops"],
 
     "@crewhaus/tool-evm": ["@crewhaus/tool-evm@workspace:packages/tool-evm"],
 
@@ -3391,6 +3981,8 @@
     "@crewhaus/tool-executor": ["@crewhaus/tool-executor@workspace:packages/tool-executor"],
 
     "@crewhaus/tool-fetch": ["@crewhaus/tool-fetch@workspace:packages/tool-fetch"],
+
+    "@crewhaus/tool-fleet": ["@crewhaus/tool-fleet@workspace:packages/tool-fleet"],
 
     "@crewhaus/tool-flow": ["@crewhaus/tool-flow@workspace:packages/tool-flow"],
 
@@ -3402,6 +3994,10 @@
 
     "@crewhaus/tool-harness-synthesizer": ["@crewhaus/tool-harness-synthesizer@workspace:packages/tool-harness-synthesizer"],
 
+    "@crewhaus/tool-host": ["@crewhaus/tool-host@workspace:packages/tool-host"],
+
+    "@crewhaus/tool-hostfs": ["@crewhaus/tool-hostfs@workspace:packages/tool-hostfs"],
+
     "@crewhaus/tool-html": ["@crewhaus/tool-html@workspace:packages/tool-html"],
 
     "@crewhaus/tool-http": ["@crewhaus/tool-http@workspace:packages/tool-http"],
@@ -3409,6 +4005,12 @@
     "@crewhaus/tool-image": ["@crewhaus/tool-image@workspace:packages/tool-image"],
 
     "@crewhaus/tool-image-generation": ["@crewhaus/tool-image-generation@workspace:packages/tool-image-generation"],
+
+    "@crewhaus/tool-kyc": ["@crewhaus/tool-kyc@workspace:packages/tool-kyc"],
+
+    "@crewhaus/tool-ledger": ["@crewhaus/tool-ledger@workspace:packages/tool-ledger"],
+
+    "@crewhaus/tool-lifecycle": ["@crewhaus/tool-lifecycle@workspace:packages/tool-lifecycle"],
 
     "@crewhaus/tool-loop-detection": ["@crewhaus/tool-loop-detection@workspace:packages/tool-loop-detection"],
 
@@ -3430,6 +4032,8 @@
 
     "@crewhaus/tool-notify": ["@crewhaus/tool-notify@workspace:packages/tool-notify"],
 
+    "@crewhaus/tool-objectstore": ["@crewhaus/tool-objectstore@workspace:packages/tool-objectstore"],
+
     "@crewhaus/tool-obs": ["@crewhaus/tool-obs@workspace:packages/tool-obs"],
 
     "@crewhaus/tool-onchain": ["@crewhaus/tool-onchain@workspace:packages/tool-onchain"],
@@ -3440,13 +4044,19 @@
 
     "@crewhaus/tool-pkg": ["@crewhaus/tool-pkg@workspace:packages/tool-pkg"],
 
+    "@crewhaus/tool-pkgmgr": ["@crewhaus/tool-pkgmgr@workspace:packages/tool-pkgmgr"],
+
     "@crewhaus/tool-plan": ["@crewhaus/tool-plan@workspace:packages/tool-plan"],
 
     "@crewhaus/tool-proc": ["@crewhaus/tool-proc@workspace:packages/tool-proc"],
 
+    "@crewhaus/tool-registry": ["@crewhaus/tool-registry@workspace:packages/tool-registry"],
+
     "@crewhaus/tool-result-store": ["@crewhaus/tool-result-store@workspace:packages/tool-result-store"],
 
     "@crewhaus/tool-retrieve": ["@crewhaus/tool-retrieve@workspace:packages/tool-retrieve"],
+
+    "@crewhaus/tool-routing": ["@crewhaus/tool-routing@workspace:packages/tool-routing"],
 
     "@crewhaus/tool-schema": ["@crewhaus/tool-schema@workspace:packages/tool-schema"],
 
@@ -3454,11 +4064,17 @@
 
     "@crewhaus/tool-screen-capture": ["@crewhaus/tool-screen-capture@workspace:packages/tool-screen-capture"],
 
+    "@crewhaus/tool-secrets": ["@crewhaus/tool-secrets@workspace:packages/tool-secrets"],
+
     "@crewhaus/tool-secure": ["@crewhaus/tool-secure@workspace:packages/tool-secure"],
+
+    "@crewhaus/tool-specops": ["@crewhaus/tool-specops@workspace:packages/tool-specops"],
 
     "@crewhaus/tool-sql": ["@crewhaus/tool-sql@workspace:packages/tool-sql"],
 
     "@crewhaus/tool-state": ["@crewhaus/tool-state@workspace:packages/tool-state"],
+
+    "@crewhaus/tool-supplychain": ["@crewhaus/tool-supplychain@workspace:packages/tool-supplychain"],
 
     "@crewhaus/tool-table": ["@crewhaus/tool-table@workspace:packages/tool-table"],
 
@@ -3467,6 +4083,8 @@
     "@crewhaus/tool-text": ["@crewhaus/tool-text@workspace:packages/tool-text"],
 
     "@crewhaus/tool-todo": ["@crewhaus/tool-todo@workspace:packages/tool-todo"],
+
+    "@crewhaus/tool-token": ["@crewhaus/tool-token@workspace:packages/tool-token"],
 
     "@crewhaus/tool-validate": ["@crewhaus/tool-validate@workspace:packages/tool-validate"],
 

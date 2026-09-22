@@ -12,17 +12,25 @@
 import { describe, expect, test } from "bun:test";
 import { parseIstanbulSummary, parseLcov, totalOf, worstFirst } from "./lib/coverage";
 import {
+  LOCKFILE_NAMES,
   matchWorkspaceGlob,
   parseBunLock,
+  parseBunLockDetailed,
   parseCargoLock,
+  parseCargoLockDetailed,
   parseCargoToml,
   parseGoMod,
+  parseLockfileDetailed,
   parsePackageJson,
   parsePackageLock,
+  parsePackageLockDetailed,
+  parsePnpmLock,
+  parsePnpmLockDetailed,
   parsePyproject,
   parseRequirementsTxt,
   parseSemver,
   parseYarnLock,
+  parseYarnLockDetailed,
   satisfies,
   stripJsonc,
 } from "./lib/deps";
@@ -895,6 +903,114 @@ describe("dependency manifests", () => {
     expect(berry).toEqual([{ name: "zod", version: "3.23.8" }]);
   });
 
+  // pnpm changed its entry-key grammar twice, and all three generations are
+  // still in the wild. These three fixtures are the `packages:` sections of
+  // lockfiles written by pnpm 7, 8 and 10 for the same package.json.
+  test("pnpm-lock.yaml, generations 5, 6 and 9", () => {
+    const v5 = parsePnpmLock(
+      [
+        "lockfileVersion: 5.4",
+        "",
+        "dependencies:",
+        "  react-dom: 18.2.0_react@18.2.0",
+        "",
+        "packages:",
+        "",
+        "  /@sindresorhus/is/5.6.0:",
+        "    resolution: {integrity: sha512-Abc==}",
+        "    dev: false",
+        "",
+        "  /react-dom/18.2.0_react@18.2.0:",
+        "    resolution: {integrity: sha512-Def==}",
+        "    dependencies:",
+        "      react: 18.2.0",
+        "    dev: false",
+        "",
+      ].join("\n"),
+    );
+    expect(v5).toEqual([
+      { name: "@sindresorhus/is", version: "5.6.0" },
+      { name: "react-dom", version: "18.2.0" },
+    ]);
+    // pnpm 8 kept the leading slash but moved to `name@version`, so a reader
+    // written only to the v5 shape reads NOTHING here — which is how the
+    // whole format came to be silently unread.
+    const v6 = parsePnpmLock(
+      [
+        "lockfileVersion: '6.0'",
+        "",
+        "packages:",
+        "",
+        "  /@sindresorhus/is@5.6.0:",
+        "    resolution: {integrity: sha512-Abc==}",
+        "",
+        "  /react-dom@18.2.0(react@18.2.0):",
+        "    resolution: {integrity: sha512-Def==}",
+        "",
+      ].join("\n"),
+    );
+    expect(v6).toEqual([
+      { name: "@sindresorhus/is", version: "5.6.0" },
+      { name: "react-dom", version: "18.2.0" },
+    ]);
+    const v9 = parsePnpmLock(
+      [
+        "lockfileVersion: '9.0'",
+        "",
+        "packages:",
+        "",
+        "  '@sindresorhus/is@5.6.0':",
+        "    resolution: {integrity: sha512-Abc==}",
+        "",
+        "  react-dom@18.2.0:",
+        "    resolution: {integrity: sha512-Def==}",
+        "",
+      ].join("\n"),
+    );
+    expect(v9).toEqual([
+      { name: "@sindresorhus/is", version: "5.6.0" },
+      { name: "react-dom", version: "18.2.0" },
+    ]);
+  });
+
+  test("pnpm: only `packages:` is a resolution, and `_` is legal in a name", () => {
+    // `importers:` holds the ranges the workspace DECLARED and `snapshots:`
+    // re-lists a package once per peer combination. Counting either would
+    // report a resolved version that is not one, or the same package twice.
+    const scoped = parsePnpmLock(
+      [
+        "lockfileVersion: '9.0'",
+        "",
+        "importers:",
+        "",
+        "  .:",
+        "    dependencies:",
+        "      zod:",
+        "        specifier: ^3",
+        "        version: 3.23.8",
+        "",
+        "packages:",
+        "",
+        "  zod@3.23.8:",
+        "    resolution: {integrity: sha512-Abc==}",
+        "",
+        "snapshots:",
+        "",
+        "  zod@3.23.8: {}",
+        "",
+      ].join("\n"),
+    );
+    expect(scoped).toEqual([{ name: "zod", version: "3.23.8" }]);
+    // `@a2ui/web_core` is a real package. Cutting a v5 peer suffix at the
+    // first `_` in the key rather than inside the version segment would
+    // truncate this name to `@a2ui/web`.
+    expect(
+      parsePnpmLock(
+        "packages:\n\n  '@a2ui/web_core@0.10.0':\n    resolution: {integrity: sha512-A==}\n",
+      ),
+    ).toEqual([{ name: "@a2ui/web_core", version: "0.10.0" }]);
+  });
+
   test("requirements.txt: extras, markers and comments", () => {
     const deps = parseRequirementsTxt(
       [
@@ -967,6 +1083,286 @@ describe("dependency manifests", () => {
     expect(matchWorkspaceGlob("packages/a/b", "packages/**")).toBe(true);
     expect(matchWorkspaceGlob("apps/web", "packages/*")).toBe(false);
     expect(matchWorkspaceGlob("packages/x", "!packages/x")).toBe(false);
+  });
+});
+
+describe("lockfile readers, the wide view", () => {
+  // Verbatim bun shapes: the integrity is the LAST slot, the resolution slot
+  // is empty for anything from the configured registry and a URL only when it
+  // is not, and a workspace member is a one-element tuple with neither.
+  const BUN_LOCK = [
+    "{",
+    '  "lockfileVersion": 1,',
+    '  "packages": {',
+    '    "zod": ["zod@3.23.8", "", { "dependencies": {} }, "sha512-Abc123=="],',
+    '    "inhouse": ["inhouse@1.0.0", "https://npm.internal.example.com/inhouse/-/inhouse-1.0.0.tgz", {}, "sha512-Def456=="],',
+    '    "@acme/app": ["@acme/app@workspace:packages/app"],',
+    "  },",
+    "}",
+  ].join("\n");
+
+  test("bun.lock: integrity always, a URL only where bun recorded one", () => {
+    expect(parseBunLockDetailed(BUN_LOCK)).toEqual([
+      { ecosystem: "npm", name: "@acme/app", version: "workspace:packages/app" },
+      {
+        ecosystem: "npm",
+        name: "inhouse",
+        version: "1.0.0",
+        resolvedUrl: "https://npm.internal.example.com/inhouse/-/inhouse-1.0.0.tgz",
+        integrity: "sha512-Def456==",
+      },
+      { ecosystem: "npm", name: "zod", version: "3.23.8", integrity: "sha512-Abc123==" },
+    ]);
+  });
+
+  test("package-lock.json: `resolved` only when it is a URL", () => {
+    const detailed = parsePackageLockDetailed(
+      JSON.stringify({
+        packages: {
+          "": { name: "root", version: "1.0.0" },
+          "node_modules/zod": {
+            version: "3.23.8",
+            resolved: "https://registry.npmjs.org/zod/-/zod-3.23.8.tgz",
+            integrity: "sha512-Abc123==",
+          },
+          // npm usually omits `version` on a link entry, so this is the guard
+          // rather than a common shape — but a workspace path is what npm
+          // writes into `resolved` there, and it must never come back as a URL
+          // for something to fetch.
+          "node_modules/ui": { version: "0.1.0", resolved: "packages/ui", link: true },
+        },
+      }),
+    );
+    expect(detailed).toEqual([
+      { ecosystem: "npm", name: "root", version: "1.0.0" },
+      { ecosystem: "npm", name: "ui", version: "0.1.0" },
+      {
+        ecosystem: "npm",
+        name: "zod",
+        version: "3.23.8",
+        resolvedUrl: "https://registry.npmjs.org/zod/-/zod-3.23.8.tgz",
+        integrity: "sha512-Abc123==",
+      },
+    ]);
+  });
+
+  test("yarn.lock: classic carries both, berry neither", () => {
+    // `resolved` and `integrity` sit BELOW `version`, which is the whole
+    // reason an entry is flushed at the next header rather than at its
+    // version line.
+    const classic = parseYarnLockDetailed(
+      [
+        '"zod@^3.23.0":',
+        '  version "3.23.8"',
+        '  resolved "https://registry.yarnpkg.com/zod/-/zod-3.23.8.tgz#e67ad4b4"',
+        "  integrity sha512-Abc123==",
+        "",
+      ].join("\n"),
+    );
+    expect(classic).toEqual([
+      {
+        ecosystem: "npm",
+        name: "zod",
+        version: "3.23.8",
+        resolvedUrl: "https://registry.yarnpkg.com/zod/-/zod-3.23.8.tgz#e67ad4b4",
+        integrity: "sha512-Abc123==",
+      },
+    ]);
+    // Berry's `resolution:` is a descriptor and its `checksum:` hashes Yarn's
+    // own zip, not the published tarball. Both are dropped: a consumer that
+    // verified a registry download against that checksum would reject a good
+    // tarball, and one that fetched the descriptor would fetch nothing.
+    const berry = parseYarnLockDetailed(
+      [
+        '"zod@npm:^3.23.0":',
+        "  version: 3.23.8",
+        '  resolution: "zod@npm:3.23.8"',
+        "  checksum: 10c0/9f3a1c2b",
+        "  languageName: node",
+        "",
+      ].join("\n"),
+    );
+    expect(berry).toEqual([{ ecosystem: "npm", name: "zod", version: "3.23.8" }]);
+  });
+
+  test("pnpm-lock.yaml: the entry's own fields beat the key, and only a tarball is a URL", () => {
+    // Verbatim pnpm 10 shapes. A registry package records SRI and no URL; a
+    // git one records `repo`/`commit` and its REAL version in a `version:`
+    // field, while the key holds the git URL where a version would be; a
+    // directory one records neither.
+    const detailed = parsePnpmLockDetailed(
+      [
+        "lockfileVersion: '9.0'",
+        "",
+        "packages:",
+        "",
+        "  is-odd@git+ssh://git@github.com/jonschlinkert/is-odd.git#a80ee0d:",
+        "    resolution: {commit: a80ee0d, repo: git+ssh://git@github.com/jonschlinkert/is-odd.git, type: git}",
+        "    version: 3.0.1",
+        "    engines: {node: '>=4'}",
+        "",
+        "  inhouse@1.0.0:",
+        "    resolution: {tarball: https://npm.internal.example.com/inhouse/-/inhouse-1.0.0.tgz}",
+        "",
+        "  local-pkg@file:local-pkg:",
+        "    resolution: {directory: local-pkg, type: directory}",
+        "",
+        "  zod@3.23.8:",
+        "    resolution: {integrity: sha512-Abc123==}",
+        "",
+      ].join("\n"),
+    );
+    expect(detailed).toEqual([
+      {
+        ecosystem: "npm",
+        name: "inhouse",
+        version: "1.0.0",
+        resolvedUrl: "https://npm.internal.example.com/inhouse/-/inhouse-1.0.0.tgz",
+      },
+      // The version is 3.0.1, not the git URL the key carries — and the key
+      // is split at the FIRST `@` after the scope, because the last one is
+      // inside `git@github.com`.
+      { ecosystem: "npm", name: "is-odd", version: "3.0.1" },
+      // Neither field is recorded for a directory, and the key stands in for
+      // the version so the entry is still visible in a diff.
+      { ecosystem: "npm", name: "local-pkg", version: "file:local-pkg" },
+      { ecosystem: "npm", name: "zod", version: "3.23.8", integrity: "sha512-Abc123==" },
+    ]);
+    // A git resolution's `repo` is a repository, not the address an artifact
+    // came from, so it is NOT promoted to `resolvedUrl` the way `tarball` is.
+    expect(detailed[1]).not.toHaveProperty("resolvedUrl");
+  });
+
+  test("Cargo.lock: checksum as bare hex, and `source` is not a resolved URL", () => {
+    const detailed = parseCargoLockDetailed(
+      [
+        "[[package]]",
+        'name = "serde"',
+        'version = "1.0.203"',
+        'source = "registry+https://github.com/rust-lang/crates.io-index"',
+        'checksum = "7253ab4de971e72fb7be983802300c30b5a7f0c2e56fab8abfc6a214307c0094"',
+        "",
+        "[[package]]",
+        'name = "local-thing"',
+        'version = "0.1.0"',
+      ].join("\n"),
+    );
+    expect(detailed).toEqual([
+      // A path dependency has no checksum at all, and no URL is invented for it.
+      { ecosystem: "cargo", name: "local-thing", version: "0.1.0" },
+      {
+        ecosystem: "cargo",
+        name: "serde",
+        version: "1.0.203",
+        integrity: "7253ab4de971e72fb7be983802300c30b5a7f0c2e56fab8abfc6a214307c0094",
+      },
+    ]);
+  });
+
+  test("Cargo.lock: a table after the packages does not inherit the last checksum", () => {
+    // `[[patch.unused]]` is written below the packages and carries its own
+    // name and version. The reader has to end the crate before reading them,
+    // or the crate is lost and its checksum is reported against another name.
+    const detailed = parseCargoLockDetailed(
+      [
+        "[[package]]",
+        'name = "serde"',
+        'version = "1.0.203"',
+        'checksum = "7253ab4de971e72fb7be983802300c30b5a7f0c2e56fab8abfc6a214307c0094"',
+        "",
+        "[[patch.unused]]",
+        'name = "other"',
+        'version = "9.9.9"',
+      ].join("\n"),
+    );
+    expect(detailed).toContainEqual({
+      ecosystem: "cargo",
+      name: "serde",
+      version: "1.0.203",
+      integrity: "7253ab4de971e72fb7be983802300c30b5a7f0c2e56fab8abfc6a214307c0094",
+    });
+    expect(detailed.find((e) => e.name === "other")?.integrity).toBeUndefined();
+  });
+
+  test("a hash that is not the hash it claims to be is dropped", () => {
+    const notSri = parsePackageLockDetailed(
+      JSON.stringify({
+        packages: {
+          "node_modules/a": {
+            version: "1.0.0",
+            integrity: "10c0/9f3a",
+            resolved: "https://example.com/a.tgz",
+          },
+        },
+      }),
+    );
+    expect(notSri).toEqual([
+      { ecosystem: "npm", name: "a", version: "1.0.0", resolvedUrl: "https://example.com/a.tgz" },
+    ]);
+    const truncated = parseCargoLockDetailed(
+      ["[[package]]", 'name = "x"', 'version = "1.0.0"', 'checksum = "abc123"'].join("\n"),
+    );
+    expect(truncated).toEqual([{ ecosystem: "cargo", name: "x", version: "1.0.0" }]);
+  });
+
+  test("the narrow readers still return exactly a name and a version", () => {
+    const narrow = [
+      ...parseBunLock(BUN_LOCK),
+      ...parsePackageLock(
+        JSON.stringify({
+          packages: {
+            "node_modules/zod": {
+              version: "3.23.8",
+              resolved: "https://registry.npmjs.org/zod/-/zod-3.23.8.tgz",
+              integrity: "sha512-Abc123==",
+            },
+          },
+        }),
+      ),
+      ...parseYarnLock('"zod@^3":\n  version "3.23.8"\n  integrity sha512-Abc123==\n'),
+      ...parsePnpmLock(
+        "packages:\n\n  zod@3.23.8:\n    resolution: {integrity: sha512-Abc123==}\n",
+      ),
+      ...parseCargoLock(
+        [
+          "[[package]]",
+          'name = "serde"',
+          'version = "1.0.203"',
+          'checksum = "7253ab4de971e72fb7be983802300c30b5a7f0c2e56fab8abfc6a214307c0094"',
+        ].join("\n"),
+      ),
+    ];
+    // Every fixture above carries a hash, and several a URL. `toEqual` alone
+    // would still pass on a record that had them set to `undefined`, so the
+    // keys are asserted: the narrow view is what every existing caller
+    // destructures and what `DependencyList` serialises, and a widened one
+    // would put a hash in output that has never contained one.
+    for (const entry of narrow) expect(Object.keys(entry).sort()).toEqual(["name", "version"]);
+    expect(narrow).toHaveLength(7);
+  });
+
+  test("parseLockfileDetailed picks a reader, and says when there is none", () => {
+    expect(parseLockfileDetailed("bun.lock", BUN_LOCK)).toHaveLength(3);
+    expect(
+      parseLockfileDetailed("/abs/path/Cargo.lock", '[[package]]\nname = "serde"\nversion = "1"\n'),
+    ).toEqual([{ ecosystem: "cargo", name: "serde", version: "1" }]);
+    expect(
+      parseLockfileDetailed("pnpm-lock.yaml", "packages:\n\n  zod@3.23.8:\n    resolution: {}\n"),
+    ).toEqual([{ ecosystem: "npm", name: "zod", version: "3.23.8" }]);
+    // `undefined`, never `[]`: a format this package does not read and a
+    // lockfile with nothing in it are different answers, and a caller that
+    // conflated them would report a bun project as depending on nothing.
+    // `bun.lockb` is binary, so the `bun.lock` reader would return `[]`.
+    expect(parseLockfileDetailed("bun.lockb", "")).toBeUndefined();
+    expect(parseLockfileDetailed("shrinkwrap.yaml", "packages:\n")).toBeUndefined();
+    // Every name in the list resolves to a reader, so the list cannot name a
+    // format nothing reads.
+    for (const name of LOCKFILE_NAMES) {
+      expect({ name, read: parseLockfileDetailed(name, "") !== undefined }).toEqual({
+        name,
+        read: true,
+      });
+    }
   });
 });
 

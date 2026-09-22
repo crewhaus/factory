@@ -19,12 +19,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SampleSchema } from "@crewhaus/eval-dataset";
 import { parseGradersConfig } from "@crewhaus/eval-grader";
+import { providerCredentialsSatisfied } from "@crewhaus/harness-advice/doctor-checks";
 import {
   FIRST_PARTY_GRADER_TEMPLATES,
   GRADER_TEMPLATE_FAMILIES,
   graderTemplateCatalog,
 } from "@crewhaus/template-registry";
-import { providerCredentialsSatisfied } from "./doctor-checks";
 import { gradersConfigToYaml } from "./feedback";
 import {
   DEFAULT_SCAFFOLD_SAMPLES,

@@ -1,0 +1,37 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    {
+      "path": "../errors"
+    },
+    {
+      "path": "../tool-builder"
+    },
+    {
+      "path": "../tool-catalog"
+    },
+    {
+      "path": "../eval-grader"
+    },
+    {
+      "path": "../eval-ops"
+    },
+    {
+      "path": "../eval-report"
+    },
+    {
+      "path": "../eval-runner"
+    },
+    {
+      "path": "../tool-math"
+    },
+    {
+      "path": "../tool-executor"
+    }
+  ],
+  "include": ["src/**/*"]
+}

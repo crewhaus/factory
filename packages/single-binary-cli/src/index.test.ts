@@ -7,6 +7,7 @@ import {
   ARCHES,
   BUILD_MATRIX,
   type BuildBinaryRunner,
+  type ManifestInputs,
   PLATFORMS,
   SingleBinaryError,
   binaryName,
@@ -257,5 +258,229 @@ describe("sha256OfFile", () => {
     const b = await sha256OfFile(path);
     expect(a).toBe(b);
     expect(a).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe("the release manifests render byte-for-byte what they rendered before", () => {
+  /**
+   * These four strings ARE the published artefacts. A Homebrew formula that
+   * differs by a line is a formula Homebrew may still install and then fail to
+   * audit; a Debian control paragraph that loses its indentation is not a
+   * control paragraph at all.
+   *
+   * The rest of this file checks these renderers with `toContain`, which is
+   * fine for "does the sha appear" and useless for "did anything else move".
+   * A refactor can reorder, reindent or drop a line — including the on_macos
+   * comment that explains why an Apple-Silicon host is served the arm64 binary
+   * even when Homebrew reports an Intel CPU, which is load-bearing knowledge
+   * this project paid for once — and every existing assertion still passes.
+   *
+   * So: full output, pinned. Changing a manifest deliberately means updating
+   * the expected text here, which is the point — it makes the change visible
+   * in a diff instead of in the next release.
+   */
+  const SHA = (n: string): string => n.repeat(64).slice(0, 64);
+  const INPUTS: ManifestInputs = {
+    version: "1.2.3",
+    homepage: "https://crewhaus.ai",
+    downloadBaseUrl: "https://github.com/crewhaus/factory/releases/download/v1.2.3",
+    sha256: {
+      "macos-arm64": SHA("a"),
+      "macos-x64": SHA("b"),
+      "linux-arm64": SHA("c"),
+      "linux-x64": SHA("d"),
+      "windows-x64": SHA("e"),
+    },
+  };
+
+  test("homebrew: the whole file, not a sample of it", () => {
+    expect(renderHomebrewFormula(INPUTS)).toBe(`class Crewhaus < Formula
+  desc "Modular meta-harness — compile a single spec into multiple agent runtimes"
+  homepage "https://crewhaus.ai"
+  version "1.2.3"
+  license "Apache-2.0"
+
+  on_macos do
+    # An x86_64 Homebrew running under Rosetta 2 on Apple Silicon reports
+    # Hardware::CPU.intel?, but the x64 binary then executes under Rosetta — which
+    # emulates a pre-AVX (Westmere) CPU. Bun's macOS x64 runtime requires AVX2 and
+    # there is no AVX-free macOS Bun build, so it warns ("CPU lacks AVX support")
+    # and may crash. Serve the native arm64 binary on every Apple-Silicon host,
+    # translated or not. Genuine Intel Macs (AVX2-capable) still get the x64 build.
+    if Hardware::CPU.physical_cpu_arm64?
+      url "https://github.com/crewhaus/factory/releases/download/v1.2.3/crewhaus-macos-arm64-1.2.3"
+      sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    else
+      url "https://github.com/crewhaus/factory/releases/download/v1.2.3/crewhaus-macos-x64-1.2.3"
+      sha256 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/crewhaus/factory/releases/download/v1.2.3/crewhaus-linux-arm64-1.2.3"
+      sha256 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    end
+    on_intel do
+      url "https://github.com/crewhaus/factory/releases/download/v1.2.3/crewhaus-linux-x64-1.2.3"
+      sha256 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    end
+  end
+
+  def install
+    bin.install Dir["*"].first => "crewhaus"
+  end
+
+  test do
+    system "#{bin}/crewhaus", "--version"
+  end
+end
+`);
+  });
+
+  test("debian: the whole file, not a sample of it", () => {
+    expect(renderDebianControl(INPUTS)).toBe(`Package: crewhaus
+Version: 1.2.3
+Section: utils
+Priority: optional
+Architecture: any
+Maintainer: CrewHaus Maintainers <maintainers@crewhaus.ai>
+Depends: libc6 (>= 2.31)
+Description: Modular meta-harness — compile a single spec into multiple agent runtimes
+ CrewHaus compiles a single high-level harness spec into multiple
+ runtime targets (graph, workflow, channel bot, eval, batch worker,
+ voice service, browser-driver, research-runner). The binary is a
+ self-contained Bun bundle requiring no Node/Bun on the target host.
+`);
+  });
+
+  test("winget: the whole file, not a sample of it", () => {
+    expect(
+      renderWingetManifest(INPUTS),
+    ).toBe(`# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.4.0.schema.json
+PackageIdentifier: CrewHaus.CLI
+PackageVersion: 1.2.3
+Publisher: CrewHaus
+Author: CrewHaus
+PackageName: crewhaus
+PackageUrl: https://crewhaus.ai
+License: Apache-2.0
+ShortDescription: Modular meta-harness — compile a single spec into multiple agent runtimes
+Description: |
+  CrewHaus compiles a single high-level harness spec into multiple runtime targets.
+Tags:
+  - cli
+  - llm
+  - agent-framework
+Installers:
+  - Architecture: x64
+    InstallerType: portable
+    InstallerUrl: https://github.com/crewhaus/factory/releases/download/v1.2.3/crewhaus-windows-x64-1.2.3.exe
+    InstallerSha256: EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE
+ManifestType: installer
+ManifestVersion: 1.4.0
+`);
+  });
+
+  test("scoop: the whole object, key order included", () => {
+    // Scoop's manifest is JSON, so the assertion is on the serialised form —
+    // key ORDER is part of what gets published and a plain object comparison
+    // would not notice it moving.
+    expect(JSON.stringify(renderScoopManifest(INPUTS), null, 2)).toBe(
+      JSON.stringify(
+        {
+          version: "1.2.3",
+          description:
+            "Modular meta-harness \u2014 compile a single spec into multiple agent runtimes",
+          homepage: "https://crewhaus.ai",
+          license: "Apache-2.0",
+          architecture: {
+            "64bit": {
+              url: "https://github.com/crewhaus/factory/releases/download/v1.2.3/crewhaus-windows-x64-1.2.3.exe",
+              hash: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            },
+          },
+          bin: "crewhaus.exe",
+        },
+        null,
+        2,
+      ),
+    );
+  });
+});
+
+describe("the renderers serve a product that is not crewhaus", () => {
+  /**
+   * The goldens above prove the refactor moved no bytes for crewhaus. This
+   * proves the parameter is real rather than decorative — a `ProductIdentity`
+   * nothing exercises is a type that compiles and does nothing.
+   */
+  const OTHER: ProductIdentity = {
+    binaryName: "widgetd",
+    formulaClass: "Widgetd",
+    shortDescription: "A widget daemon",
+    license: "MIT",
+    debian: {
+      section: "net",
+      maintainer: "Widget Co <ops@widget.example>",
+      depends: "libc6 (>= 2.34)",
+      longDescription: ["Serves widgets.", "Nothing more."],
+    },
+    winget: {
+      packageIdentifier: "WidgetCo.Widgetd",
+      publisher: "Widget Co",
+      author: "Widget Co",
+      longDescription: "Serves widgets.",
+      tags: ["widgets"],
+    },
+    // No macOS note: the Rosetta/AVX caveat is a fact about Bun-compiled
+    // binaries, and this one is not.
+  };
+  const INPUTS_OTHER: ManifestInputs = {
+    version: "0.9.0",
+    homepage: "https://widget.example",
+    downloadBaseUrl: "https://widget.example/dl/0.9.0",
+    sha256: {
+      "macos-arm64": "1".repeat(64),
+      "macos-x64": "2".repeat(64),
+      "linux-arm64": "3".repeat(64),
+      "linux-x64": "4".repeat(64),
+      "windows-x64": "5".repeat(64),
+    },
+    product: OTHER,
+  };
+
+  test("homebrew takes the class, the binary name and drops an absent note", () => {
+    const out = renderHomebrewFormula(INPUTS_OTHER);
+    expect(out).toContain("class Widgetd < Formula");
+    expect(out).toContain('license "MIT"');
+    expect(out).toContain("/widgetd-macos-arm64-0.9.0");
+    expect(out).toContain('bin.install Dir["*"].first => "widgetd"');
+    // Nothing of crewhaus survives — including the AVX note, which is opt-in.
+    expect(out).not.toContain("crewhaus");
+    expect(out).not.toContain("Crewhaus");
+    expect(out).not.toContain("Rosetta");
+    // And the block it lived in is still well-formed with no comment at all.
+    expect(out).toContain("  on_macos do\n    if Hardware::CPU.physical_cpu_arm64?");
+  });
+
+  test("debian keeps the one leading space on every continuation line", () => {
+    const out = renderDebianControl(INPUTS_OTHER);
+    expect(out).toContain("Package: widgetd");
+    expect(out).toContain("Section: net");
+    // The space is the whole format. Asserting the exact two lines is the only
+    // way to catch it being dropped or doubled.
+    expect(out).toContain("Description: A widget daemon\n Serves widgets.\n Nothing more.\n");
+    expect(out).not.toContain("crewhaus");
+  });
+
+  test("scoop and winget carry the product through", () => {
+    const scoop = renderScoopManifest(INPUTS_OTHER) as Record<string, unknown>;
+    expect(scoop["bin"]).toBe("widgetd.exe");
+    expect(scoop["license"]).toBe("MIT");
+    const winget = renderWingetManifest(INPUTS_OTHER);
+    expect(winget).toContain("PackageIdentifier: WidgetCo.Widgetd");
+    expect(winget).toContain("Tags:\n  - widgets\nInstallers:");
+    expect(winget).not.toContain("crewhaus");
   });
 });

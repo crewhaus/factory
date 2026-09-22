@@ -500,11 +500,12 @@ export type AttachedAdvisorPersistence = {
 
 /**
  * Cheap in-run thresholds for the digest tally. Keep in sync with
- * `DEFAULT_ADVICE_THRESHOLDS` in `apps/cli/src/advise-rules.ts` — the rule
- * library owns the canonical values, but runtime-core cannot import from
- * apps/cli, so the digest mirrors them here (a drift only ever means the
- * nudge line appears/hides slightly off the report; the report itself is
- * always authoritative).
+ * `DEFAULT_ADVICE_THRESHOLDS` in `@crewhaus/harness-advice` (advise-rules.ts)
+ * — the rule library owns the canonical values, but runtime-core cannot
+ * import them: harness-advice depends on runtime-core (through the compiler),
+ * so the edge only runs one way and the digest mirrors them here instead (a
+ * drift only ever means the nudge line appears/hides slightly off the report;
+ * the report itself is always authoritative).
  */
 const DIGEST_THRESHOLDS = {
   toolFailureMinCalls: 5,

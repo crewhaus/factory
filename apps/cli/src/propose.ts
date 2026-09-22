@@ -31,8 +31,8 @@
  * any human acts on it.
  */
 import { createHash } from "node:crypto";
+import { renderChangelogEntry } from "@crewhaus/spec-changelog/spec-changelog";
 import { type SpecDiffEntry, diffSpecYaml } from "@crewhaus/spec-patch";
-import { renderChangelogEntry } from "./spec-changelog";
 
 /** Thrown for operational failures (unreadable spec, no change, driver
  *  failure). The CLI routes the message through `die()`; tests assert on

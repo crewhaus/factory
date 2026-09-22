@@ -71,6 +71,33 @@ rather than letting `valid: true` be read as "no typo". A position with no
 debt has no health factor rather than an infinite one — `Infinity` would read
 as safe to a caller comparing against a threshold.
 
+## Multicall3, as library code
+
+`encodeAggregate3`, `decodeAggregate3` and `decodeRevertData` are exported
+from the package but register no tool: packing a batch is only useful to
+something that can dial a chain, and nothing here dials anything. They pack
+`aggregate3((address,bool,bytes)[])` and read `(bool,bytes)[]` back.
+
+Two properties are the reason they exist:
+
+- **A failed sub-call is data.** With `allowFailure` — which defaults to true
+  — the batch succeeds and the failed entry comes back with `success: false`
+  and its revert bytes. A batch whose own answer cannot be read throws
+  instead, because that is a different event: there are no partial results.
+- **Results are matched by position**, and nothing in the return blob names
+  the call it answers. A blob holding a different number of results than the
+  batch sent is refused rather than zipped against the calls, since a balance
+  read against the wrong token is worse than no balance.
+
+Revert bytes are decoded where they say something: `Error(string)` gives its
+reason, `Panic(uint256)` the documented meaning of its code. An unrecognised
+selector keeps its hex and gets no message — a guess at a custom error is
+worse than the bytes, which are at least searchable.
+
+The canonical Multicall3 address is a **default**, not a constant: the
+deterministic deploy is at the same address on most chains, which is not the
+same as all of them, so every entry point takes it as an argument.
+
 ## What it does not do
 
 - **It does not reach a chain.** No RPC calls, no balances, no gas estimates,

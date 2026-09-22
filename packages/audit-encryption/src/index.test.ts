@@ -436,7 +436,8 @@ describe("#164 — DEK versioning + rotation re-keys (CWE-323)", () => {
     expect(await enc.decryptPayload(r1)).toEqual({ n: 1 });
     expect(await enc.decryptPayload(r2)).toEqual({ n: 2 });
     expect(await enc.decryptPayload(r3)).toEqual({ n: 3 });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and rolling a DEK re-derives.
+  }, 20_000);
 
   test("decrypt throws if no KEK material is retained for the record's kekRef", async () => {
     const enc = await buildEncryption();
@@ -591,7 +592,8 @@ describe("#163/#164 follow-up — persistent FileDekStore across restart", () =>
     expect(await enc2.decryptPayload(r1)).toEqual({ n: 1 });
     expect(await enc2.decryptPayload(r3)).toEqual({ n: 3 });
     expect(await enc2.decryptPayload(r4)).toEqual({ n: 4 });
-  });
+    // scrypt at N=32768 is memory-hard on purpose, and this restarts the store.
+  }, 20_000);
 
   test("reading a DEK file without its KEK material throws a clear error", async () => {
     const dir = freshDir();

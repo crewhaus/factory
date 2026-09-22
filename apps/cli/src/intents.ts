@@ -24,9 +24,9 @@
  * callback). No credential/secret text enters a rendered example un-redacted.
  */
 
+import { normalizeEvidenceTokens } from "@crewhaus/dataset-ops/graders-suggest";
 import type { FeedbackRecord, LoggedEvent, SessionTurn } from "./feedback";
 import { mergeFeedback, normalizeRating } from "./feedback";
-import { normalizeEvidenceTokens } from "./graders-suggest";
 
 /** Thrown on malformed inputs / bad flags. The CLI routes it through `die()`. */
 export class IntentsError extends Error {
