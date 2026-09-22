@@ -1198,6 +1198,37 @@ describe("emitChannelBot — gateway control-UI (Phase 3 §3.4)", () => {
     expect(c).toContain("[gateway] listening on");
   });
 
+  test("the control UI binds LOOPBACK, explicitly", () => {
+    // `Bun.serve` with no `hostname` binds the WILDCARD — and then reports
+    // `server.hostname === "localhost"`, which is a misleading getter rather
+    // than the bound interface. Omitting the key published an
+    // unauthenticated status page (harness name, shape, channel list, turn
+    // counts) to the whole network, on by default for every spec with a
+    // `gateway:` block.
+    //
+    // Everything else about this port says local: `service-setup` documents
+    // it "Never tunnelled" and tunnels the events port instead, the
+    // `gateway:` block is `.strict()` with no bind field, and the channel
+    // image is `EXPOSE 3000` — the events port, never this one. This asserts
+    // the key is present, because its ABSENCE is the bug and absence is
+    // exactly what a substring test otherwise cannot see.
+    for (const ui of [true, false]) {
+      const c = fileMap({ ...MIN_IR, gateway: { port: 19001, ui } }).get("daemon.ts") ?? "";
+      const serve = c.slice(c.indexOf("__gatewayServer = Bun.serve"));
+      expect(serve.slice(0, serve.indexOf("fetch:"))).toContain('hostname: "127.0.0.1"');
+    }
+  });
+
+  test("the PUBLIC webhook port is still wildcard — the two binds are not the same decision", () => {
+    // Slack has to reach the events port from the internet, so that listener
+    // must NOT gain a loopback bind by copy-paste. Its requests are
+    // signature-verified per adapter; the control UI's are not verified at
+    // all, which is why only one of the two is fenced.
+    const c = fileMap({ ...MIN_IR, gateway: { port: 19001, ui: true } }).get("daemon.ts") ?? "";
+    const publicServe = c.slice(c.indexOf("const server = Bun.serve"));
+    expect(publicServe.slice(0, publicServe.indexOf("});"))).not.toContain("hostname:");
+  });
+
   test("gateway.ui:false suppresses HTML dashboard route", () => {
     const ir: IrChannelV0 = {
       ...MIN_IR,

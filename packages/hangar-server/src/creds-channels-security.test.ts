@@ -25,7 +25,7 @@ import { createHmac } from "node:crypto";
 import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { type AuditRecord, recomputeRecordHash } from "@crewhaus/audit-log";
-import { signSynthetic } from "./channels-ops";
+import { dashboardUrlFor, signSynthetic } from "./channels-ops";
 import { credentialsMatrix, unsetEnvVar, upsertEnvVar } from "./creds-ops";
 import { makeFixtureHarness } from "./fixture";
 import type { M3Context } from "./m3";
@@ -773,6 +773,54 @@ describe("channels", () => {
     // An unset ref refuses by NAME.
     const unset = signSynthetic("slack", spec, "hello", NOW, {});
     expect("missing" in unset && unset.missing).toContain("$SLACK_SIGNING_SECRET");
+  });
+
+  test("the dashboard address is loopback, and absent unless one is really served", () => {
+    // Loopback is the POINT, not an oversight. The control-UI port is the
+    // one port `service-setup` refuses to tunnel, the `gateway:` block is
+    // `.strict()` with no bind field, and the surface carries no auth — so
+    // the address this hands the console is the machine's own.
+    expect(dashboardUrlFor(true, 8787, true)).toBe("http://127.0.0.1:8787/");
+
+    // …and nothing is offered unless a dashboard is genuinely being served.
+    expect(dashboardUrlFor(false, 8787, true)).toBeNull(); // `ui: false`
+    expect(dashboardUrlFor(true, null, true)).toBeNull(); // no gateway port
+    expect(dashboardUrlFor(true, 8787, false)).toBeNull(); // daemon is down
+  });
+
+  test("the gateway panel reports a loopback dashboard url for a running daemon", async () => {
+    const t = bootTestServer({
+      now: () => NOW,
+      runJob: () => Promise.resolve({ exitCode: 0 }),
+      // `live.running` comes from the process layer's snapshot, so faking a
+      // running daemon is what reaches the branch that composes the url —
+      // the branch no test touched before.
+      wrapProcessLayer: (layer) => ({
+        ...layer,
+        get: (entry) => ({
+          ...layer.get(entry),
+          // A synthetic snapshot, not a spread of the real one: building the
+          // real handle's snapshot in a fixture with no run dir throws, and
+          // `liveDaemon` swallows a throw as "not running" — which is the
+          // branch this test exists to get past.
+          snapshot: () =>
+            ({ state: "running", ports: {} }) as unknown as ReturnType<
+              ReturnType<typeof layer.get>["snapshot"]
+            >,
+        }),
+      }),
+    });
+    try {
+      const { id } = await seed(t);
+      const { status, body } = await t.api(`/api/h/${id}/gateway`);
+      expect(status).toBe(200);
+      expect(body["declared"]).toBe(true);
+      expect(body["port"]).toBe(8787);
+      // The fixture spec declares `gateway: { port: 8787, ui: true }`.
+      expect(body["dashboardUrl"]).toBe("http://127.0.0.1:8787/");
+    } finally {
+      await t.stop();
+    }
   });
 
   test("the gateway panel offers the block it is missing rather than an error", async () => {

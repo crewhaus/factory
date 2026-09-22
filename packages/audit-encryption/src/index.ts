@@ -36,12 +36,14 @@ import type { Secrets } from "@crewhaus/secrets-manager";
  *     `tag` causes `decrypt` to throw — satisfies the §39 T8
  *     ciphertext-integrity requirement.
  *   - The 32-byte AES wrapping key is derived from the KEK string via
- *     scrypt (a salted, memory-hard KDF) with a per-record random salt.
- *     This holds even when the KEK is a low-entropy passphrase: scrypt
- *     stretches it and the persisted salt defeats precomputation
- *     (CWE-916 — a bare unsalted hash would not). The salt is stored on
- *     the record (`kekSalt`) so the same key can be re-derived at
- *     unwrap time.
+ *     scrypt (a salted, memory-hard KDF) with a random salt minted once
+ *     per (KEK, DEK version). This holds even when the KEK is a
+ *     low-entropy passphrase: scrypt stretches it and the persisted salt
+ *     defeats precomputation (CWE-916 — a bare unsalted hash would not).
+ *     The salt is stored on the record (`kekSalt`) so the same key can
+ *     be re-derived at unwrap time. Records sharing a DEK version
+ *     therefore share a salt and a wrapped DEK — that is what lets one
+ *     derivation cover a whole version's worth of records.
  *   - 12-byte (96-bit) IVs randomly generated per record.
  *
  * Key rotation:
@@ -379,16 +381,33 @@ export function createFileDekStore(
 const KEY_BYTES = 32; // AES-256
 const IV_BYTES = 12; // GCM standard
 const SALT_BYTES = 16; // scrypt salt
-/** scrypt cost params: N=2^15 keeps derivation well under a frame budget. */
+/** scrypt cost params: N=2^15 costs ~50ms and ~64MB per derivation. */
 const SCRYPT_PARAMS = { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 } as const;
 /** Default DEK roll threshold. */
 export const DEFAULT_MAX_RECORDS_PER_DEK = 100_000;
+
+/**
+ * One wrapped copy of a DEK — the envelope fields a record carries so a
+ * holder of the KEK can unwrap it. Computed once per (KEK, DEK version)
+ * and shared verbatim by every record sealed under that pair.
+ */
+type DekWrap = {
+  readonly kekRef: string;
+  readonly kekSalt: string;
+  readonly wrappedDek: string;
+  readonly wrappedDekIv: string;
+  readonly wrappedDekTag: string;
+};
 
 /**
  * Derive the 32-byte AES wrapping key from the KEK string using scrypt
  * with the supplied salt. scrypt is salted + memory-hard, so this is
  * sound even when `kekValue` is a low-entropy passphrase (CWE-916). The
  * salt must be persisted (`EncryptedRecord.kekSalt`) to re-derive.
+ *
+ * Deliberately called once per (KEK, DEK version), never per record:
+ * each call costs ~50ms and ~64MB, and per-record re-salting buys no
+ * extra resistance — see {@link wrapDekForCurrentKek}.
  */
 function deriveKekKey(kekValue: string, salt: Buffer): Buffer {
   return scryptSync(kekValue, salt, KEY_BYTES, SCRYPT_PARAMS);
@@ -556,6 +575,64 @@ export async function createAuditEncryption(
     return deriveKekKey(kekValue, Buffer.from(kekSalt, "hex"));
   }
 
+  // Most recent DEK wrap per tenant, tagged with the (kekRef, dekRef)
+  // pair and the exact DEK bytes it was built for. Bounded by tenant
+  // count: a KEK rotation or a DEK roll overwrites the tenant's entry
+  // rather than adding one.
+  const dekWrapCache = new Map<
+    string,
+    { readonly tag: string; readonly dek: Buffer; readonly wrap: DekWrap }
+  >();
+
+  /**
+   * Wrap `dek` under the current KEK, reusing the cached envelope when
+   * this (KEK, DEK version) pair has already been wrapped.
+   *
+   * Derivation is per DEK version, not per record. A salt's job is to
+   * make precomputation against *this* KEK worthless, and one random
+   * salt already does that. Re-salting per record multiplies our cost by
+   * the record count while leaving an attacker's cost at one scrypt per
+   * guess — they need only pick a single record to test a guess against
+   * — so the same CPU budget buys strictly more resistance spent on a
+   * higher N than on more salts.
+   *
+   * The wrap is computed once and its *ciphertext* reused, rather than
+   * re-encrypting per record under a stable key: that keeps exactly one
+   * (key, IV) pair in play, so there is no GCM nonce-reuse budget to
+   * spend.
+   */
+  function wrapDekForCurrentKek(tenantId: string, dekRef: string, dek: Buffer): DekWrap {
+    // Read the KEK ref and value in one synchronous pass so a rotation
+    // cannot land between them and stamp a record with a `kekRef` that
+    // does not match the key that sealed it.
+    const kekRef = currentKekRef;
+    const kekValue = currentKekValue;
+    const tag = `${kekRef}|${dekRef}`;
+    const hit = dekWrapCache.get(tenantId);
+    // Reuse only when the cached envelope demonstrably wraps *this* DEK.
+    // `dekRef` alone is not enough: a DEK store shared with another
+    // process can hand back different bytes under an unchanged version
+    // (two writers minting v1 for a new tenant, last write winning), and
+    // pairing a stale wrap with fresh DEK bytes would emit a record that
+    // never decrypts. A 32-byte compare costs nothing next to scrypt.
+    // This is a cache-coherence check on our own key material, not a
+    // secret comparison, so plain `equals` is the right tool.
+    if (hit !== undefined && hit.tag === tag && hit.dek.equals(dek)) return hit.wrap;
+    const salt = rng(SALT_BYTES);
+    const kekKey = deriveKekKey(kekValue, salt);
+    const dekIv = rng(IV_BYTES);
+    const { ciphertext, tag: gcmTag } = encryptBytes(dek, kekKey, dekIv);
+    const wrap: DekWrap = {
+      kekRef,
+      kekSalt: salt.toString("hex"),
+      wrappedDek: ciphertext.toString("hex"),
+      wrappedDekIv: dekIv.toString("hex"),
+      wrappedDekTag: gcmTag.toString("hex"),
+    };
+    dekWrapCache.set(tenantId, { tag, dek: Buffer.from(dek), wrap });
+    return wrap;
+  }
+
   return {
     get kekRef(): string {
       return currentKekRef;
@@ -568,26 +645,22 @@ export async function createAuditEncryption(
       const plaintext = Buffer.from(JSON.stringify(payload), "utf8");
       const iv = rng(IV_BYTES);
       const { ciphertext, tag } = encryptBytes(plaintext, dek, iv);
-      // Derive the wrapping key with a fresh per-record salt, then wrap
-      // the DEK with the current KEK so we can persist the wrapped form
-      // alongside the record (production callers may store the wrapped
-      // DEK out-of-band; we include it here for self-contained
-      // round-trip).
-      const salt = rng(SALT_BYTES);
-      const kekKey = deriveKekKey(currentKekValue, salt);
-      const dekIv = rng(IV_BYTES);
-      const { ciphertext: wrappedDek, tag: wrappedTag } = encryptBytes(dek, kekKey, dekIv);
+      // Wrap the DEK under the current KEK. The envelope is derived once
+      // per (KEK, DEK version) and reused verbatim — see
+      // wrapDekForCurrentKek. Records stay self-contained; production
+      // callers may instead store the wrapped DEK out-of-band.
+      const wrap = wrapDekForCurrentKek(tenantId, dekRef, dek);
       return {
         tenantId,
-        kekRef: currentKekRef,
+        kekRef: wrap.kekRef,
         dekRef,
-        kekSalt: salt.toString("hex"),
+        kekSalt: wrap.kekSalt,
         iv: iv.toString("hex"),
         tag: tag.toString("hex"),
         encryptedPayload: ciphertext.toString("hex"),
-        wrappedDek: wrappedDek.toString("hex"),
-        wrappedDekIv: dekIv.toString("hex"),
-        wrappedDekTag: wrappedTag.toString("hex"),
+        wrappedDek: wrap.wrappedDek,
+        wrappedDekIv: wrap.wrappedDekIv,
+        wrappedDekTag: wrap.wrappedDekTag,
       };
     },
     async decryptPayload(record: EncryptedRecord): Promise<unknown> {

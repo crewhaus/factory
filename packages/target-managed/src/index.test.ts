@@ -1382,9 +1382,40 @@ describe("emitManaged — crewhaus.control.v1", () => {
     );
     expect(d).toContain('target: "managed",');
     expect(d).toContain("await __control.start();");
-    expect(d.indexOf("const handle = await gateway.listen(PORT);")).toBeLessThan(
-      d.indexOf("await __control.start();"),
-    );
+    // `indexOf` returns -1 for a line that no longer exists, and -1 satisfies
+    // `toBeLessThan` all by itself — which is how this assertion went on
+    // passing after the emit gained its host argument, while checking
+    // nothing. Prove the line is THERE before ordering it.
+    const listenAt = d.indexOf("const handle = await gateway.listen(PORT, HOST);");
+    expect(listenAt).toBeGreaterThan(-1);
+    expect(listenAt).toBeLessThan(d.indexOf("await __control.start();"));
+  });
+
+  test("the gateway binds every interface by default — it is the shape's only listener", () => {
+    const d = daemon();
+    // `gateway.listen`'s own default is 127.0.0.1, which is right for a
+    // library and wrong here: this is the managed daemon's ONLY socket, it
+    // carries `/healthz`, and the shape ships in an `EXPOSE 8080` image that
+    // Docker, the Helm chart and all four PaaS adapters deploy. Omitting the
+    // argument bound loopback inside the container, so every probe and every
+    // request from outside was refused while the in-container healthcheck
+    // still passed — healthy-looking and serving nobody.
+    expect(d).toContain('const HOST = process.env.HOST ?? "0.0.0.0";');
+    expect(d).toContain("await gateway.listen(PORT, HOST)");
+    // The bind has to be visible in the log, or the next person debugging a
+    // refused connection has nothing to read. The banner used to print the
+    // port alone.
+    expect(d).toContain("[managed] gateway listening on ${HOST}:${handle.port}");
+  });
+
+  test("HOST is an override, not a hard-coded wildcard", () => {
+    // An operator who wants the old posture back must be able to ask for it,
+    // and `HOST` is the conventional partner to the `PORT` this emit already
+    // reads. It is allow-listed in the supervisor's log scrubber alongside
+    // PORT, so its value survives into captured daemon logs.
+    const d = daemon();
+    expect(d).toContain("process.env.HOST ??");
+    expect(d).not.toContain('gateway.listen(PORT, "0.0.0.0")');
   });
 
   test("control calls append to a HARNESS-level audit log, not a tenant's", () => {
