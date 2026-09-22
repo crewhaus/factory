@@ -472,7 +472,14 @@ export function recordEvalRun(summary: EvalRunSummary, opts: RecordEvalRunOption
  * Read the run index, oldest first — EVERY line, superseding entries
  * included. Missing file → empty list. Corrupt or torn lines are skipped
  * rather than thrown — the index is an append-only log and one bad line must
- * not hide every other run.
+ * not hide every other run. A line that PARSES but is not a JSON object
+ * (`null`, `42`, `[]`) is skipped on the same grounds: it cannot be a run,
+ * and passing it through would hand every consumer a non-entry typed as an
+ * entry — {@link readRunIndexLatest} throws a TypeError the moment it reads
+ * `.runId` off `null`, which is the whole-file crash this skipping exists to
+ * prevent. Field-level validation is NOT done here: an object-shaped row
+ * with a nonsense `passRate` still comes back, for consumers that report on
+ * such rows rather than dropping them silently.
  *
  * NOTE: `runId` is NOT unique across the returned entries. `eval --resume`
  * keeps the interrupted run's original id and APPENDS a superseding entry
@@ -489,11 +496,17 @@ export function readRunIndex(evalsDir: string = DEFAULT_EVALS_DIR): RunIndexEntr
   for (const line of readFileSync(path, "utf-8").split("\n")) {
     const trimmed = line.trim();
     if (trimmed === "") continue;
+    let parsed: unknown;
     try {
-      entries.push(JSON.parse(trimmed) as RunIndexEntry);
+      parsed = JSON.parse(trimmed);
     } catch {
       // skip corrupt line — see docstring
+      continue;
     }
+    // The cast below is a claim about the file, not a check of it, so guard
+    // the one shape that makes a reader crash rather than misreport.
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
+    entries.push(parsed as RunIndexEntry);
   }
   return entries;
 }

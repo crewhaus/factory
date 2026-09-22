@@ -154,6 +154,40 @@ describe("run index (index.jsonl)", () => {
     const entries = readRunIndex(evalsDir);
     expect(entries.map((e) => e.runId)).toEqual(["run_aaaa1111aaaa1111", "run_bbbb2222bbbb2222"]);
   });
+
+  /**
+   * A line can PARSE and still not be a row. `JSON.parse` returns `null` for
+   * a `null` line without throwing, so the old `catch` never saw it and the
+   * cast handed it to every consumer typed as an entry — and the collapse in
+   * `readRunIndexLatest` threw "null is not an object" on the first `.runId`,
+   * taking down `eval-report history`, the trends fold and the cost tallies
+   * over one stray line. That is precisely what this reader's skipping exists
+   * to prevent, so the non-object shapes are skipped like a torn line.
+   */
+  test("lines that parse but are not objects are skipped, like torn lines", () => {
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(makeEntry("run_aaaa1111aaaa1111"), evalsDir);
+    appendFileSync(join(evalsDir, INDEX_FILENAME), 'null\n42\n[]\n"str"\ntrue\n');
+    appendRunIndex(makeEntry("run_bbbb2222bbbb2222"), evalsDir);
+    const entries = readRunIndex(evalsDir);
+    expect(entries.map((e) => e.runId)).toEqual(["run_aaaa1111aaaa1111", "run_bbbb2222bbbb2222"]);
+    // The point of the skip: the collapsed reader survives the same file.
+    expect(() => readRunIndexLatest(evalsDir)).not.toThrow();
+    expect(readRunIndexLatest(evalsDir).map((e) => e.runId)).toEqual([
+      "run_aaaa1111aaaa1111",
+      "run_bbbb2222bbbb2222",
+    ]);
+  });
+
+  test("an OBJECT-shaped row is still returned, however nonsensical its fields", () => {
+    // The skip is shape-only. Consumers that report on unusable rows (the
+    // evalops fold names them, with a reason) need them to arrive, so a row
+    // that could be a run is not silently dropped here.
+    const evalsDir = join(newTempRoot(), ".crewhaus", "evals");
+    appendRunIndex(makeEntry("run_aaaa1111aaaa1111"), evalsDir);
+    appendFileSync(join(evalsDir, INDEX_FILENAME), '{"runId":"run_odd","passRate":1.4}\n');
+    expect(readRunIndex(evalsDir).map((e) => e.runId)).toEqual(["run_aaaa1111aaaa1111", "run_odd"]);
+  });
 });
 
 /**
