@@ -57,9 +57,10 @@ export type IndexRead = {
   readonly lines: number;
   /** Lines `@crewhaus/eval-report` turned into rows. */
   readonly parsedRows: number;
-  /** Non-blank lines that did not parse. The shared reader skips these by
-   *  design; a report that does not say so is claiming a completeness it
-   *  cannot support. */
+  /** Non-blank lines the shared reader could not turn into a row: they did
+   *  not parse, or they parsed as something that cannot be a run (`null`,
+   *  `42`, `[]`). It skips both by design; a report that does not say so is
+   *  claiming a completeness it cannot support. */
   readonly unparsedLines: number;
   /** Rows dropped by the supersede collapse — a resumed run's earlier,
    *  truncated figures. */
@@ -162,12 +163,16 @@ export function readIndex(toolName: string, dirRel: string, maxBytes: number): L
   // The absolute directory goes to the shared reader so its own `join` cannot
   // be re-based by a cwd change between the containment check and the read.
   const allRows = readRunIndex(dir.value.real);
-  // UPSTREAM SHARP EDGE: `readRunIndexLatest` reads `.runId` off every parsed
-  // line, so a line holding `null` — which `readRunIndex` accepts, because
-  // `JSON.parse("null")` does not throw — makes the collapse throw a
-  // TypeError. Rather than crash on one bad line, the raw rows are used and
-  // the DEGRADATION is named: without the collapse, a resumed run's superseded
-  // row is still in the list, and the fold will report the duplicate runId.
+  // BELT AND BRACES. `readRunIndexLatest` reads `.runId` off every row it is
+  // given, and `readRunIndex` used to hand it a line holding `null` — which
+  // parses fine — so the collapse threw a TypeError and took this whole read
+  // down with it. The shared reader now skips a line that parses but is not a
+  // JSON object, so nothing in a file should reach that throw any more; this
+  // catch stays because the alternative to a named degradation is a crash,
+  // and that trade does not depend on which shapes the reader skips today.
+  // If it ever fires: the raw rows are used and the DEGRADATION is named —
+  // without the collapse, a resumed run's superseded row is still in the
+  // list, and the fold will report the duplicate runId.
   let latest: RunIndexEntry[];
   let collapseFailed: string | undefined;
   try {

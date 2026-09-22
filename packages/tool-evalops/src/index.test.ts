@@ -1135,19 +1135,25 @@ test("a truncated accounting list says how many rows it left out", async () => {
   expect(String(out["unusableRowsOmittedNote"])).toMatch(/not all of them/);
 });
 
-test("a supersede collapse that could not run reaches the caller", async () => {
+test("a line that parses but is not a run is counted, not crashed on", async () => {
   writeIndex(root, [
     row({ runId: "r1", ts: "2026-01-01T00:00:00Z" }),
-    // `readRunIndex` accepts this line (JSON.parse("null") does not throw);
-    // the collapse then dereferences `.runId` and throws.
+    // `readRunIndex` used to accept this line (JSON.parse("null") does not
+    // throw) and the collapse then dereferenced `.runId` and threw, which
+    // this tool reported as a `collapseFailed` degradation. The shared reader
+    // skips it now, so the result is a clean one: the line is accounted for
+    // as unreadable and every figure below it stands.
     "null",
   ]);
   const out = await call(evalHistory, {});
   expect(out["ok"]).toBe(true);
-  // Without the collapse a resumed run appears twice, so the degradation has
-  // to be visible in the RESULT, not only inside the reader that noticed it.
-  expect(String(out["collapseFailed"])).toMatch(/WITHOUT the collapse/);
-  expect(out["unusableRowCount"]).toBe(1);
+  expect(out["collapseFailed"]).toBeUndefined();
+  expect(out["runsRead"]).toBe(1);
+  expect(out["unusableRowCount"]).toBe(0);
+  expect(out["unparsedLines"]).toBe(1);
+  // The count is not silent: a recorded run that cannot be read is not a run
+  // that never happened, so the result says what the number means.
+  expect(String(out["unparsedLinesNote"])).toMatch(/not a JSON object/);
 });
 
 test("coverage reads the newest run by timestamp, not the last line of the index", async () => {
