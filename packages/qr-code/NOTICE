@@ -1,0 +1,29 @@
+CrewHaus Factory
+Copyright 2026 Max Meier
+
+This product includes software developed by Max Meier
+(operating as StudioMax — https://studiomax.io) and contributors.
+
+The CrewHaus name and logo are trademarks of Max Meier. See
+TRADEMARK.md for the use-of-marks policy.
+
+================================================================
+This product also includes the following third-party software,
+licensed under their respective licenses. See the package's
+license file for full terms.
+
+[As of the launch, fill in the third-party software list. Common
+ones likely to apply, depending on what packages actually ship:]
+
+- Bun runtime (MIT)
+- TypeScript (Apache-2.0)
+- Zod (MIT)
+- Anthropic TypeScript SDK (MIT)
+- OpenAI TypeScript SDK (Apache-2.0)
+- yaml (ISC)
+- Various other npm packages — see package.json files
+
+For the complete attribution, run:
+  bun run licenses
+
+================================================================

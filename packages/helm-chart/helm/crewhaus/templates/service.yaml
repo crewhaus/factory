@@ -1,4 +1,4 @@
-{{- if has .Values.target (list "channel" "managed" "crew" "voice" "browser") -}}
+{{- if has .Values.target (list "channel" "managed") -}}
 apiVersion: v1
 kind: Service
 metadata:

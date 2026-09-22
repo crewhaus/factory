@@ -207,6 +207,21 @@ export function validateValues(values: ChartValues): void {
   if (values.service.port <= 0 || values.service.port > 65535) {
     throw new HelmChartError(`service.port out of range: ${values.service.port}`);
   }
+  // `targetPort` is the one that matters and nothing checked it: it becomes
+  // the containerPort, the Service's destination, the port both probes dial
+  // AND — since the chart now emits it as PORT — the port the process binds.
+  // The floor is 1024 rather than 1 because the pod runs as uid 10001 with
+  // every capability dropped, so a privileged port could never be bound and
+  // would fail as a crash loop rather than a validation error.
+  if (
+    !Number.isInteger(values.service.targetPort) ||
+    values.service.targetPort < 1024 ||
+    values.service.targetPort > 65535
+  ) {
+    throw new HelmChartError(
+      `service.targetPort must be an integer 1024..65535 (the pod runs unprivileged as uid 10001); got ${values.service.targetPort}`,
+    );
+  }
   if (!values.image.tag) {
     throw new HelmChartError("image.tag must be non-empty");
   }
@@ -258,7 +273,23 @@ export function renderContext(values: ChartValues, releaseName = "crewhaus"): Re
   };
 }
 
-const DAEMON_SHAPES = ["channel", "managed", "crew", "voice", "browser"];
+/**
+ * The shapes whose compiled daemon actually opens an HTTP socket and answers
+ * `/healthz` — and therefore the only ones that can carry a Service, an
+ * Ingress and `httpGet` probes.
+ *
+ * NOT the same as "runs continuously". `crew`, `voice` and `browser` are
+ * long-running too, but their bundles contain no `Bun.serve` and no
+ * `/healthz` at all (voice is a stdin/JSONL loop, crew consumes a brief on
+ * stdin and exits), so an `httpGet` probe against them can never pass at any
+ * port. They take the exec probe (`doctor --liveness`) instead, which the
+ * deployment template already renders for every non-HTTP shape.
+ *
+ * Kept in lock-step with the three templates that repeat it inline by
+ * `index.test.ts` — the list used to be duplicated in four places with
+ * nothing checking they agreed.
+ */
+export const HTTP_SHAPES = ["channel", "managed"] as const;
 
 /**
  * Tokenise a template into actions and literals so we can do depth-aware
@@ -632,7 +663,8 @@ export function renderChart(values: ChartValues, releaseName = "crewhaus"): Reco
   return result;
 }
 
-/** Daemon shapes that get a Service + Ingress rendered. */
-export function isDaemonShape(target: TargetShape): boolean {
-  return DAEMON_SHAPES.includes(target);
+/** Whether this shape serves HTTP, and so gets a Service, an Ingress and
+ *  `httpGet` probes. See {@link HTTP_SHAPES} for why it is only two. */
+export function servesHttp(target: TargetShape): boolean {
+  return (HTTP_SHAPES as readonly string[]).includes(target);
 }

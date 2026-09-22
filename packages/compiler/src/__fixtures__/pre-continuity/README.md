@@ -376,3 +376,15 @@ which `renderTranscriptDigest` has always skipped. Both strings remain emitted
 ONLY for a spec that declares `evaluation:` with an `llm_judge` grader, and no
 pinned spec here declares one — the byte-restore test passes against the
 existing pins unchanged.
+
+
+**Managed bind delta — `managed.daemon.ts` only.** The managed daemon now
+passes a host to `gateway.listen`, so its pin gained a `HOST` constant
+(`process.env.HOST ?? "0.0.0.0"`), the host argument on the `listen` call and
+the host in the boot banner. `gateway-server`'s `listen(port, host =
+"127.0.0.1")` default meant the shape's ONLY listener — `/healthz`
+included — bound loopback inside its own `EXPOSE 8080` image, so every probe
+and request from outside the container was refused while the in-container
+healthcheck stayed green. Nothing else in either bundle moved; the eight added
+and two removed lines are entirely that change, and the continuity opt-out
+contract is untouched.
