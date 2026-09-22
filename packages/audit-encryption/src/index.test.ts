@@ -197,12 +197,135 @@ describe("#163 — salted, stretched KEK derivation (CWE-916)", () => {
     expect(await enc.decryptPayload(record)).toEqual({ x: 1 });
   });
 
-  test("salt is fresh per record", async () => {
+  test("salt + wrapped DEK are shared by records on one DEK version", async () => {
     const enc = await buildEncryption();
     const a = await enc.encryptPayload({ x: 1 }, "tenant-a");
-    const b = await enc.encryptPayload({ x: 1 }, "tenant-a");
-    expect(a.kekSalt).not.toBe(b.kekSalt);
-  });
+    const b = await enc.encryptPayload({ x: 2 }, "tenant-a");
+    // One derivation covers the version, so the KEK envelope is shared...
+    expect(b.kekSalt).toBe(a.kekSalt);
+    expect(b.wrappedDek).toBe(a.wrappedDek);
+    expect(b.wrappedDekIv).toBe(a.wrappedDekIv);
+    // ...while the payload layer stays per-record.
+    expect(b.iv).not.toBe(a.iv);
+    expect(await enc.decryptPayload(a)).toEqual({ x: 1 });
+    expect(await enc.decryptPayload(b)).toEqual({ x: 2 });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
+
+  test("salt is fresh per DEK version", async () => {
+    setKek("KEK_TEST", "ke-secret-1234567890");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    // Roll the DEK on every record so consecutive writes land on
+    // different versions.
+    const enc = await createAuditEncryption({
+      secrets,
+      kekName: "KEK_TEST",
+      maxRecordsPerDek: 1,
+    });
+    const a = await enc.encryptPayload({ x: 1 }, "tenant-a");
+    const b = await enc.encryptPayload({ x: 2 }, "tenant-a");
+    expect(b.dekRef).not.toBe(a.dekRef);
+    expect(b.kekSalt).not.toBe(a.kekSalt);
+    expect(await enc.decryptPayload(a)).toEqual({ x: 1 });
+    expect(await enc.decryptPayload(b)).toEqual({ x: 2 });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
+
+  test("salt is fresh after a KEK rotation, and old records still decrypt", async () => {
+    const enc = await buildEncryption("kek-v1-secret-12345678");
+    const before = await enc.encryptPayload({ x: 1 }, "tenant-a");
+    await enc.rotateKek("kek-v2-secret-87654321", "kek:KEK_TEST:v2");
+    const after = await enc.encryptPayload({ x: 2 }, "tenant-a");
+    // The cache is keyed by (kekRef, dekRef), so rotation re-derives.
+    expect(after.kekSalt).not.toBe(before.kekSalt);
+    expect(after.kekRef).toBe("kek:KEK_TEST:v2");
+    expect(await enc.decryptPayload(before)).toEqual({ x: 1 });
+    expect(await enc.decryptPayload(after)).toEqual({ x: 2 });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
+
+  test("a DEK swapped under an unchanged version forces a fresh wrap", async () => {
+    // The wrap cache is keyed by (kekRef, dekRef) AND the DEK bytes. A
+    // store shared with another process can return different bytes under
+    // an unchanged version; reusing the cached envelope there would emit
+    // a record whose wrappedDek does not match the DEK that sealed the
+    // payload — i.e. a record that never decrypts.
+    setKek("KEK_TEST", "kek-secret-12345678");
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    // A get/set-only store (no getEntry) pins every read to version 1
+    // while handing back fresh DEK bytes each time.
+    const handedOut: Buffer[] = [];
+    const swappingStore = {
+      async get(): Promise<Buffer> {
+        const dek = randomBytes(32);
+        handedOut.push(dek);
+        return dek;
+      },
+      async set(): Promise<void> {},
+    };
+    const enc = await createAuditEncryption({
+      secrets,
+      kekName: "KEK_TEST",
+      dekStore: swappingStore,
+    });
+    const a = await enc.encryptPayload({ n: 1 }, "tenant-swap");
+    const b = await enc.encryptPayload({ n: 2 }, "tenant-swap");
+    // Same dekRef — the version never moved — but different DEK bytes.
+    expect(b.dekRef).toBe(a.dekRef);
+    expect(handedOut[0]?.equals(handedOut[1] as Buffer)).toBe(false);
+    // So the envelope had to be re-derived rather than reused...
+    expect(b.wrappedDek).not.toBe(a.wrappedDek);
+    // ...and both records still decrypt.
+    expect(await enc.decryptPayload(a)).toEqual({ n: 1 });
+    expect(await enc.decryptPayload(b)).toEqual({ n: 2 });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
+
+  test("records written with the old per-record salt still decrypt", async () => {
+    // Before the wrap-once change every record minted its own salt and
+    // its own wrapped copy of the DEK. Those records are on disk in the
+    // field; hand-build two of them (distinct salts, distinct wrapped
+    // DEKs, same tenant + DEK) and prove decryptPayload still reads them.
+    const kekValue = "passphrase-shaped-kek";
+    setKek("KEK_TEST", kekValue);
+    const secrets = createSecrets({ backend: createEnvVarBackend() });
+    const store = new InMemoryDekStore();
+    const dek = randomBytes(32);
+    await store.set("tenant-old", dek);
+    const enc = await createAuditEncryption({ secrets, kekName: "KEK_TEST", dekStore: store });
+
+    function oldStyleRecord(payload: unknown): EncryptedRecord {
+      // A salt minted per record, exactly as the old encryptPayload did.
+      const salt = randomBytes(16);
+      const kekKey = _deriveKekKeyForTest(kekValue, salt);
+      const dekIv = randomBytes(12);
+      const wrapped = _encryptBytesForTest(dek, kekKey, dekIv);
+      const iv = randomBytes(12);
+      const body = _encryptBytesForTest(Buffer.from(JSON.stringify(payload), "utf8"), dek, iv);
+      return {
+        tenantId: "tenant-old",
+        kekRef: "kek:KEK_TEST:v1",
+        dekRef: "dek:tenant-old:v1",
+        kekSalt: salt.toString("hex"),
+        iv: iv.toString("hex"),
+        tag: body.tag.toString("hex"),
+        encryptedPayload: body.ciphertext.toString("hex"),
+        wrappedDek: wrapped.ciphertext.toString("hex"),
+        wrappedDekIv: dekIv.toString("hex"),
+        wrappedDekTag: wrapped.tag.toString("hex"),
+      };
+    }
+
+    const first = oldStyleRecord({ era: "old", n: 1 });
+    const second = oldStyleRecord({ era: "old", n: 2 });
+    // The tell-tale of the old format: same DEK, different salts.
+    expect(second.kekSalt).not.toBe(first.kekSalt);
+    expect(second.wrappedDek).not.toBe(first.wrappedDek);
+    // Both still decrypt, each under its own salt.
+    expect(await enc.decryptPayload(first)).toEqual({ era: "old", n: 1 });
+    expect(await enc.decryptPayload(second)).toEqual({ era: "old", n: 2 });
+    // scrypt at N=32768 is memory-hard on purpose, and this runs several derivations.
+  }, 20_000);
 
   test("legacy unsalted-SHA-256 records still decrypt (back-compat)", async () => {
     // Hand-build a record in the pre-migration format: DEK wrapped under a
