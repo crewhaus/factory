@@ -71,8 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 call 22 builtin tools; it can now call 549. They read chains and ledgers, drive
 git and package managers, gate a page before it publishes, operate a fleet, and
 answer the hundreds of small questions a run used to spend a model call on —
-none of them makes one, and a spec turns them on a capability group at a time
-rather than a name at a time. Two of the fixes below are worth reading even if
+almost none of them makes one, and a spec turns them on a capability group at a
+time rather than a name at a time. Two of the fixes below are worth reading even if
 you upgrade nothing: an SSRF classifier that compared address text, found by
 auditing all ten copies of it, and a daemon status page that had been binding
 the wildcard rather than loopback.
@@ -83,7 +83,9 @@ the wildcard rather than loopback.
   #462, #463, #465, #466, #467, #469, #470, #471, #472). Each is an ordinary
   builtin — it takes a typed input, does the work in-process, and returns a
   result — so the work it does costs no tokens and cannot drift between runs.
-  Broadly:
+  Two of the 549 are the exception and say so in their own descriptions:
+  `ImageGenerate` calls a remote image model and `WebSearch` calls a paid
+  search API. Every other one is local work. Broadly:
 
   - **Pure computation, no I/O at all.** Text, structured data (JSON, YAML,
     TOML, CSV, XML), encoding and hashing, dates and schedules, maths and
