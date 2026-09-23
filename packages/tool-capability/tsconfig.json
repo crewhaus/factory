@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-registry-manifest" }
+  ],
+  "include": ["src/**/*"]
+}

@@ -680,6 +680,7 @@ export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
     export: "onchainTransactionsSync",
   },
   seoLint: { package: "@crewhaus/tool-verify", export: "seoLint" },
+  toolRegistry: { package: "@crewhaus/tool-capability", export: "toolRegistry" },
   codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
   codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
   codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },

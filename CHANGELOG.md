@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A harness can now see the tools it does NOT have.** `ListTools` has always
+  answered "what can I call right now", from the live catalog. The other half —
+  "what exists in this framework that I was not given" — had no answer at all:
+  a compiled bundle contains only the tools its spec granted, so from inside,
+  the ones it lacks were invisible. An agent could not name one, let alone say
+  what it would do.
+
+  The new **`ToolRegistry`** tool (`@crewhaus/tool-capability`) answers it.
+  Search by text, narrow by category, or ask for one key and get that tool's
+  whole description. Rows split into what this harness is running and what it
+  is not, and a row it is not running carries a line on how to ask for it.
+
+  **This is ergonomics, not a control.** Leaving a tool out of `tools:` is what
+  shapes a harness; this only makes the omission legible, so an operator can
+  see what the agent is missing. In any harness that grants bash, file write or
+  code execution the agent can already edit `crewhaus.yaml` itself, and nothing
+  here changes that.
+
+  Whether a tool is bound is read from the LIVE catalog rather than from the
+  spec, so a tool an MCP peer registered an hour after boot counts as bound.
+
+  **MCP is asymmetric, and the answer says so.** A spec declares an MCP server,
+  not the tools it offers, and a server's tools are only known once it
+  connects. So the "not bound" half is builtins only, bound MCP tools are
+  absent from the "bound" half, and every result points at `ListTools` for the
+  whole live toolset.
+
+- **`@crewhaus/tool-registry-manifest` — every builtin tool, as data.** Nothing
+  in the tree could describe a tool that had not been imported: the CLI
+  emitter's builtin map carries a package and an export name, the category
+  registry is forbidden from importing a tool package, and descriptions and
+  flags live only on the tool objects themselves. So they are projected once,
+  by `scripts/gen-tool-registry.ts`, into a dependency-free package — the shape
+  `@crewhaus/docker-images` already uses for its Dockerfile bodies. The key set
+  is derived from the emitter's map rather than written out, so it is a
+  projection and not one more list to keep in sync, and
+  `apps/cli/src/tool-registry.test.ts` re-projects every row and fails when the
+  checked-in data has gone stale.
+
+  It is around 450 KB of description text, which is why it is its own package
+  and why `ToolRegistry` is its own tool: growing `ListTools` instead would
+  carry all of it into every bundle of every shape.
+
+### Changed
+
+- **`ToolInventory` checks builtin names without being asked.** Its own
+  docstring named the gap: a builtin key could only be checked against a
+  `knownTools` list you passed, because the builtin registry lived in the
+  compiled bundle rather than in the spec. With the builtin set in the tree
+  that is obsolete — the check is now the default, `unknown` is always
+  reported, and the "not checked" note is gone. An explicit `knownTools` still
+  wins, for a spec being checked against a different release's runtime, and the
+  answer says which list it used. The set comes from `BUILTIN_TOOL_MAP`, which
+  this package already reaches and which is keys without prose, so no bundle
+  granting a `tool-crewhaus` tool pays for the manifest's 455 KB.
+
 ## [0.7.0] - 2026-09-22
 
 **Tools a harness can run without spending a token.** A CrewHaus harness could

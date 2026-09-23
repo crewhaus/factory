@@ -378,20 +378,44 @@ describe("ToolInventory", () => {
     expect(result.builtin.length).toBeGreaterThan(1);
   });
 
-  test("without knownTools it says so rather than pretending to verify builtins", async () => {
-    const result = await callJson<{ note?: string; unknown?: string[] }>(toolInventory, {
-      spec: CLI_SPEC,
-    });
-    expect(result.note).toContain("were not checked");
-    expect(result.unknown).toBeUndefined();
+  /**
+   * This used to answer "builtin tool names were not checked for existence",
+   * because the builtin registry lived in the compiled bundle and this tool
+   * only reads a spec file. `@crewhaus/tool-registry-manifest` puts that
+   * registry in the tree, so the check is now the default and the note is
+   * gone — a spec naming a tool that does not exist is caught without the
+   * caller having to know to ask.
+   */
+  test("builtins are checked against this release without being asked", async () => {
+    const spec = CLI_SPEC.replace("tools: [read, write, bash]", "tools: [read, notARealTool]");
+    const result = await callJson<{
+      note?: string;
+      unknown: string[];
+      checkedAgainst: string;
+    }>(toolInventory, { spec });
+    expect(result.unknown).toEqual(["notARealTool"]);
+    expect(result.checkedAgainst).toBe("this release's builtins");
+    expect(result.note).toBeUndefined();
   });
 
-  test("with knownTools, a granted tool outside the list is reported unknown", async () => {
-    const result = await callJson<{ unknown: string[] }>(toolInventory, {
+  test("a spec of real tools reports nothing unknown", async () => {
+    const result = await callJson<{ unknown: string[] }>(toolInventory, { spec: CLI_SPEC });
+    expect(result.unknown).toEqual([]);
+  });
+
+  /**
+   * The override is why `knownTools` stays: a spec can legitimately be checked
+   * against a runtime that is not this one — a bundle compiled from another
+   * release has a different builtin set — and the answer says which list it
+   * used so the two cannot be confused.
+   */
+  test("an explicit knownTools still overrides, for a different runtime", async () => {
+    const result = await callJson<{ unknown: string[]; checkedAgainst: string }>(toolInventory, {
       spec: CLI_SPEC,
       knownTools: ["Read", "Write"],
     });
     expect(result.unknown).toEqual(["bash"]);
+    expect(result.checkedAgainst).toBe("the knownTools you passed");
   });
 });
 

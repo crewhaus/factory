@@ -78,6 +78,7 @@
     { "path": "../../packages/trace-event-bus" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-builder" },
+    { "path": "../../packages/tool-capability" },
     { "path": "../../packages/tool-discovery" },
     { "path": "../../packages/tool-routing" },
     { "path": "../../packages/tool-deploy" },
