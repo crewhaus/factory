@@ -1,8 +1,8 @@
 {
-  "name": "@crewhaus/tool-crewhaus",
+  "name": "@crewhaus/tool-capability",
   "version": "0.7.0",
   "type": "module",
-  "description": "Deterministic CrewHaus operations tools: spec validation, compilation checks, preflight, eval gates, fleet inventory and audit verification",
+  "description": "ToolRegistry: what builtin tools exist, and which of them this harness is actually running",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -12,14 +12,9 @@
     "test": "bun test src"
   },
   "dependencies": {
-    "@crewhaus/audit-log": "workspace:*",
-    "@crewhaus/compiler": "workspace:*",
-    "@crewhaus/errors": "workspace:*",
-    "@crewhaus/preflight": "workspace:*",
-    "@crewhaus/spec": "workspace:*",
-    "@crewhaus/target-cli": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-registry-manifest": "workspace:*",
     "zod": "^3.23.8"
   },
   "devDependencies": {
@@ -34,9 +29,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/crewhaus/factory.git",
-    "directory": "packages/tool-crewhaus"
+    "directory": "packages/tool-capability"
   },
-  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-crewhaus#readme",
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-capability#readme",
   "bugs": {
     "url": "https://github.com/crewhaus/factory/issues"
   },
