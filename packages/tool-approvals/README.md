@@ -101,16 +101,15 @@ about the value that is easy to forget is observed — **the tool name**:
    see this, which is why the tool half is put to the **matcher** as well
    (check `1b`), not just to `===`. Refused.
 
-### An argument constraint is still wider than one call
+### An argument constraint covers the approved call, not its aliases
 
-Four built-ins (`Read`, `Write`, `Edit`, `Grep`) have **more than one** operative
-field, and `matchesPattern` accepts the argument in *any* of them (`vals.some`,
-the shape of the #145 decoy-field fix). So `Read(notes/a.md)` also covers
-`{ file_path: "notes/a.md", path: "/etc/shadow" }`. Refusing would fire for every
-argument-constrained rule about those four tools — and the aliases exist because
-they are two spellings of one argument — while narrowing the rule is an upstream
-change to the matcher the permission **engine** also runs. So it is disclosed
-instead, on every such suggestion, prefixed `WIDER THAN THE APPROVED CALL`.
+Before 0.7.1, four built-ins (`Read`, `Write`, `Edit`, `Grep`) had more than one
+operative field and the matcher accepted the argument in *any* of them, so
+`Read(notes/a.md)` also covered `{ file_path: "notes/a.md", path: "/etc/shadow" }`,
+and every such suggestion carried a `WIDER THAN THE APPROVED CALL` line. Since
+0.7.1 an allow rule needs *every* operative value of the call to match, and the
+file tools declare the one field they read, so that call is not covered and the
+line is gone.
 
 `adversarial.test.ts` drives the property end to end with the path
 `notes/a*b?c[d]{e}\nsecret.md` (a `*`, a `?`, a `[`, a `{` and a newline, in one

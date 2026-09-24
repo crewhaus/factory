@@ -286,7 +286,7 @@ describe("a proposal that covers more than the approved call says so", () => {
     expect(ruleCovers(suggestion.pattern, "Read", "/etc/shadow")).toBe(true);
   });
 
-  test("an argument-constrained rule for a tool with FIELD ALIASES says it is still wider — and it is", async () => {
+  test("an argument-constrained rule for a tool with FIELD ALIASES covers only the approved call (0.7.1)", async () => {
     askSession(tmp, "sess_1", {
       toolName: "Read",
       input: { file_path: "notes/a.md" },
@@ -296,32 +296,18 @@ describe("a proposal that covers more than the approved call says so", () => {
     const suggestion = out.suggestions[0] as SuggestResult["suggestions"][number];
     expect(suggestion.pattern).toBe("Read(notes/a.md)");
     expect(suggestion.argConstrained).toBe(true);
-    expect(suggestion.evidence.some((l) => l.startsWith("WIDER THAN THE APPROVED CALL"))).toBe(
-      true,
-    );
-    // Demonstrated, not asserted: `matchesPattern` takes the value from ANY of
-    // the tool's operative fields, so the approved value in one alias carries a
-    // never-approved value in the other past the rule.
+    // Demonstrated, not asserted: an allow rule needs EVERY operative field of
+    // the call to match, so the approved value in one alias no longer carries
+    // a never-approved value in the other past the rule…
     const compiled = compilePattern(suggestion.pattern);
     expect(matchesPattern(compiled, "Read", { file_path: "notes/a.md" })).toBe(true);
     expect(matchesPattern(compiled, "Read", { file_path: "notes/a.md", path: "/etc/shadow" })).toBe(
-      true,
+      false,
     );
-    // A tool with a SINGLE operative field gets no such line, because it has no
-    // such alias — the note must not be boilerplate on every suggestion.
-    expect(
-      (
-        await (async () => {
-          rmSync(path.join(tmp, ".crewhaus"), { recursive: true, force: true });
-          askSession(tmp, "sess_2", {
-            toolName: "Bash",
-            input: { command: "git status" },
-            approved: 3,
-          });
-          return await suggest();
-        })()
-      ).suggestions[0]?.evidence.some((l) => l.startsWith("WIDER THAN THE APPROVED CALL")),
-    ).toBe(false);
+    // …so there is no widening left to disclose.
+    expect(suggestion.evidence.some((l) => l.startsWith("WIDER THAN THE APPROVED CALL"))).toBe(
+      false,
+    );
   });
 
   test("a tool with no operative-argument field can only ever get a blanket grant — and is labelled", async () => {

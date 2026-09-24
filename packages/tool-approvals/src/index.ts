@@ -798,36 +798,21 @@ export function blastRadiusNotes(
 }
 
 /**
- * Say out loud that an argument-constrained rule is still wider than the one
- * call it was derived from, whenever the tool has MORE THAN ONE operative field.
+ * Formerly: say out loud that an argument-constrained rule for a tool with
+ * more than one operative field (Read, Write, Edit, Grep) was wider than the
+ * call it came from, because the matcher accepted the argument in ANY of the
+ * fields — so `Read(notes/a.md)` also covered
+ * `{ file_path: "notes/a.md", path: "/etc/shadow" }`.
  *
- * `matchesPattern` collects the value of EVERY operative field the input
- * carries and accepts the call when ANY of them matches (`vals.some`) — the
- * shape of the #145 fix, which was about stopping a DECOY field outside the
- * table from authorising a call. The consequence for a suggestion is that
- * `Read(notes/a.md)` also covers `{ file_path: "notes/a.md", path: "/etc/shadow" }`:
- * the approved value sits in one alias, something else sits in the other, and
- * which of them the tool acts on is the tool's business, not the rule's. Four
- * built-ins are in this position — Read, Write, Edit and Grep.
+ * Since 0.7.1 an allow rule needs EVERY operative value of the call to match,
+ * and the file tools declare the one field they read, so that call is not
+ * covered and there is nothing to disclose. Kept, returning nothing, so a
+ * caller written against 0.7.0 keeps compiling.
  *
- * REFUSING IS NOT THE ANSWER. The refusal would fire for every argument-
- * constrained rule about those four tools, which is the package's main case,
- * and the aliases exist precisely because they are two spellings of one
- * argument. The matcher's rule is also the ENGINE's rule, so narrowing it is an
- * upstream change to `@crewhaus/tool-permission-matcher` with its own blast
- * radius — not something a suggestion tool may decide by proposing a different
- * pattern, because the grammar has no way to say "this field only".
- *
- * So it is disclosed, like the blanket grants above: the human approving the
- * rule is told what it actually covers.
+ * @deprecated Always returns `[]`.
  */
-export function aliasFieldNotes(toolName: string, argConstrained: boolean): string[] {
-  if (!argConstrained) return [];
-  const fields = OPERATIVE_ARG_FIELDS[toolName];
-  if (fields === undefined || fields.length < 2) return [];
-  return [
-    `WIDER THAN THE APPROVED CALL: the permission matcher accepts this argument in ANY of ${toolName}'s operative fields (${fields.join(", ")}), so the rule also covers a call that puts the approved value in one of them and an unapproved value in another`,
-  ];
+export function aliasFieldNotes(_toolName: string, _argConstrained: boolean): string[] {
+  return [];
 }
 
 /** An inbox row back in record shape, so the SAME ordering code runs over the
@@ -1003,7 +988,6 @@ export const permissionsSuggest: RegisteredTool = buildTool({
       verified.push(suggestion);
       const notes = [
         ...blastRadiusNotes(suggestion.toolName, agg?.argSamples ?? [], verdict.argConstrained),
-        ...aliasFieldNotes(suggestion.toolName, verdict.argConstrained),
         ...(readOnlyKnown
           ? []
           : [
