@@ -316,6 +316,36 @@ describe("front matter", () => {
   });
 });
 
+describe("a __proto__ front matter key is an ordinary key (C199)", () => {
+  test("it is kept, in order, as an own property", () => {
+    const data = parseFrontmatter("__proto__: keepme\ntitle: t");
+    expect(Object.keys(data)).toEqual(["__proto__", "title"]);
+    expect(Object.getOwnPropertyDescriptor(data, "__proto__")?.value).toBe("keepme");
+    expect(JSON.stringify(data)).toBe('{"__proto__":"keepme","title":"t"}');
+  });
+
+  test("a list or ~ value does not become, or remove, the record's prototype", () => {
+    const list = parseFrontmatter("__proto__: [a, b]");
+    expect(Array.isArray(Object.getPrototypeOf(list))).toBe(false);
+    expect(Object.getOwnPropertyDescriptor(list, "__proto__")?.value).toEqual(["a", "b"]);
+    const nul = parseFrontmatter("__proto__: ~\nx: 1");
+    expect(Object.keys(nul)).toEqual(["__proto__", "x"]);
+    expect(Object.getOwnPropertyDescriptor(nul, "__proto__")?.value).toBeNull();
+  });
+
+  test("a repeated __proto__ is a duplicate key like any other", () => {
+    expect(() => parseFrontmatter("__proto__: a\n__proto__: b")).toThrow(FrontmatterError);
+    expect(() => parseFrontmatter("__proto__: a\n__proto__: b")).toThrow(
+      /duplicate key "__proto__"/,
+    );
+  });
+
+  test("it serializes back where it was", () => {
+    const data = parseFrontmatter("__proto__: keepme\ntitle: t");
+    expect(serializeFrontmatter(data, Object.keys(data))).toBe("__proto__: keepme\ntitle: t");
+  });
+});
+
 describe("notebooks", () => {
   const notebook = {
     cells: [

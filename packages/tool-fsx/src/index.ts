@@ -52,7 +52,9 @@ import {
   checkRelocatedLinks,
   copyTreeSafe,
   ensureDirContained,
+  writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
+import { openRegularFile } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import {
   type ArchiveEntry,
@@ -72,6 +74,7 @@ import {
   renderTree,
 } from "./lib/format";
 import {
+  FRONTMATTER_KEY,
   type FrontmatterData,
   FrontmatterError,
   type FrontmatterValue,
@@ -121,18 +124,34 @@ const CHUNK_BYTES = 256 * 1024;
 // ---------------------------------------------------------------------------
 
 /**
- * Open a validated path with `O_NOFOLLOW`. `resolveSafe` already proved the
- * path is inside the workspace, but the leaf could be swapped for a symlink
- * afterwards (CWE-367); refusing to follow it at open closes that window.
+ * Open a validated regular file for reading, never following a link at the
+ * leaf. `resolveSafe` already proved the path is inside the workspace, but
+ * the leaf could be swapped afterwards (CWE-367), so the open itself refuses
+ * a link (`O_NOFOLLOW`). It also refuses a FIFO, socket or device BEFORE
+ * opening it, and opens with `O_NONBLOCK`: a plain open of a FIFO blocks the
+ * event loop until a writer appears, and no timeout or abort signal reaches
+ * a blocked open (C074). tool-safety's openRegularFile makes both checks and
+ * compares the descriptor with what was checked. The caller closes the fd.
  */
-function openNoFollow(toolName: string, abs: string): number {
-  try {
-    return openSync(abs, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
-      throw new ToolPermissionError(toolName, abs);
-    }
-    throw err;
+function openNoFollow(toolName: string, target: { real: string; rel: string }): number {
+  const opened = openRegularFile(target.real, { followSymlinks: false });
+  if (opened.ok) return opened.fd;
+  const shown = target.rel === "" ? "." : target.rel;
+  switch (opened.code) {
+    case "symlink-refused":
+      throw new ToolPermissionError(toolName, shown);
+    case "not-regular-file":
+      throw new Error(
+        `${shown} is a ${opened.kind ?? "special file"}, not a regular file; it was not opened`,
+      );
+    case "changed-while-opening":
+      throw new Error(`${shown} was replaced while it was being opened; it was not read`);
+    case "not-found":
+      throw new Error(`no such file: ${shown}`);
+    case "permission-denied":
+      throw new Error(`${shown} cannot be read: permission denied`);
+    default:
+      throw new Error(`${shown} could not be read`);
   }
 }
 
@@ -152,11 +171,11 @@ function streamFile(fd: number, onChunk: (chunk: Buffer, length: number) => void
 /** Hash a file without loading it: fixed-size chunks into the digest. */
 function hashFile(
   toolName: string,
-  abs: string,
+  target: SafePath,
   algorithm: string,
 ): { hex: string; bytes: number } {
   const hasher = createHash(algorithm);
-  const fd = openNoFollow(toolName, abs);
+  const fd = openNoFollow(toolName, target);
   try {
     const bytes = streamFile(fd, (chunk, length) => {
       hasher.update(chunk.subarray(0, length));
@@ -168,13 +187,13 @@ function hashFile(
 }
 
 /** Read a whole file, refusing anything over `limit`. */
-function readWholeFile(toolName: string, abs: string, limit: number): Buffer {
-  const fd = openNoFollow(toolName, abs);
+function readWholeFile(toolName: string, target: SafePath, limit: number): Buffer {
+  const fd = openNoFollow(toolName, target);
   try {
     const { size } = fstatSync(fd);
     if (size > limit) {
       throw new Error(
-        `"${abs}" is ${formatBytes(size)}, over this tool's ${formatBytes(limit)} limit`,
+        `"${target.rel}" is ${formatBytes(size)}, over this tool's ${formatBytes(limit)} limit`,
       );
     }
     const buffer = Buffer.allocUnsafe(size);
@@ -190,30 +209,26 @@ function readWholeFile(toolName: string, abs: string, limit: number): Buffer {
   }
 }
 
-/** Replace a file's contents atomically: write a sibling, then rename over it. */
-function writeAtomic(abs: string, contents: string | Uint8Array): void {
-  const tmp = `${abs}.tmp.${randomBytes(6).toString("hex")}`;
-  try {
-    const fd = openSync(tmp, "w", 0o600);
-    try {
-      const bytes =
-        typeof contents === "string" ? Buffer.from(contents, "utf8") : Buffer.from(contents);
-      let written = 0;
-      while (written < bytes.length) {
-        written += writeSync(fd, bytes, written, bytes.length - written);
-      }
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(tmp, abs);
-  } catch (err) {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      // Nothing to clean up.
-    }
-    throw err;
-  }
+/**
+ * Replace (or create) a workspace file's contents through tool-safety's
+ * writeFileSafe: a temp created with O_EXCL|O_NOFOLLOW under a random name
+ * beside it, 0600 until complete, then renamed into place. An existing
+ * file keeps its permission bits. The copy that lived here always left the
+ * file at 0600, so FrontmatterWrite and NotebookEdit made a 0644 document
+ * private and a 0755 file lose its execute bit (C213). Missing parents are
+ * created one at a time, never through a link. Returns the refusal reason,
+ * or undefined when the bytes are in place.
+ */
+function writeAtomic(
+  target: SafePath,
+  contents: string,
+  options: { createParents: boolean },
+): string | undefined {
+  const written = writeFileSafe(workspaceRoot(), relArg(target), contents, {
+    overwrite: true,
+    createParents: options.createParents,
+  });
+  return written.ok ? undefined : written.reason;
 }
 
 type Existing = { kind: "file" | "dir" | "symlink" | "other"; size: number; mtimeMs: number };
@@ -333,7 +348,7 @@ export const stat: RegisteredTool = buildTool({
         base["sha256"] = null;
         base["sha256Note"] = "skipped: file is over 256 MiB — call FileHash explicitly to hash it";
       } else {
-        base["sha256"] = hashFile("Stat", target.real, "sha256").hex;
+        base["sha256"] = hashFile("Stat", target, "sha256").hex;
       }
     }
     return json(base);
@@ -356,7 +371,7 @@ export const fileHash: RegisteredTool = buildTool({
     if (info === undefined) return `no such file: ${target.rel}`;
     if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not a regular file`;
     const algorithm = input.algorithm ?? "sha256";
-    const result = hashFile("FileHash", target.real, algorithm);
+    const result = hashFile("FileHash", target, algorithm);
     return json({ path: target.rel, algorithm, hash: result.hex, bytes: result.bytes });
   },
 });
@@ -590,10 +605,32 @@ export const findFiles: RegisteredTool = buildTool({
 // reading part of a file
 // ---------------------------------------------------------------------------
 
+/** Characters of line text ReadLines returns by default, across all the lines. */
+export const READ_LINES_DEFAULT_MAX_CHARS = 256 * 1024;
+/** The most a caller may raise that budget to. */
+export const READ_LINES_MAX_CHARS = 4 * 1024 * 1024;
+/**
+ * How far past a cut ReadLines keeps reading to measure the cut line's full
+ * length. Only reading, never storing; past this the length is a lower bound.
+ */
+const READ_LINES_MEASURE_BYTES = 64 * 1024 * 1024;
+
+type CutLine = { line: number; chars: number } | { line: number; charsAtLeast: number };
+
+/**
+ * The first `take` UTF-16 units of `text`, never ending inside a surrogate
+ * pair, so a cut line is still valid text.
+ */
+function cutAt(text: string, take: number): string {
+  if (take <= 0) return "";
+  const last = text.charCodeAt(take - 1);
+  return last >= 0xd800 && last <= 0xdbff ? text.slice(0, take - 1) : text.slice(0, take);
+}
+
 export const readLines: RegisteredTool = buildTool({
   name: "ReadLines",
   description:
-    "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context.",
+    "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context. The lines returned share a character budget (maxChars, default 262144): a line that would pass it is cut and reported with its full length, and the range stops there.",
   inputSchema: z.object({
     path: z.string().min(1),
     start: z.number().int().min(1).optional().describe("first line, 1-based (default 1)"),
@@ -605,6 +642,15 @@ export const readLines: RegisteredTool = buildTool({
       .max(20_000)
       .optional()
       .describe("cap on lines returned (default 500)"),
+    maxChars: z
+      .number()
+      .int()
+      .min(1024)
+      .max(READ_LINES_MAX_CHARS)
+      .optional()
+      .describe(
+        `budget for the text of all returned lines (default ${READ_LINES_DEFAULT_MAX_CHARS})`,
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -619,41 +665,121 @@ export const readLines: RegisteredTool = buildTool({
     const end = Math.min(input.end ?? start + maxLines - 1, start + maxLines - 1);
     if (end < start) return `end (${end}) is before start (${start})`;
 
-    const fd = openNoFollow("ReadLines", target.real);
+    // A line was held whole until its newline, and lines before `start` were
+    // accumulated too, so `maxLines: 1` on a minified bundle or a JSON file
+    // with no newline returned (and held) the whole file (C164). Now:
+    //  - lines before `start` are counted on the raw bytes (0x0a never occurs
+    //    inside a UTF-8 sequence) and never decoded or kept;
+    //  - the returned text shares one character budget; the line that would
+    //    pass it is cut on a code-point boundary, its full length measured by
+    //    reading on without storing (up to READ_LINES_MEASURE_BYTES), and the
+    //    range stops after it.
+    const budget = input.maxChars ?? READ_LINES_DEFAULT_MAX_CHARS;
+    let budgetLeft = budget;
+    const fd = openNoFollow("ReadLines", target);
     const lines: string[] = [];
-    let lineNo = 0;
-    let carry = "";
-    let reachedEnd = false;
+    let cutLine: CutLine | undefined;
+    let lineNo = 1; // the line the next byte belongs to
+    let current = ""; // kept text of the in-range line being read
+    let currentChars = 0; // its full length so far
+    let cut = false; // it passed the budget
+    let measured = 0; // bytes read past the cut
+    let reachedEnd = false; // the last requested line was completed
+    let stoppedAtBudget = false;
+    let endOfFile = false;
+    // ignoreBOM: the decoder is flushed at every line end, and a flushed
+    // decoder would otherwise strip U+FEFF from the start of the next line.
+    // The file's own BOM is dropped by hand below, as 0.7.0 did.
+    const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+
+    const take = (text: string): void => {
+      currentChars += text.length;
+      if (cut) return;
+      if (text.length <= budgetLeft) {
+        current += text;
+        budgetLeft -= text.length;
+        return;
+      }
+      current += cutAt(text, budgetLeft);
+      budgetLeft = 0;
+      cut = true;
+    };
+    const finishLine = (complete: boolean): void => {
+      lines.push(current);
+      if (cut) {
+        cutLine = complete
+          ? { line: lineNo, chars: currentChars }
+          : { line: lineNo, charsAtLeast: currentChars };
+      }
+      current = "";
+      currentChars = 0;
+    };
+
     try {
-      const decoder = new TextDecoder("utf-8");
       const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
       let position = 0;
-      for (;;) {
+      scan: for (;;) {
         const read = readSync(fd, buffer, 0, CHUNK_BYTES, position);
-        if (read <= 0) break;
-        position += read;
-        // `stream: true` keeps a multi-byte character split across a chunk
-        // boundary intact instead of decoding it into replacement characters.
-        carry += decoder.decode(buffer.subarray(0, read), { stream: true });
-        let cut = carry.indexOf("\n");
-        while (cut !== -1) {
-          lineNo += 1;
-          const line = carry.slice(0, cut);
-          carry = carry.slice(cut + 1);
-          if (lineNo >= start && lineNo <= end) lines.push(line);
-          if (lineNo >= end) {
-            reachedEnd = true;
-            break;
-          }
-          cut = carry.indexOf("\n");
+        if (read <= 0) {
+          endOfFile = true;
+          break;
         }
-        if (reachedEnd) break;
-      }
-      if (!reachedEnd) {
-        carry += decoder.decode();
-        if (carry !== "") {
+        const chunkStart = position;
+        position += read;
+        let at = 0;
+        while (at < read) {
+          const newline = buffer.indexOf(0x0a, at);
+          const stop = newline === -1 || newline >= read ? read : newline;
+          if (lineNo >= start) {
+            let from = at;
+            // The file's byte-order mark is not part of line 1, as before.
+            if (
+              chunkStart + at === 0 &&
+              read >= 3 &&
+              buffer[0] === 0xef &&
+              buffer[1] === 0xbb &&
+              buffer[2] === 0xbf
+            ) {
+              from = 3;
+            }
+            if (cut) measured += stop - from;
+            take(decoder.decode(buffer.subarray(from, stop), { stream: true }));
+          }
+          if (stop === read) break; // the line goes on into the next chunk
+          // A newline ends line `lineNo`.
+          if (lineNo >= start) {
+            take(decoder.decode());
+            finishLine(true);
+            if (lineNo >= end) {
+              reachedEnd = true;
+              break scan;
+            }
+            if (budgetLeft === 0) {
+              stoppedAtBudget = true;
+              break scan;
+            }
+          }
           lineNo += 1;
-          if (lineNo >= start && lineNo <= end) lines.push(carry);
+          at = stop + 1;
+        }
+        if (cut && measured >= READ_LINES_MEASURE_BYTES) {
+          // Stop measuring: the cut line's length is a lower bound.
+          take(decoder.decode());
+          finishLine(false);
+          stoppedAtBudget = lineNo < end;
+          reachedEnd = lineNo >= end;
+          break;
+        }
+      }
+      if (endOfFile && lineNo >= start && (currentChars > 0 || cut)) {
+        // A last line with no newline after it.
+        take(decoder.decode());
+        finishLine(true);
+      } else if (endOfFile && lineNo >= start) {
+        const rest = decoder.decode();
+        if (rest !== "") {
+          take(rest);
+          finishLine(true);
         }
       }
     } finally {
@@ -668,7 +794,17 @@ export const readLines: RegisteredTool = buildTool({
       returned: lines.length,
       // True when the file ran out before the requested end — the caller
       // knows there is nothing more to ask for.
-      endOfFile: !reachedEnd,
+      endOfFile: endOfFile && !reachedEnd,
+      // Present only when the budget cut the answer short, so an answer
+      // that fits is byte-for-byte what 0.7.0 returned.
+      ...(cutLine !== undefined || stoppedAtBudget
+        ? {
+            truncated: true,
+            maxChars: budget,
+            ...(cutLine !== undefined ? { truncatedLines: [cutLine] } : {}),
+            ...(stoppedAtBudget ? { stoppedAtBudget: true } : {}),
+          }
+        : {}),
     });
   },
 });
@@ -698,7 +834,7 @@ export const tailFile: RegisteredTool = buildTool({
 
     const wanted = input.lines ?? 50;
     const scanLimit = input.maxBytes ?? 1024 * 1024;
-    const fd = openNoFollow("TailFile", target.real);
+    const fd = openNoFollow("TailFile", target);
     let text: string;
     let scanned = 0;
     let hitStart = false;
@@ -1203,7 +1339,7 @@ export const splitFile: RegisteredTool = buildTool({
 
     // Plan first so an existing part can be refused before anything is written.
     const planned: { name: string; bytes: number; lines?: number }[] = [];
-    const fd = openNoFollow("SplitFile", target.real);
+    const fd = openNoFollow("SplitFile", target);
     try {
       if (input.maxBytes !== undefined) {
         const size = fstatSync(fd).size;
@@ -1303,7 +1439,7 @@ export const splitFile: RegisteredTool = buildTool({
     // swapped in at a part name after the check above is replaced as a name,
     // never written through, and a dangling one never creates its target.
     const written: string[] = [];
-    const source = openNoFollow("SplitFile", target.real);
+    const source = openNoFollow("SplitFile", target);
     try {
       let position = 0;
       for (const part of parts) {
@@ -1409,7 +1545,7 @@ export const concatFiles: RegisteredTool = buildTool({
     try {
       for (const [index, source] of sources.entries()) {
         if (index > 0 && separatorBytes.length > 0) writer.write(separatorBytes);
-        const fd = openNoFollow("ConcatFiles", source.real);
+        const fd = openNoFollow("ConcatFiles", source);
         try {
           streamFile(fd, (chunk, length) => {
             writer.write(chunk.subarray(0, length));
@@ -1454,7 +1590,7 @@ function inspectArchive(
   if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not an archive file`;
   let bytes: Buffer;
   try {
-    bytes = readWholeFile(toolName, target.real, MAX_ARCHIVE_BYTES);
+    bytes = readWholeFile(toolName, target, MAX_ARCHIVE_BYTES);
   } catch (err) {
     return (err as Error).message;
   }
@@ -1938,7 +2074,7 @@ export const frontmatterRead: RegisteredTool = buildTool({
     if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not a regular file`;
     let text: string;
     try {
-      text = readWholeFile("FrontmatterRead", target.real, MAX_WHOLE_FILE_BYTES).toString("utf8");
+      text = readWholeFile("FrontmatterRead", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
     } catch (err) {
       return (err as Error).message;
     }
@@ -1966,6 +2102,24 @@ export const frontmatterRead: RegisteredTool = buildTool({
 
 const frontmatterScalar = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
+/**
+ * A key FrontmatterWrite may set: one the subset can read back. A key with a
+ * space or a colon was written verbatim and left a block FrontmatterRead then
+ * refused. `__proto__` is refused by name: the input parser builds a plain
+ * object, where that key sets the prototype and silently disappears, so the
+ * call reported `written: true` without it. Removing one (`removeKeys`)
+ * still works.
+ */
+const frontmatterKey = z
+  .string()
+  .regex(
+    FRONTMATTER_KEY,
+    "a front matter key is letters, digits and _ . - (starting with a letter, digit or _)",
+  )
+  .refine((key) => key !== "__proto__", {
+    message: 'the key "__proto__" cannot be set through this tool',
+  });
+
 export const frontmatterWrite: RegisteredTool = buildTool({
   name: "FrontmatterWrite",
   operativeArgs: [{ field: "path", kind: "path" }],
@@ -1973,7 +2127,7 @@ export const frontmatterWrite: RegisteredTool = buildTool({
   inputSchema: z.object({
     path: z.string().min(1),
     data: z
-      .record(z.union([frontmatterScalar, z.array(frontmatterScalar).max(1000)]))
+      .record(frontmatterKey, z.union([frontmatterScalar, z.array(frontmatterScalar).max(1000)]))
       .describe("keys to set"),
     removeKeys: z.array(z.string().min(1)).max(200).optional(),
     merge: z
@@ -1992,9 +2146,7 @@ export const frontmatterWrite: RegisteredTool = buildTool({
     let text = "";
     if (info !== undefined) {
       try {
-        text = readWholeFile("FrontmatterWrite", target.real, MAX_WHOLE_FILE_BYTES).toString(
-          "utf8",
-        );
+        text = readWholeFile("FrontmatterWrite", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
       } catch (err) {
         return (err as Error).message;
       }
@@ -2036,8 +2188,8 @@ export const frontmatterWrite: RegisteredTool = buildTool({
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, written: false });
     if (next === text) return json({ ...summary, dryRun: false, written: false });
-    mkdirSync(path.dirname(target.abs), { recursive: true });
-    writeAtomic(target.abs, next);
+    const refused = writeAtomic(target, next, { createParents: true });
+    if (refused !== undefined) return refused;
     return json({ ...summary, dryRun: false, written: true });
   },
 });
@@ -2076,9 +2228,7 @@ export const notebookRead: RegisteredTool = buildTool({
     if (info.kind !== "file") return `${target.rel} is a ${info.kind}, not a regular file`;
     let notebook: ReturnType<typeof parseNotebook>;
     try {
-      const text = readWholeFile("NotebookRead", target.real, MAX_WHOLE_FILE_BYTES).toString(
-        "utf8",
-      );
+      const text = readWholeFile("NotebookRead", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
       notebook = parseNotebook(text);
     } catch (err) {
       if (err instanceof NotebookError) return `${target.rel}: ${err.message}`;
@@ -2144,7 +2294,7 @@ export const notebookEdit: RegisteredTool = buildTool({
     let notebook: ReturnType<typeof parseNotebook>;
     let original: string;
     try {
-      original = readWholeFile("NotebookEdit", target.real, MAX_WHOLE_FILE_BYTES).toString("utf8");
+      original = readWholeFile("NotebookEdit", target, MAX_WHOLE_FILE_BYTES).toString("utf8");
       notebook = parseNotebook(original);
     } catch (err) {
       if (err instanceof NotebookError) return `${target.rel}: ${err.message}`;
@@ -2178,7 +2328,8 @@ export const notebookEdit: RegisteredTool = buildTool({
       changed: next !== original,
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, written: false });
-    writeAtomic(target.abs, next);
+    const refused = writeAtomic(target, next, { createParents: false });
+    if (refused !== undefined) return refused;
     return json({ ...summary, dryRun: false, written: true });
   },
 });

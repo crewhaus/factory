@@ -13,10 +13,12 @@
  *     from walking the tool out of it.
  *   - `.git` is always skipped: it is machine state, not the user's content.
  */
-import { type Dirent, lstatSync, readFileSync, readdirSync } from "node:fs";
+import { type Dirent, lstatSync, readdirSync } from "node:fs";
 import * as path from "node:path";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { type IgnoreLayer, type IgnoreRule, isIgnored, parseGitignore } from "./lib/gitignore";
 import { compileGlob } from "./lib/glob";
+import { workspaceRoot } from "./paths";
 
 export type NodeKind = "file" | "dir" | "symlink" | "other";
 
@@ -82,13 +84,23 @@ function excluded(
   return false;
 }
 
-/** Read and compile one `.gitignore`, or undefined when there is none. */
+/** A `.gitignore` larger than this contributes no rules, like an unreadable one. */
+export const GITIGNORE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Read and compile one `.gitignore`, or undefined when there is none.
+ *
+ * Read through tool-safety's contained open: a `.gitignore` that is a FIFO
+ * is refused BEFORE it is opened (a plain read blocked the event loop until
+ * a writer appeared, so one planted FIFO hung Tree, which plan mode runs
+ * unasked: C074), one linked out of the workspace is not read, and at most
+ * GITIGNORE_MAX_BYTES are. Any of those, like a missing or unreadable
+ * file, contributes no rules.
+ */
 export function loadIgnoreRules(file: string): IgnoreRule[] | undefined {
-  try {
-    return parseGitignore(readFileSync(file, "utf8"));
-  } catch {
-    return undefined; // missing or unreadable: contributes no rules
-  }
+  const r = openForReadSync(workspaceRoot(), file, { maxBytes: GITIGNORE_MAX_BYTES });
+  if (!r.ok || r.truncated) return undefined;
+  return parseGitignore(r.text);
 }
 
 type WalkState = {

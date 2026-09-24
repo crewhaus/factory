@@ -197,9 +197,21 @@ function splitFlowItems(body: string, lineNo: number): string[] {
 
 const KEY_LINE = /^([A-Za-z0-9_][A-Za-z0-9._-]*)\s*:(.*)$/;
 
-/** Parse the YAML subset. Throws `FrontmatterError` on anything outside it. */
+/** A key this subset can read back: what `KEY_LINE` accepts before the colon. */
+export const FRONTMATTER_KEY = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+
+/**
+ * Parse the YAML subset. Throws `FrontmatterError` on anything outside it.
+ *
+ * The record has no prototype. On a plain `{}`, `data["__proto__"] = …`
+ * hit the prototype setter: the key vanished from the record (a list became
+ * its prototype, `~` removed it), so FrontmatterRead misreported the keys,
+ * FrontmatterWrite silently deleted a line nobody asked it to touch, and a
+ * repeated `__proto__` escaped the duplicate-key check (C199). Here it is an
+ * ordinary key and round-trips like any other.
+ */
 export function parseFrontmatter(yaml: string): FrontmatterData {
-  const data: FrontmatterData = {};
+  const data = Object.create(null) as FrontmatterData;
   const lines = yaml === "" ? [] : yaml.split("\n");
   let i = 0;
   while (i < lines.length) {

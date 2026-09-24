@@ -6176,7 +6176,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "readLines",
     name: "ReadLines",
     description:
-      "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context.",
+      "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context. The lines returned share a character budget (maxChars, default 262144): a line that would pass it is cut and reported with its full length, and the range stops there.",
     readOnly: true,
     destructive: false,
     scope: "internal",

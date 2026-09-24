@@ -20,7 +20,7 @@ tools:
 | `Tree` | A directory drawn as a tree: depth-capped, entry-capped, sorted, `.gitignore`-aware |
 | `DiskUsage` | Sizes rolled up per directory, largest first |
 | `FindFiles` | By name glob, size range, mtime window and type — sorted |
-| `ReadLines` | A numbered line range, reading only as far as the range needs |
+| `ReadLines` | A numbered line range, reading only as far as the range needs, within a character budget |
 | `TailFile` | The last N lines, read backwards from the end |
 | `MakeDirectory` | Create a directory, with its parents |
 | `TouchFile` | Create an empty file; set its timestamps when you supply one |
@@ -88,6 +88,26 @@ Hand-built malicious archives in `archive-fixtures.ts` test that, because
 tar does), never the file or directory it points at, and reports any stored
 link that leads outside the archived tree, since `ArchiveExtract` will refuse
 it.
+
+## Reading and rewriting files
+
+Every read opens the file without following a link at the leaf, and refuses
+a FIFO, socket or device before opening it: a plain open of a FIFO blocks
+the whole process until something writes to it, and no timeout reaches it.
+The walk's `.gitignore` files are read the same way, and one linked out of
+the workspace, larger than 1 MiB, or not a regular file contributes no rules.
+
+`ReadLines` returns at most `maxChars` characters of line text in all
+(default 262 144, at most 4 Mi). A line that would pass the budget is cut and
+listed in `truncatedLines` with its full length (`charsAtLeast` when it runs
+on for more than 64 MiB), and the range stops there, with `truncated: true`;
+resume from `end + 1`. Lines before `start` are counted, never held.
+
+`FrontmatterWrite` and `NotebookEdit` rewrite a file through a temp and a
+rename, and the file keeps its permission bits. A front matter key named
+`__proto__` is read, kept and written like any other key; it cannot be *set*
+through `FrontmatterWrite` (the input would drop it), and neither can a key
+the subset could not read back.
 
 ## Determinism
 
