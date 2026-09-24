@@ -751,6 +751,71 @@ describe("scoreValue", () => {
     expect(scoreValue({ seats: 500, plan: "ent" }, capped).band).toBe("cold");
   });
 
+  test("decimal points sum the way a person adds them: 0.7 + 0.1 reaches a band at 0.8", () => {
+    const bands = [
+      { name: "hot", min: 0.8 },
+      { name: "warm", min: 0.5 },
+    ];
+    const result = scoreValue(
+      { title: "VP", employees: 900 },
+      {
+        rules: [
+          { id: "a", when: [{ path: "title", op: "equals", expected: "VP" }], points: 0.7 },
+          { id: "b", when: [{ path: "employees", op: "greaterThan", expected: 499 }], points: 0.1 },
+        ],
+        bands,
+      },
+    );
+    // 0.7.0: 0.7999999999999999 and "warm".
+    expect({ score: result.score, rawScore: result.rawScore, band: result.band }).toEqual({
+      score: 0.8,
+      rawScore: 0.8,
+      band: "hot",
+    });
+  });
+
+  test("the band does not depend on the order the rules are declared in", () => {
+    const bands = [{ name: "hot", min: 0.8 }];
+    const out: Array<{ pts: number[]; score: number; band: string | null }> = [];
+    for (const pts of [
+      [0.1, 0.1, 0.6],
+      [0.6, 0.1, 0.1],
+      [0.1, 0.6, 0.1],
+    ]) {
+      const r = scoreValue(1, {
+        rules: pts.map((p, i) => ({ id: `r${i}`, when: [{ op: "exists" as const }], points: p })),
+        bands,
+      });
+      out.push({ pts, score: r.score, band: r.band });
+    }
+    // 0.7.0: the second order summed to 0.7999999999999999 and missed "hot".
+    expect(out).toEqual([
+      { pts: [0.1, 0.1, 0.6], score: 0.8, band: "hot" },
+      { pts: [0.6, 0.1, 0.1], score: 0.8, band: "hot" },
+      { pts: [0.1, 0.6, 0.1], score: 0.8, band: "hot" },
+    ]);
+  });
+
+  test("cancellation leaves no float residue, and a clamp at a decimal bound is exact", () => {
+    const rules = (pts: number[]) =>
+      pts.map((p, i) => ({ id: `r${i}`, when: [{ op: "exists" as const }], points: p }));
+    // 0.7.0: 0.10000000000002274.
+    expect(scoreValue(1, { rules: rules([1000.1, -1000]) }).score).toBe(0.1);
+    expect(scoreValue(1, { rules: rules([0.1, 0.2]) }).score).toBe(0.3);
+    // 0.1 + 0.2 is exactly 0.3, so it is NOT above a 0.3 cap and is not clamped.
+    const capped = scoreValue(1, { rules: rules([0.1, 0.2]), max: 0.3 });
+    expect({ score: capped.score, rawScore: capped.rawScore }).toEqual({
+      score: 0.3,
+      rawScore: 0.3,
+    });
+    const floored = scoreValue(1, {
+      rules: rules([0.1, 0.2]),
+      min: 0.35,
+      bands: [{ name: "b", min: 0.35 }],
+    });
+    expect({ score: floored.score, band: floored.band }).toEqual({ score: 0.35, band: "b" });
+  });
+
   test("a rule with no checks would always fire, so it is rejected", () => {
     expect(() => scoreValue({}, { rules: [{ id: "x", when: [], points: 1 }] })).toThrow(
       /always award/,

@@ -61,6 +61,10 @@ explanation rather than guessed at, because per ECMAScript an offset-less
 date-time string is *local* time while the date-only form is UTC — so the
 same spec would mean different instants on two machines.
 
+`RuleScore` adds points as exact decimals, not binary floats, so `0.7 + 0.1`
+is `0.8` and meets a band at `0.8`, and the total does not depend on the
+order the rules are declared in.
+
 An epoch outside the ±8.64e15 ms a `Date` can represent is rejected by name
 for the same reason: the field that parsed it is the only place that still
 knows which of a spec's several instants was the bad one, and left to reach a

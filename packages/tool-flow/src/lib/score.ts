@@ -8,7 +8,23 @@
  * be re-run identically next quarter. This returns the contributors, and the
  * version of the rules that produced them.
  */
+import { decimalKernel } from "@crewhaus/tool-math";
 import { type Check, runChecks } from "@crewhaus/tool-schema";
+
+type Decimal = decimalKernel.Decimal;
+const { align, decimalAdd, decimalToNumber, parseDecimal } = decimalKernel;
+
+/**
+ * `a` compared with `b`, exactly: -1, 0 or 1. A bound of -Infinity or
+ * Infinity (a library caller's, since JSON cannot spell one) compares as
+ * what it is rather than failing the parse.
+ */
+function compareExact(a: Decimal, b: number): number {
+  if (b === Number.NEGATIVE_INFINITY) return 1;
+  if (b === Number.POSITIVE_INFINITY) return -1;
+  const aligned = align(a, parseDecimal(b));
+  return aligned.a < aligned.b ? -1 : aligned.a > aligned.b ? 1 : 0;
+}
 
 export type ScoreRule = {
   readonly id: string;
@@ -69,28 +85,42 @@ export function scoreValue(value: unknown, model: ScoreModel): ScoreResult {
 
   const contributors: Array<{ id: string; label: string; points: number }> = [];
   const missed: Array<{ id: string; reason: string }> = [];
-  let rawScore = 0;
+  // Summed as exact decimals, not doubles. Points are decimal literals, and
+  // String(number) gives that literal back, so the sum is the one a person
+  // adds up by hand: 0.7 + 0.1 is 0.8 and lands in a band at 0.8, where the
+  // float sum 0.7999999999999999 missed it. Exact addition is also
+  // associative, so the band no longer depends on the order the rules were
+  // declared in (0.1 + 0.1 + 0.6 and 0.6 + 0.1 + 0.1 used to band apart).
+  let exact: Decimal = { unscaled: 0n, scale: 0 };
 
   for (const rule of model.rules) {
     const report = runChecks(value, rule.when as Check[]);
     if (report.ok) {
-      rawScore += rule.points;
+      exact = decimalAdd(exact, parseDecimal(rule.points));
       contributors.push({ id: rule.id, label: rule.label ?? rule.id, points: rule.points });
     } else {
       missed.push({ id: rule.id, reason: report.failures[0]?.reason ?? "" });
     }
   }
 
+  const rawScore = decimalToNumber(exact);
   let score = rawScore;
-  if (model.min !== undefined) score = Math.max(model.min, score);
-  if (model.max !== undefined) score = Math.min(model.max, score);
+  let clamped: Decimal = exact;
+  if (model.min !== undefined && compareExact(clamped, model.min) < 0) {
+    score = model.min;
+    clamped = parseDecimal(model.min);
+  }
+  if (model.max !== undefined && compareExact(clamped, model.max) > 0) {
+    score = model.max;
+    clamped = parseDecimal(model.max);
+  }
 
   let band: string | null = null;
   if (model.bands && model.bands.length > 0) {
     // Highest qualifying band wins, whatever order they were declared in, so
     // a table written low-to-high and one written high-to-low agree.
     const sorted = [...model.bands].sort((a, b) => b.min - a.min);
-    band = sorted.find((b) => score >= b.min)?.name ?? null;
+    band = sorted.find((b) => compareExact(clamped, b.min) >= 0)?.name ?? null;
   }
 
   return { score, rawScore, band, version: model.version ?? null, contributors, missed };
