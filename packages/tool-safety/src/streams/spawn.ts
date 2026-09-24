@@ -73,6 +73,22 @@ export type SpawnBoundedOptions = {
   readonly drainGraceMs?: number;
   /** After SIGKILL, how long to wait for the child to be reaped before giving up on it. Default 1000. */
   readonly reapGraceMs?: number;
+  /**
+   * Called once when a timeout, an abort or an overflow starts the kill,
+   * just before the group is signalled. For a child that is only a client
+   * of the process doing the work, this is where that work is stopped: a
+   * `docker run` CLI can be killed while its container runs on, so the
+   * sandbox runs `docker kill <name>` from here. Not awaited; a caller that
+   * starts something waits for it itself. A throw is ignored.
+   */
+  readonly onKill?: (reason: "timeout" | "abort" | "overflow") => void;
+  /**
+   * Each stdout chunk as it arrives, before the cap drops any of it, with
+   * the running byte total: for a caller that shows the output live and
+   * stops at its own cap. A throw is ignored.
+   */
+  readonly onStdoutChunk?: (chunk: Uint8Array, totalBytes: number) => void;
+  readonly onStderrChunk?: (chunk: Uint8Array, totalBytes: number) => void;
 };
 
 export type SpawnBoundedResult = {
@@ -316,9 +332,14 @@ export async function spawnBounded(options: SpawnBoundedOptions): Promise<SpawnB
       // Already gone.
     }
   };
-  const beginKill = (): void => {
+  const beginKill = (reason: "timeout" | "abort" | "overflow"): void => {
     if (killStarted) return;
     killStarted = true;
+    try {
+      options.onKill?.(reason);
+    } catch {
+      // The caller's hook must not stop the kill.
+    }
     killTree(group, "SIGTERM", signalChild);
     // Not cleared when the child exits: another member of its group may
     // ignore SIGTERM, and "then SIGKILL" is the promise. The timer is
@@ -335,31 +356,50 @@ export async function spawnBounded(options: SpawnBoundedOptions): Promise<SpawnB
   };
 
   const drainStop = new AbortController();
-  const collect = (stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<CollectResult> =>
+  const collect = (
+    stream: ReadableStream<Uint8Array>,
+    maxBytes: number,
+    onChunk: ((chunk: Uint8Array, totalBytes: number) => void) | undefined,
+  ): Promise<CollectResult> =>
     collectBounded(stream, {
       maxBytes,
       tailBytes,
       signal: drainStop.signal,
-      onChunk: (_chunk, total) => {
+      onChunk: (chunk, total) => {
+        if (onChunk !== undefined) {
+          try {
+            onChunk(chunk, total);
+          } catch {
+            // A consumer's error must not stop the drain.
+          }
+        }
         if (total > maxBytes && options.onOverflow === "kill" && !killStarted) {
           killedForOverflow = true;
-          beginKill();
+          beginKill("overflow");
         }
       },
     });
-  const stdoutP = collect(proc.stdout as ReadableStream<Uint8Array>, maxStdoutBytes);
-  const stderrP = collect(proc.stderr as ReadableStream<Uint8Array>, maxStderrBytes);
+  const stdoutP = collect(
+    proc.stdout as ReadableStream<Uint8Array>,
+    maxStdoutBytes,
+    options.onStdoutChunk,
+  );
+  const stderrP = collect(
+    proc.stderr as ReadableStream<Uint8Array>,
+    maxStderrBytes,
+    options.onStderrChunk,
+  );
 
   const deadline =
     timeoutDelay === undefined
       ? undefined
       : setTimeout(() => {
           timedOut = true;
-          beginKill();
+          beginKill("timeout");
         }, timeoutDelay);
   const unsubscribe = onAbort(options.signal, () => {
     aborted = true;
-    beginKill();
+    beginKill("abort");
   });
 
   let abandoned = false;

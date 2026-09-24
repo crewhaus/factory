@@ -305,6 +305,129 @@ describe.if(posix)("spawnBounded", () => {
 });
 
 /**
+ * The hooks a caller uses when the child is only a client of the process
+ * doing the work (the sandbox's `docker run`): `onKill` to stop that work
+ * when the kill starts, and the chunk hooks to show output live.
+ */
+describe.if(posix)("spawnBounded hooks", () => {
+  /** A child that prints its pid first, so the chunk hook learns it. */
+  const PID_THEN = (rest: string) => ["sh", "-c", `echo $$; ${rest}`];
+
+  async function runWithHooks(
+    extra: Partial<Parameters<typeof spawnBounded>[0]>,
+    rest = "exec sleep 30",
+  ): Promise<{
+    r: Awaited<ReturnType<typeof spawnBounded>>;
+    reasons: string[];
+    aliveAtKill: boolean[];
+    pid: number;
+  }> {
+    const reasons: string[] = [];
+    const aliveAtKill: boolean[] = [];
+    let pid = 0;
+    let firstLine = "";
+    const r = await spawnBounded({
+      cmd: PID_THEN(rest),
+      timeoutMs: 60_000,
+      maxStdoutBytes: 1_000,
+      maxStderrBytes: 1_000,
+      killGraceMs: 500,
+      onStdoutChunk: (chunk) => {
+        if (pid !== 0) return;
+        firstLine += new TextDecoder().decode(chunk);
+        if (firstLine.includes("\n")) pid = Number(firstLine.split("\n")[0]);
+      },
+      onKill: (why) => {
+        reasons.push(why);
+        aliveAtKill.push(pid > 0 && alive(pid));
+      },
+      ...extra,
+    });
+    return { r, reasons, aliveAtKill, pid };
+  }
+
+  test("onKill is told the reason once, while the child is still there to stop", async () => {
+    const { r, reasons, aliveAtKill, pid } = await runWithHooks({ timeoutMs: 500 });
+    try {
+      expect(r.timedOut).toBe(true);
+      expect(reasons).toEqual(["timeout"]);
+      expect(aliveAtKill).toEqual([true]);
+      expect(await waitGone(pid, 10_000)).toBe(true);
+    } finally {
+      killGroup(r.pid);
+    }
+  }, 30_000);
+
+  test("onKill says abort for an abort and overflow for an overflow kill", async () => {
+    const controller = new AbortController();
+    const aborted = runWithHooks({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 300);
+    const a = await aborted;
+    const o = await runWithHooks(
+      { onOverflow: "kill", maxStdoutBytes: 64 },
+      "while :; do echo yyyyyyyyyyyyyyyyyyyy; done",
+    );
+    try {
+      expect(a.reasons).toEqual(["abort"]);
+      expect(o.reasons).toEqual(["overflow"]);
+      expect(o.r.killedForOverflow).toBe(true);
+    } finally {
+      killGroup(a.r.pid);
+      killGroup(o.r.pid);
+    }
+  }, 30_000);
+
+  test("a command that exits on its own never calls onKill", async () => {
+    const { r, reasons } = await runWithHooks({}, "echo done");
+    expect(r.exitCode).toBe(0);
+    expect(reasons).toEqual([]);
+  }, 30_000);
+
+  test("an onKill that throws does not stop the kill", async () => {
+    const t0 = performance.now();
+    const { r, pid } = await runWithHooks({
+      timeoutMs: 300,
+      onKill: () => {
+        throw new Error("hook broke");
+      },
+    });
+    try {
+      expect(r.timedOut).toBe(true);
+      expect(await waitGone(pid, 10_000)).toBe(true);
+      expect(performance.now() - t0).toBeLessThan(20_000);
+    } finally {
+      killGroup(r.pid);
+    }
+  }, 30_000);
+
+  test("the chunk hooks see every byte, past the cap too, with running totals", async () => {
+    const seen = { out: 0, err: 0, lastOut: 0, lastErr: 0 };
+    const r = await spawnBounded({
+      cmd: ["sh", "-c", "head -c 100000 /dev/zero; head -c 5000 /dev/zero >&2"],
+      timeoutMs: 20_000,
+      maxStdoutBytes: 1_000,
+      maxStderrBytes: 10,
+      onStdoutChunk: (chunk, total) => {
+        seen.out += chunk.length;
+        seen.lastOut = total;
+      },
+      onStderrChunk: (chunk, total) => {
+        seen.err += chunk.length;
+        seen.lastErr = total;
+        throw new Error("a consumer's error must not stop the drain");
+      },
+    });
+    expect(seen).toEqual({ out: 100_000, err: 5_000, lastOut: 100_000, lastErr: 5_000 });
+    expect(r).toMatchObject({
+      stdoutBytes: 100_000,
+      stderrBytes: 5_000,
+      stdoutTruncated: true,
+      outputComplete: true,
+    });
+  }, 30_000);
+});
+
+/**
  * The host process is a separate Bun process running this child script, so
  * its signals and exit can be driven without touching the test runner.
  */
