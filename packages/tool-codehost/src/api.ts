@@ -29,6 +29,8 @@ export type CallCtx = {
   /** Absolute API root, e.g. `https://api.github.com`, without a trailing slash. */
   readonly baseUrl: string;
   readonly token: string;
+  /** The canonical origin of `baseUrl`: the only origin the token is sent to. */
+  readonly tokenOrigin: string;
   readonly deadline: Deadline;
   readonly maxBytes: number;
   /** Scrubs the token out of anything on its way to the caller. */
@@ -159,6 +161,7 @@ export async function apiRequest(c: CallCtx, init: ApiRequestInit): Promise<ApiR
     body,
     signal: c.deadline.signal,
     cfg: c.cfg,
+    credentialOrigin: c.tokenOrigin,
   });
   const drained = await readCapped(opened.res, init.maxBytes ?? c.maxBytes, c.deadline.signal);
   const map = headerMap(opened.res);

@@ -41,6 +41,7 @@
 import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
 import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 /** Refusal by the allow-list, the SSRF gate, a redirect rule or a credential rule. */
@@ -85,9 +86,24 @@ export type CodehostConfig = {
   readonly baseUrl?: string;
   /** NAME of the environment variable holding the token, never the token. */
   readonly tokenEnv?: string;
+  /**
+   * Further variables a call may name as `tokenEnv`, each with the origins
+   * its token may be sent to (null: any allowed origin). A call can choose
+   * among these and `tokenEnv`; it can never add one.
+   */
+  readonly tokenEnvs: ReadonlyMap<string, ReadonlySet<string> | null>;
   /** Default host kind for calls that do not name one. */
   readonly host?: HostKind;
 };
+
+/**
+ * `token_envs`: a list of variable names, whose tokens may go to any
+ * allowed origin, or a map from a name to the origins its token may go to.
+ */
+export type TokenEnvsInput = readonly string[] | Readonly<Record<string, readonly string[]>>;
+
+/** Where an operator lists the variables a call may name. Every refusal names it. */
+export const TOKEN_ENVS_KEY = "tool_config.codehost.token_envs";
 
 export type CodehostConfigInput = {
   readonly allowed_origins?: readonly string[];
@@ -96,10 +112,12 @@ export type CodehostConfigInput = {
   readonly baseUrl?: string;
   readonly token_env?: string;
   readonly tokenEnv?: string;
+  readonly token_envs?: TokenEnvsInput;
+  readonly tokenEnvs?: TokenEnvsInput;
   readonly host?: string;
 };
 
-const EMPTY_CONFIG: CodehostConfig = { allowedOrigins: new Set<string>() };
+const EMPTY_CONFIG: CodehostConfig = { allowedOrigins: new Set<string>(), tokenEnvs: new Map() };
 
 let codehostConfig: CodehostConfig = EMPTY_CONFIG;
 
@@ -111,12 +129,66 @@ export function buildCodehostConfig(input: CodehostConfigInput): CodehostConfig 
   const baseUrl = input.baseUrl ?? input.base_url;
   const tokenEnv = input.tokenEnv ?? input.token_env;
   const host = input.host === "github" || input.host === "gitlab" ? input.host : undefined;
+  const tokenEnvs = buildTokenEnvs(input.tokenEnvs ?? input.token_envs, origins);
   return {
     allowedOrigins: origins,
+    tokenEnvs,
     ...(baseUrl !== undefined ? { baseUrl } : {}),
     ...(tokenEnv !== undefined ? { tokenEnv } : {}),
     ...(host !== undefined ? { host } : {}),
   };
+}
+
+/**
+ * Check `token_envs` at boot. A malformed entry throws, so a
+ * misconfiguration surfaces when the harness starts. An entry is never
+ * quoted: an operator who pasted a token here, or wrote `$GITHUB_TOKEN`
+ * (which the bundle resolves to the token itself), would otherwise see it
+ * printed.
+ */
+function buildTokenEnvs(
+  raw: unknown,
+  origins: ReadonlySet<string>,
+): ReadonlyMap<string, ReadonlySet<string> | null> {
+  const out = new Map<string, ReadonlySet<string> | null>();
+  if (raw === undefined || raw === null) return out;
+  const checkName = (name: unknown, where: string): string => {
+    if (!isEnvName(name) || looksLikePastedSecret(name) || looksLikeAToken(name)) {
+      throw new CodehostPermissionError(
+        `${TOKEN_ENVS_KEY} lists environment variable NAMES (such as GITHUB_TOKEN, written without a $); ${where} is not one, and has not been echoed back`,
+      );
+    }
+    return name;
+  };
+  if (Array.isArray(raw)) {
+    raw.forEach((name, index) => out.set(checkName(name, `entry ${index + 1}`), null));
+    return out;
+  }
+  if (typeof raw !== "object") {
+    throw new CodehostPermissionError(
+      `${TOKEN_ENVS_KEY} must be a list of variable names, or a map from a variable name to the origins its token may be sent to`,
+    );
+  }
+  Object.entries(raw as Record<string, unknown>).forEach(([key, bound], index) => {
+    const name = checkName(key, `key ${index + 1}`);
+    if (!Array.isArray(bound) || bound.length === 0) {
+      throw new CodehostPermissionError(
+        `${TOKEN_ENVS_KEY}.${name} must list the origins its token may be sent to`,
+      );
+    }
+    const set = new Set<string>();
+    for (const origin of bound) {
+      const canonical = canonicalizeOrigin(String(origin));
+      if (!origins.has(canonical)) {
+        throw new CodehostPermissionError(
+          `${TOKEN_ENVS_KEY}.${name} lists ${canonical}, which is not in allowed_origins`,
+        );
+      }
+      set.add(canonical);
+    }
+    out.set(name, set);
+  });
+  return out;
 }
 
 /** Replace the process-global config. Codegen calls this at boot. */
@@ -718,6 +790,72 @@ export function resolveToken(
 }
 
 /**
+ * The token ONE call sends, and only to where it may go.
+ *
+ * The variable is `tokenEnv` from the call, else `token_env` from the
+ * codehost tool_config. A call may only name `token_env` itself or a
+ * variable listed in `token_envs`; anything else is refused before the
+ * environment is read, so a call cannot send another process secret (a
+ * provider key, a deploy token) as a bearer token, nor learn whether one is
+ * set (flag-truth-5#11, security-10#8).
+ *
+ * The token is also held to the origins it was configured for, checked
+ * against the origin of the API root this call will use: a `token_envs` map
+ * entry names them, and `token_env` belongs to `base_url`'s origin when the
+ * operator set one. So a call cannot point a self-hosted instance's token
+ * at another allowed host by passing its own `baseUrl`.
+ */
+export function resolveCallToken(
+  inputName: string | undefined,
+  cfg: CodehostConfig,
+  baseOrigin: string,
+  env: Record<string, string | undefined> = process.env,
+): ResolvedToken {
+  const name = inputName ?? cfg.tokenEnv;
+  // The pasted-token and no-name refusals first: they must never quote.
+  if (name === undefined || name === "" || !ENV_NAME.test(name) || looksLikeAToken(name)) {
+    return resolveToken(name, env);
+  }
+  const allowed = [...(cfg.tokenEnv !== undefined ? [cfg.tokenEnv] : []), ...cfg.tokenEnvs.keys()];
+  const resolved = resolveCredentialEnv(name, {
+    allowed,
+    purpose: "tokenEnv",
+    configKey: TOKEN_ENVS_KEY,
+    env,
+  });
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      message:
+        resolved.code === "not-allowed"
+          ? `${resolved.reason} (the codehost tool_config's token_env is allowed too)`
+          : resolved.reason,
+    };
+  }
+  const bound = cfg.tokenEnvs.has(name)
+    ? (cfg.tokenEnvs.get(name) ?? null)
+    : name === cfg.tokenEnv && cfg.baseUrl !== undefined
+      ? new Set([originOfBase(cfg.baseUrl)])
+      : null;
+  if (bound !== null && !bound.has(baseOrigin)) {
+    return {
+      ok: false,
+      message: `the token in "${name}" may be sent only to ${[...bound].sort().join(", ")} (token_env belongs to the codehost tool_config's base_url; a ${TOKEN_ENVS_KEY} map entry names the origins for its variable), and this call's baseUrl is ${baseOrigin} — nothing was sent`,
+    };
+  }
+  return { ok: true, token: resolved.value };
+}
+
+/** The canonical origin of an API root, or its text when it is not a URL. */
+export function originOfBase(baseUrl: string): string {
+  try {
+    return canonicalizeOrigin(baseUrl);
+  } catch {
+    return baseUrl;
+  }
+}
+
+/**
  * A function that scrubs a secret out of anything on its way back to the
  * caller.
  *
@@ -811,6 +949,13 @@ export type OpenOptions = {
   readonly signal: AbortSignal;
   readonly cfg: CodehostConfig;
   readonly maxRedirects?: number;
+  /**
+   * The canonical origin the call's token is for. When given, a request to
+   * any other origin carries no credential header, at every hop — so a
+   * `rel="next"` page URL that names another allowed origin is fetched
+   * without the token, as a redirect there already is.
+   */
+  readonly credentialOrigin?: string | undefined;
 };
 
 export type OpenResult = {
@@ -856,6 +1001,14 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     assertNoUserinfo(current);
     assertOriginAllowed(current, o.cfg);
+    if (o.credentialOrigin !== undefined && currentOrigin !== o.credentialOrigin) {
+      for (const name of Object.keys(headers)) {
+        if (CREDENTIAL_HEADERS.has(name.toLowerCase())) {
+          delete headers[name];
+          credentialsDropped = true;
+        }
+      }
+    }
     // The call's own signal bounds the lookup; DNS_TIMEOUT_MS is the backstop
     // for a caller that opened no deadline at all.
     const pinnedIp = await assertNotSsrf(current.hostname, o.signal);

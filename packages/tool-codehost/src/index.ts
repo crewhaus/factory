@@ -97,9 +97,10 @@ import {
   byString,
   describeFailure,
   json,
+  originOfBase,
   redactorFor,
+  resolveCallToken,
   resolveCodehostConfig,
-  resolveToken,
   startDeadline,
 } from "./net";
 
@@ -136,7 +137,7 @@ const tokenEnvSchema = z
   .min(1)
   .optional()
   .describe(
-    "NAME of the environment variable holding the API token — never the token itself, which is not accepted as an argument and is refused, unquoted, if one is passed here",
+    "NAME of the environment variable holding the API token — never the token itself, which is not accepted as an argument and is refused, unquoted, if one is passed here. Defaults to the codehost tool_config's token_env; a call may name only that or a variable listed in its token_envs",
   );
 
 const timeoutSchema = z
@@ -228,7 +229,8 @@ async function withCall(
   // is a mistake to report, not a reason to go looking for a secret.
   const baseProblem = baseUrlProblem(baseUrl);
   if (baseProblem !== null) return baseProblem;
-  const token = resolveToken(input.tokenEnv ?? cfg.tokenEnv);
+  const tokenOrigin = originOfBase(baseUrl);
+  const token = resolveCallToken(input.tokenEnv, cfg, tokenOrigin);
   if (!token.ok) return token.message;
   const redact = redactorFor(token.token);
   const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
@@ -237,6 +239,7 @@ async function withCall(
     host,
     baseUrl,
     token: token.token,
+    tokenOrigin,
     deadline,
     maxBytes: input.maxBytes ?? DEFAULT_MAX_BYTES,
     redact,
