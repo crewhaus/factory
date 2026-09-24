@@ -148,7 +148,11 @@ robots.txt matching, HMAC signatures, JSON path reading, backoff arithmetic
 and certificate shaping. `src/net.ts` is the gate. `src/index.ts` wraps them
 as tools. `src/paths.ts` is the workspace-containment check, copied from
 `@crewhaus/tool-fsx`, that `DownloadFile` passes every caller-supplied path
-through.
+through before it makes the request. The write itself goes through
+`@crewhaus/tool-safety/fs`'s `writeFileSafe`: a temp created exclusively,
+under a random name, beside the destination, and renamed into place, so a
+link planted where the temp will be cannot carry the bytes out of the
+workspace.
 
 The tests use real servers: `Bun.serve({ port: 0 })` on 127.0.0.1, never a
 public address, never a mocked `fetch`. A stubbed transport would prove

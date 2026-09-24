@@ -46,13 +46,13 @@ import {
   resolveNs,
   resolveTxt,
 } from "node:dns/promises";
-import { lstatSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import * as path from "node:path";
+import { lstatSync } from "node:fs";
 import { connect as tlsConnect } from "node:tls";
 import type { DetailedPeerCertificate } from "node:tls";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { redactKnownSecrets, redactKnownSecretsDeep } from "@crewhaus/tool-safety/env";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { decodeBody } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { formatDn, summarizeCert } from "./lib/cert";
@@ -94,7 +94,7 @@ import {
   startDeadline,
 } from "./net";
 import type { AuthProfile, Deadline, HttpConfig } from "./net";
-import { ToolPermissionError, resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 export {
   HttpPermissionError,
@@ -891,8 +891,6 @@ export const httpBatch: RegisteredTool = buildTool({
 // download
 // ---------------------------------------------------------------------------
 
-let partCounter = 0;
-
 export const downloadFile: RegisteredTool = buildTool({
   name: "DownloadFile",
   operativeArgs: [
@@ -961,9 +959,6 @@ export const downloadFile: RegisteredTool = buildTool({
     }
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
-    // A distinct partial name per call so two concurrent downloads into the
-    // same directory cannot clobber each other's in-flight bytes.
-    const partial = `${target.real}.crewhaus-part-${process.pid}-${partCounter++}`;
     try {
       const opened = await openRequest({
         url,
@@ -992,9 +987,21 @@ export const downloadFile: RegisteredTool = buildTool({
       if (input.expectedSha256 !== undefined && digest !== input.expectedSha256.toLowerCase()) {
         return `checksum mismatch: expected ${input.expectedSha256.toLowerCase()}, got ${digest} — nothing was written`;
       }
-      mkdirSync(path.dirname(target.real), { recursive: true });
-      writeFileSync(partial, raw.bytes);
-      renameSync(partial, target.real);
+      // The bytes go to a temp created O_EXCL|O_NOFOLLOW under a random name
+      // beside the destination, and are renamed into place. 0.7.0 wrote a
+      // name anyone could predict (`<dest>.crewhaus-part-<pid>-<n>`) with a
+      // plain open, so a link planted there carried the download out of the
+      // workspace, or truncated a file outside through a hard link, while
+      // the result reported the in-workspace path (security-8#13). Parent
+      // directories are created one at a time, each contained; a link at the
+      // leaf is followed only while it stays inside the workspace, and a
+      // FIFO, device or directory there is refused.
+      const written = writeFileSafe(workspaceRoot(), input.path, raw.bytes, {
+        overwrite: input.overwrite === true,
+        createParents: true,
+        leafSymlink: "follow-contained",
+      });
+      if (!written.ok) return `${written.reason} — nothing was written`;
       const contentType = opened.res.headers.get("content-type");
       return json({
         path: target.rel,
@@ -1009,7 +1016,6 @@ export const downloadFile: RegisteredTool = buildTool({
       return describeFailure(err, deadline);
     } finally {
       deadline.cancel();
-      rmSync(partial, { force: true });
     }
   }),
 });
