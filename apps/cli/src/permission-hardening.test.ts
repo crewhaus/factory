@@ -282,6 +282,14 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
         rules(["alwaysAllow", "Grep(src/**)"]),
       ),
     ).toBe("ask");
+    // Leaving `path` out searches the whole workspace, so it is read as ".".
+    expect(
+      await gate("Grep", { pattern: "src/x|password" }, rules(["alwaysAllow", "Grep(src/**)"])),
+    ).toBe("ask");
+    // Control: a search that really is under src/ is allowed.
+    expect(
+      await gate("Grep", { pattern: "src/x", path: "src" }, rules(["alwaysAllow", "Grep(src/**)"])),
+    ).toBe("allow");
   });
 });
 

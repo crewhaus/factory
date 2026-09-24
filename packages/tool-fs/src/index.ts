@@ -442,10 +442,11 @@ export const grep: RegisteredTool = buildTool({
   concurrencySafe: true,
   // Both fields are operative: a `Grep(src/**)` allow needs `path` in src/
   // AND the regex to match, so a regex cannot carry an out-of-scope path;
-  // a `Grep(*password*)` deny fires on the regex alone.
+  // a `Grep(*password*)` deny fires on the regex alone. Leaving `path` out
+  // searches the whole workspace, so a rule reads it as ".".
   operativeArgs: [
     { field: "pattern", kind: "text" },
-    { field: "path", kind: "path" },
+    { field: "path", kind: "path", default: "." },
   ],
   execute: async (input) => {
     const root = process.cwd();

@@ -90,7 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **An argument-scoped allow must cover every argument it is about.** For
   Read, Write and Edit that is `path` alone. For Grep it is the regex AND the
   path, so `Grep(src/**)` no longer allows a search just because its path is
-  under `src/`. To allow searching, keep the bare `Grep` allow (the builtin
+  under `src/`, and a search with no `path` counts as a search of the whole
+  workspace. To allow searching, keep the bare `Grep` allow (the builtin
   default) and deny what must stay out, e.g. `alwaysDeny Grep(.env)`.
 - **Paths and URLs in rules are matched where the tool will act.** A path is
   resolved against the workspace first — `src/../.git` is `.git`, a symlinked
