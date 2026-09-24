@@ -425,7 +425,7 @@ import {
 // Item 3 (G32) — plugin activation. `crewhaus run` activates the spec's
 // `plugins:` (and the `--plugins` override) in-process exactly like a compiled
 // bundle's boot (`renderPlugins` in @crewhaus/target-cli).
-import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";
+import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";
 // Adaptive model routing — `crewhaus route status|reset` inspects/clears the
 // per-(routeKey, model) reward scoreboard behind `agent.model_pool`; advise
 // mines the same scoreboard into pool-policy suggestions.
@@ -4475,9 +4475,7 @@ async function runRunCli(
   if (pluginNames.length > 0) {
     const activated = await activatePlugins({
       names: pluginNames,
-      ...createDefaultPluginRuntime({
-        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
-      }),
+      ...createBootPluginRuntime(),
     });
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;
@@ -5852,9 +5850,7 @@ async function buildServeRuntime(
   if (pluginNames.length > 0) {
     const activated = await activatePlugins({
       names: pluginNames,
-      ...createDefaultPluginRuntime({
-        allowUnsigned: process.env["CREWHAUS_PLUGIN_ALLOW_UNSIGNED"] === "1",
-      }),
+      ...createBootPluginRuntime(),
     });
     pluginSkillDirs = activated.skillDirs;
     pluginTools = activated.tools;

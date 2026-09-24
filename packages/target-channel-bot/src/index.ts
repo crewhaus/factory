@@ -672,11 +672,11 @@ function renderPlugins(ir: IrChannelV0): {
   return {
     hasAny: true,
     imports: [
-      `import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";`,
+      `import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";`,
     ],
     activateBoot: `  const __plugins = await activatePlugins({
     names: ${JSON.stringify(names)},
-    ...createDefaultPluginRuntime({ allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1" }),
+    ...createBootPluginRuntime(),
   });`,
     registerBoot: `  for (const __t of __plugins.tools) {
     if (defaultCatalog.get(__t.name) !== undefined) {

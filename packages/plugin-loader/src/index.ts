@@ -1,7 +1,7 @@
-import { verify } from "node:crypto";
-import { realpathSync, statSync } from "node:fs";
+import { createPublicKey, verify } from "node:crypto";
+import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve as resolvePath, sep } from "node:path";
+import { delimiter, join, resolve as resolvePath, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type PluginRegistry, createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
@@ -85,6 +85,11 @@ export type PluginLoaderOptions = {
    * signatures.
    */
   readonly allowUnsigned?: boolean;
+  /**
+   * Where a dev-mode downgrade is reported: every plugin loaded without a
+   * verified signature under `allowUnsigned`. Defaults to stderr.
+   */
+  readonly warn?: (line: string) => void;
   /**
    * Override for tests: load + parse a manifest file. Defaults to
    * reading via `Bun.file` + `JSON.parse`.
@@ -179,12 +184,28 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
     }
   }
 
+  const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+
   function verifySignature(manifest: PluginManifest): boolean {
     if (manifest.signature === undefined) {
-      if (allowUnsigned) return false;
+      if (allowUnsigned) {
+        warn(
+          `[plugins] "${manifest.name}" is unsigned and loads only because CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1 — development only`,
+        );
+        return false;
+      }
       throw new PluginLoaderError(
         `plugin manifest "${manifest.name}" is unsigned and allowUnsigned is false`,
       );
+    }
+    if (anchors.length === 0 && allowUnsigned) {
+      // Dev mode with nothing to check against: the signature cannot be
+      // verified either way, so the plugin is loaded as unverified — the same
+      // standing as an unsigned one — rather than refused for being signed.
+      warn(
+        `[plugins] "${manifest.name}" is signed, but no trust anchor is configured to check it; it loads unverified only because CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1 — development only`,
+      );
+      return false;
     }
     const sig = manifest.signature;
     if (sig.algorithm !== "ed25519") {
@@ -408,6 +429,140 @@ export function createDefaultPluginRuntime(opts: DefaultPluginRuntimeOptions = {
     trustedRoots: [opts.pluginsDir ?? paths.pluginsDir],
     ...(opts.trustAnchors !== undefined ? { trustAnchors: opts.trustAnchors } : {}),
     allowUnsigned: opts.allowUnsigned ?? false,
+  });
+  return { registry, loader };
+}
+
+/** Names a list of PEM files (or directories of them) the loader trusts, beside the default directory. */
+export const PLUGIN_TRUST_ANCHORS_ENV = "CREWHAUS_PLUGIN_TRUST_ANCHORS";
+/** `1` loads unsigned plugins. Development only; every boot says so. */
+export const PLUGIN_ALLOW_UNSIGNED_ENV = "CREWHAUS_PLUGIN_ALLOW_UNSIGNED";
+
+/** The documented trust-anchor directory: `~/.crewhaus/plugin-trust`, one `*.pem` per publisher. */
+export function defaultTrustAnchorDir(homeDir: string = homedir()): string {
+  return join(homeDir, ".crewhaus", "plugin-trust");
+}
+
+/**
+ * Read the operator's trust anchors: every `*.pem` in
+ * `~/.crewhaus/plugin-trust/`, and every file or directory listed in
+ * `CREWHAUS_PLUGIN_TRUST_ANCHORS` (separated like PATH). Each must hold one
+ * Ed25519 public key. A listed path that does not exist, or a file that is not
+ * such a key, is a problem the caller refuses to boot on — an anchor the
+ * operator meant to trust and silently lost is how signed plugins stop
+ * verifying. A missing default directory is not a problem.
+ */
+export function loadTrustAnchors(
+  opts: {
+    readonly env?: Readonly<Record<string, string | undefined>>;
+    readonly homeDir?: string;
+  } = {},
+): { readonly anchors: ReadonlyArray<TrustAnchor>; readonly problems: ReadonlyArray<string> } {
+  const env = opts.env ?? process.env;
+  const anchors: TrustAnchor[] = [];
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  const readKey = (file: string): void => {
+    const abs = resolvePath(file);
+    if (seen.has(abs)) return;
+    seen.add(abs);
+    let pem: string;
+    try {
+      pem = readFileSync(abs, "utf8");
+    } catch (err) {
+      problems.push(`cannot read trust anchor ${abs}: ${(err as Error).message}`);
+      return;
+    }
+    try {
+      const key = createPublicKey(pem);
+      if (key.asymmetricKeyType !== "ed25519") {
+        problems.push(
+          `trust anchor ${abs} is a ${key.asymmetricKeyType} key; plugins are signed with Ed25519`,
+        );
+        return;
+      }
+    } catch {
+      problems.push(`trust anchor ${abs} is not a PEM public key`);
+      return;
+    }
+    anchors.push({ name: abs, publicKeyPem: pem });
+  };
+  const readDir = (dir: string, required: boolean): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir)
+        .filter((f) => f.endsWith(".pem"))
+        .sort();
+    } catch (err) {
+      if (required)
+        problems.push(`cannot read trust anchor directory ${dir}: ${(err as Error).message}`);
+      return;
+    }
+    for (const f of entries) readKey(join(dir, f));
+  };
+  readDir(defaultTrustAnchorDir(opts.homeDir), false);
+  for (const raw of (env[PLUGIN_TRUST_ANCHORS_ENV] ?? "").split(delimiter)) {
+    const path = raw.trim();
+    if (path === "") continue;
+    let isDir = false;
+    try {
+      isDir = statSync(path).isDirectory();
+    } catch (err) {
+      problems.push(
+        `${PLUGIN_TRUST_ANCHORS_ENV} lists ${path}, which cannot be read: ${(err as Error).message}`,
+      );
+      continue;
+    }
+    if (isDir) readDir(path, true);
+    else readKey(path);
+  }
+  return { anchors, problems };
+}
+
+/**
+ * The plugin runtime every boot path uses — a compiled cli or channel bundle
+ * and `crewhaus run`. Trust anchors come from the documented places
+ * ({@link loadTrustAnchors}), so a signed plugin verifies. Unsigned plugins
+ * stay refused unless `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1`, and that downgrade
+ * is announced on every boot.
+ *
+ * With neither an anchor nor the downgrade, no plugin could ever load, so
+ * this refuses to boot and says what to do.
+ */
+export function createBootPluginRuntime(
+  opts: {
+    readonly env?: Readonly<Record<string, string | undefined>>;
+    readonly homeDir?: string;
+    readonly warn?: (line: string) => void;
+  } = {},
+): { readonly registry: PluginRegistry; readonly loader: PluginLoader } {
+  const env = opts.env ?? process.env;
+  const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const { anchors, problems } = loadTrustAnchors({
+    env,
+    ...(opts.homeDir !== undefined ? { homeDir: opts.homeDir } : {}),
+  });
+  if (problems.length > 0) {
+    throw new PluginLoaderError(`plugin trust anchors: ${problems.join("; ")}`);
+  }
+  const allowUnsigned = env[PLUGIN_ALLOW_UNSIGNED_ENV] === "1";
+  if (allowUnsigned) {
+    warn(
+      `[plugins] ${PLUGIN_ALLOW_UNSIGNED_ENV}=1 — unsigned plugins load without verification. Development only; unset it in production.`,
+    );
+  }
+  if (anchors.length === 0 && !allowUnsigned) {
+    throw new PluginLoaderError(
+      `no plugin can be verified: no trust anchor is configured. Put the publisher's Ed25519 public key (a .pem file) in ${defaultTrustAnchorDir(opts.homeDir)}, or list .pem files in ${PLUGIN_TRUST_ANCHORS_ENV}. For development only, ${PLUGIN_ALLOW_UNSIGNED_ENV}=1 loads unsigned plugins.`,
+    );
+  }
+  const paths = defaultPluginPaths(opts.homeDir);
+  const registry = createPluginRegistry({ registryPath: paths.registryPath, allowUnsigned: true });
+  const loader = createPluginLoader({
+    trustedRoots: [paths.pluginsDir],
+    trustAnchors: anchors,
+    allowUnsigned,
+    warn,
   });
   return { registry, loader };
 }

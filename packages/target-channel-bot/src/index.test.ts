@@ -420,9 +420,10 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     const c =
       fileMap({ ...MIN_IR, tools: ["read"], plugins: ["two-tools"] }).get("daemon.ts") ?? "";
     expect(c).toContain(
-      'import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";',
+      'import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";',
     );
     expect(c).toContain('names: ["two-tools"],');
+    expect(c).toContain("...createBootPluginRuntime(),");
     expect(c).toContain("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })");
     // Activation precedes skill discovery; registration follows the builtins
     // and precedes the agent's catalog snapshot.

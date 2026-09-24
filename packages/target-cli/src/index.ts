@@ -544,10 +544,12 @@ const __evaluation: RunEvaluation = {
  *     collision, and a plugin tool named after a built-in never throws
  *     `defaultCatalog.register`'s duplicate-name error and bricks boot.
  *
- * Trust: `createDefaultPluginRuntime` builds the loader against
- * `~/.crewhaus/plugins` with fail-closed signature verification;
- * `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1` downgrades to dev (unsigned) mode. Empty
- * pieces when the spec omits `plugins:`, keeping bundles byte-identical.
+ * Trust: `createBootPluginRuntime` builds the loader against
+ * `~/.crewhaus/plugins`, verifying each signature against the operator's trust
+ * anchors (`~/.crewhaus/plugin-trust/*.pem` and `CREWHAUS_PLUGIN_TRUST_ANCHORS`);
+ * `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1` downgrades to dev (unsigned) mode and says
+ * so on every boot. Empty pieces when the spec omits `plugins:`, keeping
+ * bundles byte-identical.
  */
 function renderPlugins(ir: IrV0): {
   imports: string[];
@@ -562,11 +564,11 @@ function renderPlugins(ir: IrV0): {
   return {
     hasAny: true,
     imports: [
-      `import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";`,
+      `import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";`,
     ],
     activateBoot: `const __plugins = await activatePlugins({
   names: ${JSON.stringify(names)},
-  ...createDefaultPluginRuntime({ allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1" }),
+  ...createBootPluginRuntime(),
 });`,
     registerBoot: `for (const __t of __plugins.tools) {
   if (defaultCatalog.get(__t.name) !== undefined) {

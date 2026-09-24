@@ -53,11 +53,11 @@ afterAll(() => {
 /** Spawn the CLI, optionally feeding `stdin` (then EOF), and capture streams. */
 async function runCli(
   args: ReadonlyArray<string>,
-  opts: { cwd?: string; stdin?: string } = {},
+  opts: { cwd?: string; stdin?: string; env?: Record<string, string> } = {},
 ): Promise<RunResult> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd: opts.cwd ?? SPAWN_CWD,
-    env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY },
+    env: { PATH: process.env["PATH"] ?? "", ...HERMETIC_REGISTRY, ...opts.env },
     stdin: opts.stdin !== undefined ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -295,20 +295,25 @@ describe("crewhaus serve --mcp", () => {
 
 describe("crewhaus run --plugins (item 3)", () => {
   // `--plugins <names>` reaches plugin activation before any model call: with no
-  // trust anchors + allowUnsigned off (the clean-env default), the loader fails
-  // CLOSED, which proves the override was threaded into activatePlugins (a spec
-  // with no plugins: and no flag never constructs the loader).
+  // trust anchors + allowUnsigned off (the clean-env default), the boot refuses
+  // and says where a publisher's key goes, which proves the override was
+  // threaded into activatePlugins (a spec with no plugins: and no flag never
+  // constructs the loader). HOME is a fresh directory, so a key the developer
+  // keeps in their own ~/.crewhaus/plugin-trust cannot change the answer.
   test("threads the override into activation (fails closed with no trust anchors)", async () => {
-    const r = await runCli([
-      "run",
-      CLI_SPEC,
-      "--plugins",
-      "__definitely_not_installed__",
-      "--prompt",
-      "hi",
-    ]);
-    expect(r.exitCode).not.toBe(0);
-    expect(r.stderr + r.stdout).toContain("plugin-loader");
+    const home = mkdtempSync(join(tmpdir(), "crewhaus-plugins-home-"));
+    try {
+      const r = await runCli(
+        ["run", CLI_SPEC, "--plugins", "__definitely_not_installed__", "--prompt", "hi"],
+        { env: { HOME: home } },
+      );
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain(
+        `no plugin can be verified: no trust anchor is configured. Put the publisher's Ed25519 public key (a .pem file) in ${join(home, ".crewhaus", "plugin-trust")}`,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

@@ -1547,12 +1547,14 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
   test("plugins: list → activates them and registers contributed tools on the catalog", () => {
     const c = emitCli(baseIr({ plugins: ["acme-tools", "beta-pack"] })).files[0]?.content ?? "";
     expect(c).toContain(
-      'import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";',
+      'import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";',
     );
     // Names are emitted verbatim, in load order.
     expect(c).toContain('names: ["acme-tools","beta-pack"]');
-    // Fail-closed loader, dev opt-out via env.
-    expect(c).toContain('allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1"');
+    // The operator's trust anchors and the announced dev opt-in both come from
+    // the one boot runtime `crewhaus run` uses too (extension-path#0).
+    expect(c).toContain("...createBootPluginRuntime(),");
+    expect(c).not.toContain("allowUnsigned");
     // Contributed tools land on the shared catalog, first-party wins collisions.
     expect(c).toContain("for (const __t of __plugins.tools)");
     expect(c).toContain("defaultCatalog.register(__t);");
