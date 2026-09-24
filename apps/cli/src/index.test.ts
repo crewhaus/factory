@@ -1327,7 +1327,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
   test("a typo equidistant from a read-only and a mutating tool is NOT auto-applied; prints a suggestion", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     const original =
-      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reit\n";
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools:\n  - Reit\n";
     writeFileSync(specPath, original);
     const result = await runCli(["lint", specPath, "--fix"], {
       env: { ANTHROPIC_API_KEY: "test" },
@@ -1336,9 +1336,10 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(readFileSync(specPath, "utf-8")).toBe(original);
     // A suggestion is printed naming both candidates, not a silent rewrite.
     expect(result.stdout).toContain("suggestion:");
+    // Candidates are the spec keys a tools: list takes (shape-reach#6).
     expect(result.stdout).toContain("Reit");
-    expect(result.stdout).toContain("Read");
-    expect(result.stdout).toContain("Edit");
+    expect(result.stdout).toContain('"read"');
+    expect(result.stdout).toContain('"edit"');
     expect(result.stdout).toContain("ambiguous");
     expect(result.stdout).not.toContain("fixed: tool");
   });
@@ -1349,14 +1350,43 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     // ambiguity, so --fix should still rewrite it in place.
     writeFileSync(
       specPath,
-      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reed\n",
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools:\n  - Reed\n",
     );
     const result = await runCli(["lint", specPath, "--fix"], {
       env: { ANTHROPIC_API_KEY: "test" },
     });
-    expect(result.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
-    expect(readFileSync(specPath, "utf-8")).toContain("- Read");
+    // The spec key, which compile accepts — not the registered name "Read",
+    // which a top-level tools: list rejects (shape-reach#6).
+    expect(result.stdout).toContain('fixed: tool "Reed" → "read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toContain("- read");
     expect(readFileSync(specPath, "utf-8")).not.toContain("Reed");
+    const compiled = await runCli(["compile", specPath, "-o", join(tmp, "fixed-out")], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(compiled.exitCode).toBe(0);
+  });
+
+  test("a bare word in a list that is not tools: is left alone", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original =
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ncli:\n  banner:\n    taglineMode: random\n    taglines:\n      - Reed\ntools:\n  - read\n";
+    writeFileSync(specPath, original);
+    await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+  });
+
+  test("lint reports a tool the spec's shape cannot compile, in compile's words", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools: [evmCall, nosuchtool]\n",
+    );
+    const result = await runCli(["lint", specPath], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain(
+      '[tool] tools: tool "evmCall" is a builtin, but the cli shape cannot run it',
+    );
+    expect(result.stdout).toContain('[tool] tools: unknown tool "nosuchtool"');
   });
 });
 
@@ -3672,5 +3702,52 @@ describe("crewhaus init --hybrid (0.6.0 §9.2)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// docs-claims#1 / shape-reach#10 — `tools suggest` reads the tools a spec
+// GRANTS the way compile does: from the shape's own site (agent.tools on
+// channel), with categories expanded. Before, it read the top-level
+// `tools:` raw, so a channel spec was told to add the tools it already had
+// and a category grant was invisible.
+describe("crewhaus tools suggest — reads grants the way compile does", () => {
+  const CHANNEL =
+    "name: ch\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    Use the Read filesystem tool and the Bash shell tool to ground answers.\n  tools:\n    - read\n    - bash\nchannels:\n  slack:\n    botToken: $SLACK_BOT_TOKEN\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\n";
+
+  test("a channel spec's agent.tools count as granted", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, CHANNEL);
+    const result = await runCli(["tools", "suggest", specPath, "--json"]);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      missing: Array<{ key: string }>;
+      present: Array<{ key: string }>;
+    };
+    expect(out.missing.map((m) => m.key)).not.toContain("read");
+    expect(out.missing.map((m) => m.key)).not.toContain("bash");
+    expect(out.present.map((m) => m.key)).toContain("bash");
+  });
+
+  test("a category grant covers the tools it expands to", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: v\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: Check the citations and the coverage report.\ntools: [all-verify, all-toolchain]\n",
+    );
+    const result = await runCli(["tools", "suggest", specPath, "--json"]);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      missing: Array<{ key: string }>;
+      unimplied: string[];
+    };
+    expect(out.missing.map((m) => m.key)).not.toContain("citationLint");
+    expect(out.missing.map((m) => m.key)).not.toContain("coverageSummary");
+    // …and they were implied, so the check above is not vacuous.
+    const present = (JSON.parse(result.stdout) as { present: Array<{ key: string }> }).present;
+    expect(present.map((m) => m.key)).toEqual(
+      expect.arrayContaining(["citationLint", "coverageSummary"]),
+    );
+    // The grant is reported per concrete key, never as the selector.
+    expect(out.unimplied).not.toContain("all-verify");
   });
 });

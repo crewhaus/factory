@@ -416,6 +416,35 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     expect(c).toContain("defaultCatalog.register(sendMessage);");
   });
 
+  test("plugins: activates at boot and registers after every first-party tool (extension-path#4)", () => {
+    const c =
+      fileMap({ ...MIN_IR, tools: ["read"], plugins: ["two-tools"] }).get("daemon.ts") ?? "";
+    expect(c).toContain(
+      'import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";',
+    );
+    expect(c).toContain('names: ["two-tools"],');
+    expect(c).toContain("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })");
+    // Activation precedes skill discovery; registration follows the builtins
+    // and precedes the agent's catalog snapshot.
+    const activate = c.indexOf("await activatePlugins(");
+    const discover = c.indexOf("discoverSkills(");
+    const builtin = c.indexOf("defaultCatalog.register(read);");
+    const register = c.indexOf("for (const __t of __plugins.tools)");
+    const snapshot = c.indexOf("tools: defaultCatalog.list()");
+    expect(activate).toBeGreaterThan(-1);
+    expect(activate).toBeLessThan(discover);
+    expect(builtin).toBeLessThan(register);
+    expect(register).toBeLessThan(snapshot);
+    // No plugins, no plugin plumbing.
+    expect(fileMap(MIN_IR).get("daemon.ts")).not.toContain("plugin-loader");
+  });
+
+  test("a 0.7.0 builtin and a code-execution tool resolve on the channel shape", () => {
+    const files = fileMap({ ...MIN_IR, tools: ["jsonQuery", "python"] });
+    expect(files.get("daemon.ts")).toContain('import { jsonQuery } from "@crewhaus/tool-data";');
+    expect(files.get("agent.ts")).toContain("sandboxAvailable: ((process.env.CREWHAUS_SANDBOX");
+  });
+
   test("rejects unknown tool names", () => {
     const irBad: IrChannelV0 = { ...MIN_IR, tools: ["nonexistent"] };
     expect(() => emitChannelBot(irBad)).toThrow(TargetEmitError);

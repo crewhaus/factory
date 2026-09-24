@@ -18,6 +18,7 @@ import {
   formatAuditLines,
   formatSuggestLines,
   formatToolListLines,
+  literalToolKeys,
   splitInstructionClauses,
   suggestTools,
 } from "./tools-cli";
@@ -317,6 +318,23 @@ describe("auditTools", () => {
     expect(unused.map((f) => f.key)).toEqual(["write"]);
   });
 
+  it("a key granted by a category is advised as an exclusion, never as a line to delete (docs-claims#1)", () => {
+    const result = auditTools({
+      sessions,
+      specTools: ["read", "write"],
+      literalKeys: new Set(["read"]),
+      usage,
+      toolMap: TOOL_MAP,
+      hasExplicitToolList: true,
+    });
+    const unused = result.findings.filter((f) => f.kind === "unused");
+    expect(unused).toEqual([{ kind: "unused", key: "write", name: "Write", viaCategory: true }]);
+    const text = formatAuditLines(result).join("\n");
+    expect(text).toContain("add -write to tools: to exclude it");
+    // An exclusion is never itself a finding.
+    expect(text).not.toContain("-gitCommit (");
+  });
+
   it("skips unused detection when no explicit list was declared", () => {
     const result = auditTools({
       sessions,
@@ -384,5 +402,17 @@ describe("auditTools", () => {
     });
     expect(result.findings).toEqual([]);
     expect(formatAuditLines(result)[0]).toContain("no tool-usage findings");
+  });
+});
+
+describe("literalToolKeys", () => {
+  it("collects named keys from every shape site, skipping selectors, exclusions and sub-agents", () => {
+    const spec = {
+      tools: ["all-git", "-gitCommit", "read"],
+      agent: { tools: ["bash"], sub_agents: { h: { tools: ["write"] } } },
+      steps: [{ tools: ["jsonQuery"] }],
+      models: { fast: { tools: ["grep"] } },
+    };
+    expect([...literalToolKeys(spec)].sort()).toEqual(["bash", "jsonQuery", "read"]);
   });
 });

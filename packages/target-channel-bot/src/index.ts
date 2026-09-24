@@ -2563,20 +2563,33 @@ try {
       ? `\n  // Loop contract 0.4 — spec-declared lifecycle hooks, layered below the\n  // settings.json-discovered ones (spec first; user → project later-wins).\n  const __specHooks: ReadonlyArray<HookDef> = ${JSON.stringify(specHooks)};`
       : "";
   const agentHooksExpr = specHooks !== undefined ? "[...__specHooks, ...__hooks]" : "__hooks";
+  // extension-path#4 — `plugins:` is wired on channel (renderPlugins was
+  // defined and never called, so a declared plugin silently did nothing).
+  // Activation runs before skill discovery so the plugins' skill dirs are
+  // discovered; their tools register after the MCP, sub-agent and knowledge
+  // boots, so a first-party tool always wins a name collision. All three
+  // pieces are empty without `plugins:`, keeping those bundles byte-identical.
+  const plugins = renderPlugins(ir);
+  const pluginsImport = plugins.imports.length > 0 ? `\n${plugins.imports.join("\n")}` : "";
+  const pluginsActivateBoot = plugins.hasAny ? `${plugins.activateBoot}\n` : "";
+  const pluginsRegisterBoot = plugins.hasAny
+    ? `\n  // Plugins (G32) — after every first-party tool is on the catalog.\n${plugins.registerBoot}\n`
+    : "";
+  const pluginSkillDirsArg = plugins.hasAny ? ", pluginDirs: __plugins.skillDirs" : "";
   const extensionImports = continuityOn
     ? `${hooksEngineImport}
-import { defaultCatalog } from "@crewhaus/tool-catalog";`
+import { defaultCatalog } from "@crewhaus/tool-catalog";${pluginsImport}`
     : `${hooksEngineImport}
 import { discoverSkills, createSkillTool } from "@crewhaus/skills-registry";
 import { loadCommands } from "@crewhaus/slash-commands";
-import { defaultCatalog } from "@crewhaus/tool-catalog";`;
+import { defaultCatalog } from "@crewhaus/tool-catalog";${pluginsImport}`;
   const extensionBoot = continuityOn
-    ? `  const __cwd = process.cwd();
+    ? `${pluginsActivateBoot}  const __cwd = process.cwd();
   const __hooks = await loadHooks({ cwd: __cwd });`
-    : `  const __cwd = process.cwd();
+    : `${pluginsActivateBoot}  const __cwd = process.cwd();
   const [__hooks, __skills, __slashCommands] = await Promise.all([
     loadHooks({ cwd: __cwd }),
-    discoverSkills({ cwd: __cwd }),
+    discoverSkills({ cwd: __cwd${pluginSkillDirsArg} }),
     loadCommands({ cwd: __cwd }),
   ]);
   if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
@@ -2728,7 +2741,7 @@ async function main(): Promise<void> {
 ${adapterConstructBlock}
 
 ${extensionBoot}${specHooksBoot}${auditApprovalsBoot}
-${controlPlaneBoot}${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}
+${controlPlaneBoot}${registerBlock}${mcpBoot}${subAgentBoot}${knowledgeBoot}${pluginsRegisterBoot}
   // Loop contract 0.4 (Batch E, G78) — per-spec cross-run prompt-cache
   // rotation store (§2.5). One small JSON record under
   // .crewhaus/prompt-cache/<spec>.json survives restarts so the daemon reuses

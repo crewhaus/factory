@@ -274,7 +274,9 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
   // name the shape cannot compile, a warning for a builtin that is inert.
   // After the scope gate, so an unvettable outward sink still reads as that.
   const shapeTools = checkShapeTools(ir);
-  if (shapeTools.errors.length > 0) throw new CompilerError(shapeTools.errors.join("\n"));
+  if (shapeTools.errors.length > 0) {
+    throw new CompilerError(shapeTools.errors.map((e) => `${e.path}: ${e.message}`).join("\n"));
+  }
   // G45 — the VALIDATING ir-passes (graph reachability + edge/message-schema
   // resolution, §47 chain referential integrity, memory/continuity
   // integrity) run UNCONDITIONALLY: they rewrite nothing, so they cannot
@@ -777,18 +779,18 @@ const PROFILE_FOR_TARGET: Readonly<Record<Spec["target"], ShapeToolProfile>> = S
  * The cf-worker flavour has its own gate, {@link assertCfWorkerToolsEdgeSafe}.
  */
 export function checkShapeTools(ir: IrNode): {
-  readonly errors: ReadonlyArray<string>;
+  readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>;
   readonly warnings: ReadonlyArray<CompileWarning>;
 } {
   const shape: ToolShape = ir.target;
   if (PROFILE_FOR_TARGET[ir.target].runtime !== "host") return { errors: [], warnings: [] };
-  const errors: string[] = [];
+  const errors: Array<{ path: string; message: string }> = [];
   const warnings: CompileWarning[] = [];
   for (const site of toolSitesOf(ir)) {
     for (const key of new Set(site.tools)) {
       const verdict = checkBuiltinTool(key, shape);
       if (verdict.kind === "unknown" || verdict.kind === "refused") {
-        errors.push(`${site.path}: ${verdict.message}`);
+        errors.push({ path: site.path, message: verdict.message });
       } else if (verdict.kind === "inert") {
         warnings.push({ code: "tool-unwired", path: site.path, message: verdict.message });
       }

@@ -25,7 +25,7 @@ import {
 // deploy/propose handlers (lazy boot); the approval gate helper needs the
 // registry/audit types for its signature.
 import type { AuditLog } from "@crewhaus/audit-log";
-import { SpecParseError, compile, lower } from "@crewhaus/compiler";
+import { type IrNode, SpecParseError, compile, lower, toolSitesOf } from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import {
   type CapabilityRequirement,
@@ -464,7 +464,15 @@ import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
-import { CATEGORIES, categoriesForTool, toolsInCategory } from "@crewhaus/tool-categories";
+import {
+  BUILTIN_TOOLS,
+  CATEGORIES,
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinToolsFor,
+  categoriesForTool,
+  toolsInCategory,
+} from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
@@ -1522,6 +1530,7 @@ import {
   formatSuggestLines,
   formatToolDetailLines,
   formatToolListLines,
+  literalToolKeys,
   nearestToolKeys,
   searchTools,
   suggestTools,
@@ -2294,27 +2303,20 @@ async function runCompile(args: ParsedArgs): Promise<void> {
 }
 
 /**
- * Item 41 — the tool-name resolver shared by `lint` and its `--fix` nearest-
- * match. Returns a `(name) => RegisteredTool | undefined` that resolves BOTH
- * the camelCase spec key (`webSearch`) and the registered PascalCase name
- * (`WebSearch`, used in sub-agent `tools:`), matching the strict-scope gate.
- * The camelCase keys + PascalCase names are also returned as the legal-name
- * candidate set for nearest-match typo suggestions.
+ * Item 41 — the tool-name resolver shared by `lint` (its scope audit) and the
+ * `--fix` capability signal. Returns a `(name) => RegisteredTool | undefined`
+ * that resolves BOTH the camelCase spec key (`webSearch`) and the registered
+ * PascalCase name (`WebSearch`, the spelling session logs and permission
+ * rules use), matching the strict-scope gate. The `--fix` candidates come
+ * from the spec's shape instead (see `applyLintFixes`).
  */
 async function buildToolResolver(): Promise<{
   resolve: (name: string) => RegisteredTool | undefined;
-  candidates: string[];
 }> {
   const toolMap = await loadToolMap();
   const byRegisteredName: Record<string, RegisteredTool> = {};
   for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
-  const candidates = [
-    ...new Set([...Object.keys(toolMap), ...Object.keys(byRegisteredName)]),
-  ].sort();
-  return {
-    resolve: (name) => toolMap[name] ?? byRegisteredName[name],
-    candidates,
-  };
+  return { resolve: (name) => toolMap[name] ?? byRegisteredName[name] };
 }
 
 /**
@@ -2359,14 +2361,10 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
     die(`could not read ${absSpec}: ${(err as Error).message}`);
   }
 
-  const { resolve: resolveTool, candidates } = await buildToolResolver();
+  const { resolve: resolveTool } = await buildToolResolver();
 
   if (args.flags["fix"] === true) {
-    const {
-      text: fixedYaml,
-      applied,
-      suggested,
-    } = applyLintFixes(yamlText, candidates, resolveTool);
+    const { text: fixedYaml, applied, suggested } = applyLintFixes(yamlText, resolveTool);
     if (applied.length > 0) {
       writeFileSync(absSpec, fixedYaml);
       for (const line of applied) process.stdout.write(`fixed: ${line}\n`);
@@ -2401,17 +2399,56 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
  */
 function applyLintFixes(
   yamlText: string,
-  toolCandidates: readonly string[],
   resolveTool: (name: string) => RegisteredTool | undefined,
 ): { text: string; applied: string[]; suggested: string[] } {
   const applied: string[] = [];
   const suggested: string[] = [];
   const getReadOnly = (candidateName: string): boolean | undefined =>
     resolveTool(candidateName)?.readOnly;
+  // shape-reach#6 — a typo is fixed to a spelling `compile` accepts on THIS
+  // spec's shape: the camelCase spec key, which every tools: list takes (a
+  // sub-agent list maps it to the registered name). Rewriting to the
+  // PascalCase name produced a spec compile then rejected. Read `target:`
+  // off the text, because the spec may not parse yet.
+  const target = /^target:\s*["']?([\w-]+)/m.exec(yamlText)?.[1];
+  const shape: ToolShape =
+    target !== undefined && Object.hasOwn(SHAPE_TOOL_PROFILES, target)
+      ? (target as ToolShape)
+      : "cli";
+  const shapeKeys = builtinToolsFor(shape);
+  const toolCandidates = shapeKeys.length > 0 ? shapeKeys : builtinToolsFor("cli");
+  const fixToken = (token: string): { to?: string; suggestion?: string } => {
+    const nearest = nearestToolName(token, toolCandidates, undefined, getReadOnly);
+    if (nearest?.kind === "match") return { to: nearest.name };
+    if (nearest?.kind === "ambiguous") {
+      const options = nearest.candidates.map((c) => `"${c}"`).join(" or ");
+      return {
+        suggestion: `tool "${token}" — did you mean ${options}? (not auto-fixed — ambiguous across tool capabilities)`,
+      };
+    }
+    return {};
+  };
   const lines = yamlText.split("\n");
+  // The block key the current list items belong to — only items of a
+  // `tools:` list are tool names; a bare word in any other list is not.
+  let listKey: { key: string; indent: number } | undefined;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (line === undefined) continue;
+    const indent = line.length - line.trimStart().length;
+    const trimmed = line.trim();
+
+    const blockKey = /^(\s*)([A-Za-z_][\w-]*):\s*(#.*)?$/.exec(line);
+    if (blockKey?.[2] !== undefined) {
+      listKey = { key: blockKey[2], indent };
+      continue;
+    }
+    const isItem = trimmed.startsWith("- ") || trimmed === "-";
+    if (trimmed !== "" && !trimmed.startsWith("#") && listKey !== undefined) {
+      // A list item belongs to the key above it at the same or a deeper
+      // indent; any other content at or left of the key closes the block.
+      if (!(isItem && indent >= listKey.indent) && indent <= listKey.indent) listKey = undefined;
+    }
 
     // Unsafe `name:` value → sanitised.
     const nameMatch = /^(\s*name:\s*)(.+?)(\s*)$/.exec(line);
@@ -2425,22 +2462,38 @@ function applyLintFixes(
       }
     }
 
-    // A `- toolName` list item that is an unknown tool near a legal name.
+    // A `- toolName` item of a `tools:` block list that is a typo.
     const toolMatch = /^(\s*-\s*)([A-Za-z]\w*)(\s*)$/.exec(line);
-    if (toolMatch?.[2] !== undefined) {
-      const nearest = nearestToolName(toolMatch[2], toolCandidates, undefined, getReadOnly);
-      if (nearest?.kind === "match") {
-        lines[i] = `${toolMatch[1]}${nearest.name}`;
-        applied.push(`tool "${toolMatch[2]}" → "${nearest.name}" (nearest match)`);
+    if (toolMatch?.[2] !== undefined && listKey?.key === "tools") {
+      const fix = fixToken(toolMatch[2]);
+      if (fix.to !== undefined) {
+        lines[i] = `${toolMatch[1]}${fix.to}`;
+        applied.push(`tool "${toolMatch[2]}" → "${fix.to}" (nearest match)`);
         continue;
       }
-      if (nearest?.kind === "ambiguous") {
-        const options = nearest.candidates.map((c) => `"${c}"`).join(" or ");
-        suggested.push(
-          `tool "${toolMatch[2]}" — did you mean ${options}? (not auto-fixed — ambiguous across tool capabilities)`,
-        );
+      if (fix.suggestion !== undefined) {
+        suggested.push(fix.suggestion);
         continue;
       }
+    }
+
+    // A flow-style `tools: [a, b]` list: fix each bare token in place.
+    const flow = /^(\s*(?:-\s*)?tools:\s*\[)([^\]]*)(\].*)$/.exec(line);
+    if (flow?.[2] !== undefined) {
+      const tokens = flow[2].split(",");
+      let changed = false;
+      const fixed = tokens.map((raw) => {
+        const token = raw.trim();
+        if (!/^[A-Za-z]\w*$/.test(token)) return raw;
+        const fix = fixToken(token);
+        if (fix.suggestion !== undefined) suggested.push(fix.suggestion);
+        if (fix.to === undefined) return raw;
+        changed = true;
+        applied.push(`tool "${token}" → "${fix.to}" (nearest match)`);
+        return raw.replace(token, fix.to);
+      });
+      if (changed) lines[i] = `${flow[1]}${fixed.join(",")}${flow[3]}`;
+      continue;
     }
 
     // A credential value that looks like a malformed env ref → $UPPER_SNAKE_CASE.
@@ -3623,6 +3676,25 @@ async function detectDefaultModel(): Promise<string | undefined> {
  */
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
   return loadBuiltinTools(CLI_RUNTIME_TOOL_KEYS);
+}
+
+/**
+ * The instruction text a spec's agents run on, for `tools suggest`: the
+ * agent's own, or every step's / node's / role's for the multi-agent shapes.
+ */
+function instructionsOf(ir: IrNode): string {
+  const parts: string[] = [];
+  const agent = (ir as { agent?: { instructions?: unknown } }).agent;
+  if (typeof agent?.instructions === "string") parts.push(agent.instructions);
+  for (const field of ["steps", "nodes", "roles"] as const) {
+    const units = (ir as unknown as Record<string, unknown>)[field];
+    if (!Array.isArray(units)) continue;
+    for (const unit of units) {
+      const text = (unit as { instructions?: unknown }).instructions;
+      if (typeof text === "string") parts.push(text);
+    }
+  }
+  return parts.join("\n");
 }
 
 /**
@@ -14444,6 +14516,25 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     const key = args.positional[0];
     if (key === undefined) die("usage: crewhaus tools show <tool>");
     const detail = buildToolDetail(key, toolMap, categoriesForTool);
+    const shapeOnly = BUILTIN_TOOLS[key];
+    if (detail === undefined && shapeOnly !== undefined) {
+      // shape-reach#8 — a shape-specific builtin (the evm family,
+      // sendMessage) is not in the cli set this command loads, but it is a
+      // builtin: say which shapes carry it instead of "no builtin named".
+      const shapes = shapeOnly.shapes?.join(", ") ?? "every shape";
+      const lines = [
+        `${key} (${shapeOnly.name}) — ${shapeOnly.package}`,
+        `  carried by: ${shapes}`,
+        ...(shapeOnly.withheld !== undefined ? [`  not available: ${shapeOnly.withheld}`] : []),
+        ...(shapeOnly.inert !== undefined ? [`  note: ${shapeOnly.inert}`] : []),
+      ];
+      if (jsonMode) {
+        process.stdout.write(`${JSON.stringify({ key, ...shapeOnly }, null, 2)}\n`);
+        return;
+      }
+      for (const line of lines) process.stdout.write(`${line}\n`);
+      return;
+    }
     if (detail === undefined) {
       const near = nearestToolKeys(key, Object.keys(toolMap));
       const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
@@ -14500,13 +14591,27 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     } catch (err) {
       die(`${specPath} did not parse: ${(err as Error).message}`);
     }
-    const specRecord = spec as unknown as Record<string, unknown>;
-    const agent = specRecord["agent"] as Record<string, unknown> | undefined;
-    const instructions = typeof agent?.["instructions"] === "string" ? agent["instructions"] : "";
-    const specTools = Array.isArray(specRecord["tools"])
-      ? (specRecord["tools"] as unknown[]).filter((t): t is string => typeof t === "string")
-      : [];
-    const result = suggestTools(instructions, specTools, CLI_RUNTIME_TOOL_KEYS, toolMap);
+    // docs-claims#1 / shape-reach#10 — read the tools the spec GRANTS, the
+    // way compile does: categories expanded, exclusions applied, from every
+    // site the spec's shape keeps them in (agent.tools, steps, nodes, roles).
+    // And never suggest a tool this shape cannot compile.
+    let ir: IrNode;
+    try {
+      ir = lower(spec);
+    } catch (err) {
+      die(`${specPath} did not lower: ${(err as Error).message}`);
+    }
+    const shape: ToolShape = ir.target;
+    const specTools = [...new Set(toolSitesOf(ir).flatMap((site) => site.tools))];
+    const instructions = instructionsOf(ir);
+    const shapeKeys = builtinToolsFor(shape);
+    if (shapeKeys.length === 0) {
+      process.stdout.write(
+        `the ${shape} shape registers no tool catalog, so there is nothing to suggest for ${specPath}\n`,
+      );
+      return;
+    }
+    const result = suggestTools(instructions, specTools, shapeKeys, toolMap);
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;
@@ -14526,28 +14631,34 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     // The cwd spec supplies the grant list; without one we still report the
     // failing/read-only findings mined purely from usage.
     let specTools: string[] = [];
+    let literalKeys: ReadonlySet<string> = new Set();
     let hasExplicitToolList = false;
     const specPath = join(process.cwd(), "crewhaus.yaml");
     if (existsSync(specPath)) {
       try {
-        const spec = parseSpec(readFileSync(specPath, "utf-8")) as unknown as Record<
-          string,
-          unknown
-        >;
-        if (Array.isArray(spec["tools"])) {
-          specTools = (spec["tools"] as unknown[]).filter(
-            (t): t is string => typeof t === "string",
-          );
-          hasExplicitToolList = true;
-        }
+        // docs-claims#1 — the grants compile sees: categories expanded,
+        // exclusions applied, from wherever the shape keeps its tools. An
+        // exclusion is never itself reported as an unused grant.
+        const spec = parseSpec(readFileSync(specPath, "utf-8"));
+        const sites = toolSitesOf(lower(spec));
+        specTools = [...new Set(sites.flatMap((site) => site.tools))];
+        literalKeys = literalToolKeys(spec);
+        hasExplicitToolList = sites.some((site) => site.tools.length > 0);
       } catch (err) {
         process.stderr.write(
-          `[tools audit] crewhaus.yaml did not parse (${(err as Error).message}) — auditing usage only\n`,
+          `[tools audit] crewhaus.yaml did not compile (${(err as Error).message}) — auditing usage only\n`,
         );
       }
     }
     const usage = buildToolUsage(sessions);
-    const result = auditTools({ sessions, specTools, usage, toolMap, hasExplicitToolList });
+    const result = auditTools({
+      sessions,
+      specTools,
+      literalKeys,
+      usage,
+      toolMap,
+      hasExplicitToolList,
+    });
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
       return;

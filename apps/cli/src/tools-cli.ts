@@ -29,7 +29,7 @@
 import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
 import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { builtinToolsFor } from "@crewhaus/tool-categories";
+import { builtinToolsFor, registeredToolName } from "@crewhaus/tool-categories";
 
 // -------- tools list --------
 
@@ -1177,6 +1177,36 @@ export function formatSuggestLines(result: ToolSuggestResult): string[] {
   return lines;
 }
 
+/**
+ * The tool keys a spec names LITERALLY in its shape tool lists — the entries
+ * that are neither an `all-<category>` selector nor an `-exclusion`.
+ * Sub-agent and model-profile lists are not grants and are skipped.
+ */
+export function literalToolKeys(spec: unknown): ReadonlySet<string> {
+  const out = new Set<string>();
+  const visit = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, path);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === "sub_agents" || (path === "" && key === "models")) continue;
+      if (key === "tools" && Array.isArray(value)) {
+        for (const entry of value) {
+          if (typeof entry === "string" && !entry.startsWith("-") && !entry.startsWith("all-")) {
+            out.add(entry);
+          }
+        }
+        continue;
+      }
+      visit(value, path === "" ? key : `${path}.${key}`);
+    }
+  };
+  visit(spec, "");
+  return out;
+}
+
 // -------- tools audit --------
 
 /** Per-tool aggregate over a session set's `tool_stats` lines, keyed by the
@@ -1226,8 +1256,17 @@ export const DEFAULT_AUDIT_THRESHOLDS: AuditThresholds = Object.freeze({
 });
 
 export type ToolAuditFinding =
-  /** A tool granted in the spec but never called across the mined sessions. */
-  | { readonly kind: "unused"; readonly key: string; readonly name: string }
+  /**
+   * A tool granted in the spec but never called across the mined sessions.
+   * `viaCategory` — granted by an `all-<category>` selector rather than by
+   * name, so the fix is an exclusion (`-key`), not deleting a line.
+   */
+  | {
+      readonly kind: "unused";
+      readonly key: string;
+      readonly name: string;
+      readonly viaCategory?: boolean;
+    }
   /** A granted tool whose error rate crosses the threshold. */
   | {
       readonly kind: "failing";
@@ -1265,7 +1304,14 @@ export type ToolAuditResult = {
  */
 export function auditTools(opts: {
   readonly sessions: ReadonlyArray<SessionEvents>;
+  /** Concrete keys the spec grants — categories expanded, exclusions applied. */
   readonly specTools: ReadonlyArray<string>;
+  /**
+   * The keys the spec names literally. A granted key missing from this set
+   * came from a category; its "unused" advice is to exclude it. Absent: every
+   * key is treated as literal (the pre-0.7.1 behaviour).
+   */
+  readonly literalKeys?: ReadonlySet<string>;
   readonly usage: ReadonlyMap<string, ToolUsageStats>;
   readonly toolMap: Readonly<Record<string, RegisteredTool>>;
   readonly hasExplicitToolList: boolean;
@@ -1276,7 +1322,8 @@ export function auditTools(opts: {
 
   // Index usage by the RegisteredTool `.name` (already the usage key) and
   // build a spec-key → name resolver.
-  const nameFor = (key: string): string => opts.toolMap[key]?.name ?? key;
+  const nameFor = (key: string): string =>
+    opts.toolMap[key]?.name ?? registeredToolName(key) ?? key;
 
   // (a) unused grants — only when the spec declared an explicit list.
   if (opts.hasExplicitToolList) {
@@ -1284,7 +1331,8 @@ export function auditTools(opts: {
       const name = nameFor(key);
       const stats = opts.usage.get(name);
       if (stats === undefined || stats.calls === 0) {
-        findings.push({ kind: "unused", key, name });
+        const viaCategory = opts.literalKeys !== undefined && !opts.literalKeys.has(key);
+        findings.push({ kind: "unused", key, name, ...(viaCategory ? { viaCategory } : {}) });
       }
     }
   }
@@ -1347,7 +1395,9 @@ export function formatAuditLines(result: ToolAuditResult): string[] {
     switch (f.kind) {
       case "unused":
         lines.push(
-          `[remove?] ${f.key} (${f.name}) — granted but never called in the mined sessions; drop it from tools: unless it's for a path these sessions didn't exercise`,
+          f.viaCategory === true
+            ? `[remove?] ${f.key} (${f.name}) — granted by a category but never called in the mined sessions; add -${f.key} to tools: to exclude it, unless it's for a path these sessions didn't exercise`
+            : `[remove?] ${f.key} (${f.name}) — granted but never called in the mined sessions; drop it from tools: unless it's for a path these sessions didn't exercise`,
         );
         break;
       case "failing":

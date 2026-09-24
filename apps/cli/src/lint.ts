@@ -1,4 +1,4 @@
-import { type IrNode, lower } from "@crewhaus/compiler";
+import { type IrNode, checkShapeTools, lower } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
 import { type Spec, SpecParseError, parseSpec } from "@crewhaus/spec";
@@ -106,6 +106,20 @@ export function runLint(
     }
   }
 
+  // Stage 3b — the compiler's own per-shape tool check (shape-reach#6): a
+  // name that is not a builtin, or a builtin this spec's shape cannot run,
+  // is an error worded exactly as `crewhaus compile` words it; a builtin that
+  // compiles but can never succeed, or a sub-agent tool its parent never
+  // registers, is a warning. Before this, lint said "clean" for tool lists
+  // compile rejected.
+  const shapeTools = checkShapeTools(ir);
+  for (const e of shapeTools.errors) {
+    findings.push({ message: e.message, path: e.path, severity: "error", rule: "tool" });
+  }
+  for (const w of shapeTools.warnings) {
+    findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
+  }
+
   // Stage 4 — tool-scope audit over the IR's tool names, sharing the exact
   // gate `compile --strict` uses. A resolvable built-in is audited by
   // capability/scope; an outward-by-name sink that resolves to no external
@@ -208,11 +222,11 @@ export type NearestToolMatch =
   | { readonly kind: "ambiguous"; readonly candidates: readonly string[] };
 
 /**
- * Nearest legal name(s) for a mistyped tool name. `candidates` is the union of
- * the legal spellings — the camelCase BUILTIN_TOOL_MAP keys AND the registered
- * PascalCase names (both forms are legal in a spec: top-level `tools:` uses the
- * camelCase key; a sub-agent `tools:` uses the PascalCase registered name). An
- * exact match returns undefined (nothing to fix). Otherwise the closest
+ * Nearest legal name(s) for a mistyped tool name. `candidates` are the legal
+ * spellings — the camelCase spec keys of the builtins the spec's shape can
+ * compile, which every `tools:` list accepts (a sub-agent list maps them to
+ * the registered names since 0.7.1). An exact match returns undefined
+ * (nothing to fix). Otherwise the closest
  * candidate(s) within `maxDistance` (default 3) are considered; undefined
  * means nothing is close enough (a genuinely unknown tool, not a typo).
  *
