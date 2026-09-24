@@ -1,7 +1,7 @@
 import { type IrNode, lower } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
-import { type Spec, SpecParseError, parseSpec } from "@crewhaus/spec";
+import { type Spec, SpecParseError, mcpServerNameWarnings, parseSpec } from "@crewhaus/spec";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -141,6 +141,18 @@ export function runLint(
       path: "mcp_servers.thredz",
       severity: "warning",
       rule: "thredz-override",
+    });
+  }
+
+  // Stage 5b — 0.7.1: an mcp_servers key with `__` in it, or `_` at either
+  // end, makes `mcp__<server>__<tool>` ambiguous. 0.7.0 ran such keys, so the
+  // spec still parses; `compile` prints the same warning.
+  for (const w of mcpServerNameWarnings(spec)) {
+    findings.push({
+      message: w.message,
+      path: w.path,
+      severity: "warning",
+      rule: "mcp-server-name",
     });
   }
 

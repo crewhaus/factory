@@ -113,6 +113,7 @@ import {
   type SpecTelegramChannel,
   type SpecWatchmeBlock,
   type SpecWhatsAppChannel,
+  mcpServerNameWarnings,
   parseSpec,
 } from "@crewhaus/spec";
 import { emitBatchWorker } from "@crewhaus/target-batch-worker";
@@ -574,6 +575,10 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
       ].join(" "),
     });
   }
+  // 0.7.1 — an `mcp_servers` key with `__` in it, or `_` at either end,
+  // makes `mcp__<server>__<tool>` ambiguous. 0.7.0 ran such keys, so it is a
+  // warning here rather than a parse error.
+  for (const w of mcpServerNameWarnings(spec)) out.push({ code: "mcp-server-name", ...w });
   return out;
 }
 

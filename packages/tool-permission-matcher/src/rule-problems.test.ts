@@ -60,6 +60,16 @@ describe("rules that name no tool", () => {
     expect(problems(["mcp__github__*"], ["github"])).toEqual([]);
     expect(problems(["mcp__*"])).toEqual([]);
   });
+
+  test("a declared server whose key contains `__` is found by its key, not by splitting", () => {
+    // 0.7.0 ran such keys; the first `__` is not where the server ends.
+    expect(problems(["mcp__gh__enterprise__*"], ["gh__enterprise"])).toEqual([]);
+    expect(problems(["mcp__gh__enterprise__echo"], ["gh__enterprise"])).toEqual([]);
+    expect(problems(["mcp___internal__echo"], ["_internal"])).toEqual([]);
+    expect(problems(["mcp__gh__enterprise__*"], ["github"])[0]?.message).toContain(
+      'the MCP server "gh"',
+    );
+  });
 });
 
 describe("argument patterns that cannot scope", () => {

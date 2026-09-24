@@ -44,12 +44,17 @@ import { z } from "zod";
 const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 /**
- * An MCP server name: letters, digits, `-` and single `_`, starting and
- * ending with a letter or digit. No `__`, which is the separator in
- * `mcp__<server>__<tool>` — with it, server `a` + tool `b__c` and server
- * `a__b` + tool `c` would register the same name.
+ * An MCP server name: the characters a tool name can carry — letters,
+ * digits, `-` and `_` — because it becomes part of every tool the server
+ * contributes (`mcp__<server>__<tool>`).
+ *
+ * A name that also contains `__`, or starts or ends with `_` or `-`, still
+ * registers: crewhaus 0.7.0 ran such servers and a patch release keeps them
+ * running. The spec warns about them (see `mcpServerNameWarning` in
+ * `@crewhaus/spec`), because `__` is also the separator — server `a` + tool
+ * `b__c` and server `a__b` + tool `c` register the same name.
  */
-export const MCP_SERVER_NAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]|_(?!_))*(?<!_)$/;
+export const MCP_SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 /** Model providers accept tool names up to this long. */
 export const MAX_TOOL_NAME_LENGTH = 64;
@@ -61,10 +66,12 @@ export const MAX_TOOL_NAME_LENGTH = 64;
  */
 export function mcpServerNameProblem(name: string): string | undefined {
   if (MCP_SERVER_NAME_PATTERN.test(name)) return undefined;
-  if (name.includes("__")) {
-    return `MCP server name "${name}" contains "__", which separates the server from the tool in mcp__<server>__<tool>. Use a single "_" or "-" instead, e.g. "${name.replace(/_{2,}/g, "-")}".`;
-  }
-  return `MCP server name "${name}" can only use letters, digits, "-" and "_", and must start and end with a letter or digit, e.g. "${name.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^[-_]+|[-_]+$/g, "") || "my-server"}".`;
+  const suggestion =
+    name
+      .replace(/[^A-Za-z0-9_-]+/g, "-")
+      .replace(/_{2,}/g, "-")
+      .replace(/^[-_]+|[-_]+$/g, "") || "my-server";
+  return `MCP server name "${name}" can only use letters, digits, "-" and "_", e.g. "${suggestion}".`;
 }
 
 export type McpToolFlags = {

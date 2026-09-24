@@ -177,7 +177,11 @@ export function permissionRuleProblems(
         }
       }
       if (toolGlob.startsWith("mcp__")) {
-        const server = toolGlob.slice(5).split("__")[0] ?? "";
+        const rest = toolGlob.slice(5);
+        // A declared key may itself contain `__` (0.7.0 ran such keys), so
+        // the server is found by the keys, not by splitting the name.
+        if ([...servers].some((s) => rest.startsWith(`${s}__`))) continue;
+        const server = rest.split("__")[0] ?? "";
         if (server !== "" && !GLOB_META.test(server) && !servers.has(server)) {
           report(
             "unknown-mcp-server",

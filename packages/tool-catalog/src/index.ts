@@ -718,9 +718,11 @@ export function mcpToolName(server: string, tool: string): string {
 export function legacyMcpToolName(name: string): string | undefined {
   if (!name.startsWith(MCP_TOOL_NAME_PREFIX)) return undefined;
   const rest = name.slice(MCP_TOOL_NAME_PREFIX.length);
-  const sep = rest.indexOf("__");
-  // A server name is never empty and never contains `__`.
-  if (sep <= 0 || sep + 2 >= rest.length) return undefined;
+  // The separator after a server of at least one character. An
+  // `mcp_servers` key may itself contain `__` or start with `_` (0.7.0 ran
+  // such keys), and the old spelling is still everything after `mcp__`.
+  const sep = rest.indexOf("__", 1);
+  if (sep < 1 || sep + 2 >= rest.length) return undefined;
   return rest;
 }
 

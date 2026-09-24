@@ -106,11 +106,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that came from a tool result, an MCP response, a sub-agent or another source
   other than the user is blocked, not only logged — the treatment `Fetch` and
   `WebFetch` already get.
-- **`mcp_servers` keys must fit in a tool name.** Use letters, digits, `-`
-  and single `_`, starting and ending with a letter or digit. A key with a
-  space, a dot or `__` now fails at compile time with a suggested rename,
-  instead of producing tool names every model request would reject. An MCP
-  tool whose full name would be longer than model providers accept (64
+- **`mcp_servers` keys must fit in a tool name.** A key can use letters,
+  digits, `-` and `_`. A key with any other character, such as a space or a
+  dot, now fails at compile time with a suggested rename; it produced tool
+  names every model request rejected. A key with `__` in it, or `_` at either
+  end, still works, but `compile` and `lint` warn about it: `__` also
+  separates the server from the tool, so two servers' tool names can collide.
+  Rename such a key, and rename the permission rules, hooks and `rate_limits`
+  that name it along with it. The warning does not fail `compile --strict`.
+  An MCP tool whose full name would be longer than model providers accept (64
   characters) is left out with a warning that says how short the server key
   must be; the server's other tools still register.
 - **Plan mode honours deny and ask rules.** It used to decide on the tool's

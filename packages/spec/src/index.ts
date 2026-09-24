@@ -209,12 +209,17 @@ const mcpServerConfigSchema = z.discriminatedUnion("transport", [stdioMcpConfig,
 /**
  * An `mcp_servers` key becomes part of every tool name the server contributes
  * (`mcp__<server>__<tool>`), and model providers accept only letters, digits,
- * `_` and `-` there. `__` is the separator, so it cannot appear inside the
- * server name, and neither can a leading or trailing `_` (either would make
- * the split ambiguous). Mirrors `MCP_SERVER_NAME_PATTERN` in `@crewhaus/tool-mcp`,
- * which refuses the same names at registration; apps/cli checks the two agree.
+ * `_` and `-` there, so any other character fails the spec. Mirrors
+ * `MCP_SERVER_NAME_PATTERN` in `@crewhaus/tool-mcp`, which refuses the same
+ * names at registration; apps/cli checks the two agree.
  */
-const MCP_SERVER_NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]|_(?!_))*(?<!_)$/;
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * The names {@link mcpServerNameWarning} is quiet about: no `__`, and no `_`
+ * at either end.
+ */
+const CLEAR_MCP_SERVER_NAME_RE = /^(?!_)(?:[A-Za-z0-9-]|_(?!_))+(?<!_)$/;
 
 function mcpServerNameSuggestion(name: string): string {
   const cleaned = name
@@ -224,13 +229,59 @@ function mcpServerNameSuggestion(name: string): string {
   return cleaned === "" ? "my-server" : cleaned;
 }
 
+/**
+ * Why an `mcp_servers` key that works should still be renamed, or undefined
+ * when there is nothing to say. `__` is the separator in
+ * `mcp__<server>__<tool>`, and a key containing it, or starting or ending
+ * with `_`, makes that split ambiguous: server `a` + tool `b__c` and
+ * server `a__b` + tool `c` are the same tool name.
+ */
+function mcpServerNameWarning(name: string): string | undefined {
+  if (!MCP_SERVER_NAME_RE.test(name) || CLEAR_MCP_SERVER_NAME_RE.test(name)) return undefined;
+  const suggestion = mcpServerNameSuggestion(name);
+  const why = name.includes("__")
+    ? 'contains "__", which also separates the server from the tool in mcp__<server>__<tool>'
+    : 'starts or ends with "_", which blurs where mcp__<server>__<tool> splits';
+  return `mcp_servers key "${name}" ${why}, so two servers' tool names can collide. Rename it, e.g. "${suggestion}", and rename the permission rules, hooks and rate_limits that name ${name}__… or mcp__${name}__… to match.`;
+}
+
+/**
+ * The `mcp_servers` keys in a parsed spec that work but should be renamed
+ * (see {@link mcpServerNameWarning}), wherever the shape nests the block.
+ * crewhaus 0.7.0 ran such keys, so `compile` and `lint` warn about them
+ * rather than fail.
+ */
+export function mcpServerNameWarnings(
+  spec: unknown,
+): Array<{ readonly path: string; readonly message: string }> {
+  const out: Array<{ path: string; message: string }> = [];
+  const visit = (node: unknown, at: string): void => {
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => visit(item, `${at}[${i}]`));
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      const path = at === "" ? key : `${at}.${key}`;
+      if (key !== "mcp_servers" || value === null || typeof value !== "object") {
+        visit(value, path);
+        continue;
+      }
+      for (const name of Object.keys(value)) {
+        const message = mcpServerNameWarning(name);
+        if (message !== undefined) out.push({ path: `${path}.${name}`, message });
+      }
+    }
+  };
+  visit(spec, "");
+  return out;
+}
+
 const mcpServerNameKey = z.string().superRefine((name, ctx) => {
   if (MCP_SERVER_NAME_RE.test(name)) return;
   ctx.addIssue({
     code: z.ZodIssueCode.custom,
-    message: name.includes("__")
-      ? `mcp_servers key "${name}" contains "__", which separates the server from the tool in mcp__<server>__<tool>. Rename it, e.g. "${mcpServerNameSuggestion(name)}".`
-      : `mcp_servers key "${name}" can only use letters, digits, "-" and "_", and must start and end with a letter or digit. Rename it, e.g. "${mcpServerNameSuggestion(name)}".`,
+    message: `mcp_servers key "${name}" can only use letters, digits, "-" and "_". Rename it, e.g. "${mcpServerNameSuggestion(name)}", and rename the permission rules, hooks and rate_limits that name it to match.`,
   });
 });
 
@@ -4113,6 +4164,15 @@ type SpecModelCheckContext = {
 const MODEL_DIRECTED_TOOLS = new Set(["Consult", "Escalate"]);
 const MCP_TOOL_SELECTOR_RE = /^mcp__([^_].*?)__(.+)$/;
 
+/** Does `selector` (`mcp__<server>__<tool or glob>`) start with a declared server? */
+function namesDeclaredMcpServer(selector: string, servers: ReadonlySet<string>): boolean {
+  for (const server of servers) {
+    const prefix = `mcp__${server}__`;
+    if (selector.startsWith(prefix) && selector.length > prefix.length) return true;
+  }
+  return false;
+}
+
 /** Levenshtein distance — the did-you-mean helper for unknown `$refs` / tags. */
 function editDistance(a: string, b: string): number {
   if (a === b) return 0;
@@ -4265,6 +4325,8 @@ function checkProfileTools(
   }
   for (const [i, tool] of tools.entries()) {
     if (tool.startsWith("mcp__")) {
+      // A declared key may itself contain `__`, so match the keys first.
+      if (namesDeclaredMcpServer(tool, ctx.mcpServers)) continue;
       const server = tool.match(MCP_TOOL_SELECTOR_RE)?.[1];
       if (server === undefined) {
         ctx.custom(

@@ -190,8 +190,20 @@ describe("a documented MCP deny rule fires (flag-truth-1#1)", () => {
 
 describe("every copy of the old-spelling rule agrees", () => {
   // Generated, not listed: servers and tools drawn from the grammar tool-mcp
-  // accepts, including remote tool names that themselves contain `__`.
-  const servers = ["a", "gh", "my-server", "my_server", "x1"];
+  // accepts, including remote tool names that themselves contain `__` and the
+  // server keys 0.7.0 ran that the spec now only warns about (`__` inside,
+  // `_` at an end).
+  const servers = [
+    "a",
+    "gh",
+    "my-server",
+    "my_server",
+    "x1",
+    "gh__enterprise",
+    "_internal",
+    "__lead",
+    "trail_",
+  ];
   const remotes = ["t", "create_issue", "a__b", "_lead", "trail_"];
   const names = servers.flatMap((s) =>
     remotes.map(
@@ -223,6 +235,37 @@ describe("every copy of the old-spelling rule agrees", () => {
     expect(toolListEntryNames("mcp__gh__t", "gh__t")).toBe(false);
     expect(matchesToolPattern("mcp__gh__t", "gh__t")).toBe(false);
   });
+
+  test("hooks-engine agrees with the other copies on every generated name", async () => {
+    // One hook per distinct old spelling; each name must fire exactly the
+    // hook for its own old spelling, and a name with none must fire nothing.
+    const legacies = [...new Set(names.map((n) => matcherLegacy(n) as string))];
+    const hooks = legacies.map((matcher) => ({
+      event: "pre-tool" as const,
+      matcher,
+      command: `printf '{"decision":"allow"}'`,
+    }));
+    const probes = [...names, "Read", "gh__create_issue", "mcp__", "mcp__x__", "mcp____t"];
+    const fired = await Promise.all(
+      probes.map(async (name) => ({
+        name,
+        matchers: (await runHooks("pre-tool", { name }, hooks)).map((r) => r.hook.matcher),
+      })),
+    );
+    let aliased = 0;
+    for (const { name, matchers } of fired) {
+      const legacy = matcherLegacy(name);
+      // A non-MCP probe (`gh__create_issue`) fires only a hook that names it
+      // exactly; an MCP name fires the hook for its old spelling.
+      const expected = legacies.filter((m) => m === name || m === legacy);
+      expect({ name, matchers }).toEqual({ name, matchers: expected });
+      if (legacy !== undefined && matchers.includes(legacy)) aliased++;
+    }
+    expect(aliased).toBe(names.length);
+    // One way only: a hook on the new spelling never fires for a non-MCP name.
+    const newSpelling = [{ event: "pre-tool" as const, matcher: "mcp__gh__t", command: "true" }];
+    expect(await runHooks("pre-tool", { name: "gh__t" }, newSpelling)).toEqual([]);
+  }, 20_000);
 
   test("a hook written against the old spelling still fires", async () => {
     const hook = {

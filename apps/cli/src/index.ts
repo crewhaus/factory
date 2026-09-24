@@ -2132,9 +2132,14 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // not a defect; and model-sunset is a wall-clock notice that would make a
   // 0.5.x pool that compiled under --strict yesterday fail today (past
   // `retiresOn` a `models:` profile is already a hard error at lower time).
+  //
+  // 0.7.1 — mcp-server-name is informational for the same reason as
+  // model-sunset: the key ran on 0.7.0, and a spec that compiled under
+  // --strict before the upgrade must still compile after it.
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
     "cli-autodistill-toolchain",
+    "mcp-server-name",
     "model-plan-candidate-only",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",

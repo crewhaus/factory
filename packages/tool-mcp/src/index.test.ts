@@ -444,16 +444,24 @@ describe("0.7.1 — one spelling for MCP tool names (flag-truth-1#1, extension-p
     const { host } = makeFakeHost({ serverName: "x", tools: [] });
     const remote = { name: "create_issue", inputSchema: {} };
     expect(() => buildMcpRegisteredTool(host, "my server.v2", remote, flags)).toThrow(
-      'MCP server name "my server.v2" can only use letters, digits, "-" and "_", and must start and end with a letter or digit, e.g. "my-server-v2".',
+      'MCP server name "my server.v2" can only use letters, digits, "-" and "_", e.g. "my-server-v2".',
     );
-    expect(() => buildMcpRegisteredTool(host, "a__b", remote, flags)).toThrow(
-      /contains "__", which separates the server from the tool in mcp__<server>__<tool>. Use a single "_" or "-" instead, e.g. "a-b"/,
-    );
-    for (const bad of ["_a", "a_", "-a", "", "a b"]) {
+    for (const bad of ["", "a b", "a.b", "é"]) {
       expect(mcpServerNameProblem(bad)).toBeDefined();
     }
     for (const good of ["a", "github", "my_server", "my-server", "thredz-ops", "A1"]) {
       expect(mcpServerNameProblem(good)).toBeUndefined();
+    }
+  });
+
+  test("a server name 0.7.0 ran still registers, with `__` inside or `_` at an end", () => {
+    // The spec warns about these (the split into server and tool is
+    // ambiguous), but 0.7.0 registered them and a patch release keeps them.
+    const { host } = makeFakeHost({ serverName: "x", tools: [] });
+    const remote = { name: "echo", inputSchema: {} };
+    for (const server of ["gh__enterprise", "_internal", "trail_", "__lead", "-dash"]) {
+      expect(mcpServerNameProblem(server)).toBeUndefined();
+      expect(buildMcpRegisteredTool(host, server, remote, flags).name).toBe(`mcp__${server}__echo`);
     }
   });
 

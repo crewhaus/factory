@@ -511,3 +511,80 @@ describe("compile() warnings — budget-degrade-outside-pool", () => {
     expect(result.warnings.map((w) => w.code)).toEqual(["budget-degrade-outside-pool"]);
   });
 });
+
+describe("compile() warnings — mcp-server-name (0.7.1)", () => {
+  const withServer = (key: string): string =>
+    [
+      "name: c",
+      "target: cli",
+      "agent:",
+      "  model: m",
+      "  instructions: i",
+      "mcp_servers:",
+      `  ${JSON.stringify(key)}:`,
+      "    transport: stdio",
+      "    command: mcp-fs",
+    ].join("\n");
+
+  test("a key 0.7.0 ran with `__` in it compiles, with a warning naming the key", () => {
+    const result = compile(withServer("gh__enterprise"));
+    expect(result.files.length).toBeGreaterThan(0);
+    expect(result.warnings.map((w) => [w.code, w.path])).toEqual([
+      ["mcp-server-name", "mcp_servers.gh__enterprise"],
+    ]);
+    expect(result.warnings[0]?.message).toContain('Rename it, e.g. "gh-enterprise"');
+  });
+
+  test("a key with `_` at an end warns too; an ordinary key does not", () => {
+    expect(compile(withServer("_internal")).warnings.map((w) => w.code)).toEqual([
+      "mcp-server-name",
+    ]);
+    expect(compile(withServer("my_server")).warnings).toEqual([]);
+  });
+});
+
+describe("model-profile MCP selectors and a key that contains `__` (0.7.1)", () => {
+  test("a profile selecting mcp__gh__enterprise__* compiles when gh__enterprise is declared", () => {
+    const result = compile(
+      [
+        "name: c",
+        "target: cli",
+        "agent:",
+        "  model: default",
+        "  instructions: i",
+        "models:",
+        "  default:",
+        "    model: claude-sonnet-5",
+        "    tools: [mcp__gh__enterprise__*]",
+        "mcp_servers:",
+        "  gh__enterprise:",
+        "    transport: stdio",
+        "    command: mcp-gh",
+      ].join("\n"),
+      { applyIrPasses: true },
+    );
+    expect(result.warnings.map((w) => w.code)).toEqual(["mcp-server-name"]);
+  });
+
+  test("so does a pool candidate's (the ir-pass check, not only the spec's)", () => {
+    const result = compile(
+      [
+        "name: c",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        "  model_pool:",
+        "    candidates:",
+        "      - { model: claude-sonnet-4-6, tags: [cheap], tools: [mcp__gh__enterprise__echo] }",
+        "      - { model: claude-opus-4-8, tags: [strong] }",
+        "mcp_servers:",
+        "  gh__enterprise:",
+        "    transport: stdio",
+        "    command: mcp-gh",
+      ].join("\n"),
+      { applyIrPasses: true },
+    );
+    expect(result.warnings.map((w) => w.code)).toContain("mcp-server-name");
+  });
+});

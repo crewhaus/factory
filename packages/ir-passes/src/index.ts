@@ -840,6 +840,12 @@ function checkCandidateTools(
   const blockTools = new Set((block.tools ?? []).map((t) => t.toLowerCase()));
   for (const [i, tool] of tools.entries()) {
     if (tool.startsWith("mcp__")) {
+      // A declared key may itself contain `__`, so match the keys first.
+      if (
+        [...mcpServers].some((s) => tool.startsWith(`mcp__${s}__`) && tool.length > s.length + 7)
+      ) {
+        continue;
+      }
       const server = tool.match(MCP_TOOL_SELECTOR_RE)?.[1];
       if (server === undefined) {
         throw new IrPassError(

@@ -428,13 +428,13 @@ export function buildHookEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.Pr
  * `<server>__<tool>` for an `mcp__<server>__<tool>` name, else undefined. The
  * same rule as `legacyMcpToolName` in `@crewhaus/tool-permission-matcher`,
  * copied because extension packages must not depend on tool packages;
- * runtime-core's `mcp-names.test.ts` checks the copies agree.
+ * apps/cli's `mcp-names.test.ts` checks the copies agree.
  */
 function legacyMcpName(name: string): string | undefined {
   if (!name.startsWith("mcp__")) return undefined;
   const rest = name.slice("mcp__".length);
-  const sep = rest.indexOf("__");
-  if (sep <= 0 || sep + 2 >= rest.length) return undefined;
+  const sep = rest.indexOf("__", 1);
+  if (sep < 1 || sep + 2 >= rest.length) return undefined;
   return rest;
 }
 

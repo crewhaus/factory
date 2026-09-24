@@ -539,7 +539,7 @@ export const toolInventory: RegisteredTool = buildTool({
     const unknown: string[] = [];
     for (const tool of resolved.tools) {
       if (tool.startsWith("mcp__")) {
-        const server = tool.slice("mcp__".length).split("__")[0] ?? "";
+        const server = mcpServerOf(tool, servers);
         mcp.push({ tool, server, declared: servers.has(server) });
         continue;
       }
@@ -563,6 +563,23 @@ export const toolInventory: RegisteredTool = buildTool({
     });
   },
 });
+
+/**
+ * The server an `mcp__<server>__<tool>` name belongs to: the longest declared
+ * `mcp_servers` key it starts with, because a key may itself contain `__`
+ * (0.7.0 ran such keys). With no declared key, the text up to the first
+ * `__` after the prefix.
+ */
+function mcpServerOf(tool: string, servers: ReadonlySet<string>): string {
+  const rest = tool.slice("mcp__".length);
+  let best: string | undefined;
+  for (const server of servers) {
+    if (rest.startsWith(`${server}__`) && (best === undefined || server.length > best.length)) {
+      best = server;
+    }
+  }
+  return best ?? rest.split("__")[0] ?? "";
+}
 
 export const permissionAudit: RegisteredTool = buildTool({
   name: "PermissionAudit",
