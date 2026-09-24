@@ -135,29 +135,44 @@ const permissionsBlock = z
 const mcpRequiredField = z.boolean().optional();
 
 /**
- * 0.6.0 §5.5 — MCP tool trust flags, NARROWING-ONLY. Every MCP tool is
- * `readOnly: false` today and therefore asks in default mode; `tool_flags`
- * lets a spec tighten what the runtime knows about a server's tools
- * (`defaults` for every tool on the server, `per_tool` for named ones).
+ * 0.6.0 §5.5 — MCP tool trust flags, NARROWING-ONLY. `tool_flags` lets a spec
+ * tighten what the runtime knows about a server's tools (`defaults` for every
+ * tool on the server, `per_tool` keyed by the server's own tool name). Since
+ * 0.7.1 it is lowered and enforced: `destructive: true` makes auto mode ask,
+ * `requireJustification: true` puts the tool behind the intent gate. The
+ * server's own `destructiveHint: true` / `readOnlyHint: false` annotations
+ * tighten the same way; the loosening hints are ignored.
  *
- * SECURITY: the enumerated key set is `{readOnly: true, destructive: true,
+ * SECURITY: the enumerated key set is `{destructive: true,
  * requireJustification: true}` and each value is the literal `true` — a spec
  * may never clear `requireJustification`, never set `scope: internal` on an
  * `mcp__*` tool and never touch `ioCapability`. Loosening any of those would
  * punch straight through the egress chokepoint, which keys on
  * `scope === "external"`, so the schema rejects the loosening direction at
  * parse time (defense in depth, mirroring `permissions.mode: bypass`).
+ *
+ * `readOnly` is NOT a tightening, and is refused: a read-only tool is one
+ * plan mode and auto mode run WITHOUT asking, so marking a remote tool
+ * read-only grants it. 0.6.0 accepted the key (and refused to compile any
+ * `tool_flags` at all), so no spec that compiled relied on it.
  */
 const MCP_TOOL_FLAG_FORBIDDEN_KEYS = ["scope", "ioCapability", "classifyOutput"] as const;
 
 const mcpToolFlagsEntrySchema = z
   .object({
-    readOnly: z.literal(true).optional(),
+    readOnly: z
+      .never({
+        errorMap: () => ({
+          message:
+            "mcp_servers.<name>.tool_flags cannot set readOnly: read-only is a grant, not a restriction — plan and auto mode run a read-only tool without asking. Remove it; to tighten a tool, set destructive: true or requireJustification: true",
+        }),
+      })
+      .optional(),
     destructive: z.literal(true).optional(),
     requireJustification: z.literal(true).optional(),
   })
   .strict(
-    `mcp_servers.<name>.tool_flags may only TIGHTEN a tool's trust flags (readOnly: true, destructive: true, requireJustification: true); ${MCP_TOOL_FLAG_FORBIDDEN_KEYS.join(", ")} and every other RegisteredTool property are tool-author facts a spec cannot override`,
+    `mcp_servers.<name>.tool_flags may only TIGHTEN a tool's trust flags (destructive: true, requireJustification: true); ${MCP_TOOL_FLAG_FORBIDDEN_KEYS.join(", ")} and every other RegisteredTool property are tool-author facts a spec cannot override`,
   );
 
 const mcpToolFlagsBlock = z

@@ -4,17 +4,38 @@
  * touch the underlying @modelcontextprotocol/sdk types.
  */
 
+/**
+ * Trust flags a spec sets on a server's tools (`mcp_servers.<n>.tool_flags`).
+ * They can only TIGHTEN: each is the literal `true`, and there is no
+ * `readOnly`, because read-only is a grant (plan and auto mode run a
+ * read-only tool without asking), not a restriction.
+ */
+export type McpToolTrustFlags = {
+  readonly destructive?: true;
+  readonly requireJustification?: true;
+};
+
+/** `defaults` for every tool on the server; `perTool` by remote tool name. */
+export type McpToolFlagsConfig = {
+  readonly defaults?: McpToolTrustFlags;
+  readonly perTool?: Readonly<Record<string, McpToolTrustFlags>>;
+};
+
 export type StdioServerConfig = {
   readonly transport: "stdio";
   readonly command: string;
   readonly args?: ReadonlyArray<string>;
   readonly env?: Readonly<Record<string, string>>;
+  /** See {@link McpToolFlagsConfig}. Read by `@crewhaus/tool-mcp` when it registers the tools. */
+  readonly toolFlags?: McpToolFlagsConfig;
 };
 
 export type SseServerConfig = {
   readonly transport: "sse";
   readonly url: string;
   readonly headers?: Readonly<Record<string, string>>;
+  /** See {@link McpToolFlagsConfig}. */
+  readonly toolFlags?: McpToolFlagsConfig;
 };
 
 export type McpServerConfig = StdioServerConfig | SseServerConfig;
@@ -39,6 +60,16 @@ export type McpToolDefinition = {
   readonly name: string;
   readonly description?: string;
   readonly inputSchema: unknown;
+  /**
+   * The server's own trust hints (MCP `ToolAnnotations`), kept only when they
+   * are booleans. They are claims by the server, not facts: `@crewhaus/tool-mcp`
+   * lets `destructiveHint: true` and `readOnlyHint: false` tighten a tool and
+   * ignores the loosening directions.
+   */
+  readonly annotations?: {
+    readonly readOnlyHint?: boolean;
+    readonly destructiveHint?: boolean;
+  };
 };
 
 /**

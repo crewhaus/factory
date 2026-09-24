@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { McpError } from "@crewhaus/errors";
-import type { McpClient, McpHost, McpServerConfig, McpToolDefinition } from "@crewhaus/mcp-host";
+import type {
+  McpClient,
+  McpHost,
+  McpServerConfig,
+  McpToolDefinition,
+  McpToolFlagsConfig,
+} from "@crewhaus/mcp-host";
 import { nextBackoffMs } from "@crewhaus/mcp-host";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -71,6 +77,22 @@ export type McpToolFlags = {
   readonly requireJustification?: boolean;
 };
 
+/**
+ * How a remote tool's trust flags are decided, most permissive first:
+ *
+ * 1. the caller's `defaults` / `perTool` (a runtime that knows the server,
+ *    such as the Thredz backend's justification-gated tools);
+ * 2. the spec's `mcp_servers.<n>.tool_flags`, carried on the server's config
+ *    (`McpServerConfig.toolFlags`) — `destructive` and `requireJustification`
+ *    can only be turned ON;
+ * 3. the server's own `ToolAnnotations`: `destructiveHint: true` makes the
+ *    tool destructive and `readOnlyHint: false` makes it not read-only; the
+ *    opposite hints are ignored, because a remote server's claim may tighten
+ *    a tool but never loosen it.
+ *
+ * A destructive tool is never read-only: read-only is a grant (plan and auto
+ * mode run such a tool without asking), so it cannot survive a tightening.
+ */
 export type RegisterMcpServerOptions = {
   /** Default flags applied to every tool from this server. */
   readonly defaults?: McpToolFlags;
@@ -140,7 +162,12 @@ function registerOne(
     else console.warn(`[mcp] ${reason} The server's other tools are registered.`);
     return;
   }
-  const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name));
+  const tool = buildMcpRegisteredTool(
+    host,
+    serverName,
+    remote,
+    resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
+  );
   catalog.register(tool);
   opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
 }
@@ -347,10 +374,24 @@ export function hashToolSchema(schema: unknown): string {
   return createHash("sha256").update(canonicalJson(schema)).digest("hex").slice(0, 16);
 }
 
-/** Build a drift snapshot (remote name → schema hash) from a live tool list. */
+/**
+ * Build a drift snapshot (remote name → schema hash) from a live tool list.
+ * A tool that carries trust hints hashes them with its schema, so a server
+ * that starts calling a tool destructive mid-run has it re-registered with
+ * the tighter flags. A tool without hints hashes exactly as before.
+ */
 export function snapshotTools(tools: ReadonlyArray<McpToolDefinition>): McpToolSnapshot {
   const map = new Map<string, string>();
-  for (const t of tools) map.set(t.name, hashToolSchema(t.inputSchema));
+  for (const t of tools) {
+    map.set(
+      t.name,
+      hashToolSchema(
+        t.annotations === undefined
+          ? t.inputSchema
+          : { inputSchema: t.inputSchema, annotations: t.annotations },
+      ),
+    );
+  }
   return map;
 }
 
@@ -767,23 +808,53 @@ export function narrowToolsForActiveSkill(
   return tools.filter((t) => allow.some((entry) => toolListEntryNames(entry, t.name)));
 }
 
-/** Fold `defaults` + `perTool` overrides into one resolved flag set. */
-function resolveFlags(
+/** The spec's `tool_flags` for a server, off the config it was added with. */
+function configuredFlags(host: McpHost, serverName: string): McpToolFlagsConfig | undefined {
+  return host.has(serverName) ? host.getClient(serverName).toolFlags : undefined;
+}
+
+/**
+ * Fold the caller's `defaults` + `perTool`, the spec's `tool_flags` and the
+ * server's annotations into one flag set — see {@link RegisterMcpServerOptions}
+ * for the order. The spec and the server can only tighten.
+ */
+export function resolveMcpToolFlags(
   opts: RegisterMcpServerOptions,
-  remoteName: string,
+  serverName: string,
+  remote: Pick<McpToolDefinition, "name" | "annotations">,
+  configured: McpToolFlagsConfig | undefined,
 ): {
   concurrencySafe: boolean;
   readOnly: boolean;
   destructive: boolean;
   requireJustification: boolean;
 } {
-  const override = opts.perTool?.[remoteName] ?? {};
+  const override = opts.perTool?.[remote.name] ?? {};
+  // A spec's per_tool key is the server's own tool name; the registered
+  // `mcp__<server>__<tool>` spelling is accepted too, since tightening by
+  // either name is safe.
+  const specPerTool =
+    configured?.perTool?.[remote.name] ??
+    configured?.perTool?.[namespacedToolName(serverName, remote.name)];
+  const hints = remote.annotations;
+  const destructive =
+    (override.destructive ?? opts.defaults?.destructive ?? false) ||
+    configured?.defaults?.destructive === true ||
+    specPerTool?.destructive === true ||
+    hints?.destructiveHint === true;
+  const requireJustification =
+    (override.requireJustification ?? opts.defaults?.requireJustification ?? false) ||
+    configured?.defaults?.requireJustification === true ||
+    specPerTool?.requireJustification === true;
+  const readOnly =
+    (override.readOnly ?? opts.defaults?.readOnly ?? false) &&
+    !destructive &&
+    hints?.readOnlyHint !== false;
   return {
     concurrencySafe: override.concurrencySafe ?? opts.defaults?.concurrencySafe ?? false,
-    readOnly: override.readOnly ?? opts.defaults?.readOnly ?? false,
-    destructive: override.destructive ?? opts.defaults?.destructive ?? false,
-    requireJustification:
-      override.requireJustification ?? opts.defaults?.requireJustification ?? false,
+    readOnly,
+    destructive,
+    requireJustification,
   };
 }
 
@@ -829,9 +900,13 @@ export async function registerMcpToolAliases(
         `mcp server "${serverName}" tool "${remote.name}" cannot be aliased onto its bare name — a tool named "${remote.name}" is already registered on the catalog (the local twin must not be registered when the ${serverName} backend owns the vocabulary)`,
       );
     }
-    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name), {
-      registeredName: remote.name,
-    });
+    const tool = buildMcpRegisteredTool(
+      host,
+      serverName,
+      remote,
+      resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
+      { registeredName: remote.name },
+    );
     catalog.register(tool);
     registered.push(remote.name);
     opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });

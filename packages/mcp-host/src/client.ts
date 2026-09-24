@@ -20,6 +20,7 @@ import type {
   McpClientState,
   McpServerConfig,
   McpToolDefinition,
+  McpToolFlagsConfig,
 } from "./types.js";
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 60_000;
@@ -110,6 +111,11 @@ export class McpClient {
   private connectedDeferred: PromiseDeferred<void> = createDeferred();
   private queuedWaiters = 0;
   private readonly toolsChangedHandlers = new Set<(client: McpClient) => void>();
+
+  /** The trust flags the spec set on this server's tools, from its config. */
+  get toolFlags(): McpToolFlagsConfig | undefined {
+    return this.config.toolFlags;
+  }
 
   constructor(name: string, config: McpServerConfig, opts: McpClientOptions = {}) {
     this.name = name;
@@ -348,11 +354,15 @@ export class McpClient {
     } catch (err) {
       throw new McpProtocolError(`mcp listTools "${this.name}" failed`, err);
     }
-    const tools: McpToolDefinition[] = result.tools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-    }));
+    const tools: McpToolDefinition[] = result.tools.map((t) => {
+      const annotations = trustHints((t as { annotations?: unknown }).annotations);
+      return {
+        name: t.name,
+        description: t.description,
+        inputSchema: t.inputSchema,
+        ...(annotations !== undefined ? { annotations } : {}),
+      };
+    });
     this.cachedTools = Object.freeze(tools);
     return this.cachedTools;
   }
@@ -664,6 +674,20 @@ export function makeSseFetch(
  * with `\n`; non-text blocks become deterministic placeholders so the model
  * sees a meaningful result rather than `[object Object]`.
  */
+/**
+ * The two trust hints a server's `ToolAnnotations` may carry that bear on a
+ * permission decision, kept only when they are booleans; anything else in the
+ * annotations (a title, idempotency, open-world) is dropped here.
+ */
+function trustHints(raw: unknown): McpToolDefinition["annotations"] {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const { readOnlyHint, destructiveHint } = raw as Record<string, unknown>;
+  const out: { readOnlyHint?: boolean; destructiveHint?: boolean } = {};
+  if (typeof readOnlyHint === "boolean") out.readOnlyHint = readOnlyHint;
+  if (typeof destructiveHint === "boolean") out.destructiveHint = destructiveHint;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function reduceCallResult(raw: {
   content?: ReadonlyArray<unknown>;
   isError?: boolean;

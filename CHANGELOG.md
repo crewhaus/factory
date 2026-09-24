@@ -209,6 +209,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now skipped and listed as unreadable. `ApprovalStatus` and
   `ApprovalsInbox` likewise no longer read a harness's `.env` through a link
   that leads outside; they report the session root as unknown instead.
+- **You can now mark an MCP server's tools destructive, and a server that
+  says a tool is destructive is believed.** In auto mode every MCP call ran
+  without asking — a remote `delete_repo` included — and
+  `mcp_servers.<name>.tool_flags`, the setting meant to change that, failed
+  to compile. It now compiles and takes effect:
+
+  ```yaml
+  mcp_servers:
+    github:
+      transport: stdio
+      command: github-mcp
+      tool_flags:
+        defaults: { requireJustification: true }
+        per_tool: { delete_repo: { destructive: true } }
+  ```
+
+  `destructive: true` makes auto mode ask; `requireJustification: true` puts
+  the tool behind the justification check. A server's own
+  `destructiveHint: true` annotation now makes that tool ask in auto mode
+  too, with no setting. The flags and hints can only make a tool stricter:
+  `readOnlyHint: true` is ignored, and `tool_flags` no longer accepts
+  `readOnly` (it would let plan and auto mode run the tool without asking) —
+  remove it, or use `destructive` / `requireJustification` instead.
 - **A deny written the way the docs say now fires on MCP tools.**
   `alwaysDeny mcp__github__*` matched nothing, because the tools were
   registered under another name, so in auto mode the call simply ran.
