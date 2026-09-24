@@ -1387,8 +1387,18 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
     // Skill-bundle convention: `<plugin-dir>/skills/` — a directory of
     // `<name>/SKILL.md` subdirs, exactly skills-registry's pluginDirs contract.
     // The entrypoint sits at `<plugin-dir>/index.js`, so its parent is the dir.
-    const skillDir = resolvePath(plugin.entrypointPath, "..", "skills");
-    if (exists(skillDir)) skillDirs.push(skillDir);
+    // Like index.js, it must really be inside the plugin's directory.
+    const pluginDir = dirname(plugin.entrypointPath);
+    const skillDir = join(pluginDir, "skills");
+    if (exists(skillDir)) {
+      const contained = resolveContained(pluginDir, "skills");
+      if (contained.ok) skillDirs.push(skillDir);
+      else {
+        note(
+          `plugin "${name}": its skills directory ${contained.code === "escapes-root" ? "is a link that leads outside the plugin's directory" : `cannot be used (${contained.reason})`}, so its skills were not loaded.`,
+        );
+      }
+    }
   }
   return { loaded, tools, channels, models, graders, targetEmitters, skillDirs, warnings };
 }

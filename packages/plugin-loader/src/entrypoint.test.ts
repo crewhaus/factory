@@ -10,12 +10,18 @@ import { generateKeyPairSync, sign } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
   type PluginManifest,
   entrypointDigest,
   manifestPayloadForSigning,
 } from "@crewhaus/plugin-sdk";
-import { MAX_PLUGIN_MANIFEST_BYTES, PluginLoaderError, createPluginLoader } from "./index";
+import {
+  MAX_PLUGIN_MANIFEST_BYTES,
+  PluginLoaderError,
+  activatePlugins,
+  createPluginLoader,
+} from "./index";
 
 let root: string;
 let outside: string;
@@ -198,5 +204,51 @@ describe("the manifest is read with a cap", () => {
       `failed to read plugin manifest at ${realpathSync(path)}: it is larger than ${MAX_PLUGIN_MANIFEST_BYTES} bytes`,
     );
     expect(seen.imported).toEqual([]);
+  });
+});
+
+describe("a plugin's skills/ must be inside its directory too (C170)", () => {
+  test("a skills/ linked outside the plugin is not loaded, and the boot says so", async () => {
+    writeFileSync(join(dir, "index.js"), "export default {};\n");
+    mkdirSync(join(outside, "skills", "evil"), { recursive: true });
+    writeFileSync(join(outside, "skills", "evil", "SKILL.md"), "---\nname: evil\n---\nbody\n");
+    symlinkSync(join(outside, "skills"), join(dir, "skills"));
+    const manifest = writeManifest({ name: "my-plugin", version: "1.0.0" });
+    const registry = createPluginRegistry({
+      registryPath: join(root, "registry.json"),
+      allowUnsigned: true,
+    });
+    await registry.register({
+      manifest: { name: "my-plugin", version: "1.0.0" },
+      sourcePath: manifest,
+    });
+    const { loader } = spyLoader();
+    const activated = await activatePlugins({ names: ["my-plugin"], registry, loader });
+    expect(activated.skillDirs).toEqual([]);
+    expect(activated.warnings).toEqual([
+      'plugin "my-plugin": its skills directory is a link that leads outside the plugin\'s directory, so its skills were not loaded.',
+    ]);
+  });
+
+  test("a skills/ inside the plugin, or linked within it, is collected", async () => {
+    writeFileSync(join(dir, "index.js"), "export default {};\n");
+    mkdirSync(join(dir, "bundled", "one"), { recursive: true });
+    symlinkSync("bundled", join(dir, "skills"));
+    const manifest = writeManifest({ name: "my-plugin", version: "1.0.0" });
+    const registry = createPluginRegistry({
+      registryPath: join(root, "registry.json"),
+      allowUnsigned: true,
+    });
+    await registry.register({
+      manifest: { name: "my-plugin", version: "1.0.0" },
+      sourcePath: manifest,
+    });
+    const activated = await activatePlugins({
+      names: ["my-plugin"],
+      registry,
+      loader: spyLoader().loader,
+    });
+    expect(activated.skillDirs).toEqual([join(realpathSync(dir), "skills")]);
+    expect(activated.warnings).toEqual([]);
   });
 });
