@@ -84,58 +84,67 @@ const IMPLICIT_CLOSE: Readonly<Record<string, ReadonlyArray<string>>> = {
 /** Elements a `</p>`-style stray close may not escape past. */
 const SCOPE_BARRIERS: ReadonlySet<string> = new Set(["table", "template", "html", "body"]);
 
-const NAMED_ENTITIES: Readonly<Record<string, string>> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-  nbsp: " ",
-  copy: "©",
-  reg: "®",
-  trade: "™",
-  hellip: "…",
-  mdash: "—",
-  ndash: "–",
-  lsquo: "‘",
-  rsquo: "’",
-  ldquo: "“",
-  rdquo: "”",
-  eacute: "é",
-  egrave: "è",
-  agrave: "à",
-  uuml: "ü",
-  ouml: "ö",
-  auml: "ä",
-  szlig: "ß",
-  ccedil: "ç",
-  ntilde: "ñ",
-  pound: "£",
-  euro: "€",
-  yen: "¥",
-  cent: "¢",
-  deg: "°",
-  middot: "·",
-  bull: "•",
-  times: "×",
-  divide: "÷",
-  laquo: "«",
-  raquo: "»",
-  sect: "§",
-  para: "¶",
-  dagger: "†",
-  permil: "‰",
-  prime: "′",
-  ne: "≠",
-  le: "≤",
-  ge: "≥",
-  minus: "−",
-  plusmn: "±",
-  frac12: "½",
-  shy: "",
-  zwnj: "",
-  zwj: "",
-};
+/**
+ * A null prototype, because the key is whatever name a page wrote between `&`
+ * and `;`: on an object literal `&constructor;`, `&valueOf;` and
+ * `&toString;` resolved to Object.prototype's functions and decoded into
+ * their source text ("function Object() { [native code] }") in the middle of
+ * the page's prose.
+ */
+const NAMED_ENTITIES: Readonly<Record<string, string>> = Object.freeze(
+  Object.assign(Object.create(null) as Record<string, string>, {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+    nbsp: " ",
+    copy: "©",
+    reg: "®",
+    trade: "™",
+    hellip: "…",
+    mdash: "—",
+    ndash: "–",
+    lsquo: "‘",
+    rsquo: "’",
+    ldquo: "“",
+    rdquo: "”",
+    eacute: "é",
+    egrave: "è",
+    agrave: "à",
+    uuml: "ü",
+    ouml: "ö",
+    auml: "ä",
+    szlig: "ß",
+    ccedil: "ç",
+    ntilde: "ñ",
+    pound: "£",
+    euro: "€",
+    yen: "¥",
+    cent: "¢",
+    deg: "°",
+    middot: "·",
+    bull: "•",
+    times: "×",
+    divide: "÷",
+    laquo: "«",
+    raquo: "»",
+    sect: "§",
+    para: "¶",
+    dagger: "†",
+    permil: "‰",
+    prime: "′",
+    ne: "≠",
+    le: "≤",
+    ge: "≥",
+    minus: "−",
+    plusmn: "±",
+    frac12: "½",
+    shy: "",
+    zwnj: "",
+    zwj: "",
+  }),
+);
 
 /** Expand character references. Unknown ones are left as written. */
 export function decodeEntities(text: string): string {
@@ -169,16 +178,38 @@ const element = (tag: string, attrs: Record<string, string>, parent: Element | n
   parent,
 });
 
+/**
+ * An attribute map with a null prototype. Attribute names are the page's
+ * choice: on a plain object, `constructor` and `__proto__` read as inherited
+ * members, so `[constructor]` matched every element, a real `constructor`
+ * attribute was dropped as "already present", and `__proto__="x"` set the
+ * map's prototype instead of storing a value.
+ */
+function attributeMap(): Record<string, string> {
+  return Object.create(null) as Record<string, string>;
+}
+
+/**
+ * The value of attribute `name` on `node`, reading own entries only.
+ *
+ * Every lookup by a name that came from a caller or a page goes through
+ * this, so an Element whose `attrs` some other code built as a plain `{}`
+ * still cannot answer with an Object.prototype member.
+ */
+export function attrOf(node: Element, name: string): string | undefined {
+  return Object.hasOwn(node.attrs, name) ? node.attrs[name] : undefined;
+}
+
 /** Parse an attribute list: quoted, unquoted, and bare attributes. */
 function parseAttributes(source: string): Record<string, string> {
-  const attrs: Record<string, string> = {};
+  const attrs = attributeMap();
   const re = /([^\s"'=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]*)))?/g;
   let m: RegExpExecArray | null = re.exec(source);
   while (m !== null) {
     const name = (m[1] as string).toLowerCase();
     const value = m[2] ?? m[3] ?? m[4] ?? "";
     // First wins, which is what browsers do with a repeated attribute.
-    if (!(name in attrs)) attrs[name] = decodeEntities(value);
+    if (!Object.hasOwn(attrs, name)) attrs[name] = decodeEntities(value);
     m = re.exec(source);
   }
   return attrs;
@@ -202,7 +233,7 @@ export function parseHtml(source: string, options: ParseOptions = {}): Element {
   }
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
 
-  const root = element("#root", {}, null);
+  const root = element("#root", attributeMap(), null);
   let current = root;
   let depth = 0;
   let i = 0;

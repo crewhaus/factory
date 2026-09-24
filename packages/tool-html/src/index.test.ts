@@ -316,3 +316,106 @@ describe("HtmlRecords", () => {
     );
   });
 });
+
+describe("names a page or a caller chooses never reach Object.prototype", () => {
+  // Each of these read an inherited member on 0.7.0.
+  const PROTO = ["constructor", "__proto__", "toString", "valueOf", "hasOwnProperty"];
+
+  test("an entity named like a prototype member is left as written, not decoded into source text", async () => {
+    const out = await call<{ text: string }>(htmlText, {
+      html: "<p>a &constructor; &valueOf; &toString; &hasOwnProperty; &__proto__; &amp;</p>",
+    });
+    // 0.7.0 put "function Object() { [native code] }" in the middle of the prose.
+    expect(out.text).toBe("a &constructor; &valueOf; &toString; &hasOwnProperty; &__proto__; &");
+  });
+
+  test("an attribute selector on a prototype name matches only elements that carry it", async () => {
+    let checked = 0;
+    for (const name of PROTO) {
+      const none = await call<{ count: number }>(htmlQuery, {
+        html: "<p>a</p><i>b</i>",
+        selector: `[${name}]`,
+      });
+      // 0.7.0: count 2 for constructor, and [constructor^=f] threw.
+      const prefix = await call<{ count: number }>(htmlQuery, {
+        html: "<p>a</p><i>b</i>",
+        selector: `[${name}^=f]`,
+      });
+      const some = await call<{ count: number }>(htmlQuery, {
+        html: `<p ${name}="fx">a</p><i>b</i>`,
+        selector: `[${name}^=f]`,
+      });
+      expect({ name, none: none.count, prefix: prefix.count, some: some.count }).toEqual({
+        name,
+        none: 0,
+        prefix: 0,
+        some: 1,
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(PROTO.length);
+  });
+
+  test("a real attribute with a prototype name is kept, readable, and first-wins", async () => {
+    const out = await call<{ values: Array<string | null>; matches: Array<{ attrs: object }> }>(
+      htmlQuery,
+      {
+        html: '<p constructor="kept" __proto__="x" tostring="t" constructor="second">a</p>',
+        selector: "p",
+        attribute: "constructor",
+      },
+    );
+    // 0.7.0: values [""] (the attribute was dropped as already present) and
+    // __proto__ vanished from attrs.
+    expect(out.values).toEqual(["kept"]);
+    expect(Object.entries(out.matches[0]?.attrs ?? {}).sort()).toEqual([
+      ["__proto__", "x"],
+      ["constructor", "kept"],
+      ["tostring", "t"],
+    ]);
+    const unset = await call<{ values: string[] }>(htmlQuery, {
+      html: "<p>a</p>",
+      selector: "p",
+      attribute: "constructor",
+    });
+    expect(unset.values).toEqual([""]);
+  });
+
+  test("an element named constructor is parsed like any other", async () => {
+    const out = await call<{ text: string }>(htmlText, {
+      html: "<p>hello</p><constructor>world</constructor><__proto__>x</__proto__>",
+    });
+    expect(out.text).toContain("hello");
+    expect(out.text).toContain("world");
+  });
+
+  test("HtmlRecords counts a prototype-named field's misses and never reads an inherited attribute", async () => {
+    const out = await call<{
+      records: Array<Record<string, string>>;
+      missing: Record<string, number>;
+    }>(htmlRecords, {
+      html: '<ul><li><a href="/1">one</a></li><li><a href="/2" constructor="c">two</a></li></ul>',
+      container: "li",
+      fields: { link: "a@constructor", constructor: "b", toString: "a" },
+    });
+    // 0.7.0: link came back from the prototype chain, and the misses of the
+    // `constructor` field were counted as "function Object()…1".
+    expect(out.records.map((r) => r["link"])).toEqual(["", "c"]);
+    expect(Object.entries(out.missing).sort()).toEqual([
+      ["constructor", 2],
+      ["link", 1],
+    ]);
+    expect(out.records[1]?.["toString"]).toBe("two");
+  });
+
+  test("HtmlStructuredData keeps a meta tag named __proto__ or constructor", async () => {
+    const out = await call<{ meta: object; openGraph: object }>(htmlStructuredData, {
+      html: '<meta name="__proto__" content="v"><meta name="constructor" content="c"><meta property="og:__proto__" content="o">',
+    });
+    expect(Object.entries(out.meta).sort()).toEqual([
+      ["__proto__", "v"],
+      ["constructor", "c"],
+    ]);
+    expect(Object.entries(out.openGraph)).toEqual([["__proto__", "o"]]);
+  });
+});

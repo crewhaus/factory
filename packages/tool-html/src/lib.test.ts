@@ -16,7 +16,15 @@ import {
   outline,
   readableText,
 } from "./lib/extract";
-import { decodeEntities, normalizeText, parseHtml, textOf, walk } from "./lib/parse";
+import {
+  type Element,
+  attrOf,
+  decodeEntities,
+  normalizeText,
+  parseHtml,
+  textOf,
+  walk,
+} from "./lib/parse";
 import { queryAll, queryFirst } from "./lib/select";
 
 const first = (html: string, selector: string) => queryFirst(parseHtml(html), selector);
@@ -398,5 +406,33 @@ describe("readable text", () => {
       "p",
       "b",
     ]);
+  });
+});
+
+describe("attribute reads are own-property reads", () => {
+  test("an element some other code built with a plain {} still answers only its own attributes", () => {
+    const root: Element = { type: "element", tag: "#root", attrs: {}, children: [], parent: null };
+    const p: Element = {
+      type: "element",
+      tag: "p",
+      attrs: { id: "x" },
+      children: [],
+      parent: root,
+    };
+    root.children.push(p);
+    expect([attrOf(p, "constructor"), attrOf(p, "toString"), attrOf(p, "id")]).toEqual([
+      undefined,
+      undefined,
+      "x",
+    ]);
+    expect(queryAll(root, "[constructor]")).toHaveLength(0);
+    expect(queryAll(root, "[constructor^=f]")).toHaveLength(0);
+    expect(queryAll(root, "#x")).toHaveLength(1);
+  });
+
+  test("parsed attribute maps have no prototype, and __proto__ is an ordinary key", () => {
+    const [p] = queryAll(parseHtml('<p __proto__="v">a</p>'), "p");
+    expect(Object.getPrototypeOf(p?.attrs)).toBeNull();
+    expect(attrOf(p as Element, "__proto__")).toBe("v");
   });
 });

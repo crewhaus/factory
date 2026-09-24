@@ -5,7 +5,7 @@
  * context window: what are the rows, where do the links go, what fields does
  * this form want, what does the page say about itself.
  */
-import { type Element, normalizeText, textOf, walk } from "./parse";
+import { type Element, attrOf, normalizeText, textOf, walk } from "./parse";
 import { createMatchContext, queryAll } from "./select";
 
 const cellText = (node: Element): string => normalizeText(textOf(node));
@@ -251,9 +251,12 @@ export function extractStructuredData(root: Element): StructuredData {
     }
   }
 
-  const openGraph: Record<string, string> = {};
-  const twitter: Record<string, string> = {};
-  const meta: Record<string, string> = {};
+  // Null prototypes: the keys are the page's meta names. On `{}` a
+  // `<meta name="__proto__">` set the map's prototype instead of an entry and
+  // vanished from the result.
+  const openGraph: Record<string, string> = Object.create(null);
+  const twitter: Record<string, string> = Object.create(null);
+  const meta: Record<string, string> = Object.create(null);
   for (const tag of queryAll(root, "meta")) {
     const key = (tag.attrs["property"] ?? tag.attrs["name"] ?? "").toLowerCase();
     const content = tag.attrs["content"];
@@ -299,9 +302,11 @@ export function extractRecords(
   // answered once for the whole recipe rather than once per container.
   const ctx = createMatchContext();
   const containers = queryAll(root, recipe.container, limit, ctx);
-  const missing: Record<string, number> = {};
+  // Null prototypes: the keys are the caller's field names, and on `{}` a
+  // field called `constructor` counted its misses as "function Object()…1".
+  const missing: Record<string, number> = Object.create(null);
   const records = containers.map((container) => {
-    const row: Record<string, string> = {};
+    const row: Record<string, string> = Object.create(null);
     for (const [field, spec] of Object.entries(recipe.fields)) {
       const at = spec.lastIndexOf("@");
       const selector = at === -1 ? spec : spec.slice(0, at);
@@ -315,7 +320,7 @@ export function extractRecords(
       const value =
         attribute === null || attribute === "text"
           ? normalizeText(textOf(found))
-          : (found.attrs[attribute.toLowerCase()] ?? "");
+          : (attrOf(found, attribute.toLowerCase()) ?? "");
       if (value === "") missing[field] = (missing[field] ?? 0) + 1;
       row[field] = value;
     }

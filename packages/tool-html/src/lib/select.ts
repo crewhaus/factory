@@ -12,7 +12,7 @@
  * `:nth-child(n)`, `:nth-of-type(n)` and `:not(simple)`.
  */
 import type { Element } from "./parse";
-import { walk } from "./parse";
+import { attrOf, walk } from "./parse";
 
 type AttrTest = {
   readonly name: string;
@@ -195,10 +195,12 @@ export function parseSelectorGroup(source: string): Selector[] {
 }
 
 const classesOf = (node: Element): string[] =>
-  (node.attrs["class"] ?? "").split(/\s+/).filter((c) => c !== "");
+  (attrOf(node, "class") ?? "").split(/\s+/).filter((c) => c !== "");
 
 function attrMatches(node: Element, test: AttrTest): boolean {
-  const raw = node.attrs[test.name];
+  // Own attributes only: `[constructor]` must not match every element, and
+  // `[constructor^=f]` must not call startsWith on a function.
+  const raw = attrOf(node, test.name);
   if (raw === undefined) return false;
   if (test.op === "exists") return true;
   const actual = test.insensitive ? raw.toLowerCase() : raw;
@@ -306,7 +308,7 @@ function previousElementSibling(node: Element, ctx: MatchContext): Element | nul
 
 function matchesSimple(node: Element, simple: Simple, ctx: MatchContext): boolean {
   if (simple.tag !== null && node.tag !== simple.tag) return false;
-  if (simple.id !== null && node.attrs["id"] !== simple.id) return false;
+  if (simple.id !== null && attrOf(node, "id") !== simple.id) return false;
   if (simple.classes.length > 0) {
     const have = classesOf(node);
     if (!simple.classes.every((c) => have.includes(c))) return false;

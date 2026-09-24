@@ -25,7 +25,7 @@ import {
   outline,
   readableText,
 } from "./lib/extract";
-import { type Element, normalizeText, parseHtml, textOf } from "./lib/parse";
+import { type Element, attrOf, normalizeText, parseHtml, textOf } from "./lib/parse";
 import { queryAll } from "./lib/select";
 import { resolveSafe } from "./paths";
 
@@ -109,7 +109,7 @@ export const htmlQuery: RegisteredTool = buildTool({
     const values = shown.map((node) =>
       input.attribute === undefined
         ? normalizeText(textOf(node))
-        : (node.attrs[input.attribute.toLowerCase()] ?? ""),
+        : (attrOf(node, input.attribute.toLowerCase()) ?? ""),
     );
     return json({
       from,
@@ -332,6 +332,7 @@ export const HTML_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
 export {
   type Element,
   type TextNode,
+  attrOf,
   normalizeText,
   parseHtml,
   textOf,
