@@ -41,6 +41,15 @@ The rules:
 | `oversizedFile` | warning | a file adding more than 800 lines |
 | `commentedCode` | warning | **off by default** — see below |
 
+`ticketPattern` replaces what counts as a ticket, and `machinePathPatterns`
+adds path shapes of your own. Both are regular expressions the caller writes,
+so each is screened before it is accepted (a shape that backtracks
+catastrophically, such as `(a+)+` or `(a|a)*`, is refused with the reason) and
+then run in `@crewhaus/tool-safety`'s regex worker under a deadline, never on
+the harness's own thread. A line the worker could not answer is listed under
+`undetermined` with a warning: it is neither a finding nor clean, so `clean`
+is not set.
+
 Disable any of them by name with `disable`, and turn the opt-in ones on with
 `enable`. An id that is not a rule is rejected by the schema rather than
 ignored, because a typo that silently disables nothing is how a team ends up
