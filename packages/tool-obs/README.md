@@ -48,7 +48,7 @@ after buffering is not a cap.
 | `AlertList` | The alerts currently firing | read-only |
 | `AlertAck` | Acknowledge one alert | destructive, justification-gated |
 | `StatusPagePost` | Publish an incident update | destructive, justification-gated |
-| `HealthProbe` | Check many endpoints under a concurrency cap and a required deadline | read-only |
+| `HealthProbe` | Check many endpoints under a concurrency cap and a required deadline; one the gate refused is counted as `refused`, not unhealthy | read-only |
 
 The outbound posture is `@crewhaus/tool-http`'s, carried over rather than
 re-derived: fail-closed origin allow-list (empty means deny all — there is no

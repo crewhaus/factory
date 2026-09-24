@@ -61,6 +61,32 @@ export class ObsPermissionError extends CrewhausError {
   }
 }
 
+/**
+ * The gate refused a request before sending it: a scheme, userinfo, an
+ * origin not in allowed_origins, or an address the SSRF check will not dial.
+ * It says nothing about the endpoint, which was never asked, so a probe
+ * reports it as refused, never as unhealthy.
+ *
+ * `redirectStatus` is set when the refusal came at a redirect hop: the
+ * endpoint DID answer, with that status, and the gate would not follow its
+ * `Location`. It is undefined when nothing was sent at all.
+ */
+export class ObsRefusedError extends ObsPermissionError {
+  constructor(
+    message: string,
+    readonly redirectStatus: number | undefined,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * The host's name did not resolve. The SSRF check raises it, but unlike a
+ * refusal it is a fact about the network, so it is not an
+ * {@link ObsRefusedError}.
+ */
+export class ObsUnresolvedError extends ObsPermissionError {}
+
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 600_000;
 export const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
@@ -452,7 +478,7 @@ export async function assertNotSsrf(hostname: string, signal?: AbortSignal): Pro
     if (err instanceof Error && err.name === "AbortError") throw err;
     if (signal?.aborted === true) throw abortError(signal);
     const msg = err instanceof Error ? err.message : String(err);
-    throw new ObsPermissionError(`SSRF: cannot resolve "${hostname}": ${msg}`);
+    throw new ObsUnresolvedError(`SSRF: cannot resolve "${hostname}": ${msg}`);
   }
   if (refused(resolved.address)) {
     throw new ObsPermissionError(
@@ -964,7 +990,8 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
   let method = o.method;
   let body = o.body;
 
-  for (let hop = 0; ; hop++) {
+  /** The gate, for the hop about to be sent; returns the address to pin. */
+  const gateHop = async (): Promise<string> => {
     if (current.protocol !== "http:" && current.protocol !== "https:") {
       throw new ObsPermissionError(
         `denied: scheme "${current.protocol}" — only http/https are allowed`,
@@ -972,7 +999,24 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     assertNoUserinfo(current);
     assertOriginAllowed(current, o.cfg);
-    const pinnedIp = await assertNotSsrf(current.hostname, o.signal);
+    return assertNotSsrf(current.hostname, o.signal);
+  };
+
+  /** The status of the answer whose Location led to this hop, if any. */
+  let redirectStatus: number | undefined;
+
+  for (let hop = 0; ; hop++) {
+    let pinnedIp: string;
+    try {
+      pinnedIp = await gateHop();
+    } catch (err) {
+      // Everything the gate refuses is a refusal, not a fact about the
+      // endpoint; a name that does not resolve is the one exception.
+      if (err instanceof ObsPermissionError && !(err instanceof ObsUnresolvedError)) {
+        throw new ObsRefusedError(err.message, redirectStatus);
+      }
+      throw err;
+    }
 
     const init: RequestInit = {
       method,
@@ -1036,6 +1080,7 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     await discard(res);
     redirects.push(safeUrlLabel(next));
+    redirectStatus = res.status;
     current = next;
     currentOrigin = nextOrigin;
   }

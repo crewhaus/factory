@@ -70,6 +70,7 @@ import {
   DEFAULT_MAX_BYTES,
   DEFAULT_TIMEOUT_MS,
   HttpPermissionError,
+  HttpRefusedError,
   MAX_MAX_BYTES,
   MAX_REDIRECTS,
   MAX_TIMEOUT_MS,
@@ -99,6 +100,8 @@ import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 export {
   HttpPermissionError,
+  HttpRefusedError,
+  HttpUnresolvedError,
   _resetHttpConfig,
   _setDnsLookup,
   _setRawFetch,
@@ -1143,7 +1146,7 @@ export const urlReachable: RegisteredTool = buildTool({
   name: "UrlReachable",
   operativeArgs: [{ field: "url", kind: "url" }],
   description:
-    "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one.",
+    "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one. A probe the allow-list or the SSRF check refuses was never sent, and comes back as reachable null with refused true, not as unreachable.",
   inputSchema: z.object({
     url: urlSchema,
     method: z.enum(["HEAD", "GET"]).optional().describe("default HEAD"),
@@ -1183,6 +1186,22 @@ export const urlReachable: RegisteredTool = buildTool({
         latencyMs,
       });
     } catch (err) {
+      if (err instanceof HttpRefusedError) {
+        // The gate stopped the probe, so it cannot say whether the endpoint
+        // is up. If the endpoint answered with a redirect the gate would not
+        // follow, THAT is a fact, and so is its status.
+        return json(
+          err.redirectStatus === undefined
+            ? { reachable: null, refused: true, error: err.message }
+            : {
+                reachable: true,
+                status: err.redirectStatus,
+                ok: null,
+                redirectRefused: err.message,
+                latencyMs: Date.now() - startedAt,
+              },
+        );
+      }
       return json({
         reachable: false,
         latencyMs: Date.now() - startedAt,
@@ -1198,7 +1217,7 @@ export const linkCheck: RegisteredTool = buildTool({
   name: "LinkCheck",
   operativeArgs: [{ field: "urls", kind: "url" }],
   description:
-    "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable.",
+    "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable. A URL the allow-list or the SSRF check refuses (or whose redirect it refuses), and one the sweep deadline left unchecked, is reported as refused or skipped with ok null, and counted apart from the broken links.",
   inputSchema: z.object({
     urls: z.array(urlSchema).min(1).max(100),
     method: z.enum(["HEAD", "GET"]).optional().describe("default HEAD"),
@@ -1221,8 +1240,14 @@ export const linkCheck: RegisteredTool = buildTool({
     const perRequest = input.perRequestTimeoutMs ?? 10_000;
     try {
       const results = await mapWithConcurrency(input.urls, input.concurrency ?? 4, async (raw) => {
-        if (overall.expired())
-          return { url: raw, ok: false, error: "skipped: the sweep deadline elapsed" };
+        if (overall.expired()) {
+          return {
+            url: raw,
+            ok: null,
+            skipped: true,
+            error: "skipped: the sweep deadline elapsed before this URL was checked",
+          };
+        }
         const url = parseUrl(raw);
         if (typeof url === "string") return { url: raw, ok: false, error: url };
         const deadline = startDeadline(
@@ -1250,6 +1275,17 @@ export const linkCheck: RegisteredTool = buildTool({
             ...(opened.finalUrl !== raw ? { finalUrl: opened.finalUrl } : {}),
           };
         } catch (err) {
+          if (err instanceof HttpRefusedError) {
+            // Not checked, so neither ok nor broken: the gate refused it
+            // (or refused the redirect it answered with).
+            return {
+              url: raw,
+              ok: null,
+              refused: true,
+              ...(err.redirectStatus !== undefined ? { status: err.redirectStatus } : {}),
+              error: err.message,
+            };
+          }
           return { url: raw, ok: false, error: describeFailure(err, deadline) };
         } finally {
           deadline.cancel();
@@ -1257,8 +1293,10 @@ export const linkCheck: RegisteredTool = buildTool({
       });
       return json({
         checked: results.length,
-        okCount: results.filter((r) => r.ok).length,
-        brokenCount: results.filter((r) => !r.ok).length,
+        okCount: results.filter((r) => r.ok === true).length,
+        brokenCount: results.filter((r) => r.ok === false).length,
+        refusedCount: results.filter((r) => "refused" in r).length,
+        skippedCount: results.filter((r) => "skipped" in r).length,
         results,
       });
     } finally {

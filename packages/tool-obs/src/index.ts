@@ -84,6 +84,7 @@ import {
   MAX_TIMEOUT_MS,
   type ObsConfig,
   ObsPermissionError,
+  ObsRefusedError,
   authHeaders,
   configuredOrigins,
   describeFailure,
@@ -103,6 +104,8 @@ import { type SafePath, ToolPermissionError, resolveSafe, toPosix } from "./path
 
 export {
   ObsPermissionError,
+  ObsRefusedError,
+  ObsUnresolvedError,
   _resetObsConfig,
   _setDnsLookup,
   _setRawFetch,
@@ -1735,7 +1738,7 @@ export const healthProbe: RegisteredTool = buildTool({
   name: "HealthProbe",
   operativeArgs: [{ field: "urls", kind: "url" }],
   description:
-    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have. The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
+    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have; one the allow-list or the SSRF check refused was never sent and comes back as refused, not unhealthy (both with ok null). The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
   inputSchema: z.object({
     urls: z
       .array(z.string().min(1))
@@ -1796,10 +1799,13 @@ export const healthProbe: RegisteredTool = buildTool({
 
     type Probe = {
       url: string;
-      ok: boolean;
+      /** null: not determined — the probe was skipped or refused. */
+      ok: boolean | null;
       status?: number;
       latencyMs?: number;
       skipped?: boolean;
+      /** The gate refused it (or the redirect it answered with); see error. */
+      refused?: boolean;
       /** Present only when a token exists: whether this probe carried it. */
       authenticated?: boolean;
       error?: string;
@@ -1812,7 +1818,7 @@ export const healthProbe: RegisteredTool = buildTool({
       if (deadline.expired()) {
         results[index] = {
           url: label,
-          ok: false,
+          ok: null,
           skipped: true,
           error: "the sweep deadline elapsed before this endpoint was probed",
         };
@@ -1850,6 +1856,18 @@ export const healthProbe: RegisteredTool = buildTool({
           ...(token.token === "" ? {} : { authenticated: carriesToken }),
         };
       } catch (err) {
+        if (err instanceof ObsRefusedError) {
+          // Never probed (or its redirect was not followed), so it is
+          // neither healthy nor unhealthy: say which, and why.
+          results[index] = {
+            url: label,
+            ok: null,
+            refused: true,
+            ...(err.redirectStatus !== undefined ? { status: err.redirectStatus } : {}),
+            error: redact(err.message),
+          };
+          return;
+        }
         results[index] = {
           url: label,
           ok: false,
@@ -1880,9 +1898,10 @@ export const healthProbe: RegisteredTool = buildTool({
     const probes = [...results].sort((a, b) => byString(a.url, b.url));
     return json({
       probed: probes.length,
-      healthy: probes.filter((p) => p.ok).length,
-      unhealthy: probes.filter((p) => !p.ok && p.skipped !== true).length,
+      healthy: probes.filter((p) => p.ok === true).length,
+      unhealthy: probes.filter((p) => p.ok === false).length,
       skipped: probes.filter((p) => p.skipped === true).length,
+      refused: probes.filter((p) => p.refused === true).length,
       deadlineMs: input.deadlineMs,
       probes,
     });

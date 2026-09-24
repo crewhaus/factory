@@ -1296,7 +1296,9 @@ describe("HeadRequest / UrlReachable / LinkCheck", () => {
     });
     expect(result.checked).toBe(3);
     expect(result.okCount).toBe(1);
-    expect(result.brokenCount).toBe(2);
+    // The 404 is broken; the URL the allow-list refused was never checked.
+    expect(result.brokenCount).toBe(1);
+    expect(result.refusedCount).toBe(1);
     expect(result.results.map((r: { url: string }) => r.url)).toEqual([
       `${origin}/json`,
       `${origin}/status/404`,

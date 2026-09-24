@@ -31,8 +31,8 @@ tool_config:
 | `DownloadFile` | Fetch to a contained path under a byte cap, with an optional sha256 verified before the file is kept |
 | `HeadRequest` | Existence, size, content type and caching headers without the body |
 | `HttpWaitFor` | Poll until a status or a JSON field predicate holds, within a required deadline |
-| `UrlReachable` | A bounded connectivity probe: status and latency |
-| `LinkCheck` | Check a list of URLs with a concurrency cap and a shared deadline |
+| `UrlReachable` | A bounded connectivity probe: status and latency. A probe the gate refused comes back as `refused`, never as unreachable |
+| `LinkCheck` | Check a list of URLs with a concurrency cap and a shared deadline; refused and skipped URLs are counted apart from broken ones |
 | `SseRead` | Collect server-sent events until a count, a terminator event, or a required deadline |
 | `WebhookSign` | HMAC signature header in the timestamped or plain-body scheme |
 | `WebhookVerify` | Constant-time verification that rejects a stale timestamp as a replay |

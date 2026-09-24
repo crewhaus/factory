@@ -3658,7 +3658,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "healthProbe",
     name: "HealthProbe",
     description:
-      "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have. The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
+      "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have; one the allow-list or the SSRF check refused was never sent and comes back as refused, not unhealthy (both with ok null). The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -4719,7 +4719,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "linkCheck",
     name: "LinkCheck",
     description:
-      "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable.",
+      "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable. A URL the allow-list or the SSRF check refuses (or whose redirect it refuses), and one the sweep deadline left unchecked, is reported as refused or skipped with ok null, and counted apart from the broken links.",
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -7958,7 +7958,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "urlReachable",
     name: "UrlReachable",
     description:
-      "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one.",
+      "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one. A probe the allow-list or the SSRF check refuses was never sent, and comes back as reachable null with refused true, not as unreachable.",
     readOnly: true,
     destructive: false,
     scope: "external",
