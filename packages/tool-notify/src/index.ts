@@ -19,9 +19,9 @@
  *      exactly this, and no tool here opts out of it.
  *   2. **The gate is tool-http's gate.** Allow-list, SSRF refusal, IP
  *      pinning, credential stripping and byte caps all live in `./net` and
- *      every outbound byte passes through them. Recipients and SMTP hosts
- *      have their own allow-lists, equally fail-closed. See that file's
- *      header.
+ *      every outbound byte passes through them. Email recipients, SMTP
+ *      hosts, SMS numbers and push targets have their own allow-lists,
+ *      equally fail-closed. See that file's header.
  *   3. **Credentials are environment variable NAMES**, and only names the
  *      operator listed in `allowed_secret_envs` (or a provider's own
  *      `auth.envVar`, for that provider): a call chooses among them and can
@@ -86,6 +86,7 @@ import {
   assertSmtpHostAllowed,
   byString,
   describeFailure,
+  destinationRefusal,
   json,
   ledgerLookup,
   ledgerRecord,
@@ -103,7 +104,14 @@ import {
   sleep,
   startDeadline,
 } from "./net";
-import type { AuthProfile, Deadline, NotifyConfig, ProviderProfile, TxtAnswer } from "./net";
+import type {
+  AuthProfile,
+  Deadline,
+  DestinationKind,
+  NotifyConfig,
+  ProviderProfile,
+  TxtAnswer,
+} from "./net";
 import { resolveSafe } from "./paths";
 import { sendMail } from "./smtp";
 
@@ -1965,15 +1973,25 @@ function buildProviderCall(
 /** The shared execute body for SmsSend and PushNotify. */
 async function runProviderSend(
   toolName: string,
+  kind: DestinationKind,
   providerName: string,
   values: Readonly<Record<string, string>>,
   args: { idempotencyKey?: string; timeoutMs?: number; maxBytes?: number },
   ctx: ToolExecuteContext | undefined,
 ): Promise<string> {
+  const cfg = resolveNotifyConfig(ctx?.toolConfig);
+  // The destination is checked first, before the ledger: a key reused for a
+  // number the list no longer admits is refused, not answered from memory.
+  // A provider that maps no `to` never sends the caller's value, so its
+  // destination is whatever the operator pinned in staticFields.
+  const profile = cfg.providers.get(providerName);
+  if (profile?.fields?.["to"] !== undefined) {
+    const refused = destinationRefusal(values["to"] ?? "", kind, cfg);
+    if (refused !== null) return notSentBecause(refused);
+  }
   const cached = ledgerLookup(toolName, args.idempotencyKey);
   if (cached !== undefined) return cached.result;
 
-  const cfg = resolveNotifyConfig(ctx?.toolConfig);
   const call = buildProviderCall(cfg, providerName, values, args.idempotencyKey);
   if (!call.ok) return notSentBecause(call.message);
 
@@ -2032,7 +2050,9 @@ export const smsSend: RegisteredTool = buildTool({
       .string()
       .min(1)
       .max(100)
-      .describe("the destination number, in the format the provider expects (E.164 for most)"),
+      .describe(
+        "the destination number; it must be in tool_config.notify.allowed_sms_recipients, which is matched in E.164 form (+ and digits; spaces, dashes and parentheses are ignored)",
+      ),
     body: z
       .string()
       .min(1)
@@ -2064,6 +2084,7 @@ export const smsSend: RegisteredTool = buildTool({
     };
     return runProviderSend(
       "SmsSend",
+      "sms",
       args.provider,
       { to: args.to, body: args.body, from: args.from ?? "" },
       args,
@@ -2083,7 +2104,9 @@ export const pushNotify: RegisteredTool = buildTool({
       .string()
       .min(1)
       .max(500)
-      .describe("device token, topic or whatever the provider addresses"),
+      .describe(
+        "device token, topic or whatever the provider addresses; it must be in tool_config.notify.allowed_push_targets",
+      ),
     title: z.string().max(200).optional(),
     body: z.string().min(1).max(4000),
     data: z
@@ -2115,6 +2138,7 @@ export const pushNotify: RegisteredTool = buildTool({
     }
     return runProviderSend(
       "PushNotify",
+      "push",
       args.provider,
       {
         to: args.to,

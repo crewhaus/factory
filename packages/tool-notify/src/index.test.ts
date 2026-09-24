@@ -333,6 +333,8 @@ beforeEach(() => {
     allowed_recipients: ["ops@example.com", "*@team.test"],
     allowed_smtp_hosts: ["127.0.0.1"],
     allowed_sender_domains: ["example.com"],
+    allowed_sms_recipients: ["+1*"],
+    allowed_push_targets: ["device-token"],
     providers: {
       gateway: {
         endpoint: `${origin}/sms`,

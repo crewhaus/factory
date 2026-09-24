@@ -92,6 +92,7 @@ beforeEach(() => {
     allowed_recipients: ["ops@example.com"],
     allowed_smtp_hosts: ["127.0.0.1"],
     allowed_secret_envs: [LISTED],
+    allowed_sms_recipients: ["+1555*"],
     providers: {
       gw: {
         endpoint: `${origin}/sms`,

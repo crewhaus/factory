@@ -8,7 +8,8 @@
  * twice:
  *
  *   1. Empty allow-list ⇒ deny all. There is no "allow everything" value,
- *      for origins, for SMTP hosts, or for email recipients.
+ *      for origins, for SMTP hosts, for email recipients, for SMS numbers or
+ *      for push targets.
  *   2. Scheme must be http or https.
  *   3. Origin (scheme + lowercase host + non-default port) must match an
  *      allow-list entry exactly, after canonicalisation.
@@ -141,6 +142,15 @@ export type NotifyConfig = {
    * read only for that provider, never by a name a call supplies.
    */
   readonly allowedSecretEnvs: readonly string[];
+  /**
+   * The numbers `SmsSend` may address, in E.164 form: an exact number, or a
+   * prefix ending in `*` (`+44*`). Empty (the default) refuses every number,
+   * as `allowedRecipients` refuses every address: an SMS costs money, and a
+   * number the model chooses is the premium-rate pumping surface.
+   */
+  readonly allowedSmsRecipients: readonly string[];
+  /** The device tokens or topics `PushNotify` may address: exact, or a `prefix*`. Empty refuses all. */
+  readonly allowedPushTargets: readonly string[];
 };
 
 export type NotifyConfigInput = {
@@ -155,6 +165,10 @@ export type NotifyConfigInput = {
   readonly providers?: Readonly<Record<string, ProviderProfile>>;
   readonly allowed_secret_envs?: readonly string[];
   readonly allowedSecretEnvs?: readonly string[];
+  readonly allowed_sms_recipients?: readonly string[];
+  readonly allowedSmsRecipients?: readonly string[];
+  readonly allowed_push_targets?: readonly string[];
+  readonly allowedPushTargets?: readonly string[];
 };
 
 /** Where an operator allows a credential variable. Every refusal names it. */
@@ -167,6 +181,8 @@ const EMPTY_CONFIG: NotifyConfig = {
   allowedSenderDomains: new Set<string>(),
   providers: new Map<string, ProviderProfile>(),
   allowedSecretEnvs: [],
+  allowedSmsRecipients: [],
+  allowedPushTargets: [],
 };
 
 let notifyConfig: NotifyConfig = EMPTY_CONFIG;
@@ -214,7 +230,111 @@ export function buildNotifyConfig(input: NotifyConfigInput): NotifyConfig {
     allowedSenderDomains: senderDomains,
     providers,
     allowedSecretEnvs: buildSecretEnvs(input.allowedSecretEnvs ?? input.allowed_secret_envs),
+    allowedSmsRecipients: buildDestinations(
+      input.allowedSmsRecipients ?? input.allowed_sms_recipients,
+      "sms",
+    ),
+    allowedPushTargets: buildDestinations(
+      input.allowedPushTargets ?? input.allowed_push_targets,
+      "push",
+    ),
   };
+}
+
+/** Which allow-list a provider send's destination is checked against. */
+export type DestinationKind = "sms" | "push";
+
+const DESTINATION_KEYS: Readonly<Record<DestinationKind, string>> = {
+  sms: "allowed_sms_recipients",
+  push: "allowed_push_targets",
+};
+
+/** An E.164 number: `+`, a non-zero digit, and at most fifteen digits in all. */
+const E164 = /^\+[1-9]\d{0,14}$/;
+
+/**
+ * A phone number as the SMS allow-list compares it: the separators people
+ * write (spaces, `-`, `.`, parentheses) removed, so `+1 (555) 000-1111` and
+ * `+15550001111` are the same number.
+ */
+export function normalizeSmsNumber(raw: string): string {
+  let out = "";
+  for (const ch of raw.trim()) {
+    if (ch === " " || ch === "-" || ch === "." || ch === "(" || ch === ")") continue;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Check a destination allow-list at boot. A malformed entry throws, so a
+ * misconfiguration surfaces when the harness starts. There is no "allow
+ * everything" value: a bare `*` is refused, as an empty allow-list elsewhere
+ * here refuses everyone.
+ */
+function buildDestinations(raw: unknown, kind: DestinationKind): readonly string[] {
+  const key = `tool_config.notify.${DESTINATION_KEYS[kind]}`;
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new NotifyPermissionError(`${key} must be a list`);
+  const out = new Set<string>();
+  raw.forEach((entry, index) => {
+    const where = `${key} entry ${index + 1}`;
+    if (typeof entry !== "string") throw new NotifyPermissionError(`${where} is not a string`);
+    if (kind === "sms") {
+      const normalized = normalizeSmsNumber(entry);
+      const digits = normalized.endsWith("*") ? normalized.slice(0, -1) : normalized;
+      if (!E164.test(digits)) {
+        throw new NotifyPermissionError(
+          `${where} must be a number in E.164 form (a + and up to fifteen digits, such as +15550001111), or a prefix of one ending in * (such as +44*); there is no allow-everything value`,
+        );
+      }
+      out.add(normalized);
+      return;
+    }
+    const target = entry.trim();
+    const star = target.indexOf("*");
+    if (target === "" || target === "*" || (star !== -1 && star !== target.length - 1)) {
+      throw new NotifyPermissionError(
+        `${where} must be a device token or topic, or a prefix of one ending in * (such as topic:ops-*); there is no allow-everything value`,
+      );
+    }
+    out.add(target);
+  });
+  return [...out].sort(byString);
+}
+
+/**
+ * Why a provider send's destination is refused, or `null` when the list
+ * admits it. The one matcher for both lists: an entry matches exactly, or,
+ * ending in `*`, as a prefix. An SMS number is compared in normalised E.164
+ * form, so a destination that is not a number in that form matches nothing.
+ */
+export function destinationRefusal(
+  to: string,
+  kind: DestinationKind,
+  cfg: NotifyConfig,
+): string | null {
+  const key = DESTINATION_KEYS[kind];
+  const patterns = kind === "sms" ? cfg.allowedSmsRecipients : cfg.allowedPushTargets;
+  const value = kind === "sms" ? normalizeSmsNumber(to) : to.trim();
+  const usable = kind === "push" || E164.test(value);
+  if (
+    usable &&
+    patterns.some((p) => (p.endsWith("*") ? value.startsWith(p.slice(0, -1)) : value === p))
+  ) {
+    return null;
+  }
+  const what =
+    kind === "sms"
+      ? `${JSON.stringify(to)} is not in ${key}${usable ? "" : " (numbers are matched in E.164 form: a + and digits)"}`
+      : `that push target is not in ${key}`;
+  const how =
+    kind === "sms"
+      ? "An operator adds a number in E.164 form, or a prefix such as +44*"
+      : "An operator adds a device token or topic, or a prefix ending in *";
+  return patterns.length === 0
+    ? `${what} (an empty allow-list refuses everyone). ${how}`
+    : `${what}. ${how}`;
 }
 
 /**

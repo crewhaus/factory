@@ -74,7 +74,11 @@ re-deriving it — a second outbound surface with a weaker gate is the same hole
 twice. In summary:
 
 - **Empty allow-list denies everything.** Separately for origins, for SMTP
-  hosts, and for email recipients. There is no "allow all" value.
+  hosts, for email recipients, for SMS numbers (`allowed_sms_recipients`, in
+  E.164 form or a prefix such as `+44*`) and for push targets
+  (`allowed_push_targets`, exact or a `prefix*`). There is no "allow all"
+  value. A provider that pins the number in `staticFields` and maps no `to`
+  never sends the call's value, so it needs no list.
 - **SSRF refusal is numeric, not textual.** Loopback, link-local (including
   the cloud metadata address), RFC1918, CGNAT, multicast and mDNS are refused
   as an IP literal in any of its encodings — octal, hex, integer, every IPv6
@@ -102,6 +106,8 @@ tool_config:
     allowed_smtp_hosts: ["smtp.example.com"]
     allowed_sender_domains: ["example.com"]
     allowed_secret_envs: [SLACK_OPS_WEBHOOK, SLACK_BOT_TOKEN]
+    allowed_sms_recipients: ["+15550001111", "+4420*"]
+    allowed_push_targets: ["topic:ops-*"]
 ```
 
 `allowed_secret_envs` covers every name a call supplies: `webhookUrlEnv` and

@@ -52,6 +52,8 @@ beforeEach(() => {
   registerNotifyConfig({
     allowed_origins: [origin],
     allowed_secret_envs: [WEBHOOK_VAR],
+    allowed_sms_recipients: ["+1*"],
+    allowed_push_targets: ["d"],
     allowed_recipients: ["*@example.com"],
     allowed_smtp_hosts: ["127.0.0.1"],
     allowed_sender_domains: ["example.com"],
