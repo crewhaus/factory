@@ -598,6 +598,61 @@ describe("OraclePriceRead", () => {
     expect(provenance["priceId"]).toBe(ETH_USD_PRICE_ID);
   });
 
+  test("a Pyth confidence at or above 2^63 is a wide band, not a negative one (C204)", async () => {
+    // conf is a uint64. 0.7.0 read it as an int64, so these came back
+    // negative, the ratio was negative, and beyondConfidenceBound was false.
+    for (const [confidence, expected] of [
+      [1n << 63n, "92233720368.54775808"],
+      [(1n << 64n) - 1n, "184467440737.09551615"],
+    ] as const) {
+      const chain = newChain();
+      await pythFeed(chain, ADDR.pyth, ETH_USD_PRICE_ID, {
+        price: 342_155_000_000n,
+        confidence,
+        exponent: -8,
+        publishTime: BigInt(NOW - 5),
+      });
+      install({ chain });
+      configured();
+      const out = await call(oraclePriceRead, {
+        chainId: "1",
+        kind: "pyth",
+        address: ADDR.pyth,
+        priceId: ETH_USD_PRICE_ID,
+        maxConfidenceBps: 50,
+      });
+      expect(out["confidence"]).toBe(expected);
+      const signals = out["signals"] as Record<string, unknown>;
+      expect(signals["confidenceToPriceBps"] as number).toBeGreaterThan(50);
+      expect(signals["beyondConfidenceBound"]).toBe(true);
+      // A canonical encoding: nothing to say about padding.
+      expect((out["notes"] as string[]).join(" ")).not.toContain("not padded");
+    }
+  });
+
+  test("a Pyth answer whose words are not the ABI's padding is read, and says so", async () => {
+    const chain = newChain();
+    const word = (n: bigint): string => n.toString(16).padStart(64, "0");
+    // conf with a bit set above its 64: no Pyth contract answers like that.
+    route(chain, ADDR.pyth, SELECTOR_TEXT.getPriceUnsafe + ETH_USD_PRICE_ID.replace(/^0x/, ""), {
+      data: `0x${word(342_155_000_000n)}${word((1n << 64n) | 3_421_550_000n)}${word(
+        (1n << 256n) - 8n,
+      )}${word(BigInt(NOW - 5))}`,
+    });
+    install({ chain });
+    configured();
+    const out = await call(oraclePriceRead, {
+      chainId: "1",
+      kind: "pyth",
+      address: ADDR.pyth,
+      priceId: ETH_USD_PRICE_ID,
+    });
+    expect(out["confidence"]).toBe("34.2155");
+    const notes = (out["notes"] as string[]).join(" ");
+    expect(notes).toContain("the answer's conf (uint64) word is not padded");
+    expect(notes).not.toContain("expo");
+  });
+
   test("a Pyth read without a price id is refused before anything is dialled", async () => {
     const { recorded } = install({ chain: newChain() });
     configured();
@@ -949,6 +1004,38 @@ describe("PortfolioValuation", () => {
     expect((out["total"] as Record<string, unknown>)["value"]).toBe("4224.14");
     const priced = out["priced"] as Array<Record<string, unknown>>;
     expect(priced[0]?.["amount"]).toBe("1.234567890123456789");
+  });
+
+  test("a Pyth band of 2^63 or wider puts the holding in unpriced, not in the total (C204)", async () => {
+    const chain = newChain();
+    await pythFeed(chain, ADDR.pyth, ETH_USD_PRICE_ID, {
+      price: 100_000_000n,
+      confidence: 1n << 63n,
+      exponent: -8,
+      publishTime: BigInt(NOW - 5),
+    });
+    install({ chain });
+    configured();
+    const out = await call(portfolioValuation, {
+      quoteCurrency: "USD",
+      chainId: "1",
+      holdings: [
+        {
+          asset: "X",
+          amount: "1000",
+          oracle: {
+            kind: "pyth",
+            address: ADDR.pyth,
+            priceId: ETH_USD_PRICE_ID,
+            maxConfidenceBps: 100,
+          },
+        },
+      ],
+    });
+    expect((out["priced"] as unknown[]).length).toBe(0);
+    const unpriced = out["unpriced"] as Array<Record<string, unknown>>;
+    expect(String(unpriced[0]?.["reason"])).toContain("confidence band");
+    expect((out["total"] as Record<string, unknown>)["value"]).toBe("0.00");
   });
 
   test("an oracle-priced holding with an incomplete round lands in the unpriced bucket, not in the total", async () => {

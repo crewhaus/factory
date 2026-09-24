@@ -2,10 +2,12 @@ import {
   MAX_CONTRACT_TEXT_CHARS,
   SELECTORS,
   asSigned,
+  asUnsigned,
   callNoArgs,
   callWithBytes32,
   decodeString,
   decodeWords,
+  isCanonicalInt,
   normalizeAddress,
   normalizeBytes32,
   sanitizeContractText,
@@ -389,7 +391,10 @@ export async function readPyth(
     "getPriceUnsafe(bytes32)",
   ) as [bigint, bigint, bigint, bigint];
   const rawPrice = asSigned(priceWord, 64);
-  const confidence = asSigned(confWord, 64);
+  // `conf` is a uint64. Read signed, a confidence from 2^63 up came back
+  // negative, so its ratio to the price was negative and never beyond any
+  // bound — the widest band a feed can state passed as the tightest.
+  const confidence = asUnsigned(confWord, 64);
   // `expo` is an int32 and is almost always NEGATIVE: -8 means the integer is
   // scaled by 1e-8. Read unsigned it is about 4.29e9, and the price comes back
   // as a number with four billion zeros after it.
@@ -404,6 +409,16 @@ export async function readPyth(
   const value = fixed(rawPrice, -exponent);
   const confidenceValue = fixed(confidence, -exponent);
   const notes: string[] = [];
+  const dirty = [
+    isCanonicalInt(priceWord, 64, true) ? null : "price (int64)",
+    isCanonicalInt(confWord, 64, false) ? null : "conf (uint64)",
+    isCanonicalInt(expoWord, 32, true) ? null : "expo (int32)",
+  ].filter((field): field is string => field !== null);
+  if (dirty.length > 0) {
+    notes.push(
+      `the answer's ${dirty.join(", ")} ${dirty.length === 1 ? "word is" : "words are"} not padded the way the ABI encodes ${dirty.length === 1 ? "that type" : "those types"}, so only the low bits were read — a real Pyth contract does not answer like that, and a different contract answering the same selector does`,
+    );
+  }
 
   let confidenceToPriceBps = 0;
   if (isPositive(value)) {

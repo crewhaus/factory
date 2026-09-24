@@ -25,12 +25,14 @@ import {
   UINT256_MAX,
   addressFromWord,
   asSigned,
+  asUnsigned,
   callWithAddress,
   callWithAddresses,
   callWithBytes32,
   callWithUint256,
   decodeString,
   decodeWords,
+  isCanonicalInt,
   normalizeAddress,
   sanitizeContractText,
 } from "./lib/abi";
@@ -335,6 +337,28 @@ describe("ABI, against @crewhaus/tool-onchain's coder", () => {
   test("asSigned refuses a width it cannot mean", () => {
     expect(() => asSigned(1n, 0)).toThrow(AbiError);
     expect(() => asSigned(1n, 257)).toThrow(AbiError);
+  });
+
+  test("a uint64 at or above 2^63 reads positive through asUnsigned (C204)", async () => {
+    const data = await encodeReturn(["uint64"], [(1n << 63n).toString()]);
+    const [word] = decodeWords(data, 1, "conf") as [bigint];
+    expect(asUnsigned(word, 64)).toBe(1n << 63n);
+    // What 0.7.0 read it as.
+    expect(asSigned(word, 64)).toBe(-(1n << 63n));
+    expect(asUnsigned((1n << 64n) - 1n, 64)).toBe((1n << 64n) - 1n);
+    expect(asUnsigned((1n << 64n) | 5n, 64)).toBe(5n);
+    expect(() => asUnsigned(1n, 0)).toThrow(AbiError);
+    expect(() => asUnsigned(1n, 257)).toThrow(AbiError);
+  });
+
+  test("isCanonicalInt says whether a word is what an encoder writes for the type", async () => {
+    const [neg] = decodeWords(await encodeReturn(["int32"], ["-8"]), 1, "e") as [bigint];
+    expect(isCanonicalInt(neg, 32, true)).toBe(true);
+    expect(isCanonicalInt(neg, 32, false)).toBe(false);
+    expect(isCanonicalInt((1n << 64n) - 1n, 64, false)).toBe(true);
+    expect(isCanonicalInt(1n << 64n, 64, false)).toBe(false);
+    // Low 64 bits negative, upper bits zero: not a sign extension.
+    expect(isCanonicalInt(1n << 63n, 64, true)).toBe(false);
   });
 
   test("decodeString reads the same string AbiDecode does, offset and all", async () => {
