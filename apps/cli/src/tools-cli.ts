@@ -5,7 +5,8 @@
  *   list          — every builtin's name/description/scope/ioCapability/
  *                   readOnly/destructive, from the RegisteredTool metadata
  *                   the runtime already carries.
- *   suggest <spec> — rank builtins against `agent.instructions` by a
+ *   suggest <spec> — rank the builtins the spec's shape runs against its
+ *                   instructions (agent, steps, nodes, roles) by a
  *                   deterministic keyword match (no model — the tool
  *                   implication is the same shape scaffold-evals uses).
  *   audit         — mine `tool_stats` + `tool_use` events across sessions
@@ -1179,7 +1180,7 @@ export function formatSuggestLines(result: ToolSuggestResult): string[] {
     );
   }
   lines.push(
-    "heuristic: literal keyword match over agent.instructions, not a model — wording it doesn't recognize won't be suggested; `crewhaus tools list` shows every builtin",
+    "heuristic: literal keyword match over the spec's instructions, not a model — wording it doesn't recognize won't be suggested; `crewhaus tools list` shows every builtin",
   );
   return lines;
 }

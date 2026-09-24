@@ -14569,10 +14569,12 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       "usage: crewhaus tools <list|categories|show|search|suggest|audit>\n" +
         "\n" +
         "  categories               every tool category + what it turns on\n" +
-        "  show <tool>              one tool in full: flags, categories, inputs\n" +
+        "  show <tool>              one tool in full: flags, categories, inputs,\n" +
+        "                           and the shapes that run it\n" +
         "  search <query>           find a tool by name, description or category\n" +
         "  list [--category NAME]   print every builtin tool + its metadata\n" +
-        "  suggest [spec.yaml]      rank builtins against agent.instructions\n" +
+        "  suggest [spec.yaml]      rank the builtins the spec's shape runs against\n" +
+        "                           its instructions — agent, steps, nodes, roles\n" +
         "                           (deterministic keyword match; default spec\n" +
         "                           is ./crewhaus.yaml)\n" +
         "  audit [--sessions N|all] mine tool_stats across sessions vs. the\n" +

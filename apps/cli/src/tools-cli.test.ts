@@ -255,6 +255,8 @@ describe("suggestTools — precision", () => {
     // a refused-but-granted tool is still an over-grant candidate
     expect(result.unimplied).toEqual(["imageGenerate"]);
     expect(lines[lines.length - 1]).toContain("literal keyword match");
+    // shape-reach#10 — it reads every site's instructions, not only the agent's.
+    expect(lines[lines.length - 1]).toContain("over the spec's instructions");
   });
 });
 
