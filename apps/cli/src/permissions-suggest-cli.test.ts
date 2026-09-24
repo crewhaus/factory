@@ -113,3 +113,72 @@ describe("crewhaus permissions suggest", () => {
     );
   }, 30_000);
 });
+
+// The engine reads settings before the spec: an allow `--apply` writes to
+// .crewhaus/settings.json decides every call it covers before the spec's own
+// deny and ask rules are read. A proposal says which of them it overrides.
+describe("crewhaus permissions suggest — an allow that would override the spec's guards", () => {
+  const spec = (rules: string): void =>
+    writeFileSync(
+      join(cwd, "crewhaus.yaml"),
+      `name: t\ntarget: cli\nagent:\n  model: m\n  instructions: tidy up\ntools: [removePath, bash]\npermissions:\n  rules:\n${rules}`,
+    );
+  const evidenceOf = (out: Json, pattern: string): string[] =>
+    out.suggestions.find((s) => s.rule.pattern === pattern)?.evidence ?? [];
+
+  test("a bare allow names every spec deny and ask on its tool", async () => {
+    spec(
+      '    - { type: alwaysDeny, pattern: "RemovePath(.git/**)" }\n    - { type: alwaysAsk, pattern: "RemovePath(src/**)" }\n    - { type: alwaysDeny, pattern: "Write(**)" }\n',
+    );
+    seed([
+      { name: "RemovePath", input: { path: "build/a" } },
+      { name: "RemovePath", input: { path: "build/b" } },
+    ]);
+    const out = JSON.parse((await suggest(true)).stdout) as Json;
+    const overrides = evidenceOf(out, "RemovePath").filter((e) => e.startsWith("OVERRIDES"));
+    expect(overrides).toEqual([
+      "OVERRIDES alwaysDeny RemovePath(.git/**) (crewhaus.yaml): settings rules are read first, so the calls this allows would no longer reach that rule",
+      "OVERRIDES alwaysAsk RemovePath(src/**) (crewhaus.yaml): settings rules are read first, so the calls this allows would no longer reach that rule",
+    ]);
+  }, 30_000);
+
+  test("a scoped allow names only the guards that fire on its value", async () => {
+    spec(
+      '    - { type: alwaysDeny, pattern: "RemovePath(.git/**)" }\n    - { type: alwaysAsk, pattern: "RemovePath(build/**)" }\n',
+    );
+    seed([{ name: "RemovePath", input: { path: "build/cache", recursive: true } }]);
+    const out = JSON.parse((await suggest(true)).stdout) as Json;
+    const overrides = evidenceOf(out, "RemovePath(build/cache)").filter((e) =>
+      e.startsWith("OVERRIDES"),
+    );
+    expect(overrides).toEqual([
+      "OVERRIDES alwaysAsk RemovePath(build/**) (crewhaus.yaml): settings rules are read first, so the calls this allows would no longer reach that rule",
+    ]);
+  }, 30_000);
+
+  test("the builtin floor's asks count, and the text output shows the line", async () => {
+    seed([
+      { name: "Bash", input: { command: "ls build" } },
+      { name: "Bash", input: { command: "ls dist" } },
+    ]);
+    const { stdout } = await suggest(false);
+    expect(stdout).toContain(
+      "OVERRIDES alwaysAsk Bash(rm**) (the builtin floor): settings rules are read first",
+    );
+    expect(stdout).toContain("OVERRIDES alwaysAsk Bash(sudo**) (the builtin floor)");
+  }, 30_000);
+
+  test("a spec that cannot be read is said so, not treated as having no rules", async () => {
+    writeFileSync(join(cwd, "crewhaus.yaml"), "name: t\ntarget: [not a target\n");
+    seed([
+      { name: "RemovePath", input: { path: "build/a" } },
+      { name: "RemovePath", input: { path: "build/b" } },
+    ]);
+    const { stdout } = await suggest(false);
+    expect(stdout).toMatch(
+      /note: could not read the permission rules in crewhaus\.yaml \(.+\) — the proposals were not checked against its deny and ask rules/,
+    );
+    const json = JSON.parse((await suggest(true)).stdout) as { overrideCheck: unknown };
+    expect(json.overrideCheck).toMatchObject({ spec: null, unread: expect.any(String) });
+  }, 30_000);
+});

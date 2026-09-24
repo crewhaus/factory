@@ -419,6 +419,7 @@ import {
   type JustificationJudge,
   PermissionConfigError,
   type PermissionMode,
+  type PermissionRule,
   type RuleSet,
   appendSettingsRule,
   parsePermissionsConfig,
@@ -1232,6 +1233,7 @@ import {
   runStagedOptimize,
   writeBackStagedResult,
 } from "./optimize-stages";
+import { guardsOverridden, overrideNote } from "./permissions-override";
 // AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune` core (hashed
 // redaction-history aggregation → false-positive over-redaction candidates +
 // coverage gaps → reviewed .crewhaus/pii-policy.json). Side-effect-free; never
@@ -14819,6 +14821,11 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
   const { verifyRule } = await import("@crewhaus/tool-approvals");
   const suggestions: PermissionSuggestion[] = [];
   const rejected: Array<{ pattern: string; reason: string }> = [];
+  // An allow written to settings is read before the spec's rules and the
+  // builtin floor, so it takes every call it covers away from their denies
+  // and asks. Each proposal says which ones it would override
+  // (permission-integration#8).
+  const overrideCheck = specGuardRules(process.cwd());
   for (const suggestion of rankSuggestions(aggregates, readOnly)) {
     const agg = aggregates.get(suggestion.toolName);
     const scoped = agg !== undefined && isArgScoped(agg);
@@ -14828,8 +14835,34 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
       scoped ? agg.argSamples[0] : undefined,
       scoped ? agg.argKind : undefined,
     );
-    if (verdict.ok) suggestions.push(suggestion);
-    else rejected.push({ pattern: suggestion.rule.pattern, reason: verdict.reason });
+    if (!verdict.ok) {
+      rejected.push({ pattern: suggestion.rule.pattern, reason: verdict.reason });
+      continue;
+    }
+    if (suggestion.rule.type !== "alwaysAllow") {
+      suggestions.push(suggestion);
+      continue;
+    }
+    const overridden = guardsOverridden(
+      {
+        toolName: suggestion.toolName,
+        ...(scoped && agg.argSamples[0] !== undefined ? { scopedValue: agg.argSamples[0] } : {}),
+        ...(scoped && agg.argKind !== undefined ? { valueKind: agg.argKind } : {}),
+      },
+      overrideCheck.rules,
+      process.cwd(),
+    );
+    suggestions.push(
+      overridden.length === 0
+        ? suggestion
+        : {
+            ...suggestion,
+            evidence: [
+              ...suggestion.evidence,
+              ...overridden.map((g) => overrideNote(g, overrideCheck.label)),
+            ],
+          },
+    );
   }
 
   // Existing settings rules (the exact shape buildRuleSet consumes).
@@ -14847,13 +14880,31 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
 
   if (args.flags["json"] === true) {
     process.stdout.write(
-      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, rejected, diff }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          sessionIds: sessions.map((s) => s.sessionId),
+          suggestions,
+          rejected,
+          diff,
+          overrideCheck: {
+            spec: overrideCheck.spec ?? null,
+            ...(overrideCheck.unread !== undefined ? { unread: overrideCheck.unread } : {}),
+          },
+        },
+        null,
+        2,
+      )}\n`,
     );
     if (args.flags["apply"] !== true) return;
   } else {
     process.stdout.write(
       `permissions: ${suggestions.length} suggestion(s) from ${sessions.length} session(s)\n`,
     );
+    if (overrideCheck.unread !== undefined) {
+      process.stdout.write(
+        `note: ${overrideCheck.unread} — the proposals were not checked against its deny and ask rules\n`,
+      );
+    }
     if (suggestions.length === 0) {
       process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
     }
@@ -14896,6 +14947,46 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
   mkdirSync(dirname(settingsPath), { recursive: true });
   writeFileSync(settingsPath, `${JSON.stringify(newRoot, null, 2)}\n`);
   process.stdout.write(`[permissions] wrote ${diff.additions.length} rule(s) to ${settingsPath}\n`);
+}
+
+/**
+ * The deny and ask rules a settings-layer allow is read ahead of: the spec's
+ * (`./crewhaus.yaml`, when there is one) and the builtin floor's. A spec that
+ * exists but cannot be read is reported as unread, never as "no rules".
+ */
+function specGuardRules(cwd: string): {
+  readonly rules: ReadonlyArray<PermissionRule>;
+  readonly label: string;
+  readonly spec?: string;
+  readonly unread?: string;
+} {
+  const specPath = join(cwd, "crewhaus.yaml");
+  if (!existsSync(specPath)) {
+    return { rules: BUILTIN_DEFAULT_RULES, label: "the spec" };
+  }
+  try {
+    const ir = lower(parseSpec(readFileSync(specPath, "utf-8"))) as {
+      readonly permissions?: {
+        readonly rules?: ReadonlyArray<{
+          type: "alwaysAllow" | "alwaysDeny" | "alwaysAsk";
+          pattern: string;
+        }>;
+      };
+    };
+    const yaml = tagRules(ir.permissions?.rules ?? [], "yaml");
+    return {
+      rules: [...yaml, ...BUILTIN_DEFAULT_RULES],
+      label: "crewhaus.yaml",
+      spec: "crewhaus.yaml",
+    };
+  } catch (err) {
+    const why = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    return {
+      rules: BUILTIN_DEFAULT_RULES,
+      label: "the spec",
+      unread: `could not read the permission rules in crewhaus.yaml (${why})`,
+    };
+  }
 }
 
 /**
