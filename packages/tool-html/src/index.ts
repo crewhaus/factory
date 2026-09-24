@@ -345,4 +345,11 @@ export {
   outline,
   readableText,
 } from "./lib/extract";
-export { queryAll, queryFirst } from "./lib/select";
+export {
+  MAX_SELECTOR_GROUP,
+  MAX_SELECTOR_STEPS,
+  type MatchContext,
+  createMatchContext,
+  queryAll,
+  queryFirst,
+} from "./lib/select";

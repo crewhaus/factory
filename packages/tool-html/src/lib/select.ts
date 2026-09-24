@@ -169,6 +169,11 @@ export function parseSelector(source: string): Selector {
   flush();
   if (steps.length === 0)
     throw new Error("an empty selector matches nothing; say what to look for");
+  if (steps.length > MAX_SELECTOR_STEPS) {
+    throw new Error(
+      `the selector has ${steps.length} compound steps; at most ${MAX_SELECTOR_STEPS} are supported`,
+    );
+  }
   return steps;
 }
 
@@ -180,6 +185,11 @@ export function parseSelectorGroup(source: string): Selector[] {
   // and no reason, and concludes the page changed.
   if (parts.length === 0) {
     throw new Error("an empty selector matches nothing; say what to look for");
+  }
+  if (parts.length > MAX_SELECTOR_GROUP) {
+    throw new Error(
+      `the selector group has ${parts.length} selectors; at most ${MAX_SELECTOR_GROUP} are supported`,
+    );
   }
   return parts.map(parseSelector);
 }
@@ -207,12 +217,94 @@ function attrMatches(node: Element, test: AttrTest): boolean {
   }
 }
 
-function elementChildren(node: Element | null): Element[] {
-  if (node === null) return [];
-  return node.children.filter((c): c is Element => c.type === "element");
+// ---------------------------------------------------------------------------
+// Matching
+//
+// The naive right-to-left matcher re-ran the rest of the selector for EVERY
+// ancestor (descendant) or earlier sibling (`~`) that matched the step before,
+// with no memory of having asked the same question: about C(depth, steps)
+// work per element, so 5 KB of nested markup and a six-step selector ran for
+// minutes on the harness's one thread. Positional pseudo-classes and `+`/`~`
+// also rebuilt the parent's child list per element, which is quadratic in a
+// long flat list.
+//
+// Here every question is asked once per query:
+//
+//   M(node, i)   node is the subject of step i, and steps 0..i all hold
+//   A(node, i)   some ancestor a of node has M(a, i - 1)        (descendant)
+//   S(node, i)   some earlier element sibling s has M(s, i - 1)  (`~`)
+//
+// each memoised per (node, i), and a parent's element children are indexed
+// once. The whole query is then O(elements × steps). A and S are computed
+// iteratively, never by recursion along a chain, because a sibling list can
+// be hundreds of thousands long; recursion depth is bounded by the step
+// count. Ancestors and siblings outside the queried container count, as they
+// do for the DOM's querySelectorAll.
+
+/** Most compound steps one selector may have. */
+export const MAX_SELECTOR_STEPS = 32;
+/** Most selectors one comma group may have. */
+export const MAX_SELECTOR_GROUP = 32;
+
+type Position = { readonly index: number; readonly typeIndex: number };
+type Family = { readonly list: ReadonlyArray<Element> };
+
+/** One step's three memo slots per element: 0 unknown, 1 true, 2 false. */
+type Memo = Map<Element, Int8Array>;
+
+/**
+ * What a query remembers: each parent's element children, each element's
+ * position among them, and the memo tables of every selector asked so far.
+ * Share one across queries over the SAME, unchanged tree (as HtmlRecords
+ * does for its field selectors); never across trees that are edited
+ * between queries.
+ */
+export type MatchContext = {
+  readonly families: WeakMap<Element, Family>;
+  readonly positions: WeakMap<Element, Position>;
+  readonly memos: Map<Selector, Memo>;
+  readonly groups: Map<string, Selector[]>;
+};
+
+export function createMatchContext(): MatchContext {
+  return { families: new WeakMap(), positions: new WeakMap(), memos: new Map(), groups: new Map() };
 }
 
-function matchesSimple(node: Element, simple: Simple): boolean {
+function familyOf(parent: Element, ctx: MatchContext): Family {
+  const known = ctx.families.get(parent);
+  if (known !== undefined) return known;
+  const list: Element[] = [];
+  const ofType = new Map<string, number>();
+  for (const child of parent.children) {
+    if (child.type !== "element") continue;
+    const typeIndex = ofType.get(child.tag) ?? 0;
+    ofType.set(child.tag, typeIndex + 1);
+    ctx.positions.set(child, { index: list.length, typeIndex });
+    list.push(child);
+  }
+  const family = { list };
+  ctx.families.set(parent, family);
+  return family;
+}
+
+/** The element's position among its parent's element children, or null at the top. */
+function positionOf(node: Element, ctx: MatchContext): (Position & Family) | null {
+  const parent = node.parent;
+  if (parent === null) return null;
+  const family = familyOf(parent, ctx);
+  const position = ctx.positions.get(node);
+  // A node its parent does not list (a hand-built tree) has no position.
+  if (position === undefined || family.list[position.index] !== node) return null;
+  return { ...position, list: family.list };
+}
+
+function previousElementSibling(node: Element, ctx: MatchContext): Element | null {
+  const at = positionOf(node, ctx);
+  if (at === null || at.index === 0) return null;
+  return at.list[at.index - 1] ?? null;
+}
+
+function matchesSimple(node: Element, simple: Simple, ctx: MatchContext): boolean {
   if (simple.tag !== null && node.tag !== simple.tag) return false;
   if (simple.id !== null && node.attrs["id"] !== simple.id) return false;
   if (simple.classes.length > 0) {
@@ -222,85 +314,200 @@ function matchesSimple(node: Element, simple: Simple): boolean {
   for (const attr of simple.attrs) if (!attrMatches(node, attr)) return false;
 
   for (const pseudo of simple.pseudos) {
-    const siblings = elementChildren(node.parent);
+    if (pseudo.kind === "not") {
+      if (matchesSimple(node, pseudo.simple, ctx)) return false;
+      continue;
+    }
+    const at = positionOf(node, ctx);
+    if (at === null) return false;
     switch (pseudo.kind) {
       case "first-child":
-        if (siblings[0] !== node) return false;
+        if (at.index !== 0) return false;
         break;
       case "last-child":
-        if (siblings[siblings.length - 1] !== node) return false;
+        if (at.index !== at.list.length - 1) return false;
         break;
       case "nth-child":
-        if (siblings[pseudo.index - 1] !== node) return false;
+        if (at.index !== pseudo.index - 1) return false;
         break;
-      case "nth-of-type": {
-        const sameTag = siblings.filter((s) => s.tag === node.tag);
-        if (sameTag[pseudo.index - 1] !== node) return false;
-        break;
-      }
       default:
-        if (matchesSimple(node, pseudo.simple)) return false;
+        if (at.typeIndex !== pseudo.index - 1) return false;
+        break;
     }
   }
   return true;
 }
 
-/** Whether `node` matches `selector`, checked right to left. */
-export function matches(node: Element, selector: Selector): boolean {
-  const last = selector[selector.length - 1];
-  if (last === undefined) return false;
-  if (!matchesSimple(node, last.simple)) return false;
-  return matchesFrom(node, selector, selector.length - 1);
+const UNKNOWN = 0;
+const YES = 1;
+const NO = 2;
+
+/** The memo row for one selector and element: [M 0..n-1 | A 0..n-1 | S 0..n-1]. */
+function row(memo: Memo, node: Element, steps: number): Int8Array {
+  let r = memo.get(node);
+  if (r === undefined) {
+    r = new Int8Array(steps * 3);
+    memo.set(node, r);
+  }
+  return r;
 }
 
-function matchesFrom(node: Element, selector: Selector, index: number): boolean {
-  if (index === 0) return true;
-  const step = selector[index] as Step;
-  const previous = selector[index - 1] as Step;
-
-  if (step.combinator === ">") {
-    const parent = node.parent;
-    if (parent === null || !matchesSimple(parent, previous.simple)) return false;
-    return matchesFrom(parent, selector, index - 1);
+function memoFor(selector: Selector, ctx: MatchContext): Memo {
+  let memo = ctx.memos.get(selector);
+  if (memo === undefined) {
+    memo = new Map();
+    ctx.memos.set(selector, memo);
   }
-  if (step.combinator === "+" || step.combinator === "~") {
-    const siblings = elementChildren(node.parent);
-    const at = siblings.indexOf(node);
-    if (at <= 0) return false;
-    const candidates =
-      step.combinator === "+" ? [siblings[at - 1]] : siblings.slice(0, at).reverse();
-    for (const candidate of candidates) {
-      if (candidate === undefined) continue;
-      if (
-        matchesSimple(candidate, previous.simple) &&
-        matchesFrom(candidate, selector, index - 1)
-      ) {
-        return true;
+  return memo;
+}
+
+/** M(node, i): node is the subject of step i and the steps before it hold. */
+function subjectOf(
+  node: Element,
+  selector: Selector,
+  i: number,
+  memo: Memo,
+  ctx: MatchContext,
+): boolean {
+  const n = selector.length;
+  const r = row(memo, node, n);
+  const cached = r[i] as number;
+  if (cached !== UNKNOWN) return cached === YES;
+  const step = selector[i] as Step;
+  let ok = matchesSimple(node, step.simple, ctx);
+  if (ok && i > 0) {
+    switch (step.combinator) {
+      case ">": {
+        const parent = node.parent;
+        ok = parent !== null && subjectOf(parent, selector, i - 1, memo, ctx);
+        break;
       }
+      case "+": {
+        const previous = previousElementSibling(node, ctx);
+        ok = previous !== null && subjectOf(previous, selector, i - 1, memo, ctx);
+        break;
+      }
+      case "~":
+        ok = someEarlierSibling(node, selector, i, memo, ctx);
+        break;
+      default:
+        ok = someAncestor(node, selector, i, memo, ctx);
+        break;
     }
-    return false;
   }
-  // Descendant: any ancestor may satisfy the previous step.
-  let ancestor = node.parent;
-  while (ancestor !== null) {
-    if (matchesSimple(ancestor, previous.simple) && matchesFrom(ancestor, selector, index - 1)) {
-      return true;
-    }
-    ancestor = ancestor.parent;
-  }
-  return false;
+  r[i] = ok ? YES : NO;
+  return ok;
 }
 
-/** Every element under `root` matching any selector in the group. */
+/** A(node, i): some ancestor is the subject of step i - 1. Iterative up the chain. */
+function someAncestor(
+  node: Element,
+  selector: Selector,
+  i: number,
+  memo: Memo,
+  ctx: MatchContext,
+): boolean {
+  const n = selector.length;
+  const slot = n + i;
+  const chain: Element[] = [];
+  let top: Element = node;
+  // `known` is A(top, i) once the loop stops.
+  let known: boolean;
+  for (;;) {
+    if (top.parent === null) {
+      known = false;
+      break;
+    }
+    const cached = row(memo, top, n)[slot] as number;
+    if (cached !== UNKNOWN) {
+      known = cached === YES;
+      break;
+    }
+    chain.push(top);
+    top = top.parent;
+  }
+  row(memo, top, n)[slot] = known ? YES : NO;
+  // Fill downwards: A(x) = A(parent) || M(parent, i - 1).
+  for (let k = chain.length - 1; k >= 0; k--) {
+    const x = chain[k] as Element;
+    const parent = x.parent as Element;
+    known = known || subjectOf(parent, selector, i - 1, memo, ctx);
+    row(memo, x, n)[slot] = known ? YES : NO;
+  }
+  return known;
+}
+
+/** S(node, i): some earlier element sibling is the subject of step i - 1. Iterative. */
+function someEarlierSibling(
+  node: Element,
+  selector: Selector,
+  i: number,
+  memo: Memo,
+  ctx: MatchContext,
+): boolean {
+  const n = selector.length;
+  const slot = 2 * n + i;
+  const at = positionOf(node, ctx);
+  if (at === null) return false;
+  // Walk back to the first sibling whose answer is known (or the first one),
+  // then fill forwards: S(x) = S(prev) || M(prev, i - 1).
+  let k = at.index;
+  let known = false;
+  while (k > 0) {
+    const cached = row(memo, at.list[k] as Element, n)[slot] as number;
+    if (cached !== UNKNOWN) {
+      known = cached === YES;
+      break;
+    }
+    k--;
+  }
+  if (k === 0) row(memo, at.list[0] as Element, n)[slot] = NO;
+  for (let j = k + 1; j <= at.index; j++) {
+    const previous = at.list[j - 1] as Element;
+    known = known || subjectOf(previous, selector, i - 1, memo, ctx);
+    row(memo, at.list[j] as Element, n)[slot] = known ? YES : NO;
+  }
+  return known;
+}
+
+/** Whether `node` matches `selector`. Pass a context to reuse work across calls on one tree. */
+export function matches(
+  node: Element,
+  selector: Selector,
+  ctx: MatchContext = createMatchContext(),
+): boolean {
+  if (selector.length === 0) return false;
+  return subjectOf(node, selector, selector.length - 1, memoFor(selector, ctx), ctx);
+}
+
+function groupFor(source: string, ctx: MatchContext): Selector[] {
+  let group = ctx.groups.get(source);
+  if (group === undefined) {
+    group = parseSelectorGroup(source);
+    ctx.groups.set(source, group);
+  }
+  return group;
+}
+
+/**
+ * Every element under `root` matching any selector in the group, in document
+ * order. `ctx` may be shared across queries over the same unchanged tree.
+ */
 export function queryAll(
   root: Element,
   source: string,
   limit = Number.POSITIVE_INFINITY,
+  ctx: MatchContext = createMatchContext(),
 ): Element[] {
-  const group = parseSelectorGroup(source);
+  const group = groupFor(source, ctx);
+  const memos = group.map((selector) => memoFor(selector, ctx));
   const found: Element[] = [];
   for (const node of walk(root)) {
-    if (group.some((selector) => matches(node, selector))) {
+    if (
+      group.some((selector, g) =>
+        subjectOf(node, selector, selector.length - 1, memos[g] as Memo, ctx),
+      )
+    ) {
       found.push(node);
       if (found.length >= limit) break;
     }
@@ -308,6 +515,10 @@ export function queryAll(
   return found;
 }
 
-export function queryFirst(root: Element, source: string): Element | undefined {
-  return queryAll(root, source, 1)[0];
+export function queryFirst(
+  root: Element,
+  source: string,
+  ctx: MatchContext = createMatchContext(),
+): Element | undefined {
+  return queryAll(root, source, 1, ctx)[0];
 }

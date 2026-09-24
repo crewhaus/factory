@@ -44,6 +44,14 @@ concludes the page changed. `:nth-child(2n+1)` is refused rather than read as
 `:nth-child(2)` — `parseInt("2n+1")` is 2, so a lenient check would accept
 the formula and quietly return the wrong element.
 
+A selector has at most 32 compound steps and a comma group at most 32
+selectors; longer ones are refused with the cap named. Within that, a query
+costs time in proportion to the elements times the steps: each "does this
+element satisfy this step" question is answered once per query, however many
+ancestors or earlier siblings could satisfy it. Parsing is linear in the
+document's length too, including pages full of `<script>`, `<title>` or stray
+close tags.
+
 ## Details that are wrong by default elsewhere
 
 - **Table spans.** `colspan` and `rowspan` are expanded. A table that uses

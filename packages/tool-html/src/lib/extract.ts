@@ -6,7 +6,7 @@
  * this form want, what does the page say about itself.
  */
 import { type Element, normalizeText, textOf, walk } from "./parse";
-import { queryAll } from "./select";
+import { createMatchContext, queryAll } from "./select";
 
 const cellText = (node: Element): string => normalizeText(textOf(node));
 
@@ -294,7 +294,11 @@ export function extractRecords(
   recipe: RecordRecipe,
   limit = 1000,
 ): { records: Array<Record<string, string>>; missing: Record<string, number>; containers: number } {
-  const containers = queryAll(root, recipe.container, limit);
+  // One context for every query here: the field selectors run once per
+  // container over the same tree, so each (element, step) question is
+  // answered once for the whole recipe rather than once per container.
+  const ctx = createMatchContext();
+  const containers = queryAll(root, recipe.container, limit, ctx);
   const missing: Record<string, number> = {};
   const records = containers.map((container) => {
     const row: Record<string, string> = {};
@@ -302,7 +306,7 @@ export function extractRecords(
       const at = spec.lastIndexOf("@");
       const selector = at === -1 ? spec : spec.slice(0, at);
       const attribute = at === -1 ? null : spec.slice(at + 1);
-      const found = selector.trim() === "" ? container : queryAll(container, selector, 1)[0];
+      const found = selector.trim() === "" ? container : queryAll(container, selector, 1, ctx)[0];
       if (found === undefined) {
         row[field] = "";
         missing[field] = (missing[field] ?? 0) + 1;
