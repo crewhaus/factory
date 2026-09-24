@@ -41,12 +41,15 @@ describe("createScreenshotTool", () => {
     expect(Array.from(decoded)).toEqual(Array.from(png));
   });
 
-  test("flag profile: read-only, not destructive, classifier off (controlled output)", () => {
+  // 0.7.1 (C152): the result is an image the model must see, of a page an
+  // attacker may control.
+  test("flag profile: read-only, not destructive, classifier on, requires vision", () => {
     const driver = stubDriver(new Uint8Array(0));
     const tool = createScreenshotTool({ driver });
     expect(tool.readOnly).toBe(true);
     expect(tool.destructive).toBe(false);
-    expect(tool.classifyOutput).toBe(false);
+    expect(tool.classifyOutput).toBe(true);
+    expect(tool.requiresModelFeatures).toEqual({ vision: true });
     expect(tool.name).toBe("Screenshot");
   });
 
