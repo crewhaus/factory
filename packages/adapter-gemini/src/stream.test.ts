@@ -452,3 +452,53 @@ describe("translateGeminiStream", () => {
     expect(messageDelta?.usage).toEqual({ input: 100, output: 7, cacheRead: 64 });
   });
 });
+
+// C129 — block indices restart on every response, so the synthesised id was
+// `gemini_Bash_0` in every turn whose first call was Bash. Two calls in one
+// run then shared an id, and the tool-result store pointed the second at the
+// first call's saved output.
+describe("translateGeminiStream — tool-call ids are unique within a run", () => {
+  async function toolUseIds(parts: ReadonlyArray<Record<string, unknown>>): Promise<string[]> {
+    const events = await collect(
+      translateGeminiStream(
+        synthChunks([
+          {
+            candidates: [
+              { content: { role: "model", parts }, finishReason: FinishReason.STOP },
+            ] as GenerateContentResponse["candidates"],
+          },
+        ]),
+      ),
+    );
+    return events.flatMap((e) =>
+      e.kind === "content_block_start" && e.block.type === "tool_use" ? [e.block.id] : [],
+    );
+  }
+
+  test("the same call in two responses gets two ids, both still in the synthetic shape", async () => {
+    const [a] = await toolUseIds([{ functionCall: { name: "Bash", args: {} } }]);
+    const [b] = await toolUseIds([{ functionCall: { name: "Bash", args: {} } }]);
+    expect(a).toBeDefined();
+    expect(a).not.toBe(b);
+    for (const id of [a, b]) expect(id).toMatch(/^gemini_Bash_\d+$/);
+  });
+
+  test("calls within one response get distinct ids, and an underscored name survives", async () => {
+    const ids = await toolUseIds([
+      { functionCall: { name: "my_tool", args: {} } },
+      { functionCall: { name: "my_tool", args: {} } },
+    ]);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+    for (const id of ids) expect(id).toMatch(/^gemini_my_tool_\d+$/);
+  });
+
+  test("an id Gemini sends is used as is", async () => {
+    expect(await toolUseIds([{ functionCall: { id: "abc", name: "Bash", args: {} } }])).toEqual([
+      "abc",
+    ]);
+    // An empty one is not an id.
+    const [synth] = await toolUseIds([{ functionCall: { id: "", name: "Bash", args: {} } }]);
+    expect(synth).toMatch(/^gemini_Bash_\d+$/);
+  });
+});

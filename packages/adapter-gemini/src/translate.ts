@@ -196,7 +196,7 @@ function toGeminiToolConfig(choice: ToolChoice): GenerateContentConfig["toolConf
  * assistant turns of a conversation. Gemini's contract is that
  * `functionResponse.name` matches `FunctionCall.name` (the declared
  * function name), but the canonical `tool_result.tool_use_id` carries
- * our synthetic correlator (`gemini_<fn>_<idx>` from stream.ts) — this
+ * our synthetic correlator (`gemini_<fn>_<nonce><idx>` from stream.ts) — this
  * map lets `toGeminiContent` resolve the real name.
  */
 function collectToolUseNames(messages: ReadonlyArray<CanonicalMessage>): Map<string, string> {
@@ -215,8 +215,10 @@ const SYNTHETIC_TOOL_USE_ID = /^gemini_(.+)_\d+$/;
 /**
  * Fallback for tool_use ids whose originating `tool_use` block is no
  * longer in the message window (e.g. after compaction): recover the
- * function name by stripping the synthetic `gemini_<name>_<idx>` shape.
- * Non-synthetic ids pass through unchanged.
+ * function name by stripping the synthetic `gemini_<name>_<digits>` shape
+ * (`<digits>` is the stream's nonce and the block index; before 0.7.1 it was
+ * the index alone, which still parses). Non-synthetic ids pass through
+ * unchanged.
  */
 function stripSyntheticToolUseId(id: string): string {
   const match = SYNTHETIC_TOOL_USE_ID.exec(id);

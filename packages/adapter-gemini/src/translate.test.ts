@@ -114,6 +114,38 @@ describe("toGeminiParams", () => {
     expect(fr?.id).toBe("gemini_my_tool_3");
   });
 
+  test("an orphaned id in the 0.7.1 shape (stream nonce + index) still yields the function name", async () => {
+    const { translateGeminiStream } = await import("./stream.js");
+    let id = "";
+    for await (const e of translateGeminiStream(
+      (async function* () {
+        yield {
+          candidates: [
+            {
+              content: { role: "model", parts: [{ functionCall: { name: "my_tool", args: {} } }] },
+            },
+          ],
+        } as never;
+      })(),
+    )) {
+      if (e.kind === "content_block_start" && e.block.type === "tool_use") id = e.block.id;
+    }
+    expect(id).not.toBe("gemini_my_tool_0");
+    const params = toGeminiParams({
+      ...baseReq,
+      messages: [
+        { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] },
+      ],
+    });
+    const fr = (
+      params.contents as Array<{
+        parts?: Array<{ functionResponse?: { id?: string; name?: string } }>;
+      }>
+    )[0]?.parts?.[0]?.functionResponse;
+    expect(fr?.name).toBe("my_tool");
+    expect(fr?.id).toBe(id);
+  });
+
   test("orphaned non-synthetic tool_use_ids pass through as the name unchanged", () => {
     const params = toGeminiParams({
       ...baseReq,

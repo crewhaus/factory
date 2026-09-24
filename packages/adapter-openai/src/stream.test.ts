@@ -301,22 +301,34 @@ describe("translateOpenAIStream", () => {
     expect(stops).toHaveLength(1);
   });
 
-  test("tool_call chunk with no id falls back to call_<index>", async () => {
-    const events = await collect(
-      translateOpenAIStream(
-        synthChunks([
-          mkChunk({
-            tool_calls: [{ index: 3, type: "function", function: { name: "X", arguments: "{}" } }],
-          }),
-          mkChunk({}, "tool_calls", { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }),
-        ]),
-      ),
-    );
-    const blockStart = events.find(
-      (e): e is Extract<StreamEvent, { kind: "content_block_start" }> =>
-        e.kind === "content_block_start" && e.block.type === "tool_use",
-    );
-    expect(blockStart?.block).toEqual({ type: "tool_use", id: "call_3", name: "X", input: {} });
+  // C129 — the fallback was `call_<index>`, the same in every response, so
+  // two calls in one run shared an id. It now carries a per-stream nonce.
+  test("tool_call chunk with no id falls back to call_<nonce>_<index>, unique per stream", async () => {
+    const idOf = async (): Promise<string | undefined> => {
+      const events = await collect(
+        translateOpenAIStream(
+          synthChunks([
+            mkChunk({
+              tool_calls: [
+                { index: 3, type: "function", function: { name: "X", arguments: "{}" } },
+              ],
+            }),
+            mkChunk({}, "tool_calls", { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }),
+          ]),
+        ),
+      );
+      const blockStart = events.find(
+        (e): e is Extract<StreamEvent, { kind: "content_block_start" }> =>
+          e.kind === "content_block_start" && e.block.type === "tool_use",
+      );
+      expect(blockStart?.block).toMatchObject({ type: "tool_use", name: "X", input: {} });
+      return blockStart?.block.type === "tool_use" ? blockStart.block.id : undefined;
+    };
+    const first = await idOf();
+    const second = await idOf();
+    expect(first).toMatch(/^call_[0-9a-f]{8}_3$/);
+    expect(second).toMatch(/^call_[0-9a-f]{8}_3$/);
+    expect(first).not.toBe(second);
   });
 
   test("content_filter finish_reason → stop_sequence", async () => {
