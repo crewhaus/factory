@@ -25,7 +25,6 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import {
-  type Dirent,
   closeSync,
   existsSync,
   constants as fsConstants,
@@ -62,6 +61,7 @@ import {
   detectArchiveFormat,
   readArchiveEntries,
 } from "./lib/archive-format";
+import { type UnsafeLink, memberComponents, unsafeArchiveLinks } from "./lib/archive-links";
 import {
   type TreeNode,
   formatBytes,
@@ -103,6 +103,7 @@ import {
   describeFailure,
   runProcess,
 } from "./proc";
+import { scanStagedTree, watchTreeSize } from "./staging";
 import { type WalkNode, type WalkOptions, compareStrings, rollUpSizes, walkTree } from "./walk";
 
 /** Compact JSON — the reader is a model, and every byte is context. */
@@ -1469,10 +1470,24 @@ function inspectArchive(
   }
 }
 
+/** Declared bytes of an archive's regular-file members, from its own index. */
+function declaredBytes(entries: ReadonlyArray<ArchiveEntry>): number {
+  let total = 0;
+  for (const entry of entries) if (entry.kind === "file") total += entry.size;
+  return total;
+}
+
+/** `name -> target (why)`, the form every link refusal takes. */
+function describeUnsafeLink(link: UnsafeLink): string {
+  return link.linkTarget === ""
+    ? `${link.name} (${link.why})`
+    : `${link.name} -> ${link.linkTarget} (${link.why})`;
+}
+
 export const archiveList: RegisteredTool = buildTool({
   name: "ArchiveList",
   description:
-    "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
+    "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path or link would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
   inputSchema: z.object({
     path: z.string().min(1),
     limit: z
@@ -1491,13 +1506,18 @@ export const archiveList: RegisteredTool = buildTool({
     if (typeof read === "string") return read;
     const sorted = [...read.entries].sort((a, b) => compareStrings(a.name, b.name));
     const unsafe = sorted.filter((entry) => archiveEntryEscapes(entry.name)).map((e) => e.name);
+    const unsafeLinks = unsafeArchiveLinks(sorted).map(describeUnsafeLink);
     const limit = input.limit ?? 500;
     return json({
       path: target.rel,
       format: read.format,
       count: sorted.length,
+      // Declared by the archive's index. For a zip it is a claim: ArchiveExtract
+      // measures what was really written before it accepts anything.
+      totalBytes: declaredBytes(sorted),
       truncated: sorted.length > limit,
       unsafeEntries: unsafe.slice(0, 50),
+      unsafeLinks: unsafeLinks.slice(0, 50),
       entries: sorted.slice(0, limit).map((entry) => ({
         name: entry.name,
         kind: entry.kind,
@@ -1576,7 +1596,11 @@ export const archiveCreate: RegisteredTool = buildTool({
       format === "zip"
         ? // -X drops the extra attribute blocks (uid/gid, resource forks), which
           // are host state rather than content; -r recurses; -q stays quiet.
-          ["zip", "-q", "-r", "-X", output.abs, "--", name]
+          // -y stores a symlink AS a link, as tar does. Without it zip follows
+          // the link: a file link packed the outside file's bytes, and a
+          // directory link (`dirlink -> ~/.ssh`) made it recurse into and
+          // pack the whole outside directory.
+          ["zip", "-q", "-r", "-X", "-y", output.abs, "--", name]
         : format === "tar.gz"
           ? ["tar", "-c", "-z", "-f", output.abs, "-C", parent, "--", name]
           : ["tar", "-c", "-f", output.abs, "-C", parent, "--", name];
@@ -1590,6 +1614,11 @@ export const archiveCreate: RegisteredTool = buildTool({
     }
     const read = inspectArchive("ArchiveCreate", resolveSafe("ArchiveCreate", output.rel));
     const size = peek(output.abs)?.size ?? 0;
+    // Links are stored as links in every format. One that leads outside the
+    // archive's own tree is harmless here, but ArchiveExtract will refuse the
+    // archive for it, so the caller hears about it now.
+    const linksLeaving =
+      typeof read === "string" ? [] : unsafeArchiveLinks(read.entries).map(describeUnsafeLink);
     return json({
       created: true,
       output: output.rel,
@@ -1598,6 +1627,13 @@ export const archiveCreate: RegisteredTool = buildTool({
       size: formatBytes(size),
       entries: typeof read === "string" ? null : read.entries.length,
       ...(typeof read === "string" ? { verifyNote: read } : {}),
+      ...(linksLeaving.length > 0
+        ? {
+            linksLeavingArchive: linksLeaving.slice(0, 50),
+            linksNote:
+              "these symlinks were stored as links; they lead outside the archived tree, so ArchiveExtract will refuse to extract this archive",
+          }
+        : {}),
     });
   },
 });
@@ -1605,71 +1641,30 @@ export const archiveCreate: RegisteredTool = buildTool({
 /** The staging directory an extraction lands in before anything is accepted. */
 const STAGING_NAME = ".crewhaus-extract";
 
-/** How many staged entries the post-extraction scan will look at. */
-const STAGING_SCAN_BUDGET = 500_000;
+/**
+ * Default cap on the bytes an extraction may write: eight times the largest
+ * archive this tool reads. tar and tar.gz are already bounded by that read
+ * (their content is parsed in memory); a zip is not, since deflate reaches
+ * about 1000:1.
+ */
+const DEFAULT_EXTRACT_BYTES = 8 * MAX_ARCHIVE_BYTES;
+/** The most a caller may raise `maxBytes` to. */
+const MAX_EXTRACT_BYTES = 16 * 1024 * 1024 * 1024;
 
-type StagingScan = {
-  /** Every symlink under the staged root whose target resolves outside it. */
-  readonly escaping: string[];
-  /**
-   * True when some part of the staged tree was NOT inspected — the budget ran
-   * out, a directory would not open, or a link would not read. The caller
-   * must treat this as a failure: "we did not look" is not "nothing is there".
-   */
-  readonly incomplete: boolean;
-};
+let extractCommandForTest:
+  | ((argv: ReadonlyArray<string>, staging: string) => string[] | undefined)
+  | undefined;
 
 /**
- * Inspect every entry of a just-extracted tree for a symlink aimed out of it.
- *
- * This deliberately does NOT use `walkTree`. That walker is built for the
- * listing tools and skips `.git` unconditionally and stops at depth 64 —
- * reasonable when the question is "what is in this project", fatal when the
- * question is "did anything hostile land here". An archive member called
- * `pkg/.git/pwn -> /etc/passwd` is invisible to it, so the link is accepted
- * and planted inside the workspace. A plain readdir walk skips nothing.
- *
- * It is iterative rather than recursive so a pathologically deep archive
- * cannot overflow the stack half-way through the check, and it never
- * descends THROUGH a symlink, so there are no cycles to terminate.
+ * Test seam: rewrite the extractor's argv, so a test can stand in for an
+ * extractor that reads the archive differently from this tool's own index
+ * (writes a name it does not list, links a file from outside) and prove the
+ * post-extraction gate catches it. Pass `undefined` to restore.
  */
-function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): StagingScan {
-  const escaping: string[] = [];
-  let incomplete = false;
-  let remaining = budget;
-  const stack: Array<{ abs: string; rel: string }> = [{ abs: root, rel: "" }];
-  while (stack.length > 0) {
-    const dir = stack.pop() as { abs: string; rel: string };
-    let dirents: Dirent[];
-    try {
-      dirents = readdirSync(dir.abs, { withFileTypes: true });
-    } catch {
-      incomplete = true;
-      continue;
-    }
-    for (const dirent of dirents) {
-      if (remaining <= 0) {
-        incomplete = true;
-        break;
-      }
-      remaining -= 1;
-      const abs = path.join(dir.abs, dirent.name);
-      const rel = dir.rel === "" ? dirent.name : `${dir.rel}/${dirent.name}`;
-      if (dirent.isSymbolicLink()) {
-        let target: string;
-        try {
-          target = readlinkSync(abs);
-        } catch {
-          incomplete = true;
-          continue;
-        }
-        if (!isInside(root, path.resolve(dir.abs, target))) escaping.push(`${rel} -> ${target}`);
-        continue;
-      }
-      if (dirent.isDirectory()) stack.push({ abs, rel });
-    }
-  }
-  return { escaping: escaping.sort(compareStrings), incomplete };
+export function _setExtractCommandForTest(
+  fn: ((argv: ReadonlyArray<string>, staging: string) => string[] | undefined) | undefined,
+): void {
+  extractCommandForTest = fn;
 }
 
 export const archiveExtract: RegisteredTool = buildTool({
@@ -1679,13 +1674,22 @@ export const archiveExtract: RegisteredTool = buildTool({
     { field: "destination", kind: "path" },
   ],
   description:
-    "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped.",
+    "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list, the total size and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped and no more than `maxBytes` was written.",
   inputSchema: z.object({
     archive: z.string().min(1),
     destination: z.string().min(1),
     overwrite: z.boolean().optional().describe("replace top-level entries that already exist"),
     dryRun: z.boolean().optional(),
     maxEntries: z.number().int().min(1).max(200_000).optional().describe("default 20000"),
+    maxBytes: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_EXTRACT_BYTES)
+      .optional()
+      .describe(
+        `most bytes of file content the extraction may write (default ${formatBytes(DEFAULT_EXTRACT_BYTES)})`,
+      ),
     timeout: timeoutField,
   }),
   destructive: true,
@@ -1705,12 +1709,16 @@ export const archiveExtract: RegisteredTool = buildTool({
     if (entries.length > maxEntries) {
       return `${archive.rel} holds ${entries.length} members, over the ${maxEntries} cap`;
     }
+    const maxBytes = input.maxBytes ?? DEFAULT_EXTRACT_BYTES;
+    const totalBytes = declaredBytes(entries);
 
     // ZIP-SLIP GATE. Every member name is checked against the destination
     // BEFORE the extractor runs, using the archive's own index rather than a
     // printed listing. A member with a `..` segment, an absolute path or a
-    // drive prefix is refused, and so is a symlink member whose recorded
-    // target points out of the destination.
+    // drive prefix is refused, and so is a link member that leads out of the
+    // destination once extracted: resolved over the archive's own tree, one
+    // component at a time, so a chain through another link member is seen
+    // (`x -> a/b/y/../f` with `a/b/y -> ../..`).
     const refusals: string[] = [];
     for (const entry of entries) {
       if (archiveEntryEscapes(entry.name)) {
@@ -1722,7 +1730,7 @@ export const archiveExtract: RegisteredTool = buildTool({
         refusals.push(`${entry.name} (resolves outside the destination)`);
         continue;
       }
-      if ((entry.name.split("/")[0] ?? "") === STAGING_NAME) {
+      if ((memberComponents(entry.name)[0] ?? "") === STAGING_NAME) {
         // The staging directory lives at `<destination>/<STAGING_NAME>`, so a
         // member of that name would be promoted onto the directory it is
         // being promoted out of — which fails mid-loop and takes the rest of
@@ -1730,22 +1738,9 @@ export const archiveExtract: RegisteredTool = buildTool({
         refusals.push(
           `${entry.name} (collides with the staging directory this tool extracts into)`,
         );
-        continue;
-      }
-      if (entry.kind === "symlink" || entry.kind === "hardlink") {
-        if (entry.linkTarget === undefined || entry.linkTarget === "") {
-          // An unreadable target is refused rather than waved through: a
-          // link this gate cannot evaluate is precisely what a crafted
-          // archive would present to get past it.
-          refusals.push(`${entry.name} (a link whose target this archive does not state)`);
-          continue;
-        }
-        const linkTarget = path.resolve(path.dirname(landing), entry.linkTarget);
-        if (!isInside(destination.abs, linkTarget)) {
-          refusals.push(`${entry.name} -> ${entry.linkTarget} (link points outside)`);
-        }
       }
     }
+    for (const link of unsafeArchiveLinks(entries)) refusals.push(describeUnsafeLink(link));
     if (refusals.length > 0) {
       return json({
         extracted: false,
@@ -1757,11 +1752,23 @@ export const archiveExtract: RegisteredTool = buildTool({
         refusedCount: refusals.length,
       });
     }
+    if (totalBytes > maxBytes) {
+      return json({
+        extracted: false,
+        reason: "too large",
+        archive: archive.rel,
+        totalBytes,
+        maxBytes,
+        detail: `the archive declares ${formatBytes(totalBytes)} of content, over the ${formatBytes(maxBytes)} limit; pass a larger maxBytes to extract it`,
+      });
+    }
 
-    const topLevel = [
-      ...new Set(entries.map((entry) => (entry.name.split("/")[0] ?? "").replace(/\/$/, ""))),
-    ]
-      .filter((name) => name !== "" && name !== ".")
+    // Top-level names from normalized components: a tar made with
+    // `tar -C dir .` names its members `./a`, and taking the text before the
+    // first `/` gave "." — no top-level names at all, so no conflicts were
+    // reported and existing entries were replaced without `overwrite`.
+    const topLevel = [...new Set(entries.map((entry) => memberComponents(entry.name)[0] ?? ""))]
+      .filter((name) => name !== "")
       .sort(compareStrings);
     const conflicts = topLevel.filter(
       (name) => peek(path.join(destination.abs, name)) !== undefined,
@@ -1772,6 +1779,7 @@ export const archiveExtract: RegisteredTool = buildTool({
       destination: destination.rel,
       format,
       members: entries.length,
+      totalBytes,
       topLevel,
     };
     if (input.dryRun === true) {
@@ -1787,7 +1795,8 @@ export const archiveExtract: RegisteredTool = buildTool({
       });
     }
 
-    mkdirSync(destination.abs, { recursive: true });
+    const made = ensureDirContained(workspaceRoot(), relArg(destination));
+    if (!made.ok) return json({ extracted: false, code: made.code, reason: made.reason });
     const staging = path.join(destination.abs, STAGING_NAME);
     if (peek(staging) !== undefined) {
       return `${path.posix.join(destination.rel === "" ? "." : destination.rel, STAGING_NAME)} already exists — remove it, it is left over from an interrupted extraction`;
@@ -1800,23 +1809,59 @@ export const archiveExtract: RegisteredTool = buildTool({
         : format === "tar.gz"
           ? ["tar", "-x", "-z", "-f", archive.abs, "-C", staging]
           : ["tar", "-x", "-f", archive.abs, "-C", staging];
-    const result = await runProcess(argv, {
-      cwd: workspaceRoot(),
-      timeoutMs: input.timeout ?? DEFAULT_PROCESS_TIMEOUT_MS,
-      ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-    });
+    const command = extractCommandForTest?.(argv, staging) ?? argv;
+    // A zip's declared sizes are not what unzip writes, so the staging tree
+    // is watched while it grows and the extractor is killed once it passes
+    // the cap, rather than being left to fill the disk until its timeout.
+    const watch = watchTreeSize(staging, maxBytes);
+    const signal =
+      ctx?.signal !== undefined ? AbortSignal.any([ctx.signal, watch.signal]) : watch.signal;
+    let result: Awaited<ReturnType<typeof runProcess>>;
+    try {
+      result = await runProcess(command, {
+        cwd: workspaceRoot(),
+        timeoutMs: input.timeout ?? DEFAULT_PROCESS_TIMEOUT_MS,
+        signal,
+      });
+    } finally {
+      watch.stop();
+    }
+    const tooLarge = (written: string): string =>
+      json({
+        extracted: false,
+        reason: "too large",
+        archive: archive.rel,
+        totalBytes,
+        maxBytes,
+        detail: `${written}; the extracted tree was discarded`,
+      });
+    if (watch.exceeded()) {
+      rmSync(staging, { recursive: true, force: true });
+      return tooLarge(
+        `the extractor wrote more than ${formatBytes(maxBytes)} and was stopped (the archive declares ${formatBytes(totalBytes)})`,
+      );
+    }
     if (result.code !== 0 || result.missing) {
       rmSync(staging, { recursive: true, force: true });
       return `could not extract ${archive.rel}: ${describeFailure(argv, result)}`;
     }
 
-    // Second gate, after the extractor has had its say: a link that ended up
-    // pointing out of the staging tree means something got past the name
-    // check, so nothing is accepted. An INCOMPLETE scan is refused on the
-    // same terms — a gate that could not read part of the tree has not
-    // cleared it.
+    // Second gate, after the extractor has had its say: the staged tree is
+    // what gets promoted, so it is what is checked. A link that leads out of
+    // it, a file hard-linked from outside it, content beyond the cap or
+    // beyond what the index declared, or a top-level name the index did not
+    // list means something got past the first gate, and nothing is accepted.
+    // An INCOMPLETE scan is refused on the same terms — a gate that could not
+    // read part of the tree has not cleared it.
     const scan = scanStagedTree(staging);
-    if (scan.escaping.length > 0 || scan.incomplete) {
+    const unlisted = readdirSorted(staging).filter((name) => !topLevel.includes(name));
+    const understated = format === "zip" && scan.bytes > totalBytes;
+    if (
+      scan.escaping.length > 0 ||
+      scan.linkedOut.length > 0 ||
+      scan.incomplete ||
+      unlisted.length > 0
+    ) {
       rmSync(staging, { recursive: true, force: true });
       return json({
         extracted: false,
@@ -1825,9 +1870,21 @@ export const archiveExtract: RegisteredTool = buildTool({
         detail:
           scan.escaping.length > 0
             ? "the extracted tree contains symlinks pointing outside it; it was discarded"
-            : "the extracted tree could not be fully checked for escaping symlinks; it was discarded",
-        refused: scan.escaping.slice(0, 50),
+            : scan.linkedOut.length > 0
+              ? "the extracted tree contains files hard-linked to something outside it; it was discarded"
+              : unlisted.length > 0
+                ? "the extractor produced top-level entries the archive's index does not list; it was discarded"
+                : "the extracted tree could not be fully checked; it was discarded",
+        refused: [...scan.escaping, ...scan.linkedOut, ...unlisted].slice(0, 50),
       });
+    }
+    if (scan.bytes > maxBytes || understated) {
+      rmSync(staging, { recursive: true, force: true });
+      return tooLarge(
+        understated
+          ? `the archive declares ${formatBytes(totalBytes)} but extracted to ${formatBytes(scan.bytes)}, so its index understates its content`
+          : `the extraction wrote ${formatBytes(scan.bytes)}, over the ${formatBytes(maxBytes)} limit`,
+      );
     }
 
     const moved: string[] = [];
@@ -1842,7 +1899,7 @@ export const archiveExtract: RegisteredTool = buildTool({
     } finally {
       rmSync(staging, { recursive: true, force: true });
     }
-    return json({ ...summary, dryRun: false, extracted: true, entries: moved });
+    return json({ ...summary, dryRun: false, extracted: true, bytes: scan.bytes, entries: moved });
   },
 });
 

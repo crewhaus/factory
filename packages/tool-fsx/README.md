@@ -66,10 +66,28 @@ archive's own structures **in this process** — tar's headers, zip's central
 directory — rather than from `tar -t` or `unzip -Z1` output, because a member
 name can contain a newline and the two tars in the wild quote control
 characters differently. It refuses any member whose path escapes the
-destination (zip-slip) or whose symlink target does, extracts into a staging
-directory, re-checks the result for escaping links, and only then accepts it.
+destination (zip-slip) or whose link does. A link's target is resolved over
+the archive's own tree one component at a time, the way the kernel will
+resolve it, so `x -> a/b/y/../f` is seen to leave the destination when
+`a/b/y` is itself a link to `../..`; text folding would have said `a/b/f`.
+A `.tar.gz` is listed from every gzip member, as `tar -xz` reads it, and a
+pax `GNU.sparse.name` is read as the member's name, as both tars read it.
+
+It then extracts into a staging directory and checks what was actually
+written before accepting any of it: every link resolved through the real
+tree, every file's hard-link count (a file with a name outside the tree is
+refused), every top-level name against the index, and the bytes written.
+`maxBytes` (default 1 GiB, at most 16 GiB) caps the content: an archive whose
+index declares more is refused before extraction, `dryRun` and `ArchiveList`
+report `totalBytes`, the extractor is stopped once the staging tree passes the
+cap, and a zip that wrote more than its index declared is refused as lying.
 Hand-built malicious archives in `archive-fixtures.ts` test that, because
 `tar` and `zip` refuse to *create* such an archive in the first place.
+
+`ArchiveCreate` stores a symlink as a link in every format (`zip -y`, as
+tar does), never the file or directory it points at, and reports any stored
+link that leads outside the archived tree, since `ArchiveExtract` will refuse
+it.
 
 ## Determinism
 

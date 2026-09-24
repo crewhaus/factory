@@ -192,7 +192,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "archiveExtract",
     name: "ArchiveExtract",
     description:
-      "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped.",
+      "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list, the total size and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped and no more than `maxBytes` was written.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -211,7 +211,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "archiveList",
     name: "ArchiveList",
     description:
-      "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
+      "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path or link would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
     readOnly: true,
     destructive: false,
     scope: "internal",
