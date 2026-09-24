@@ -428,7 +428,7 @@ describe("an .env that links outside the workspace", () => {
     // reading it would surface "assigns CREWHAUS_SESSION_DIR" — a fact about a
     // file the caller never named. The tools must say "not read" instead.
     const saved = process.env["CREWHAUS_SESSION_DIR"];
-    delete process.env["CREWHAUS_SESSION_DIR"];
+    Reflect.deleteProperty(process.env, "CREWHAUS_SESSION_DIR");
     const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-tool-approvals-outside-"));
     try {
       writeFileSync(path.join(outside, "secret.env"), "CREWHAUS_SESSION_DIR=/x\n");
@@ -449,7 +449,7 @@ describe("an .env that links outside the workspace", () => {
         }).toEqual({ tool, readTheOutsideFile: false, saidNotRead: true });
       }
     } finally {
-      if (saved === undefined) delete process.env["CREWHAUS_SESSION_DIR"];
+      if (saved === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_SESSION_DIR");
       else process.env["CREWHAUS_SESSION_DIR"] = saved;
       rmSync(outside, { recursive: true, force: true });
     }
