@@ -1440,6 +1440,16 @@ describe("RobotsCheck / SitemapParse / FeedParse", () => {
     expect(await run(sitemapParse, {})).toContain("either text or url");
   });
 
+  test("FeedParse on a hostile tag parses in milliseconds rather than holding the loop (C091)", async () => {
+    const hostile = `<rss version="2.0"><channel x${"y".repeat(40_000)}><title>T</title><item><title>a</title></item></channel></rss>`;
+    const t0 = performance.now();
+    const result = await run(feedParse, { text: hostile });
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(result.kind).toBe("rss");
+    expect(result.title).toBe("T");
+    expect(result.entries.map((e: { title: string }) => e.title)).toEqual(["a"]);
+  }, 20_000);
+
   test("FeedParse reads a fetched feed and keeps its order", async () => {
     const result = await run(feedParse, { url: `${origin}/feed.xml` });
     expect(result.kind).toBe("rss");

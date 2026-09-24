@@ -24,7 +24,15 @@ import {
   timingSafeEqualHex,
   verifySignature,
 } from "./lib/webhook";
-import { XmlParseError, childrenNamed, decodeXmlText, parseXml, textOf } from "./lib/xml";
+import {
+  XmlParseError,
+  childrenNamed,
+  decodeXmlText,
+  hasInternalSubset,
+  parseAttrs,
+  parseXml,
+  textOf,
+} from "./lib/xml";
 import {
   HttpPermissionError,
   applyAuth,
@@ -685,6 +693,102 @@ describe("xml", () => {
   test("comments and processing instructions are skipped", () => {
     const root = parseXml("<r><!-- note --><a>1</a></r>");
     expect(textOf(root, "a")).toBe("1");
+  });
+});
+
+// SitemapParse and FeedParse parse after the fetch's deadline is cancelled,
+// synchronously, and `text` input is capped only at MAX_XML_BYTES: a
+// super-linear step here held the event loop for as long as it liked.
+// 400 000 characters took the 0.7.0 attribute pattern minutes; the sizes
+// below fail it in seconds instead of hanging, and parse in milliseconds now.
+describe("xml on hostile documents (C091)", () => {
+  test("a long attribute token with no '=' is scanned once", () => {
+    const t0 = performance.now();
+    const root = parseXml(
+      `<urlset x${"y".repeat(40_000)} a="1"><url><loc>https://e.x/</loc></url></urlset>`,
+    );
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(root.name).toBe("urlset");
+    expect(root.attrs).toEqual({ a: "1" });
+    expect(root.children[0]?.children[0]?.text).toBe("https://e.x/");
+  }, 20_000);
+
+  test("many <!DOCTYPE openers before one '>' are checked once", () => {
+    const t0 = performance.now();
+    expect(parseXml(`${"<!DOCTYPE ".repeat(12_000)}><urlset/>`).name).toBe("urlset");
+    expect(() => parseXml(`${"<!DOCTYPE ".repeat(12_000)}[<!-- -->]><urlset/>`)).toThrow(
+      /internal DTD subset/,
+    );
+    expect(performance.now() - t0).toBeLessThan(500);
+  }, 20_000);
+
+  test("one '[' after many closed openers is looked for once, not once per opener", () => {
+    // 1.5 MB: a search for the `[` per opener costs seconds here.
+    const t0 = performance.now();
+    expect(parseXml(`<r>${"<!DOCTYPE>".repeat(150_000)}</r><!-- [ -->`).name).toBe("r");
+    expect(performance.now() - t0).toBeLessThan(500);
+  }, 20_000);
+
+  test.each([
+    ["bare a=b=c", { a: "b=c" }],
+    [`x:a = "q" b='r' c=s/t`, { a: "q", b: "r", c: "s/t" }],
+    ['a="1" a="2"', { a: "2" }],
+    ["=a=1", { a: "1" }],
+    ["a= >", {}],
+    [`a="unclosed b='2'`, { b: "2" }],
+    ["a\u00a0=\u00a0'nbsp'", { a: "nbsp" }],
+  ])("attributes %p read as %p", (source, expected) => {
+    expect(parseAttrs(source)).toEqual(expected);
+  });
+
+  // The 0.7.0 spellings, kept here only as the oracle for the rewrite.
+  const OLD_ATTR = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+  const oldAttrs = (source: string): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const m of source.matchAll(OLD_ATTR)) {
+      const raw = m[1] as string;
+      const colon = raw.lastIndexOf(":");
+      out[(colon === -1 ? raw : raw.slice(colon + 1)).toLowerCase()] = decodeXmlText(
+        m[2] ?? m[3] ?? m[4] ?? "",
+      );
+    }
+    return out;
+  };
+  const OLD_SUBSET = /<!DOCTYPE[^>]*\[/i;
+
+  test("on random short tags, attributes and the subset check agree with 0.7.0 exactly", () => {
+    const alphabet = [
+      "a",
+      "B",
+      ":",
+      "=",
+      " ",
+      "\t",
+      '"',
+      "'",
+      "/",
+      ">",
+      "[",
+      "&amp;",
+      "<!DOCTYPE",
+      "<!doctype",
+      "x",
+    ];
+    let seed = 11;
+    const next = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let compared = 0;
+    for (let i = 0; i < 30_000; i++) {
+      let source = "";
+      const len = next(14);
+      for (let j = 0; j < len; j++) source += alphabet[next(alphabet.length)];
+      expect(parseAttrs(source)).toEqual(oldAttrs(source));
+      expect(hasInternalSubset(source)).toBe(OLD_SUBSET.test(source));
+      compared++;
+    }
+    expect(compared).toBe(30_000);
   });
 });
 
