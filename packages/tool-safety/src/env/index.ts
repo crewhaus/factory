@@ -16,7 +16,11 @@
  *   results, in their encoded spellings too.
  * - {@link redactUrlCredentials} / {@link redactUrlCredentialsInText}:
  *   userinfo and credential-named parameters out of URLs.
+ * - {@link withoutCredentials}: a child process's environment without the
+ *   variables that hold a credential, for a child that runs code the
+ *   workspace supplies.
  */
+export { type CredentialFreeEnv, withoutCredentials } from "./child";
 export {
   type CredentialEnvOptions,
   type CredentialEnvRefusal,
