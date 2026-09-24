@@ -177,6 +177,16 @@ export type EvalGateThresholds = {
   readonly maxRegressions?: number;
   /** Verdict-preserving score moves smaller than this are not reported. */
   readonly scoreEpsilon?: number;
+  /**
+   * Let two runs that NAME different datasets be gated against each other.
+   * Off by default: their scores are not comparable, so the gate fails.
+   */
+  readonly allowDatasetMismatch?: boolean;
+  /**
+   * The share of the baseline's samples the candidate must also have run
+   * (0..1). Unset: any overlap will do, but none at all still fails.
+   */
+  readonly minSharedFraction?: number;
 };
 
 export type EvalGateResult = {
@@ -207,6 +217,8 @@ export type EvalGateResult = {
     readonly maxPassRateDrop: number;
     readonly maxRegressions: number;
     readonly scoreEpsilon: number;
+    readonly allowDatasetMismatch?: boolean;
+    readonly minSharedFraction?: number;
   };
   /** Set when either side's pass rate had to be recomputed from samples. */
   readonly notes: readonly string[];
@@ -227,6 +239,13 @@ function round(n: number): number {
  * INCONCLUSIVE and still counted in the pass rate (that is what the runner's
  * own aggregate does) — the list exists so a gate failure caused by judge
  * noise is visible as such.
+ *
+ * A comparison that never happened is not a pass (0.7.1, security-5#5): two
+ * runs that share no sample ids, or that both name a dataset and name
+ * different ones, FAIL the gate with a reason, because a candidate whose pass
+ * rate merely matches a baseline measured on something else has not been
+ * shown to hold the line. The verdict stays `pass | fail`: a third value
+ * would be read as "not fail" by every caller written `verdict === "fail"`.
  */
 export function compareEvalRuns(
   baseline: EvalRunView,
@@ -284,6 +303,28 @@ export function compareEvalRuns(
       `pass rate ${round(candidate.passRate)} is below the declared floor ${thresholds.minPassRate}`,
     );
   }
+  if (shared === 0) {
+    reasons.push(
+      "the two runs share no sample ids — nothing was compared sample by sample, so the candidate cannot be shown to hold the line (a smoke run, a different dataset, or re-keyed sample ids)",
+    );
+  } else if (
+    thresholds.minSharedFraction !== undefined &&
+    baseById.size > 0 &&
+    shared / baseById.size < thresholds.minSharedFraction
+  ) {
+    reasons.push(
+      `the candidate ran ${shared} of the baseline's ${baseById.size} samples (${round(shared / baseById.size)}), below the required share ${thresholds.minSharedFraction}`,
+    );
+  }
+  const datasetsDiffer =
+    baseline.datasetName !== undefined &&
+    candidate.datasetName !== undefined &&
+    baseline.datasetName !== candidate.datasetName;
+  if (datasetsDiffer && thresholds.allowDatasetMismatch !== true) {
+    reasons.push(
+      `the runs name different datasets (${baseline.datasetName} vs ${candidate.datasetName}) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway`,
+    );
+  }
 
   const notes: string[] = [];
   for (const [label, run] of [
@@ -317,9 +358,6 @@ export function compareEvalRuns(
       `the two runs name different datasets (${baseline.datasetName ?? "unknown"} vs ${candidate.datasetName ?? "unknown"}) — scores from different datasets are not comparable`,
     );
   }
-  if (shared === 0) {
-    notes.push("the two runs share no sample ids, so no per-sample comparison was possible");
-  }
 
   return {
     verdict: reasons.length === 0 ? "pass" : "fail",
@@ -348,6 +386,12 @@ export function compareEvalRuns(
       maxPassRateDrop,
       maxRegressions,
       scoreEpsilon,
+      ...(thresholds.allowDatasetMismatch !== undefined
+        ? { allowDatasetMismatch: thresholds.allowDatasetMismatch }
+        : {}),
+      ...(thresholds.minSharedFraction !== undefined
+        ? { minSharedFraction: thresholds.minSharedFraction }
+        : {}),
     },
     notes,
   };

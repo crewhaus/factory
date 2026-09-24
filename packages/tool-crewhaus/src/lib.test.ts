@@ -737,11 +737,72 @@ describe("eval gate", () => {
     expect(compareEvalRuns(base, cand).inconclusive).toEqual(["b"]);
   });
 
-  test("comparing runs over different datasets is noted, not silently gated", () => {
-    const doc = evalDoc([["a", true, 1]], { config: { datasetName: "other" } });
+  // 0.7.1 (security-5#5): a comparison that never happened used to PASS —
+  // zero shared samples and a dataset mismatch were notes, and a candidate
+  // whose pass rate merely matched cleared "the release gate".
+  test("runs over different datasets FAIL the gate unless the caller allows it", () => {
+    const doc = evalDoc(
+      [
+        ["a", true, 1],
+        ["b", true, 1],
+        ["c", false, 0],
+      ],
+      { config: { datasetName: "other" } },
+    );
     const { base, cand } = run(doc);
-    const result = compareEvalRuns(base, cand, { maxPassRateDrop: 1 });
+    const result = compareEvalRuns(base, cand);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons).toEqual([
+      "the runs name different datasets (golden vs other) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway",
+    ]);
+    const allowed = compareEvalRuns(base, cand, { allowDatasetMismatch: true });
+    expect(allowed.verdict).toBe("pass");
+    expect(allowed.notes.some((n) => n.includes("different datasets"))).toBe(true);
+    expect(allowed.thresholds.allowDatasetMismatch).toBe(true);
+  });
+
+  test("runs that share no sample ids FAIL the gate, even with a perfect candidate", () => {
+    const { base, cand } = run(evalDoc([["x", true, 1]]));
+    const result = compareEvalRuns(base, cand);
+    expect(result.samples.shared).toBe(0);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons.some((r) => r.includes("share no sample ids"))).toBe(true);
+  });
+
+  test("a smoke run on another dataset with new ids fails for both reasons", () => {
+    const { base, cand } = run(
+      evalDoc([["smoke-0", true, 1]], { config: { datasetName: "smoke" } }),
+    );
+    const result = compareEvalRuns(base, cand);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons.map((r) => r.slice(0, 30))).toEqual([
+      "the two runs share no sample i",
+      "the runs name different datase",
+    ]);
+  });
+
+  test("a candidate that names no dataset keeps the note and is not failed for it", () => {
+    const { base, cand } = run({
+      ...evalDoc([
+        ["a", true, 1],
+        ["b", true, 1],
+        ["c", false, 0],
+      ]),
+      config: {},
+    });
+    const result = compareEvalRuns(base, cand);
+    expect(result.verdict).toBe("pass");
     expect(result.notes.some((n) => n.includes("different datasets"))).toBe(true);
+  });
+
+  test("minSharedFraction fails a candidate that covers too little of the baseline", () => {
+    const { base, cand } = run(evalDoc([["a", true, 1]]));
+    expect(compareEvalRuns(base, cand).verdict).toBe("pass");
+    const strict = compareEvalRuns(base, cand, { minSharedFraction: 0.5 });
+    expect(strict.verdict).toBe("fail");
+    expect(strict.reasons).toEqual([
+      "the candidate ran 1 of the baseline's 3 samples (0.333333), below the required share 0.5",
+    ]);
   });
 });
 

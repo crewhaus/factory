@@ -108,7 +108,9 @@ supply, because the builtin registry lives in the compiled bundle rather than
 in the spec. `BundleFreshness` uses preflight's mtime heuristic and says so —
 `stale` means "recompile to be sure", not "proven different". `AuditVerify`
 returns `anchorChecked`, because a chain that verifies without an anchor has
-not ruled out a dropped tail. `EvalBaselineCompare` reads a results document
+not ruled out a dropped tail. `EvalBaselineCompare` fails a comparison that never happened — two runs that share
+no sample id, or that name different datasets (unless `allowDatasetMismatch`) —
+rather than passing a candidate measured on something else; and it reads a results document
 without believing it: a declared `passRate` outside 0..1 is discarded in
 favour of the samples, one the samples contradict is reported as a note, and a
 repeated `sampleId` is named, because samples are matched by id and a repeat

@@ -830,6 +830,21 @@ describe("EvalBaselineCompare", () => {
     ).toContain("baseline");
   });
 
+  test("a one-sample smoke run on another dataset does not pass a 50-sample gate (0.7.1)", async () => {
+    const baseline = evalDoc(
+      Array.from({ length: 50 }, (_, i): [string, boolean, number] => [`s${i}`, i % 10 !== 0, 1]),
+    );
+    const candidate = { ...evalDoc([["other-0", true, 1]]), config: { datasetName: "smoke" } };
+    const result = await callJson<{
+      verdict: string;
+      reasons: string[];
+      samples: { shared: number };
+    }>(evalBaselineCompare, { baseline, candidate });
+    expect(result.samples.shared).toBe(0);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons.length).toBe(2);
+  });
+
   test("passing both a document and a path for one side is refused", async () => {
     write("base.json", JSON.stringify(evalDoc([["a", true, 1]])));
     expect(

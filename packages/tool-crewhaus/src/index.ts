@@ -1020,7 +1020,7 @@ function loadEvalDoc(
 export const evalBaselineCompare: RegisteredTool = buildTool({
   name: "EvalBaselineCompare",
   description:
-    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
+    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A comparison that never happened fails: runs that share no sample ids, or that name different datasets (unless allowDatasetMismatch), fail the gate, and minSharedFraction can require the candidate to cover more of the baseline. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
   inputSchema: z.object({
     baseline: evalDocSchema.optional().describe("the baseline run's results document"),
     baselinePath: z.string().optional().describe("path to the baseline results.json instead"),
@@ -1050,6 +1050,20 @@ export const evalBaselineCompare: RegisteredTool = buildTool({
       .max(1)
       .optional()
       .describe("verdict-preserving score moves smaller than this are not reported (default 0.1)"),
+    allowDatasetMismatch: z
+      .boolean()
+      .optional()
+      .describe(
+        "gate two runs that name different datasets anyway (default false: their scores are not comparable, so the gate fails)",
+      ),
+    minSharedFraction: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe(
+        "the share of the baseline's samples the candidate must also have run, e.g. 1 for all of them (default: any overlap; none at all always fails)",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -1073,6 +1087,12 @@ export const evalBaselineCompare: RegisteredTool = buildTool({
       ...(input.maxPassRateDrop !== undefined ? { maxPassRateDrop: input.maxPassRateDrop } : {}),
       ...(input.maxRegressions !== undefined ? { maxRegressions: input.maxRegressions } : {}),
       ...(input.scoreEpsilon !== undefined ? { scoreEpsilon: input.scoreEpsilon } : {}),
+      ...(input.allowDatasetMismatch !== undefined
+        ? { allowDatasetMismatch: input.allowDatasetMismatch }
+        : {}),
+      ...(input.minSharedFraction !== undefined
+        ? { minSharedFraction: input.minSharedFraction }
+        : {}),
     };
     return json({
       ...compareEvalRuns(baseline.value, candidate.value, thresholds),
