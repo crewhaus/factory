@@ -7,7 +7,7 @@
  * fallback + injected callback, and the wiki_write event seam.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
@@ -444,6 +444,19 @@ describe("log_knowledge_gap", () => {
     expect(res).toBe("gap routed to plan store: T");
     expect(seen).toEqual([{ topic: "T", tags: ["a"], priority: "medium" }]);
     expect(await bundle.store.get("gap-t")).toBeNull(); // fallback skipped
+  });
+
+  test("a link planted at the gap article's predictable temp name creates nothing outside (security-2#0)", async () => {
+    const outside = join(tmp, "outside");
+    mkdirSync(outside);
+    const articles = join(tmp, "spec", "articles");
+    mkdirSync(articles, { recursive: true });
+    symlinkSync(join(outside, "x.sh"), join(articles, "gap-foo.md.tmp"));
+    const bundle = makeBundle();
+    const res = await bundle.logKnowledgeGap.execute({ topic: "foo" });
+    expect(res).toContain("gap-foo");
+    expect(existsSync(join(outside, "x.sh"))).toBe(false);
+    expect(lstatSync(join(articles, "gap-foo.md")).isFile()).toBe(true);
   });
 });
 

@@ -1302,6 +1302,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/embedder": "workspace:*",
@@ -3514,6 +3515,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "yaml": "^2.6.0",
       },
       "devDependencies": {

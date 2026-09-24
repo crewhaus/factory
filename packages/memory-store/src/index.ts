@@ -58,12 +58,19 @@
  * write-path-governance rule: facts proven by tool runs outrank
  * pure-text claims of equal textual relevance.
  */
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { appendFile, readFile } from "node:fs/promises";
+import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
+import { appendContained, openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/memories";
+
+/**
+ * The most of a memory file the store reads, capped before anything is
+ * buffered. Far past the working set the store is designed for; a file this
+ * large is refused with the command that shrinks it, never read in part.
+ */
+export const MEMORY_FILE_MAX_BYTES = 512 * 1024 * 1024;
 
 /** Schema version stamped on every new write. Absent = v1 (read lazily). */
 export const MEMORY_SCHEMA_VERSION = 2;
@@ -245,15 +252,41 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
     }
   }
 
+  const fileName = `${opts.specName}.jsonl`;
+
+  /**
+   * Every read, append and rewrite goes through the contained primitives,
+   * rooted at `rootDir`: a symlink planted at `<spec>.jsonl` or at the old
+   * fixed compaction temp `<spec>.jsonl.tmp` used to be followed, so a
+   * remembered line — model-written text — could be appended to, or a
+   * compaction written over, any file the process could reach
+   * (security-2#0's sibling). A link or special file at the leaf is now
+   * refused, naming the file.
+   */
+  function refused(action: string, reason: string): MemoryStoreError {
+    return new MemoryStoreError(`refusing to ${action} ${fileName} in ${rootDir}: ${reason}`);
+  }
+
   async function readLines(): Promise<string[]> {
-    if (!existsSync(filePath)) return [];
-    let raw: string;
-    try {
-      raw = await readFile(filePath, "utf-8");
-    } catch {
-      return [];
+    const read = await openForRead(rootDir, fileName, {
+      maxBytes: MEMORY_FILE_MAX_BYTES,
+      followLeafSymlink: false,
+    });
+    if (!read.ok) {
+      if (read.code === "not-found") return [];
+      throw refused("read", read.reason);
     }
-    return raw.split("\n").filter((l) => l.trim() !== "");
+    if (read.truncated) {
+      throw new MemoryStoreError(
+        `${fileName} in ${rootDir} is larger than ${MEMORY_FILE_MAX_BYTES} bytes, so it was not read; archive or trim it (crewhaus memory sweep --compact rewrites it without forgotten entries)`,
+      );
+    }
+    return read.text.split("\n").filter((l) => l.trim() !== "");
+  }
+
+  function appendLines(text: string): void {
+    const appended = appendContained(rootDir, fileName, text, { mode: 0o600 });
+    if (!appended.ok) throw refused("append to", appended.reason);
   }
 
   type Loaded = {
@@ -338,7 +371,7 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
         return JSON.stringify(t);
       })
       .join("\n");
-    await appendFile(filePath, `${lines}\n`, { mode: 0o600 });
+    appendLines(`${lines}\n`);
   }
 
   /**
@@ -479,7 +512,7 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
       // primitives: `sweep()` tombstones expired entries, `forget()`
       // supersedes stale ones, and `compact()` rewrites the file dropping
       // dead lines (`crewhaus memory sweep --compact` runs both).
-      await appendFile(filePath, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+      appendLines(`${JSON.stringify(entry)}\n`);
       return entry;
     },
 
@@ -565,9 +598,15 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
         // verbatim so compact never destroys forward-compatible data.
         kept.push(line);
       }
-      const tmpPath = `${filePath}.tmp`;
-      writeFileSync(tmpPath, kept.length > 0 ? `${kept.join("\n")}\n` : "", { mode: 0o600 });
-      renameSync(tmpPath, filePath);
+      // A random O_EXCL temp beside the file, renamed into place: the
+      // replaced file keeps its permission bits.
+      const written = writeFileSafe(
+        rootDir,
+        fileName,
+        kept.length > 0 ? `${kept.join("\n")}\n` : "",
+        { overwrite: true, mode: 0o600 },
+      );
+      if (!written.ok) throw refused("rewrite", written.reason);
       embeddingCache.clear();
       return { kept: kept.length, dropped };
     },

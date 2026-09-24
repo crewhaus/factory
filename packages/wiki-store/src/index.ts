@@ -74,11 +74,12 @@
  * option), any resolved path outside the tenant's root throws before any
  * IO happens. The default root under a tenant is `<tenantRoot>/wiki`.
  */
-import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { lstatSync, unlinkSync } from "node:fs";
+import { mkdir, readdir } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Tenant, assertSamePath, currentTenantContext } from "@crewhaus/tenancy";
+import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import YAML from "yaml";
 import { type AcquireLockOptions, withLock } from "./lock";
 
@@ -105,6 +106,14 @@ const SPEC_NAME_REGEX = /^[a-zA-Z0-9_\-.]+$/;
  *  that could traverse (`..`, `/`, uppercase, spaces). */
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,127}$/;
 const WIKILINK_REGEX = /\[\[([^\]]+)\]\]/g;
+/**
+ * The most of one article file the store reads or writes. Reads are capped
+ * before anything is buffered; a write past it is refused, so the store
+ * never writes an article it would then refuse to read.
+ */
+export const ARTICLE_MAX_BYTES = 16 * 1024 * 1024;
+/** index.json is a derived cache: past this it is rebuilt from the articles instead of read. */
+const INDEX_MAX_BYTES = 64 * 1024 * 1024;
 
 export class WikiStoreError extends CrewhausError {
   override readonly name: string = "WikiStoreError";
@@ -570,31 +579,71 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
     return fence(join(articlesDir, `${slug}.md`));
   }
 
+  /** A store path as the store names it in messages: `articles/notes.md`. */
+  function storeRel(absPath: string): string {
+    return relative(storeDir, absPath).split("\\").join("/");
+  }
+
+  /**
+   * Write `content` at `absPath` without writing THROUGH anything planted in
+   * the store (security-2#0). The bytes go to an `O_EXCL|O_NOFOLLOW` temp
+   * under a random name in the file's physical directory, which must be
+   * inside the store, and the temp is renamed into place. A fixed temp name
+   * (`<slug>.md.tmp`, `index.json.tmp`) used to be opened with link
+   * following, so a symlink planted there — dangling or not — created or
+   * truncated a file anywhere the process could write. A symlinked article,
+   * a symlinked `versions/<slug>` directory leading out, or a FIFO at the
+   * leaf is refused, naming the store path.
+   */
   async function atomicWrite(absPath: string, content: string): Promise<void> {
     fence(absPath);
-    await mkdir(dirname(absPath), { recursive: true });
-    const tmpPath = `${absPath}.tmp`;
-    await writeFile(tmpPath, content, { mode: 0o600 });
-    await rename(tmpPath, absPath);
+    await mkdir(storeDir, { recursive: true });
+    const rel = storeRel(absPath);
+    const written = writeFileSafe(storeDir, rel, content, {
+      overwrite: true,
+      createParents: true,
+      mode: 0o600,
+    });
+    if (!written.ok) {
+      throw new WikiStoreError(`refusing to write ${rel} in the wiki store: ${written.reason}`);
+    }
+  }
+
+  /**
+   * At most `maxBytes` of a regular file inside the store, never through a
+   * symlink (a planted `articles/<slug>.md -> ~/.ssh/...` is not read), or
+   * `null` when nothing is there.
+   */
+  async function readStoreFile(absPath: string, maxBytes: number): Promise<string | null> {
+    fence(absPath);
+    const rel = storeRel(absPath);
+    const read = await openForRead(storeDir, rel, { maxBytes, followLeafSymlink: false });
+    if (!read.ok) {
+      if (read.code === "not-found") return null;
+      throw new WikiStoreError(`refusing to read ${rel} in the wiki store: ${read.reason}`);
+    }
+    if (read.truncated) {
+      throw new WikiStoreError(
+        `${rel} in the wiki store is larger than ${maxBytes} bytes, so it was not read`,
+      );
+    }
+    return read.text;
   }
 
   async function readArticle(slug: string): Promise<WikiArticle | null> {
-    const p = articlePath(slug);
-    if (!existsSync(p)) return null;
-    let raw: string;
-    try {
-      raw = await readFile(p, "utf8");
-    } catch {
-      return null;
-    }
-    return parseArticle(raw);
+    const raw = await readStoreFile(articlePath(slug), ARTICLE_MAX_BYTES);
+    return raw === null ? null : parseArticle(raw);
   }
 
   async function listArticleSlugs(): Promise<string[]> {
     fence(articlesDir);
     let entries: string[];
     try {
-      entries = await readdir(articlesDir);
+      // Regular files only: a symlink or FIFO named like an article is not
+      // one of the store's articles, and reading it is refused anyway.
+      entries = (await readdir(articlesDir, { withFileTypes: true }))
+        .filter((e) => e.isFile())
+        .map((e) => e.name);
     } catch {
       return [];
     }
@@ -642,18 +691,27 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
    *  (the crash-safe guarantee: the index is always derivable). */
   async function loadIndex(): Promise<WikiIndexFile> {
     fence(indexPath);
-    if (existsSync(indexPath)) {
-      try {
-        const parsed = JSON.parse(await readFile(indexPath, "utf8")) as unknown;
+    try {
+      const raw = await readStoreFile(indexPath, INDEX_MAX_BYTES);
+      if (raw !== null) {
+        const parsed = JSON.parse(raw) as unknown;
         if (isIndexFile(parsed)) return parsed;
-      } catch {
-        // fall through to rebuild
       }
+    } catch {
+      // missing, corrupt, oversized or not a regular file: fall through to rebuild
     }
     return rebuildIndex();
   }
 
   async function persistIndex(index: WikiIndexFile): Promise<void> {
+    // index.json is a derived cache, so a symlink planted in its place is
+    // removed (unlink never follows a link) rather than left to fail every
+    // write; the rebuilt index then lands as a regular file.
+    try {
+      if (lstatSync(fence(indexPath)).isSymbolicLink()) unlinkSync(indexPath);
+    } catch {
+      // nothing there yet
+    }
     await atomicWrite(indexPath, `${JSON.stringify(index, null, 2)}\n`);
   }
 
@@ -880,7 +938,13 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
             body: input.body,
           };
         }
-        await atomicWrite(articlePath(slug), serializeArticle(next));
+        const serialized = serializeArticle(next);
+        if (Buffer.byteLength(serialized, "utf8") > ARTICLE_MAX_BYTES) {
+          throw new WikiStoreError(
+            `write(): article "${slug}" would be larger than ${ARTICLE_MAX_BYTES} bytes; split it into linked articles`,
+          );
+        }
+        await atomicWrite(articlePath(slug), serialized);
         // The index is a derived cache — rebuild from the authoritative
         // article scan so a previously stale/corrupt index self-heals on
         // the next mutation.
@@ -999,13 +1063,16 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
       let priorVersions = 0;
       fence(versionsDir);
       try {
-        for (const slugDir of await readdir(versionsDir)) {
+        // Real directories and regular files only: a `versions/<slug>` link
+        // leading out of the store is not listed through.
+        for (const slugDir of await readdir(versionsDir, { withFileTypes: true })) {
+          if (!slugDir.isDirectory()) continue;
           try {
-            priorVersions += (await readdir(join(versionsDir, slugDir))).filter((f) =>
-              f.endsWith(".md"),
-            ).length;
+            priorVersions += (
+              await readdir(join(versionsDir, slugDir.name), { withFileTypes: true })
+            ).filter((f) => f.isFile() && f.name.endsWith(".md")).length;
           } catch {
-            // not a directory / raced away — skip
+            // raced away — skip
           }
         }
       } catch {
