@@ -1,11 +1,12 @@
 # @crewhaus/tool-safety
 
-The guards tool packages import instead of each hand-rolling its own. An audit of the 0.7.0 builtins found the same defects in dozens of packages that share no code. The first is caller-supplied regexes that freeze the process and, worse, answer "no match" when the engine gave up. Each helper here closes one of those, once.
+The guards tool packages import instead of each hand-rolling its own. An audit of the 0.7.0 builtins found the same defects in dozens of packages that share no code: caller-supplied regexes that freeze the process, output capped only after it was buffered, a compressed response inflated to gigabytes, and a FIFO that blocks a read for ever. Each helper here closes one of those, once.
 
-Zero runtime dependencies: Bun and `node:*` only. **Bun only** — it uses Bun Workers, so it is not for the cf-worker targets.
+Zero runtime dependencies: Bun and `node:*` only. **Bun only** — it uses Bun Workers and `Bun.spawn`, so it is not for the cf-worker targets.
 
 ```ts
 import { runRegex, screenUserRegex } from "@crewhaus/tool-safety/regex";
+import { spawnBounded, readResponseBounded, withRawBody, readFileBounded } from "@crewhaus/tool-safety/streams";
 ```
 
 ## `./regex`: caller-supplied regular expressions
@@ -91,9 +92,45 @@ At the deadline the caller's event loop is free. The worker thread, though, can'
 
 `bun build --compile` embeds only statically imported modules, so a worker started from a separate file URL would be missing from a single-file binary. The worker is created from an inline source string through a Blob URL. `compiled-binary.test.ts` builds a real binary and runs it from a directory with no source tree.
 
+## `./streams`: bounded reading
+
+### `collectBounded(stream, { maxBytes, tailBytes?, onChunk?, signal? })`
+
+`collectBounded` applies the cap as bytes arrive. Past the cap it still reads to the end, because a child blocked on a full pipe never exits, but it counts the bytes and drops them. The result reports `truncated`, `totalBytes`, `omittedBytes`, an optional `tail`/`tailText`, and `complete` (whether the end of the stream was reached). An error is returned in `error`, not thrown.
+
+### `spawnBounded({ cmd, cwd, env, stdin, timeoutMs, maxStdoutBytes, maxStderrBytes, signal, … })`
+
+`spawnBounded` runs argv without a shell. The child leads its own process group, and a timeout or abort sends SIGTERM to the whole group, then SIGKILL after `killGraceMs`. On Windows it runs `taskkill /T /F`, best effort.
+
+The result carries `exitCode` (null when signalled), `signal`, `timedOut`, `aborted`, `stdout`/`stderr` with their `…Truncated` flags and byte counts, and `outputComplete`.
+
+When a grandchild keeps a pipe open after the child exits, reading stops after `drainGraceMs`. The helper returns the bytes that did arrive, with `outputComplete: false`. It never reports an empty string as if it were the output.
+
+`onOverflow: "kill"` stops a producer at its cap. That grandchild itself is not killed after a normal exit, because it may be a daemon the command meant to start.
+
+### `readResponseBounded(res, { maxBytes })` with `withRawBody(init)`
+
+Measured on Bun 1.3.14: unless a request passes `decompress: false`, `fetch` inflates a gzip, deflate, br or zstd body in native code before JavaScript sees a byte. A 65 KB gzip body put 273 MB on the heap before the first `read()` returned. Bun also **keeps** the `Content-Encoding` header, and it keeps `Content-Length` at the compressed size, so the response gives no sign it was decoded.
+
+The bound therefore has to start at the request. Fetch with `withRawBody({...})`, and this reader decodes the body itself, stopping the decoder once `maxBytes` of decoded output exist. Against 1 GiB bombs it decoded the cap plus one 16 KiB chunk, with peak RSS up about 20–25 MB, in all four codings. Without `withRawBody`, the same bombs cost +1.5 GB (gzip) and +3.5 GB (br) before any reader saw them.
+
+The reader refuses a body the runtime already decoded, with the code `auto-decompressed`. It detects that when the body runs past its own `Content-Length`, or when a gzip or zstd body lacks its magic bytes. A double-decoded br or deflate body surfaces as `decode-error` instead. The memory is spent by then, so the check exists to make a missing `withRawBody` fail a test. Every adopting package should keep a gzip-bomb test against a local server.
+
+### `readFileBounded(path, { maxBytes, followSymlinks? })` and `readFileBoundedSync`
+
+The helper reads at most `maxBytes` plus one byte (to tell whether more exists); it never reads the whole file and then slices. A FIFO, socket, device or directory is refused with `not-regular-file` and its `kind` **before it is opened**. Opening a FIFO unblocks whoever is waiting to write it, and opening some devices has side effects.
+
+The open descriptor is checked again with `fstat`, and it must be the same file (`dev`/`ino`) as the one checked. The open uses `O_NONBLOCK`, so a path swapped for a FIFO between the two checks cannot block. `followSymlinks: false` refuses a symlink and opens with `O_NOFOLLOW`.
+
 ## Adopting it
 
 | Finding(s) | Replace | With |
 |---|---|---|
 | flag-truth-1#5, security-1#2, security-2#1, security-6#6, security-8#9, security-8#12, security-9#7, security-12#1, flag-truth-2#6, security-5#20 | `new RegExp(callerPattern)` + synchronous `test`/`exec`/`replace` | `screenUserRegex` in the input schema, plus `runRegex`/a session with a batch op at run time. Surface non-`ok` as undetermined (see above). |
 | security-10#0 | a literal regex with an overlap (`\s+[^:]*`) | Fix the literal and cap line length. `runRegex({ op: "testEach" })` is the fallback if the pattern must stay. |
+| security-8#7, security-8#8, security-10#9 | `new Response(proc.stdout).text()` + `capText` | `spawnBounded`, reporting `outputComplete: false` as unreadable. |
+| security-6#8, security-12#4 | `collectStream` → `new Response(stream).text()` | `collectBounded` (with `onOverflow: "kill"` semantics where the output past the cap is worthless). |
+| security-5#7, security-9#4 | `fetch(url)` + a capped reader | `fetch(url, withRawBody(init))` + `readResponseBounded`, plus a local gzip-bomb test. |
+| security-12#3, flag-truth-6#5 | `Buffer.allocUnsafe(size)` + read all | `readFileBounded` / `readFileBoundedSync`. |
+| security-11#8 | line reads with no byte budget | `readFileBounded` for the budget; the per-line cap stays in the tool. |
+| flag-truth-6#4, security-12#8 | a preview capped by lines only | The UTF-8-safe cut in `collectBounded` is the model; the preview fix itself lives in `tool-result-store`. |

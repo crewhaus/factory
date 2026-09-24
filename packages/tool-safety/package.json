@@ -2,12 +2,13 @@
   "name": "@crewhaus/tool-safety",
   "version": "0.7.0",
   "type": "module",
-  "description": "Zero-dependency guards tool packages share instead of hand-rolling: caller-supplied regexes screened for catastrophic shapes and run under a real deadline in a terminable worker",
+  "description": "Zero-dependency guards tool packages share instead of hand-rolling: caller-supplied regexes run under a real deadline in a terminable worker, and bounded readers for streams, child processes, HTTP bodies and files",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./regex": "./src/regex/index.ts"
+    "./regex": "./src/regex/index.ts",
+    "./streams": "./src/streams/index.ts"
   },
   "scripts": {
     "test": "bun test src"
