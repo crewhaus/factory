@@ -35,9 +35,14 @@ thing it asked.
 the filesystem, and the tool only makes it when the index behind the answer
 was confirmed: on macOS that means `mdutil` said the volume is indexed. When
 `mdutil` is absent, times out, or reports "unknown indexing state" — and when
-the backend's own output was cut off at this package's capture ceiling — the
-search came back empty and nobody checked why. That is not evidence the file
-is absent, and it is not the same instruction to a caller.
+the backend's own output was cut off at this package's capture ceiling, or
+could not be read to its end — the search came back empty and nobody checked
+why. That is not evidence the file is absent, and it is not the same
+instruction to a caller.
+
+The capture ceiling bounds memory as well as the answer: a backend's output
+is kept up to the ceiling as it arrives and the rest is drained unstored, so a
+whole-volume listing costs the ceiling, not the listing.
 
 ## WatchPath
 
