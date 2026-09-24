@@ -82,6 +82,29 @@ export function jaccard(a: ReadonlySet<string>, b: ReadonlySet<string>): number 
 
 export type SimilarityMethod = "levenshtein" | "jaro" | "trigram" | "tokenJaccard";
 
+/**
+ * The most cells one edit-distance or Jaro comparison may take: the same
+ * ceiling TextDiff's LCS table has. Both methods are O(n x m) and run
+ * synchronously on the harness thread, so two 20,000-character strings
+ * stalled every session in the process for seconds.
+ */
+export const MAX_SIMILARITY_CELLS = 25_000_000;
+
+/**
+ * The work one comparison does, in cells: the DP table for Levenshtein, the
+ * matching window for Jaro. Trigram and token overlap are linear, so they
+ * cost nothing against the quadratic budget.
+ */
+export function similarityCost(a: string, b: string, method: SimilarityMethod): number {
+  if (a === b || a.length === 0 || b.length === 0) return 0;
+  if (method === "levenshtein") return a.length * b.length;
+  if (method === "jaro") {
+    const window = Math.max(0, Math.floor(Math.max(a.length, b.length) / 2) - 1);
+    return a.length * Math.min(b.length, 2 * window + 1);
+  }
+  return 0;
+}
+
 export function similarity(a: string, b: string, method: SimilarityMethod): number {
   if (method === "levenshtein") return levenshteinRatio(a, b);
   if (method === "jaro") return jaroWinkler(a, b);

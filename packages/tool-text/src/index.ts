@@ -32,7 +32,14 @@ import {
   sortLines as sortLinesFn,
 } from "./lib/normalize";
 import { regexExtractAll } from "./lib/regex";
-import { extractKeywords as extractKeywordsFn, fuzzyRank, similarity } from "./lib/similarity";
+import {
+  MAX_SIMILARITY_CELLS,
+  type SimilarityMethod,
+  extractKeywords as extractKeywordsFn,
+  fuzzyRank,
+  similarity,
+  similarityCost,
+} from "./lib/similarity";
 import { classifyByRules, renderTemplateString } from "./lib/template";
 
 /** Compact JSON — no indentation, since the reader is a model, not a person. */
@@ -126,7 +133,7 @@ export const textDiff: RegisteredTool = buildTool({
     const bLines = prep(input.b);
     // The LCS table is O(n*m) cells; refuse rather than exhaust memory.
     const cells = (aLines.length + 1) * (bLines.length + 1);
-    if (cells > 25_000_000) {
+    if (cells > MAX_SIMILARITY_CELLS) {
       return `inputs too large to diff (${aLines.length} x ${bLines.length} lines) — diff a narrower region`;
     }
     const ops = diffLines(aLines, bLines);
@@ -476,6 +483,22 @@ export const extractEntities: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * The most quadratic work one FuzzyMatch call may do, summed over its
+ * candidates: eight single comparisons' worth, about a second on a laptop.
+ * tool-kyc's SanctionsScreen sends up to 10,000 list names per call; at the
+ * name lengths a sanctions list holds (tens of characters) that is a few
+ * million cells, far inside it.
+ */
+const MAX_FUZZY_CELLS = 8 * MAX_SIMILARITY_CELLS;
+
+/** Why comparing a and b by `method` is too much work for one call, or null. */
+function tooCostly(a: string, b: string, method: SimilarityMethod): string | null {
+  const cells = similarityCost(a, b, method);
+  if (cells <= MAX_SIMILARITY_CELLS) return null;
+  return `inputs too large for ${method} (${a.length} x ${b.length} characters) — use trigram or tokenJaccard, or compare a narrower region`;
+}
+
 export const fuzzyMatch: RegisteredTool = buildTool({
   name: "FuzzyMatch",
   description:
@@ -489,16 +512,31 @@ export const fuzzyMatch: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) =>
-    json({
+  execute: async (input) => {
+    const method = input.method ?? "jaro";
+    assertSize(input.query, "query");
+    // Refused before any comparison runs, never part-way through: a ranking
+    // that silently skipped the costly candidates would read as "no match".
+    let total = 0;
+    for (const [i, candidate] of input.candidates.entries()) {
+      assertSize(candidate, `candidates[${i}]`);
+      const single = tooCostly(input.query, candidate, method);
+      if (single !== null) return `candidates[${i}]: ${single}`;
+      total += similarityCost(input.query, candidate, method);
+    }
+    if (total > MAX_FUZZY_CELLS) {
+      return `candidates too large for ${method}: ${input.candidates.length} comparisons against a ${input.query.length}-character query need about ${total} cells, over the ${MAX_FUZZY_CELLS} one call may take — use trigram or tokenJaccard, or send fewer or shorter candidates`;
+    }
+    return json({
       hits: fuzzyRank(
         input.query,
         input.candidates,
-        input.method ?? "jaro",
+        method,
         input.minScore ?? 0.5,
         input.limit ?? 10,
       ),
-    }),
+    });
+  },
 });
 
 export const textSimilarity: RegisteredTool = buildTool({
@@ -515,9 +553,12 @@ export const textSimilarity: RegisteredTool = buildTool({
   execute: async (input) => {
     assertSize(input.a, "a");
     assertSize(input.b, "b");
+    const method = input.method ?? "trigram";
+    const refused = tooCostly(input.a, input.b, method);
+    if (refused !== null) return refused;
     return json({
-      score: Number(similarity(input.a, input.b, input.method ?? "trigram").toFixed(6)),
-      method: input.method ?? "trigram",
+      score: Number(similarity(input.a, input.b, method).toFixed(6)),
+      method,
     });
   },
 });
