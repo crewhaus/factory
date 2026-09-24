@@ -3732,7 +3732,7 @@ function lowerThredzWiredNoMcp(
  *
  * Hyphen, never ":" — a role name may legally contain spaces, dots and colons
  * (`safeName` is permissive), and if the server name ever falls through to
- * `namespacedToolName` it builds `<server>__<tool>`, which must satisfy the
+ * `namespacedToolName` it builds `mcp__<server>__<tool>`, which must satisfy the
  * providers' `^[a-zA-Z0-9_-]{1,64}$`. The spec layer already rejects two roles
  * whose names collapse to the same slug, so this cannot silently collide.
  */

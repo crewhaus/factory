@@ -63,6 +63,30 @@ describe("resolveChildPermissions — modes", () => {
     expect(builtinPatterns).not.toContain("Bash(rm**)");
   });
 
+  test("scoped keeps an MCP rule whichever spelling the rule and def.tools use (0.7.1)", () => {
+    const rules: RuleSet = {
+      ...emptyRuleSet,
+      yaml: [
+        { type: "alwaysDeny", pattern: "mcp__gh__delete_repo", source: "yaml" },
+        { type: "alwaysAllow", pattern: "gh__create_issue", source: "yaml" },
+        { type: "alwaysAllow", pattern: "mcp__other__*", source: "yaml" },
+      ],
+    };
+    for (const tools of [
+      ["gh__create_issue", "gh__delete_repo"],
+      ["mcp__gh__create_issue", "mcp__gh__delete_repo"],
+    ]) {
+      const out = resolveChildPermissions(
+        { mode: "default", rules },
+        { ...DEF_BASE, tools, permissions: "scoped" },
+      );
+      expect(out.rules.yaml.map((r) => r.pattern)).toEqual([
+        "mcp__gh__delete_repo",
+        "gh__create_issue",
+      ]);
+    }
+  });
+
   test("scoped drops a rule whose pattern fails to compile (defensive catch)", () => {
     // A malformed pattern that makes compilePattern() throw (unmatched paren).
     // ruleMatchesAnyAllowedName must swallow the throw and treat the rule as a

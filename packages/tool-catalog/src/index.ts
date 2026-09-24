@@ -624,4 +624,44 @@ export function stripJustificationField(input: unknown): unknown {
   return rest;
 }
 
+// ---------------------------------------------------------------------------
+// MCP tool names
+// ---------------------------------------------------------------------------
+
+/**
+ * The prefix every tool from an MCP server carries: a remote tool `echo` on
+ * the server `everything` is registered as `mcp__everything__echo`. This is
+ * the spelling the docs, the spec's model-profile `tools:` selectors, the
+ * egress fabric and the scope audit all key on.
+ */
+export const MCP_TOOL_NAME_PREFIX = "mcp__";
+
+/** The registered name of the remote tool `tool` on the MCP server `server`. */
+export function mcpToolName(server: string, tool: string): string {
+  return `${MCP_TOOL_NAME_PREFIX}${server}__${tool}`;
+}
+
+/**
+ * The spelling an MCP tool name had before crewhaus 0.7.1, `<server>__<tool>`,
+ * or `undefined` when `name` is not an MCP tool name. Rules, allow-lists and
+ * rate limits written against the old spelling keep matching through it.
+ */
+export function legacyMcpToolName(name: string): string | undefined {
+  if (!name.startsWith(MCP_TOOL_NAME_PREFIX)) return undefined;
+  const rest = name.slice(MCP_TOOL_NAME_PREFIX.length);
+  const sep = rest.indexOf("__");
+  // A server name is never empty and never contains `__`.
+  if (sep <= 0 || sep + 2 >= rest.length) return undefined;
+  return rest;
+}
+
+/**
+ * Does a name written in a tool list (a skill's or sub-agent's `tools`, a
+ * rate-limit key) refer to the registered tool `name`? Exact match, or the
+ * pre-0.7.1 spelling of an MCP tool name.
+ */
+export function toolListEntryNames(entry: string, name: string): boolean {
+  return entry === name || (entry.length > 0 && legacyMcpToolName(name) === entry);
+}
+
 export const defaultCatalog = new ToolCatalog();

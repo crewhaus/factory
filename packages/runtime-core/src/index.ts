@@ -158,7 +158,11 @@ import { narrowRuleSet } from "@crewhaus/sub-agent-permission-inheritance";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool, ToolExecuteModel } from "@crewhaus/tool-catalog";
-import { stripJustificationField, withJustificationField } from "@crewhaus/tool-catalog";
+import {
+  legacyMcpToolName,
+  stripJustificationField,
+  withJustificationField,
+} from "@crewhaus/tool-catalog";
 import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
@@ -2781,6 +2785,38 @@ const MODEL_DESTINATION_SINKS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * 0.7.1 — re-key a tool-name map (rate limits) written with the pre-0.7.1
+ * MCP spelling `<server>__<tool>` onto the registered `mcp__<server>__<tool>`
+ * name. A key that already names a tool, `"*"`, or an old spelling whose new
+ * name the map also carries is left alone. Returns the input by reference
+ * when nothing moved.
+ */
+export function rekeyLegacyMcpToolKeys<V>(
+  map: Readonly<Record<string, V>> | undefined,
+  toolNames: ReadonlySet<string>,
+): Readonly<Record<string, V>> | undefined {
+  if (map === undefined) return undefined;
+  const byLegacy = new Map<string, string>();
+  for (const name of toolNames) {
+    const legacy = legacyMcpToolName(name);
+    if (legacy !== undefined) byLegacy.set(legacy, name);
+  }
+  if (byLegacy.size === 0) return map;
+  let moved = false;
+  const out: Record<string, V> = {};
+  for (const [key, value] of Object.entries(map)) {
+    const registered = key === "*" || toolNames.has(key) ? undefined : byLegacy.get(key);
+    if (registered !== undefined && !Object.hasOwn(map, registered)) {
+      out[registered] = value;
+      moved = true;
+    } else {
+      out[key] = value;
+    }
+  }
+  return moved ? out : map;
+}
+
+/**
  * Default egress sink-scope. Runtime-joined MCP sinks (`mcp__*`) are the
  * canonical dynamically-discovered external sink, and the model-destination
  * built-ins above are dynamic by virtue of their model-chosen target — both
@@ -5033,7 +5069,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // gates the acquire call site: tools outside the map (no named entry, no
   // `"*"`) are not rate-gated at all — the limiter itself is fail-closed on
   // unknown keys, so the guard is what keeps unlisted tools ungated.
-  const rateLimitEntries = Object.entries(opts.rateLimits ?? {});
+  // 0.7.1 — MCP tools are registered as `mcp__<server>__<tool>`; a limit a
+  // spec wrote against the old `<server>__<tool>` spelling is re-keyed onto
+  // the registered name so it keeps applying.
+  const toolNamesAtStart: ReadonlySet<string> = new Set(tools.map((t) => t.name));
+  const runRateLimits = rekeyLegacyMcpToolKeys(opts.rateLimits, toolNamesAtStart);
+  const rateLimitEntries = Object.entries(runRateLimits ?? {});
   let toolRateLimiter: RateLimiter | undefined;
   if (rateLimitEntries.length > 0) {
     const buckets = new Map<string, BucketConfig>();
@@ -5047,8 +5088,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     toolRateLimiter = createRateLimiter({ buckets });
   }
   const hasToolRateBucket = (toolName: string): boolean =>
-    opts.rateLimits !== undefined &&
-    (opts.rateLimits[toolName] !== undefined || opts.rateLimits["*"] !== undefined);
+    runRateLimits !== undefined &&
+    (runRateLimits[toolName] !== undefined || runRateLimits["*"] !== undefined);
 
   // -------------------------------------------------------------------------
   // 0.6.0 §4.4 — the per-candidate plan table. One plan per enabled pool
@@ -5106,7 +5147,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         };
     const deny = cfg?.permissions?.deny ?? [];
     const ask = cfg?.permissions?.ask ?? [];
-    const rateEntries = Object.entries(cfg?.rateLimits ?? {}) as ReadonlyArray<
+    const planRateLimits = rekeyLegacyMcpToolKeys(cfg?.rateLimits, toolNamesAtStart);
+    const rateEntries = Object.entries(planRateLimits ?? {}) as ReadonlyArray<
       readonly [string, { readonly rpm: number; readonly burst?: number }]
     >;
     const armId = fromPool ? (cfg.profile ?? cfg.model) : (candidate?.modelString ?? opts.model);
@@ -5125,7 +5167,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
       planLimiter = createRateLimiter({ buckets });
     }
-    const planRateLimits = cfg?.rateLimits;
     const names = new Set(planAdvertised.map(({ tool }) => tool.name));
     return {
       armId,

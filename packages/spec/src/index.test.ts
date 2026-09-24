@@ -675,6 +675,32 @@ steps:
     expect(spec.mcp_servers?.["fs"]).toBeDefined();
   });
 
+  test("an mcp_servers key must fit inside mcp__<server>__<tool> (extension-path#15)", () => {
+    const withServer = (key: string) => `
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  ${JSON.stringify(key)}:
+    transport: stdio
+    command: npx
+`;
+    expect(() => parseSpec(withServer("my server.v2"))).toThrow(
+      'mcp_servers key "my server.v2" can only use letters, digits, "-" and "_", and must start and end with a letter or digit. Rename it, e.g. "my-server-v2".',
+    );
+    expect(() => parseSpec(withServer("a__b"))).toThrow(
+      /mcp_servers key "a__b" contains "__", which separates the server from the tool in mcp__<server>__<tool>\. Rename it, e.g\. "a-b"\./,
+    );
+    for (const bad of ["_a", "a_", "-a", ""]) {
+      expect(() => parseSpec(withServer(bad))).toThrow(/mcp_servers key/);
+    }
+    for (const good of ["a", "github", "my_server", "my-server", "A1"]) {
+      expect(() => parseSpec(withServer(good))).not.toThrow();
+    }
+  });
+
   test("mcp_servers field is optional", () => {
     const spec = parseSpec(`
 name: hello

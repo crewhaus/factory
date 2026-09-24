@@ -4,7 +4,12 @@ import { McpError } from "@crewhaus/errors";
 import type { McpHost, McpToolDefinition } from "@crewhaus/mcp-host";
 import { type RunContext, createRunContext } from "@crewhaus/run-context";
 import { ToolCatalog } from "@crewhaus/tool-catalog";
-import { buildMcpRegisteredTool, namespacedToolName, registerMcpServer } from "./index.js";
+import {
+  buildMcpRegisteredTool,
+  mcpServerNameProblem,
+  namespacedToolName,
+  registerMcpServer,
+} from "./index.js";
 
 /**
  * In-memory fake McpHost. Sufficient for tool-mcp's surface — we only need
@@ -60,8 +65,8 @@ function makeFakeHost(opts: {
 
 describe("namespacedToolName", () => {
   test("joins server and tool with double underscore", () => {
-    expect(namespacedToolName("everything", "echo")).toBe("everything__echo");
-    expect(namespacedToolName("fs", "read_file")).toBe("fs__read_file");
+    expect(namespacedToolName("everything", "echo")).toBe("mcp__everything__echo");
+    expect(namespacedToolName("fs", "read_file")).toBe("mcp__fs__read_file");
   });
 });
 
@@ -82,7 +87,7 @@ describe("buildMcpRegisteredTool — schema and flags", () => {
       { concurrencySafe: false, readOnly: false, destructive: false },
     );
 
-    expect(tool.name).toBe("x__echo");
+    expect(tool.name).toBe("mcp__x__echo");
     expect(tool.description).toBe("remote echo");
     expect(tool.jsonSchema).toEqual({
       type: "object",
@@ -149,7 +154,7 @@ describe("buildMcpRegisteredTool — schema and flags", () => {
       { name: "tool", inputSchema: {} },
       { concurrencySafe: false, readOnly: false, destructive: false },
     );
-    expect(tool.description).toBe("MCP tool x__tool");
+    expect(tool.description).toBe("MCP tool mcp__x__tool");
   });
 });
 
@@ -169,15 +174,15 @@ describe("registerMcpServer — round-trip via fake host (T3)", () => {
     });
 
     const names = catalog.list().map((t) => t.name);
-    expect(names).toEqual(["everything__echo", "everything__add"]);
+    expect(names).toEqual(["mcp__everything__echo", "mcp__everything__add"]);
     expect(registered).toEqual([
-      { fullName: "everything__echo", remoteName: "echo" },
-      { fullName: "everything__add", remoteName: "add" },
+      { fullName: "mcp__everything__echo", remoteName: "echo" },
+      { fullName: "mcp__everything__add", remoteName: "add" },
     ]);
 
     // Invoke the registered tool — args should land in the underlying
     // MCP call as the un-namespaced remote tool name.
-    const echo = catalog.get("everything__echo");
+    const echo = catalog.get("mcp__everything__echo");
     if (!echo) throw new Error("echo not registered");
     const result = await echo.execute({ message: "hi" });
     expect(result).toBe('{"message":"hi"}');
@@ -202,9 +207,9 @@ describe("registerMcpServer — round-trip via fake host (T3)", () => {
       },
     });
 
-    const read = catalog.get("fs__read");
-    const write = catalog.get("fs__write");
-    const del = catalog.get("fs__delete");
+    const read = catalog.get("mcp__fs__read");
+    const write = catalog.get("mcp__fs__write");
+    const del = catalog.get("mcp__fs__delete");
     expect(read?.concurrencySafe).toBe(true);
     expect(read?.readOnly).toBe(true);
     expect(read?.destructive).toBe(false);
@@ -222,7 +227,7 @@ describe("registerMcpServer — round-trip via fake host (T3)", () => {
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "x", catalog);
-    const tool = catalog.get("x__broken");
+    const tool = catalog.get("mcp__x__broken");
     if (!tool) throw new Error("broken not registered");
     expect(tool.execute({})).rejects.toThrow(McpError);
     expect(tool.execute({})).rejects.toThrow(/args invalid/);
@@ -245,7 +250,7 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "data", catalog);
-    const tool = catalog.get("data__report");
+    const tool = catalog.get("mcp__data__report");
     if (!tool) throw new Error("report not registered");
 
     const ctx: RunContext = createRunContext();
@@ -266,7 +271,7 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "evil", catalog);
-    const tool = catalog.get("evil__pwn");
+    const tool = catalog.get("mcp__evil__pwn");
     if (!tool) throw new Error("pwn not registered");
 
     const ctx: RunContext = createRunContext();
@@ -289,7 +294,7 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "plain", catalog);
-    const tool = catalog.get("plain__echo");
+    const tool = catalog.get("mcp__plain__echo");
     if (!tool) throw new Error("echo not registered");
 
     // No second arg at all — the prior contract (used widely in this file).
@@ -314,7 +319,7 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "evil", catalog);
-    const tool = catalog.get("evil__boom");
+    const tool = catalog.get("mcp__evil__boom");
     if (!tool) throw new Error("boom not registered");
 
     const ctx: RunContext = createRunContext();
@@ -342,7 +347,7 @@ describe("Pillar 3 boundary fabric — tagContent provenance (#160)", () => {
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "svc", catalog);
-    const tool = catalog.get("svc__call");
+    const tool = catalog.get("mcp__svc__call");
     if (!tool) throw new Error("call not registered");
 
     const ctx: RunContext = createRunContext();
@@ -366,7 +371,7 @@ describe("Pillar 3 boundary fabric — precise tag fires on every run (#160-foll
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "data", catalog);
-    const tool = catalog.get("data__report");
+    const tool = catalog.get("mcp__data__report");
     if (!tool) throw new Error("report not registered");
 
     const ctx: RunContext = createRunContext();
@@ -386,7 +391,7 @@ describe("Pillar 3 boundary fabric — precise tag fires on every run (#160-foll
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "data", catalog);
-    const tool = catalog.get("data__report");
+    const tool = catalog.get("mcp__data__report");
     if (!tool) throw new Error("report not registered");
 
     const direct: RunContext = createRunContext();
@@ -408,12 +413,60 @@ describe("Pillar 3 boundary fabric — precise tag fires on every run (#160-foll
     });
     const catalog = new ToolCatalog();
     await registerMcpServer(host, "data", catalog);
-    const tool = catalog.get("data__report");
+    const tool = catalog.get("mcp__data__report");
     if (!tool) throw new Error("report not registered");
 
     const ctx: RunContext = createRunContext();
     await tool.execute({}, { bridge: { runContext: ctx } });
 
     expect(ctx.dataLineage?.get(content)).toBe("mcp");
+  });
+});
+
+describe("0.7.1 — one spelling for MCP tool names (flag-truth-1#1, extension-path#15)", () => {
+  const flags = { concurrencySafe: false, readOnly: false, destructive: false };
+
+  test("the registered name is the documented mcp__<server>__<tool>", () => {
+    const { host } = makeFakeHost({ serverName: "github", tools: [] });
+    const tool = buildMcpRegisteredTool(
+      host,
+      "github",
+      { name: "create_issue", inputSchema: {} },
+      flags,
+    );
+    expect(tool.name).toBe("mcp__github__create_issue");
+    // Everything that keys on the prefix now sees an MCP tool as one.
+    expect(tool.scope).toBe("external");
+  });
+
+  test("a server name the tool name cannot carry is refused, saying what to write", () => {
+    const { host } = makeFakeHost({ serverName: "x", tools: [] });
+    const remote = { name: "create_issue", inputSchema: {} };
+    expect(() => buildMcpRegisteredTool(host, "my server.v2", remote, flags)).toThrow(
+      'MCP server name "my server.v2" can only use letters, digits, "-" and "_", and must start and end with a letter or digit, e.g. "my-server-v2".',
+    );
+    expect(() => buildMcpRegisteredTool(host, "a__b", remote, flags)).toThrow(
+      /contains "__", which separates the server from the tool in mcp__<server>__<tool>. Use a single "_" or "-" instead, e.g. "a-b"/,
+    );
+    for (const bad of ["_a", "a_", "-a", "", "a b"]) {
+      expect(mcpServerNameProblem(bad)).toBeDefined();
+    }
+    for (const good of ["a", "github", "my_server", "my-server", "thredz-ops", "A1"]) {
+      expect(mcpServerNameProblem(good)).toBeUndefined();
+    }
+  });
+
+  test("a name longer than providers accept is refused at registration", () => {
+    const { host } = makeFakeHost({ serverName: "x", tools: [] });
+    const long = "t".repeat(64 - "mcp__srv__".length + 1);
+    expect(() =>
+      buildMcpRegisteredTool(host, "srv", { name: long, inputSchema: {} }, flags),
+    ).toThrow(
+      /65 characters; model providers accept at most 64\. Give the server a shorter name in mcp_servers\./,
+    );
+    const fits = "t".repeat(64 - "mcp__srv__".length);
+    expect(
+      buildMcpRegisteredTool(host, "srv", { name: fits, inputSchema: {} }, flags).name,
+    ).toHaveLength(64);
   });
 });

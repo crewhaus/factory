@@ -51,7 +51,7 @@ import {
 import { CrewhausError } from "@crewhaus/errors";
 import { resolveChildPermissions } from "@crewhaus/sub-agent-permission-inheritance";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { type RegisteredTool, toolListEntryNames } from "@crewhaus/tool-catalog";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -381,7 +381,8 @@ export function resolveSubAgentDefinition(
  * tool-name allowlist on the definition. Undefined `def.tools` (with
  * `permissions: "inherit"`) → the child inherits the parent's full
  * catalog. Undefined `def.tools` with any other permission mode → empty
- * child catalog (the user has implicitly opted out).
+ * child catalog (the user has implicitly opted out). An MCP tool may be
+ * listed by its pre-0.7.1 spelling (`<server>__<tool>`).
  */
 function buildChildCatalog(
   parentTools: ReadonlyArray<RegisteredTool>,
@@ -391,8 +392,7 @@ function buildChildCatalog(
   if (allowed === undefined) {
     return def.permissions === undefined || def.permissions === "inherit" ? parentTools : [];
   }
-  const allowlist = new Set(allowed);
-  return parentTools.filter((t) => allowlist.has(t.name));
+  return parentTools.filter((t) => allowed.some((entry) => toolListEntryNames(entry, t.name)));
 }
 
 export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool {

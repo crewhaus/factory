@@ -42,7 +42,11 @@ import {
   type RuleSet,
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
-import { compilePattern } from "@crewhaus/tool-permission-matcher";
+import {
+  MCP_TOOL_NAME_PREFIX,
+  compilePattern,
+  matchesToolName,
+} from "@crewhaus/tool-permission-matcher";
 
 export type ChildPermissions = {
   readonly mode: PermissionMode;
@@ -53,6 +57,17 @@ export type ChildPermissions = {
 function resolveChildMode(parentMode: PermissionMode, def: SubAgentDefinition): PermissionMode {
   if (parentMode === "bypass" && def.inherit_bypass !== true) return "default";
   return parentMode;
+}
+
+/**
+ * The registered names a `tools:` entry can stand for. An entry written
+ * `<server>__<tool>` is how an MCP tool was named before 0.7.1; it is now
+ * registered as `mcp__<server>__<tool>`.
+ */
+function registeredSpellings(entry: string): readonly string[] {
+  return entry.startsWith(MCP_TOOL_NAME_PREFIX) || !entry.includes("__")
+    ? [entry]
+    : [entry, `${MCP_TOOL_NAME_PREFIX}${entry}`];
 }
 
 /** True iff `rule.pattern`'s tool-glob can match any name in `allowedToolNames`. */
@@ -66,7 +81,9 @@ function ruleMatchesAnyAllowedName(
   } catch {
     return false;
   }
-  return allowedToolNames.some((name) => compiled._toolRe.test(name));
+  return allowedToolNames.some((entry) =>
+    registeredSpellings(entry).some((name) => matchesToolName(compiled, name)),
+  );
 }
 
 /** Filter every rule source by the allowlist; preserves the source taxonomy. */

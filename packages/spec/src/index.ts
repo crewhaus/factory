@@ -191,7 +191,35 @@ const sseMcpConfig = z
 
 const mcpServerConfigSchema = z.discriminatedUnion("transport", [stdioMcpConfig, sseMcpConfig]);
 
-const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optional();
+/**
+ * An `mcp_servers` key becomes part of every tool name the server contributes
+ * (`mcp__<server>__<tool>`), and model providers accept only letters, digits,
+ * `_` and `-` there. `__` is the separator, so it cannot appear inside the
+ * server name, and neither can a leading or trailing `_` (either would make
+ * the split ambiguous). Mirrors `MCP_SERVER_NAME_PATTERN` in `@crewhaus/tool-mcp`,
+ * which refuses the same names at registration; apps/cli checks the two agree.
+ */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]|_(?!_))*(?<!_)$/;
+
+function mcpServerNameSuggestion(name: string): string {
+  const cleaned = name
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/_{2,}/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  return cleaned === "" ? "my-server" : cleaned;
+}
+
+const mcpServerNameKey = z.string().superRefine((name, ctx) => {
+  if (MCP_SERVER_NAME_RE.test(name)) return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    message: name.includes("__")
+      ? `mcp_servers key "${name}" contains "__", which separates the server from the tool in mcp__<server>__<tool>. Rename it, e.g. "${mcpServerNameSuggestion(name)}".`
+      : `mcp_servers key "${name}" can only use letters, digits, "-" and "_", and must start and end with a letter or digit. Rename it, e.g. "${mcpServerNameSuggestion(name)}".`,
+  });
+});
+
+const mcpServersBlock = z.record(mcpServerNameKey, mcpServerConfigSchema).optional();
 
 // Section 13 — sub-agent definitions (`subAgentDefinitionSchema` /
 // `subAgentsBlock`) are declared below the model-profile section: from

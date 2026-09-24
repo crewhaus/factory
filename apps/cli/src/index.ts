@@ -463,7 +463,7 @@ import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 // `crewhaus templates list/search` fall back to when no --registry / env is set.
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { buildTool } from "@crewhaus/tool-builder";
-import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
+import { type RegisteredTool, ToolCatalog, mcpToolName } from "@crewhaus/tool-catalog";
 import { CATEGORIES, categoriesForTool, toolsInCategory } from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
@@ -5007,7 +5007,7 @@ async function runRunCli(
 
     // Item 38 — runtime auto-quarantine. `crewhaus mcp doctor` persists the set
     // of chronically-failing servers to `.crewhaus/mcp/quarantine.json`; here we
-    // withdraw those servers' namespaced (`<server>__<tool>`) tools from the
+    // withdraw those servers' namespaced (`mcp__<server>__<tool>`) tools from the
     // catalog so the model can't call them, and append a synthetic notice to the
     // instructions (mirroring loop-detection's warning injection) so the model
     // routes around them. Opt out with --no-mcp-quarantine. Auto-restore is
@@ -5029,7 +5029,7 @@ async function runRunCli(
         }
       }
       if (quarantinedServers.length > 0) {
-        const prefixes = quarantinedServers.map((s) => `${s}__`);
+        const prefixes = quarantinedServers.map((s) => mcpToolName(s, ""));
         tools = tools.filter((t) => !prefixes.some((p) => t.name.startsWith(p)));
         mcpQuarantineNotice = quarantinedServers
           .map((s) => quarantineNotice(s, "flagged chronically failing by `crewhaus mcp doctor`"))
