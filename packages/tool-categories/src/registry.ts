@@ -8,12 +8,12 @@
  * offline, so pulling a tool implementation in here would drag Bun/network/
  * sandbox dependencies into the compile path.
  *
- * Keeping it honest: `packages/tool-categories` cannot itself prove that a
- * key here resolves to a real tool. `apps/cli/src/tool-registry.test.ts` —
- * which CAN import every builtin — asserts both directions:
- *   (1) every key listed here exists in the emitter's BUILTIN_TOOL_MAP, and
- *   (2) every key in BUILTIN_TOOL_MAP is listed in exactly one leaf category.
- * Add a builtin without categorizing it and that test fails.
+ * Keeping it honest: `./shapes.test.ts` holds this registry to the builtin
+ * table (`./builtins.ts`) in both directions — every categorized key is a
+ * builtin with no shape restriction, and every such builtin sits in exactly
+ * one leaf category — and `apps/cli/src/tool-registry.test.ts`, which CAN
+ * import every tool, checks the table against the tools themselves. Add a
+ * builtin without categorizing it and a test fails.
  */
 
 /** A leaf category owns tool keys; a roll-up category owns other categories. */

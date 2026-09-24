@@ -33,9 +33,9 @@ import {
  * the JSON-stringified upstream state. The node's reply text is added
  * to the state under a key matching the node name (e.g. `state.plan`,
  * `state.execute`, `state.summarise`). Nodes that declare `tools` get
- * them resolved through the built-in tool map (G07 — the same
- * resolveTools/BUILTIN_TOOL_MAP approach as target-crew's roles) and
- * passed straight into the node's runChatLoop call.
+ * them resolved through the shared builtin table (G07 —
+ * `resolveBuiltinTools` from `@crewhaus/tool-categories`, as every shape
+ * does) and passed straight into the node's runChatLoop call.
  *
  * Loop contract 0.4 (Batch A):
  *   - `edges[].when` lowers onto graph-engine `EdgeCondition` lambdas
