@@ -805,6 +805,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
@@ -1029,6 +1030,7 @@
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
       },
     },
     "packages/grader-continuity": {

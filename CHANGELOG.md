@@ -96,8 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **MCP tools are named `mcp__<server>__<tool>`**, the name the docs have
   always used; they were registered as `<server>__<tool>`. This is the name
   the model now sees. Permission rules, model-profile `deny`/`ask`, skill and
-  sub-agent `tools:` lists, hook matchers and `rate_limits` written with the
-  old spelling keep working, so no spec needs to change — but instructions
+  sub-agent `tools:` lists, hook matchers, `rate_limits` and the tool names an
+  eval expects (a `tool_call_sequence` grader's `expected`, a sample's
+  `expected_tools` or `expectedTool`) written with the old spelling keep
+  working, so no spec needs to change — but instructions
   that tell the model to call a tool by its old name should be updated. A
   model profile's `tools: [mcp__<server>__*]` now selects that server's tools,
   where before it selected none.

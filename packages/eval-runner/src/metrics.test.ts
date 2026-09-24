@@ -160,6 +160,30 @@ describe("runSample metrics (G56)", () => {
     expect(meta.metrics.safetyViolations.total).toBe(3);
   });
 
+  test("expected_tools naming an MCP tool's pre-0.7.1 spelling still counts the call", async () => {
+    const outDir = newTempRoot();
+    const ir = narrowToAgent(lower(parseSpec(SPEC)));
+    const events: TraceEvent[] = [...toolPair("t1", "mcp__srv__echo")];
+    const invoker: AgentInvoker = async ({ sample }) => ({
+      agentOutput: sample.expected_output ?? "",
+      events,
+    });
+    const { compiled } = parseGradersConfig(GRADERS);
+    const summary = await runEval({
+      ir,
+      dataset: {
+        name: "m-legacy",
+        samples: yieldSamples([
+          { id: "s1", input: "x", expected_output: "y", expected_tools: ["srv__echo", "other__x"] },
+        ]),
+      },
+      compiledGraders: compiled,
+      opts: { invoker, outDir },
+    });
+    // srv__echo is the recorded mcp__srv__echo; other__x was never called.
+    expect(summary.samples[0]?.metrics?.toolCallAccuracy).toBeCloseTo(0.5);
+  });
+
   test("no expected_tools → no toolCallAccuracy (absent, not 1.0)", async () => {
     const outDir = newTempRoot();
     const ir = narrowToAgent(lower(parseSpec(SPEC)));
