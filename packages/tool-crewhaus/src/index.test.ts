@@ -1152,12 +1152,127 @@ describe("permission reporting matches the engine", () => {
     const decisions = Object.fromEntries(result.tools.map((t) => [t.tool, t.decision]));
     expect(decisions).toEqual({
       grep: "deny",
-      read: "allow for read-only tools, deny for the rest",
+      // Read's own flags are known (it is read-only), so the fallback is
+      // reported as the answer for Read, not as the mode's general rule.
+      read: "allow",
       webFetch: "deny",
     });
     expect(
       result.findings.some((f) => f.reason.includes("the engine ignores every allow rule")),
     ).toBe(true);
+  });
+
+  test("every builtin reports its real flags, so its unguarded sinks are found (permission-integration#9)", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [webFetch, httpRequest, emailSend, runCommand, removePath, webhookPost, chatPost, packageInstall, read]",
+      "permissions:",
+      "  mode: auto",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{
+        tool: string;
+        decision: string;
+        external: boolean;
+        destructive?: boolean;
+        readOnly?: boolean;
+        requireJustification?: boolean;
+        flagsFrom: string;
+      }>;
+      findings: Array<{ tool: string; reason: string }>;
+    }>(permissionAudit, { spec });
+    const row = (tool: string) => result.tools.find((t) => t.tool === tool);
+    // The audit's evidence: these reported external:false and never destructive.
+    for (const tool of [
+      "httpRequest",
+      "emailSend",
+      "runCommand",
+      "webhookPost",
+      "chatPost",
+      "packageInstall",
+    ]) {
+      expect({ tool, external: row(tool)?.external, destructive: row(tool)?.destructive }).toEqual({
+        tool,
+        external: true,
+        destructive: true,
+      });
+    }
+    expect(row("removePath")).toMatchObject({
+      external: false,
+      destructive: true,
+      decision: "ask",
+    });
+    expect(row("read")).toMatchObject({ readOnly: true, decision: "allow", flagsFrom: "builtin" });
+    // Auto mode asks for a destructive tool and allows the rest.
+    expect(row("httpRequest")?.decision).toBe("ask");
+    expect(row("webFetch")?.decision).toBe("allow");
+    const unguarded = new Set(
+      result.findings
+        .filter((f) => f.reason.includes("reaches outside the process"))
+        .map((f) => f.tool),
+    );
+    for (const tool of [
+      "webFetch",
+      "httpRequest",
+      "emailSend",
+      "runCommand",
+      "webhookPost",
+      "chatPost",
+      "packageInstall",
+    ]) {
+      expect(unguarded.has(tool)).toBe(true);
+    }
+    expect(
+      result.findings.some((f) => f.tool === "removePath" && f.reason.includes("is destructive")),
+    ).toBe(true);
+    // An intent-gated tool with no LLM judge is denied outside tests; the audit says so.
+    expect(row("emailSend")?.requireJustification).toBe(true);
+    expect(
+      result.findings.some(
+        (f) => f.tool === "emailSend" && f.reason.includes("security.justification.judge"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a rule that can never fire covers nothing and is listed with its fix (permission-integration#12)", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [removePath, httpRequest, runCommand]",
+      "permissions:",
+      "  rules:",
+      '    - { type: alwaysAllow, pattern: "HttpRequest(GET https://api.example.com/**)" }',
+      '    - { type: alwaysAllow, pattern: "RunCommand(git status)" }',
+      '    - { type: alwaysDeny, pattern: "removePath(tmp/**)" }',
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; rule?: { pattern: string }; conditional: boolean }>;
+      ruleProblems: Array<{ pattern: string; code: string; suggestion?: string }>;
+      unusedRules: Array<{ pattern: string }>;
+    }>(permissionAudit, { spec });
+    expect(result.ruleProblems.map((p) => [p.code, p.suggestion])).toEqual([
+      ["argument-cannot-match", "HttpRequest(https://api.example.com/**)"],
+      ["tool-key-not-name", "RemovePath(tmp/**)"],
+    ]);
+    const row = (tool: string) => result.tools.find((t) => t.tool === tool);
+    // No longer reported as conditional cover for HttpRequest.
+    expect(row("httpRequest")?.rule).toBeUndefined();
+    // RunCommand declares its argv, so `RunCommand(git status)` is real cover.
+    expect(row("runCommand")).toMatchObject({
+      rule: { pattern: "RunCommand(git status)" },
+      conditional: true,
+    });
+    expect(result.unusedRules.map((r) => r.pattern).sort()).toEqual([
+      "HttpRequest(GET https://api.example.com/**)",
+      "removePath(tmp/**)",
+    ]);
   });
 
   test("a rule in the pre-0.7.1 MCP spelling still names an mcp__ tool", async () => {

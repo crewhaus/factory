@@ -50,6 +50,7 @@ import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { TOOL_FLAGS, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import { z } from "zod";
 import { HARNESS_SPEC_FILENAME, discoverHarnesses } from "./discover";
 import {
@@ -566,14 +567,14 @@ export const toolInventory: RegisteredTool = buildTool({
 export const permissionAudit: RegisteredTool = buildTool({
   name: "PermissionAudit",
   description:
-    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use as the \"what can this harness really do\" review before deploying it. It sees the spec's own rules only — CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time — and it matches the tool-name half of a pattern, reporting an argument-scoped rule like `Bash(git *)` as conditional cover rather than pretending to evaluate future arguments. A rule the matcher cannot compile is listed under `malformedRules` and treated the way the engine treats it (a broken deny or ask gates everything; a broken allow is dropped). Under `mode: plan` the decisions follow plan mode: allow rules are ignored, a deny or ask rule denies, and anything else is allowed only if the tool is read-only.",
+    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use as the \"what can this harness really do\" review before deploying it. It sees the spec's own rules only — CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time — and it matches the tool-name half of a pattern, reporting an argument-scoped rule like `Bash(git *)` as conditional cover rather than pretending to evaluate future arguments. A rule the matcher cannot compile is listed under `malformedRules` and treated the way the engine treats it (a broken deny or ask gates everything; a broken allow is dropped); a rule that can never fire as written (a spec key where the tool name belongs, an argument pattern the tool's field cannot match) is listed under `ruleProblems` with its fix and covers nothing. Builtins are reported with their own flags, so an unruled call's decision is the one the engine would make for that tool. Under `mode: plan` the decisions follow plan mode: allow rules are ignored, a deny or ask rule denies, and anything else is allowed only if the tool is read-only.",
   inputSchema: z.object({
     ...specSourceFields,
     destructiveTools: z
       .array(z.string())
       .optional()
       .describe(
-        "tools the target runtime marks destructive; the spec cannot know this for builtins, so pass it to get them flagged",
+        "extra tools to treat as destructive, e.g. a custom tool; builtins are already read from their own flags",
       ),
   }),
   readOnly: true,
@@ -601,12 +602,23 @@ export const permissionAudit: RegisteredTool = buildTool({
       }
     }
 
+    const judge = parsed.ok
+      ? asRecord(asRecord(asRecord(parsed.value)?.["security"])?.["justification"])?.["judge"]
+      : undefined;
     const result = auditPermissions({
       tools: view.value.tools,
       mode: view.value.permissions.mode,
       askMode: view.value.permissions.askMode,
       rules: view.value.permissions.rules,
       destructiveTools: destructive,
+      // permission-integration#9 / flag-truth-3#4 — a builtin's real flags,
+      // from the manifest generated off the tools themselves, instead of
+      // "external" read off six legacy names and "destructive" read off
+      // nothing.
+      flagsOf: (tool) => TOOL_FLAGS[tool] ?? TOOL_FLAGS_BY_NAME.get(tool),
+      knownTools: Object.values(TOOL_FLAGS),
+      mcpServers: view.value.mcpServers.map((s) => s.name),
+      ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });
     return json({
       ...result,

@@ -9,6 +9,8 @@
     { "path": "../audit-log" },
     { "path": "../tool-catalog" },
     { "path": "../tool-builder" },
+    { "path": "../tool-permission-matcher" },
+    { "path": "../tool-registry-manifest" },
     { "path": "../target-cli" },
     { "path": "../tool-executor" }
   ],

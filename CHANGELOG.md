@@ -154,6 +154,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the argument's length, and they match exactly what they matched before.
 - **`PermissionAudit` describes plan mode as it now works**, and matches a
   rule written with the old MCP spelling against the new tool name.
+- **`PermissionAudit` reports every builtin's real flags.** It read
+  "external" off six legacy tool names and "destructive" off nothing, so for
+  `HttpRequest`, `EmailSend`, `WebhookPost`, `RunCommand`, `RemovePath` and
+  the other 0.7.0 builtins it said the harness reached nothing outside and
+  raised no finding. Each tool now carries its own read-only, destructive,
+  external, sandbox and justification flags, an unruled call is reported with
+  the decision the engine would make for that tool, a rule that can never
+  fire is listed under `ruleProblems` and counted as covering nothing, and a
+  justification-gated tool with no `security.justification.judge` is flagged.
 
 ### Security
 

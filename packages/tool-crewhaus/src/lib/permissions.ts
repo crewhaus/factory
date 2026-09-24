@@ -16,18 +16,39 @@
  *   2. Only the spec's own rules are seen. The engine also consults CLI
  *      flags, `.crewhaus/settings.json`, hook-installed rules and a builtin
  *      floor, in that precedence order; none of those live in the spec.
- *   3. `readOnly` / `destructive` are properties of the TOOL, and the tool
- *      registry lives in the compiled bundle, not in the spec. So the
- *      destructive column is filled only from what the document itself
- *      declares (`mcp_servers.*.tool_flags`) plus anything the caller passes
- *      in. It is never guessed from a name.
+ *   3. `readOnly` / `destructive` / `scope` are properties of the TOOL. For a
+ *      builtin they come from the builtin manifest the caller passes in
+ *      (`flagsOf`), which is generated from the tools themselves. For
+ *      anything else — an MCP tool, a custom tool — only what the document
+ *      declares (`mcp_servers.*.tool_flags`), what the caller passes in, and
+ *      the definitionally outward names (`mcp__*`, `Fetch`, …) are known.
+ *      Nothing is guessed from a name beyond that.
  *
  * Pure: no filesystem, no clock, no locale-sensitive comparison.
  */
 
 import { isOutwardName } from "@crewhaus/tool-builder";
 import { legacyMcpToolName } from "@crewhaus/tool-catalog";
+import {
+  type PermissionRuleProblem,
+  permissionRuleProblems,
+} from "@crewhaus/tool-permission-matcher";
 import { compareStrings } from "./spec-view";
+
+/**
+ * How a builtin is gated, as the manifest describes it (`ToolFlags` in
+ * `@crewhaus/tool-registry-manifest`, taken structurally).
+ */
+export type ToolFlagsLike = {
+  readonly name: string;
+  readonly readOnly: boolean;
+  readonly destructive: boolean;
+  readonly scope: string;
+  readonly ioCapability?: string;
+  readonly requiresSandbox: boolean;
+  readonly requireJustification: boolean;
+  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+};
 
 /** A rule as a spec declares it. */
 export type RuleLike = { readonly type: string; readonly pattern: string };
@@ -43,10 +64,26 @@ export type ToolPermission = {
   readonly rule?: RuleLike;
   /** True when the matched rule also constrains arguments (`Tool(glob)`). */
   readonly conditional: boolean;
-  /** The tool crosses a process or network boundary by name (see `isOutwardName`). */
+  /**
+   * The tool crosses a process or network boundary: its flags say
+   * `scope: "external"` or declare an io capability, or — for a tool the
+   * manifest does not describe — its name is definitionally outward.
+   */
   readonly external: boolean;
-  /** Only set when the document or the caller SAYS so — never inferred. */
+  /** From the tool's flags, the document's `tool_flags` or the caller. */
   readonly destructive?: boolean;
+  /** From the tool's flags; absent when they are not known. */
+  readonly readOnly?: boolean;
+  /** Every call must carry a justification the intent gate accepts. */
+  readonly requireJustification?: boolean;
+  /** The engine allows it only with a sandbox and an explicit allow rule. */
+  readonly requiresSandbox?: boolean;
+  /**
+   * Where the flags came from: `"builtin"` when the manifest describes the
+   * tool, `"name"` when only its name (and anything the document or caller
+   * declared) was available.
+   */
+  readonly flagsFrom: "builtin" | "name";
 };
 
 export type PermissionFinding = {
@@ -78,6 +115,13 @@ export type PermissionAuditResult = {
    * `decision`s below are computed that way.
    */
   readonly modeOverridesRules: boolean;
+  /**
+   * Rules that can never do what they say: a spec key where the tool's name
+   * belongs, an argument pattern the tool's operative field cannot match, an
+   * MCP server the spec does not declare. The same check `crewhaus lint`
+   * runs. Such a rule is not counted as covering any tool.
+   */
+  readonly ruleProblems: readonly PermissionRuleProblem[];
   readonly findings: readonly PermissionFinding[];
 };
 
@@ -195,9 +239,25 @@ export function toRegisteredName(toolKey: string): string {
   return first === undefined ? toolKey : first.toUpperCase() + toolKey.slice(1);
 }
 
-/** True when the tool crosses a process or network boundary by definition. */
-export function isExternalTool(toolKey: string): boolean {
+/**
+ * True when the tool crosses a process or network boundary: its flags say so
+ * when they are known, else its name is definitionally outward.
+ */
+export function isExternalTool(toolKey: string, flags?: ToolFlagsLike): boolean {
+  if (flags !== undefined) return flags.scope === "external" || flags.ioCapability !== undefined;
   return isOutwardName(toolKey) || isOutwardName(toRegisteredName(toolKey));
+}
+
+/**
+ * What the engine decides for a call no rule matched, when the tool's flags
+ * are known — the mode's fallback applied to this tool, then the sandbox
+ * floor.
+ */
+export function unmatchedDecision(mode: string, flags: ToolFlagsLike): string {
+  if (mode === "plan") return flags.readOnly ? "allow" : "deny";
+  const base = mode === "auto" ? (flags.readOnly || !flags.destructive ? "allow" : "ask") : "ask";
+  // Section 18 floor: a sandboxed tool is never allowed by a fallback.
+  return flags.requiresSandbox ? "deny" : base;
 }
 
 /** What an unmatched call resolves to under each mode, before tool flags. */
@@ -219,6 +279,17 @@ export type AuditPermissionsInput = {
   readonly rules: readonly RuleLike[];
   /** Tools the document or the caller declares destructive. */
   readonly destructiveTools?: ReadonlySet<string>;
+  /**
+   * The flags of a builtin, looked up by spec key or registered name;
+   * `undefined` for anything the manifest does not describe.
+   */
+  readonly flagsOf?: (tool: string) => ToolFlagsLike | undefined;
+  /** Every builtin, for spotting a rule that names none of them. */
+  readonly knownTools?: readonly ToolFlagsLike[];
+  /** The MCP servers the spec declares. */
+  readonly mcpServers?: readonly string[];
+  /** The spec's `security.justification.judge`, when it sets one. */
+  readonly justificationJudge?: string;
 };
 
 /**
@@ -242,12 +313,40 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   const usedRules = new Set<string>();
   const tools: ToolPermission[] = [];
   const findings: PermissionFinding[] = [];
+  const flagsOf = input.flagsOf ?? (() => undefined);
+  const grantedTools = [...new Set(input.tools)].sort(compareStrings);
 
-  for (const tool of [...new Set(input.tools)].sort(compareStrings)) {
+  // Rules that can never fire as written cover nothing; the ones whose
+  // argument is merely unscoped still match (on the call's text).
+  const ruleProblems = permissionRuleProblems({
+    rules: input.rules,
+    granted: grantedTools.flatMap((tool) => {
+      const flags = flagsOf(tool);
+      return flags !== undefined
+        ? [
+            {
+              name: flags.name,
+              ...(flags.operativeArgs ? { operativeArgs: flags.operativeArgs } : {}),
+            },
+          ]
+        : [{ name: toRegisteredName(tool) }];
+    }),
+    known: input.knownTools ?? [],
+    mcpServers: input.mcpServers ?? [],
+  });
+  const deadRules = new Set(
+    ruleProblems
+      .filter((p) => p.code !== "argument-not-scoped")
+      .map((p) => `${p.type} ${p.pattern}`),
+  );
+
+  for (const tool of grantedTools) {
     const registered = toRegisteredName(tool);
+    const flags = flagsOf(tool);
     let matched: { rule: RuleLike; coverage: Coverage } | undefined;
     for (const rule of input.rules) {
       if (modeOverridesRules && rule.type === "alwaysAllow") continue;
+      if (deadRules.has(`${rule.type} ${rule.pattern}`)) continue;
       if (splitPattern(rule.pattern) === undefined) {
         // Mirror the engine: a broken guard still gates, a broken grant does
         // not. Scanning in declaration order, so this rule wins here exactly
@@ -269,37 +368,70 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
         break;
       }
     }
-    const external = isExternalTool(tool);
-    const isDestructive = destructive.has(tool) || destructive.has(registered);
+    const external = isExternalTool(tool, flags);
+    const isDestructive =
+      destructive.has(tool) || destructive.has(registered) || flags?.destructive === true;
+    const ruled = matched === undefined ? undefined : decisionOf(matched.rule.type);
+    const decision =
+      matched === undefined
+        ? flags !== undefined
+          ? unmatchedDecision(input.mode, flags)
+          : fallback
+        : modeOverridesRules
+          ? "deny"
+          : // The sandbox floor holds even over a matching allow: only an
+            // allow can let a sandboxed tool through, and only with a sandbox.
+            flags?.requiresSandbox === true && ruled !== "allow"
+            ? "deny"
+            : (ruled as string);
     const entry: ToolPermission = {
       tool,
-      decision:
-        matched === undefined
-          ? fallback
-          : modeOverridesRules
-            ? "deny"
-            : decisionOf(matched.rule.type),
+      decision,
       ...(matched !== undefined ? { rule: matched.rule } : {}),
       conditional: matched?.coverage === "conditional",
       external,
       ...(isDestructive ? { destructive: true } : {}),
+      ...(flags !== undefined
+        ? {
+            readOnly: flags.readOnly,
+            requireJustification: flags.requireJustification,
+            requiresSandbox: flags.requiresSandbox,
+          }
+        : {}),
+      flagsFrom: flags !== undefined ? "builtin" : "name",
     };
     tools.push(entry);
 
+    if (flags?.requireJustification === true && decision !== "deny") {
+      findings.push({
+        tool,
+        reason:
+          input.justificationJudge === undefined || input.justificationJudge === "rule-based"
+            ? "needs a justification on every call, and this spec sets no security.justification.judge: outside tests the default judge denies every such call unless CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1. Set security.justification.judge: claude"
+            : `needs a justification on every call, judged by ${input.justificationJudge}`,
+      });
+    }
+
+    // What an unruled call comes to: this tool's own answer when its flags
+    // are known, else the mode's general fallback.
+    const unruled =
+      flags !== undefined
+        ? `${unmatchedDecision(input.mode, flags)} (mode ${input.mode})`
+        : fallback;
     if (matched === undefined && external) {
       findings.push({
         tool,
-        reason: `reaches outside the process (${registered}) and no declared rule names it — it resolves to the mode fallback: ${fallback}`,
+        reason: `reaches outside the process (${registered}) and no declared rule names it — it resolves to the mode fallback: ${unruled}`,
       });
     } else if (matched === undefined && isDestructive) {
       findings.push({
         tool,
-        reason: `is declared destructive and no rule names it — it resolves to the mode fallback: ${fallback}`,
+        reason: `is destructive and no rule names it — it resolves to the mode fallback: ${unruled}`,
       });
     } else if (matched?.coverage === "conditional" && (external || isDestructive)) {
       findings.push({
         tool,
-        reason: `is covered only by the argument-scoped rule "${matched.rule.pattern}" — calls whose arguments fall outside that glob resolve to the mode fallback: ${fallback}`,
+        reason: `is covered only by the argument-scoped rule "${matched.rule.pattern}" — calls whose arguments fall outside that glob resolve to the mode fallback: ${unruled}`,
       });
     }
   }
@@ -333,6 +465,7 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     unusedRules,
     malformedRules,
     modeOverridesRules,
+    ruleProblems,
     findings,
   };
 }
