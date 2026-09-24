@@ -701,6 +701,14 @@ describe("TableJoin", () => {
       maxRows: 1,
     });
     expect(out.truncated).toBe(true);
+    expect(out.totalRows).toBe(2);
+  });
+
+  test("an uncapped join does not carry totalRows, so 0.7.0's output bytes are unchanged", async () => {
+    const out = await text(tableJoin, { left: [{ id: 1 }], right: [{ id: 1 }], leftKey: "id" });
+    expect(out).toBe(
+      '{"rowCount":1,"truncated":false,"unmatchedLeft":0,"unmatchedRight":0,"rows":[{"id":1,"right_id":1}]}',
+    );
   });
 
   test("the schema requires a non-empty left key", () => {

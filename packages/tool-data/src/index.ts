@@ -724,6 +724,7 @@ export const tableJoin: RegisteredTool = buildTool({
     return json({
       rowCount: result.rows.length,
       truncated: result.truncated,
+      ...(result.truncated ? { totalRows: result.totalRows } : {}),
       unmatchedLeft: result.unmatchedLeft,
       unmatchedRight: result.unmatchedRight,
       rows: result.rows,

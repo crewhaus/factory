@@ -403,13 +403,24 @@ export type JoinOptions = {
  * how a join quietly loses rows.
  *
  * Every right-hand match is emitted, so a one-to-many join multiplies rows,
- * as SQL does. `maxRows` bounds that.
+ * as SQL does. `maxRows` bounds that — the WORK as well as the output: a row
+ * past the cap is counted, never built, so a join on a low-cardinality key
+ * (every row `status: "open"`) costs the rows it returns plus one pass over
+ * each side, not |left| x |right| merges thrown away. `totalRows` is the size
+ * the uncapped join would have had, counted arithmetically, so a caller can
+ * tell ten rows cut from eleven apart from ten cut from millions.
  */
 export function joinRecords(
   left: ReadonlyArray<Record_>,
   right: ReadonlyArray<Record_>,
   options: JoinOptions,
-): { rows: Record_[]; truncated: boolean; unmatchedLeft: number; unmatchedRight: number } {
+): {
+  rows: Record_[];
+  truncated: boolean;
+  totalRows: number;
+  unmatchedLeft: number;
+  unmatchedRight: number;
+} {
   const index = new Map<string, Record_[]>();
   for (const r of right) {
     const key = getPath(r, options.rightKey);
@@ -422,14 +433,14 @@ export function joinRecords(
   const rows: Record_[] = [];
   const matchedRight = new Set<string>();
   let unmatchedLeft = 0;
-  let truncated = false;
+  let totalRows = 0;
 
-  const push = (row: Record_): void => {
-    if (rows.length >= options.maxRows) {
-      truncated = true;
-      return;
-    }
-    rows.push(row);
+  // The cap is checked BEFORE a row is built. Building it first and then
+  // discarding it (the 0.7.0 shape) made maxRows bound the answer but not
+  // the work: every matching pair was merged whatever the cap said.
+  const keep = (build: () => Record_): void => {
+    totalRows += 1;
+    if (rows.length < options.maxRows) rows.push(build());
   };
 
   for (const l of left) {
@@ -438,11 +449,15 @@ export function joinRecords(
     const matches = id === null ? undefined : index.get(id);
     if (matches === undefined || matches.length === 0) {
       unmatchedLeft += 1;
-      if (options.kind === "left" || options.kind === "full") push({ ...l });
+      if (options.kind === "left" || options.kind === "full") keep(() => ({ ...l }));
       continue;
     }
     if (id !== null) matchedRight.add(id);
-    for (const r of matches) push(mergeRow(l, r, options.rightPrefix));
+    const take = Math.min(Math.max(options.maxRows - rows.length, 0), matches.length);
+    for (let i = 0; i < take; i++) {
+      rows.push(mergeRow(l, matches[i] as Record_, options.rightPrefix));
+    }
+    totalRows += matches.length;
   }
 
   let unmatchedRight = 0;
@@ -451,10 +466,16 @@ export function joinRecords(
     const id = isPresent(key) ? canonicalStringify(key) : null;
     if (id === null || !matchedRight.has(id)) {
       unmatchedRight += 1;
-      if (options.kind === "right" || options.kind === "full") push({ ...r });
+      if (options.kind === "right" || options.kind === "full") keep(() => ({ ...r }));
     }
   }
-  return { rows, truncated, unmatchedLeft, unmatchedRight };
+  return {
+    rows,
+    truncated: totalRows > rows.length,
+    totalRows,
+    unmatchedLeft,
+    unmatchedRight,
+  };
 }
 
 function mergeRow(left: Record_, right: Record_, prefix: string): Record_ {

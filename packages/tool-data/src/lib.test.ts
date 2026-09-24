@@ -1580,6 +1580,66 @@ describe("joining", () => {
     });
     expect(out.truncated).toBe(true);
   });
+
+  test("maxRows bounds the work, not just the output: a pair past the cap is never merged", () => {
+    // Every right row carries a counting getter; mergeRow reads it once per
+    // merge, so the counter IS the number of pairs built. On 0.7.0 it was
+    // 300 x 300 = 90,000 for a 5-row answer.
+    let merged = 0;
+    const right = Array.from({ length: 300 }, () => {
+      const r: Record<string, unknown> = { id: 1 };
+      Object.defineProperty(r, "v", {
+        enumerable: true,
+        get: () => {
+          merged += 1;
+          return 0;
+        },
+      });
+      return r;
+    });
+    const left = Array.from({ length: 300 }, () => ({ id: 1 }));
+    const out = joinRecords(left, right, { ...base, kind: "inner", maxRows: 5 });
+    expect({
+      rows: out.rows.length,
+      truncated: out.truncated,
+      totalRows: out.totalRows,
+      merged,
+    }).toEqual({ rows: 5, truncated: true, totalRows: 90_000, merged: 5 });
+  });
+
+  test("a capped full join still counts every unmatched row, and keeps the uncapped prefix", () => {
+    const l = [{ id: 1, n: "a" }, { id: 1, n: "b" }, { id: 1, n: "c" }, { id: 2 }];
+    const r = [{ id: 1, m: "x" }, { id: 1, m: "y" }, { id: 1, m: "z" }, { id: 3 }];
+    const whole = joinRecords(l, r, { ...base, kind: "full" });
+    const capped = joinRecords(l, r, { ...base, kind: "full", maxRows: 2 });
+    expect(whole.totalRows).toBe(11);
+    expect(whole.truncated).toBe(false);
+    expect({
+      rows: capped.rows,
+      truncated: capped.truncated,
+      totalRows: capped.totalRows,
+      unmatchedLeft: capped.unmatchedLeft,
+      unmatchedRight: capped.unmatchedRight,
+    }).toEqual({
+      rows: whole.rows.slice(0, 2),
+      truncated: true,
+      totalRows: 11,
+      unmatchedLeft: 1,
+      unmatchedRight: 1,
+    });
+  });
+
+  test("a cap that lands exactly on the join's size is not truncation", () => {
+    const out = joinRecords([{ id: 1 }], [{ id: 1 }, { id: 1 }], {
+      ...base,
+      kind: "inner",
+      maxRows: 2,
+    });
+    expect({ truncated: out.truncated, totalRows: out.totalRows }).toEqual({
+      truncated: false,
+      totalRows: 2,
+    });
+  });
 });
 
 describe("reshaping", () => {
