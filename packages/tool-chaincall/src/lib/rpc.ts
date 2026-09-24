@@ -56,10 +56,13 @@ export function setChainRpcResolver(fn: ChainRpcResolver | undefined): void {
 /**
  * Adapt a `ChainAdapter` into the seam, so the runtime can hand these tools
  * the same adapters `tool-evm` already gets. `rpcRead` keeps its own
- * allowlist and boundary classification; this does not replace either.
+ * allowlist and boundary classification; this does not replace either. The
+ * call's signal goes through, so a cancelled read closes its request instead
+ * of leaving it in flight.
  */
 export function chainRpcFromAdapter(adapter: ChainAdapter): ChainRpc {
-  return (method, params) => adapter.rpcRead(method, params);
+  return (method, params, opts) =>
+    adapter.rpcRead(method, params, opts?.signal === undefined ? {} : { signal: opts.signal });
 }
 
 /**
@@ -119,12 +122,12 @@ function abortError(signal: AbortSignal): Error {
  * write-class method reaching this line is a defect in this package and
  * should arrive at the log looking like one.
  *
- * The signal is both passed down AND raced against. `ChainAdapter.rpcRead`
- * takes no signal, so a transport built on one cannot be cancelled — and a
- * `timeoutMs` that bounds nothing is a promise this package should not be
- * making. Racing means the TOOL returns on time; the request underneath it
- * may still be in flight, which is the honest limit of a seam whose other
- * side does not accept a signal.
+ * The signal is both passed down AND raced against. The chain adapter
+ * honours it (see `chainRpcFromAdapter`), but a transport bound some other
+ * way may not — and a `timeoutMs` that bounds nothing is a promise this
+ * package should not be making. Racing means the TOOL returns on time even
+ * then; the request underneath may still be in flight, which is the honest
+ * limit of a seam whose other side does not accept a signal.
  */
 export async function rpcRead(
   rpc: ChainRpc,

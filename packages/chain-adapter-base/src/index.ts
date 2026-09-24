@@ -85,12 +85,21 @@ export interface ChainAdapter {
    * `eth_blockNumber`, `eth_chainId`. Any attempt to dispatch a
    * write-class method (`eth_sendRawTransaction`, etc.) throws.
    */
-  rpcRead(
-    method: string,
-    params: ReadonlyArray<unknown>,
-    opts?: { readonly bypassCache?: boolean },
-  ): Promise<unknown>;
+  rpcRead(method: string, params: ReadonlyArray<unknown>, opts?: RpcReadOptions): Promise<unknown>;
 }
+
+/**
+ * Per-read options. A read is always bounded: an adapter applies its own
+ * default deadline when `timeoutMs` is left out, and gives up as soon as
+ * `signal` fires, so a node that never answers cannot hold a turn open.
+ */
+export type RpcReadOptions = {
+  readonly bypassCache?: boolean;
+  /** The caller's cancellation — a tool passes its call's `ctx.signal`. */
+  readonly signal?: AbortSignal;
+  /** The whole read's deadline, across every RPC URL it tries. */
+  readonly timeoutMs?: number;
+};
 
 /**
  * Whitelist of read-only JSON-RPC methods. Adding writes here is a

@@ -385,6 +385,7 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/chain-adapter-base": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/channel-adapter-base": {

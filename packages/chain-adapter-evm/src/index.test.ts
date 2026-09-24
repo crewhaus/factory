@@ -235,3 +235,127 @@ describe("createEvmAdapter — network errors", () => {
     expect(((caught as ChainAdapterError).cause as Error).message).toContain("ECONNREFUSED");
   });
 });
+
+describe("a read is bounded in time and in bytes (C041)", () => {
+  const LOCAL = {
+    chainId: "1",
+    rpcPolicy: "single" as const,
+    finality: { kind: "finalized" as const },
+    reorgTolerant: true,
+  };
+
+  /** A node that accepts the request and never answers it. */
+  function silentNode(): { url: string; stop: () => void } {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => new Promise(() => {}),
+    });
+    return { url: `http://127.0.0.1:${server.port}/`, stop: () => server.stop(true) };
+  }
+
+  /**
+   * How a read ended, or "still pending" if it had not after two seconds —
+   * far past the 50-100 ms the reads below are given, so the sentinel only
+   * wins when nothing ends the read at all (0.7.0 waited forever).
+   */
+  async function settle(read: Promise<unknown>): Promise<unknown> {
+    return Promise.race([
+      read.then(
+        () => "resolved",
+        (err: unknown) => err,
+      ),
+      Bun.sleep(2_000).then(() => "still pending"),
+    ]);
+  }
+
+  test("every dispatch carries a signal and keeps the body raw, with no caller signal at all", async () => {
+    const seen: RequestInit[] = [];
+    const fetchImpl = ((_url: string, init: RequestInit) => {
+      seen.push(init);
+      return Promise.resolve(
+        new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "0x1" })),
+      );
+    }) as unknown as typeof fetch;
+    await createEvmAdapter(BASE_CONFIG, fetchImpl).rpcRead("eth_blockNumber", []);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(seen[0]?.signal?.aborted).toBe(false);
+    // Bun inflates a compressed body before JavaScript sees it unless told not to.
+    expect((seen[0] as { decompress?: boolean }).decompress).toBe(false);
+  });
+
+  test("the caller's cancel ends a read against a node that never answers", async () => {
+    const node = silentNode();
+    try {
+      const adapter = createEvmAdapter({ ...LOCAL, rpcUrls: [node.url] });
+      const cancel = new AbortController();
+      const read = adapter.rpcRead("eth_getLogs", [{}], { signal: cancel.signal });
+      setTimeout(() => cancel.abort(), 50);
+      const outcome = await settle(read);
+      expect(outcome).toBeInstanceOf(ChainAdapterError);
+      expect((outcome as Error).message).toContain("eth_getLogs: the read was cancelled");
+    } finally {
+      node.stop();
+    }
+  });
+
+  test("with no caller signal, the read's own deadline ends it, across every fallback URL", async () => {
+    const node = silentNode();
+    try {
+      const adapter = createEvmAdapter({
+        ...LOCAL,
+        rpcPolicy: "fallback",
+        rpcUrls: [node.url, node.url, node.url],
+      });
+      const outcome = await settle(adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 100 }));
+      expect(outcome).toBeInstanceOf(ChainAdapterError);
+      expect((outcome as Error).message).toContain("eth_blockNumber: no answer within 100 ms");
+    } finally {
+      node.stop();
+    }
+  });
+
+  test("a body past the cap is refused, not parsed from a prefix", async () => {
+    const huge = `{"jsonrpc":"2.0","id":1,"result":"0x${"0".repeat(17 * 1024 * 1024)}"}`;
+    const fetchImpl = mockFetch(() => new Response(huge));
+    const adapter = createEvmAdapter(BASE_CONFIG, fetchImpl);
+    const err = await adapter.rpcRead("eth_call", [], { bypassCache: true }).catch((e) => e);
+    expect(err).toBeInstanceOf(ChainAdapterError);
+    expect(String((err as ChainAdapterError).cause)).toContain(
+      "is larger than 16777216 bytes — refusing to read it",
+    );
+  });
+
+  test("a gzip bomb from a real node is cut at the cap while still compressed", async () => {
+    // 64 MB of zeros, about 64 KB on the wire.
+    const bomb = Bun.gzipSync(new Uint8Array(64 * 1024 * 1024));
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => new Response(bomb, { headers: { "content-encoding": "gzip" } }),
+    });
+    try {
+      const adapter = createEvmAdapter({
+        ...LOCAL,
+        rpcUrls: [`http://127.0.0.1:${server.port}/`],
+      });
+      const err = await adapter.rpcRead("eth_call", []).catch((e) => e);
+      expect(String((err as ChainAdapterError).cause)).toContain(
+        "is larger than 16777216 bytes — refusing to read it",
+      );
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test("a deadline that is not a duration is refused before anything is sent", async () => {
+    const fetchImpl = mockFetch(() => {
+      throw new Error("nothing should be sent");
+    });
+    const adapter = createEvmAdapter(BASE_CONFIG, fetchImpl);
+    await expect(adapter.rpcRead("eth_blockNumber", [], { timeoutMs: Number.NaN })).rejects.toThrow(
+      "timeoutMs NaN is not a duration",
+    );
+  });
+});

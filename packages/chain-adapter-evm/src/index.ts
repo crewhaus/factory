@@ -16,10 +16,25 @@ import {
   type ChainAdapter,
   type ChainAdapterConfig,
   ChainAdapterError,
+  type RpcReadOptions,
   assertReadOnlyMethod,
   classifyChainPayload,
   orderRpcUrls,
 } from "@crewhaus/chain-adapter-base";
+import { readResponseBounded, withRawBody } from "@crewhaus/tool-safety/streams";
+
+/**
+ * A read's deadline when the caller names none: across every URL it tries,
+ * so a fallback list cannot multiply it.
+ */
+export const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+/**
+ * The most bytes of a JSON-RPC response this reads, decoded. A large
+ * eth_getLogs or Multicall3 answer runs to megabytes; nothing a node should
+ * send runs to more, and a body is held in memory whole.
+ */
+export const MAX_RPC_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 type JsonRpcRequest = {
   readonly jsonrpc: "2.0";
@@ -55,17 +70,38 @@ export function createEvmAdapter(
     async rpcRead(
       method: string,
       params: ReadonlyArray<unknown>,
-      opts?: { readonly bypassCache?: boolean },
+      opts?: RpcReadOptions,
     ): Promise<unknown> {
       assertReadOnlyMethod(config.chainId, method);
       const urls = orderRpcUrls(config.rpcUrls, config.rpcPolicy);
-
-      if (config.rpcPolicy === "quorum") {
-        return quorumDispatch(config.chainId, urls, method, params, fetchImpl, nextId++, opts);
+      const timeoutMs = opts?.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new ChainAdapterError(
+          config.chainId,
+          method,
+          `timeoutMs ${timeoutMs} is not a duration`,
+        );
       }
+      const deadline = AbortSignal.timeout(timeoutMs);
+      const call: Dispatch = {
+        chainId: config.chainId,
+        method,
+        params,
+        fetchImpl,
+        id: nextId++,
+        signal: opts?.signal === undefined ? deadline : AbortSignal.any([opts.signal, deadline]),
+        cancelled: () =>
+          opts?.signal?.aborted === true
+            ? "the read was cancelled"
+            : deadline.aborted
+              ? `no answer within ${timeoutMs} ms`
+              : undefined,
+        ...(opts?.bypassCache !== undefined ? { bypassCache: opts.bypassCache } : {}),
+      };
+      if (config.rpcPolicy === "quorum") return quorumDispatch(urls, call);
       // "single" was reduced to one URL by orderRpcUrls; "fallback"
       // iterates the full list and stops on the first success.
-      return fallbackDispatch(config.chainId, urls, method, params, fetchImpl, nextId++, opts);
+      return fallbackDispatch(urls, call);
     },
   };
 }
@@ -126,38 +162,48 @@ function endpointLabel(url: string): string {
   }
 }
 
-async function fallbackDispatch(
-  chainId: string,
-  urls: readonly string[],
-  method: string,
-  params: ReadonlyArray<unknown>,
-  fetchImpl: typeof fetch,
-  id: number,
-  opts?: { readonly bypassCache?: boolean },
-): Promise<unknown> {
+/** One read, as every URL it is sent to sees it. */
+type Dispatch = {
+  readonly chainId: string;
+  readonly method: string;
+  readonly params: ReadonlyArray<unknown>;
+  readonly fetchImpl: typeof fetch;
+  readonly id: number;
+  /** The caller's signal and the read's deadline, together. */
+  readonly signal: AbortSignal;
+  /** Why the read was stopped, once it was; undefined while it may go on. */
+  readonly cancelled: () => string | undefined;
+  readonly bypassCache?: boolean;
+};
+
+async function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unknown> {
   let lastError: unknown;
   for (const url of urls) {
     try {
-      return await dispatchOne(chainId, url, method, params, fetchImpl, id, opts);
+      return await dispatchOne(url, call);
     } catch (err) {
       lastError = err;
+      // A cancelled or timed-out read is over: the next URL would only be
+      // asked after the caller stopped waiting.
+      const stopped = call.cancelled();
+      if (stopped !== undefined) {
+        throw new ChainAdapterError(call.chainId, call.method, stopped);
+      }
     }
   }
-  throw new ChainAdapterError(chainId, method, `all ${urls.length} RPC URL(s) failed`, lastError);
+  throw new ChainAdapterError(
+    call.chainId,
+    call.method,
+    `all ${urls.length} RPC URL(s) failed`,
+    lastError,
+  );
 }
 
-async function quorumDispatch(
-  chainId: string,
-  urls: readonly string[],
-  method: string,
-  params: ReadonlyArray<unknown>,
-  fetchImpl: typeof fetch,
-  id: number,
-  opts?: { readonly bypassCache?: boolean },
-): Promise<unknown> {
-  const results = await Promise.allSettled(
-    urls.map((u) => dispatchOne(chainId, u, method, params, fetchImpl, id, opts)),
-  );
+async function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknown> {
+  const { chainId, method } = call;
+  const results = await Promise.allSettled(urls.map((u) => dispatchOne(u, call)));
+  const stopped = call.cancelled();
+  if (stopped !== undefined) throw new ChainAdapterError(chainId, method, stopped);
   const fulfilled = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
   if (fulfilled.length === 0) {
     throw new ChainAdapterError(chainId, method, "quorum failed: every RPC URL rejected");
@@ -182,23 +228,22 @@ async function quorumDispatch(
   );
 }
 
-async function dispatchOne(
-  chainId: string,
-  url: string,
-  method: string,
-  params: ReadonlyArray<unknown>,
-  fetchImpl: typeof fetch,
-  id: number,
-  opts?: { readonly bypassCache?: boolean },
-): Promise<unknown> {
+async function dispatchOne(url: string, call: Dispatch): Promise<unknown> {
+  const { chainId, method, params, id } = call;
   const body: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
   let res: Response;
   try {
-    res = await fetchImpl(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    // The body stays encoded until the bounded reader decodes it, so a
+    // compressed answer cannot inflate past the cap before it is counted.
+    res = await call.fetchImpl(
+      url,
+      withRawBody({
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: call.signal,
+      }) as RequestInit,
+    );
   } catch (err) {
     // No `cause`: a dialler's error can quote the URL it failed on, and a
     // provider keeps its key in the URL's path.
@@ -206,16 +251,41 @@ async function dispatchOne(
     throw new ChainAdapterError(chainId, method, `network error: ${message}`);
   }
   if (!res.ok) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // already closed
+    }
     throw new ChainAdapterError(chainId, method, `HTTP ${res.status} from ${endpointLabel(url)}`);
   }
-  const text = await res.text();
+  const read = await readResponseBounded(res, {
+    maxBytes: MAX_RPC_RESPONSE_BYTES,
+    signal: call.signal,
+  });
+  if (!read.ok) {
+    throw new ChainAdapterError(
+      chainId,
+      method,
+      `the response from ${endpointLabel(url)} could not be read: ${read.code === "aborted" ? (call.cancelled() ?? "the read was stopped") : read.reason}`,
+    );
+  }
+  if (read.truncated) {
+    // Parsing a prefix is not an option — half a JSON-RPC answer is either
+    // an error or, worse, a shorter plausible one.
+    throw new ChainAdapterError(
+      chainId,
+      method,
+      `the response from ${endpointLabel(url)} is larger than ${MAX_RPC_RESPONSE_BYTES} bytes — refusing to read it`,
+    );
+  }
+  const text = read.text;
 
   // Pillar 3: classify the raw response BEFORE parsing. The classifier
   // operates on text — JSON-RPC error messages, decoded log strings,
   // and any other vector through which an attacker could plant a
   // malicious payload all hit the classifier first.
   const boundary = await classifyChainPayload(text, {
-    ...(opts?.bypassCache !== undefined ? { bypassCache: opts.bypassCache } : {}),
+    ...(call.bypassCache !== undefined ? { bypassCache: call.bypassCache } : {}),
   });
   if (boundary.action === "redact") {
     // The verbatim node response is suspected of carrying an injection
