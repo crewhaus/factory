@@ -443,3 +443,24 @@ describe("ingestDocument — relative dangling-link base", () => {
     }
   });
 });
+
+describe("ingestDocument — a dangling link's target is walked as the kernel walks it (C068)", () => {
+  test("a parser is never handed a file the caller's path does not lead to", async () => {
+    // `a/y -> ..` is the workspace root, so `a/y/..` is the workspace's
+    // parent: `evil.pdf` leads outside. Folded as text it read as the
+    // in-root `a/x.pdf`, which a registered parser was then handed.
+    mkdirSync(join(tmp, "a"));
+    symlinkSync("..", join(tmp, "a", "y"));
+    writeFileSync(join(tmp, "a", "x.pdf"), "in-root decoy");
+    symlinkSync("a/y/../x.pdf", join(tmp, "evil.pdf"));
+    const handed: string[] = [];
+    registerDocumentParser(".pdf", async (path) => {
+      handed.push(path);
+      return { content: "parsed" };
+    });
+    await expect(ingestDocument.execute({ path: "evil.pdf" })).rejects.toBeInstanceOf(
+      ToolPermissionError,
+    );
+    expect(handed).toEqual([]);
+  });
+});
