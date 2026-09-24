@@ -84,7 +84,9 @@ function checkPrivateDir(dir: string, create: boolean): "ok" | "absent" {
       `the state directory ${dir} belongs to another user, so a record in it is not trusted`,
     );
   }
-  if ((stats.mode & 0o077) !== 0) {
+  // Group or other WRITE is what lets someone else plant a record; read is
+  // only the pid and the deadline. A directory this call creates is 0700.
+  if ((stats.mode & 0o022) !== 0) {
     if (!create) {
       throw new StateFileError(
         `the state directory ${dir} can be written by other users (mode ${(stats.mode & 0o777).toString(8)}), so a record in it is not trusted`,

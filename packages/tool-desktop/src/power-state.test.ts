@@ -109,6 +109,14 @@ posixTest("a directory other users can write is not trusted", () => {
   expect(() => fs().readText(file)).toThrow("can be written by other users");
 });
 
+posixTest("a directory others can read but not write is still trusted", () => {
+  const file = powerStateFile();
+  mkdirSync(dirname(file), { recursive: true });
+  chmodSync(dirname(file), 0o755);
+  writeFileSync(file, "{}");
+  expect(fs().readText(file)).toBe("{}");
+});
+
 posixTest("a FIFO at the record's path is refused without blocking", async () => {
   const file = powerStateFile();
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
