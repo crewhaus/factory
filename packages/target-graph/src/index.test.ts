@@ -251,10 +251,23 @@ describe("emitGraph — node tools (G07)", () => {
     expect(readImports.length).toBe(1);
   });
 
-  test("rejects an unknown tool with the known-tools list", () => {
+  test("rejects an unknown tool by name, with a next step", () => {
     expect(() => emitGraph(withTools(["teleport"]))).toThrow(TargetEmitError);
     expect(() => emitGraph(withTools(["teleport"]))).toThrow(/unknown tool "teleport"/);
-    expect(() => emitGraph(withTools(["teleport"]))).toThrow(/known tools: .*bash.*read/);
+    expect(() => emitGraph(withTools(["teleport"]))).toThrow(/crewhaus tools search/);
+  });
+
+  test("a 0.7.0 builtin resolves on a graph node (shape-reach#0)", () => {
+    const code = emitGraph(withTools(["jsonQuery", "gitStatus"])).files[0]?.content ?? "";
+    expect(code).toContain('import { jsonQuery } from "@crewhaus/tool-data";');
+    expect(code).toContain('import { gitStatus } from "@crewhaus/tool-git";');
+    expect(code).toContain("tools: [jsonQuery, gitStatus]");
+  });
+
+  test("a code-execution tool wires the sandbox floor into the node's loop", () => {
+    const code = emitGraph(withTools(["python"])).files[0]?.content ?? "";
+    expect(code).toContain('sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker")');
+    expect(emitGraph(withTools(["read"])).files[0]?.content).not.toContain("sandboxAvailable");
   });
 
   test("tool-less graphs emit no tools field and no tool imports", () => {

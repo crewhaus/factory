@@ -61,6 +61,12 @@ import {
   renderHybridWiringFields,
   renderModelWiringFields,
 } from "@crewhaus/model-service";
+import {
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -70,91 +76,47 @@ export class TargetEmitError extends CrewhausError {
 }
 
 /**
- * Built-in tool name → package + export. Mirror of `loadToolMap()` in
- * `apps/cli/src/index.ts` — the `crewhaus run` browser path resolves the
- * same names to RegisteredTool instances. `initSymbol` is the optional
- * registration function called with the matching `toolConfigs[name]` blob
- * before the tool is registered (mirrors `applyToolConfigs()` in the run
- * path, which currently handles `fetch` and `webFetch`).
+ * The spec's `tools` → imports, `tool_config` registrations and
+ * `defaultCatalog.register(...)` lines, through the one shared builtin table
+ * (`@crewhaus/tool-categories`), so every builtin and category the browser
+ * shape can run resolves here. A name it cannot run throws `TargetEmitError`
+ * with the shared message.
  */
-type BuiltinToolEntry = {
-  readonly package: string;
-  readonly export: string;
-  readonly initSymbol?: string;
-};
-
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  write: { package: "@crewhaus/tool-fs", export: "write" },
-  edit: { package: "@crewhaus/tool-fs", export: "edit" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
-  fetch: {
-    package: "@crewhaus/tool-fetch",
-    export: "fetch",
-    initSymbol: "registerFetchConfig",
-  },
-  imageGenerate: {
-    package: "@crewhaus/tool-image-generation",
-    export: "imageGenerate",
-  },
-  ingestDocument: {
-    package: "@crewhaus/tool-document-ingest",
-    export: "ingestDocument",
-  },
-  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
-  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
-  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
-  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
-};
-
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
 ): {
-  imports: string[];
-  inits: string[];
-  registrations: string[];
+  imports: ReadonlyArray<string>;
+  inits: ReadonlyArray<string>;
+  registrations: ReadonlyArray<string>;
+  sandbox: boolean;
 } {
-  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
-
-  const byPackage = new Map<string, Set<string>>();
-  const registrations: string[] = [];
-  const inits: string[] = [];
-  for (const name of toolNames) {
-    const entry = BUILTIN_TOOL_MAP[name];
-    if (!entry) {
-      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-    }
-    const set = byPackage.get(entry.package) ?? new Set<string>();
-    set.add(entry.export);
-    byPackage.set(entry.package, set);
-    if (entry.initSymbol !== undefined) {
-      const cfg = toolConfigs[name];
-      if (cfg !== undefined) {
-        set.add(entry.initSymbol);
-        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-      }
-    }
-    registrations.push(`defaultCatalog.register(${entry.export});`);
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools("browser", [{ tools: toolNames, toolConfigs }]);
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
   }
+  return {
+    imports: resolved.imports,
+    inits: resolved.inits,
+    registrations: (resolved.sites[0] ?? []).map((id) => `defaultCatalog.register(${id});`),
+    sandbox: resolved.sandbox,
+  };
+}
 
-  const imports: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
-    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
-  }
-  return { imports, inits, registrations };
+/**
+ * `sandboxAvailable` for the runChatLoop options when a registered tool runs
+ * model-written code — the CREWHAUS_SANDBOX grammar the cli bundle and
+ * `crewhaus run` use. "" otherwise, so bundles without those tools keep
+ * their bytes.
+ */
+function sandboxField(ir: IrBrowserV0, indent: string): string {
+  return resolveTools(ir.tools, ir.toolConfigs).sandbox
+    ? `\n${indent}sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},`
+    : "";
 }
 
 /**
@@ -418,7 +380,7 @@ async function main(): Promise<void> {
   // context. limits/budget/max_tokens (Batch A) apply to each turn.
   const runOptions = {
     model: SPEC_MODEL,
-    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}
+    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}${sandboxField(ir, "    ")}
     runContext,
     sessionName: SPEC_NAME,
     sessionTarget: "browser" as const,

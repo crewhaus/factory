@@ -168,6 +168,35 @@ describe("emitWorkflow", () => {
     expect(() => emitWorkflow(ir)).toThrow(/unknown tool "bogus"/);
   });
 
+  test("a 0.7.0 builtin resolves on a step, and tool_config reaches its registrar", () => {
+    const ir: IrWorkflowV0 = {
+      ...TWO_STEP_IR,
+      steps: [
+        {
+          name: "a",
+          instructions: "i",
+          model: "m",
+          tools: ["jsonQuery", "webFetch"],
+          toolConfigs: { webFetch: { allowed_domains: ["example.com"] } },
+        },
+      ],
+    };
+    const c = emitWorkflow(ir).files[0]?.content ?? "";
+    expect(c).toContain('import { jsonQuery } from "@crewhaus/tool-data";');
+    expect(c).toContain('import { registerWebFetchConfig, webFetch } from "@crewhaus/tool-web";');
+    expect(c).toContain('registerWebFetchConfig({"allowed_domains":["example.com"]});');
+    expect(c).toContain("[jsonQuery, webFetch, __skillTool]");
+  });
+
+  test("a code-execution step wires the sandbox floor", () => {
+    const ir: IrWorkflowV0 = {
+      ...TWO_STEP_IR,
+      steps: [{ name: "a", instructions: "i", model: "m", tools: ["python"], toolConfigs: {} }],
+    };
+    expect(emitWorkflow(ir).files[0]?.content).toContain("sandboxAvailable: ((process.env");
+    expect(emitWorkflow(TWO_STEP_IR).files[0]?.content).not.toContain("sandboxAvailable");
+  });
+
   test("escapes instructions and model strings safely", () => {
     const ir: IrWorkflowV0 = {
       ...TWO_STEP_IR,

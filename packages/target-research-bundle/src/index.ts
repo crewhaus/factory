@@ -42,6 +42,12 @@ import {
   renderHybridWiringFields,
   renderModelWiringFields,
 } from "@crewhaus/model-service";
+import {
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -50,67 +56,48 @@ export class TargetEmitError extends CrewhausError {
   }
 }
 
-type BuiltinToolEntry = {
-  readonly package: string;
-  readonly export: string;
-  readonly initSymbol?: string;
-};
-
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  fetch: {
-    package: "@crewhaus/tool-fetch",
-    export: "fetch",
-    initSymbol: "registerFetchConfig",
-  },
-};
-
+/**
+ * The spec's `tools` → imports, `tool_config` registrations and
+ * `defaultCatalog.register(...)` lines, through the one shared builtin table
+ * (`@crewhaus/tool-categories`), so every builtin and category the research
+ * shape can run resolves here. A name it cannot run throws `TargetEmitError`
+ * with the shared message.
+ */
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
 ): {
-  imports: string[];
-  inits: string[];
-  registrations: string[];
+  imports: ReadonlyArray<string>;
+  inits: ReadonlyArray<string>;
+  registrations: ReadonlyArray<string>;
+  sandbox: boolean;
 } {
-  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
-  const byPackage = new Map<string, Set<string>>();
-  const inits: string[] = [];
-  const registrations: string[] = [];
-  for (const name of toolNames) {
-    const entry = BUILTIN_TOOL_MAP[name];
-    if (!entry) {
-      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-    }
-    const set = byPackage.get(entry.package) ?? new Set<string>();
-    set.add(entry.export);
-    byPackage.set(entry.package, set);
-    if (entry.initSymbol !== undefined) {
-      const cfg = toolConfigs[name];
-      if (cfg !== undefined) {
-        set.add(entry.initSymbol);
-        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-      }
-    }
-    registrations.push(`defaultCatalog.register(${entry.export});`);
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools("research", [{ tools: toolNames, toolConfigs }]);
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
   }
-  const imports: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
-    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
-  }
-  return { imports, inits, registrations };
+  return {
+    imports: resolved.imports,
+    inits: resolved.inits,
+    registrations: (resolved.sites[0] ?? []).map((id) => `defaultCatalog.register(${id});`),
+    sandbox: resolved.sandbox,
+  };
+}
+
+/**
+ * `sandboxAvailable` for the runChatLoop options when a registered tool runs
+ * model-written code — the CREWHAUS_SANDBOX grammar the cli bundle and
+ * `crewhaus run` use. "" otherwise, so bundles without those tools keep
+ * their bytes.
+ */
+function sandboxField(ir: IrResearchV0, indent: string): string {
+  return resolveTools(ir.tools, ir.toolConfigs).sandbox
+    ? `\n${indent}sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},`
+    : "";
 }
 
 function renderPermissionsField(ir: IrResearchV0): string {
@@ -572,7 +559,7 @@ async function runOneBranch(args: {
   const runContext = createRunContext();
   const finalText = await runChatLoop({
     model: SPEC_MODEL,
-    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}
+    instructions: SPEC_INSTRUCTIONS,${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${taxonomyField(ir, "    ")}${sandboxField(ir, "    ")}
     runContext,
     sessionName: ${escapeJsonString(ir.name)},
     sessionTarget: "research",

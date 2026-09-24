@@ -26,6 +26,25 @@ import { CrewhausError } from "@crewhaus/errors";
 import { CATEGORIES, type CategoryDef, leafCategories, rollUpCategories } from "./registry";
 
 export { CATEGORIES, type CategoryDef, leafCategories, rollUpCategories };
+export { BUILTIN_TOOLS, type BuiltinToolEntry } from "./builtins";
+export {
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  SHAPE_TOOL_PROFILES,
+  type ShapeToolProfile,
+  type ToolConfigInit,
+  type ToolShape,
+  type ToolSite,
+  type ToolVerdict,
+  builtinKeyForName,
+  builtinToolsFor,
+  checkBuiltinTool,
+  planToolConfigInits,
+  registeredToolName,
+  resolveBuiltinTools,
+  unknownToolMessage,
+} from "./shapes";
 
 export class ToolCategoryError extends CrewhausError {
   override readonly name = "ToolCategoryError";

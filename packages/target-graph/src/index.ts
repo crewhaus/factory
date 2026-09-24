@@ -17,6 +17,12 @@ import {
   renderModelWiringFields,
   scopedModelWiringFragment,
 } from "@crewhaus/model-service";
+import {
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 
 /**
  * Emit a single-file `agent.ts` bundle that builds the graph via
@@ -127,110 +133,44 @@ export class TargetEmitError extends CrewhausError {
 }
 
 /**
- * G07 — built-in tool name → package + export, ported from target-crew's
- * map (which itself mirrors target-channel-bot's minus the channel-only
- * `sendMessage`): graph nodes, like crew roles, pass resolved tool values
- * straight into their own runChatLoop call rather than registering them on
- * `defaultCatalog`. `initSymbol` names the package's config-registration
- * export, called once before the graph is built when the node's
- * `toolConfigs` carries a value for the tool.
- */
-type BuiltinToolEntry = {
-  readonly package: string;
-  readonly export: string;
-  readonly initSymbol?: string;
-};
-
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  write: { package: "@crewhaus/tool-fs", export: "write" },
-  edit: { package: "@crewhaus/tool-fs", export: "edit" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
-  fetch: {
-    package: "@crewhaus/tool-fetch",
-    export: "fetch",
-    initSymbol: "registerFetchConfig",
-  },
-  // §47 read-only EVM tools (slice 0).
-  evmCall: { package: "@crewhaus/tool-evm", export: "evmCall" },
-  evmGetLogs: { package: "@crewhaus/tool-evm", export: "evmGetLogs" },
-  evmGetTransaction: { package: "@crewhaus/tool-evm", export: "evmGetTransaction" },
-  evmGetTransactionReceipt: {
-    package: "@crewhaus/tool-evm",
-    export: "evmGetTransactionReceipt",
-  },
-  evmGetBalance: { package: "@crewhaus/tool-evm", export: "evmGetBalance" },
-  evmBlockNumber: { package: "@crewhaus/tool-evm", export: "evmBlockNumber" },
-  // §47 destructive EVM tools (slice 1) — gated by permission-engine
-  // (destructive: true) and wallet-engine (two-gate model).
-  evmSendTransaction: { package: "@crewhaus/tool-evm-tx", export: "evmSendTransaction" },
-  evmSimulate: { package: "@crewhaus/tool-evm-tx", export: "evmSimulate" },
-  // Pillar 2 — AST-aware code intelligence (recipe 54).
-  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
-  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
-  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
-  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
-};
-
-/**
- * G07 — resolve every node's `tools` across the whole graph into ONE
- * grouped import block + init list (agent.ts is a single file, unlike
- * crew's per-role files) plus a per-node `[a, b]` array literal for the
- * node's runChatLoop `tools` field. Shared `initSymbol`s are emitted once
- * (first configured node wins — target-cli's shared-symbol rule).
+ * G07 — resolve every node's `tools` across the whole graph into ONE grouped
+ * import block + init list (agent.ts is a single file, unlike crew's
+ * per-role files) plus a per-node `[a, b]` array literal for the node's
+ * runChatLoop `tools` field. Graph nodes pass the resolved tools straight to
+ * their own runChatLoop rather than registering them on `defaultCatalog`.
+ * The builtins come from the one shared table (`@crewhaus/tool-categories`),
+ * so every tool and category the graph shape can run resolves here; a name
+ * it cannot run throws `TargetEmitError` with the shared message.
  */
 function resolveTools(ir: IrGraphV0): {
-  imports: string[];
-  inits: string[];
+  imports: ReadonlyArray<string>;
+  inits: ReadonlyArray<string>;
   /** node name → rendered `[read, grep]` literal; absent when the node declares no tools. */
   toolsArrayByNode: Map<string, string>;
+  /** Some node registers a tool that runs model-written code. */
+  sandbox: boolean;
 } {
-  const byPackage = new Map<string, Set<string>>();
-  const inits: string[] = [];
-  const initEmitted = new Set<string>();
+  const declaring = ir.nodes.filter((node) => node.tools.length > 0);
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools(
+      "graph",
+      declaring.map((node) => ({ tools: node.tools, toolConfigs: node.toolConfigs })),
+    );
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
+  }
   const toolsArrayByNode = new Map<string, string>();
-  for (const node of ir.nodes) {
-    if (node.tools.length === 0) continue;
-    const registrations: string[] = [];
-    for (const name of node.tools) {
-      const entry = BUILTIN_TOOL_MAP[name];
-      if (!entry) {
-        const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-        throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-      }
-      const set = byPackage.get(entry.package) ?? new Set<string>();
-      set.add(entry.export);
-      byPackage.set(entry.package, set);
-      if (entry.initSymbol !== undefined) {
-        const cfg = node.toolConfigs[name];
-        if (cfg !== undefined) {
-          set.add(entry.initSymbol);
-          if (!initEmitted.has(entry.initSymbol)) {
-            inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-            initEmitted.add(entry.initSymbol);
-          }
-        }
-      }
-      registrations.push(entry.export);
-    }
-    toolsArrayByNode.set(node.name, `[${registrations.join(", ")}]`);
-  }
-  const imports: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
-    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
-  }
-  return { imports, inits, toolsArrayByNode };
+  declaring.forEach((node, i) => {
+    toolsArrayByNode.set(node.name, `[${(resolved.sites[i] ?? []).join(", ")}]`);
+  });
+  return {
+    imports: resolved.imports,
+    inits: resolved.inits,
+    toolsArrayByNode,
+    sandbox: resolved.sandbox,
+  };
 }
 
 /**
@@ -1008,10 +948,15 @@ function renderAgent(ir: IrGraphV0, evalEntry = false): string {
   // Graph-LEVEL runChatLoop fields, identical in every node's call (the
   // taxonomy precedent): failure taxonomy, spend cap, hard ceilings, hooks,
   // permission policy, and the G11 ask disposition + approval store.
-  const graphLevelFields = `${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderPermissionsFields(ir)}${renderApprovalFields(ir, "        ")}`;
   // G07 — per-node tools: one grouped import/init block for the file,
   // one array literal per declaring node.
   const tools = resolveTools(ir);
+  // A code-execution tool on any node needs the sandbox floor wired, with the
+  // same CREWHAUS_SANDBOX grammar the cli bundle and `crewhaus run` use.
+  const sandboxField = tools.sandbox
+    ? `\n        sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},`
+    : "";
+  const graphLevelFields = `${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderPermissionsFields(ir)}${renderApprovalFields(ir, "        ")}${sandboxField}`;
   const toolImportBlock = tools.imports.length > 0 ? `${tools.imports.join("\n")}\n` : "";
   const toolInitBlock = tools.inits.length > 0 ? `\n${tools.inits.join("\n")}\n` : "";
 

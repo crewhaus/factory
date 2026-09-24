@@ -42,6 +42,7 @@
  */
 import type { Sample } from "@crewhaus/eval-dataset";
 import { parseSpec } from "@crewhaus/spec";
+import { registeredToolName } from "@crewhaus/tool-categories";
 import { type GradersConfigObject, synthesizeGraders } from "./feedback";
 
 /** Thrown on a spec this scaffold cannot derive eval assets from (and on
@@ -251,39 +252,26 @@ export function templateSampleInputs(info: ScaffoldInfo, n: number): string[] {
 // -------- tool implication --------
 
 /**
- * Spec tool name → the RUNTIME (PascalCase) tool name recorded in trace
- * events and expected by tool graders, plus the input keywords that
- * "obviously imply" the tool. Mirrors `loadToolMap` in index.ts /
- * target-cli's BUILTIN_TOOL_MAP — keep the name column in sync. Keyword
- * sets are deliberately conservative: a missed implication is a stub the
- * user fills in; a false one is a failing grader they must debug.
+ * Spec tool key → the input keywords that "obviously imply" the tool. The
+ * runtime (PascalCase) name recorded in trace events and expected by tool
+ * graders comes from the builtin table, never from here. Keyword sets are
+ * deliberately conservative: a missed implication is a stub the user fills
+ * in; a false one is a failing grader they must debug.
  */
-const TOOL_IMPLICATIONS: Readonly<Record<string, { runtime: string; keywords: string[] }>> = {
-  read: { runtime: "Read", keywords: ["read the file", "open the file", "file contents"] },
-  write: { runtime: "Write", keywords: ["write a file", "create a file", "save to a file"] },
-  edit: { runtime: "Edit", keywords: ["edit", "modify the file", "refactor"] },
-  glob: { runtime: "Glob", keywords: ["find files", "list files", "matching files"] },
-  grep: {
-    runtime: "Grep",
-    keywords: ["grep", "search the code", "search the codebase", "find references"],
-  },
-  bash: {
-    runtime: "Bash",
-    keywords: ["run the", "execute", "shell", "command", "install", "the tests"],
-  },
-  todoWrite: { runtime: "TodoWrite", keywords: ["todo", "task list", "plan out"] },
-  webFetch: { runtime: "WebFetch", keywords: ["fetch", "url", "web page", "website"] },
-  webSearch: {
-    runtime: "WebSearch",
-    keywords: ["search the web", "search online", "look up online", "web search", "latest news"],
-  },
-  readImage: { runtime: "ReadImage", keywords: ["image", "screenshot", "photo"] },
-  fetch: { runtime: "Fetch", keywords: ["fetch", "http", "api", "endpoint", "url"] },
-  imageGenerate: {
-    runtime: "ImageGenerate",
-    keywords: ["generate an image", "draw", "illustration"],
-  },
-  ingestDocument: { runtime: "IngestDocument", keywords: ["pdf", "document", "docx"] },
+const TOOL_IMPLICATIONS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  read: ["read the file", "open the file", "file contents"],
+  write: ["write a file", "create a file", "save to a file"],
+  edit: ["edit", "modify the file", "refactor"],
+  glob: ["find files", "list files", "matching files"],
+  grep: ["grep", "search the code", "search the codebase", "find references"],
+  bash: ["run the", "execute", "shell", "command", "install", "the tests"],
+  todoWrite: ["todo", "task list", "plan out"],
+  webFetch: ["fetch", "url", "web page", "website"],
+  webSearch: ["search the web", "search online", "look up online", "web search", "latest news"],
+  readImage: ["image", "screenshot", "photo"],
+  fetch: ["fetch", "http", "api", "endpoint", "url"],
+  imageGenerate: ["generate an image", "draw", "illustration"],
+  ingestDocument: ["pdf", "document", "docx"],
 };
 
 function keywordImplied(input: string, keyword: string): boolean {
@@ -296,17 +284,19 @@ function keywordImplied(input: string, keyword: string): boolean {
  * The runtime tool names a sample input obviously implies, drawn ONLY from
  * the spec's own tools list. Builtin spec names map to their runtime
  * PascalCase form (`webSearch` → `WebSearch` — the casing tool graders
- * compare against); unknown/custom tools (e.g. `mcp__*`) are implied only
- * when the input mentions them verbatim and pass through unchanged.
+ * compare against); any other spec tool is implied only when the input
+ * mentions it verbatim — a builtin still maps to its runtime name, and a
+ * custom or `mcp__*` name passes through unchanged.
  */
 export function impliedTools(input: string, specTools: ReadonlyArray<string>): string[] {
   const out: string[] = [];
   for (const tool of specTools) {
-    const known = TOOL_IMPLICATIONS[tool];
-    if (known !== undefined) {
-      if (known.keywords.some((k) => keywordImplied(input, k))) out.push(known.runtime);
+    const keywords = TOOL_IMPLICATIONS[tool];
+    const runtime = registeredToolName(tool) ?? tool;
+    if (keywords !== undefined) {
+      if (keywords.some((k) => keywordImplied(input, k))) out.push(runtime);
     } else if (input.toLowerCase().includes(tool.toLowerCase())) {
-      out.push(tool);
+      out.push(runtime);
     }
   }
   return [...new Set(out)];

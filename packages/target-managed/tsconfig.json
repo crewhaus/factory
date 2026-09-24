@@ -10,7 +10,8 @@
     { "path": "../infra-utils" },
     { "path": "../ir" },
     { "path": "../memory-service" },
-    { "path": "../model-service" }
+    { "path": "../model-service" },
+    { "path": "../tool-categories" }
   ],
   "include": ["src/**/*"]
 }

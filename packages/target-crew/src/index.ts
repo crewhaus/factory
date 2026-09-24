@@ -34,6 +34,12 @@ import {
 } from "@crewhaus/ir";
 import { memoryFragmentFromIr } from "@crewhaus/memory-service";
 import { renderModelWiringFields, renderSubAgentDef } from "@crewhaus/model-service";
+import {
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 
 export class TargetEmitError extends CrewhausError {
   override readonly name = "TargetEmitError";
@@ -41,59 +47,6 @@ export class TargetEmitError extends CrewhausError {
     super("compiler", message, cause);
   }
 }
-
-/**
- * Built-in tool name → package + export. Mirrors target-channel-bot's
- * map but excluded `sendMessage` (the channel-bot variant) since CRW
- * roles use `a2a-protocol`'s `SendMessage` automatically wired by the
- * orchestrator.
- */
-type BuiltinToolEntry = {
-  readonly package: string;
-  readonly export: string;
-  readonly initSymbol?: string;
-};
-
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  write: { package: "@crewhaus/tool-fs", export: "write" },
-  edit: { package: "@crewhaus/tool-fs", export: "edit" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
-  fetch: {
-    package: "@crewhaus/tool-fetch",
-    export: "fetch",
-    initSymbol: "registerFetchConfig",
-  },
-  // §47 read-only EVM tools (slice 0).
-  evmCall: { package: "@crewhaus/tool-evm", export: "evmCall" },
-  evmGetLogs: { package: "@crewhaus/tool-evm", export: "evmGetLogs" },
-  evmGetTransaction: { package: "@crewhaus/tool-evm", export: "evmGetTransaction" },
-  evmGetTransactionReceipt: {
-    package: "@crewhaus/tool-evm",
-    export: "evmGetTransactionReceipt",
-  },
-  evmGetBalance: { package: "@crewhaus/tool-evm", export: "evmGetBalance" },
-  evmBlockNumber: { package: "@crewhaus/tool-evm", export: "evmBlockNumber" },
-  // §47 destructive EVM tools (slice 1) — gated by permission-engine
-  // (destructive: true) and wallet-engine (two-gate model).
-  evmSendTransaction: { package: "@crewhaus/tool-evm-tx", export: "evmSendTransaction" },
-  evmSimulate: { package: "@crewhaus/tool-evm-tx", export: "evmSimulate" },
-  // Pillar 2 — AST-aware code intelligence (recipe 54).
-  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
-  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
-  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
-  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
-};
 
 /**
  * Evals Wave 4, cluster S (D36 + NEW-shape-1) — `emitCrew` options.
@@ -144,42 +97,46 @@ function safeFileName(role: string): string {
   return role.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
+/**
+ * One role's `tools` → its file's imports, `tool_config` registrations and
+ * the identifiers its RoleDefinition carries, through the one shared builtin
+ * table (`@crewhaus/tool-categories`). The crew shape refuses `sendMessage`
+ * by name: the orchestrator already gives every role SendMessage and Handoff.
+ */
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
 ): {
-  imports: string[];
-  inits: string[];
-  registrations: string[];
+  imports: ReadonlyArray<string>;
+  inits: ReadonlyArray<string>;
+  registrations: ReadonlyArray<string>;
+  sandbox: boolean;
 } {
-  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
-  const byPackage = new Map<string, Set<string>>();
-  const registrations: string[] = [];
-  const inits: string[] = [];
-  for (const name of toolNames) {
-    const entry = BUILTIN_TOOL_MAP[name];
-    if (!entry) {
-      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-    }
-    const set = byPackage.get(entry.package) ?? new Set<string>();
-    set.add(entry.export);
-    byPackage.set(entry.package, set);
-    if (entry.initSymbol !== undefined) {
-      const cfg = toolConfigs[name];
-      if (cfg !== undefined) {
-        set.add(entry.initSymbol);
-        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-      }
-    }
-    registrations.push(entry.export);
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools("crew", [{ tools: toolNames, toolConfigs }]);
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
   }
-  const imports: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
-    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
-  }
-  return { imports, inits, registrations };
+  return {
+    imports: resolved.imports,
+    inits: resolved.inits,
+    registrations: resolved.sites[0] ?? [],
+    sandbox: resolved.sandbox,
+  };
+}
+
+/**
+ * `sandboxAvailable` for the crew RunOptions when any role registers a tool
+ * that runs model-written code — the same CREWHAUS_SANDBOX grammar the cli
+ * bundle and `crewhaus run` use. "" otherwise, so bundles without those
+ * tools keep their bytes.
+ */
+function renderSandboxField(ir: IrCrewV0): string {
+  const any = ir.roles.some((role) => resolveTools(role.tools, role.toolConfigs).sandbox);
+  return any ? `\n  sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},` : "";
 }
 
 function renderPermissionsField(ir: IrCrewV0): string {
@@ -881,7 +838,7 @@ function renderDaemon(ir: IrCrewV0): string {
     : "";
   const permField = renderPermissionsField(ir);
   const approvalFields = renderApprovalFields(ir, "    ");
-  const taxonomyField = renderFailureTaxonomyField(ir);
+  const taxonomyField = `${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}`;
   // Loop contract 0.4 (Batch A) — the new crew.run knobs.
   const crewCapsFields = renderCrewCapsFields(ir);
   const loopLimitsField = renderLoopLimitsField(ir);
@@ -1078,7 +1035,7 @@ function renderEvalEntry(ir: IrCrewV0): string {
     : "";
   const permField = renderPermissionsField(ir);
   const approvalFields = renderApprovalFields(ir, "    ");
-  const taxonomyField = renderFailureTaxonomyField(ir);
+  const taxonomyField = `${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}`;
   const crewCapsFields = renderCrewCapsFields(ir);
   const loopLimitsField = renderLoopLimitsField(ir);
   const budgetField = renderBudgetField(ir);

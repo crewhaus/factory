@@ -24,6 +24,12 @@ import {
   renderJudgePanelFields,
   renderModelWiringFields,
 } from "@crewhaus/model-service";
+import {
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 
 /**
  * Emit a managed-daemon bundle. Generates `daemon.ts` that wires:
@@ -73,121 +79,55 @@ export class TargetEmitError extends CrewhausError {
 }
 
 /**
- * Loop contract 0.4 (Batch F, G81) — built-in tool name → package + export.
- * The managed daemon runs on node, so it carries the FULL builtin surface
- * (mirror of `BUILTIN_TOOL_MAP` in target-cli + apps/cli's `loadToolMap()` —
- * keep the three in sync). `initSymbol` names the per-tool config registrar
- * emitted (with the matching `tool_config[name]` blob) before the tool is
- * registered on defaultCatalog.
- */
-type BuiltinToolEntry = {
-  readonly package: string;
-  readonly export: string;
-  readonly initSymbol?: string;
-};
-
-const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  write: { package: "@crewhaus/tool-fs", export: "write" },
-  edit: { package: "@crewhaus/tool-fs", export: "edit" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  bashOutput: { package: "@crewhaus/tool-bash", export: "bashOutput" },
-  killShell: { package: "@crewhaus/tool-bash", export: "killShell" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
-  fetch: {
-    package: "@crewhaus/tool-fetch",
-    export: "fetch",
-    initSymbol: "registerFetchConfig",
-  },
-  python: {
-    package: "@crewhaus/tool-code-execution",
-    export: "python",
-    initSymbol: "registerCodeExecutionConfig",
-  },
-  javascript: {
-    package: "@crewhaus/tool-code-execution",
-    export: "javascript",
-    initSymbol: "registerCodeExecutionConfig",
-  },
-  shell: {
-    package: "@crewhaus/tool-code-execution",
-    export: "shell",
-    initSymbol: "registerCodeExecutionConfig",
-  },
-  imageGenerate: {
-    package: "@crewhaus/tool-image-generation",
-    export: "imageGenerate",
-    initSymbol: "registerImageGenerationConfig",
-  },
-  ingestDocument: {
-    package: "@crewhaus/tool-document-ingest",
-    export: "ingestDocument",
-  },
-  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
-  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
-  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
-  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
-};
-
-/**
  * Loop contract 0.4 (Batch F, G81) — resolve the managed spec's `agent.tools`
- * into grouped imports + per-tool config inits + defaultCatalog registrations.
- * Mirror of target-cli's `resolveTools`: a shared `initSymbol` (python/
- * javascript/shell → `registerCodeExecutionConfig`) is emitted exactly once,
- * honoring `tool_config[name]` (or the `codeExecution`/`code_execution`
- * aliases). The `@crewhaus/tool-catalog` import is supplied by the caller's
- * `catalogImport` (defaultCatalog is shared with thredz/knowledge), so it is
- * NOT prepended here. Empty when the spec declares no tools, keeping bundles
- * byte-identical. Per-tenant `tool_config` overlays are a runtime policy-engine
- * concern (the daemon evaluates policy per request with the tenant id); this
- * emit registers the base catalog every tenant draws from.
+ * into grouped imports + per-tool config inits + defaultCatalog registrations,
+ * through the one shared builtin table (`@crewhaus/tool-categories`). The
+ * managed daemon is a long-lived Bun process, so it carries every host
+ * builtin; a code-execution tool also wires `sandboxAvailable` (see
+ * `renderSandboxField`). The `@crewhaus/tool-catalog` import is supplied by
+ * the caller's `catalogImport` (defaultCatalog is shared with
+ * thredz/knowledge), so it is NOT prepended here. Per-tenant `tool_config`
+ * overlays are a runtime policy-engine concern (the daemon evaluates policy
+ * per request with the tenant id); this emit registers the base catalog
+ * every tenant draws from.
  */
 function resolveManagedTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
-): { imports: string[]; inits: string[]; registrations: string[] } {
-  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
-  const byPackage = new Map<string, Set<string>>();
-  const registrations: string[] = [];
-  const inits: string[] = [];
-  const initEmitted = new Set<string>();
-  for (const name of toolNames) {
-    const entry = BUILTIN_TOOL_MAP[name];
-    if (!entry) {
-      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-    }
-    const set = byPackage.get(entry.package) ?? new Set<string>();
-    set.add(entry.export);
-    byPackage.set(entry.package, set);
-    if (entry.initSymbol !== undefined) {
-      const cfg =
-        toolConfigs[name] ?? toolConfigs["codeExecution"] ?? toolConfigs["code_execution"];
-      if (cfg !== undefined && !initEmitted.has(entry.initSymbol)) {
-        set.add(entry.initSymbol);
-        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-        initEmitted.add(entry.initSymbol);
-      } else if (cfg !== undefined) {
-        set.add(entry.initSymbol);
-      }
-    }
-    registrations.push(`defaultCatalog.register(${entry.export});`);
+): {
+  imports: ReadonlyArray<string>;
+  inits: ReadonlyArray<string>;
+  registrations: ReadonlyArray<string>;
+  sandbox: boolean;
+} {
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools("managed", [{ tools: toolNames, toolConfigs }]);
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
   }
-  const imports: string[] = [];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
-    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
-  }
-  return { imports, inits, registrations };
+  return {
+    imports: resolved.imports,
+    inits: resolved.inits,
+    registrations: (resolved.sites[0] ?? []).map((id) => `defaultCatalog.register(${id});`),
+    sandbox: resolved.sandbox,
+  };
+}
+
+/**
+ * `sandboxAvailable` for the turn's runChatLoop when a registered tool runs
+ * model-written code. Before 0.7.1 the managed daemon registered python /
+ * javascript / shell but never passed this, so the permission engine's
+ * sandbox floor denied every call (and pointed the operator at
+ * CREWHAUS_SANDBOX, which the daemon did not read). Same grammar as the cli
+ * bundle: unset means docker is available, `noop` denies.
+ */
+function renderSandboxField(ir: IrManagedV0): string {
+  return resolveManagedTools(ir.tools ?? [], ir.toolConfigs ?? {}).sandbox
+    ? `\n    sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},`
+    : "";
 }
 
 /**
@@ -718,7 +658,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";`
   const toolsOn = ir.tools !== undefined && ir.tools.length > 0;
   const resolvedTools = toolsOn
     ? resolveManagedTools(ir.tools ?? [], ir.toolConfigs ?? {})
-    : { imports: [], inits: [], registrations: [] };
+    : { imports: [], inits: [], registrations: [], sandbox: false };
   const thredzImports = thredzOn
     ? `
 import { McpHost, resolveMcpServerConfig } from "@crewhaus/mcp-host";
@@ -921,7 +861,7 @@ export type ManagedAgentArgs = {
 export async function runOneTurn(args: ManagedAgentArgs): Promise<string> {
 ${memBlock}${approvalsBoot}  return await runChatLoop({
     model: ${escapeJsonString(ir.agent.model)},
-    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
+    instructions: ${escapeJsonString(ir.agent.instructions)},${renderAgentLoopFields(ir)}${renderModelWiringFields(ir.agent, "    ")}${hybridFields}${renderFailureTaxonomyField(ir)}${renderSandboxField(ir)}${renderBudgetField(ir)}${evaluation.field}${renderLimitsFields(ir)}${renderHooksField(ir)}${renderSloField(ir)}
     sessionName: args.sessionId,
     sessionTarget: "managed",
     seedMessages: [{ role: "user", content: args.input }],

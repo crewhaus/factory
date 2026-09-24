@@ -2,7 +2,7 @@
   "name": "@crewhaus/tool-categories",
   "version": "0.7.0",
   "type": "module",
-  "description": "Tool category registry and the all-<category> / -<tool> selector grammar a spec's tools: list accepts",
+  "description": "The builtin tool table, the per-shape tool profiles and resolver, the category registry, and the all-<category> / -<tool> selector grammar a spec's tools: list accepts",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {

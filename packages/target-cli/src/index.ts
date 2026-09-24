@@ -18,6 +18,14 @@ import {
   renderModelWiringFields,
   renderSubAgentDef,
 } from "@crewhaus/model-service";
+import {
+  BUILTIN_TOOLS,
+  BuiltinToolError,
+  type ResolvedTools,
+  SANDBOX_AVAILABLE_EXPR,
+  builtinToolsFor,
+  resolveBuiltinTools,
+} from "@crewhaus/tool-categories";
 import { renderBannerBoot } from "./banner";
 
 // Phase 3 §3.3 — the banner contract is shared with the interpreter path
@@ -68,20 +76,8 @@ export class TargetEmitError extends CrewhausError {
 }
 
 /**
- * Built-in tool name → package + export. Section 2 seeds this with every
- * Section-3 tool so the convention is documented; the actual packages ship
- * incrementally (currently none — generated agents that reference these
- * names will fail at install time until Section 3 lands).
- *
- * Mirror: `loadToolMap()` in apps/cli/src/index.ts maps the same names to
- * RegisteredTool instances for `crewhaus run`. Keep both maps in sync.
- */
-/**
- * Section 14 — `initSymbol` is the name of an exported function in the
- * tool's package that takes a config blob and registers it for the tool
- * to read at execute time (e.g. `registerFetchConfig({ allowed_origins })`).
- * Codegen emits the call before `defaultCatalog.register(...)` when the
- * IR's `toolConfigs` map has a value for the tool.
+ * A builtin tool's wiring: the package that exports it, the export, and the
+ * optional `tool_config` registrar the bundle calls before registering it.
  */
 type BuiltinToolEntry = {
   readonly package: string;
@@ -89,604 +85,34 @@ type BuiltinToolEntry = {
   readonly initSymbol?: string;
 };
 
-export const BUILTIN_TOOL_MAP: Record<string, BuiltinToolEntry> = {
-  read: { package: "@crewhaus/tool-fs", export: "read" },
-  write: { package: "@crewhaus/tool-fs", export: "write" },
-  edit: { package: "@crewhaus/tool-fs", export: "edit" },
-  glob: { package: "@crewhaus/tool-fs", export: "glob" },
-  grep: { package: "@crewhaus/tool-fs", export: "grep" },
-  bash: { package: "@crewhaus/tool-bash", export: "bash" },
-  // Background-shell companions to `bash` (Claude-Code-style long-running
-  // tasks): poll a detached command's output / stop it. Opt-in like any tool.
-  bashOutput: { package: "@crewhaus/tool-bash", export: "bashOutput" },
-  killShell: { package: "@crewhaus/tool-bash", export: "killShell" },
-  todoWrite: { package: "@crewhaus/tool-todo", export: "todoWrite" },
-  webFetch: {
-    package: "@crewhaus/tool-web",
-    export: "webFetch",
-    initSymbol: "registerWebFetchConfig",
-  },
-  webSearch: { package: "@crewhaus/tool-web", export: "webSearch" },
-  readImage: { package: "@crewhaus/tool-image", export: "readImage" },
-  fetch: {
-    package: "@crewhaus/tool-fetch",
-    export: "fetch",
-    initSymbol: "registerFetchConfig",
-  },
-  python: {
-    package: "@crewhaus/tool-code-execution",
-    export: "python",
-    initSymbol: "registerCodeExecutionConfig",
-  },
-  javascript: {
-    package: "@crewhaus/tool-code-execution",
-    export: "javascript",
-    initSymbol: "registerCodeExecutionConfig",
-  },
-  shell: {
-    package: "@crewhaus/tool-code-execution",
-    export: "shell",
-    initSymbol: "registerCodeExecutionConfig",
-  },
-  // M4.1 — image generation (DALL-E / Replicate / mock for offline).
-  imageGenerate: {
-    package: "@crewhaus/tool-image-generation",
-    export: "imageGenerate",
-    initSymbol: "registerImageGenerationConfig",
-  },
-  // M4.3 — document ingest (txt/md/csv/json out of the box; PDF/docx
-  // via operator-registered parsers).
-  ingestDocument: {
-    package: "@crewhaus/tool-document-ingest",
-    export: "ingestDocument",
-  },
-  // Pillar 2 — AST-aware code intelligence (recipe 54).
-  compactLog: { package: "@crewhaus/tool-text", export: "compactLog" },
-  countTokens: { package: "@crewhaus/tool-text", export: "countTokens" },
-  escapeString: { package: "@crewhaus/tool-text", export: "escapeString" },
-  extractEntities: { package: "@crewhaus/tool-text", export: "extractEntities" },
-  extractKeywords: { package: "@crewhaus/tool-text", export: "extractKeywords" },
-  fuzzyMatch: { package: "@crewhaus/tool-text", export: "fuzzyMatch" },
-  glossaryReplace: { package: "@crewhaus/tool-text", export: "glossaryReplace" },
-  markdownOutline: { package: "@crewhaus/tool-text", export: "markdownOutline" },
-  markdownTable: { package: "@crewhaus/tool-text", export: "markdownTable" },
-  normalizeText: { package: "@crewhaus/tool-text", export: "normalizeText" },
-  regexExtract: { package: "@crewhaus/tool-text", export: "regexExtract" },
-  renderTemplate: { package: "@crewhaus/tool-text", export: "renderTemplate" },
-  ruleClassify: { package: "@crewhaus/tool-text", export: "ruleClassify" },
-  sortLines: { package: "@crewhaus/tool-text", export: "sortLines" },
-  textDiff: { package: "@crewhaus/tool-text", export: "textDiff" },
-  textSimilarity: { package: "@crewhaus/tool-text", export: "textSimilarity" },
-  truncateToBudget: { package: "@crewhaus/tool-text", export: "truncateToBudget" },
-  wrapText: { package: "@crewhaus/tool-text", export: "wrapText" },
-  jsonQuery: { package: "@crewhaus/tool-data", export: "jsonQuery" },
-  jsonPatch: { package: "@crewhaus/tool-data", export: "jsonPatch" },
-  jsonMergePatch: { package: "@crewhaus/tool-data", export: "jsonMergePatch" },
-  jsonFormat: { package: "@crewhaus/tool-data", export: "jsonFormat" },
-  dataDiff: { package: "@crewhaus/tool-data", export: "dataDiff" },
-  dataConvert: { package: "@crewhaus/tool-data", export: "dataConvert" },
-  csvParse: { package: "@crewhaus/tool-data", export: "csvParse" },
-  csvWrite: { package: "@crewhaus/tool-data", export: "csvWrite" },
-  tableQuery: { package: "@crewhaus/tool-data", export: "tableQuery" },
-  tableAggregate: { package: "@crewhaus/tool-data", export: "tableAggregate" },
-  tableJoin: { package: "@crewhaus/tool-data", export: "tableJoin" },
-  recordsToColumns: { package: "@crewhaus/tool-data", export: "recordsToColumns" },
-  columnsToRecords: { package: "@crewhaus/tool-data", export: "columnsToRecords" },
-  flattenObject: { package: "@crewhaus/tool-data", export: "flattenObject" },
-  unflattenObject: { package: "@crewhaus/tool-data", export: "unflattenObject" },
-  jsonlParse: { package: "@crewhaus/tool-data", export: "jsonlParse" },
-  jsonlWrite: { package: "@crewhaus/tool-data", export: "jsonlWrite" },
-  xmlParse: { package: "@crewhaus/tool-data", export: "xmlParse" },
-  sortRecords: { package: "@crewhaus/tool-data", export: "sortRecords" },
-  dedupeRecords: { package: "@crewhaus/tool-data", export: "dedupeRecords" },
-  sampleRecords: { package: "@crewhaus/tool-data", export: "sampleRecords" },
-  dataShape: { package: "@crewhaus/tool-data", export: "dataShape" },
-  jsonSortKeys: { package: "@crewhaus/tool-data", export: "jsonSortKeys" },
-  hash: { package: "@crewhaus/tool-encode", export: "hash" },
-  hmac: { package: "@crewhaus/tool-encode", export: "hmac" },
-  checksum: { package: "@crewhaus/tool-encode", export: "checksum" },
-  hexEncode: { package: "@crewhaus/tool-encode", export: "hexEncode" },
-  hexDecode: { package: "@crewhaus/tool-encode", export: "hexDecode" },
-  urlEncode: { package: "@crewhaus/tool-encode", export: "urlEncode" },
-  urlDecode: { package: "@crewhaus/tool-encode", export: "urlDecode" },
-  urlParse: { package: "@crewhaus/tool-encode", export: "urlParse" },
-  urlBuild: { package: "@crewhaus/tool-encode", export: "urlBuild" },
-  urlNormalize: { package: "@crewhaus/tool-encode", export: "urlNormalize" },
-  uuid: { package: "@crewhaus/tool-encode", export: "uuid" },
-  ulid: { package: "@crewhaus/tool-encode", export: "ulid" },
-  nanoId: { package: "@crewhaus/tool-encode", export: "nanoId" },
-  slugify: { package: "@crewhaus/tool-encode", export: "slugify" },
-  jwtDecode: { package: "@crewhaus/tool-encode", export: "jwtDecode" },
-  jwtVerify: { package: "@crewhaus/tool-encode", export: "jwtVerify" },
-  dateParse: { package: "@crewhaus/tool-datetime", export: "dateParse" },
-  dateFormat: { package: "@crewhaus/tool-datetime", export: "dateFormat" },
-  dateConvertTimezone: { package: "@crewhaus/tool-datetime", export: "dateConvertTimezone" },
-  dateAdd: { package: "@crewhaus/tool-datetime", export: "dateAdd" },
-  dateDiff: { package: "@crewhaus/tool-datetime", export: "dateDiff" },
-  durationParse: { package: "@crewhaus/tool-datetime", export: "durationParse" },
-  durationFormat: { package: "@crewhaus/tool-datetime", export: "durationFormat" },
-  businessDays: { package: "@crewhaus/tool-datetime", export: "businessDays" },
-  dateRange: { package: "@crewhaus/tool-datetime", export: "dateRange" },
-  cronNext: { package: "@crewhaus/tool-datetime", export: "cronNext" },
-  cronDescribe: { package: "@crewhaus/tool-datetime", export: "cronDescribe" },
-  recurrenceExpand: { package: "@crewhaus/tool-datetime", export: "recurrenceExpand" },
-  weekOfYear: { package: "@crewhaus/tool-datetime", export: "weekOfYear" },
-  dayOfYear: { package: "@crewhaus/tool-datetime", export: "dayOfYear" },
-  isLeapYear: { package: "@crewhaus/tool-datetime", export: "isLeapYear" },
-  quarterOf: { package: "@crewhaus/tool-datetime", export: "quarterOf" },
-  timestampConvert: { package: "@crewhaus/tool-datetime", export: "timestampConvert" },
-  jsonSchemaValidate: { package: "@crewhaus/tool-schema", export: "jsonSchemaValidate" },
-  jsonSchemaInfer: { package: "@crewhaus/tool-schema", export: "jsonSchemaInfer" },
-  validateRecords: { package: "@crewhaus/tool-schema", export: "validateRecords" },
-  assert: { package: "@crewhaus/tool-schema", export: "assert" },
-  compareGolden: { package: "@crewhaus/tool-schema", export: "compareGolden" },
-  deepEqual: { package: "@crewhaus/tool-schema", export: "deepEqual" },
-  matchSubset: { package: "@crewhaus/tool-schema", export: "matchSubset" },
-  checkRequiredFields: { package: "@crewhaus/tool-schema", export: "checkRequiredFields" },
-  validateEnum: { package: "@crewhaus/tool-schema", export: "validateEnum" },
-  validateFormat: { package: "@crewhaus/tool-schema", export: "validateFormat" },
-  validateUniqueKeys: { package: "@crewhaus/tool-schema", export: "validateUniqueKeys" },
-  validateReferences: { package: "@crewhaus/tool-schema", export: "validateReferences" },
-  schemaDiff: { package: "@crewhaus/tool-schema", export: "schemaDiff" },
-  schemaSummarize: { package: "@crewhaus/tool-schema", export: "schemaSummarize" },
-  gitStatus: { package: "@crewhaus/tool-git", export: "gitStatus" },
-  gitDiff: { package: "@crewhaus/tool-git", export: "gitDiff" },
-  gitLog: { package: "@crewhaus/tool-git", export: "gitLog" },
-  gitShow: { package: "@crewhaus/tool-git", export: "gitShow" },
-  gitBlame: { package: "@crewhaus/tool-git", export: "gitBlame" },
-  gitBranchList: { package: "@crewhaus/tool-git", export: "gitBranchList" },
-  gitTagList: { package: "@crewhaus/tool-git", export: "gitTagList" },
-  gitRemoteList: { package: "@crewhaus/tool-git", export: "gitRemoteList" },
-  gitMergeBase: { package: "@crewhaus/tool-git", export: "gitMergeBase" },
-  gitRevParse: { package: "@crewhaus/tool-git", export: "gitRevParse" },
-  gitFileHistory: { package: "@crewhaus/tool-git", export: "gitFileHistory" },
-  gitStashList: { package: "@crewhaus/tool-git", export: "gitStashList" },
-  gitConflicts: { package: "@crewhaus/tool-git", export: "gitConflicts" },
-  gitWorktreeList: { package: "@crewhaus/tool-git", export: "gitWorktreeList" },
-  gitAdd: { package: "@crewhaus/tool-git", export: "gitAdd" },
-  gitCommit: { package: "@crewhaus/tool-git", export: "gitCommit" },
-  gitSwitch: { package: "@crewhaus/tool-git", export: "gitSwitch" },
-  gitBranchCreate: { package: "@crewhaus/tool-git", export: "gitBranchCreate" },
-  gitBranchDelete: { package: "@crewhaus/tool-git", export: "gitBranchDelete" },
-  gitStashPush: { package: "@crewhaus/tool-git", export: "gitStashPush" },
-  gitStashPop: { package: "@crewhaus/tool-git", export: "gitStashPop" },
-  gitTagCreate: { package: "@crewhaus/tool-git", export: "gitTagCreate" },
-  gitApplyPatch: { package: "@crewhaus/tool-git", export: "gitApplyPatch" },
-  gitCherryPick: { package: "@crewhaus/tool-git", export: "gitCherryPick" },
-  gitResetPaths: { package: "@crewhaus/tool-git", export: "gitResetPaths" },
-  gitWorktreeAdd: { package: "@crewhaus/tool-git", export: "gitWorktreeAdd" },
-  gitWorktreeRemove: { package: "@crewhaus/tool-git", export: "gitWorktreeRemove" },
-  stat: { package: "@crewhaus/tool-fsx", export: "stat" },
-  fileHash: { package: "@crewhaus/tool-fsx", export: "fileHash" },
-  tree: { package: "@crewhaus/tool-fsx", export: "tree" },
-  diskUsage: { package: "@crewhaus/tool-fsx", export: "diskUsage" },
-  findFiles: { package: "@crewhaus/tool-fsx", export: "findFiles" },
-  readLines: { package: "@crewhaus/tool-fsx", export: "readLines" },
-  tailFile: { package: "@crewhaus/tool-fsx", export: "tailFile" },
-  makeDirectory: { package: "@crewhaus/tool-fsx", export: "makeDirectory" },
-  touchFile: { package: "@crewhaus/tool-fsx", export: "touchFile" },
-  tempDir: { package: "@crewhaus/tool-fsx", export: "tempDir" },
-  copyPath: { package: "@crewhaus/tool-fsx", export: "copyPath" },
-  movePath: { package: "@crewhaus/tool-fsx", export: "movePath" },
-  removePath: { package: "@crewhaus/tool-fsx", export: "removePath" },
-  splitFile: { package: "@crewhaus/tool-fsx", export: "splitFile" },
-  concatFiles: { package: "@crewhaus/tool-fsx", export: "concatFiles" },
-  archiveList: { package: "@crewhaus/tool-fsx", export: "archiveList" },
-  archiveCreate: { package: "@crewhaus/tool-fsx", export: "archiveCreate" },
-  archiveExtract: { package: "@crewhaus/tool-fsx", export: "archiveExtract" },
-  frontmatterRead: { package: "@crewhaus/tool-fsx", export: "frontmatterRead" },
-  frontmatterWrite: { package: "@crewhaus/tool-fsx", export: "frontmatterWrite" },
-  notebookRead: { package: "@crewhaus/tool-fsx", export: "notebookRead" },
-  notebookEdit: { package: "@crewhaus/tool-fsx", export: "notebookEdit" },
-  runCommand: { package: "@crewhaus/tool-proc", export: "runCommand" },
-  runPipeline: { package: "@crewhaus/tool-proc", export: "runPipeline" },
-  retry: { package: "@crewhaus/tool-proc", export: "retry" },
-  processStart: { package: "@crewhaus/tool-proc", export: "processStart" },
-  processStatus: { package: "@crewhaus/tool-proc", export: "processStatus" },
-  processOutput: { package: "@crewhaus/tool-proc", export: "processOutput" },
-  processStop: { package: "@crewhaus/tool-proc", export: "processStop" },
-  processList: { package: "@crewhaus/tool-proc", export: "processList" },
-  waitForPort: { package: "@crewhaus/tool-proc", export: "waitForPort" },
-  waitForFile: { package: "@crewhaus/tool-proc", export: "waitForFile" },
-  waitForOutput: { package: "@crewhaus/tool-proc", export: "waitForOutput" },
-  commandExists: { package: "@crewhaus/tool-proc", export: "commandExists" },
-  envInspect: { package: "@crewhaus/tool-proc", export: "envInspect" },
-  base64Encode: { package: "@crewhaus/tool-encode", export: "base64Encode" },
-  base64Decode: { package: "@crewhaus/tool-encode", export: "base64Decode" },
-  httpRequest: { package: "@crewhaus/tool-http", export: "httpRequest" },
-  httpPaginate: { package: "@crewhaus/tool-http", export: "httpPaginate" },
-  graphqlQuery: { package: "@crewhaus/tool-http", export: "graphqlQuery" },
-  httpBatch: { package: "@crewhaus/tool-http", export: "httpBatch" },
-  downloadFile: { package: "@crewhaus/tool-http", export: "downloadFile" },
-  headRequest: { package: "@crewhaus/tool-http", export: "headRequest" },
-  urlReachable: { package: "@crewhaus/tool-http", export: "urlReachable" },
-  linkCheck: { package: "@crewhaus/tool-http", export: "linkCheck" },
-  httpWaitFor: { package: "@crewhaus/tool-http", export: "httpWaitFor" },
-  sseRead: { package: "@crewhaus/tool-http", export: "sseRead" },
-  webhookSign: { package: "@crewhaus/tool-http", export: "webhookSign" },
-  webhookVerify: { package: "@crewhaus/tool-http", export: "webhookVerify" },
-  dnsLookup: { package: "@crewhaus/tool-http", export: "dnsLookup" },
-  tlsInspect: { package: "@crewhaus/tool-http", export: "tlsInspect" },
-  robotsCheck: { package: "@crewhaus/tool-http", export: "robotsCheck" },
-  sitemapParse: { package: "@crewhaus/tool-http", export: "sitemapParse" },
-  feedParse: { package: "@crewhaus/tool-http", export: "feedParse" },
-  kvSet: { package: "@crewhaus/tool-state", export: "kvSet" },
-  kvGet: { package: "@crewhaus/tool-state", export: "kvGet" },
-  kvDelete: { package: "@crewhaus/tool-state", export: "kvDelete" },
-  kvList: { package: "@crewhaus/tool-state", export: "kvList" },
-  counterIncrement: { package: "@crewhaus/tool-state", export: "counterIncrement" },
-  counterGet: { package: "@crewhaus/tool-state", export: "counterGet" },
-  checkpointSave: { package: "@crewhaus/tool-state", export: "checkpointSave" },
-  checkpointLoad: { package: "@crewhaus/tool-state", export: "checkpointLoad" },
-  checkpointList: { package: "@crewhaus/tool-state", export: "checkpointList" },
-  journalAppend: { package: "@crewhaus/tool-state", export: "journalAppend" },
-  journalRead: { package: "@crewhaus/tool-state", export: "journalRead" },
-  blackboardPost: { package: "@crewhaus/tool-state", export: "blackboardPost" },
-  blackboardRead: { package: "@crewhaus/tool-state", export: "blackboardRead" },
-  noteWrite: { package: "@crewhaus/tool-state", export: "noteWrite" },
-  noteSearch: { package: "@crewhaus/tool-state", export: "noteSearch" },
-  indexBuild: { package: "@crewhaus/tool-state", export: "indexBuild" },
-  indexSearch: { package: "@crewhaus/tool-state", export: "indexSearch" },
-  stateExport: { package: "@crewhaus/tool-state", export: "stateExport" },
-  stateImport: { package: "@crewhaus/tool-state", export: "stateImport" },
-  dedupeMark: { package: "@crewhaus/tool-state", export: "dedupeMark" },
-  specValidate: { package: "@crewhaus/tool-crewhaus", export: "specValidate" },
-  specCompileCheck: { package: "@crewhaus/tool-crewhaus", export: "specCompileCheck" },
-  specSummarize: { package: "@crewhaus/tool-crewhaus", export: "specSummarize" },
-  specDiff: { package: "@crewhaus/tool-crewhaus", export: "specDiff" },
-  toolInventory: { package: "@crewhaus/tool-crewhaus", export: "toolInventory" },
-  permissionAudit: { package: "@crewhaus/tool-crewhaus", export: "permissionAudit" },
-  preflightRun: { package: "@crewhaus/tool-crewhaus", export: "preflightRun" },
-  harnessInventory: { package: "@crewhaus/tool-crewhaus", export: "harnessInventory" },
-  bundleFreshness: { package: "@crewhaus/tool-crewhaus", export: "bundleFreshness" },
-  auditVerify: { package: "@crewhaus/tool-crewhaus", export: "auditVerify" },
-  evalBaselineCompare: { package: "@crewhaus/tool-crewhaus", export: "evalBaselineCompare" },
-  sessionSummarize: { package: "@crewhaus/tool-crewhaus", export: "sessionSummarize" },
-  traceQuery: { package: "@crewhaus/tool-crewhaus", export: "traceQuery" },
-  costSummarize: { package: "@crewhaus/tool-crewhaus", export: "costSummarize" },
-  runTests: { package: "@crewhaus/tool-code", export: "runTests" },
-  testFailureSummary: { package: "@crewhaus/tool-code", export: "testFailureSummary" },
-  runBuild: { package: "@crewhaus/tool-code", export: "runBuild" },
-  typecheck: { package: "@crewhaus/tool-code", export: "typecheck" },
-  lint: { package: "@crewhaus/tool-code", export: "lint" },
-  format: { package: "@crewhaus/tool-code", export: "format" },
-  formatCheck: { package: "@crewhaus/tool-code", export: "formatCheck" },
-  diagnostics: { package: "@crewhaus/tool-code", export: "diagnostics" },
-  astQuery: { package: "@crewhaus/tool-code", export: "astQuery" },
-  symbolOutline: { package: "@crewhaus/tool-code", export: "symbolOutline" },
-  findReferences: { package: "@crewhaus/tool-code", export: "findReferences" },
-  importGraph: { package: "@crewhaus/tool-code", export: "importGraph" },
-  deadFileScan: { package: "@crewhaus/tool-code", export: "deadFileScan" },
-  todoScan: { package: "@crewhaus/tool-code", export: "todoScan" },
-  dependencyList: { package: "@crewhaus/tool-code", export: "dependencyList" },
-  dependencyOutdated: { package: "@crewhaus/tool-code", export: "dependencyOutdated" },
-  packageScripts: { package: "@crewhaus/tool-code", export: "packageScripts" },
-  workspacePackages: { package: "@crewhaus/tool-code", export: "workspacePackages" },
-  coverageSummary: { package: "@crewhaus/tool-code", export: "coverageSummary" },
-  stackTraceParse: { package: "@crewhaus/tool-code", export: "stackTraceParse" },
-  prList: { package: "@crewhaus/tool-codehost", export: "prList" },
-  prGet: { package: "@crewhaus/tool-codehost", export: "prGet" },
-  prFiles: { package: "@crewhaus/tool-codehost", export: "prFiles" },
-  prComments: { package: "@crewhaus/tool-codehost", export: "prComments" },
-  prReviews: { package: "@crewhaus/tool-codehost", export: "prReviews" },
-  issueList: { package: "@crewhaus/tool-codehost", export: "issueList" },
-  issueGet: { package: "@crewhaus/tool-codehost", export: "issueGet" },
-  checkRuns: { package: "@crewhaus/tool-codehost", export: "checkRuns" },
-  workflowRuns: { package: "@crewhaus/tool-codehost", export: "workflowRuns" },
-  workflowRunLogs: { package: "@crewhaus/tool-codehost", export: "workflowRunLogs" },
-  releaseList: { package: "@crewhaus/tool-codehost", export: "releaseList" },
-  releaseGet: { package: "@crewhaus/tool-codehost", export: "releaseGet" },
-  repoGet: { package: "@crewhaus/tool-codehost", export: "repoGet" },
-  compareRefs: { package: "@crewhaus/tool-codehost", export: "compareRefs" },
-  searchCode: { package: "@crewhaus/tool-codehost", export: "searchCode" },
-  searchIssues: { package: "@crewhaus/tool-codehost", export: "searchIssues" },
-  rateLimitStatus: { package: "@crewhaus/tool-codehost", export: "rateLimitStatus" },
-  prCreate: { package: "@crewhaus/tool-codehost", export: "prCreate" },
-  prUpdate: { package: "@crewhaus/tool-codehost", export: "prUpdate" },
-  prComment: { package: "@crewhaus/tool-codehost", export: "prComment" },
-  prReviewSubmit: { package: "@crewhaus/tool-codehost", export: "prReviewSubmit" },
-  issueCreate: { package: "@crewhaus/tool-codehost", export: "issueCreate" },
-  issueUpdate: { package: "@crewhaus/tool-codehost", export: "issueUpdate" },
-  issueComment: { package: "@crewhaus/tool-codehost", export: "issueComment" },
-  releaseCreate: { package: "@crewhaus/tool-codehost", export: "releaseCreate" },
-  workflowRunRerun: { package: "@crewhaus/tool-codehost", export: "workflowRunRerun" },
-  sqlQuery: { package: "@crewhaus/tool-sql", export: "sqlQuery" },
-  sqlExec: { package: "@crewhaus/tool-sql", export: "sqlExec" },
-  sqlTransaction: { package: "@crewhaus/tool-sql", export: "sqlTransaction" },
-  sqlExplain: { package: "@crewhaus/tool-sql", export: "sqlExplain" },
-  schemaList: { package: "@crewhaus/tool-sql", export: "schemaList" },
-  schemaDescribe: { package: "@crewhaus/tool-sql", export: "schemaDescribe" },
-  dbSchemaDiff: { package: "@crewhaus/tool-sql", export: "dbSchemaDiff" },
-  tableStats: { package: "@crewhaus/tool-sql", export: "tableStats" },
-  integrityCheck: { package: "@crewhaus/tool-sql", export: "integrityCheck" },
-  importCsv: { package: "@crewhaus/tool-sql", export: "importCsv" },
-  importJson: { package: "@crewhaus/tool-sql", export: "importJson" },
-  exportCsv: { package: "@crewhaus/tool-sql", export: "exportCsv" },
-  exportJson: { package: "@crewhaus/tool-sql", export: "exportJson" },
-  databaseBackup: { package: "@crewhaus/tool-sql", export: "databaseBackup" },
-  migrationStatus: { package: "@crewhaus/tool-sql", export: "migrationStatus" },
-  migrationApply: { package: "@crewhaus/tool-sql", export: "migrationApply" },
-  docxRead: { package: "@crewhaus/tool-docs", export: "docxRead" },
-  docxWrite: { package: "@crewhaus/tool-docs", export: "docxWrite" },
-  xlsxRead: { package: "@crewhaus/tool-docs", export: "xlsxRead" },
-  xlsxWrite: { package: "@crewhaus/tool-docs", export: "xlsxWrite" },
-  pptxRead: { package: "@crewhaus/tool-docs", export: "pptxRead" },
-  pdfInfo: { package: "@crewhaus/tool-docs", export: "pdfInfo" },
-  pdfText: { package: "@crewhaus/tool-docs", export: "pdfText" },
-  pdfSplit: { package: "@crewhaus/tool-docs", export: "pdfSplit" },
-  pdfMerge: { package: "@crewhaus/tool-docs", export: "pdfMerge" },
-  emlParse: { package: "@crewhaus/tool-docs", export: "emlParse" },
-  mboxSplit: { package: "@crewhaus/tool-docs", export: "mboxSplit" },
-  icsParse: { package: "@crewhaus/tool-docs", export: "icsParse" },
-  icsWrite: { package: "@crewhaus/tool-docs", export: "icsWrite" },
-  vcardParse: { package: "@crewhaus/tool-docs", export: "vcardParse" },
-  documentText: { package: "@crewhaus/tool-docs", export: "documentTextTool" },
-  documentDiff: { package: "@crewhaus/tool-docs", export: "documentDiff" },
-  piiScan: { package: "@crewhaus/tool-secure", export: "piiScan" },
-  piiRedact: { package: "@crewhaus/tool-secure", export: "piiRedact" },
-  pseudonymize: { package: "@crewhaus/tool-secure", export: "pseudonymize" },
-  depseudonymize: { package: "@crewhaus/tool-secure", export: "depseudonymize" },
-  secretScan: { package: "@crewhaus/tool-secure", export: "secretScan" },
-  entropyScore: { package: "@crewhaus/tool-secure", export: "entropyScore" },
-  promptInjectionScan: { package: "@crewhaus/tool-secure", export: "promptInjectionScan" },
-  invisibleCharScan: { package: "@crewhaus/tool-secure", export: "invisibleCharScan" },
-  homoglyphNormalize: { package: "@crewhaus/tool-secure", export: "homoglyphNormalize" },
-  urlSafetyCheck: { package: "@crewhaus/tool-secure", export: "urlSafetyCheck" },
-  allowlistCheck: { package: "@crewhaus/tool-secure", export: "allowlistCheck" },
-  contentPolicyCheck: { package: "@crewhaus/tool-secure", export: "contentPolicyCheck" },
-  hashChainVerify: { package: "@crewhaus/tool-secure", export: "hashChainVerify" },
-  signPayload: { package: "@crewhaus/tool-secure", export: "signPayload" },
-  verifyPayload: { package: "@crewhaus/tool-secure", export: "verifyPayload" },
-  redactForExport: { package: "@crewhaus/tool-secure", export: "redactForExport" },
-  evaluate: { package: "@crewhaus/tool-math", export: "evaluate" },
-  statistics: { package: "@crewhaus/tool-math", export: "statistics" },
-  percentile: { package: "@crewhaus/tool-math", export: "percentile" },
-  correlation: { package: "@crewhaus/tool-math", export: "correlation" },
-  linearRegression: { package: "@crewhaus/tool-math", export: "linearRegressionTool" },
-  histogram: { package: "@crewhaus/tool-math", export: "histogram" },
-  outliers: { package: "@crewhaus/tool-math", export: "outliers" },
-  moneyAdd: { package: "@crewhaus/tool-math", export: "moneyAdd" },
-  moneyMultiply: { package: "@crewhaus/tool-math", export: "moneyMultiplyTool" },
-  moneyAllocate: { package: "@crewhaus/tool-math", export: "moneyAllocateTool" },
-  currencyConvert: { package: "@crewhaus/tool-math", export: "currencyConvert" },
-  unitConvert: { package: "@crewhaus/tool-math", export: "unitConvert" },
-  round: { package: "@crewhaus/tool-math", export: "round" },
-  numberFormat: { package: "@crewhaus/tool-math", export: "numberFormat" },
-  numberParse: { package: "@crewhaus/tool-math", export: "numberParse" },
-  percent: { package: "@crewhaus/tool-math", export: "percent" },
-  amortize: { package: "@crewhaus/tool-math", export: "amortize" },
-  npv: { package: "@crewhaus/tool-math", export: "npv" },
-  irr: { package: "@crewhaus/tool-math", export: "irr" },
-  geoDistance: { package: "@crewhaus/tool-math", export: "geoDistance" },
-  geoBoundingBox: { package: "@crewhaus/tool-math", export: "geoBoundingBox" },
-  geoPointInPolygon: { package: "@crewhaus/tool-math", export: "geoPointInPolygon" },
-  chatPost: { package: "@crewhaus/tool-notify", export: "chatPost" },
-  chatUpdate: { package: "@crewhaus/tool-notify", export: "chatUpdate" },
-  chatDelete: { package: "@crewhaus/tool-notify", export: "chatDelete" },
-  chatReact: { package: "@crewhaus/tool-notify", export: "chatReact" },
-  emailCompose: { package: "@crewhaus/tool-notify", export: "emailCompose" },
-  emailSend: { package: "@crewhaus/tool-notify", export: "emailSend" },
-  webhookPost: { package: "@crewhaus/tool-notify", export: "webhookPost" },
-  smsSend: { package: "@crewhaus/tool-notify", export: "smsSend" },
-  pushNotify: { package: "@crewhaus/tool-notify", export: "pushNotify" },
-  deliveryCheck: { package: "@crewhaus/tool-notify", export: "deliveryCheck" },
-  notifyDigest: { package: "@crewhaus/tool-notify", export: "notifyDigest" },
-  quietHours: { package: "@crewhaus/tool-notify", export: "quietHours" },
-  rateLimitGate: { package: "@crewhaus/tool-notify", export: "rateLimitGate" },
-  messageTemplate: { package: "@crewhaus/tool-notify", export: "messageTemplate" },
-  eventQuery: { package: "@crewhaus/tool-obs", export: "eventQuery" },
-  eventCounts: { package: "@crewhaus/tool-obs", export: "eventCounts" },
-  toolCallStats: { package: "@crewhaus/tool-obs", export: "toolCallStats" },
-  errorCluster: { package: "@crewhaus/tool-obs", export: "errorCluster" },
-  runTimeline: { package: "@crewhaus/tool-obs", export: "runTimeline" },
-  costReport: { package: "@crewhaus/tool-obs", export: "costReport" },
-  budgetCheck: { package: "@crewhaus/tool-obs", export: "budgetCheck" },
-  sloEvaluate: { package: "@crewhaus/tool-obs", export: "sloEvaluate" },
-  incidentBundle: { package: "@crewhaus/tool-obs", export: "incidentBundle" },
-  metricsQuery: { package: "@crewhaus/tool-obs", export: "metricsQuery" },
-  logsQuery: { package: "@crewhaus/tool-obs", export: "logsQuery" },
-  alertList: { package: "@crewhaus/tool-obs", export: "alertList" },
-  alertAck: { package: "@crewhaus/tool-obs", export: "alertAck" },
-  statusPagePost: { package: "@crewhaus/tool-obs", export: "statusPagePost" },
-  healthProbe: { package: "@crewhaus/tool-obs", export: "healthProbe" },
-  imageInfo: { package: "@crewhaus/tool-media", export: "imageInfo" },
-  imageKind: { package: "@crewhaus/tool-media", export: "imageKind" },
-  pngRead: { package: "@crewhaus/tool-media", export: "pngRead" },
-  pngWrite: { package: "@crewhaus/tool-media", export: "pngWrite" },
-  imageResize: { package: "@crewhaus/tool-media", export: "imageResize" },
-  imageCrop: { package: "@crewhaus/tool-media", export: "imageCrop" },
-  imageDiff: { package: "@crewhaus/tool-media", export: "imageDiff" },
-  exifRead: { package: "@crewhaus/tool-media", export: "exifRead" },
-  exifStrip: { package: "@crewhaus/tool-media", export: "exifStrip" },
-  qrEncode: { package: "@crewhaus/tool-media", export: "qrEncode" },
-  barcodeEncode: { package: "@crewhaus/tool-media", export: "barcodeEncode" },
-  chartRender: { package: "@crewhaus/tool-media", export: "chartRender" },
-  sparklineRender: { package: "@crewhaus/tool-media", export: "sparklineRender" },
-  diagramRender: { package: "@crewhaus/tool-media", export: "diagramRender" },
-  colorConvert: { package: "@crewhaus/tool-media", export: "colorConvert" },
-  colorContrast: { package: "@crewhaus/tool-media", export: "colorContrast" },
-  subtitleParse: { package: "@crewhaus/tool-media", export: "subtitleParse" },
-  subtitleWrite: { package: "@crewhaus/tool-media", export: "subtitleWrite" },
-  mediaProbe: { package: "@crewhaus/tool-media", export: "mediaProbe" },
-  branch: { package: "@crewhaus/tool-flow", export: "branch" },
-  consensusVote: { package: "@crewhaus/tool-flow", export: "consensusVote" },
-  deadlineCheck: { package: "@crewhaus/tool-flow", export: "deadlineCheck" },
-  decisionTable: { package: "@crewhaus/tool-flow", export: "decisionTable" },
-  errorClassify: { package: "@crewhaus/tool-flow", export: "errorClassify" },
-  ruleScore: { package: "@crewhaus/tool-flow", export: "ruleScore" },
-  stallDetect: { package: "@crewhaus/tool-flow", export: "stallDetect" },
-  licenseAggregate: { package: "@crewhaus/tool-pkg", export: "licenseAggregate" },
-  lockfileDiff: { package: "@crewhaus/tool-pkg", export: "lockfileDiff" },
-  packagePublishPreflight: { package: "@crewhaus/tool-pkg", export: "packagePublishPreflight" },
-  packageTarballInspect: { package: "@crewhaus/tool-pkg", export: "packageTarballInspect" },
-  semverResolve: { package: "@crewhaus/tool-pkg", export: "semverResolve" },
-  costBasisCompute: { package: "@crewhaus/tool-money", export: "costBasisCompute" },
-  glCodeSuggest: { package: "@crewhaus/tool-money", export: "glCodeSuggest" },
-  paymentIdentifierValidate: {
-    package: "@crewhaus/tool-money",
-    export: "paymentIdentifierValidate",
-  },
-  purchaseOrderMatch: { package: "@crewhaus/tool-money", export: "purchaseOrderMatch" },
-  refundAbuseCheck: { package: "@crewhaus/tool-money", export: "refundAbuseCheck" },
-  refundAmountCompute: { package: "@crewhaus/tool-money", export: "refundAmountCompute" },
-  spendLimitCheck: { package: "@crewhaus/tool-money", export: "spendLimitCheck" },
-  statementParse: { package: "@crewhaus/tool-money", export: "statementParse" },
-  taxCalculate: { package: "@crewhaus/tool-money", export: "taxCalculate" },
-  webhookSignatureVerify: { package: "@crewhaus/tool-money", export: "webhookSignatureVerify" },
-  abiDecode: { package: "@crewhaus/tool-onchain", export: "abiDecode" },
-  abiEncodeCall: { package: "@crewhaus/tool-onchain", export: "abiEncodeCall" },
-  addressCheck: { package: "@crewhaus/tool-onchain", export: "addressCheck" },
-  defiMath: { package: "@crewhaus/tool-onchain", export: "defiMath" },
-  functionSelector: { package: "@crewhaus/tool-onchain", export: "functionSelector" },
-  typedDataHash: { package: "@crewhaus/tool-onchain", export: "typedDataHash" },
-  tokenUnits: { package: "@crewhaus/tool-onchain", export: "tokenUnits" },
-  htmlForms: { package: "@crewhaus/tool-html", export: "htmlForms" },
-  htmlLinks: { package: "@crewhaus/tool-html", export: "htmlLinks" },
-  htmlQuery: { package: "@crewhaus/tool-html", export: "htmlQuery" },
-  htmlRecords: { package: "@crewhaus/tool-html", export: "htmlRecords" },
-  htmlStructuredData: { package: "@crewhaus/tool-html", export: "htmlStructuredData" },
-  htmlTable: { package: "@crewhaus/tool-html", export: "htmlTable" },
-  htmlText: { package: "@crewhaus/tool-html", export: "htmlText" },
-  acceptanceCheck: { package: "@crewhaus/tool-verify", export: "acceptanceCheck" },
-  checksumVerify: { package: "@crewhaus/tool-verify", export: "checksumVerify" },
-  citationLint: { package: "@crewhaus/tool-verify", export: "citationLint" },
-  goldenCompare: { package: "@crewhaus/tool-verify", export: "goldenCompare" },
-  goldenUpdate: { package: "@crewhaus/tool-verify", export: "goldenUpdate" },
-  markdownLinkCheck: { package: "@crewhaus/tool-verify", export: "markdownLinkCheck" },
-  contactNormalize: { package: "@crewhaus/tool-table", export: "contactNormalize" },
-  fixedWidthParse: { package: "@crewhaus/tool-table", export: "fixedWidthParse" },
-  recordLinkage: { package: "@crewhaus/tool-table", export: "recordLinkage" },
-  tableDiff: { package: "@crewhaus/tool-table", export: "tableDiff" },
-  tableProfile: { package: "@crewhaus/tool-table", export: "tableProfile" },
-  tableReshape: { package: "@crewhaus/tool-table", export: "tableReshape" },
-  tableShard: { package: "@crewhaus/tool-table", export: "tableShard" },
-  diffParse: { package: "@crewhaus/tool-text", export: "diffParse" },
-  diffLint: { package: "@crewhaus/tool-changeset", export: "diffLint" },
-  docsSymbolCheck: { package: "@crewhaus/tool-changeset", export: "docsSymbolCheck" },
-  bundleSizeCheck: { package: "@crewhaus/tool-buildperf", export: "bundleSizeCheck" },
-  benchmarkCompare: { package: "@crewhaus/tool-buildperf", export: "benchmarkCompare" },
-  flakyTestDetect: { package: "@crewhaus/tool-buildperf", export: "flakyTestDetect" },
-  registryPackageInfo: { package: "@crewhaus/tool-registry", export: "registryPackageInfo" },
-  registrySearch: { package: "@crewhaus/tool-registry", export: "registrySearch" },
-  registryOutdated: { package: "@crewhaus/tool-registry", export: "registryOutdated" },
-  manifestDependencySet: { package: "@crewhaus/tool-registry", export: "manifestDependencySet" },
-  dependencyAudit: { package: "@crewhaus/tool-supplychain", export: "dependencyAudit" },
-  ciWorkflowAudit: { package: "@crewhaus/tool-supplychain", export: "ciWorkflowAudit" },
-  containerImageInspect: { package: "@crewhaus/tool-containers", export: "containerImageInspect" },
-  containerImageTags: { package: "@crewhaus/tool-containers", export: "containerImageTags" },
-  dataDriftCheck: { package: "@crewhaus/tool-table", export: "dataDriftCheck" },
-  evmGetBlock: { package: "@crewhaus/tool-chainread", export: "evmGetBlock" },
-  evmBlockAtTimestamp: { package: "@crewhaus/tool-chainread", export: "evmBlockAtTimestamp" },
-  evmRpcHealth: { package: "@crewhaus/tool-chainread", export: "evmRpcHealth" },
-  evmNonceStatus: { package: "@crewhaus/tool-chainread", export: "evmNonceStatus" },
-  evmWaitForReceipt: { package: "@crewhaus/tool-chainread", export: "evmWaitForReceipt" },
-  evmTransactionSummary: { package: "@crewhaus/tool-chainread", export: "evmTransactionSummary" },
-  evmEventScan: { package: "@crewhaus/tool-chainread", export: "evmEventScan" },
-  evmMulticall: { package: "@crewhaus/tool-chaincall", export: "evmMulticall" },
-  contractInspect: { package: "@crewhaus/tool-chaincall", export: "contractInspect" },
-  evmSimulateBundle: { package: "@crewhaus/tool-chaincall", export: "evmSimulateBundle" },
-  gasMarketRead: { package: "@crewhaus/tool-chaincall", export: "gasMarketRead" },
-  tokenResolve: { package: "@crewhaus/tool-token", export: "tokenResolve" },
-  erc20Balance: { package: "@crewhaus/tool-token", export: "erc20Balance" },
-  erc721TokenInfo: { package: "@crewhaus/tool-token", export: "erc721TokenInfo" },
-  priceQuote: { package: "@crewhaus/tool-defi", export: "priceQuote" },
-  oraclePriceRead: { package: "@crewhaus/tool-defi", export: "oraclePriceRead" },
-  defiPositionRead: { package: "@crewhaus/tool-defi", export: "defiPositionRead" },
-  portfolioValuation: { package: "@crewhaus/tool-defi", export: "portfolioValuation" },
-  ledgerPost: { package: "@crewhaus/tool-ledger", export: "ledgerPost" },
-  ledgerQuery: { package: "@crewhaus/tool-ledger", export: "ledgerQuery" },
-  ledgerReconcile: { package: "@crewhaus/tool-ledger", export: "ledgerReconcile" },
-  invoiceRender: { package: "@crewhaus/tool-ledger", export: "invoiceRender" },
-  eInvoiceBuild: { package: "@crewhaus/tool-einvoice", export: "eInvoiceBuild" },
-  eInvoiceParse: { package: "@crewhaus/tool-einvoice", export: "eInvoiceParse" },
-  paymentFileBuild: { package: "@crewhaus/tool-einvoice", export: "paymentFileBuild" },
-  vatIdValidate: { package: "@crewhaus/tool-kyc", export: "vatIdValidate" },
-  entityRegistryLookup: { package: "@crewhaus/tool-kyc", export: "entityRegistryLookup" },
-  sanctionsScreen: { package: "@crewhaus/tool-kyc", export: "sanctionsScreen" },
-  objectPresign: { package: "@crewhaus/tool-objectstore", export: "objectPresign" },
-  systemInfo: { package: "@crewhaus/tool-host", export: "systemInfo" },
-  networkInfo: { package: "@crewhaus/tool-host", export: "networkInfo" },
-  portInspect: { package: "@crewhaus/tool-host", export: "portInspect" },
-  secretLookup: { package: "@crewhaus/tool-secrets", export: "secretLookup" },
-  envFileUpsert: { package: "@crewhaus/tool-secrets", export: "envFileUpsert" },
-  secretRotate: { package: "@crewhaus/tool-secrets", export: "secretRotate" },
-  watchPath: { package: "@crewhaus/tool-hostfs", export: "watchPath" },
-  trashPath: { package: "@crewhaus/tool-hostfs", export: "trashPath" },
-  osIndexSearch: { package: "@crewhaus/tool-hostfs", export: "osIndexSearch" },
-  cronList: { package: "@crewhaus/tool-cron", export: "cronList" },
-  cronDelete: { package: "@crewhaus/tool-cron", export: "cronDelete" },
-  packageManifestGenerate: {
-    package: "@crewhaus/tool-distribution",
-    export: "packageManifestGenerate",
-  },
-  packageManifestVerify: {
-    package: "@crewhaus/tool-distribution",
-    export: "packageManifestVerify",
-  },
-  packageQuery: { package: "@crewhaus/tool-pkgmgr", export: "packageQuery" },
-  packageInstall: { package: "@crewhaus/tool-pkgmgr", export: "packageInstall" },
-  clipboardRead: { package: "@crewhaus/tool-desktop", export: "clipboardRead" },
-  clipboardWrite: { package: "@crewhaus/tool-desktop", export: "clipboardWrite" },
-  desktopNotify: { package: "@crewhaus/tool-desktop", export: "desktopNotify" },
-  openExternal: { package: "@crewhaus/tool-desktop", export: "openExternal" },
-  printDocument: { package: "@crewhaus/tool-desktop", export: "printDocument" },
-  windowList: { package: "@crewhaus/tool-desktop", export: "windowList" },
-  userPresence: { package: "@crewhaus/tool-desktop", export: "userPresence" },
-  powerAssertion: { package: "@crewhaus/tool-desktop", export: "powerAssertion" },
-  specPatchApply: { package: "@crewhaus/tool-specops", export: "specPatchApply" },
-  specUpgrade: { package: "@crewhaus/tool-specops", export: "specUpgrade" },
-  specAdvise: { package: "@crewhaus/tool-specops", export: "specAdvise" },
-  doctorFix: { package: "@crewhaus/tool-specops", export: "doctorFix" },
-  evalHistory: { package: "@crewhaus/tool-evalops", export: "evalHistory" },
-  evalAggregate: { package: "@crewhaus/tool-evalops", export: "evalAggregate" },
-  evalBaselinePin: { package: "@crewhaus/tool-evalops", export: "evalBaselinePin" },
-  evalCoverage: { package: "@crewhaus/tool-evalops", export: "evalCoverage" },
-  graderMetaTest: { package: "@crewhaus/tool-evalops", export: "graderMetaTest" },
-  datasetPut: { package: "@crewhaus/tool-dataset", export: "datasetPut" },
-  datasetInspect: { package: "@crewhaus/tool-dataset", export: "datasetInspect" },
-  datasetLint: { package: "@crewhaus/tool-dataset", export: "datasetLint" },
-  datasetMine: { package: "@crewhaus/tool-dataset", export: "datasetMine" },
-  approvalStatus: { package: "@crewhaus/tool-approvals", export: "approvalStatus" },
-  approvalsInbox: { package: "@crewhaus/tool-approvals", export: "approvalsInbox" },
-  permissionsSuggest: { package: "@crewhaus/tool-approvals", export: "permissionsSuggest" },
-  harnessRetire: { package: "@crewhaus/tool-lifecycle", export: "harnessRetire" },
-  storeMigrate: { package: "@crewhaus/tool-lifecycle", export: "storeMigrate" },
-  retentionEnforce: { package: "@crewhaus/tool-lifecycle", export: "retentionEnforce" },
-  knowledgeSync: { package: "@crewhaus/tool-lifecycle", export: "knowledgeSync" },
-  harnessRegister: { package: "@crewhaus/tool-fleet", export: "harnessRegister" },
-  harnessJobStatus: { package: "@crewhaus/tool-fleet", export: "harnessJobStatus" },
-  compileBundle: { package: "@crewhaus/tool-fleet", export: "compileBundle" },
-  cliVersionPin: { package: "@crewhaus/tool-fleet", export: "cliVersionPin" },
-  hooksManage: { package: "@crewhaus/tool-fleet", export: "hooksManage" },
-  specPin: { package: "@crewhaus/tool-deploy", export: "specPin" },
-  deployRollback: { package: "@crewhaus/tool-deploy", export: "deployRollback" },
-  deployInspect: { package: "@crewhaus/tool-deploy", export: "deployInspect" },
-  routeControl: { package: "@crewhaus/tool-routing", export: "routeControl" },
-  experimentLedger: { package: "@crewhaus/tool-routing", export: "experimentLedger" },
-  flywheelStatus: { package: "@crewhaus/tool-routing", export: "flywheelStatus" },
-  watchmeReport: { package: "@crewhaus/tool-routing", export: "watchmeReport" },
-  marketplaceSearch: { package: "@crewhaus/tool-discovery", export: "marketplaceSearch" },
-  federationDiscover: { package: "@crewhaus/tool-discovery", export: "federationDiscover" },
-  factCrossCheck: { package: "@crewhaus/tool-verify", export: "factCrossCheck" },
-  vectorDelete: { package: "@crewhaus/tool-state", export: "vectorDelete" },
-  emailSendPreflight: { package: "@crewhaus/tool-notify", export: "emailSendPreflight" },
-  deliverabilityCheck: { package: "@crewhaus/tool-notify", export: "deliverabilityCheck" },
-  emitTraceEvent: { package: "@crewhaus/tool-obs", export: "emitTraceEvent" },
-  localTime: { package: "@crewhaus/tool-datetime", export: "localTime" },
-  leadAssign: { package: "@crewhaus/tool-flow", export: "leadAssign" },
-  sequenceRun: { package: "@crewhaus/tool-flow", export: "sequenceRun" },
-  onchainTransactionsSync: {
-    package: "@crewhaus/tool-chainread",
-    export: "onchainTransactionsSync",
-  },
-  seoLint: { package: "@crewhaus/tool-verify", export: "seoLint" },
-  toolRegistry: { package: "@crewhaus/tool-capability", export: "toolRegistry" },
-  codegraphSearch: { package: "@crewhaus/tool-codegraph", export: "codegraphSearch" },
-  codegraphCallers: { package: "@crewhaus/tool-codegraph", export: "codegraphCallers" },
-  codegraphCallees: { package: "@crewhaus/tool-codegraph", export: "codegraphCallees" },
-  codegraphImpact: { package: "@crewhaus/tool-codegraph", export: "codegraphImpact" },
-};
+/**
+ * Every builtin the cli shape compiles, keyed by the spec key a `tools:` list
+ * names. Kept as an export for back-compat; it is a projection of
+ * `BUILTIN_TOOLS` in `@crewhaus/tool-categories`, the one table every shape
+ * reads, and is never edited here.
+ */
+export const BUILTIN_TOOL_MAP: Readonly<Record<string, BuiltinToolEntry>> = Object.freeze(
+  Object.fromEntries(
+    builtinToolsFor("cli").map((key): [string, BuiltinToolEntry] => {
+      const entry = BUILTIN_TOOLS[key] as BuiltinToolEntry;
+      return [
+        key,
+        {
+          package: entry.package,
+          export: entry.export,
+          ...(entry.initSymbol !== undefined ? { initSymbol: entry.initSymbol } : {}),
+        },
+      ];
+    }),
+  ),
+);
 
+/**
+ * The spec's `tools:` → the bundle's imports, `tool_config` registrations and
+ * `defaultCatalog.register(...)` lines, through the shared resolver every
+ * shape calls. A name the cli shape cannot compile throws `TargetEmitError`
+ * with the resolver's message.
+ */
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
@@ -694,48 +120,22 @@ function resolveTools(
   imports: string[];
   inits: string[];
   registrations: string[];
+  sandbox: boolean;
 } {
-  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [] };
-
-  // Group exports + inits by package for one grouped import per package.
-  const byPackage = new Map<string, Set<string>>();
-  const registrations: string[] = [];
-  const inits: string[] = [];
-  // Section 18 — when several tools share an `initSymbol` (e.g.
-  // python/javascript/shell all calling `registerCodeExecutionConfig`),
-  // emit the init exactly once. We honor a `tool_config.codeExecution`
-  // (or the first per-tool config we encounter) for the shared symbol.
-  const initEmitted = new Set<string>();
-  for (const name of toolNames) {
-    const entry = BUILTIN_TOOL_MAP[name];
-    if (!entry) {
-      const known = Object.keys(BUILTIN_TOOL_MAP).sort().join(", ");
-      throw new TargetEmitError(`unknown tool "${name}" — known tools: ${known}`);
-    }
-    const set = byPackage.get(entry.package) ?? new Set<string>();
-    set.add(entry.export);
-    byPackage.set(entry.package, set);
-    if (entry.initSymbol !== undefined) {
-      const cfg =
-        toolConfigs[name] ?? toolConfigs["codeExecution"] ?? toolConfigs["code_execution"];
-      if (cfg !== undefined && !initEmitted.has(entry.initSymbol)) {
-        set.add(entry.initSymbol);
-        inits.push(`${entry.initSymbol}(${JSON.stringify(cfg)});`);
-        initEmitted.add(entry.initSymbol);
-      } else if (cfg !== undefined) {
-        // ensure the symbol is imported even when init was emitted earlier
-        set.add(entry.initSymbol);
-      }
-    }
-    registrations.push(`defaultCatalog.register(${entry.export});`);
+  if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
+  let resolved: ResolvedTools;
+  try {
+    resolved = resolveBuiltinTools("cli", [{ tools: toolNames, toolConfigs }]);
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
+    throw err;
   }
-
-  const imports: string[] = [`import { defaultCatalog } from "@crewhaus/tool-catalog";`];
-  for (const pkg of [...byPackage.keys()].sort()) {
-    const symbols = [...(byPackage.get(pkg) ?? new Set<string>())].sort();
-    imports.push(`import { ${symbols.join(", ")} } from "${pkg}";`);
-  }
-  return { imports, inits, registrations };
+  return {
+    imports: [`import { defaultCatalog } from "@crewhaus/tool-catalog";`, ...resolved.imports],
+    inits: [...resolved.inits],
+    registrations: (resolved.sites[0] ?? []).map((id) => `defaultCatalog.register(${id});`),
+    sandbox: resolved.sandbox,
+  };
 }
 
 function renderPermissionsField(ir: IrV0): string {
@@ -1171,7 +571,12 @@ function renderPlugins(ir: IrV0): {
 }
 
 function renderAgent(ir: IrV0): string {
-  const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
+  const {
+    imports: builtinImports,
+    inits,
+    registrations,
+    sandbox: hasSandboxTools,
+  } = resolveTools(ir.tools, ir.toolConfigs);
   const mcp = renderMcpServers(ir);
   const subAgents = renderSubAgents(ir);
   // FR-006 — Pillar 3 sink-side egress matcher. Empty pieces for the
@@ -1283,12 +688,8 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // Section 18 — only flip `sandboxAvailable` on at runtime when the
   // operator has wired a real backend. Default (unset) treats docker as
   // available; `CREWHAUS_SANDBOX=noop` always denies the floor.
-  const hasSandboxTools = ir.tools.some(
-    (t) => t === "python" || t === "javascript" || t === "shell",
-  );
-  const sandboxField = hasSandboxTools
-    ? '\n  sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop"),'
-    : "";
+  // The resolver reports whether any registered tool runs model-written code.
+  const sandboxField = hasSandboxTools ? `\n  sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},` : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
   // Loop contract 0.4 (Batch A) — extended-thinking selector. The IR carries

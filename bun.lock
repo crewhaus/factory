@@ -1910,6 +1910,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
     },
     "packages/target-browser-driver": {
@@ -1920,6 +1921,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
     },
     "packages/target-cf-worker-cli": {
@@ -1975,6 +1977,7 @@
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/audit-log": "workspace:*",
@@ -2015,6 +2018,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/egress-matcher-semantic": "workspace:*",
@@ -2040,6 +2044,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
     },
     "packages/target-eval-bundle": {
@@ -2064,6 +2069,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
     },
     "packages/target-managed": {
@@ -2076,6 +2082,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
     },
     "packages/target-onchain": {
@@ -2115,6 +2122,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/memory-service": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
     },
     "packages/target-voice": {
@@ -2135,6 +2143,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-service": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
       "peerDependencies": {
         "@crewhaus/hooks-engine": "workspace:*",
