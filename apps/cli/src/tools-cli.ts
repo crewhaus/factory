@@ -29,7 +29,14 @@
 import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
 import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { builtinToolsFor, registeredToolName, toolConfigHint } from "@crewhaus/tool-categories";
+import {
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinToolsFor,
+  checkBuiltinTool,
+  registeredToolName,
+  toolConfigHint,
+} from "@crewhaus/tool-categories";
 
 // -------- tools list --------
 
@@ -1541,7 +1548,40 @@ export type ToolDetail = {
   readonly inputFields: ReadonlyArray<string>;
   /** What a spec writes to configure it (`tool_config.http`), when it takes any. */
   readonly configure?: string;
+  /**
+   * The shapes whose bundles run it — a shape that carries no tools at all
+   * (pipeline, voice, onchain) is never listed. Empty for a key the builtin
+   * table does not know.
+   */
+  readonly shapes: ReadonlyArray<ToolShape>;
 };
+
+/**
+ * The shapes that compile `key` into a bundle that runs it: the ones the
+ * compiler accepts it on, less the shapes that register no tools (which
+ * accept any list and ignore it).
+ */
+export function shapesRunning(key: string): ReadonlyArray<ToolShape> {
+  return (Object.keys(SHAPE_TOOL_PROFILES) as ToolShape[]).filter((shape) => {
+    if (SHAPE_TOOL_PROFILES[shape].runtime === "none") return false;
+    const kind = checkBuiltinTool(key, shape).kind;
+    return kind === "ok" || kind === "inert";
+  });
+}
+
+/** `tools show`'s "runs on" wording for a tool's shapes. */
+function shapesLine(shapes: ReadonlyArray<ToolShape>): string {
+  const host = (Object.keys(SHAPE_TOOL_PROFILES) as ToolShape[]).filter(
+    (s) => SHAPE_TOOL_PROFILES[s].runtime === "host",
+  );
+  const edge = shapes.includes("cf-worker");
+  if (host.every((s) => shapes.includes(s))) {
+    return edge
+      ? "every shape that runs tools, the cf-worker edge included"
+      : "every shape that runs tools, except the cf-worker edge";
+  }
+  return `${shapes.join(", ")} only`;
+}
 
 /**
  * Project one tool into its detail record. `key` is the camelCase spec key;
@@ -1570,6 +1610,7 @@ export function buildToolDetail(
     concurrencySafe: tool.concurrencySafe ?? false,
     inputFields: inputFieldNames(tool),
     ...(toolConfigHint(key) !== undefined ? { configure: toolConfigHint(key) } : {}),
+    shapes: shapesRunning(key),
   };
 }
 
@@ -1630,6 +1671,8 @@ export function formatToolDetailLines(d: ToolDetail): string[] {
     `  categories  ${d.categories.length > 0 ? d.categories.map((c) => `all-${c}`).join(", ") : "(uncategorized)"}`,
     `  input       ${d.inputFields.length > 0 ? d.inputFields.join(", ") : "(no declared fields)"}`,
     ...(d.configure !== undefined ? [`  configure   ${d.configure}`] : []),
+    // shape-reach#10 — say where it runs, rather than implying everywhere.
+    ...(d.shapes.length > 0 ? [`  runs on     ${shapesLine(d.shapes)}`] : []),
     "",
     `  enable with  tools: [${d.key}]`,
   ];

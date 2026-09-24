@@ -16,6 +16,7 @@ import {
   inputFieldNames,
   nearestToolKeys,
   searchTools,
+  shapesRunning,
 } from "./tools-cli";
 
 const FIXTURE_CATEGORIES = {
@@ -170,6 +171,54 @@ describe("formatToolDetailLines", () => {
 
   test("ends with a copy-pasteable enable line", () => {
     expect(text).toContain("tools: [fetchIt]");
+  });
+
+  test("a key the builtin table does not know says nothing about shapes", () => {
+    expect(text).not.toContain("runs on");
+  });
+});
+
+// shape-reach#10 — `tools show` printed "enable with tools: [x]" for every
+// tool, as if every shape ran it. It now says which shapes do.
+describe("tools show names the shapes that run a tool", () => {
+  const show = (key: string): string =>
+    formatToolDetailLines(
+      buildToolDetail(key, { [key]: TOOL_MAP.readIt as ToolLike }, catsFor) as NonNullable<
+        ReturnType<typeof buildToolDetail>
+      >,
+    ).join("\n");
+
+  test("a host-only tool runs on every shape that runs tools, but not on the edge", () => {
+    for (const key of ["gitStatus", "python", "jsonQuery"]) {
+      expect(show(key)).toContain(
+        "runs on     every shape that runs tools, except the cf-worker edge",
+      );
+    }
+  });
+
+  test("an edge-safe tool says the edge runs it too", () => {
+    expect(show("fetch")).toContain(
+      "runs on     every shape that runs tools, the cf-worker edge included",
+    );
+  });
+
+  test("the shapes listed are the ones the compiler accepts it on", () => {
+    // A shape with no tool catalog (pipeline, voice, onchain) is never listed.
+    expect(shapesRunning("jsonQuery")).toEqual([
+      "cli",
+      "workflow",
+      "channel",
+      "graph",
+      "managed",
+      "crew",
+      "research",
+      "batch",
+      "browser",
+      "eval",
+    ]);
+    expect(shapesRunning("evmCall")).toEqual(["workflow", "graph", "crew"]);
+    expect(show("evmCall")).toContain("runs on     workflow, graph, crew only");
+    expect(shapesRunning("nope")).toEqual([]);
   });
 });
 
