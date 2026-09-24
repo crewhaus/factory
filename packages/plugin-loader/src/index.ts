@@ -1,5 +1,5 @@
 import { createPublicKey, verify } from "node:crypto";
-import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join, resolve as resolvePath, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
@@ -14,11 +14,23 @@ import {
   type PluginTargetEmitter,
   type RegisteredTool,
   type ToolDefinition,
+  crewhausEngineProblem,
   entrypointDigest,
   manifestPayloadForSigning,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
 import { buildTool } from "@crewhaus/tool-builder";
+import { RUNTIME_TOOL_NAMES, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
+import type { ZodType as Zod4Type } from "zod/v4";
+import pkg from "../package.json" with { type: "json" };
+
+/**
+ * The crewhaus version a plugin's `engines.crewhaus` range is checked against:
+ * this package's own version, which the release train bumps in lockstep with
+ * every other crewhaus package. A static import, so a compiled bundle carries
+ * the version it was built from.
+ */
+export const PLUGIN_HOST_VERSION: string = typeof pkg.version === "string" ? pkg.version : "0.0.0";
 
 /**
  * Section 41 — `@crewhaus/plugin-loader`.
@@ -90,6 +102,11 @@ export type PluginLoaderOptions = {
    * verified signature under `allowUnsigned`. Defaults to stderr.
    */
   readonly warn?: (line: string) => void;
+  /**
+   * The crewhaus version a manifest's `engines.crewhaus` range must include.
+   * Defaults to {@link PLUGIN_HOST_VERSION}; tests pin it.
+   */
+  readonly hostVersion?: string;
   /**
    * Override for tests: load + parse a manifest file. Defaults to
    * reading via `Bun.file` + `JSON.parse`.
@@ -185,6 +202,28 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
   }
 
   const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const hostVersion = opts.hostVersion ?? PLUGIN_HOST_VERSION;
+
+  /** The error for an entrypoint that cannot be read or imported; `failed` says which. */
+  function entrypointError(
+    manifest: PluginManifest,
+    entrypointPath: string,
+    failed: string,
+    err: unknown,
+  ): PluginLoaderError {
+    if (!existsSync(entrypointPath)) {
+      // 0.7.x `crewhaus plugins install` writes the manifest only, so this is
+      // what an installed-but-never-supplied plugin looks like at boot.
+      return new PluginLoaderError(
+        `plugin "${manifest.name}" has no index.js next to its plugin.json: expected ${entrypointPath}. \`crewhaus plugins install\` delivers the manifest only; put the plugin's code there (its sha256 must equal the manifest's entrypointDigest when one is set).`,
+        err,
+      );
+    }
+    return new PluginLoaderError(
+      `${failed}: ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
 
   function verifySignature(manifest: PluginManifest): boolean {
     if (manifest.signature === undefined) {
@@ -260,6 +299,12 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
         );
       }
       const manifest = validatePluginManifest(raw);
+      // A plugin that says which crewhaus it runs on is held to it, before
+      // anything else about it is trusted or run.
+      const engineProblem = crewhausEngineProblem(manifest, hostVersion);
+      if (engineProblem !== undefined) {
+        throw new PluginLoaderError(`${engineProblem} — refusing to load it`);
+      }
       const signed = verifySignature(manifest);
 
       // Resolve the entrypoint. The convention is "the manifest sits
@@ -282,8 +327,10 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
         try {
           bytes = await readEntrypoint(entrypointPath);
         } catch (err) {
-          throw new PluginLoaderError(
-            `failed to read plugin entrypoint at ${entrypointPath} for digest check: ${err instanceof Error ? err.message : String(err)}`,
+          throw entrypointError(
+            manifest,
+            entrypointPath,
+            `failed to read plugin entrypoint at ${entrypointPath} for digest check`,
             err,
           );
         }
@@ -299,8 +346,10 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
       try {
         module = await importEntry(entrypointPath);
       } catch (err) {
-        throw new PluginLoaderError(
-          `failed to import plugin entrypoint at ${entrypointPath}: ${err instanceof Error ? err.message : String(err)}`,
+        throw entrypointError(
+          manifest,
+          entrypointPath,
+          `failed to import plugin entrypoint at ${entrypointPath}`,
           err,
         );
       }
@@ -535,7 +584,16 @@ export function createBootPluginRuntime(
     readonly homeDir?: string;
     readonly warn?: (line: string) => void;
   } = {},
-): { readonly registry: PluginRegistry; readonly loader: PluginLoader } {
+): {
+  readonly registry: PluginRegistry;
+  readonly loader: PluginLoader;
+  /**
+   * Where the boot's plugin warnings go (stderr by default). Spread into
+   * {@link activatePlugins} with the rest, so a plugin tool it leaves out is
+   * reported on every boot path without the host printing `warnings` itself.
+   */
+  readonly warn: (line: string) => void;
+} {
   const env = opts.env ?? process.env;
   const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
   const { anchors, problems } = loadTrustAnchors({
@@ -564,7 +622,7 @@ export function createBootPluginRuntime(
     allowUnsigned,
     warn,
   });
-  return { registry, loader };
+  return { registry, loader, warn };
 }
 
 /**
@@ -606,9 +664,79 @@ export type ActivatePluginsOptions = {
    * records the miss in `warnings` and skips it.
    */
   readonly onMissing?: "throw" | "warn";
+  /**
+   * Where each warning is also reported as it is recorded, prefixed
+   * `[plugins] `. {@link createBootPluginRuntime} supplies stderr, so every
+   * boot path that spreads it reports them. Without it they are only returned.
+   */
+  readonly warn?: (line: string) => void;
   /** Test seam: override the skill-directory existence probe. */
   readonly existsImpl?: (path: string) => boolean;
 };
+
+/**
+ * Why a plugin tool may not have the name `name`, or undefined when it may.
+ * A plugin adds tools; it cannot take the name of one crewhaus defines:
+ *
+ * - a builtin: permission rules, the builtin rules crewhaus seeds itself (a
+ *   `Read`/`Glob`/`Grep` alwaysAllow), the matcher's per-tool argument fields
+ *   and `ToolRegistry` all key on the name, so a plugin `Grep` would run under
+ *   the builtin's grants and be reported as the builtin — whether or not the
+ *   spec lists the builtin;
+ * - a tool the runtime registers itself (`ListTools`, `Skill`, `Task`, the
+ *   Focus/Plan/Goal and memory tools, `Consult`, `Escalate`, …): a plugin one
+ *   would displace it, and inherit its builtin alwaysAllow where it has one;
+ * - an `mcp__` name, which everything reads as an MCP server's tool.
+ *
+ * Names come from `@crewhaus/tool-registry-manifest/flags`, the generated
+ * list every builtin and runtime tool is checked against, so a tool added
+ * later is reserved without an edit here.
+ */
+export function reservedPluginToolNameReason(name: string): string | undefined {
+  if (TOOL_FLAGS_BY_NAME.has(name)) return "a builtin crewhaus tool has that name";
+  if (RUNTIME_TOOL_NAMES.includes(name)) {
+    return "the crewhaus runtime registers a tool of that name itself";
+  }
+  if (name.startsWith("mcp__")) return "names starting mcp__ belong to MCP servers' tools";
+  return undefined;
+}
+
+/** A zod 4 schema carries `_zod`; a zod 3 one carries `_def.typeName`. */
+function isZod4Schema(schema: unknown): boolean {
+  return schema !== null && typeof schema === "object" && "_zod" in schema;
+}
+
+/**
+ * A plugin tool's definition with a JSON Schema the model can read. crewhaus
+ * describes a tool's input to the model with a zod 3 converter, which reads a
+ * zod 4 schema — what `npm i zod` installs today — as having no parameters at
+ * all. So a tool with a zod 4 `inputSchema` and no `jsonSchema` of its own
+ * gets one from zod's own zod 4 converter (validation still runs through the
+ * schema's own `safeParse`). If zod cannot describe it, the tool keeps the
+ * empty schema it had before, and a warning says so.
+ */
+async function describePluginToolInput(
+  pluginName: string,
+  def: ToolDefinition<unknown>,
+): Promise<{ readonly def: ToolDefinition<unknown>; readonly warning?: string }> {
+  if (def.jsonSchema !== undefined || !isZod4Schema(def.inputSchema)) return { def };
+  let why: string;
+  try {
+    const { toJSONSchema } = await import("zod/v4");
+    const json = toJSONSchema(def.inputSchema as unknown as Zod4Type, {
+      target: "draft-7",
+      io: "input",
+    }) as Record<string, unknown>;
+    if (json["type"] === "object") return { def: { ...def, jsonSchema: json } };
+    why = `it describes ${JSON.stringify(json["type"] ?? "no")} input, and a tool's input is an object`;
+  } catch (err) {
+    why = err instanceof Error ? err.message : String(err);
+  }
+  return {
+    def,
+    warning: `plugin "${pluginName}" tool "${def.name}" has a zod 4 input schema crewhaus cannot describe (${why}), so the model is shown it with no parameters. Give the tool a jsonSchema, or build its schema with zod 3.`,
+  };
+}
 
 function defaultDirExists(path: string): boolean {
   try {
@@ -654,6 +782,10 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
   const targetEmitters: PluginTargetEmitter[] = [];
   const skillDirs: string[] = [];
   const warnings: string[] = [];
+  const note = (msg: string): void => {
+    warnings.push(msg);
+    opts.warn?.(`[plugins] ${msg}`);
+  };
   const seen = new Set<string>();
   for (const name of opts.names) {
     if (seen.has(name)) continue; // de-dupe repeats; keep first-occurrence order
@@ -662,16 +794,28 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
     if (entry === undefined) {
       const msg = `plugin "${name}" is named in plugins: but is not installed in the plugin registry`;
       if (onMissing === "throw") throw new PluginLoaderError(`activatePlugins: ${msg}`);
-      warnings.push(msg);
+      note(msg);
       continue;
     }
     const plugin = await opts.loader.load(entry.sourcePath);
     loaded.push(plugin);
     const contributions = readContributions(plugin.module.default);
     // Normalize tools through buildTool so plugin tools get the same
-    // fail-closed scope/justification inference as first-party tools.
+    // fail-closed scope/justification inference as first-party tools. A
+    // plugin is signed, in-process code, so its descriptions are not
+    // boundary-classified the way a remote MCP server's are.
     for (const tool of contributions.tools ?? []) {
-      tools.push(buildTool(tool as ToolDefinition<unknown>));
+      const described = await describePluginToolInput(name, tool as ToolDefinition<unknown>);
+      if (described.warning !== undefined) note(described.warning);
+      const built = buildTool(described.def);
+      const reserved = reservedPluginToolNameReason(built.name);
+      if (reserved !== undefined) {
+        note(
+          `plugin "${name}" tool "${built.name}" was left out: ${reserved}. Rename it in the plugin (for example "${name}_${built.name}").`,
+        );
+        continue;
+      }
+      tools.push(built);
     }
     for (const channel of contributions.channels ?? []) channels.push(channel);
     for (const model of contributions.models ?? []) models.push(model);
@@ -745,7 +889,8 @@ export async function activatePluginsOrStartWithout(opts: {
   }
   for (const name of names) {
     try {
-      const one = await activatePlugins({ names: [name], ...runtime, onMissing: "throw" });
+      const one = await activatePlugins({ names: [name], ...runtime, onMissing: "throw", warn });
+      merged.warnings.push(...one.warnings);
       merged.loaded.push(...one.loaded);
       merged.tools.push(...one.tools);
       merged.channels.push(...one.channels);

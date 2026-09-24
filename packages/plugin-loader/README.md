@@ -32,3 +32,39 @@ verify against a trusted key is still refused.
 
 With no trusted key and no opt-in, a spec that names plugins does not start,
 and the message says where to put the key.
+
+## Which crewhaus a plugin runs on
+
+A manifest may say which crewhaus versions it supports:
+
+```json
+{ "name": "my-plugin", "version": "1.0.0", "engines": { "crewhaus": "^0.7.0" } }
+```
+
+A plugin whose range leaves out the running version is refused before it is
+verified or imported, and so is a range crewhaus cannot read. A manifest with
+no range loads on any version. A canary (`0.7.1-canary.2`) is checked as its
+release (`0.7.1`).
+
+## Tool names a plugin cannot use
+
+A plugin adds tools; it cannot take the name of one crewhaus defines. A plugin
+tool named like a builtin (`Grep`, `HttpRequest`, …), like a tool the runtime
+registers itself (`ListTools`, `Skill`, `Consult`, …), or starting `mcp__` is
+left out with a warning, and the plugin's other tools load. Permission rules
+and crewhaus's own grants key on tool names, so a plugin `Grep` would otherwise
+run under the grant crewhaus gives the builtin one.
+
+## Input schemas
+
+Give each tool a zod 3 schema, or a `jsonSchema` the model reads beside a
+schema of your own. A zod 4 schema without a `jsonSchema` is converted with
+zod's own converter; if zod cannot describe it, the tool is shown to the model
+with no parameters and the boot says so.
+
+## Code
+
+`crewhaus plugins install` writes the manifest only. Put the plugin's
+`index.js` next to its `plugin.json` in `~/.crewhaus/plugins/<name>/`; when the
+manifest has an `entrypointDigest`, the file's sha256 must match it. A plugin
+with no `index.js` is refused at boot with the path it expected.

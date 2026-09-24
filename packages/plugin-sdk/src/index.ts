@@ -165,7 +165,11 @@ export type PluginManifest = {
   readonly author?: string;
   readonly homepage?: string;
   readonly license?: string;
-  /** Minimum crewhaus runtime version this plugin requires (semver range). */
+  /**
+   * The crewhaus versions this plugin runs on, as a semver range
+   * (`"^0.7.0"`). The loader refuses the plugin on a version outside it, or
+   * when the range is not one ({@link crewhausEngineProblem}).
+   */
   readonly engines?: { readonly crewhaus?: string };
   readonly permissions?: PluginPermissions;
   readonly contributions?: PluginContributions;
@@ -286,6 +290,68 @@ export function validatePluginManifest(m: unknown): PluginManifest {
   }
 
   return manifest as unknown as PluginManifest;
+}
+
+// ---------------------------------------------------------------------------
+// engines.crewhaus — which crewhaus a plugin runs on
+// ---------------------------------------------------------------------------
+
+/** One version in a range: `1`, `1.2`, `1.2.3`, `1.x`, `*`, `1.2.3-beta.1+build`. */
+const RANGE_PARTIAL =
+  /^v?(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)?)?$/;
+const RANGE_OPERATOR = /^(?:<=|>=|<|>|=|~|\^)/;
+const MAX_RANGE_LENGTH = 256;
+
+/**
+ * Is `range` a semver range crewhaus can check a version against? The npm
+ * grammar: comparator sets joined by `||`, each a space-separated list of
+ * versions with an optional `<`, `<=`, `>`, `>=`, `=`, `~` or `^`, or a
+ * hyphen range `1.2.3 - 2.3.4`. Versions may be partial (`1.2`) or use `x`/`*`.
+ *
+ * Checked on its own because `Bun.semver.satisfies` answers `true` for text
+ * that is not a range at all ("not a range", "garbage>=1"), which would let a
+ * plugin that declares nonsense run anywhere.
+ */
+export function isValidEngineRange(range: string): boolean {
+  if (typeof range !== "string" || range.length > MAX_RANGE_LENGTH) return false;
+  for (const raw of range.split("||")) {
+    // `>= 1.2.3` is the same comparator as `>=1.2.3`.
+    // An empty set leaves one empty token, which is not a version.
+    const set = raw.trim().replace(/(<=|>=|<|>|=|~|\^)\s+/g, "$1");
+    const hyphen = set.match(/^(\S+)\s+-\s+(\S+)$/);
+    if (hyphen !== null) {
+      if (!RANGE_PARTIAL.test(hyphen[1] ?? "") || !RANGE_PARTIAL.test(hyphen[2] ?? "")) {
+        return false;
+      }
+      continue;
+    }
+    for (const token of set.split(/\s+/)) {
+      if (!RANGE_PARTIAL.test(token.replace(RANGE_OPERATOR, ""))) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Why a plugin must not run on crewhaus `hostVersion`, or undefined when it
+ * may: its manifest's `engines.crewhaus` is not a semver range, or the range
+ * leaves this version out. A plugin that declares no range runs anywhere, as
+ * before. A prerelease host (`0.7.1-canary.2`) is checked as its release
+ * (`0.7.1`), so a canary runs the plugins its release will.
+ */
+export function crewhausEngineProblem(
+  manifest: Pick<PluginManifest, "name" | "version" | "engines">,
+  hostVersion: string,
+): string | undefined {
+  const range = manifest.engines?.crewhaus;
+  if (range === undefined) return undefined;
+  const who = `plugin "${manifest.name}" ${manifest.version}`;
+  if (!isValidEngineRange(range)) {
+    return `${who} declares engines.crewhaus ${JSON.stringify(range)}, which is not a semver range, so crewhaus cannot tell whether it runs on ${hostVersion}`;
+  }
+  const release = hostVersion.match(/^\d+\.\d+\.\d+/)?.[0] ?? hostVersion;
+  if (Bun.semver.satisfies(release, range)) return undefined;
+  return `${who} requires crewhaus ${range}, and this is crewhaus ${hostVersion}`;
 }
 
 /**

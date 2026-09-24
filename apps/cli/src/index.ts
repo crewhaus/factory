@@ -4549,7 +4549,6 @@ async function runRunCli(
     process.stdout.write(
       `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
     );
-    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
   }
 
   // Section 11 — discover hooks, skills, and slash commands from the user's
@@ -5929,7 +5928,6 @@ async function buildServeRuntime(
     process.stdout.write(
       `[plugins] ${activated.loaded.length} activated: ${pluginNames.join(", ")}\n`,
     );
-    for (const warning of activated.warnings) process.stdout.write(`[plugins] ${warning}\n`);
   }
 
   // MCP servers — connect + register remote tools (thredz through connectThredz,
