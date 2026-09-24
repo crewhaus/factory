@@ -21,6 +21,8 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  type ToolSite,
+  readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
 
@@ -120,7 +122,10 @@ export function emitGraph(ir: IrGraphV0, opts: EmitGraphOptions = {}): Bundle {
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, { toolFacts: readmeToolFacts(nodeSites(ir), ir) }),
+    });
   }
   return { files };
 }
@@ -130,6 +135,17 @@ export class TargetEmitError extends CrewhausError {
   constructor(message: string, cause?: unknown) {
     super("compiler", message, cause);
   }
+}
+
+/** Each node that declares tools, with its block and the spec path a message names. */
+function nodeSites(ir: IrGraphV0): ReadonlyArray<ToolSite> {
+  return ir.nodes
+    .filter((node) => node.tools.length > 0)
+    .map((node) => ({
+      tools: node.tools,
+      toolConfigs: node.toolConfigs,
+      path: `nodes.${node.name}.tool_config`,
+    }));
 }
 
 /**
@@ -153,10 +169,7 @@ function resolveTools(ir: IrGraphV0): {
   const declaring = ir.nodes.filter((node) => node.tools.length > 0);
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools(
-      "graph",
-      declaring.map((node) => ({ tools: node.tools, toolConfigs: node.toolConfigs })),
-    );
+    resolved = resolveBuiltinTools("graph", nodeSites(ir), ir);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;

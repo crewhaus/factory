@@ -23,7 +23,9 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  type SpecChainBlocks,
   builtinToolsFor,
+  readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
 import { renderBannerBoot } from "./banner";
@@ -63,7 +65,12 @@ export function emitCli(ir: IrV0, opts: EmitReadmeOptions = {}): Bundle {
   // servers, required env vars, launch snippet). Default ON; `crewhaus
   // compile --no-readme` threads `readme: false` through here.
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts([{ tools: ir.tools, toolConfigs: ir.toolConfigs }], ir),
+      }),
+    });
   }
   return { files };
 }
@@ -116,6 +123,7 @@ export const BUILTIN_TOOL_MAP: Readonly<Record<string, BuiltinToolEntry>> = Obje
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
+  chains?: SpecChainBlocks,
 ): {
   imports: string[];
   inits: string[];
@@ -125,7 +133,7 @@ function resolveTools(
   if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("cli", [{ tools: toolNames, toolConfigs }]);
+    resolved = resolveBuiltinTools("cli", [{ tools: toolNames, toolConfigs }], chains);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;
@@ -576,7 +584,7 @@ function renderAgent(ir: IrV0): string {
     inits,
     registrations,
     sandbox: hasSandboxTools,
-  } = resolveTools(ir.tools, ir.toolConfigs);
+  } = resolveTools(ir.tools, ir.toolConfigs, ir);
   const mcp = renderMcpServers(ir);
   const subAgents = renderSubAgents(ir);
   // FR-006 — Pillar 3 sink-side egress matcher. Empty pieces for the

@@ -130,20 +130,49 @@ describe("renderBundleReadme — env vars + literal redaction (item 42)", () => 
 });
 
 describe("renderBundleReadme — tool table (item 42)", () => {
-  test("renders one sorted row per tool with scope + flags", () => {
+  test("renders one sorted row per tool with the facts the emitter supplies", () => {
     const ir = baseCliIr({
       tools: ["python", "bash", "mcp__github__search", "webFetch"],
       toolConfigs: { webFetch: { allowed_origins: ["https://example.com"] } },
     });
-    const md = renderBundleReadme(ir);
+    // The emitter passes the builtin table's facts; this package has no
+    // dependency to read them, so a stub stands in for readmeToolFacts.
+    const facts: Record<string, { scope: string; notes: string[] }> = {
+      python: { scope: "built-in", notes: ["sandboxed"] },
+      bash: { scope: "external", notes: [] },
+      webFetch: { scope: "external", notes: ["configured by `tool_config.webFetch`"] },
+    };
+    const md = renderBundleReadme(ir, { toolFacts: (name) => facts[name] });
     expect(md).toContain("## Tools");
     expect(md).toContain("| Tool | Used by | Scope | Notes |");
-    expect(md).toContain("| `bash` | agent | built-in | — |");
+    expect(md).toContain("| `bash` | agent | external | — |");
     expect(md).toContain("| `python` | agent | built-in | sandboxed |");
     expect(md).toContain("| `mcp__github__search` | agent | external (MCP) | — |");
-    expect(md).toContain("| `webFetch` | agent | external | configured via `tool_config` |");
+    expect(md).toContain(
+      "| `webFetch` | agent | external | configured by `tool_config.webFetch` |",
+    );
     // Sorted: bash row precedes python row.
     expect(md.indexOf("| `bash` |")).toBeLessThan(md.indexOf("| `python` |"));
+  });
+
+  test("without facts nothing is claimed: no scope from a name, no config from a key", () => {
+    const md = renderBundleReadme(
+      baseCliIr({
+        tools: ["imageGenerate", "webFetch"],
+        toolConfigs: { webFetch: { allowed_domains: ["a.example"] } },
+      }),
+    );
+    expect(md).toContain("| `imageGenerate` | agent | built-in | — |");
+    expect(md).toContain("| `webFetch` | agent | built-in | — |");
+    expect(md).not.toContain("justification");
+    expect(md).not.toContain("configured");
+  });
+
+  test("a pipe in a note cannot split the row", () => {
+    const md = renderBundleReadme(baseCliIr({ tools: ["fetch"] }), {
+      toolFacts: () => ({ scope: "external", notes: ["configured by `tool_config.a|b`"] }),
+    });
+    expect(md).toContain("| `fetch` | agent | external | configured by `tool_config.a\\|b` |");
   });
 
   test("a tool the agent lists as `read` and a sub-agent as `Read` is one row", () => {
@@ -179,7 +208,9 @@ describe("renderBundleReadme — tool table (item 42)", () => {
         },
       ],
     });
-    const md = renderBundleReadme(cli);
+    const md = renderBundleReadme(cli, {
+      toolFacts: (name) => (name === "WebSearch" ? { scope: "external", notes: [] } : undefined),
+    });
     expect(md).toContain("| `read` | agent | built-in | — |");
     expect(md).toContain("| `WebSearch` | sub-agent `researcher` | external | — |");
 
@@ -203,9 +234,15 @@ describe("renderBundleReadme — tool table (item 42)", () => {
     expect(renderBundleReadme(wf)).toContain("| `read` | step `draft` | built-in | — |");
   });
 
-  test("justification-gated defaults are flagged", () => {
-    const md = renderBundleReadme(baseCliIr({ tools: ["imageGenerate"] }));
-    expect(md).toContain("justification-gated by default");
+  test("a tool_config $VAR is listed with the environment variables, never its value", () => {
+    const md = renderBundleReadme(
+      baseCliIr({
+        tools: ["httpRequest"],
+        toolConfigs: { http: { allowed_origins: ["$API_ORIGIN", "https://literal.example"] } },
+      }),
+    );
+    expect(md).toContain("- `API_ORIGIN`");
+    expect(md).not.toContain("literal.example");
   });
 
   test("the Tools section is omitted when the IR references no tools", () => {

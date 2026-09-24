@@ -8,7 +8,7 @@ import {
   renderBundleReadme,
 } from "@crewhaus/ir";
 import { parseModelString } from "@crewhaus/model-router";
-import { resolveBuiltinTools } from "@crewhaus/tool-categories";
+import { readmeToolFacts, resolveBuiltinTools } from "@crewhaus/tool-categories";
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 
 export type EmitOptions = {
@@ -69,6 +69,9 @@ export function emitCfWorkerGraph(ir: IrGraphV0, opts: EmitOptions = {}): Bundle
       content: renderBundleReadme(ir, {
         ...CF_WORKER_README_OPTS,
         unwiredTools: { names: new Set(wiring.unwired), note: CF_WORKER_UNWIRED_NOTE },
+        toolFacts: readmeToolFacts(
+          ir.nodes.map((n) => ({ tools: n.tools, toolConfigs: n.toolConfigs })),
+        ),
       }),
     });
   }

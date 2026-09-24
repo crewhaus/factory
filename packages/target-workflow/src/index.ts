@@ -21,6 +21,9 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  type SpecChainBlocks,
+  type ToolSite,
+  readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
 
@@ -96,7 +99,10 @@ export function emitWorkflow(ir: IrWorkflowV0, opts: EmitWorkflowOptions = {}): 
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, { toolFacts: readmeToolFacts(stepSites(ir.steps), ir) }),
+    });
   }
   return { files };
 }
@@ -108,6 +114,15 @@ export class TargetEmitError extends CrewhausError {
   }
 }
 
+/** Each step's tool list and block, with the spec path a message names. */
+function stepSites(steps: readonly IrWorkflowStep[]): ReadonlyArray<ToolSite> {
+  return steps.map((step, i) => ({
+    tools: step.tools,
+    toolConfigs: step.toolConfigs,
+    path: `steps[${i}].tool_config`,
+  }));
+}
+
 /**
  * Resolve every step's `tools` through the one shared builtin table
  * (`@crewhaus/tool-categories`): ONE grouped import block for the file, the
@@ -115,7 +130,10 @@ export class TargetEmitError extends CrewhausError {
  * receives. A name the workflow shape cannot run throws `TargetEmitError`
  * with the shared message.
  */
-function resolveStepTools(steps: readonly IrWorkflowStep[]): {
+function resolveStepTools(
+  steps: readonly IrWorkflowStep[],
+  chains?: SpecChainBlocks,
+): {
   readonly imports: ReadonlyArray<string>;
   readonly inits: ReadonlyArray<string>;
   /** Per step (same index as `steps`), the identifiers to pass as tools. */
@@ -124,10 +142,7 @@ function resolveStepTools(steps: readonly IrWorkflowStep[]): {
 } {
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools(
-      "workflow",
-      steps.map((step) => ({ tools: step.tools, toolConfigs: step.toolConfigs })),
-    );
+    resolved = resolveBuiltinTools("workflow", stepSites(steps), chains);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;
@@ -948,7 +963,7 @@ const __EVAL_EXIT: number = (EXIT_CODES as Record<string, number>)["evaluation"]
 `;
 
 function renderAgent(ir: IrWorkflowV0, evalEntry = false): string {
-  const tools = resolveStepTools(ir.steps);
+  const tools = resolveStepTools(ir.steps, ir);
   const importBlock = tools.imports.length > 0 ? `${tools.imports.join("\n")}\n` : "";
   // `tool_config` registrations run once, at module load, before any step.
   const toolInitBlock = tools.inits.length > 0 ? `${tools.inits.join("\n")}\n` : "";

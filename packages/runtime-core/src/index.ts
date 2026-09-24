@@ -159,6 +159,7 @@ import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool, ToolExecuteModel } from "@crewhaus/tool-catalog";
 import { stripJustificationField, withJustificationField } from "@crewhaus/tool-catalog";
+import { resolveToolConfigEnv } from "@crewhaus/tool-categories";
 import { executeTool } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
@@ -5155,7 +5156,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       hasToolRateBucket: (toolName: string): boolean =>
         planRateLimits !== undefined &&
         (planRateLimits[toolName] !== undefined || planRateLimits["*"] !== undefined),
-      ...(cfg?.toolConfigs !== undefined ? { toolConfigs: cfg.toolConfigs } : {}),
+      // `$VAR` values in a candidate's tool_config are read from the
+      // environment here, when the loop starts, as the boot registrations
+      // read theirs — never compiled into the bundle. An unset one fails
+      // the start and names the variable.
+      ...(cfg?.toolConfigs !== undefined
+        ? {
+            toolConfigs: resolveToolConfigEnv(
+              cfg.toolConfigs,
+              `model_pool candidate ${cfg.profile ?? candidate?.modelString ?? opts.model} tool_config`,
+              process.env,
+            ).value as Readonly<Record<string, unknown>>,
+          }
+        : {}),
       ...(cfg?.overlay !== undefined
         ? { overlayBlock: { type: "text" as const, text: cfg.overlay } }
         : {}),

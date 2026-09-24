@@ -601,6 +601,33 @@ describe("plan table — per-candidate permissions, tool_config, rate limits (§
     expect(cfgCalls[0]?.model?.armId).toBe("strong");
   });
 
+  test("a candidate's $VAR tool_config value is read from the environment when the loop starts", async () => {
+    const withRef: Candidate = {
+      ...FAST_PROFILE,
+      toolConfigs: { cfg: { token: "$PLAN_TABLE_CFG_TOKEN" } },
+    };
+    cfgCalls.length = 0;
+    process.env["PLAN_TABLE_CFG_TOKEN"] = "read-at-start";
+    try {
+      await run(
+        scriptedAdapter([{ tool: "Cfg" }, { text: "ok" }]),
+        scriptedAdapter([{ text: "s" }]),
+        [withRef, STRONG_PROFILE],
+      );
+      expect(cfgCalls[0]?.toolConfig).toEqual({ token: "read-at-start" });
+    } finally {
+      Reflect.deleteProperty(process.env, "PLAN_TABLE_CFG_TOKEN");
+    }
+    await expect(
+      run(scriptedAdapter([{ text: "ok" }]), scriptedAdapter([{ text: "s" }]), [
+        withRef,
+        STRONG_PROFILE,
+      ]),
+    ).rejects.toThrow(
+      "model_pool candidate fast tool_config.cfg.token reads $PLAN_TABLE_CFG_TOKEN, but PLAN_TABLE_CFG_TOKEN is not set.",
+    );
+  });
+
   test("a candidate's rate_limits bucket paces its own tool calls (both Read calls complete under `tool:Read@fast`)", async () => {
     const limited: Candidate = {
       ...FAST_PROFILE,

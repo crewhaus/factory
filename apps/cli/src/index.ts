@@ -25,7 +25,14 @@ import {
 // deploy/propose handlers (lazy boot); the approval gate helper needs the
 // registry/audit types for its signature.
 import type { AuditLog } from "@crewhaus/audit-log";
-import { type IrNode, SpecParseError, compile, lower, toolSitesOf } from "@crewhaus/compiler";
+import {
+  type IrNode,
+  SpecParseError,
+  checkShapeTools,
+  compile,
+  lower,
+  toolSitesOf,
+} from "@crewhaus/compiler";
 import { buildContextBundle, discoverRoots } from "@crewhaus/context-bundle";
 import {
   type CapabilityRequirement,
@@ -468,9 +475,11 @@ import {
   BUILTIN_TOOLS,
   CATEGORIES,
   SHAPE_TOOL_PROFILES,
+  type SpecChainBlocks,
   type ToolShape,
   builtinToolsFor,
   categoriesForTool,
+  registerToolConfigs,
   toolsInCategory,
 } from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
@@ -1880,8 +1889,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  edge-unsafe-tool (a tool the cf-worker flavour leaves out: a\n" +
         "  builtin the edge does not run, or a custom tool it cannot verify),\n" +
         "  tool-unwired (a builtin that compiles but that nothing binds, so\n" +
-        "  every call fails), sub-agent-tool-ungranted (a sub-agent lists a\n" +
-        "  builtin its parent never registers), channel-reactions-join\n" +
+        "  every call fails), tool-config-unused (a tool_config block no listed\n" +
+        "  tool reads, so the setting is not in force), sub-agent-tool-ungranted\n" +
+        "  (a sub-agent lists a builtin its parent never registers),\n" +
+        "  channel-reactions-join\n" +
         "  (informational — reaction feedback attributes to the exact turn\n" +
         "  only once the outbound-ts join file accumulates), and the 0.6.0\n" +
         "  model-plan-* / model-sunset / model-capabilities-unknown /\n" +
@@ -3707,39 +3718,31 @@ const runEvalLib: typeof runEvalCore = (args) =>
   runEvalCore({ ...args, opts: { importToolPackage, ...args.opts } });
 
 /**
- * Section 14 — apply per-tool config from the IR's `toolConfigs` map by
- * calling each tool's registration function. Mirror of the codegen-emitted
- * init calls in target-cli/target-channel-bot. Keep in sync.
+ * Section 14 — apply the spec's `tool_config` and chain blocks by calling
+ * each registrar the listed tools need, through the one rule every emitter
+ * renders (`registerToolConfigs` in `@crewhaus/tool-categories`), so `crewhaus
+ * run` makes exactly the registrations the compiled bundle makes. `$VAR`
+ * values are read from this process's environment. A block the registrars
+ * cannot apply — two different blocks for one package, an unset variable, a
+ * malformed origin — stops the run with its message.
  */
 async function applyToolConfigs(
-  toolNames: readonly string[],
-  toolConfigs: Readonly<Record<string, unknown>>,
+  ir: {
+    readonly tools: readonly string[];
+    readonly toolConfigs: Readonly<Record<string, unknown>>;
+  } & SpecChainBlocks,
 ): Promise<void> {
-  const used = new Set(toolNames);
-  if (used.has("fetch") && toolConfigs["fetch"] !== undefined) {
-    const { registerFetchConfig } = await import("@crewhaus/tool-fetch");
-    registerFetchConfig(toolConfigs["fetch"] as Parameters<typeof registerFetchConfig>[0]);
-  }
-  if (used.has("webFetch") && toolConfigs["webFetch"] !== undefined) {
-    const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
-    registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
-  }
-  // Section 18 — code-execution tools (python/javascript/shell) share a single
-  // `registerCodeExecutionConfig`. Mirror target-cli's resolveTools: honor a
-  // per-tool config (first one seen) or the shared `codeExecution`/
-  // `code_execution` alias, register once. Without this the run path ignored
-  // tool_config for code-exec tools that the compiled bundle applies.
-  if (used.has("python") || used.has("javascript") || used.has("shell")) {
-    const cfg =
-      toolConfigs["python"] ??
-      toolConfigs["javascript"] ??
-      toolConfigs["shell"] ??
-      toolConfigs["codeExecution"] ??
-      toolConfigs["code_execution"];
-    if (cfg !== undefined) {
-      const { registerCodeExecutionConfig } = await import("@crewhaus/tool-code-execution");
-      registerCodeExecutionConfig(cfg as Parameters<typeof registerCodeExecutionConfig>[0]);
-    }
+  try {
+    await registerToolConfigs(
+      [{ tools: ir.tools, toolConfigs: ir.toolConfigs }],
+      importToolPackage,
+      {
+        env: process.env,
+        chains: ir,
+      },
+    );
+  } catch (err) {
+    die(err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -4012,6 +4015,15 @@ async function runRun(args: ParsedArgs): Promise<void> {
   // bundle stamps at boot (cost-on-by-default; trace printer for pretty/json).
   applyRunObservabilityEnv(args, ir);
 
+  // A tool_config block no listed tool reads is not in force. `compile` says
+  // so; `crewhaus run` says the same, so a restriction written under the
+  // wrong key is not silently missing from a run either.
+  const runnable = ir.target === "cli" || ir.target === "browser";
+  for (const warning of runnable ? checkShapeTools(ir).warnings : []) {
+    if (warning.code !== "tool-config-unused") continue;
+    process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
+  }
+
   if (ir.target === "cli") return runRunCli(args, ir, specPath);
   if (ir.target === "browser") return runRunBrowser(args, ir);
   die(
@@ -4248,7 +4260,7 @@ async function runRunCli(
   if (ir.tools.length > 0) {
     // Section 14 — apply per-tool config (e.g. registerFetchConfig) before
     // loading the tools so first-call execution sees the registered config.
-    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    await applyToolConfigs(ir);
     const toolMap = await loadToolMap();
     tools = ir.tools.map((name) => {
       const tool = toolMap[name];
@@ -5034,7 +5046,7 @@ async function runRunBrowser(
 
   let tools: RegisteredTool[] = [];
   if (ir.tools.length > 0) {
-    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    await applyToolConfigs(ir);
     const toolMap = await loadToolMap();
     tools = ir.tools.map((name) => {
       const tool = toolMap[name];
@@ -5819,7 +5831,7 @@ async function buildServeRuntime(
   // Built-in tools (Section 14 per-tool config applied first).
   let tools: RegisteredTool[] = [];
   if (ir.tools.length > 0) {
-    await applyToolConfigs(ir.tools, ir.toolConfigs);
+    await applyToolConfigs(ir);
     const toolMap = await loadToolMap();
     tools = ir.tools.map((name) => {
       const tool = toolMap[name];

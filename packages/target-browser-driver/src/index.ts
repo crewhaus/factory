@@ -65,6 +65,7 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
 
@@ -191,7 +192,12 @@ export function emitBrowserDriver(ir: IrBrowserV0, opts: EmitReadmeOptions = {})
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts([{ tools: ir.tools, toolConfigs: ir.toolConfigs }]),
+      }),
+    });
   }
   return { files };
 }

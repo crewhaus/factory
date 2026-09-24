@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { BUILTIN_TOOLS } from "./builtins";
+import { planToolConfigInits } from "./config";
 import { CATEGORIES, leafCategories } from "./registry";
 import {
   BuiltinToolError,
@@ -8,7 +9,6 @@ import {
   builtinKeyForName,
   builtinToolsFor,
   checkBuiltinTool,
-  planToolConfigInits,
   registeredToolName,
   resolveBuiltinTools,
   unknownToolMessage,
@@ -105,16 +105,19 @@ describe("checkBuiltinTool", () => {
 
   test("a withheld builtin is refused on every shape", () => {
     for (const shape of SHAPES) {
-      const v = checkBuiltinTool("evmSimulate", shape);
+      const v = checkBuiltinTool("evmSendTransaction", shape);
       expect(v.kind).toBe("refused");
       expect(v.kind === "refused" && v.message).toContain("no shape can run it");
+      expect(v.kind === "refused" && v.message).toContain("EvmSimulate runs the same transaction");
     }
   });
 
-  test("an inert builtin compiles with a warning on its own shapes", () => {
-    const v = checkBuiltinTool("evmCall", "graph");
-    expect(v.kind).toBe("inert");
-    expect(v.kind === "inert" && v.message).toContain("no chain adapter is bound");
+  test("a chain reader compiles on its own shapes and names the registrar that binds it", () => {
+    for (const key of ["evmCall", "evmSimulate"]) {
+      const v = checkBuiltinTool(key, "graph");
+      expect(v.kind).toBe("ok");
+      expect(v.kind === "ok" && v.entry.chainSymbol).toMatch(/^bind\w+Chains$/);
+    }
   });
 
   test("the edge refuses host builtins with the reason, and runs its own set", () => {
@@ -164,6 +167,7 @@ describe("planToolConfigInits — the one tool_config rule", () => {
         package: "@crewhaus/tool-fetch",
         initSymbol: "registerFetchConfig",
         config: { allowed_origins: ["https://a.test"] },
+        where: "tool_config.fetch",
       },
     ]);
   });
@@ -175,13 +179,24 @@ describe("planToolConfigInits — the one tool_config rule", () => {
     expect(plan.map((p) => p.initSymbol)).toEqual(["registerCodeExecutionConfig"]);
   });
 
-  test("tools sharing a registrar register once, first configured wins", () => {
+  test("tools sharing a registrar register once", () => {
     const plan = planToolConfigInits([
-      { tools: ["python", "javascript"], toolConfigs: { javascript: { a: 1 }, python: { b: 2 } } },
-      { tools: ["shell"], toolConfigs: { shell: { c: 3 } } },
+      { tools: ["python", "javascript"], toolConfigs: { javascript: { a: 1 }, python: { a: 1 } } },
+      { tools: ["shell"], toolConfigs: { shell: { a: 1 } } },
     ]);
     expect(plan).toHaveLength(1);
-    expect(plan[0]?.config).toEqual({ b: 2 });
+    expect(plan[0]?.config).toEqual({ a: 1 });
+  });
+
+  test("two different blocks for one registrar are refused, naming both keys", () => {
+    expect(() =>
+      planToolConfigInits([
+        {
+          tools: ["python", "javascript"],
+          toolConfigs: { javascript: { a: 1 }, python: { b: 2 } },
+        },
+      ]),
+    ).toThrow(/tool_config\.javascript and tool_config\.python both configure code execution/);
   });
 });
 

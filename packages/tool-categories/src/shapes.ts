@@ -11,8 +11,22 @@
  *
  * Pure functions over data. Nothing here imports a tool package.
  */
-import { CrewhausError } from "@crewhaus/errors";
 import { BUILTIN_TOOLS, type BuiltinToolEntry } from "./builtins";
+import {
+  type SpecChainBlocks,
+  type ToolConfigEnv,
+  type ToolConfigInit,
+  type ToolSite,
+  applyToolConfig,
+  planChainInits,
+  planToolConfigInits,
+  renderToolConfigInit,
+  toolConfigEnvRefs,
+} from "./config";
+import { distance } from "./distance";
+import { BuiltinToolError } from "./error";
+
+export { BuiltinToolError };
 
 /**
  * Every place a spec's builtin tools can end up: the fourteen spec targets,
@@ -97,14 +111,6 @@ export const SHAPE_TOOL_PROFILES: Readonly<Record<ToolShape, ShapeToolProfile>> 
 export const SANDBOX_AVAILABLE_EXPR =
   '((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop")';
 
-/** A builtin-tool refusal: an unknown name, or a builtin this shape cannot run. */
-export class BuiltinToolError extends CrewhausError {
-  override readonly name = "BuiltinToolError";
-  constructor(message: string, cause?: unknown) {
-    super("tool", message, cause);
-  }
-}
-
 /** Can `shape` compile `key`? The same rules `refusal` explains in words. */
 function carriedBy(key: string, entry: BuiltinToolEntry, shape: ToolShape): boolean {
   return refusal(key, entry, shape) === undefined;
@@ -185,22 +191,6 @@ function refusal(key: string, entry: BuiltinToolEntry, shape: ToolShape): string
   return undefined;
 }
 
-/** Case-insensitive edit distance, for the "did you mean" hint. */
-function distance(a: string, b: string): number {
-  const s = a.toLowerCase();
-  const t = b.toLowerCase();
-  let prev = Array.from({ length: t.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= s.length; i++) {
-    const curr = [i];
-    for (let j = 1; j <= t.length; j++) {
-      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
-      curr[j] = Math.min((prev[j] ?? 0) + 1, (curr[j - 1] ?? 0) + 1, (prev[j - 1] ?? 0) + cost);
-    }
-    prev = curr;
-  }
-  return prev[t.length] ?? 0;
-}
-
 /**
  * The message for a name that is not a builtin. Kept short on purpose: it
  * names the problem and one next step, instead of listing every builtin.
@@ -243,77 +233,38 @@ export function checkBuiltinTool(key: string, shape: ToolShape): ToolVerdict {
   return { kind: "ok", key, entry };
 }
 
-/** One list of tools a bundle registers together, with the config that list carries. */
-export type ToolSite = {
-  readonly tools: ReadonlyArray<string>;
-  readonly toolConfigs?: Readonly<Record<string, unknown>>;
-};
-
-/** One `tool_config` registration: call `initSymbol(config)` from `package` at boot. */
-export type ToolConfigInit = {
-  readonly key: string;
-  readonly package: string;
-  readonly initSymbol: string;
-  readonly config: unknown;
-};
-
-/** The shared registrar the three code-execution tools use. */
-const CODE_EXECUTION_INIT = "registerCodeExecutionConfig";
-
-/**
- * Which `tool_config` blob reaches which registration function — the one
- * rule every emitter renders and every runtime (`crewhaus run`, the eval
- * runner) calls.
- *
- * A tool's own `tool_config.<key>` wins. The `codeExecution` /
- * `code_execution` aliases apply only to the code-execution registrar that
- * python, javascript and shell share. Several tools sharing a registrar
- * register once, with the first configured tool's blob.
- */
-export function planToolConfigInits(sites: ReadonlyArray<ToolSite>): ReadonlyArray<ToolConfigInit> {
-  const plan: ToolConfigInit[] = [];
-  const seen = new Set<string>();
-  for (const site of sites) {
-    const configs = site.toolConfigs ?? {};
-    for (const key of site.tools) {
-      const entry = Object.hasOwn(BUILTIN_TOOLS, key) ? BUILTIN_TOOLS[key] : undefined;
-      if (entry?.initSymbol === undefined || seen.has(entry.initSymbol)) continue;
-      const config =
-        configs[key] ??
-        (entry.initSymbol === CODE_EXECUTION_INIT
-          ? (configs["codeExecution"] ?? configs["code_execution"])
-          : undefined);
-      if (config === undefined) continue;
-      seen.add(entry.initSymbol);
-      plan.push({ key, package: entry.package, initSymbol: entry.initSymbol, config });
-    }
-  }
-  return plan;
-}
-
 /** Imports a tool package; the caller decides how (a literal loader table in the CLI binary). */
 export type ToolPackageImporter = (pkg: string) => Promise<Readonly<Record<string, unknown>>>;
 
 /**
- * The runtime half of {@link planToolConfigInits}: call each registrar with
- * its blob, importing its package through `importPackage`. `crewhaus eval`
- * calls this before wiring tools, so an eval measures the tool_config the
- * compiled bundle applies. Throws when a package does not export the
- * registrar the table names.
+ * The runtime half of the boot rule: call each registrar with its block —
+ * `$VAR` references read from `env` — importing its package through
+ * `importPackage`, then each chain registrar the tools need with the spec's
+ * chain blocks. `crewhaus run` and `crewhaus eval` call this before wiring
+ * tools, so both apply exactly the registrations a compiled bundle makes.
+ * Throws when two blocks for one registrar differ, when a referenced variable
+ * is unset, or when a package does not export the registrar the table names.
  */
 export async function registerToolConfigs(
   sites: ReadonlyArray<ToolSite>,
   importPackage: ToolPackageImporter,
+  opts: { readonly env?: ToolConfigEnv; readonly chains?: SpecChainBlocks } = {},
 ): Promise<ReadonlyArray<ToolConfigInit>> {
-  const plan = planToolConfigInits(sites);
+  const plan = [
+    ...planToolConfigInits(sites),
+    ...planChainInits(
+      sites.flatMap((s) => s.tools),
+      opts.chains,
+    ),
+  ];
   for (const init of plan) {
     const registrar = (await importPackage(init.package))[init.initSymbol];
     if (typeof registrar !== "function") {
       throw new BuiltinToolError(
-        `${init.package} does not export ${init.initSymbol}, the tool_config registrar the builtin table names for "${init.key}"`,
+        `${init.package} does not export ${init.initSymbol}, the registrar the builtin table names for ${init.where === "" ? "chains" : init.where}`,
       );
     }
-    (registrar as (config: unknown) => void)(init.config);
+    applyToolConfig(registrar as (config: never) => void, init.config, init.where, opts.env ?? {});
   }
   return plan;
 }
@@ -348,14 +299,20 @@ export type ResolvedTools = {
  *
  * On a host shape every name must be a builtin that shape can run; anything
  * else throws `BuiltinToolError` with the same message the compiler prints.
- * On the edge nothing throws: a name the worker cannot wire is returned in
- * `unwired` (the compiler has already warned about it, or refused it under
- * `--strict`), and each wired tool is imported as `__t_<key>` so it cannot
- * collide with a Worker global such as `fetch`.
+ * On the edge a name the worker cannot wire is returned in `unwired` (the
+ * compiler has already warned about it, or refused it under `--strict`), and
+ * each wired tool is imported as `__t_<key>` so it cannot collide with a
+ * Worker global such as `fetch`. On every shape, two different `tool_config`
+ * blocks for one registrar throw, and so does a `$VAR` reference on the edge,
+ * which has no process environment to read it from at boot.
+ *
+ * `chains` is the spec's chain blocks; a tool that reads a chain gets its
+ * registrar called with them, and without them it refuses every call.
  */
 export function resolveBuiltinTools(
   shape: ToolShape,
   sites: ReadonlyArray<ToolSite>,
+  chains?: SpecChainBlocks,
 ): ResolvedTools {
   const edge = SHAPE_TOOL_PROFILES[shape].runtime === "edge";
   const groups = new Map<string, { exports: Set<string>; inits: Set<string> }>();
@@ -409,9 +366,24 @@ export function resolveBuiltinTools(
   }
 
   const inits: string[] = [];
-  for (const init of planToolConfigInits(wiredForInit)) {
+  const plan = [
+    ...planToolConfigInits(wiredForInit),
+    ...planChainInits(
+      wiredForInit.flatMap((s) => s.tools),
+      chains,
+    ),
+  ];
+  for (const init of plan) {
+    const ref = edge ? toolConfigEnvRefs(init.config, init.where)[0] : undefined;
+    if (ref !== undefined) {
+      throw new BuiltinToolError(
+        `${ref.path} reads $${ref.name} from the environment, but a Cloudflare Worker has no environment at boot. Write the value itself, or compile without --emit-as cf-worker.`,
+      );
+    }
+    const rendered = renderToolConfigInit(init);
     group(init.package).inits.add(init.initSymbol);
-    inits.push(`${init.initSymbol}(${JSON.stringify(init.config)});`);
+    if (rendered.readsEnv) group("@crewhaus/tool-categories").inits.add("applyToolConfig");
+    inits.push(rendered.line);
   }
 
   const packages = [...groups.keys()].sort();

@@ -196,17 +196,42 @@ edit(
 
 // 2 — the builtin table -----------------------------------------------------
 {
-  // The registered name and the io / sandbox facts are read off the tools
+  // The registered name and the io / sandbox / justification facts are read off the tools
   // themselves, so the row cannot claim something the tool does not do.
   // (apps/cli/src/tool-registry.test.ts re-reads them on every run.)
   const mod = (await import(join(ROOT, "packages", pkgDir, "src", "index.ts"))) as Record<
     string,
     unknown
   >;
+  // A package whose every existing row names one boot registrar configures
+  // the whole package through it (tool_config.http), so a new tool in it
+  // names it too — otherwise the package's block would not reach it.
+  const siblings = Object.values(
+    (
+      (await import(join(ROOT, BUILTINS_FILE))) as {
+        BUILTIN_TOOLS: Record<
+          string,
+          { package: string; initSymbol?: string; chainSymbol?: string }
+        >;
+      }
+    ).BUILTIN_TOOLS,
+  ).filter((e) => e.package === scope);
+  const shared = (field: "initSymbol" | "chainSymbol"): string | undefined => {
+    const values = new Set(siblings.map((e) => e[field]));
+    const only = [...values][0];
+    return siblings.length >= 2 && values.size === 1 ? only : undefined;
+  };
+  const initSymbol = shared("initSymbol");
+  const chainSymbol = shared("chainSymbol");
   const rowFor = (key: string): string => {
     const exp = manifest.tools.find((t) => t.key === key)?.export ?? key;
     const tool = mod[exp] as
-      | { name?: unknown; ioCapability?: unknown; requiresSandbox?: unknown }
+      | {
+          name?: unknown;
+          ioCapability?: unknown;
+          requiresSandbox?: unknown;
+          requireJustification?: unknown;
+        }
       | undefined;
     if (tool === undefined || typeof tool.name !== "string") {
       throw new Error(
@@ -217,10 +242,13 @@ edit(
       `package: "${scope}"`,
       `export: "${exp}"`,
       `name: ${JSON.stringify(tool.name)}`,
+      ...(initSymbol !== undefined ? [`initSymbol: "${initSymbol}"`] : []),
+      ...(chainSymbol !== undefined ? [`chainSymbol: "${chainSymbol}"`] : []),
       ...(tool.ioCapability === "process" || tool.ioCapability === "network"
         ? [`io: "${tool.ioCapability}"`]
         : []),
       ...(tool.requiresSandbox === true ? ["sandbox: true"] : []),
+      ...(tool.requireJustification === true ? ["justify: true"] : []),
     ];
     return `  ${key}: { ${parts.join(", ")} },`;
   };

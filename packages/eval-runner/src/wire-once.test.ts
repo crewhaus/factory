@@ -355,6 +355,30 @@ describe("wireRunOnce — tools", () => {
     expect(calls.registerWebFetchConfig).toEqual([{ timeoutMs: 10 }]);
   });
 
+  test("the http package's documented block reaches its registrar, $VAR read from the environment", async () => {
+    const seen: unknown[] = [];
+    const importer = async (pkg: string): Promise<Record<string, unknown>> => {
+      if (pkg !== "@crewhaus/tool-http") throw new Error(`unexpected ${pkg}`);
+      return {
+        httpRequest: fakeTool("HttpRequest"),
+        registerHttpConfig: (c: unknown) => seen.push(c),
+      };
+    };
+    process.env["EVAL_HTTP_ORIGIN"] = "https://api.example.com";
+    try {
+      await wireRunOnce(
+        baseIr({
+          tools: ["httpRequest"],
+          toolConfigs: { http: { allowed_origins: ["$EVAL_HTTP_ORIGIN"] } },
+        }),
+        { cwd: newCwd(), importToolPackage: importer },
+      );
+    } finally {
+      Reflect.deleteProperty(process.env, "EVAL_HTTP_ORIGIN");
+    }
+    expect(seen).toEqual([{ allowed_origins: ["https://api.example.com"] }]);
+  });
+
   test("skips config registration when the tool is present but config absent", async () => {
     const ir = baseIr({ tools: ["fetch", "webFetch"], toolConfigs: {} });
     await wireRunOnce(ir, { cwd: newCwd() });

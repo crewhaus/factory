@@ -1342,6 +1342,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
       },
     },
     "packages/model-router": {
@@ -1630,6 +1631,7 @@
         "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/token-budget": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-loop-detection": "workspace:*",
         "@crewhaus/tool-orchestrator": "workspace:*",
@@ -1792,6 +1794,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
         "zod-to-json-schema": "^3.23.5",

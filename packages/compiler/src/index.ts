@@ -95,7 +95,7 @@ import {
 } from "@crewhaus/model-service";
 import {
   SPEC_PROFILE_NAME_RE,
-  type Spec,
+  Spec,
   type SpecChannel,
   type SpecCrewRole,
   type SpecDiscordChannel,
@@ -128,13 +128,18 @@ import { emitVoice } from "@crewhaus/target-voice";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 import { type ScopeFinding, isOutwardName } from "@crewhaus/tool-builder";
 import {
+  BUILTIN_TOOLS,
   SHAPE_TOOL_PROFILES,
   type ShapeToolProfile,
   ToolCategoryError,
   type ToolShape,
   builtinKeyForName,
+  chainBootConfig,
   checkBuiltinTool,
+  checkCandidateToolConfigs,
+  checkToolConfigs,
   expandToolSelectors,
+  malformedToolConfigRefs,
   registeredToolName,
 } from "@crewhaus/tool-categories";
 // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
@@ -710,7 +715,42 @@ export type IrToolSite = {
   readonly path: string;
   readonly tools: ReadonlyArray<string>;
   readonly toolConfigs?: Readonly<Record<string, unknown>>;
+  /**
+   * The `model_pool` candidates of the block that owns the site, each with
+   * the spec path of its `tool_config`. A candidate's block is read per call.
+   */
+  readonly candidates?: ReadonlyArray<{
+    readonly path: string;
+    readonly toolConfigs?: Readonly<Record<string, unknown>>;
+  }>;
 };
+
+/** The pool candidates of the block that owns a site (an agent, step, node or role). */
+function candidatesOf(
+  owner: unknown,
+  path: string,
+): NonNullable<IrToolSite["candidates"]> | undefined {
+  const pool = (owner as { modelPool?: { candidates?: ReadonlyArray<unknown> } } | undefined)
+    ?.modelPool;
+  if (pool?.candidates === undefined) return undefined;
+  return pool.candidates.map((c, i) => {
+    const toolConfigs = (c as { toolConfigs?: Readonly<Record<string, unknown>> }).toolConfigs;
+    return {
+      path: `${path}.model_pool.candidates[${i}].tool_config`,
+      ...(toolConfigs !== undefined ? { toolConfigs } : {}),
+    };
+  });
+}
+
+function withCandidates(site: IrToolSite, owner: unknown, ownerPath: string): IrToolSite {
+  const candidates = candidatesOf(owner, ownerPath);
+  return candidates === undefined ? site : { ...site, candidates };
+}
+
+/** The spec path of a site's `tool_config`: its `tools` path with the last key swapped. */
+function toolConfigPathOf(site: IrToolSite): string {
+  return site.path.replace(/tools$/, "tool_config");
+}
 
 /**
  * Every tool site of a lowered IR, per variant. Exhaustive over the IR
@@ -725,31 +765,55 @@ export function toolSitesOf(ir: IrNode): ReadonlyArray<IrToolSite> {
     case "browser":
     case "onchain":
     case "onchain-game":
-      return [{ path: "tools", tools: ir.tools, toolConfigs: ir.toolConfigs }];
+      return [
+        withCandidates(
+          { path: "tools", tools: ir.tools, toolConfigs: ir.toolConfigs },
+          ir.agent,
+          "agent",
+        ),
+      ];
     case "channel":
-      return [{ path: "agent.tools", tools: ir.tools, toolConfigs: ir.toolConfigs }];
+      return [
+        withCandidates(
+          { path: "agent.tools", tools: ir.tools, toolConfigs: ir.toolConfigs },
+          ir.agent,
+          "agent",
+        ),
+      ];
     case "managed":
-      return [{ path: "agent.tools", tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {} }];
+      return [
+        withCandidates(
+          { path: "agent.tools", tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {} },
+          ir.agent,
+          "agent",
+        ),
+      ];
     case "eval":
       return [{ path: "agent.tools", tools: ir.agent.tools }];
     case "workflow":
-      return ir.steps.map((step, i) => ({
-        path: `steps[${i}].tools`,
-        tools: step.tools,
-        toolConfigs: step.toolConfigs,
-      }));
+      return ir.steps.map((step, i) =>
+        withCandidates(
+          { path: `steps[${i}].tools`, tools: step.tools, toolConfigs: step.toolConfigs },
+          step,
+          `steps[${i}]`,
+        ),
+      );
     case "graph":
-      return ir.nodes.map((node) => ({
-        path: `nodes.${node.name}.tools`,
-        tools: node.tools,
-        toolConfigs: node.toolConfigs,
-      }));
+      return ir.nodes.map((node) =>
+        withCandidates(
+          { path: `nodes.${node.name}.tools`, tools: node.tools, toolConfigs: node.toolConfigs },
+          node,
+          `nodes.${node.name}`,
+        ),
+      );
     case "crew":
-      return ir.roles.map((role) => ({
-        path: `roles.${role.name}.tools`,
-        tools: role.tools,
-        toolConfigs: role.toolConfigs,
-      }));
+      return ir.roles.map((role) =>
+        withCandidates(
+          { path: `roles.${role.name}.tools`, tools: role.tools, toolConfigs: role.toolConfigs },
+          role,
+          `roles.${role.name}`,
+        ),
+      );
     case "pipeline":
       return [];
     default:
@@ -797,8 +861,85 @@ export function checkShapeTools(ir: IrNode): {
     }
   }
   warnings.push(...ungrantedSubAgentTools(ir));
+  const config = checkToolConfigDelivery(ir);
+  errors.push(...config.errors);
+  warnings.push(...config.warnings);
   return { errors, warnings };
 }
+
+/**
+ * Where each `tool_config` block goes, checked before anything is emitted:
+ *
+ * - two different blocks for one boot registrar (`http` and `httpRequest`,
+ *   or `fetch` in two steps of one process) are an ERROR naming both — the
+ *   registrar holds one setting, so one block would be dropped;
+ * - a credential-shaped value that starts with `$` but is not a valid
+ *   `$UPPER_SNAKE` reference is an ERROR, since it would ship as a literal;
+ * - a key no listed tool reads is a `tool-config-unused` WARNING, which
+ *   `--strict` escalates — a restriction written under a key nothing reads
+ *   is a restriction that is not in force;
+ * - a tool that reads a chain, with no `chains` block, is a `tool-unwired`
+ *   WARNING naming the block to write.
+ */
+function checkToolConfigDelivery(ir: IrNode): {
+  readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>;
+  readonly warnings: ReadonlyArray<CompileWarning>;
+} {
+  const errors: Array<{ path: string; message: string }> = [];
+  const warnings: CompileWarning[] = [];
+  const sites = toolSitesOf(ir);
+  const check = checkToolConfigs(
+    sites.map((site) => ({
+      tools: site.tools,
+      ...(site.toolConfigs !== undefined ? { toolConfigs: site.toolConfigs } : {}),
+      path: toolConfigPathOf(site),
+    })),
+  );
+  for (const c of check.conflicts) errors.push({ path: c.path, message: c.message });
+  for (const u of check.unused) {
+    warnings.push({ code: "tool-config-unused", path: u.path, message: u.message });
+  }
+  for (const site of sites) {
+    for (const bad of malformedToolConfigRefs(site.toolConfigs ?? {}, toolConfigPathOf(site))) {
+      errors.push(bad);
+    }
+    for (const candidate of site.candidates ?? []) {
+      const blocks = candidate.toolConfigs ?? {};
+      const c = checkCandidateToolConfigs(site.tools, blocks, candidate.path);
+      for (const x of c.conflicts) errors.push({ path: x.path, message: x.message });
+      for (const u of c.unused) {
+        warnings.push({ code: "tool-config-unused", path: u.path, message: u.message });
+      }
+      for (const bad of malformedToolConfigRefs(blocks, candidate.path)) errors.push(bad);
+    }
+  }
+  const chained = chainBootConfig(ir as Parameters<typeof chainBootConfig>[0]) !== undefined;
+  if (!chained) {
+    // Read off the spec schema, so a shape that gains a `chains` block starts
+    // getting the "declare one" advice without an edit here.
+    const option = Spec.optionsMap.get(ir.target) as
+      | { shape?: Record<string, unknown> }
+      | undefined;
+    const acceptsChains = option?.shape?.["chains"] !== undefined;
+    for (const site of sites) {
+      for (const key of new Set(site.tools)) {
+        if (BUILTIN_TOOLS[key]?.chainSymbol === undefined) continue;
+        warnings.push({
+          code: "tool-unwired",
+          path: site.path,
+          message: acceptsChains
+            ? `tool "${key}" reads a chain, and the spec declares none, so every call returns an error. Declare it — ${CHAINS_BLOCK_EXAMPLE}.`
+            : `tool "${key}" reads a chain, and the ${ir.target} shape cannot declare one, so every call returns an error. Remove it from tools, or use a shape that takes a chains block, such as cli.`,
+        });
+      }
+    }
+  }
+  return { errors, warnings };
+}
+
+/** What a spec writes to give a chain tool its chain. Mirrors `@crewhaus/chain-adapter-base`. */
+const CHAINS_BLOCK_EXAMPLE =
+  'chains: [{ id: "1", kind: evm, rpcUrls: [$ETH_RPC_URL], finality: { kind: finalized } }]';
 
 /**
  * A sub-agent's child catalog is the parent's registered tools filtered by

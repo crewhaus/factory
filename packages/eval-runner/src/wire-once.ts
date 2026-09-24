@@ -122,7 +122,12 @@ async function wireBuiltinTools(
     return mod;
   };
   try {
-    await registerToolConfigs([{ tools: ir.tools, toolConfigs: ir.toolConfigs }], load);
+    // The same registrations a compiled bundle makes: tool_config blocks with
+    // their `$VAR` values read from this process, and the chain blocks.
+    await registerToolConfigs([{ tools: ir.tools, toolConfigs: ir.toolConfigs }], load, {
+      env: process.env,
+      chains: ir,
+    });
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new RunnerError(err.message, err);
     throw err;

@@ -46,6 +46,8 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  type SpecChainBlocks,
+  readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
 
@@ -66,6 +68,7 @@ export class TargetEmitError extends CrewhausError {
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
+  chains?: SpecChainBlocks,
 ): {
   imports: ReadonlyArray<string>;
   inits: ReadonlyArray<string>;
@@ -75,7 +78,7 @@ function resolveTools(
   if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("research", [{ tools: toolNames, toolConfigs }]);
+    resolved = resolveBuiltinTools("research", [{ tools: toolNames, toolConfigs }], chains);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;
@@ -303,7 +306,12 @@ export function emitResearchBundle(ir: IrResearchV0, opts: EmitReadmeOptions = {
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts([{ tools: ir.tools, toolConfigs: ir.toolConfigs }], ir),
+      }),
+    });
   }
   return { files };
 }
@@ -347,7 +355,11 @@ function renderAgent(ir: IrResearchV0): string {
     HYBRID_FAMILIES_BY_SHAPE.research,
   );
   const hybridImport = hybridFields.length > 0 ? `${HYBRID_WIRING_IMPORT}\n` : "";
-  const { imports: builtinImports, inits, registrations } = resolveTools(ir.tools, ir.toolConfigs);
+  const {
+    imports: builtinImports,
+    inits,
+    registrations,
+  } = resolveTools(ir.tools, ir.toolConfigs, ir);
   const importBlock = builtinImports.length > 0 ? `${builtinImports.join("\n")}\n` : "";
   const initLines = inits.length > 0 ? `${inits.join("\n")}\n` : "";
   const registrationBlock =

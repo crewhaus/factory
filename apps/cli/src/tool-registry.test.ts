@@ -83,7 +83,7 @@ describe("category registry vs. the real builtin set", () => {
 describe("the builtin table's facts match the tools themselves", () => {
   const repoRoot = join(import.meta.dir, "..", "..", "..");
 
-  test("name, io and sandbox agree with every RegisteredTool", async () => {
+  test("name, io, sandbox, justification and scope agree with every RegisteredTool", async () => {
     const wrong: string[] = [];
     let checked = 0;
     for (const [key, entry] of Object.entries(BUILTIN_TOOLS)) {
@@ -97,7 +97,13 @@ describe("the builtin table's facts match the tools themselves", () => {
       );
       const mod = (await import(file)) as Record<string, unknown>;
       const tool = mod[entry.export] as
-        | { name: string; ioCapability?: string; requiresSandbox: boolean }
+        | {
+            name: string;
+            ioCapability?: string;
+            requiresSandbox: boolean;
+            requireJustification: boolean;
+            scope: string;
+          }
         | undefined;
       checked += 1;
       if (tool === undefined) {
@@ -112,6 +118,14 @@ describe("the builtin table's facts match the tools themselves", () => {
       if (io !== entry.io) wrong.push(`${key}: io ${entry.io} vs ${io}`);
       if ((tool.requiresSandbox === true) !== (entry.sandbox === true)) {
         wrong.push(`${key}: sandbox ${entry.sandbox} vs ${tool.requiresSandbox}`);
+      }
+      if ((tool.requireJustification === true) !== (entry.justify === true)) {
+        wrong.push(`${key}: justify ${entry.justify} vs ${tool.requireJustification}`);
+      }
+      // A bundle README prints "external" for a row with an io fact, so the
+      // two must be the same fact on every tool.
+      if ((tool.scope === "external") !== (entry.io !== undefined)) {
+        wrong.push(`${key}: scope ${tool.scope} but io ${entry.io}`);
       }
     }
     expect(checked).toBe(Object.keys(BUILTIN_TOOLS).length);

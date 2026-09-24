@@ -28,6 +28,7 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
 
@@ -66,7 +67,12 @@ export function emitManaged(ir: IrManagedV0, opts: EmitReadmeOptions = {}): Bund
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts([{ tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {} }]),
+      }),
+    });
   }
   return { files };
 }

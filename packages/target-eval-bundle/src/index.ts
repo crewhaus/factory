@@ -22,7 +22,7 @@ import {
   type IrEvalV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
-import { resolveBuiltinTools } from "@crewhaus/tool-categories";
+import { readmeToolFacts, resolveBuiltinTools } from "@crewhaus/tool-categories";
 import type { EvalBridge } from "./runtime";
 
 /**
@@ -256,9 +256,9 @@ main().catch((err) => {
     const bridged = bridge !== undefined && bridge.entryImport !== undefined;
     files.push({
       path: "README.md",
-      content: renderBundleReadme(
-        ir,
-        bridged
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts([{ tools: ir.agent.tools }]),
+        ...(bridged
           ? {
               usage: {
                 heading: "Run",
@@ -273,8 +273,8 @@ main().catch((err) => {
                 ].join("\n"),
               },
             }
-          : {},
-      ),
+          : {}),
+      }),
     });
   }
   return { files };

@@ -29,14 +29,25 @@ export type BuiltinToolEntry = {
   /** The `RegisteredTool.name`: what session logs record and permission rules match. */
   readonly name: string;
   /**
-   * An exported function taking the spec's `tool_config` blob for this tool.
-   * Emitters call it before the tool is registered; runtimes call it at boot.
+   * The registrar that receives this tool's `tool_config` block at boot — a
+   * key of {@link TOOL_BOOT_REGISTRARS}. Every tool of a configurable package
+   * names it, so the package's documented block (`tool_config.http`) and a
+   * tool's own key (`tool_config.httpRequest`) reach the same place.
    */
   readonly initSymbol?: string;
+  /**
+   * The registrar that binds what this tool reads a chain through, from the
+   * spec's `chains` / `wallets` / `contracts` / `transaction_policy` blocks —
+   * a key of {@link TOOL_BOOT_REGISTRARS}. Without a `chains` block the tool
+   * compiles with a `tool-unwired` warning and refuses every call.
+   */
+  readonly chainSymbol?: string;
   /** Mirrors `RegisteredTool.ioCapability`: the tool crosses this boundary. */
   readonly io?: "process" | "network";
   /** Mirrors `RegisteredTool.requiresSandbox`: runs model-written code. */
   readonly sandbox?: true;
+  /** Mirrors `RegisteredTool.requireJustification`: every call carries a reason. */
+  readonly justify?: true;
   /** Wired on the Cloudflare Worker edge runtime (fetch and KV only). */
   readonly edge?: true;
   /**
@@ -54,10 +65,243 @@ export type BuiltinToolEntry = {
   readonly withheld?: string;
 };
 
-const EVM_ADAPTER_UNBOUND =
-  "no chain adapter is bound in this release, so every call returns an error";
+/**
+ * A boot registrar: an exported function a bundle calls once, before any tool
+ * is registered, and `crewhaus run` and `crewhaus eval` call the same way.
+ *
+ * `source` says where its argument comes from:
+ *  - `tool_config` — the spec's block for the package. It may be written
+ *    under any of `keys` (the package's documented key comes first), or under
+ *    the own key or registered name of a tool that names this registrar.
+ *  - `chains` — the spec's `chains`, `wallets`, `contracts` and
+ *    `transaction_policy` blocks, as a {@link ChainBootConfig}.
+ *
+ * `binds` lists the package's other boot seams this registrar sets. The
+ * guard in `apps/cli/src/boot-seams.test.ts` reads the registrar's source
+ * and fails if it does not call each one, and fails for any boot seam in a
+ * tool package that no registrar, host or `OPTIONAL_BOOT_SEAMS` row covers.
+ */
+export type BootRegistrar = {
+  readonly package: string;
+  readonly source: "tool_config" | "chains";
+  /** Words for messages: "the http tools", "code execution". */
+  readonly label: string;
+  /** `tool_config` only: the package-level keys, the documented one first. */
+  readonly keys?: ReadonlyArray<string>;
+  readonly binds?: ReadonlyArray<string>;
+};
+
+export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Object.freeze({
+  registerFetchConfig: {
+    package: "@crewhaus/tool-fetch",
+    source: "tool_config",
+    label: "Fetch (and DependencyAudit's OSV mirror)",
+    keys: ["fetch"],
+  },
+  registerWebFetchConfig: {
+    package: "@crewhaus/tool-web",
+    source: "tool_config",
+    label: "WebFetch",
+    keys: ["webFetch"],
+  },
+  registerCodeExecutionConfig: {
+    package: "@crewhaus/tool-code-execution",
+    source: "tool_config",
+    label: "code execution (python, javascript, shell)",
+    keys: ["codeExecution", "code_execution"],
+  },
+  registerImageGenerationConfig: {
+    package: "@crewhaus/tool-image-generation",
+    source: "tool_config",
+    label: "ImageGenerate",
+    keys: ["imageGenerate"],
+  },
+  registerHttpConfig: {
+    package: "@crewhaus/tool-http",
+    source: "tool_config",
+    label: "the http tools",
+    keys: ["http"],
+  },
+  registerCodehostConfig: {
+    package: "@crewhaus/tool-codehost",
+    source: "tool_config",
+    label: "the codehost tools",
+    keys: ["codehost"],
+  },
+  registerNotifyConfig: {
+    package: "@crewhaus/tool-notify",
+    source: "tool_config",
+    label: "the notify tools",
+    keys: ["notify"],
+  },
+  registerObsConfig: {
+    package: "@crewhaus/tool-obs",
+    source: "tool_config",
+    label: "the obs tools",
+    keys: ["obs"],
+  },
+  registerDefiConfig: {
+    package: "@crewhaus/tool-defi",
+    source: "tool_config",
+    label: "the defi tools",
+    keys: ["defi"],
+  },
+  registerChainreadConfig: {
+    package: "@crewhaus/tool-chainread",
+    source: "tool_config",
+    label: "the chainread tools",
+    keys: ["chainread"],
+    binds: ["setRpcEndpointPolicy"],
+  },
+  registerDiscoveryConfig: {
+    package: "@crewhaus/tool-discovery",
+    source: "tool_config",
+    label: "FederationDiscover",
+    keys: ["federationDiscover"],
+    binds: ["setPeerPolicy"],
+  },
+  registerVectorDeleteConfig: {
+    package: "@crewhaus/tool-state",
+    source: "tool_config",
+    label: "VectorDelete",
+    keys: ["vectorDelete"],
+    binds: ["registerVectorTarget"],
+  },
+  registerTokenConfig: {
+    package: "@crewhaus/tool-token",
+    source: "tool_config",
+    label: "the token tools",
+    keys: ["token"],
+    binds: ["_setMetadataFetch"],
+  },
+  bindTokenChains: {
+    package: "@crewhaus/tool-token",
+    source: "chains",
+    label: "the token tools",
+    binds: ["_setChainReader"],
+  },
+  bindChainCallChains: {
+    package: "@crewhaus/tool-chaincall",
+    source: "chains",
+    label: "the chaincall tools",
+    binds: ["setChainRpcResolver"],
+  },
+  bindEvmChains: {
+    package: "@crewhaus/tool-evm",
+    source: "chains",
+    label: "the evm tools",
+    binds: ["setEvmAdapterResolver"],
+  },
+  bindEvmTxChains: {
+    package: "@crewhaus/tool-evm-tx",
+    source: "chains",
+    label: "EvmSimulate and EvmSendTransaction",
+    binds: ["setWalletResolver", "setTransactionPolicyResolver", "setWalletEngineResolver"],
+  },
+});
+
+/**
+ * Boot seams a host binds from a spec block of its own rather than from a
+ * tool row. `callers` are repo paths that must call the seam; the guard reads
+ * each one, so a row cannot outlive its binding.
+ */
+export const HOST_BOOT_SEAMS: Readonly<
+  Record<
+    string,
+    { readonly package: string; readonly by: string; readonly callers: ReadonlyArray<string> }
+  >
+> = Object.freeze({
+  registerRetrieveConfig: {
+    package: "@crewhaus/tool-retrieve",
+    by: "the pipeline shape's retrieve block, and the knowledge block",
+    callers: ["packages/target-pipeline/src/index.ts", "apps/cli/src/knowledge-ingest.ts"],
+  },
+  registerMcpServer: {
+    package: "@crewhaus/tool-mcp",
+    by: "the mcp_servers block",
+    callers: [
+      "packages/target-cli/src/index.ts",
+      "apps/cli/src/index.ts",
+      "packages/eval-runner/src/wire-once.ts",
+    ],
+  },
+  registerOptionalMcpServer: {
+    package: "@crewhaus/tool-mcp",
+    by: "the mcp_servers block, for a server marked optional",
+    callers: [
+      "packages/target-cli/src/index.ts",
+      "apps/cli/src/index.ts",
+      "packages/eval-runner/src/wire-once.ts",
+    ],
+  },
+  registerMcpToolAliases: {
+    package: "@crewhaus/tool-mcp",
+    by: "the thredz block",
+    callers: ["packages/memory-service/src/thredz.ts"],
+  },
+  registerChannelAdapter: {
+    package: "@crewhaus/tool-message-channel",
+    by: "the channel shape's channels block",
+    callers: ["packages/target-channel-bot/src/index.ts"],
+  },
+  registerToolConfigs: {
+    package: "@crewhaus/tool-categories",
+    by: "tool_config and the chain blocks, in the hosts that run a spec without compiling it",
+    callers: ["apps/cli/src/index.ts", "packages/eval-runner/src/wire-once.ts"],
+  },
+});
+
+/**
+ * Boot seams nothing binds on purpose, each with the reason its unbound state
+ * is a correct answer rather than a broken tool.
+ */
+export const OPTIONAL_BOOT_SEAMS: Readonly<
+  Record<string, { readonly package: string; readonly why: string }>
+> = Object.freeze({
+  setMarketplaceTrustRoot: {
+    package: "@crewhaus/tool-discovery",
+    why: "unbound, MarketplaceSearch reports a signed manifest's verdict as unknown, never as trusted; a trust root a spec could supply would vouch for its own templates",
+  },
+  registerDocumentParser: {
+    package: "@crewhaus/tool-document-ingest",
+    why: "DocumentIngest reads text, tabular and structured files itself; a binary format such as .pdf needs a parser library this release does not ship, and without one that format is refused by name",
+  },
+});
+
+/**
+ * What a `chains`-sourced registrar receives: the spec's chain blocks, with
+ * every `$VAR` reference already read from the environment. A wallet's
+ * `keyRef` is left out — nothing in this release signs.
+ */
+export type ChainBootConfig = {
+  readonly chains: ReadonlyArray<{
+    readonly chainId: string;
+    readonly rpcUrls: ReadonlyArray<string>;
+    readonly rpcPolicy: "single" | "quorum" | "fallback";
+    readonly finality:
+      | { readonly kind: "confirmations"; readonly count: number }
+      | { readonly kind: "finalized" }
+      | { readonly kind: "safe" };
+    readonly reorgTolerant: boolean;
+  }>;
+  readonly wallets?: ReadonlyArray<{
+    readonly id: string;
+    readonly chainId: string;
+    readonly custody: "user-controlled" | "kms" | "hsm" | "local";
+    readonly signingPolicy: "explicit-user-approval" | "policy-gated" | "automated";
+  }>;
+  readonly contracts?: ReadonlyArray<{ readonly id: string; readonly address: string }>;
+  readonly transactionPolicy?: {
+    readonly defaultWriteApproval: "required" | "policy" | "none";
+    readonly maxValueUsd?: number;
+    readonly maxValueWei?: string;
+    readonly allowedContracts: ReadonlyArray<string>;
+    readonly simulationRequired: boolean;
+  };
+};
+
 const EVM_WALLET_UNBOUND =
-  "nothing binds the wallet it signs with in this release, so every call would fail";
+  "no custody provider that can sign ships in this release, so every call would fail. EvmSimulate runs the same transaction without signing";
 
 export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.freeze({
   read: { package: "@crewhaus/tool-fs", export: "read", name: "Read" },
@@ -548,87 +792,120 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-http",
     export: "httpRequest",
     name: "HttpRequest",
+    initSymbol: "registerHttpConfig",
     io: "network",
+    justify: true,
   },
   httpPaginate: {
     package: "@crewhaus/tool-http",
     export: "httpPaginate",
     name: "HttpPaginate",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   graphqlQuery: {
     package: "@crewhaus/tool-http",
     export: "graphqlQuery",
     name: "GraphqlQuery",
+    initSymbol: "registerHttpConfig",
     io: "network",
+    justify: true,
   },
   httpBatch: {
     package: "@crewhaus/tool-http",
     export: "httpBatch",
     name: "HttpBatch",
+    initSymbol: "registerHttpConfig",
     io: "network",
+    justify: true,
   },
   downloadFile: {
     package: "@crewhaus/tool-http",
     export: "downloadFile",
     name: "DownloadFile",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   headRequest: {
     package: "@crewhaus/tool-http",
     export: "headRequest",
     name: "HeadRequest",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   urlReachable: {
     package: "@crewhaus/tool-http",
     export: "urlReachable",
     name: "UrlReachable",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   linkCheck: {
     package: "@crewhaus/tool-http",
     export: "linkCheck",
     name: "LinkCheck",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   httpWaitFor: {
     package: "@crewhaus/tool-http",
     export: "httpWaitFor",
     name: "HttpWaitFor",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
-  sseRead: { package: "@crewhaus/tool-http", export: "sseRead", name: "SseRead", io: "network" },
-  webhookSign: { package: "@crewhaus/tool-http", export: "webhookSign", name: "WebhookSign" },
-  webhookVerify: { package: "@crewhaus/tool-http", export: "webhookVerify", name: "WebhookVerify" },
+  sseRead: {
+    package: "@crewhaus/tool-http",
+    export: "sseRead",
+    name: "SseRead",
+    initSymbol: "registerHttpConfig",
+    io: "network",
+  },
+  webhookSign: {
+    package: "@crewhaus/tool-http",
+    export: "webhookSign",
+    name: "WebhookSign",
+    initSymbol: "registerHttpConfig",
+  },
+  webhookVerify: {
+    package: "@crewhaus/tool-http",
+    export: "webhookVerify",
+    name: "WebhookVerify",
+    initSymbol: "registerHttpConfig",
+  },
   dnsLookup: {
     package: "@crewhaus/tool-http",
     export: "dnsLookup",
     name: "DnsLookup",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   tlsInspect: {
     package: "@crewhaus/tool-http",
     export: "tlsInspect",
     name: "TlsInspect",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   robotsCheck: {
     package: "@crewhaus/tool-http",
     export: "robotsCheck",
     name: "RobotsCheck",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   sitemapParse: {
     package: "@crewhaus/tool-http",
     export: "sitemapParse",
     name: "SitemapParse",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   feedParse: {
     package: "@crewhaus/tool-http",
     export: "feedParse",
     name: "FeedParse",
+    initSymbol: "registerHttpConfig",
     io: "network",
   },
   kvSet: { package: "@crewhaus/tool-state", export: "kvSet", name: "KvSet" },
@@ -805,151 +1082,196 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "stackTraceParse",
     name: "StackTraceParse",
   },
-  prList: { package: "@crewhaus/tool-codehost", export: "prList", name: "PrList", io: "network" },
-  prGet: { package: "@crewhaus/tool-codehost", export: "prGet", name: "PrGet", io: "network" },
+  prList: {
+    package: "@crewhaus/tool-codehost",
+    export: "prList",
+    name: "PrList",
+    initSymbol: "registerCodehostConfig",
+    io: "network",
+  },
+  prGet: {
+    package: "@crewhaus/tool-codehost",
+    export: "prGet",
+    name: "PrGet",
+    initSymbol: "registerCodehostConfig",
+    io: "network",
+  },
   prFiles: {
     package: "@crewhaus/tool-codehost",
     export: "prFiles",
     name: "PrFiles",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   prComments: {
     package: "@crewhaus/tool-codehost",
     export: "prComments",
     name: "PrComments",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   prReviews: {
     package: "@crewhaus/tool-codehost",
     export: "prReviews",
     name: "PrReviews",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   issueList: {
     package: "@crewhaus/tool-codehost",
     export: "issueList",
     name: "IssueList",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   issueGet: {
     package: "@crewhaus/tool-codehost",
     export: "issueGet",
     name: "IssueGet",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   checkRuns: {
     package: "@crewhaus/tool-codehost",
     export: "checkRuns",
     name: "CheckRuns",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   workflowRuns: {
     package: "@crewhaus/tool-codehost",
     export: "workflowRuns",
     name: "WorkflowRuns",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   workflowRunLogs: {
     package: "@crewhaus/tool-codehost",
     export: "workflowRunLogs",
     name: "WorkflowRunLogs",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   releaseList: {
     package: "@crewhaus/tool-codehost",
     export: "releaseList",
     name: "ReleaseList",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   releaseGet: {
     package: "@crewhaus/tool-codehost",
     export: "releaseGet",
     name: "ReleaseGet",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   repoGet: {
     package: "@crewhaus/tool-codehost",
     export: "repoGet",
     name: "RepoGet",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   compareRefs: {
     package: "@crewhaus/tool-codehost",
     export: "compareRefs",
     name: "CompareRefs",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   searchCode: {
     package: "@crewhaus/tool-codehost",
     export: "searchCode",
     name: "SearchCode",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   searchIssues: {
     package: "@crewhaus/tool-codehost",
     export: "searchIssues",
     name: "SearchIssues",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   rateLimitStatus: {
     package: "@crewhaus/tool-codehost",
     export: "rateLimitStatus",
     name: "RateLimitStatus",
+    initSymbol: "registerCodehostConfig",
     io: "network",
   },
   prCreate: {
     package: "@crewhaus/tool-codehost",
     export: "prCreate",
     name: "PrCreate",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   prUpdate: {
     package: "@crewhaus/tool-codehost",
     export: "prUpdate",
     name: "PrUpdate",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   prComment: {
     package: "@crewhaus/tool-codehost",
     export: "prComment",
     name: "PrComment",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   prReviewSubmit: {
     package: "@crewhaus/tool-codehost",
     export: "prReviewSubmit",
     name: "PrReviewSubmit",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   issueCreate: {
     package: "@crewhaus/tool-codehost",
     export: "issueCreate",
     name: "IssueCreate",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   issueUpdate: {
     package: "@crewhaus/tool-codehost",
     export: "issueUpdate",
     name: "IssueUpdate",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   issueComment: {
     package: "@crewhaus/tool-codehost",
     export: "issueComment",
     name: "IssueComment",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   releaseCreate: {
     package: "@crewhaus/tool-codehost",
     export: "releaseCreate",
     name: "ReleaseCreate",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   workflowRunRerun: {
     package: "@crewhaus/tool-codehost",
     export: "workflowRunRerun",
     name: "WorkflowRunRerun",
+    initSymbol: "registerCodehostConfig",
     io: "network",
+    justify: true,
   },
   sqlQuery: { package: "@crewhaus/tool-sql", export: "sqlQuery", name: "SqlQuery" },
   sqlExec: { package: "@crewhaus/tool-sql", export: "sqlExec", name: "SqlExec" },
@@ -1117,106 +1439,199 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-notify",
     export: "chatPost",
     name: "ChatPost",
+    initSymbol: "registerNotifyConfig",
     io: "network",
+    justify: true,
   },
   chatUpdate: {
     package: "@crewhaus/tool-notify",
     export: "chatUpdate",
     name: "ChatUpdate",
+    initSymbol: "registerNotifyConfig",
     io: "network",
+    justify: true,
   },
   chatDelete: {
     package: "@crewhaus/tool-notify",
     export: "chatDelete",
     name: "ChatDelete",
+    initSymbol: "registerNotifyConfig",
     io: "network",
+    justify: true,
   },
   chatReact: {
     package: "@crewhaus/tool-notify",
     export: "chatReact",
     name: "ChatReact",
+    initSymbol: "registerNotifyConfig",
     io: "network",
+    justify: true,
   },
-  emailCompose: { package: "@crewhaus/tool-notify", export: "emailCompose", name: "EmailCompose" },
+  emailCompose: {
+    package: "@crewhaus/tool-notify",
+    export: "emailCompose",
+    name: "EmailCompose",
+    initSymbol: "registerNotifyConfig",
+  },
   emailSend: {
     package: "@crewhaus/tool-notify",
     export: "emailSend",
     name: "EmailSend",
+    initSymbol: "registerNotifyConfig",
     io: "network",
+    justify: true,
   },
   webhookPost: {
     package: "@crewhaus/tool-notify",
     export: "webhookPost",
     name: "WebhookPost",
+    initSymbol: "registerNotifyConfig",
     io: "network",
+    justify: true,
   },
-  smsSend: { package: "@crewhaus/tool-notify", export: "smsSend", name: "SmsSend", io: "network" },
+  smsSend: {
+    package: "@crewhaus/tool-notify",
+    export: "smsSend",
+    name: "SmsSend",
+    initSymbol: "registerNotifyConfig",
+    io: "network",
+    justify: true,
+  },
   pushNotify: {
     package: "@crewhaus/tool-notify",
     export: "pushNotify",
     name: "PushNotify",
+    initSymbol: "registerNotifyConfig",
     io: "network",
+    justify: true,
   },
   deliveryCheck: {
     package: "@crewhaus/tool-notify",
     export: "deliveryCheck",
     name: "DeliveryCheck",
+    initSymbol: "registerNotifyConfig",
     io: "network",
   },
-  notifyDigest: { package: "@crewhaus/tool-notify", export: "notifyDigest", name: "NotifyDigest" },
-  quietHours: { package: "@crewhaus/tool-notify", export: "quietHours", name: "QuietHours" },
+  notifyDigest: {
+    package: "@crewhaus/tool-notify",
+    export: "notifyDigest",
+    name: "NotifyDigest",
+    initSymbol: "registerNotifyConfig",
+  },
+  quietHours: {
+    package: "@crewhaus/tool-notify",
+    export: "quietHours",
+    name: "QuietHours",
+    initSymbol: "registerNotifyConfig",
+  },
   rateLimitGate: {
     package: "@crewhaus/tool-notify",
     export: "rateLimitGate",
     name: "RateLimitGate",
+    initSymbol: "registerNotifyConfig",
   },
   messageTemplate: {
     package: "@crewhaus/tool-notify",
     export: "messageTemplate",
     name: "MessageTemplate",
+    initSymbol: "registerNotifyConfig",
   },
-  eventQuery: { package: "@crewhaus/tool-obs", export: "eventQuery", name: "EventQuery" },
-  eventCounts: { package: "@crewhaus/tool-obs", export: "eventCounts", name: "EventCounts" },
-  toolCallStats: { package: "@crewhaus/tool-obs", export: "toolCallStats", name: "ToolCallStats" },
-  errorCluster: { package: "@crewhaus/tool-obs", export: "errorCluster", name: "ErrorCluster" },
-  runTimeline: { package: "@crewhaus/tool-obs", export: "runTimeline", name: "RunTimeline" },
-  costReport: { package: "@crewhaus/tool-obs", export: "costReport", name: "CostReport" },
-  budgetCheck: { package: "@crewhaus/tool-obs", export: "budgetCheck", name: "BudgetCheck" },
-  sloEvaluate: { package: "@crewhaus/tool-obs", export: "sloEvaluate", name: "SloEvaluate" },
+  eventQuery: {
+    package: "@crewhaus/tool-obs",
+    export: "eventQuery",
+    name: "EventQuery",
+    initSymbol: "registerObsConfig",
+  },
+  eventCounts: {
+    package: "@crewhaus/tool-obs",
+    export: "eventCounts",
+    name: "EventCounts",
+    initSymbol: "registerObsConfig",
+  },
+  toolCallStats: {
+    package: "@crewhaus/tool-obs",
+    export: "toolCallStats",
+    name: "ToolCallStats",
+    initSymbol: "registerObsConfig",
+  },
+  errorCluster: {
+    package: "@crewhaus/tool-obs",
+    export: "errorCluster",
+    name: "ErrorCluster",
+    initSymbol: "registerObsConfig",
+  },
+  runTimeline: {
+    package: "@crewhaus/tool-obs",
+    export: "runTimeline",
+    name: "RunTimeline",
+    initSymbol: "registerObsConfig",
+  },
+  costReport: {
+    package: "@crewhaus/tool-obs",
+    export: "costReport",
+    name: "CostReport",
+    initSymbol: "registerObsConfig",
+  },
+  budgetCheck: {
+    package: "@crewhaus/tool-obs",
+    export: "budgetCheck",
+    name: "BudgetCheck",
+    initSymbol: "registerObsConfig",
+  },
+  sloEvaluate: {
+    package: "@crewhaus/tool-obs",
+    export: "sloEvaluate",
+    name: "SloEvaluate",
+    initSymbol: "registerObsConfig",
+  },
   incidentBundle: {
     package: "@crewhaus/tool-obs",
     export: "incidentBundle",
     name: "IncidentBundle",
+    initSymbol: "registerObsConfig",
   },
   metricsQuery: {
     package: "@crewhaus/tool-obs",
     export: "metricsQuery",
     name: "MetricsQuery",
+    initSymbol: "registerObsConfig",
     io: "network",
   },
   logsQuery: {
     package: "@crewhaus/tool-obs",
     export: "logsQuery",
     name: "LogsQuery",
+    initSymbol: "registerObsConfig",
     io: "network",
   },
   alertList: {
     package: "@crewhaus/tool-obs",
     export: "alertList",
     name: "AlertList",
+    initSymbol: "registerObsConfig",
     io: "network",
   },
-  alertAck: { package: "@crewhaus/tool-obs", export: "alertAck", name: "AlertAck", io: "network" },
+  alertAck: {
+    package: "@crewhaus/tool-obs",
+    export: "alertAck",
+    name: "AlertAck",
+    initSymbol: "registerObsConfig",
+    io: "network",
+    justify: true,
+  },
   statusPagePost: {
     package: "@crewhaus/tool-obs",
     export: "statusPagePost",
     name: "StatusPagePost",
+    initSymbol: "registerObsConfig",
     io: "network",
+    justify: true,
   },
   healthProbe: {
     package: "@crewhaus/tool-obs",
     export: "healthProbe",
     name: "HealthProbe",
+    initSymbol: "registerObsConfig",
     io: "network",
   },
   imageInfo: { package: "@crewhaus/tool-media", export: "imageInfo", name: "ImageInfo" },
@@ -1383,7 +1798,12 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "goldenCompare",
     name: "GoldenCompare",
   },
-  goldenUpdate: { package: "@crewhaus/tool-verify", export: "goldenUpdate", name: "GoldenUpdate" },
+  goldenUpdate: {
+    package: "@crewhaus/tool-verify",
+    export: "goldenUpdate",
+    name: "GoldenUpdate",
+    justify: true,
+  },
   markdownLinkCheck: {
     package: "@crewhaus/tool-verify",
     export: "markdownLinkCheck",
@@ -1457,11 +1877,13 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-registry",
     export: "manifestDependencySet",
     name: "ManifestDependencySet",
+    justify: true,
   },
   dependencyAudit: {
     package: "@crewhaus/tool-supplychain",
     export: "dependencyAudit",
     name: "DependencyAudit",
+    initSymbol: "registerFetchConfig",
     io: "network",
   },
   ciWorkflowAudit: {
@@ -1490,108 +1912,129 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-chainread",
     export: "evmGetBlock",
     name: "EvmGetBlock",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   evmBlockAtTimestamp: {
     package: "@crewhaus/tool-chainread",
     export: "evmBlockAtTimestamp",
     name: "EvmBlockAtTimestamp",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   evmRpcHealth: {
     package: "@crewhaus/tool-chainread",
     export: "evmRpcHealth",
     name: "EvmRpcHealth",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   evmNonceStatus: {
     package: "@crewhaus/tool-chainread",
     export: "evmNonceStatus",
     name: "EvmNonceStatus",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   evmWaitForReceipt: {
     package: "@crewhaus/tool-chainread",
     export: "evmWaitForReceipt",
     name: "EvmWaitForReceipt",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   evmTransactionSummary: {
     package: "@crewhaus/tool-chainread",
     export: "evmTransactionSummary",
     name: "EvmTransactionSummary",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   evmEventScan: {
     package: "@crewhaus/tool-chainread",
     export: "evmEventScan",
     name: "EvmEventScan",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   evmMulticall: {
     package: "@crewhaus/tool-chaincall",
     export: "evmMulticall",
     name: "EvmMulticall",
+    chainSymbol: "bindChainCallChains",
     io: "network",
   },
   contractInspect: {
     package: "@crewhaus/tool-chaincall",
     export: "contractInspect",
     name: "ContractInspect",
+    chainSymbol: "bindChainCallChains",
     io: "network",
   },
   evmSimulateBundle: {
     package: "@crewhaus/tool-chaincall",
     export: "evmSimulateBundle",
     name: "EvmSimulateBundle",
+    chainSymbol: "bindChainCallChains",
     io: "network",
   },
   gasMarketRead: {
     package: "@crewhaus/tool-chaincall",
     export: "gasMarketRead",
     name: "GasMarketRead",
+    chainSymbol: "bindChainCallChains",
     io: "network",
   },
   tokenResolve: {
     package: "@crewhaus/tool-token",
     export: "tokenResolve",
     name: "TokenResolve",
+    initSymbol: "registerTokenConfig",
+    chainSymbol: "bindTokenChains",
     io: "network",
   },
   erc20Balance: {
     package: "@crewhaus/tool-token",
     export: "erc20Balance",
     name: "Erc20Balance",
+    initSymbol: "registerTokenConfig",
+    chainSymbol: "bindTokenChains",
     io: "network",
   },
   erc721TokenInfo: {
     package: "@crewhaus/tool-token",
     export: "erc721TokenInfo",
     name: "Erc721TokenInfo",
+    initSymbol: "registerTokenConfig",
+    chainSymbol: "bindTokenChains",
     io: "network",
   },
   priceQuote: {
     package: "@crewhaus/tool-defi",
     export: "priceQuote",
     name: "PriceQuote",
+    initSymbol: "registerDefiConfig",
     io: "network",
   },
   oraclePriceRead: {
     package: "@crewhaus/tool-defi",
     export: "oraclePriceRead",
     name: "OraclePriceRead",
+    initSymbol: "registerDefiConfig",
     io: "network",
   },
   defiPositionRead: {
     package: "@crewhaus/tool-defi",
     export: "defiPositionRead",
     name: "DefiPositionRead",
+    initSymbol: "registerDefiConfig",
     io: "network",
   },
   portfolioValuation: {
     package: "@crewhaus/tool-defi",
     export: "portfolioValuation",
     name: "PortfolioValuation",
+    initSymbol: "registerDefiConfig",
     io: "network",
   },
   ledgerPost: { package: "@crewhaus/tool-ledger", export: "ledgerPost", name: "LedgerPost" },
@@ -1678,6 +2121,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "secretRotate",
     name: "SecretRotate",
     io: "process",
+    justify: true,
   },
   watchPath: { package: "@crewhaus/tool-hostfs", export: "watchPath", name: "WatchPath" },
   trashPath: { package: "@crewhaus/tool-hostfs", export: "trashPath", name: "TrashPath" },
@@ -1693,6 +2137,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "cronDelete",
     name: "CronDelete",
     io: "process",
+    justify: true,
   },
   packageManifestGenerate: {
     package: "@crewhaus/tool-distribution",
@@ -1716,12 +2161,14 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "packageInstall",
     name: "PackageInstall",
     io: "process",
+    justify: true,
   },
   clipboardRead: {
     package: "@crewhaus/tool-desktop",
     export: "clipboardRead",
     name: "ClipboardRead",
     io: "process",
+    justify: true,
   },
   clipboardWrite: {
     package: "@crewhaus/tool-desktop",
@@ -1746,6 +2193,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "printDocument",
     name: "PrintDocument",
     io: "process",
+    justify: true,
   },
   windowList: {
     package: "@crewhaus/tool-desktop",
@@ -1817,21 +2265,25 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-lifecycle",
     export: "harnessRetire",
     name: "HarnessRetire",
+    justify: true,
   },
   storeMigrate: {
     package: "@crewhaus/tool-lifecycle",
     export: "storeMigrate",
     name: "StoreMigrate",
+    justify: true,
   },
   retentionEnforce: {
     package: "@crewhaus/tool-lifecycle",
     export: "retentionEnforce",
     name: "RetentionEnforce",
+    justify: true,
   },
   knowledgeSync: {
     package: "@crewhaus/tool-lifecycle",
     export: "knowledgeSync",
     name: "KnowledgeSync",
+    justify: true,
   },
   harnessRegister: {
     package: "@crewhaus/tool-fleet",
@@ -1856,22 +2308,34 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     io: "process",
   },
   hooksManage: { package: "@crewhaus/tool-fleet", export: "hooksManage", name: "HooksManage" },
-  specPin: { package: "@crewhaus/tool-deploy", export: "specPin", name: "SpecPin" },
+  specPin: {
+    package: "@crewhaus/tool-deploy",
+    export: "specPin",
+    name: "SpecPin",
+    justify: true,
+  },
   deployRollback: {
     package: "@crewhaus/tool-deploy",
     export: "deployRollback",
     name: "DeployRollback",
+    justify: true,
   },
   deployInspect: {
     package: "@crewhaus/tool-deploy",
     export: "deployInspect",
     name: "DeployInspect",
   },
-  routeControl: { package: "@crewhaus/tool-routing", export: "routeControl", name: "RouteControl" },
+  routeControl: {
+    package: "@crewhaus/tool-routing",
+    export: "routeControl",
+    name: "RouteControl",
+    justify: true,
+  },
   experimentLedger: {
     package: "@crewhaus/tool-routing",
     export: "experimentLedger",
     name: "ExperimentLedger",
+    justify: true,
   },
   flywheelStatus: {
     package: "@crewhaus/tool-routing",
@@ -1892,6 +2356,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-discovery",
     export: "federationDiscover",
     name: "FederationDiscover",
+    initSymbol: "registerDiscoveryConfig",
     io: "network",
   },
   factCrossCheck: {
@@ -1903,23 +2368,28 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-state",
     export: "vectorDelete",
     name: "VectorDelete",
+    initSymbol: "registerVectorDeleteConfig",
     io: "network",
+    justify: true,
   },
   emailSendPreflight: {
     package: "@crewhaus/tool-notify",
     export: "emailSendPreflight",
     name: "EmailSendPreflight",
+    initSymbol: "registerNotifyConfig",
   },
   deliverabilityCheck: {
     package: "@crewhaus/tool-notify",
     export: "deliverabilityCheck",
     name: "DeliverabilityCheck",
+    initSymbol: "registerNotifyConfig",
     io: "network",
   },
   emitTraceEvent: {
     package: "@crewhaus/tool-obs",
     export: "emitTraceEvent",
     name: "EmitTraceEvent",
+    initSymbol: "registerObsConfig",
   },
   localTime: { package: "@crewhaus/tool-datetime", export: "localTime", name: "LocalTime" },
   leadAssign: { package: "@crewhaus/tool-flow", export: "leadAssign", name: "LeadAssign" },
@@ -1928,6 +2398,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-chainread",
     export: "onchainTransactionsSync",
     name: "OnchainTransactionsSync",
+    initSymbol: "registerChainreadConfig",
     io: "network",
   },
   seoLint: { package: "@crewhaus/tool-verify", export: "seoLint", name: "SeoLint" },
@@ -1965,6 +2436,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "sendMessage",
     name: "SendMessage",
     io: "network",
+    justify: true,
     edge: true,
     shapes: ["channel"],
   },
@@ -1972,49 +2444,51 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-evm",
     export: "evmCall",
     name: "EvmCall",
+    chainSymbol: "bindEvmChains",
     shapes: ["graph", "workflow", "crew"],
-    inert: EVM_ADAPTER_UNBOUND,
   },
   evmGetLogs: {
     package: "@crewhaus/tool-evm",
     export: "evmGetLogs",
     name: "EvmGetLogs",
+    chainSymbol: "bindEvmChains",
     shapes: ["graph", "workflow", "crew"],
-    inert: EVM_ADAPTER_UNBOUND,
   },
   evmGetTransaction: {
     package: "@crewhaus/tool-evm",
     export: "evmGetTransaction",
     name: "EvmGetTransaction",
+    chainSymbol: "bindEvmChains",
     shapes: ["graph", "workflow", "crew"],
-    inert: EVM_ADAPTER_UNBOUND,
   },
   evmGetTransactionReceipt: {
     package: "@crewhaus/tool-evm",
     export: "evmGetTransactionReceipt",
     name: "EvmGetTransactionReceipt",
+    chainSymbol: "bindEvmChains",
     shapes: ["graph", "workflow", "crew"],
-    inert: EVM_ADAPTER_UNBOUND,
   },
   evmGetBalance: {
     package: "@crewhaus/tool-evm",
     export: "evmGetBalance",
     name: "EvmGetBalance",
+    chainSymbol: "bindEvmChains",
     shapes: ["graph", "workflow", "crew"],
-    inert: EVM_ADAPTER_UNBOUND,
   },
   evmBlockNumber: {
     package: "@crewhaus/tool-evm",
     export: "evmBlockNumber",
     name: "EvmBlockNumber",
+    chainSymbol: "bindEvmChains",
     shapes: ["graph", "workflow", "crew"],
-    inert: EVM_ADAPTER_UNBOUND,
   },
   evmSendTransaction: {
     package: "@crewhaus/tool-evm-tx",
     export: "evmSendTransaction",
     name: "EvmSendTransaction",
+    chainSymbol: "bindEvmTxChains",
     io: "network",
+    justify: true,
     shapes: ["graph", "workflow", "crew"],
     withheld: EVM_WALLET_UNBOUND,
   },
@@ -2022,7 +2496,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-evm-tx",
     export: "evmSimulate",
     name: "EvmSimulate",
+    chainSymbol: "bindEvmTxChains",
     shapes: ["graph", "workflow", "crew"],
-    withheld: EVM_WALLET_UNBOUND,
   },
 });

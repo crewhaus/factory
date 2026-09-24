@@ -46,16 +46,50 @@ describe("0.7.0 tools and categories compile on every host shape", () => {
   });
 
   test("a withheld builtin is refused on the shape that used to emit it (flag-truth-6#7)", () => {
-    expect(() => compile(graph("[evmSimulate]"))).toThrow(
-      /nodes\.plan\.tools: tool "evmSimulate" is a builtin, but no shape can run it: nothing binds the wallet/,
+    expect(() => compile(graph("[evmSendTransaction]"))).toThrow(
+      /nodes\.plan\.tools: tool "evmSendTransaction" is a builtin, but no shape can run it: no custody provider that can sign ships in this release/,
     );
   });
 
-  test("an inert builtin still compiles where 0.7.0 compiled it, with a tool-unwired warning", () => {
+  test("a chain reader with no chains block compiles with a warning that says what to write", () => {
     const result = compile(graph("[evmCall]"));
     const warning = result.warnings.find((w) => w.code === "tool-unwired");
     expect(warning?.path).toBe("nodes.plan.tools");
-    expect(warning?.message).toContain("no chain adapter is bound");
+    expect(warning?.message).toBe(
+      'tool "evmCall" reads a chain, and the spec declares none, so every call returns an error. Declare it — chains: [{ id: "1", kind: evm, rpcUrls: [$ETH_RPC_URL], finality: { kind: finalized } }].',
+    );
+  });
+
+  test("on a shape that cannot declare chains, the warning says to remove the tool instead", () => {
+    const yaml = [
+      "name: b",
+      "target: browser",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "tools: [gasMarketRead]",
+    ].join("\n");
+    const warning = compile(yaml).warnings.find((w) => w.code === "tool-unwired");
+    expect(warning?.message).toBe(
+      'tool "gasMarketRead" reads a chain, and the browser shape cannot declare one, so every call returns an error. Remove it from tools, or use a shape that takes a chains block, such as cli.',
+    );
+    expect(
+      compile(cli("[gasMarketRead]")).warnings.find((w) => w.code === "tool-unwired")?.message,
+    ).toContain("Declare it — chains: [");
+  });
+
+  test("with a chains block the chain tools are bound at boot, the RPC URL read from the environment", () => {
+    const yaml = `${graph("[evmCall, evmSimulate]")}\nchains:\n  - id: "1"\n    kind: evm\n    rpcUrls: [$ETH_RPC_URL]\n    finality: { kind: finalized }\nwallets:\n  - { id: ops, chainId: "1", custody: user-controlled }\n`;
+    const result = compile(yaml);
+    expect(result.warnings.filter((w) => w.code === "tool-unwired")).toEqual([]);
+    const ts = result.files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(ts).toContain('import { bindEvmChains, evmCall } from "@crewhaus/tool-evm";');
+    expect(ts).toContain('import { bindEvmTxChains, evmSimulate } from "@crewhaus/tool-evm-tx";');
+    expect(ts).toContain(
+      'applyToolConfig(bindEvmChains, {"chains":[{"chainId":"1","rpcUrls":["$ETH_RPC_URL"]',
+    );
+    expect(ts).toContain("applyToolConfig(bindEvmTxChains, ");
+    expect(ts).toContain('"wallets":[{"id":"ops","chainId":"1","custody":"user-controlled"');
   });
 
   test("a name that is not a builtin is still 'unknown', with a hint", () => {

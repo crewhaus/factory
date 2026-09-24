@@ -29,7 +29,7 @@
 import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
 import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { builtinToolsFor, registeredToolName } from "@crewhaus/tool-categories";
+import { builtinToolsFor, registeredToolName, toolConfigHint } from "@crewhaus/tool-categories";
 
 // -------- tools list --------
 
@@ -1539,6 +1539,8 @@ export type ToolDetail = {
   readonly concurrencySafe: boolean;
   /** Top-level input field names, derived from the tool's own JSON Schema. */
   readonly inputFields: ReadonlyArray<string>;
+  /** What a spec writes to configure it (`tool_config.http`), when it takes any. */
+  readonly configure?: string;
 };
 
 /**
@@ -1567,6 +1569,7 @@ export function buildToolDetail(
     requireJustification: tool.requireJustification ?? false,
     concurrencySafe: tool.concurrencySafe ?? false,
     inputFields: inputFieldNames(tool),
+    ...(toolConfigHint(key) !== undefined ? { configure: toolConfigHint(key) } : {}),
   };
 }
 
@@ -1626,6 +1629,7 @@ export function formatToolDetailLines(d: ToolDetail): string[] {
     `  flags       ${flags.join(", ")}`,
     `  categories  ${d.categories.length > 0 ? d.categories.map((c) => `all-${c}`).join(", ") : "(uncategorized)"}`,
     `  input       ${d.inputFields.length > 0 ? d.inputFields.join(", ") : "(no declared fields)"}`,
+    ...(d.configure !== undefined ? [`  configure   ${d.configure}`] : []),
     "",
     `  enable with  tools: [${d.key}]`,
   ];

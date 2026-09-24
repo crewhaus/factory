@@ -38,6 +38,8 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  type SpecChainBlocks,
+  readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
 
@@ -87,7 +89,19 @@ export function emitCrew(ir: IrCrewV0, opts: EmitCrewOptions = {}): Bundle {
   // Item 42 — generated bundle README; default ON (`crewhaus compile
   // --no-readme` opts out).
   if (opts.readme !== false) {
-    files.push({ path: "README.md", content: renderBundleReadme(ir) });
+    files.push({
+      path: "README.md",
+      content: renderBundleReadme(ir, {
+        toolFacts: readmeToolFacts(
+          ir.roles.map((role) => ({
+            tools: role.tools,
+            toolConfigs: role.toolConfigs,
+            path: `roles.${role.name}.tool_config`,
+          })),
+          ir,
+        ),
+      }),
+    });
   }
   return { files };
 }
@@ -106,6 +120,7 @@ function safeFileName(role: string): string {
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
+  chains?: SpecChainBlocks,
 ): {
   imports: ReadonlyArray<string>;
   inits: ReadonlyArray<string>;
@@ -115,7 +130,7 @@ function resolveTools(
   if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("crew", [{ tools: toolNames, toolConfigs }]);
+    resolved = resolveBuiltinTools("crew", [{ tools: toolNames, toolConfigs }], chains);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;
@@ -436,7 +451,7 @@ function renderRoleTuningFields(role: IrCrewRole): string {
 }
 
 function renderRoleAgent(ir: IrCrewV0, role: IrCrewRole): string {
-  const { imports, inits, registrations } = resolveTools(role.tools, role.toolConfigs);
+  const { imports, inits, registrations } = resolveTools(role.tools, role.toolConfigs, ir);
   const hasSubAgents = role.subAgents.length > 0;
   // Section 13 (Batch A, G34) — the role's inline sub-agent definitions:
   // rendered as a Map for the Task tool (createTaskTool resolves

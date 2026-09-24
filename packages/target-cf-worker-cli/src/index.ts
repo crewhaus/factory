@@ -2,7 +2,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import { type Bundle, type IrLimits, type IrV0, renderBundleReadme } from "@crewhaus/ir";
 import { parseModelString } from "@crewhaus/model-router";
-import { resolveBuiltinTools } from "@crewhaus/tool-categories";
+import { readmeToolFacts, resolveBuiltinTools } from "@crewhaus/tool-categories";
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 
 export type EmitOptions = {
@@ -74,6 +74,7 @@ export function emitCfWorkerCli(ir: IrV0, opts: EmitOptions = {}): Bundle {
       content: renderBundleReadme(ir, {
         ...CF_WORKER_README_OPTS,
         unwiredTools: { names: new Set(wiring.unwired), note: CF_WORKER_UNWIRED_NOTE },
+        toolFacts: readmeToolFacts([{ tools: ir.tools, toolConfigs: ir.toolConfigs }]),
       }),
     });
   }
