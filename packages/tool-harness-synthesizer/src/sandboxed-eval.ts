@@ -10,6 +10,12 @@
  * `no-new-privileges`) and scores the returned verdicts on the host —
  * the container never receives the `expected` labels.
  *
+ * The wall-clock kill stops the container itself (the sandbox runs
+ * `docker kill` on a timeout), and the verifier's output is capped at
+ * {@link VERIFIER_MAX_OUTPUT_BYTES} per stream as it arrives, so code that
+ * loops or prints without end costs neither a stuck call nor host memory
+ * (security-6#0, security-6#8).
+ *
  * The container runs `VERIFIER_HARNESS` (a fixed `node -e` script). The
  * untrusted `code` is delivered as STDIN DATA, never interpolated into
  * that script string — so it cannot break out of the harness.
@@ -22,6 +28,15 @@ export const VERIFIER_SENTINEL = "__CREWHAUS_VERIFIER__";
 
 const VERIFIER_IMAGE = "node:22-alpine";
 const DEFAULT_TIMEOUT_MS = 10_000;
+
+/**
+ * Bytes of verifier stdout (and of stderr) kept on the host. The harness
+ * writes its one result line last, and the sandbox keeps the END of a
+ * stream that overflows, so the result survives anything the verifier
+ * prints first; half the cap (512 KiB) holds a verdict line for well over
+ * 50 000 samples.
+ */
+export const VERIFIER_MAX_OUTPUT_BYTES = 1024 * 1024;
 
 /** Input/output pair handed to the verifier (labels stripped). */
 type VerifierIO = { readonly input: unknown; readonly output: unknown };
@@ -157,6 +172,7 @@ export async function runVerifierInSandbox(
     argv: ["node", "-e", VERIFIER_HARNESS],
     stdin,
     timeoutMs,
+    maxOutputBytes: VERIFIER_MAX_OUTPUT_BYTES,
   });
 
   if (result.timedOut) {
@@ -164,6 +180,11 @@ export async function runVerifierInSandbox(
   }
   const parsed = parseHarnessResult(result.stdout);
   if (parsed === undefined) {
+    if ((result.stdoutDroppedBytes ?? 0) > 0) {
+      throw new HarnessSynthesizerError(
+        `verifier output exceeded ${VERIFIER_MAX_OUTPUT_BYTES} bytes and its result line was not in what was kept`,
+      );
+    }
     if (result.exitCode !== 0) {
       throw new HarnessSynthesizerError(
         `verifier harness exited ${result.exitCode}: ${result.stderr.slice(-500)}`,
