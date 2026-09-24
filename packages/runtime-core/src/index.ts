@@ -822,8 +822,11 @@ export async function findReplayableGrant(
   }
   const now = where.now ?? Date.now();
   const maxAgeMs = where.maxAgeMs ?? REPLAYABLE_GRANT_MAX_AGE_MS;
+  // 0.7.1 — a grant made before MCP tools were renamed names the tool by its
+  // old `<server>__<tool>` spelling; it is the same tool.
+  const legacyToolName = legacyMcpToolName(where.toolName);
   const matches = all.filter((a) => {
-    if (a.toolName !== where.toolName) return false;
+    if (a.toolName !== where.toolName && a.toolName !== legacyToolName) return false;
     if (a.sessionId !== where.sessionId) return false;
     if (a.decision !== "grant") return false;
     if (a.consumedAt !== undefined) return false;
@@ -5855,6 +5858,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // below so the approving operator SEES the justification.
         const inputHash = hashApprovalInput(tu.name, operativeInput);
         let existing = await approvals.store.get(tu.name, inputHash);
+        // 0.7.1 — an approval parked before MCP tools were renamed is keyed on
+        // the old `<server>__<tool>` spelling, and the operator may already
+        // have granted it. Honour it (or re-use it while still pending)
+        // rather than parking the same call again under a new id.
+        const legacyToolName = legacyMcpToolName(tu.name);
+        if (existing === null && legacyToolName !== undefined) {
+          existing = await approvals.store.get(
+            legacyToolName,
+            hashApprovalInput(legacyToolName, operativeInput),
+          );
+        }
         // #400 — THE RESUMED CALL IS NOT THE PARKED CALL.
         //
         // A grant is keyed on whole-input equality, which silently assumes the

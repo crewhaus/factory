@@ -99,7 +99,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sub-agent `tools:` lists, hook matchers, `rate_limits` and the tool names an
   eval expects (a `tool_call_sequence` grader's `expected`, a sample's
   `expected_tools` or `expectedTool`) written with the old spelling keep
-  working. Two things may need updating. Instructions that tell the model to
+  working, and an approval parked before the upgrade still settles the
+  renamed call once granted. Two things may need updating. Instructions that tell the model to
   call a tool by its old name. And **hook scripts that read the tool name
   from their input**: a `pre-tool` or `post-tool` hook's `name` is now
   `mcp__<server>__<tool>`, so a script that compares it with
