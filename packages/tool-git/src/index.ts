@@ -1108,8 +1108,9 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     if (!opened.ok) return opened.message;
     const repo = opened.value;
     // `--unsafe-paths` is deliberately never passed: without it git refuses a
-    // patch whose paths leave the working tree, which is the containment rule
-    // of this package enforced by git itself.
+    // patch whose paths leave the working tree. openRepo has proved that
+    // working tree lies inside the workspace (C071), so git's rule keeps the
+    // patch inside it too.
     // A unified diff must end in a newline; a patch that reached us through a
     // model or a JSON field very often has had it stripped, and git answers
     // that with "corrupt patch at line N" rather than anything actionable.

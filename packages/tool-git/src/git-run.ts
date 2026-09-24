@@ -15,6 +15,12 @@
  * 2. Boundedness. Every spawn carries a deadline and forwards the caller's
  *    abort signal, and every result is capped. A tool that can hang forever, or
  *    return a gigabyte of patch, is a defect.
+ *    Containing the `cwd` is not enough, because git works on the repository
+ *    it DISCOVERS from there: `openRepo` also proves that repository's working
+ *    tree and git dir are the workspace's (C071, see `./repo-bounds`), and
+ *    every run carries GIT_CEILING_DIRECTORIES so discovery never climbs above
+ *    the workspace root, with the inherited variables that name a repository
+ *    (GIT_DIR, GIT_WORK_TREE …) dropped.
  * 3. A read runs no program the repository names (C007). See `./hardening`:
  *    every invocation switches off the fsmonitor hook, signature display and
  *    implicit bare repositories; a read also switches off external diff
@@ -34,6 +40,13 @@ import {
   hardenReadArgs,
   neutraliseRepositoryFilters,
 } from "./hardening";
+import {
+  alternateLeadingOut,
+  isInside,
+  isWorktreeOf,
+  linkLeadingOut,
+  realOrUndefined,
+} from "./repo-bounds";
 
 export {
   HARDENED_CONFIG_ARGS,
@@ -258,6 +271,14 @@ export type RunOptions = {
   readonly configArgs?: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
   readonly maxOutputChars?: number;
+  /**
+   * Let discovery climb above the workspace root. Only `locateRepository`'s
+   * probe sets it, so an enclosing repository is found and refused BY NAME
+   * rather than reported as "not a git repository"; every other run carries
+   * GIT_CEILING_DIRECTORIES, so a `.git` removed after the check cannot
+   * hand the next command to an enclosing repository.
+   */
+  readonly discoverAboveRoot?: boolean;
 };
 
 /**
@@ -348,6 +369,42 @@ async function drain(
   }
 }
 
+/**
+ * Environment variables that tell git which repository, work tree, index or
+ * object store to use instead of the one it discovers. None of them is ever
+ * passed on: the repository is the one openRepo checked.
+ */
+export const REPOSITORY_LOCATOR_ENV: readonly string[] = Object.freeze([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_SHALLOW_FILE",
+  "GIT_GRAFT_FILE",
+]);
+
+function withoutRepositoryLocators(
+  env: Readonly<Record<string, string | undefined>>,
+): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = { ...env };
+  for (const name of REPOSITORY_LOCATOR_ENV) Reflect.deleteProperty(out, name);
+  return out;
+}
+
+/**
+ * GIT_CEILING_DIRECTORIES for a run: the workspace root's parent, so git
+ * looks for a repository in the root and below and never climbs above it.
+ */
+function discoveryCeiling(): string | undefined {
+  const rootReal = realOrUndefined(process.cwd());
+  return rootReal === undefined ? undefined : path.dirname(rootReal);
+}
+
 /** Run git once, bounded by a deadline and the caller's abort signal. */
 export async function runGit(args: readonly string[], opts: RunOptions): Promise<GitRun> {
   const readOnly = opts.readOnly === true;
@@ -361,17 +418,25 @@ export async function runGit(args: readonly string[], opts: RunOptions): Promise
   // LC_ALL=C pins git's own diagnostics to one language, so a message this
   // package matches on does not change with the operator's locale.
   // GIT_TERMINAL_PROMPT=0 guarantees git never blocks waiting on a terminal.
+  const ceiling = discoveryCeiling();
   const pinned: Record<string, string> = {
     LC_ALL: "C",
     GIT_TERMINAL_PROMPT: "0",
     ...(readOnly ? { GIT_OPTIONAL_LOCKS: "0" } : {}),
+    ...(opts.discoverAboveRoot !== true && ceiling !== undefined
+      ? { GIT_CEILING_DIRECTORIES: ceiling }
+      : {}),
     ...opts.env,
   };
+  // The repository is the one discovered from `cwd` and checked by openRepo,
+  // never one an inherited GIT_DIR or GIT_WORK_TREE names (a harness started
+  // from a git hook inherits both).
+  const inherited = withoutRepositoryLocators(process.env);
   // A write keeps the full environment: a commit may sign through an agent,
   // and its hooks are the repository's, approved with the write.
   const env: Record<string, string | undefined> = readOnly
-    ? withoutCredentials(process.env, pinned).env
-    : { ...process.env, ...pinned };
+    ? withoutCredentials(inherited, pinned).env
+    : { ...inherited, ...pinned };
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {
@@ -478,25 +543,12 @@ export async function openRepo(
     return refuse(`${toolName} refused "${requested}": it is not an existing directory.`);
   }
 
-  const top = await runGit(["rev-parse", "--show-toplevel"], {
-    cwd,
+  const located = await locateRepository(toolName, requested, cwd, {
     timeoutMs,
-    readOnly: true,
     ...(signal !== undefined ? { signal } : {}),
   });
-  if (top.code !== 0) {
-    if (top.code === 127) return refuse(top.stderr);
-    // A killed-on-the-deadline probe says nothing about whether this is a
-    // repository, and reporting it as "not a git repository" would send the
-    // caller looking for the wrong problem.
-    if (top.timedOut) return refuse(failure(toolName, top));
-    if (/cannot use bare repository/i.test(top.stderr))
-      return refuse(bareRefusal(toolName, requested));
-    return refuse(
-      `${toolName} refused "${requested}": it is not a git repository (no .git found from there). git said: ${firstLine(top.stderr)}`,
-    );
-  }
-  const root = top.stdout.trim();
+  if (!located.ok) return located;
+  const root = located.value.root;
 
   const filters = await probeRepositoryFilters(toolName, cwd, {
     timeoutMs,
@@ -525,6 +577,121 @@ export async function openRepo(
         }),
     },
   };
+}
+
+/**
+ * Find the repository git will work on from `cwd`, and refuse it unless it is
+ * the workspace's (C071, see `./repo-bounds`). Returns its real top level.
+ *
+ * One probe asks for the three places git will use. The common dir comes
+ * back relative to `cwd` on some layouts, so it is resolved against `cwd`
+ * (which also makes `--path-format`, git 2.31+, unnecessary). A refusal names
+ * the caller's `cwd` and the reason, never the outside path it led to.
+ */
+export async function locateRepository(
+  toolName: string,
+  requested: string,
+  cwd: string,
+  opts: { readonly timeoutMs: number; readonly signal?: AbortSignal },
+): Promise<Resolved<{ root: string }>> {
+  const probe = await runGit(
+    ["rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"],
+    {
+      cwd,
+      timeoutMs: opts.timeoutMs,
+      readOnly: true,
+      discoverAboveRoot: true,
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+    },
+  );
+  if (probe.code !== 0) {
+    if (probe.code === 127) return refuse(probe.stderr);
+    // A killed-on-the-deadline probe says nothing about whether this is a
+    // repository, and reporting it as "not a git repository" would send the
+    // caller looking for the wrong problem.
+    if (probe.timedOut) return refuse(failure(toolName, probe));
+    if (/cannot use bare repository/i.test(probe.stderr))
+      return refuse(bareRefusal(toolName, requested));
+    return refuse(
+      `${toolName} refused "${requested}": it is not a git repository (no .git found from there). git said: ${firstLine(probe.stderr)}`,
+    );
+  }
+  const lines = probe.stdout.split("\n").map((l) => l.trim());
+  const [topRaw, gitDirRaw, commonRaw] = lines;
+  const rootReal = realOrUndefined(process.cwd());
+  if (
+    rootReal === undefined ||
+    topRaw === undefined ||
+    topRaw === "" ||
+    gitDirRaw === undefined ||
+    gitDirRaw === "" ||
+    commonRaw === undefined ||
+    commonRaw === ""
+  ) {
+    return refuse(
+      `${toolName} refused "${requested}": git did not say where this repository keeps its working tree and history, so it cannot be shown to lie inside the workspace.`,
+    );
+  }
+  const outside = (why: string): Refusal =>
+    refuse(
+      `${toolName} refused "${requested}": ${why}. The git tools work only on a repository whose working tree and history are inside the workspace root — run the harness from the repository's top level, or give the workspace a repository of its own.`,
+    );
+
+  const top = realOrUndefined(topRaw);
+  if (top === undefined || !isInside(rootReal, top)) {
+    return outside(
+      "the git repository it belongs to has its working tree outside the workspace (a repository enclosing the workspace, or one whose core.worktree points out of it)",
+    );
+  }
+  const gitDir = realOrUndefined(gitDirRaw);
+  const commonDir = realOrUndefined(path.resolve(cwd, commonRaw));
+  if (gitDir === undefined || commonDir === undefined) {
+    return outside("its git directory could not be resolved");
+  }
+
+  if (isInside(rootReal, gitDir)) {
+    if (!isInside(rootReal, commonDir)) {
+      // A git dir inside with its history outside is a `commondir` redirect
+      // written inside the workspace: git never lays a worktree out that way.
+      return outside(
+        "its .git directory takes its history from a repository outside the workspace",
+      );
+    }
+    for (const dir of gitDir === commonDir ? [gitDir] : [gitDir, commonDir]) {
+      const link = linkLeadingOut(dir, rootReal);
+      if (link !== undefined) {
+        return outside(`its .git directory holds a link (${link}) leading outside the workspace`);
+      }
+    }
+    if (alternateLeadingOut(commonDir, rootReal) !== undefined) {
+      return outside(
+        "its object store borrows from a repository outside the workspace (objects/info/alternates)",
+      );
+    }
+    return { ok: true, value: { root: top } };
+  }
+
+  // The git dir is outside. Only git's own bookkeeping in that directory,
+  // which nothing inside the workspace can write, may tie it to this tree.
+  if (isWorktreeOf(gitDir, commonDir, top)) return { ok: true, value: { root: top } };
+  if (commonDir === gitDir) {
+    const wt = await runGit(
+      ["config", "--file", path.join(gitDir, "config"), "--get", "core.worktree"],
+      {
+        cwd,
+        timeoutMs: opts.timeoutMs,
+        readOnly: true,
+        ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+      },
+    );
+    const value = wt.code === 0 ? wt.stdout.trim() : "";
+    if (value !== "" && realOrUndefined(path.resolve(gitDir, value)) === top) {
+      return { ok: true, value: { root: top } };
+    }
+  }
+  return outside(
+    "its .git points at a git directory outside the workspace that does not name this directory as its working tree (a linked worktree or submodule does; a planted .git file does not — for a checkout made with --separate-git-dir, set core.worktree in that repository's config)",
+  );
 }
 
 /** The refusal for a repository directory git found by being run inside it. */

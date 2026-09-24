@@ -30,6 +30,7 @@ import { statSync } from "node:fs";
 import * as path from "node:path";
 import {
   bareRefusal,
+  locateRepository,
   neutralisedNote,
   probeRepositoryFilters,
   runGit,
@@ -195,6 +196,22 @@ export async function collectDiff(
     ...(paths.length > 0 ? ["--", ...paths] : []),
   ];
   const timeoutMs = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  // git works on the repository it discovers from `cwd`, which can enclose
+  // the workspace or be named by a planted .git file: tool-git's check
+  // refuses any repository that is not the workspace's (C071).
+  const located = await locateRepository(toolName, request.cwd ?? ".", cwd, {
+    timeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (!located.ok) {
+    // DiffLint's own wording for "not a repository" says what to do instead.
+    if (/it is not a git repository/.test(located.message)) {
+      return refuse(
+        `${toolName} refused "${request.cwd ?? "."}": it is not a git repository. Pass \`diff\` text instead, or run from inside a checkout.`,
+      );
+    }
+    return refuse(located.message);
+  }
   // The repository's own filter drivers are switched off for this read; a
   // driver git cannot be told to skip refuses the call instead.
   const filters = await probeRepositoryFilters(toolName, cwd, {

@@ -181,3 +181,48 @@ describe("an embedded repository directory is refused", () => {
     expect(text).toContain("is a repository directory itself");
   }, 30_000);
 });
+
+/**
+ * C071 — git diffs the repository it discovers, which a contained `cwd` does
+ * not contain: a planted `.git` file names another repository, and a
+ * workspace nested in a checkout climbs to it. DiffLint goes through
+ * tool-git's check, so both are refused and nothing outside is diffed.
+ */
+describe("DiffLint diffs only the workspace's own repository", () => {
+  test("a planted .git file and an enclosing repository are refused", async () => {
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-changeset-outside-")));
+    const who = [
+      "-c",
+      "user.name=A",
+      "-c",
+      "user.email=a@example.com",
+      "-c",
+      "commit.gpgsign=false",
+    ];
+    try {
+      const victim = join(outside, "victim");
+      mkdirSync(victim);
+      git(["init", "-q", "-b", "main"], victim);
+      writeFileSync(join(victim, "secret.txt"), "one\n");
+      git([...who, "add", "-A"], victim);
+      git([...who, "commit", "-q", "-m", "one"], victim);
+      writeFileSync(join(victim, "secret.txt"), "one\nVICTIM-LINE\n");
+
+      mkdirSync(join(workspace, "planted"));
+      writeFileSync(join(workspace, "planted", ".git"), `gitdir: ${victim}/.git\n`);
+      const planted = String(await diffLint.execute({ cwd: "planted", ref: "HEAD" }));
+      expect(planted).toContain("outside the workspace");
+      expect(planted).not.toContain("VICTIM-LINE");
+
+      // The workspace itself nested inside the victim's checkout.
+      mkdirSync(join(victim, "harness"));
+      process.chdir(join(victim, "harness"));
+      const nested = String(await diffLint.execute({ cwd: "." }));
+      expect(nested).toContain("outside the workspace");
+      expect(nested).not.toContain("VICTIM-LINE");
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(outside, { recursive: true, force: true });
+    }
+  }, 30_000);
+});

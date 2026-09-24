@@ -303,6 +303,220 @@ describe("containment", () => {
 });
 
 /**
+ * C071: containing the `cwd` is not containing the repository. git works on
+ * the repository it DISCOVERS from the cwd — an enclosing checkout, the one a
+ * planted `.git` file names, or one whose history a `.git` directory borrows
+ * from outside — so each test builds that layout, proves the tool is refused,
+ * and asserts the outside repository was neither read nor changed. The
+ * controls prove the layouts git builds itself (a linked worktree, a
+ * submodule) still open when the workspace is one.
+ */
+describe("containment of the repository git discovers", () => {
+  const extra: string[] = [];
+  /** A fresh real temp dir outside the fixture workspace, removed after the test. */
+  const outsideDir = (tag: string): string => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), `crewhaus-tool-git-${tag}-`)));
+    extra.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    process.chdir(originalCwd);
+    for (const dir of extra.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** A repository with a committed file outside the workspace. */
+  function victimRepo(tag: string): string {
+    const victim = outsideDir(tag);
+    initRepo(victim);
+    writeFileSync(join(victim, "creds.txt"), "victim-secret\n");
+    commitAll(victim, "victim commit", D3);
+    return victim;
+  }
+
+  const REFUSED = "outside the workspace";
+
+  test("a workspace nested in a larger repository: reads and writes are refused, the enclosing checkout untouched", async () => {
+    const parent = outsideDir("parent");
+    initRepo(parent);
+    writeFileSync(join(parent, "outside.txt"), "main\n");
+    commitAll(parent, "outside file", D3);
+    git(["branch", "other"], parent);
+    git(["switch", "-q", "other"], parent);
+    writeFileSync(join(parent, "outside.txt"), "other\n");
+    commitAll(parent, "other side", D3);
+    git(["switch", "-q", "main"], parent);
+    mkdirSync(join(parent, "harness"));
+    writeFileSync(join(parent, "outside.txt"), "user edit\n");
+    process.chdir(join(parent, "harness"));
+
+    const cases: Array<[RegisteredTool, Record<string, unknown>]> = [
+      [gitStatus, {}],
+      [gitDiff, { mode: "patch" }],
+      [gitLog, {}],
+      [gitShow, { ref: "HEAD", path: "outside.txt" }],
+      [gitStashPush, { message: "x" }],
+      [gitSwitch, { branch: "other" }],
+    ];
+    for (const [tool, input] of cases) {
+      const out = String(await tool.execute({ cwd: ".", ...input }));
+      expect({
+        name: tool.name,
+        refused: out.includes(REFUSED),
+        leaked: out.includes("user edit"),
+      }).toEqual({
+        name: tool.name,
+        refused: true,
+        leaked: false,
+      });
+    }
+    expect(readFileSync(join(parent, "outside.txt"), "utf8")).toBe("user edit\n");
+    expect(git(["stash", "list"], parent).stdout).toBe("");
+    expect(git(["branch", "--show-current"], parent).stdout.trim()).toBe("main");
+  });
+
+  test("a planted .git file naming another repository is refused for reads and writes", async () => {
+    const victim = victimRepo("victim");
+    mkdirSync(join(workspace, "sub"));
+    writeFileSync(join(workspace, "sub", ".git"), `gitdir: ${victim}/.git\n`);
+    // Plain git follows the file: that is the door.
+    expect(git(["show", "HEAD:creds.txt"], join(workspace, "sub")).stdout).toContain(
+      "victim-secret",
+    );
+
+    const shown = String(await gitShow.execute({ cwd: "sub", ref: "HEAD", path: "creds.txt" }));
+    expect(shown).toContain(REFUSED);
+    expect(shown).not.toContain("victim-secret");
+    // The refusal names the caller's cwd, never where the file led.
+    expect(shown).not.toContain(victim);
+    const created = String(await gitBranchCreate.execute({ cwd: "sub", name: "planted-ref" }));
+    expect(created).toContain(REFUSED);
+    expect(existsSync(join(victim, ".git", "refs", "heads", "planted-ref"))).toBe(false);
+  });
+
+  test("a planted .git directory whose core.worktree points outside is refused", async () => {
+    const target = outsideDir("wt-target");
+    writeFileSync(join(target, "notes.txt"), "keep me\n");
+    mkdirSync(join(workspace, "sub2"));
+    git(["init", "-q", "-b", "main"], join(workspace, "sub2"));
+    git(["config", "core.worktree", target], join(workspace, "sub2"));
+    expect(git(["status", "--porcelain"], join(workspace, "sub2")).stdout).toContain("notes.txt");
+
+    const status = String(await gitStatus.execute({ cwd: "sub2" }));
+    expect(status).toContain(REFUSED);
+    expect(status).not.toContain("notes.txt");
+    const added = String(await gitAdd.execute({ cwd: "sub2", paths: ["notes.txt"] }));
+    expect(added).toContain(REFUSED);
+    const stashed = String(await gitStashPush.execute({ cwd: "sub2", includeUntracked: true }));
+    expect(stashed).toContain(REFUSED);
+    expect(readFileSync(join(target, "notes.txt"), "utf8")).toBe("keep me\n");
+  });
+
+  test("a .git directory that takes its history from outside is refused: commondir, a linked objects dir, alternates", async () => {
+    const victim = victimRepo("history");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+
+    // (a) a hand-made worktree git dir whose `commondir` names the victim's.
+    const a = join(workspace, "redirect", ".git");
+    mkdirSync(a, { recursive: true });
+    writeFileSync(join(a, "commondir"), `${victim}/.git\n`);
+    writeFileSync(join(a, "gitdir"), `${a}\n`);
+    writeFileSync(join(a, "HEAD"), "ref: refs/heads/main\n");
+    // (b) the workspace's own .git with the victim's objects and refs linked in.
+    const b = join(workspace, "linked");
+    mkdirSync(b);
+    git(["init", "-q", "-b", "main"], b);
+    rmSync(join(b, ".git", "objects"), { recursive: true, force: true });
+    rmSync(join(b, ".git", "refs"), { recursive: true, force: true });
+    symlinkSync(join(victim, ".git", "objects"), join(b, ".git", "objects"));
+    symlinkSync(join(victim, ".git", "refs"), join(b, ".git", "refs"));
+    // (c) a clone that borrows the victim's object store.
+    git(["clone", "-q", "--shared", victim, join(workspace, "shared")], workspace);
+
+    for (const dir of ["redirect", "linked", "shared"]) {
+      // Plain git reads the victim's history in every one of them.
+      expect({
+        dir,
+        plain: git(["log", "-1", "--format=%H"], join(workspace, dir)).stdout.trim(),
+      }).toEqual({
+        dir,
+        plain: victimHead,
+      });
+      const out = String(await gitLog.execute({ cwd: dir }));
+      expect({ dir, refused: out.includes(REFUSED), leaked: out.includes(victimHead) }).toEqual({
+        dir,
+        refused: true,
+        leaked: false,
+      });
+    }
+  });
+
+  test("an inherited GIT_DIR or GIT_WORK_TREE never redirects a tool", async () => {
+    const victim = victimRepo("env");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const saved = { dir: process.env["GIT_DIR"], tree: process.env["GIT_WORK_TREE"] };
+    process.env["GIT_DIR"] = join(victim, ".git");
+    process.env["GIT_WORK_TREE"] = victim;
+    try {
+      const out = await call(gitLog);
+      expect(JSON.stringify(out)).not.toContain(victimHead);
+      expect(out.commits[0].subject).toBe("second commit");
+    } finally {
+      if (saved.dir === undefined) Reflect.deleteProperty(process.env, "GIT_DIR");
+      else process.env["GIT_DIR"] = saved.dir;
+      if (saved.tree === undefined) Reflect.deleteProperty(process.env, "GIT_WORK_TREE");
+      else process.env["GIT_WORK_TREE"] = saved.tree;
+    }
+  });
+
+  test("every run carries a discovery ceiling at the workspace root", async () => {
+    const parent = outsideDir("ceiling");
+    initRepo(parent);
+    mkdirSync(join(parent, "harness"));
+    process.chdir(join(parent, "harness"));
+    // Without the ceiling this finds the enclosing repository.
+    expect(git(["rev-parse", "--show-toplevel"], join(parent, "harness")).code).toBe(0);
+    const run = await runGit(["rev-parse", "--show-toplevel"], {
+      cwd: join(parent, "harness"),
+      timeoutMs: 10_000,
+      readOnly: true,
+    });
+    expect({ code: run.code, notRepo: /not a git repository/i.test(run.stderr) }).toEqual({
+      code: 128,
+      notRepo: true,
+    });
+  });
+
+  test("control: a workspace that is a linked worktree of an outside repository still opens", async () => {
+    const main = victimRepo("wt-main");
+    const base = outsideDir("wt-base");
+    const wt = join(base, "wt");
+    expect(git(["worktree", "add", "-q", "-b", "wtb", wt], main).code).toBe(0);
+    process.chdir(wt);
+    const out = JSON.parse(String(await gitStatus.execute({ cwd: "." })));
+    expect(out.branch).toBe("wtb");
+  });
+
+  test("control: a workspace that is a submodule checkout still opens", async () => {
+    const sub = victimRepo("sm-sub");
+    const sup = outsideDir("sm-super");
+    initRepo(sup);
+    expect(
+      git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "mod"], sup).code,
+    ).toBe(0);
+    process.chdir(join(sup, "mod"));
+    const out = JSON.parse(String(await gitStatus.execute({ cwd: "." })));
+    expect(out.clean).toBe(true);
+  });
+
+  test("control: a worktree GitWorktreeAdd made inside the workspace opens", async () => {
+    const added = await call(gitWorktreeAdd, { path: "inner-wt", createBranch: "inner" });
+    expect(String(JSON.stringify(added))).not.toContain(REFUSED);
+    const out = JSON.parse(String(await gitStatus.execute({ cwd: "inner-wt" })));
+    expect(out.branch).toBe("inner");
+  });
+});
+
+/**
  * A ref is a path into the workspace too, because git's option parser reads a
  * bare argv word starting with "-" as an option. `--output=<file>` on a read
  * command writes anywhere on the disk, and `-D` in a name position turns a

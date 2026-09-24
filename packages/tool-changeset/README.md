@@ -141,7 +141,12 @@ A ref or range that begins with `-` is refused, because git would read it as
 an option and `git diff --output=<file>` writes anywhere on the disk. A
 pathspec that is absolute, contains `..` or starts with git's `:` magic is
 refused for the same reason. The directory git runs in is resolved against
-the workspace root, symlinks included.
+the workspace root, symlinks included, and so is the repository git finds
+from there: a workspace nested inside a larger checkout, a `.git` file naming
+another repository, or a `.git` directory whose history is linked or borrowed
+from outside is refused. A linked worktree or submodule whose git directory
+lives outside still works, because git's own bookkeeping there names this
+checkout.
 
 ## DocsSymbolCheck is built to under-report
 
