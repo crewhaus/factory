@@ -167,7 +167,8 @@ describe("what auto mode runs without asking (permission-integration#13)", () =>
    */
   const AUTO_ALLOWED: Readonly<Record<string, string>> = {
     BashOutput: "reads output from a shell this session started",
-    CliVersionPin: "runs `--version` on a harness's CLI; reports, changes nothing",
+    CliVersionPin:
+      "reads a harness CLI's version from its package.json and never runs a workspace CLI; runs `--version` only on the operator's own standalone install outside the workspace, with allowExternalCli; changes nothing",
     DesktopNotify: "shows a local notification",
     Diagnostics: "runs the project's type checker and linter to report; changes nothing",
     Fetch:
