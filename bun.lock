@@ -2751,6 +2751,7 @@
       },
       "devDependencies": {
         "@crewhaus/tool-executor": "workspace:*",
+        "typescript": "^5.7.0",
       },
     },
     "packages/tool-git": {
@@ -2800,6 +2801,7 @@
       },
       "devDependencies": {
         "@crewhaus/tool-executor": "workspace:*",
+        "typescript": "^5.7.0",
       },
     },
     "packages/tool-html": {

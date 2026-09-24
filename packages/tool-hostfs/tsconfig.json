@@ -21,5 +21,6 @@
       "path": "../tool-safety"
     }
   ],
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["**/*.test.ts", "**/*.test.tsx", "src/fixtures.ts"]
 }
