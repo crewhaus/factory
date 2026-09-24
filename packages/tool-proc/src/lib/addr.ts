@@ -196,8 +196,7 @@ export function isLoopbackIp(address: string): boolean {
   const groups = parseIpv6(address);
   if (groups === null) return false;
   if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) return true;
-  const carried = embeddedIpv4(groups);
-  return carried !== null && carried.startsWith("127.");
+  return embeddedIpv4(groups)?.startsWith("127.") === true;
 }
 
 /**
