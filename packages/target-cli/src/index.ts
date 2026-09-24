@@ -539,10 +539,16 @@ const __evaluation: RunEvaluation = {
  * The boot is split so ordering is safe:
  *   - `activateBoot` runs EARLY (before skill discovery) so `__plugins.skillDirs`
  *     can feed `discoverSkills({ pluginDirs })`.
- *   - `registerBoot` runs LATE (after the built-in and skill tools are on the
- *     catalog) and skips any name already registered — first-party wins the
- *     collision, and a plugin tool named after a built-in never throws
- *     `defaultCatalog.register`'s duplicate-name error and bricks boot.
+ *   - `registerBoot` runs LAST, after every first-party registration — the
+ *     built-in tools, the Skill tool (on both the discoverSkills and the
+ *     continuity path), Task, wireMemory's tools, every required and optional
+ *     MCP server (thredz included) and knowledge's Retrieve — and just before
+ *     runChatLoop reads `defaultCatalog.list()`. It skips any name already
+ *     registered, so first-party wins every collision and a plugin tool named
+ *     after a first-party one never throws `defaultCatalog.register`'s
+ *     duplicate-name error and bricks boot. (0.7.0 ran it right after the
+ *     extension boot, so a plugin tool named FocusRead or Task crashed the
+ *     bundle at wireMemory / createTaskTool while `crewhaus run` skipped it.)
  *
  * Trust: `createBootPluginRuntime` builds the loader against
  * `~/.crewhaus/plugins`, verifying each signature against the operator's trust
@@ -841,16 +847,16 @@ ${catchBlock}${finallyBlock}`;
   // the catalog before runChatLoop advertises `defaultCatalog.list()`.
   const knowledgeBoot = knowledge.bootBlock ? `${knowledge.bootBlock}\n\n` : "";
   // Item 3 (G32) — plugin activation. `activateBoot` runs BEFORE `extensionBoot`
-  // so `__plugins.skillDirs` feeds `discoverSkills`; `registerBoot` runs AFTER
-  // it so the plugin-tool registration's collision check sees the built-in and
-  // skill tools already on `defaultCatalog` (first-party wins), all before
-  // runChatLoop snapshots `defaultCatalog.list()`.
+  // so `__plugins.skillDirs` feeds `discoverSkills`; `registerBoot` runs after
+  // EVERY first-party registration (Task, wireMemory, MCP, Retrieve) and just
+  // before runChatLoop snapshots `defaultCatalog.list()`, so its collision
+  // check sees them all and first-party wins (extension-path#1).
   const pluginsImportBlock = plugins.imports.length > 0 ? `${plugins.imports.join("\n")}\n` : "";
-  // activateBoot precedes extensionBoot (trailing newline); registerBoot follows
-  // it (leading newline). Both empty when the spec omits `plugins:`, so the
-  // surrounding bytes are unchanged.
+  // activateBoot precedes extensionBoot (trailing newline); registerBoot sits
+  // right before the runChatLoop wrapper (trailing blank line). Both empty
+  // when the spec omits `plugins:`, so the surrounding bytes are unchanged.
   const pluginsActivateBoot = plugins.activateBoot ? `${plugins.activateBoot}\n` : "";
-  const pluginsRegisterBoot = plugins.registerBoot ? `\n${plugins.registerBoot}` : "";
+  const pluginsRegisterBoot = plugins.registerBoot ? `${plugins.registerBoot}\n\n` : "";
 
   // v0.3.0 Goal 3 — with thredz on, the MCP host boots FIRST so wireMemory
   // receives the live connection (`__thredz`) the backend flip needs; every
@@ -865,9 +871,9 @@ import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
 ${hybridImport}${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
 ${watchmeEnvStamp}${registerBlock}
-${pluginsActivateBoot}${extensionBoot}${pluginsRegisterBoot}${specHooks.bootBlock}
+${pluginsActivateBoot}${extensionBoot}${specHooks.bootBlock}
 
-${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${wrapped}
+${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${pluginsRegisterBoot}${wrapped}
 `;
 }
 
