@@ -28,7 +28,16 @@
  *                                       justification; logging a gap is the
  *                                       honest low-friction path, §7.4)
  *
- * All tools are `scope: "internal"` — local files, no network.
+ * The tools read and write local files and are `scope: "internal"`, with
+ * one exception. When the store has an embedder that leaves the process
+ * (`memory.wiki.embedder` naming anything but `mock/…`), `wiki_recall`,
+ * `wiki_semantic_search` and `wiki_related` POST the query and article text
+ * to that provider, so they are built `scope: "external"` with
+ * `ioCapability: "network"`: the query goes through the egress classifier
+ * and `compile --strict` counts them. They stay `readOnly`, and the
+ * destination is the operator's configured embedder, never one the model
+ * picks. `wiki_search`, `wiki_get`, `wiki_list` and the writers never call
+ * the embedder.
  *
  * ## Pillar 3 — the `memory` TrustOrigin (two-site pattern)
  *
@@ -349,6 +358,13 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       now,
     });
   const requireSources = opts.requireSources === true;
+  // The ranking tools send the query and article text to the embedder. A
+  // store that does not say where its embedder is, but can rank
+  // semantically, is taken to reach one.
+  const networked = store.embedderLeavesProcess ?? typeof store.semanticSearch === "function";
+  const embedderScope = networked
+    ? ({ scope: "external", ioCapability: "network" } as const)
+    : ({ scope: "internal" } as const);
 
   function createdByFrom(ctx: ToolExecuteContext | undefined): WikiCreatedBy | undefined {
     const rc = resolveRunContext(ctx);
@@ -372,7 +388,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       "PRIMARY RECALL. Fetch the most relevant slice of the expert's own wiki for a query — a combined keyword + semantic-vector context bundle. Call this FIRST on every user question before answering.",
     inputSchema: recallSchema,
     readOnly: true,
-    scope: "internal",
+    ...embedderScope,
     execute: async (input, ctx) => {
       const rc = resolveRunContext(ctx);
       const hits = await store.recall(input.query, input.limit ?? 6);
@@ -393,7 +409,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       "Vector/semantic search over the wiki. Use when a query is conceptual and keyword search would miss paraphrases.",
     inputSchema: semanticSearchSchema,
     readOnly: true,
-    scope: "internal",
+    ...embedderScope,
     execute: async (input) => {
       const k = input.limit ?? 6;
       if (store.semanticSearch === undefined) {
@@ -580,7 +596,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       "Find articles related to a slug by tags + semantic similarity. Use in reflection to detect duplicates or contradictions to reconcile.",
     inputSchema: relatedSchema,
     readOnly: true,
-    scope: "internal",
+    ...embedderScope,
     execute: async (input) => {
       let refs: Awaited<ReturnType<WikiStore["related"]>>;
       try {

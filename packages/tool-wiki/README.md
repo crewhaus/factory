@@ -34,7 +34,12 @@ for (const tool of bundle.all) defaultCatalog.register(tool);
 | `wiki_stats` | readOnly | Corpus health |
 | `log_knowledge_gap` | destructive (sideEffect audit-and-allow, **no** justification) | Record what the expert could not answer |
 
-All tools are `scope: "internal"` — local files, no network.
+The tools read and write local files and are `scope: "internal"`, with one
+exception: when `memory.wiki.embedder` names a provider outside the process
+(anything but `mock/…`), `wiki_recall`, `wiki_semantic_search` and
+`wiki_related` send the query and article text to it, so they are built
+`scope: "external"` with `ioCapability: "network"` (still `readOnly`). The
+egress classifier then sees the query, and `compile --strict` counts them.
 
 ## Pillar 3 — the `memory` TrustOrigin
 

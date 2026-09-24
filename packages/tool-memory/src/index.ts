@@ -21,6 +21,17 @@
  * injected instruction would reach for, so every call must carry a
  * justification checked against the spec's instructions.
  *
+ * Where `Recall` goes: with no embedder it reads the local file and ranks
+ * with BM25, so it is `scope: "internal"`. When memory-service built the
+ * store with an embedder that leaves the process (`memory.wiki.embedder`
+ * naming anything but `mock/…`), each recall POSTs the query and the text of
+ * the stored memories to that provider, so `Recall` is built
+ * `scope: "external"` with `ioCapability: "network"`: the query goes through
+ * the egress classifier and `compile --strict` counts it. It stays
+ * `readOnly` (plan mode keeps it), and its destination is the operator's
+ * configured embedder, never one the model picks. `Remember` and
+ * `MemoryForget` never call the embedder.
+ *
  * Deliberately NOT surfaced to the model: provenance. Model-supplied
  * evidence toolUseIds would be unverified claims — provenance stamping
  * belongs to the auto-capture path (`captureFacts`), which reads the
@@ -129,12 +140,17 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
     },
   });
 
+  // An embedder that leaves the process receives the query and every live
+  // memory's text on recall, so the tool says so (see the module doc).
+  const networked = store.embedderLeavesProcess === true;
   const recall: RegisteredTool = buildTool({
     name: "Recall",
-    description:
-      "Search prior memories for relevance to a query. Use at the start of a session, or whenever the user references something you might have stored. Returns up to K results ranked by BM25 relevance score, ordered most-relevant first.",
+    description: networked
+      ? "Search prior memories for relevance to a query. Use at the start of a session, or whenever the user references something you might have stored. Returns up to K results ranked by BM25 plus embedding similarity, ordered most-relevant first. The query and the stored memories are sent to the configured embedding provider."
+      : "Search prior memories for relevance to a query. Use at the start of a session, or whenever the user references something you might have stored. Returns up to K results ranked by BM25 relevance score, ordered most-relevant first.",
     inputSchema: recallSchema,
     readOnly: true,
+    ...(networked ? { scope: "external" as const, ioCapability: "network" as const } : {}),
     execute: async (input) => {
       const k = input.k ?? 5;
       const results = await store.recall(input.query, k);

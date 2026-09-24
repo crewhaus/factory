@@ -147,6 +147,55 @@ describe("flags (every tool pinned)", () => {
   });
 });
 
+// 0.7.1 (C040): with an embedder outside the process, the ranking tools send
+// the query and article text to it, so they say they reach the network.
+describe("flags follow the embedder", () => {
+  const RANKING = ["wiki_recall", "wiki_semantic_search", "wiki_related"];
+  function embedder(provider?: string) {
+    const sent: string[] = [];
+    return {
+      sent,
+      ...(provider !== undefined ? { provider } : {}),
+      async embed(texts: ReadonlyArray<string>): Promise<number[][]> {
+        sent.push(...texts);
+        return texts.map(() => [1, 0]);
+      },
+    };
+  }
+  function networkTools(bundle: ReturnType<typeof makeBundle>): string[] {
+    return bundle.all
+      .filter((t) => t.scope === "external" && t.ioCapability === "network")
+      .map((t) => t.name)
+      .sort();
+  }
+
+  test("a provider outside the process: the three ranking tools are external/network, readOnly kept", () => {
+    for (const provider of ["openai", undefined]) {
+      const bundle = makeBundle({ embedder: embedder(provider) });
+      expect(networkTools(bundle)).toEqual([...RANKING].sort());
+      for (const name of RANKING) {
+        expect(bundle.all.find((t) => t.name === name)?.readOnly).toBe(true);
+      }
+      expect(bundle.search.scope).toBe("internal");
+      expect(bundle.get.scope).toBe("internal");
+    }
+  });
+
+  test("the mock provider and no embedder keep every tool internal", () => {
+    for (const bundle of [makeBundle({ embedder: embedder("mock") }), makeBundle()]) {
+      expect(networkTools(bundle)).toEqual([]);
+      expect(bundle.all.every((t) => t.scope === "internal")).toBe(true);
+    }
+  });
+
+  test("an injected store that can rank semantically but does not say where is taken to reach out", () => {
+    const real = createWikiStore({ specName: "spec", rootDir: tmp, embedder: embedder() });
+    const { embedderLeavesProcess: _dropped, ...rest } = real;
+    const bundle = makeBundle({ store: rest as typeof real });
+    expect(networkTools(bundle)).toEqual([...RANKING].sort());
+  });
+});
+
 describe("wiki_write — upsert + Sources governance", () => {
   test("creates then updates by slug without the model passing a version", async () => {
     const bundle = makeBundle();

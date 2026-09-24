@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createMemoryStore } from "@crewhaus/memory-store";
 import { createMemoryTools } from "./index";
 
 let tmp: string;
@@ -159,5 +160,59 @@ describe("createMemoryTools — MemoryForget (v2)", () => {
     const { forget } = createMemoryTools({ specName: "s", rootDir: tmp });
     expect(() => forget.inputSchema.parse({ id: "not-an-id" })).toThrow();
     expect(() => forget.inputSchema.parse({ id: "mem_0123456789abcdef" })).not.toThrow();
+  });
+});
+
+// 0.7.1 (C040): an embedder outside the process receives the query and the
+// stored memories on every recall, so Recall says it reaches the network.
+describe("createMemoryTools — Recall's flags follow the store's embedder", () => {
+  function recordingEmbedder(provider?: string) {
+    const sent: string[] = [];
+    return {
+      sent,
+      ...(provider !== undefined ? { provider } : {}),
+      async embed(texts: ReadonlyArray<string>): Promise<number[][]> {
+        sent.push(...texts);
+        return texts.map(() => [1, 0]);
+      },
+    };
+  }
+
+  test("an embedder that leaves the process: external + network, still readOnly, and it is called", async () => {
+    const embedder = recordingEmbedder("openai");
+    const store = createMemoryStore({ specName: "s", rootDir: tmp, embedder });
+    const { remember, recall, forget } = createMemoryTools({ specName: "s", store });
+    expect([recall.scope, recall.ioCapability, recall.readOnly]).toEqual([
+      "external",
+      "network",
+      true,
+    ]);
+    expect(recall.description).toContain("sent to the configured embedding provider");
+    // The writers never call it, so they stay internal.
+    expect([remember.scope, forget.scope]).toEqual(["internal", "internal"]);
+    await remember.execute({ text: "the private fact" });
+    expect(embedder.sent).toEqual([]);
+    await recall.execute({ query: "fact" });
+    expect(embedder.sent).toContain("fact");
+  });
+
+  test("an embedder that does not say what it is counts as one that leaves the process", () => {
+    const store = createMemoryStore({ specName: "s", rootDir: tmp, embedder: recordingEmbedder() });
+    expect(createMemoryTools({ specName: "s", store }).recall.scope).toBe("external");
+  });
+
+  test("the in-process mock embedder, and no embedder, keep Recall internal", () => {
+    const mock = createMemoryStore({
+      specName: "s",
+      rootDir: tmp,
+      embedder: recordingEmbedder("mock"),
+    });
+    for (const tools of [
+      createMemoryTools({ specName: "s", store: mock }),
+      createMemoryTools({ specName: "s", rootDir: tmp }),
+    ]) {
+      expect([tools.recall.scope, tools.recall.ioCapability]).toEqual(["internal", undefined]);
+      expect(tools.recall.description).toContain("ranked by BM25 relevance score");
+    }
   });
 });

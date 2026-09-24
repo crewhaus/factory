@@ -119,6 +119,20 @@ export type MemoryRecallResult = {
  */
 export interface MemoryEmbedder {
   embed(texts: ReadonlyArray<string>): Promise<number[][]>;
+  /** `@crewhaus/embedder`'s provider id. Only `"mock"` is known to stay in
+   *  the process; see {@link embedderLeavesProcess}. */
+  readonly provider?: string;
+}
+
+/**
+ * Whether calling this embedder sends text out of the process. Only
+ * `@crewhaus/embedder`'s `mock` provider is known not to; every other
+ * provider (openai, voyage, cohere, gemini, a `local/…@http://…` server) is
+ * an HTTP call, and a structural embedder that does not say what it is
+ * counts as one too, so an unknown embedder never makes a tool look local.
+ */
+export function embedderLeavesProcess(embedder: MemoryEmbedder | undefined): boolean {
+  return embedder !== undefined && embedder.provider !== "mock";
 }
 
 export interface MemoryStoreOptions {
@@ -192,6 +206,14 @@ export interface MemoryStore {
   size(): Promise<number>;
   /** Diagnostic: where on disk this store writes. */
   path(): string;
+  /**
+   * True when `recall()` sends the query, and the text of stored memories,
+   * to an embedder outside the process (see {@link embedderLeavesProcess}).
+   * `@crewhaus/tool-memory` reads it to flag `Recall` as a network tool.
+   * Optional so a hand-written store still type-checks; absent reads as a
+   * store that never leaves the process.
+   */
+  readonly embedderLeavesProcess?: boolean;
 }
 
 export class MemoryStoreError extends CrewhausError {
@@ -484,6 +506,8 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
   }
 
   return {
+    embedderLeavesProcess: embedderLeavesProcess(embedder),
+
     async remember(
       text: string,
       tags: readonly string[] = [],

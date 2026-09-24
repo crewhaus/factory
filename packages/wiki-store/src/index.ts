@@ -273,6 +273,20 @@ export type WikiRelatedRef = WikiRef & {
  */
 export interface WikiEmbedder {
   embed(texts: ReadonlyArray<string>): Promise<number[][]>;
+  /** `@crewhaus/embedder`'s provider id. Only `"mock"` is known to stay in
+   *  the process; see {@link embedderLeavesProcess}. */
+  readonly provider?: string;
+}
+
+/**
+ * Whether calling this embedder sends text out of the process — the rule
+ * `@crewhaus/memory-store` applies, kept identical here (memory-service's
+ * wiring test holds the two stores to the same answer). Only
+ * `@crewhaus/embedder`'s `mock` provider is known not to; an embedder that
+ * does not say what it is counts as one that does.
+ */
+export function embedderLeavesProcess(embedder: WikiEmbedder | undefined): boolean {
+  return embedder !== undefined && embedder.provider !== "mock";
 }
 
 /** The design-§3.1 interface, verbatim (recall/search/get/write/list/related/setSignals/stats). */
@@ -305,6 +319,14 @@ export interface WikiStore {
   semanticSearch?(query: string, k?: number, minScore?: number): Promise<readonly WikiHit[]>;
   /** Diagnostic: where on disk this store lives. */
   path(): string;
+  /**
+   * True when `recall`, `related` and `semanticSearch` send the query and
+   * article text to an embedder outside the process (see
+   * {@link embedderLeavesProcess}). `@crewhaus/tool-wiki` reads it to flag
+   * those tools as network tools. Optional so another backend still
+   * type-checks; tool-wiki then decides from `semanticSearch`'s presence.
+   */
+  readonly embedderLeavesProcess?: boolean;
 }
 
 export type WikiStoreOptions = {
@@ -794,6 +816,8 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
   }
 
   return {
+    embedderLeavesProcess: embedderLeavesProcess(embedder),
+
     async recall(query: string, k = 6): Promise<readonly WikiHit[]> {
       if (typeof query !== "string" || query.length === 0) {
         throw new WikiStoreError("recall(): query must be a non-empty string");
