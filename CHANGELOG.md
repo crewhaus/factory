@@ -77,7 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the file and shell tools. `HttpRequest(https://api.example.com/**)` is about
   the URL, `RunCommand(git status)` about the command, `EmailSend(*@example.com)`
   about every recipient, `IssueCreate(crewhaus/*)` about the repository,
-  `GitAdd(src/**)` about the files (read from the tool's `cwd`). Before, an
+  `GitAdd(src/**)` about the files (read from the tool's `cwd`),
+  `SendMessage(slack:T123:C456:*)` about the channel. Before, an
   argument pattern had to match every string in the call — a request body, a
   commit message — so most scoped allows never matched and the call was asked
   about; they now match as written. A pattern aimed at something that is not

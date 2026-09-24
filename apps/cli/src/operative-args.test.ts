@@ -10,26 +10,27 @@
  * is safe for a deny but makes a scoped allow almost impossible to write and
  * leaves the egress fabric guessing.
  *
- * The scope of this guard is the live registry — every tool
- * `BUILTIN_TOOL_MAP` compiles in, loaded the way a bundle loads it — never
- * a list of names. The one list here is the EXPECTED set of tools that
- * declare `[]` ("no argument decides where this acts"): declaring nothing is
- * allowed, but it has to be a decision somebody wrote down, so a new `[]`
- * fails until it is added with its reason.
+ * The scope of this guard is read from the code, never a list of names:
+ * every tool `BUILTIN_TOOL_MAP` compiles in, loaded the way a bundle loads
+ * it, plus every `export const …: RegisteredTool` in a `packages/tool-*`
+ * package — the tools other targets emit (`SendMessage`,
+ * `EvmSendTransaction`) are builtins too. The one list here is the EXPECTED
+ * set of tools that declare `[]` ("no argument decides where this acts"):
+ * declaring nothing is allowed, but it has to be a decision somebody wrote
+ * down, so a new `[]` fails until it is added with its reason.
  */
 import { beforeAll, describe, expect, test } from "bun:test";
-import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { loadAllBuiltinTools } from "./builtin-tools-for-tests";
 
 let builtins: ReadonlyArray<RegisteredTool>;
+let fromMap = 0;
+let fromPackages = 0;
 beforeAll(async () => {
-  const loaded: RegisteredTool[] = [];
-  for (const entry of Object.values(BUILTIN_TOOL_MAP)) {
-    const mod = (await import(entry.package)) as Record<string, unknown>;
-    const tool = mod[entry.export] as RegisteredTool | undefined;
-    if (tool !== undefined) loaded.push(tool);
-  }
-  builtins = loaded;
+  const loaded = await loadAllBuiltinTools();
+  builtins = loaded.tools;
+  fromMap = loaded.fromMap;
+  fromPackages = loaded.fromPackages;
 }, 60_000);
 
 /** The tools this guard covers: anything not read-only, and anything external. */
@@ -72,10 +73,21 @@ const NO_SCOPING_ARGUMENT: Readonly<Record<string, string>> = {
 describe("every non-read-only or external builtin declares operativeArgs", () => {
   test("the sweep reads the real registry", () => {
     // The guard's own hit count: a sweep that finds nothing passes.
-    expect(builtins.length).toBeGreaterThanOrEqual(500);
+    expect(fromMap).toBeGreaterThanOrEqual(500);
+    expect(fromPackages).toBeGreaterThanOrEqual(fromMap);
+    expect(builtins.length).toBeGreaterThan(fromMap);
     expect(inScope().length).toBeGreaterThanOrEqual(220);
     const names = new Set(inScope().map((t) => t.name));
-    for (const known of ["Write", "HttpRequest", "RunCommand", "GitCommit", "HttpPaginate"]) {
+    for (const known of [
+      "Write",
+      "HttpRequest",
+      "RunCommand",
+      "GitCommit",
+      "HttpPaginate",
+      // Emitted by other targets, not by BUILTIN_TOOL_MAP.
+      "SendMessage",
+      "EvmSendTransaction",
+    ]) {
       expect(names.has(known)).toBe(true);
     }
   });
