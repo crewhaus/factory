@@ -1,4 +1,5 @@
-import { capText } from "./lib/format";
+import { constants } from "node:os";
+import { type SpawnBoundedResult, spawnBounded } from "@crewhaus/tool-safety/streams";
 
 /**
  * The one place this package starts a child process.
@@ -13,32 +14,17 @@ import { capText } from "./lib/format";
  *     reads stdin gets EOF immediately instead of hanging on a terminal
  *     that is not there.
  *   - every run has a deadline: SIGTERM on expiry, SIGKILL after a short
- *     grace period for a child that ignores the first signal.
- *   - both streams are capped, so one chatty command cannot fill a context
- *     window.
+ *     grace period for a child that ignores the first signal. The child
+ *     leads its own process group and the deadline (or an abort) signals the
+ *     whole group, so a `cmd &` it started cannot outlive the timeout.
+ *   - both streams are capped AS THEY ARE READ (C078). The foreground run is
+ *     @crewhaus/tool-safety's `spawnBounded`: memory is bounded by the cap,
+ *     not by what the child prints, and the reader keeps draining past the
+ *     cap so a child never blocks on a full pipe.
+ *   - output a grandchild still holds open after the child exits is read for
+ *     a bounded grace, then reading stops and the stream is cancelled: the
+ *     result keeps what arrived and says `outputIncomplete`, never "".
  */
-
-/** Grace between the deadline's SIGTERM and the SIGKILL that follows it. */
-const KILL_GRACE_MS = 2_000;
-/**
- * A process that forks a grandchild keeps the pipe's write end open after
- * the child itself is gone, so reading to EOF can outlive the process. Give
- * each stream a bounded drain window and move on with what arrived.
- */
-const DRAIN_GRACE_MS = 500;
-/**
- * After the SIGKILL, how long to keep waiting for the child to be reaped
- * before returning without it.
- *
- * SIGKILL cannot be caught, but it cannot interrupt a process wedged in an
- * uninterruptible kernel wait either — a stalled NFS read, a wayward driver.
- * `proc.exited` then never resolves, and every other bound in this file is
- * downstream of that await, so the whole call hangs with no deadline left to
- * save it. This is the last bound: past it the tool reports what it has and
- * lets go. (There is no portable way to put a process into that state, so
- * this is the one guarantee here with no test behind it.)
- */
-const REAP_GRACE_MS = 1_000;
 
 export type RunOutcome = {
   readonly argv: readonly string[];
@@ -56,6 +42,12 @@ export type RunOutcome = {
    * the result is what had been captured by then, and `exitCode` is unknown.
    */
   readonly abandoned?: boolean;
+  /**
+   * Set when reading stopped before a stream ended: the child exited but a
+   * process it started still held its output open past the drain grace. The
+   * text is what arrived by then — possibly all of it, possibly not.
+   */
+  readonly outputIncomplete?: boolean;
 };
 
 export type RunOptions = {
@@ -67,21 +59,83 @@ export type RunOptions = {
   readonly signal?: AbortSignal;
 };
 
-export async function runOnce(argv: readonly string[], options: RunOptions): Promise<RunOutcome> {
-  const started = performance.now();
-  const elapsed = (): number => Math.round(performance.now() - started);
+/** No UTF-16 code unit takes more than three bytes of UTF-8. */
+const BYTES_PER_CHAR = 3;
 
-  let proc: ReturnType<typeof Bun.spawn>;
-  try {
-    proc = Bun.spawn([...argv], {
-      cwd: options.cwd,
-      env: options.env,
-      stdin: options.stdin === undefined ? "ignore" : new TextEncoder().encode(options.stdin),
-      stdout: "pipe",
-      stderr: "pipe",
-      ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    });
-  } catch (err) {
+const utf8Bytes = (text: string): number => Buffer.byteLength(text, "utf8");
+
+/** `text` cut to at most `chars` UTF-16 units from the front, never mid-pair. */
+function headChars(text: string, chars: number): string {
+  if (text.length <= chars) return text;
+  const cut = text.slice(0, chars);
+  const last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
+/** `text` cut to at most `chars` UTF-16 units from the end, never mid-pair. */
+function tailChars(text: string, chars: number): string {
+  if (chars <= 0) return "";
+  if (text.length <= chars) return text;
+  const cut = text.slice(text.length - chars);
+  const first = cut.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? cut.slice(1) : cut;
+}
+
+/**
+ * One stream, capped to `maxChars`: its head and its tail — a command's head
+ * says what it started doing, its tail how it ended — with a marker stating
+ * exactly how many BYTES were dropped between them. Bytes, because the part
+ * past the byte budget was counted as it streamed past and never decoded.
+ */
+function capStream(
+  head: string,
+  tail: string | undefined,
+  truncated: boolean,
+  omittedBytes: number,
+  maxChars: number,
+): { text: string; truncated: boolean } {
+  const headRoom = Math.floor(maxChars / 2);
+  const tailRoom = maxChars - headRoom;
+  if (!truncated) {
+    if (head.length <= maxChars) return { text: head, truncated: false };
+    const h = headChars(head, headRoom);
+    const t = tailChars(head, tailRoom);
+    const dropped = utf8Bytes(head) - utf8Bytes(h) - utf8Bytes(t);
+    return { text: `${h}\n...[${dropped} bytes dropped]...\n${t}`, truncated: true };
+  }
+  const h = headChars(head, headRoom);
+  const whole = tail ?? "";
+  const t = tailChars(whole, tailRoom);
+  const dropped =
+    omittedBytes + (utf8Bytes(head) - utf8Bytes(h)) + (utf8Bytes(whole) - utf8Bytes(t));
+  return { text: `${h}\n...[${dropped} bytes dropped]...\n${t}`, truncated: true };
+}
+
+/** The exit status a shell would report: 128 + the signal's number for a signalled child. */
+function exitStatus(r: SpawnBoundedResult): number {
+  if (r.exitCode !== null) return r.exitCode;
+  if (r.signal !== null) {
+    const n = (constants.signals as Record<string, number | undefined>)[r.signal];
+    if (n !== undefined) return 128 + n;
+  }
+  return -1;
+}
+
+export async function runOnce(argv: readonly string[], options: RunOptions): Promise<RunOutcome> {
+  const max = Math.max(0, options.maxOutputChars);
+  const tailRoom = max - Math.floor(max / 2);
+  const r = await spawnBounded({
+    cmd: argv,
+    cwd: options.cwd,
+    env: options.env,
+    ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
+    timeoutMs: options.timeoutMs,
+    maxStdoutBytes: max * BYTES_PER_CHAR,
+    maxStderrBytes: max * BYTES_PER_CHAR,
+    tailBytes: tailRoom * BYTES_PER_CHAR,
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+  });
+  if (r.spawnError !== undefined) {
     return {
       argv,
       exitCode: -1,
@@ -90,80 +144,24 @@ export async function runOnce(argv: readonly string[], options: RunOptions): Pro
       stdoutTruncated: false,
       stderrTruncated: false,
       timedOut: false,
-      durationMs: elapsed(),
-      spawnError: err instanceof Error ? err.message : String(err),
+      durationMs: r.durationMs,
+      spawnError: r.spawnError,
     };
   }
-
-  let timedOut = false;
-  let reapGiveUp: ReturnType<typeof setTimeout> | undefined;
-  const term = setTimeout(() => {
-    timedOut = true;
-    try {
-      proc.kill("SIGTERM");
-    } catch {
-      // Already gone between the timer firing and the signal.
-    }
-  }, options.timeoutMs);
-  const hardKill = setTimeout(() => {
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }, options.timeoutMs + KILL_GRACE_MS);
-
-  try {
-    // The spread options above widen Bun's stdio inference, so name the
-    // piped shape explicitly rather than let the union leak outward.
-    // `.catch` is attached HERE, not after the race: the loser of the race
-    // below stays pending, and a stream torn down with the killed process
-    // would otherwise reject with nobody listening — an unhandled rejection
-    // that takes down the harness rather than the command that caused it.
-    const stdoutText = new Response(proc.stdout as ReadableStream<Uint8Array>)
-      .text()
-      .catch(() => "");
-    const stderrText = new Response(proc.stderr as ReadableStream<Uint8Array>)
-      .text()
-      .catch(() => "");
-    const abandonedMarker = Symbol("abandoned");
-    const reaped = await Promise.race([
-      proc.exited,
-      new Promise<typeof abandonedMarker>((resolve) => {
-        reapGiveUp = setTimeout(
-          () => resolve(abandonedMarker),
-          options.timeoutMs + KILL_GRACE_MS + REAP_GRACE_MS,
-        );
-      }),
-    ]);
-    const abandoned = reaped === abandonedMarker;
-    const exitCode = abandoned ? -1 : (reaped as number);
-    const drainFallback = (): Promise<string> =>
-      new Promise((resolve) => setTimeout(() => resolve(""), DRAIN_GRACE_MS));
-    const [rawOut, rawErr] = await Promise.all([
-      Promise.race([stdoutText, drainFallback()]),
-      Promise.race([stderrText, drainFallback()]),
-    ]);
-    const out = capText(rawOut, options.maxOutputChars);
-    const err = capText(rawErr, options.maxOutputChars);
-    return {
-      argv,
-      exitCode,
-      stdout: out.text,
-      stderr: err.text,
-      stdoutTruncated: out.truncated,
-      stderrTruncated: err.truncated,
-      timedOut: timedOut || abandoned,
-      durationMs: elapsed(),
-      ...(abandoned ? { abandoned: true } : {}),
-    };
-  } finally {
-    clearTimeout(term);
-    clearTimeout(hardKill);
-    // Unconditional: left running, this one would hold the event loop open
-    // for the whole timeout on every command that finished in a millisecond.
-    if (reapGiveUp !== undefined) clearTimeout(reapGiveUp);
-  }
+  const out = capStream(r.stdout, r.stdoutTail, r.stdoutTruncated, r.stdoutOmittedBytes, max);
+  const err = capStream(r.stderr, r.stderrTail, r.stderrTruncated, r.stderrOmittedBytes, max);
+  return {
+    argv,
+    exitCode: r.abandoned ? -1 : exitStatus(r),
+    stdout: out.text,
+    stderr: err.text,
+    stdoutTruncated: out.truncated,
+    stderrTruncated: err.truncated,
+    timedOut: r.timedOut || r.abandoned,
+    durationMs: r.durationMs,
+    ...(r.abandoned ? { abandoned: true } : {}),
+    ...(r.outputComplete ? {} : { outputIncomplete: true }),
+  };
 }
 
 /** A deadline-aware sleep: resolves early (and reports it) when aborted. */

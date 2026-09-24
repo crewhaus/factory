@@ -62,6 +62,7 @@ function installRunner(handler: Handler): void {
       ...(reply.stdoutTruncated === true ? { stdoutTruncated: true } : {}),
       ...(reply.stderrTruncated === true ? { stderrTruncated: true } : {}),
       ...(reply.abandoned === true ? { abandoned: true } : {}),
+      ...(reply.outputIncomplete === true ? { outputIncomplete: true } : {}),
       ...(reply.spawnError !== undefined ? { spawnError: reply.spawnError } : {}),
     };
   });
@@ -956,6 +957,21 @@ describe("what the tools say when a probe FAILED", () => {
     expect(out["sources"][0]?.available).toBe(false);
     expect(out["sources"][0]?.reason).toContain("PREFIX");
     expect(out["entries"]).toEqual([]);
+  });
+
+  test("a listing whose output a leftover process held open is not a crontab (C078)", async () => {
+    // The command exited, but a child it started kept the pipe open past the
+    // drain grace. 0.7.0 returned "" here, which read as "no jobs".
+    installRunner((argv) =>
+      argv[1] === "-l" ? { stdout: "0 3 * * * /usr/local/bin/a.sh\n", outputIncomplete: true } : {},
+    );
+    const out = await list({ sources: ["crontab"], nextRuns: 0 });
+    expect(out["sources"][0]?.available).toBe(false);
+    expect(out["sources"][0]?.reason).toContain("incomplete");
+    expect(out["entries"]).toEqual([]);
+    const removed = await remove({ source: "crontab", id: "line:1" });
+    expect(removed).toMatchObject({ ok: false, deleted: false });
+    expect(fsLog.written).toEqual([]);
   });
 
   test("a delete REFUSES to rewrite a crontab it only half read", async () => {

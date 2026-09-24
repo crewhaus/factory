@@ -178,6 +178,9 @@ function outcomeJson(outcome: Awaited<ReturnType<typeof runOnce>>): Record<strin
     stderr: outcome.stderr,
     ...(outcome.stdoutTruncated ? { stdoutTruncated: true } : {}),
     ...(outcome.stderrTruncated ? { stderrTruncated: true } : {}),
+    // The child exited, but a process it started held its output open past
+    // the drain grace: what came back is what arrived, perhaps not all of it.
+    ...(outcome.outputIncomplete === true ? { outputIncomplete: true } : {}),
   };
 }
 

@@ -376,12 +376,70 @@ describe("RunCommand", () => {
     // The grandchild sleeps 20s; returning in anything under that proves the
     // drain gave up rather than waiting for EOF.
     expect(elapsed).toBeLessThan(10_000);
+    // C078: what arrived before the drain gave up is kept, and the result
+    // says it may be incomplete — it used to come back as "" with ok:true.
+    expect(out.stdout).toContain("parent done");
+    expect(out.outputIncomplete).toBe(true);
+    expect(out.ok).toBe(true);
   });
+
+  test("a timed-out command still returns what it printed before the deadline", async () => {
+    // `sh -c`, not a fresh script file: macOS may scan a new executable for
+    // longer than this deadline before running a line of it.
+    const out = await call(runCommand, {
+      // No `exec`: the shell's own child is what used to hold the pipe open
+      // after the deadline's signal killed only the shell.
+      argv: ["sh", "-c", "echo 'error: port in use'; sleep 3"],
+      timeoutMs: 1_000,
+    });
+    expect(out.timedOut).toBe(true);
+    expect(out.stdout).toContain("error: port in use");
+  });
+
+  test("output past the cap is discarded as it arrives, not buffered first", async () => {
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    let peak = before;
+    const sampler = setInterval(() => {
+      peak = Math.max(peak, process.memoryUsage().rss);
+    }, 5);
+    let out: { stdoutTruncated: boolean; stdout: string };
+    try {
+      out = await call(runCommand, {
+        argv: ["head", "-c", "200000000", "/dev/zero"],
+        maxOutputChars: 100,
+      });
+    } finally {
+      clearInterval(sampler);
+    }
+    // 0.7.0 held the whole 200 MB (and more) as a string before capping.
+    expect(peak - before).toBeLessThan(100 * 1024 * 1024);
+    expect(out.stdoutTruncated).toBe(true);
+    // Exactly what was not returned: 200 MB minus the 50 + 50 kept.
+    expect(out.stdout).toContain("[199999900 bytes dropped]");
+  }, 20_000);
+
+  test("a grandchild still writing after the child exits is cut off, not buffered for ever", async () => {
+    const out = await call(runCommand, {
+      // The grandchild starts writing only after the drain grace is over.
+      argv: ["sh", "-c", "(sleep 0.9; head -c 50000000 /dev/zero) &\necho started"],
+      maxOutputChars: 100,
+    });
+    expect(out.outputIncomplete).toBe(true);
+    expect(out.stdout).toContain("started");
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    await Bun.sleep(1_500);
+    Bun.gc(true);
+    // The stream was cancelled at the drain grace: the 50 MB the
+    // grandchild writes afterwards never reaches this process.
+    expect(process.memoryUsage().rss - before).toBeLessThan(40 * 1024 * 1024);
+  }, 20_000);
 
   test("output over the cap is truncated at both ends rather than dropped or unbounded", async () => {
     const out = await call(runCommand, { argv: ["seq", "1", "5000"], maxOutputChars: 200 });
     expect(out.stdoutTruncated).toBe(true);
-    expect(out.stdout).toContain("chars dropped");
+    expect(out.stdout).toContain("bytes dropped");
     expect(out.stdout.startsWith("1\n2\n")).toBe(true);
     expect(out.stdout.trimEnd().endsWith("5000")).toBe(true);
   });

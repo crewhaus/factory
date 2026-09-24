@@ -110,10 +110,13 @@ before anything is touched.
 
 Every field a caller acts on distinguishes "no" from "could not tell":
 
-- `crontab -l` that was killed at its deadline, or whose output hit the
-  output cap and came back as a PREFIX, makes the source `available: false`
-  with the reason — and `CronDelete` refuses, because a rewrite built from
-  half a listing deletes the half it never saw.
+- `crontab -l` that was killed at its deadline, whose output hit the
+  output cap and came back as a PREFIX, or whose output a process it started
+  still held open after it exited (so reading stopped with what had arrived),
+  makes the source `available: false` with the reason — and `CronDelete`
+  refuses, because a rewrite built from half a listing deletes the half it
+  never saw. The cap is applied as the output is read, so a runaway command
+  costs bounded memory.
 - `launchctl list` failing makes every agent's `state` **`unknown`**, not
   `not-loaded`: no rows because nothing is loaded and no rows because the
   command failed are opposite facts.
