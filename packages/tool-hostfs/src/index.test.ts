@@ -72,6 +72,8 @@ import type { RunRequest, RunResult } from "./run";
  * files these tests create, not an invented one.
  */
 const UID = typeof process.getuid === "function" ? process.getuid() : 1000;
+/** Running as root defeats a mode-based unwritable directory; such tests are skipped, not faked. */
+const canTestUnwritable = (process.getuid?.() ?? 0) !== 0;
 const originalCwd = process.cwd();
 let workspace: string;
 /** Every command a test's tool call tried to run, in order. */
@@ -144,11 +146,17 @@ type Emit = (eventType: string, filename: string | null) => void;
 /**
  * A watcher that replays a script instead of asking the kernel.
  *
- * Bursts are emitted SYNCHRONOUSLY: a timer cannot fire between two
- * synchronous calls, so events in one burst always land in one settle window
- * no matter how loaded the machine is. Separate bursts are spaced by a real
- * sleep that is an order of magnitude longer than the window, which a slow
- * box can only make longer still.
+ * Emitting a burst synchronously is NOT enough to keep it in one settle
+ * window. A group closes on the NEXT event's own monotonic stamp
+ * (`Coalescer.push` calls `advanceTo(event.atMs)`), and each stamp is taken
+ * when the event is recorded, after the real `writeFileSync` and `lstat`
+ * before it. On a loaded runner those can take longer than the window, and
+ * the burst then splits with no timer involved: that is how "three
+ * notifications for one save" once reported `rawCount` 1 on CI. So a test
+ * whose burst must fold holds the monotonic clock still across it with
+ * {@link holdMonotonicClock} and advances it once, at the end. Separate
+ * bursts are spaced by a real sleep an order of magnitude longer than the
+ * window, which a slow box can only make longer still.
  */
 function scriptedWatcher(script: (emit: Emit) => void | Promise<void>): void {
   _setWatchFactory((_target, _options, emit) => {
@@ -160,6 +168,21 @@ function scriptedWatcher(script: (emit: Emit) => void | Promise<void>): void {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Hold the watcher's monotonic clock still until the test advances it, so
+ * every event of a burst carries the same stamp however long the real I/O
+ * between them took. `_resetHostSeams()` in afterEach lets go of it.
+ */
+function holdMonotonicClock(start = 1_000): { advance(ms: number): void } {
+  let mono = start;
+  _setMonotonicClock(() => mono);
+  return {
+    advance(ms: number): void {
+      mono += ms;
+    },
+  };
+}
 
 describe("WatchPath: containment and input", () => {
   test("a path outside the workspace is refused", async () => {
@@ -258,6 +281,9 @@ describe("WatchPath: the bounds", () => {
 
 describe("WatchPath: what it reports", () => {
   test("three notifications for one save are reported as one event", async () => {
+    // The clock is held still across the burst (see scriptedWatcher): real
+    // I/O between the emits once split this fold on a loaded CI runner.
+    const clock = holdMonotonicClock();
     writeFileSync(join(workspace, "app.ts"), "x");
     scriptedWatcher((emit) => {
       // The recorded Linux shape: one logical save, three writes, three
@@ -269,6 +295,8 @@ describe("WatchPath: what it reports", () => {
       emit("change", "app.ts");
       writeFileSync(join(workspace, "app.ts"), "yyzz");
       emit("change", "app.ts");
+      // Only now may the window close.
+      clock.advance(1_000);
     });
     const result = await callJson(watchPath, {
       path: ".",
@@ -518,8 +546,7 @@ describe("WatchPath: what it reports", () => {
     // scheduler's business, not this package's. With room for both, the
     // assertion is the real claim: the save is reported, and the temp is
     // dropped BECAUSE it is transient.
-    let mono = 1_000;
-    _setMonotonicClock(() => mono);
+    const clock = holdMonotonicClock();
     writeFileSync(join(workspace, "doc.md"), "one");
     scriptedWatcher((emit) => {
       writeFileSync(join(workspace, "doc.md.tmpABC"), "x");
@@ -529,7 +556,7 @@ describe("WatchPath: what it reports", () => {
       emit("rename", "doc.md.tmpABC");
       // Only now may the window close. However long those two lines took,
       // both events carry the same stamp and fold together.
-      mono += 1_000;
+      clock.advance(1_000);
     });
     const result = await callJson(watchPath, {
       path: ".",
@@ -565,6 +592,14 @@ describe("WatchPath: what it reports", () => {
     // correction or a laptop waking up mid-watch cannot leave a window that
     // never closes. Here the wall clock lurches backwards by an hour while
     // the events arrive, and the answer is unchanged.
+    //
+    // The deadline is the tool's maximum, far past this test's own budget,
+    // so only the monotonic settle window can end the watch: a fold that
+    // settled on the wall clock would never close and would fail at the
+    // test timeout instead of passing on the deadline's final flush. And
+    // under the held clock the duration is exactly the one advance, which a
+    // watch ended any other way would not report.
+    const clock = holdMonotonicClock();
     writeFileSync(join(workspace, "app.ts"), "x");
     let wall = Date.parse("2026-09-19T01:29:18Z");
     _setClock(() => {
@@ -576,14 +611,16 @@ describe("WatchPath: what it reports", () => {
       emit("change", "app.ts");
       writeFileSync(join(workspace, "app.ts"), "xxyy");
       emit("change", "app.ts");
+      clock.advance(1_000);
     });
     const result = await callJson(watchPath, {
       path: ".",
-      timeoutMs: 5_000,
+      timeoutMs: 600_000,
       maxEvents: 1,
       settleMs: 20,
     });
     expect(result["stoppedBy"]).toBe("eventCap");
+    expect(result["durationMs"]).toBe(1_000);
     expect((result["events"] as Array<Record<string, unknown>>)[0]?.["rawCount"]).toBe(2);
   }, 20_000);
 
@@ -1093,25 +1130,28 @@ describe("TrashPath: the same-filesystem rule", () => {
     expect(readdirSync(join(workspace, "attacker"))).toEqual([]);
   });
 
-  test("a volume whose trash cannot be created refuses, and the file stays", async () => {
-    linuxHost();
-    const volume = join(workspace, "volume");
-    mkdirSync(volume, { recursive: true });
-    writeFileSync(join(volume, "onvol.txt"), "precious\n");
-    pretendSeparateFilesystem(volume);
-    // Read-only volume: `mkdir` fails, and the only correct answer is to
-    // leave the file where it is.
-    chmodSync(volume, 0o500);
-    try {
-      const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
-      const entries = result["entries"] as Array<Record<string, unknown>>;
-      expect(result["trashed"]).toBe(0);
-      expect(entries[0]?.["status"]).toBe("refused");
-      expect(readFileSync(join(volume, "onvol.txt"), "utf8")).toBe("precious\n");
-    } finally {
-      chmodSync(volume, 0o700);
-    }
-  });
+  test.if(canTestUnwritable)(
+    "a volume whose trash cannot be created refuses, and the file stays",
+    async () => {
+      linuxHost();
+      const volume = join(workspace, "volume");
+      mkdirSync(volume, { recursive: true });
+      writeFileSync(join(volume, "onvol.txt"), "precious\n");
+      pretendSeparateFilesystem(volume);
+      // Read-only volume: `mkdir` fails, and the only correct answer is to
+      // leave the file where it is.
+      chmodSync(volume, 0o500);
+      try {
+        const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+        const entries = result["entries"] as Array<Record<string, unknown>>;
+        expect(result["trashed"]).toBe(0);
+        expect(entries[0]?.["status"]).toBe("refused");
+        expect(readFileSync(join(volume, "onvol.txt"), "utf8")).toBe("precious\n");
+      } finally {
+        chmodSync(volume, 0o700);
+      }
+    },
+  );
 
   test("an EXDEV from the move leaves the file AND removes the claimed record", async () => {
     const trash = linuxHost();

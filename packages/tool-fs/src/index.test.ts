@@ -558,19 +558,22 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
     expect(result).toContain("1 line(s) longer than 10000 characters were not searched");
   });
 
-  test("a file it could not read is counted, not taken as a miss", async () => {
-    if (process.getuid?.() === 0) return; // root reads a mode-000 file anyway
-    await writeFile(path.join(tmp, "locked.txt"), "needle\n");
-    chmodSync(path.join(tmp, "locked.txt"), 0o000);
-    try {
-      const result = String(await grep.execute({ pattern: "needle" }));
-      expect(result).toBe(
-        "no matches in the lines searched\n[grep: 1 file(s) could not be read and were not searched]",
-      );
-    } finally {
-      chmodSync(path.join(tmp, "locked.txt"), 0o600);
-    }
-  });
+  // Root reads a mode-000 file anyway: skipped (and reported as a skip) there.
+  test.if((process.getuid?.() ?? 0) !== 0)(
+    "a file it could not read is counted, not taken as a miss",
+    async () => {
+      await writeFile(path.join(tmp, "locked.txt"), "needle\n");
+      chmodSync(path.join(tmp, "locked.txt"), 0o000);
+      try {
+        const result = String(await grep.execute({ pattern: "needle" }));
+        expect(result).toBe(
+          "no matches in the lines searched\n[grep: 1 file(s) could not be read and were not searched]",
+        );
+      } finally {
+        chmodSync(path.join(tmp, "locked.txt"), 0o600);
+      }
+    },
+  );
 
   test("a complete search with no hits is still a plain 'no matches'", async () => {
     await writeFile(path.join(tmp, "f.txt"), "alpha\n");
