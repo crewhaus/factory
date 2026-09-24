@@ -86,11 +86,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool, or deny its destination, instead. `crewhaus lint` points out such
   rules.
 - **`DownloadFile` now asks for a justification**, like `HttpRequest`: it
-  fetches from a URL the model chose and writes the result into the
-  workspace. The rule every builtin now follows is written down in
-  AGENTS.md: a destructive tool that goes to a place the model chose is
-  justification-gated. In production that needs a judge
-  (`security.justification.judge: claude`), or the call is denied; set
+  fetches a URL the model chose, within the origins you allow-listed, and
+  writes the result into the workspace. The rule every builtin now follows is
+  written down in AGENTS.md: a destructive tool that goes to a place the
+  model chose is justification-gated. **A spec that grants `DownloadFile`
+  needs one line after upgrading**, or every call is denied outside tests:
+  `security.justification.judge: claude`, or the environment variable
   `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` to accept the built-in rule
   check instead. No other tool's justification flag changed.
 - **MCP tools are named `mcp__<server>__<tool>`**, the name the docs have
