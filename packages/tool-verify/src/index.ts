@@ -12,7 +12,7 @@
  * would be a crawler, and would leak which documents are being reviewed.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -28,6 +28,7 @@ import {
   readableText,
   textOf,
 } from "@crewhaus/tool-html";
+import { openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { textSimilarity } from "@crewhaus/tool-text";
 import { z } from "zod";
 import {
@@ -266,21 +267,32 @@ export const goldenUpdate: RegisteredTool = buildTool({
       root: workspaceRoot(),
       replace: input.replace,
     });
-    let previous: string | null = null;
-    try {
-      previous = readFileSync(at.real, "utf-8");
-    } catch {
-      previous = null;
+    const root = workspaceRoot();
+    // The old golden, read no further than one byte past the new one: that is
+    // enough to say whether it changed, and a FIFO or a link out of the
+    // workspace at the golden's name is refused here instead of read.
+    const bytes = Buffer.byteLength(normalized.text);
+    const before = openForReadSync(root, at.rel, { maxBytes: bytes + 1 });
+    if (!before.ok && before.code !== "not-found") {
+      return `GoldenUpdate wrote nothing: ${before.reason}`;
     }
-    // Temp file plus rename: an interrupted write leaves the old golden in
-    // place rather than a truncated one that passes nothing.
-    const temp = `${at.real}.tmp-${process.pid}`;
-    writeFileSync(temp, normalized.text);
-    renameSync(temp, at.real);
+    const previous = before.ok ? before.text : null;
+    const changed = !before.ok || before.truncated || before.text !== normalized.text;
+    // Through a randomly named temp created with O_EXCL beside the golden,
+    // then a rename: an interrupted write leaves the old golden in place
+    // rather than a truncated one that passes nothing, and a link planted at
+    // a temp name is never written through. An in-workspace link AT the
+    // golden is written through and stays a link, as editing a linked file
+    // does; one that leads out of the workspace is refused.
+    const written = writeFileSafe(root, at.rel, normalized.text, {
+      overwrite: true,
+      leafSymlink: "follow-contained",
+    });
+    if (!written.ok) return `GoldenUpdate wrote nothing: ${written.reason}`;
     return json({
       golden: at.rel,
       created: previous === null,
-      changed: previous !== normalized.text,
+      changed,
       bytes: Buffer.byteLength(normalized.text),
       normalized: normalized.applied,
     });

@@ -2,7 +2,17 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 /**
  * Every tool this package registers, against a real temporary workspace.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -137,6 +147,65 @@ describe("GoldenCompare and GoldenUpdate", () => {
       normalize: ["timestamps"],
     });
     expect(again).toMatchObject({ created: false, changed: false });
+  });
+
+  test("a symlink planted at the old predictable temp name is never written through", async () => {
+    // 0.7.0 wrote `<golden>.tmp-<pid>` with a following open and renamed it
+    // over the golden: a link planted at that name sent the bytes outside
+    // the workspace and left the golden itself a link out.
+    const outside = mkdtempSync(join(tmpdir(), "crewhaus-verify-outside-"));
+    try {
+      writeFileSync(join(outside, "victim.txt"), "ORIGINAL\n");
+      mkdirSync(join(workspace, "goldens"));
+      writeFileSync(join(workspace, "goldens/out.txt"), "old\n");
+      const planted = [`out.txt.tmp-${process.pid}`, `new.txt.tmp-${process.pid}`];
+      symlinkSync(join(outside, "victim.txt"), join(workspace, "goldens", planted[0] as string));
+      symlinkSync(join(outside, "created.txt"), join(workspace, "goldens", planted[1] as string));
+
+      const replaced = await call(goldenUpdate, { actual: "new\n", golden: "goldens/out.txt" });
+      const created = await call(goldenUpdate, { actual: "x\n", golden: "goldens/new.txt" });
+      expect(replaced).toMatchObject({ created: false, changed: true });
+      expect(created).toMatchObject({ created: true, changed: true });
+
+      expect(readFileSync(join(outside, "victim.txt"), "utf8")).toBe("ORIGINAL\n");
+      expect(existsSync(join(outside, "created.txt"))).toBe(false);
+      expect(lstatSync(join(workspace, "goldens/out.txt")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(workspace, "goldens/out.txt"), "utf8")).toBe("new\n");
+      expect(readFileSync(join(workspace, "goldens/new.txt"), "utf8")).toBe("x\n");
+      // No temp is left behind: only the goldens and the two planted links.
+      expect(readdirSync(join(workspace, "goldens")).sort()).toEqual(
+        ["new.txt", "out.txt", ...planted].sort(),
+      );
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("an in-workspace link at the golden is written through and stays a link", async () => {
+    mkdirSync(join(workspace, "real"));
+    writeFileSync(join(workspace, "real/g.txt"), "old\n");
+    symlinkSync("real/g.txt", join(workspace, "g.txt"));
+    const result = await call(goldenUpdate, { actual: "new\n", golden: "g.txt" });
+    expect(result).toMatchObject({ created: false, changed: true });
+    expect(lstatSync(join(workspace, "g.txt")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(workspace, "real/g.txt"), "utf8")).toBe("new\n");
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO at the golden's name is refused, not opened",
+    async () => {
+      const fifo = join(workspace, "g.txt");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      const out = await raw(goldenUpdate, { actual: "new\n", golden: "g.txt" });
+      expect(out).toMatch(/^GoldenUpdate wrote nothing: .*"g\.txt".*(FIFO|fifo)/);
+      expect(lstatSync(fifo).isFIFO()).toBe(true);
+    },
+  );
+
+  test("a missing directory is refused with a reason, and nothing is written", async () => {
+    const out = await raw(goldenUpdate, { actual: "x\n", golden: "nodir/g.txt" });
+    expect(out).toMatch(/^GoldenUpdate wrote nothing: .*nodir\/g\.txt/);
+    expect(existsSync(join(workspace, "nodir"))).toBe(false);
   });
 
   test("a tree compare reports added, removed and changed files", async () => {

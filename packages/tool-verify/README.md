@@ -185,4 +185,8 @@ another). And the only word-ending rule is a plural `s`, never stemming —
 baseline, so it is destructive and justification-gated, and it writes through
 a temporary file and a rename — an interrupted run leaves the old golden
 intact rather than a truncated one, which passes nothing and is easy to
-mistake for a real diff.
+mistake for a real diff. The temporary file gets a random name and is created
+exclusively, so a link waiting at a temporary name is never written through.
+A golden that is itself a link inside the workspace is written through and
+stays a link; a link out of the workspace, a FIFO or a directory at the
+golden's name is refused, and so is a golden whose directory does not exist.
