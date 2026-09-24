@@ -192,6 +192,17 @@ describe("AddressCheck", () => {
 });
 
 describe("TypedDataHash", () => {
+  test("an odd-length bytes value is an error, not a digest of a shorter value (C133)", async () => {
+    await expect(
+      raw(typedDataHash, {
+        domain: { name: "T", chainId: 1 },
+        types: { Blob: [{ name: "data", type: "bytes" }] },
+        primaryType: "Blob",
+        message: { data: "0xabc" },
+      }),
+    ).rejects.toThrow(/odd number of hex digits/);
+  });
+
   test("computes the specification's digest and says it did not sign it", async () => {
     const result = await call<{ digest: string; note: string; scheme: string }>(typedDataHash, {
       domain: {

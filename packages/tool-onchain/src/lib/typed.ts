@@ -11,7 +11,7 @@
  * was actually shown, compared against the one the dapp asked for.
  */
 import { keccak256, toHex } from "@crewhaus/tool-encode";
-import { type AbiType, type AbiValue, encodeTuple, parseType } from "./abi";
+import { type AbiType, type AbiValue, bytesArg, encodeTuple, parseType } from "./abi";
 
 export type TypedField = { readonly name: string; readonly type: string };
 export type TypedTypes = Readonly<Record<string, ReadonlyArray<TypedField>>>;
@@ -87,15 +87,9 @@ function encodeField(type: string, value: unknown, types: TypedTypes, what: stri
   if (types[type]) return hashStruct(type, value as Record<string, unknown>, types);
 
   if (type === "string") return hash(encoder.encode(String(value)));
-  if (type === "bytes") {
-    const text = String(value).replace(/^0x/i, "");
-    if (!/^[0-9a-fA-F]*$/.test(text)) throw new Error(`${what}: bytes must be hex`);
-    const bytes = new Uint8Array(text.length / 2);
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = Number.parseInt(text.slice(i * 2, i * 2 + 2), 16);
-    }
-    return hash(bytes);
-  }
+  // The coder's own strict decoder: an odd digit count is refused rather
+  // than its last nibble dropped, which made 0xabc hash as 0xab.
+  if (type === "bytes") return hash(bytesArg(value, what));
 
   // Everything else must be an atomic ABI type. When it is not, the likely
   // mistake is a struct named in a field and left out of `types`, so say

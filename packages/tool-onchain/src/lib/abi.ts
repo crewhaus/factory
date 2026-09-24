@@ -204,13 +204,30 @@ function parseTypeAt(raw: string, depth: number): AbiType {
   throw new Error(`"${text}" is not an ABI type this understands`);
 }
 
-function hexToBytes(raw: string, what: string): Uint8Array {
+/**
+ * Hex to bytes, strictly: an odd number of digits or a non-hex character is
+ * refused, never truncated or skipped. The one hex decoder the coder and the
+ * EIP-712 hasher share, so they cannot disagree about what a value is.
+ */
+export function hexToBytes(raw: string, what: string): Uint8Array {
   const text = raw.startsWith("0x") || raw.startsWith("0X") ? raw.slice(2) : raw;
   if (text.length % 2 !== 0) throw new Error(`${what} has an odd number of hex digits`);
   if (!/^[0-9a-fA-F]*$/.test(text)) throw new Error(`${what} is not hex`);
   const out = new Uint8Array(text.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = Number.parseInt(text.slice(i * 2, i * 2 + 2), 16);
   return out;
+}
+
+/**
+ * A `bytes` or `bytesN` value: a hex string. A number is refused rather than
+ * read as its decimal digits reinterpreted as hex, which is how 4660 would
+ * become 0x4660.
+ */
+export function bytesArg(value: unknown, what: string): Uint8Array {
+  if (typeof value !== "string") {
+    throw new Error(`${what}: bytes are a 0x hex string, not a ${typeof value}`);
+  }
+  return hexToBytes(value, what);
 }
 
 /** Two's complement into a 32-byte word, big-endian. */
@@ -318,9 +335,7 @@ function encodeValue(
 
   if (type.base === "string" || type.base === "bytes") {
     const bytes =
-      type.base === "string"
-        ? new TextEncoder().encode(String(value))
-        : hexToBytes(String(value), what);
+      type.base === "string" ? new TextEncoder().encode(String(value)) : bytesArg(value, what);
     return {
       head: none,
       tail: concat([wordFromBigInt(BigInt(bytes.length), false, 256, what), padRight(bytes)]),
@@ -342,7 +357,7 @@ function encodeValue(
   }
 
   if (type.base === "bytesN") {
-    const bytes = hexToBytes(String(value), what);
+    const bytes = bytesArg(value, what);
     const size = type.bits / 8;
     if (bytes.length !== size)
       throw new Error(`${what}: bytes${size} needs ${size} bytes, got ${bytes.length}`);

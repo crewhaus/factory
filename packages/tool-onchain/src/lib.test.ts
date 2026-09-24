@@ -167,6 +167,33 @@ describe("an address is checked where it is encoded, not only by AddressCheck (C
   });
 });
 
+describe("EIP-712 bytes are read by the coder's strict decoder (C133)", () => {
+  const types = { Blob: [{ name: "data", type: "bytes" }] };
+  const digest = (data: unknown) =>
+    typedDataDigest({ name: "T", chainId: 1 }, types, "Blob", { data }).digest;
+
+  test("an odd number of hex digits is refused, not hashed without its last nibble", () => {
+    // 0.7.0: 0xabc, 0xabd and 0xab all gave one digest, and 0xa hashed as 0x.
+    expect(() => digest("0xabc")).toThrow("Blob.data has an odd number of hex digits");
+    expect(() => digest("0xa")).toThrow(/odd number of hex digits/);
+    expect(() => digest("0xzz")).toThrow(/is not hex/);
+  });
+
+  test("a number is refused rather than read as hex digits", () => {
+    expect(() => digest(4660)).toThrow("Blob.data: bytes are a 0x hex string, not a number");
+    expect(() => digest([1, 2])).toThrow(/not a object/);
+    // The ABI coder refuses the same, for bytes and bytesN.
+    expect(() => encodeCall("f(bytes)", [4660])).toThrow(/bytes are a 0x hex string/);
+    expect(() => encodeCall("f(bytes2)", [4660])).toThrow(/bytes are a 0x hex string/);
+  });
+
+  test("well-formed bytes still hash, case-insensitively, and distinctly", () => {
+    expect(digest("0xab")).toBe(digest("0xAB"));
+    expect(digest("0xab")).not.toBe(digest("0xabcd"));
+    expect(digest("0x")).not.toBe(digest("0x00"));
+  });
+});
+
 describe("ABI decoding", () => {
   test("a round trip returns what went in", () => {
     const data = encodeCall("t(address,uint256,string,bool)", [VITALIK, 42n, "hi", true]);
