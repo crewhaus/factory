@@ -234,10 +234,15 @@ describe("isCredentialShapedName covers every other copy in the repo", () => {
 
   test("the sweep finds the copies it is meant to check", () => {
     // compiler + preflight CREDENTIAL_SHAPED_KEY_RE, tool-secrets
-    // SECRETISH_KEY_RE, tool-crewhaus's CLI-flag CREDENTIAL_FLAG_RE.
+    // SECRETISH_KEY_RE, tool-crewhaus's CLI-flag CREDENTIAL_FLAG_RE, and
+    // tool-categories' CREDENTIAL_KEY_RE (which tool_config keys must carry a
+    // well-formed $ENV reference).
     expect(copies.regexes.map((c) => c.file).sort()).toEqual([
       "packages/compiler/src/index.ts",
       "packages/preflight/src/secret-grammar.ts",
+      // Two here: the separator/compound form and the camelCase form.
+      "packages/tool-categories/src/config.ts",
+      "packages/tool-categories/src/config.ts",
       "packages/tool-crewhaus/src/lib/spec-view.ts",
       "packages/tool-secrets/src/index.ts",
     ]);

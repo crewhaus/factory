@@ -75,6 +75,7 @@ export {
   registerToolConfigs,
   registeredToolName,
   resolveBuiltinTools,
+  SANDBOX_AVAILABLE_IMPORT,
   SANDBOX_AVAILABLE_SYMBOL,
   unknownToolMessage,
 } from "./shapes";

@@ -219,9 +219,7 @@ describe("emitManaged — builtin tools + tool_config (loop contract 0.4, Batch 
 
   test("code-execution tools wire sandboxAvailable, so the floor can let them run (shape-reach#5)", () => {
     const c = agentOf({ ...ir, tools: ["python"] });
-    expect(c).toContain(
-      'sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop"),',
-    );
+    expect(c).toContain("sandboxAvailable: sandboxAvailableFromEnv(),");
     expect(agentOf({ ...ir, tools: ["read"] })).not.toContain("sandboxAvailable");
   });
 

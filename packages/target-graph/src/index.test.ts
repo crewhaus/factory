@@ -266,7 +266,12 @@ describe("emitGraph — node tools (G07)", () => {
 
   test("a code-execution tool wires the sandbox floor into the node's loop", () => {
     const code = emitGraph(withTools(["python"])).files[0]?.content ?? "";
-    expect(code).toContain('sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker")');
+    // The floor reads CREWHAUS_SANDBOX through the sandbox's own parser (security-6#1).
+    expect(code).toContain("sandboxAvailable: sandboxAvailableFromEnv(),");
+    expect(code).toMatch(
+      /import \{[^}]*\bsandboxAvailableFromEnv\b[^}]*\} from "@crewhaus\/tool-code-execution";/,
+    );
+    expect(code).not.toContain("process.env.CREWHAUS_SANDBOX");
     expect(emitGraph(withTools(["read"])).files[0]?.content).not.toContain("sandboxAvailable");
   });
 

@@ -193,7 +193,12 @@ describe("emitWorkflow", () => {
       ...TWO_STEP_IR,
       steps: [{ name: "a", instructions: "i", model: "m", tools: ["python"], toolConfigs: {} }],
     };
-    expect(emitWorkflow(ir).files[0]?.content).toContain("sandboxAvailable: ((process.env");
+    const content = emitWorkflow(ir).files[0]?.content ?? "";
+    // The floor reads CREWHAUS_SANDBOX through the sandbox's own parser (security-6#1).
+    expect(content).toContain("sandboxAvailable: sandboxAvailableFromEnv(),");
+    expect(content).toMatch(
+      /import \{[^}]*\bsandboxAvailableFromEnv\b[^}]*\} from "@crewhaus\/tool-code-execution";/,
+    );
     expect(emitWorkflow(TWO_STEP_IR).files[0]?.content).not.toContain("sandboxAvailable");
   });
 

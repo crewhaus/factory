@@ -3192,6 +3192,9 @@
     "packages/tool-safety": {
       "name": "@crewhaus/tool-safety",
       "version": "0.7.0",
+      "devDependencies": {
+        "@crewhaus/tool-categories": "workspace:*",
+      },
     },
     "packages/tool-schema": {
       "name": "@crewhaus/tool-schema",

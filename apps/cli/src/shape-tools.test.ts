@@ -231,6 +231,20 @@ describe("every shape's fixture compiles every kind of tool, or refuses it by na
       // wired: in the bundle's own loop, or — for eval — by the runner the
       // bundle hands its tool packages to.
       expect(source).toContain(target === "eval" ? "importToolPackage" : "sandboxAvailable");
+      // Every file that calls the floor's parser imports it itself. The
+      // channel agent and the crew daemon run the loop in a file that does
+      // not carry the tool imports, and a missing import there is a
+      // ReferenceError on the first code-execution call, not a compile error.
+      const unimported = result.files
+        .filter((f) => f.content.includes("sandboxAvailableFromEnv("))
+        .filter(
+          (f) =>
+            !/import \{[^}]*\bsandboxAvailableFromEnv\b[^}]*\} from "@crewhaus\/tool-code-execution";/.test(
+              f.content,
+            ),
+        )
+        .map((f) => f.path);
+      expect(unimported).toEqual([]);
     });
   }
 });

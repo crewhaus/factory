@@ -377,8 +377,22 @@ export function toolConfigBlockFor(
 /** A whole string value `$UPPER_SNAKE` — the same grammar `mcp_servers` accepts. */
 const ENV_REF_RE = /^\$([A-Z_][A-Z0-9_]*)$/;
 
-/** Keys whose value is a credential; a `$` value there must be a valid reference. */
-const CREDENTIAL_KEY_RE = /(key|token|secret|password)$/i;
+/**
+ * Keys whose value is a credential; a `$` value there must be a valid
+ * reference. The credential word must stand as a word — after a separator
+ * (`api_key`, `slack-token`), at a camelCase boundary (`accessToken`), on its
+ * own, or in one of the usual run-together compounds (`apikey`) — so a key
+ * that merely ends in the letters (`monkey`) is not read as a credential.
+ * `isCredentialShapedName` in @crewhaus/tool-safety flags a superset, and its
+ * guard sweeps this copy.
+ */
+const CREDENTIAL_KEY_RE =
+  /(?:^|[_.-]|api|access|auth|bearer|client|private|refresh|session)(?:key|token|secret|password)$/i;
+const CREDENTIAL_KEY_CAMEL_RE = /[a-z0-9](?:Key|Token|Secret|Password)$/;
+
+function isCredentialConfigKey(key: string): boolean {
+  return CREDENTIAL_KEY_RE.test(key) || CREDENTIAL_KEY_CAMEL_RE.test(key);
+}
 
 function envRefName(value: string): string | undefined {
   return value.match(ENV_REF_RE)?.[1];
@@ -439,7 +453,7 @@ export function malformedToolConfigRefs(
     if (typeof node === "string") {
       if (
         key !== undefined &&
-        CREDENTIAL_KEY_RE.test(key) &&
+        isCredentialConfigKey(key) &&
         REF_LOOKALIKE_RE.test(node) &&
         envRefName(node) === undefined
       ) {

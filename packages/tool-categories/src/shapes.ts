@@ -114,6 +114,15 @@ export const SHAPE_TOOL_PROFILES: Readonly<Record<ToolShape, ShapeToolProfile>> 
 export const SANDBOX_AVAILABLE_EXPR = "sandboxAvailableFromEnv()";
 /** The symbol {@link SANDBOX_AVAILABLE_EXPR} calls. */
 export const SANDBOX_AVAILABLE_SYMBOL = "sandboxAvailableFromEnv";
+/**
+ * The import an emitted file needs before it can use
+ * {@link SANDBOX_AVAILABLE_EXPR} when that file is NOT the one carrying the
+ * resolver's tool imports — the channel shape's agent.ts and the crew
+ * daemon, whose tools are imported elsewhere. A file that does carry the tool
+ * imports already has the symbol (the resolver adds it to the code-execution
+ * group) and must not import it twice.
+ */
+export const SANDBOX_AVAILABLE_IMPORT = `import { ${SANDBOX_AVAILABLE_SYMBOL} } from "@crewhaus/tool-code-execution";\n`;
 
 /** Can `shape` compile `key`? The same rules `refusal` explains in words. */
 function carriedBy(key: string, entry: BuiltinToolEntry, shape: ToolShape): boolean {

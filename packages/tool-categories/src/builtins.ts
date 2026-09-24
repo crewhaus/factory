@@ -311,6 +311,14 @@ export const OPTIONAL_BOOT_SEAMS: Readonly<
     package: "@crewhaus/tool-document-ingest",
     why: "DocumentIngest reads text, tabular and structured files itself; a binary format such as .pdf needs a parser library this release does not ship, and without one that format is refused by name",
   },
+  descriptorPathSupported: {
+    package: "@crewhaus/tool-safety",
+    why: "not configuration: a probe that caches, once per process, whether an open descriptor can be asked for its real path; tool-safety is a helper library with no tools and nothing for a spec to set",
+  },
+  setHostExitCleanup: {
+    package: "@crewhaus/tool-safety",
+    why: "a process-level switch whose default (kill still-running process groups when the host exits) is the safe one; a spec has no reason to turn it off, so nothing delivers it",
+  },
 });
 
 /**
@@ -870,6 +878,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     name: "DownloadFile",
     initSymbol: "registerHttpConfig",
     io: "network",
+    justify: true,
   },
   headRequest: {
     package: "@crewhaus/tool-http",

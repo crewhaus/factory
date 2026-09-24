@@ -1,27 +1,38 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { BUILTIN_TOOLS, builtinToolsFor } from "@crewhaus/tool-categories";
 
 /**
  * This package is Bun-only: `./regex` starts Bun Workers, `./streams` calls
  * `Bun.spawn` and imports `node:fs`, and `withRawBody`'s `decompress: false`
  * is a Bun fetch option that workerd does not have. The tools a cf-worker
- * target bundles (its `EDGE_TOOL_IMPORTS`) must therefore never depend on
- * it, directly or through another workspace package. An edge tool needs its
- * own bound (see the README).
+ * target bundles must therefore never depend on it, directly or through
+ * another workspace package. An edge tool needs its own bound (see the
+ * README).
+ *
+ * Which tools the edge bundles is read from the one builtin table every
+ * emitter resolves through (`builtinToolsFor("cf-worker")` in
+ * @crewhaus/tool-categories), not from a per-target map: since 0.7.1 no
+ * emitter keeps one, and apps/cli/src/shape-tools.test.ts fails if one
+ * reappears.
  */
 
 const PACKAGES = join(import.meta.dir, "..", "..");
-const TARGETS = ["target-cf-worker-cli", "target-cf-worker-workflow", "target-cf-worker-graph"];
 const FORBIDDEN = "@crewhaus/tool-safety";
 
-/** The package names in a target's `EDGE_TOOL_IMPORTS` table. */
-function edgePackages(source: string): string[] {
-  const start = source.indexOf("const EDGE_TOOL_IMPORTS");
-  if (start === -1) return [];
-  const end = source.indexOf("\n};", start);
-  const block = source.slice(start, end === -1 ? undefined : end);
-  return [...block.matchAll(/package:\s*"(@crewhaus\/[a-z0-9-]+)"/g)].map((m) => m[1] as string);
+/**
+ * Every package a cf-worker bundle can import for its tools: the package of
+ * each builtin the edge profile carries, plus the table package itself (the
+ * edge emitters import its config registrar).
+ */
+function edgePackages(): string[] {
+  const out = new Set<string>(["@crewhaus/tool-categories"]);
+  for (const key of builtinToolsFor("cf-worker")) {
+    const entry = BUILTIN_TOOLS[key];
+    if (entry !== undefined) out.add(entry.package);
+  }
+  return [...out].sort();
 }
 
 type Manifest = {
@@ -60,15 +71,12 @@ function workspaceDeps(): (name: string) => string[] {
 }
 
 describe("cf-worker targets never bundle this Bun-only package", () => {
-  test("no EDGE_TOOL_IMPORTS package has it in its workspace dependency closure", () => {
+  test("no package the edge bundles has it in its workspace dependency closure", () => {
     const deps = workspaceDeps();
-    const edge = new Set<string>();
-    for (const target of TARGETS) {
-      const found = edgePackages(readFileSync(join(PACKAGES, target, "src", "index.ts"), "utf8"));
-      // The guard's hit count: each target's table was found and read.
-      expect({ target, packages: found.length > 0 }).toEqual({ target, packages: true });
-      for (const name of found) edge.add(name);
-    }
+    const edge = new Set<string>(edgePackages());
+    // The guard's hit count: the edge profile carries tools, from more than
+    // the table package alone, and fetch is among them.
+    expect(builtinToolsFor("cf-worker").length).toBeGreaterThan(0);
     expect(edge.has("@crewhaus/tool-fetch")).toBe(true);
     expect(edge.size).toBeGreaterThanOrEqual(5);
     const offenders: string[] = [];

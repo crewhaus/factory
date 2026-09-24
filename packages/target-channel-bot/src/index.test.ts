@@ -442,7 +442,10 @@ describe("emitChannelBot — daemon.ts wiring", () => {
   test("a 0.7.0 builtin and a code-execution tool resolve on the channel shape", () => {
     const files = fileMap({ ...MIN_IR, tools: ["jsonQuery", "python"] });
     expect(files.get("daemon.ts")).toContain('import { jsonQuery } from "@crewhaus/tool-data";');
-    expect(files.get("agent.ts")).toContain("sandboxAvailable: ((process.env.CREWHAUS_SANDBOX");
+    expect(files.get("agent.ts")).toContain("sandboxAvailable: sandboxAvailableFromEnv(),");
+    expect(files.get("agent.ts")).toMatch(
+      /import \{[^}]*\bsandboxAvailableFromEnv\b[^}]*\} from "@crewhaus\/tool-code-execution";/,
+    );
   });
 
   test("rejects unknown tool names", () => {

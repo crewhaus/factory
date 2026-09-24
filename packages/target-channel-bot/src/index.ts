@@ -34,6 +34,7 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  SANDBOX_AVAILABLE_IMPORT,
   type SpecChainBlocks,
   readmeToolFacts,
   resolveBuiltinTools,
@@ -1175,7 +1176,7 @@ import { runChatLoop } from "@crewhaus/runtime-core";
 import type { EgressAuditSink, JustificationAuditSink } from "@crewhaus/runtime-core";
 import { createRunContext } from "@crewhaus/run-context";
 import { classifyInbound } from "@crewhaus/channel-adapter-base";
-${hybridImport}${permImport}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
+${hybridImport}${permImport}${renderSandboxField(ir) !== "" ? SANDBOX_AVAILABLE_IMPORT : ""}${approvalTypeImport}${subAgentTypeImport}${memImport}${evalImport}import type { HookDef } from "@crewhaus/hooks-engine";
 import type { SkillRef } from "@crewhaus/skills-registry";
 import type { SlashCommand } from "@crewhaus/slash-commands";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";${
