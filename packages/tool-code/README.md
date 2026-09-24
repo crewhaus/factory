@@ -141,9 +141,19 @@ report as a clean result.
   `destructive` — take an explicit `command`. `Typecheck`, `Lint`,
   `FormatCheck` and `Diagnostics` run what `src/detect.ts` works out from the
   project's own files and nothing else. That is not a convenience: a permission
-  engine allows a `readOnly` tool without asking in auto mode, and allows
-  nothing else at all in plan mode, so a read-only tool that let a caller pick
-  the program would be an unreviewed `sh -c` wearing a checker's badge.
+  engine allows a tool that is not destructive without asking in auto mode, so
+  a checker that let a caller pick the program would be an unreviewed `sh -c`
+  wearing a checker's badge.
+- **Whose code runs.** Even without a caller-chosen program, a checker runs
+  the PROJECT's code: `node_modules/.bin/eslint`, an `eslint.config.js`, a
+  prettier plugin, a `build.rs` that `cargo clippy` compiles and runs. So none
+  of the four is read-only (plan mode refuses them), and each runs with the
+  harness's credentials removed from its environment — every variable whose
+  name looks like a credential (`*_API_KEY`, `*_TOKEN`, `PGPASSWORD`,
+  `DATABASE_URL` …) or whose value is a token in a known format. Everything a
+  toolchain needs (`PATH`, `CARGO_HOME`, `GOPATH`, `VIRTUAL_ENV`, proxies, CA
+  bundles) is kept. The destructive runners keep the full environment: a
+  person approved them, and a test suite may need its `DATABASE_URL`.
 - **Bounds.** Every spawn carries a deadline (SIGTERM, then SIGKILL) and reads
   its pipes through a cap, so a runner that prints a gigabyte costs a bounded
   amount of *memory*, not just bounded output. `Diagnostics` spends ONE
@@ -183,17 +193,20 @@ all of it as tools.
 | Tools | Flags |
 |---|---|
 | `RunTests`, `RunBuild`, `Format` | `destructive`, `scope: "external"`, `ioCapability: "process"` — the only three that take an explicit `command` |
-| `Typecheck`, `Lint`, `FormatCheck`, `Diagnostics` | `readOnly`, `scope: "external"`, `ioCapability: "process"` — detected commands only |
+| `Typecheck`, `Lint`, `FormatCheck`, `Diagnostics` | not read-only and not destructive: each runs the checker this project configures, and that checker runs the project's own code; `scope: "external"`, `ioCapability: "process"`; detected commands only, without the harness's credentials |
 | everything else | `readOnly`, `concurrencySafe`, `scope: "internal"`, no io capability |
 
 `RunTests` is destructive because a test suite runs the project's own code and
 may write anything at all; calling it read-only would be a lie a permission
-engine would believe. `Typecheck` always passes `--noEmit` for the same reason
-in reverse — that is what lets it stay a read, and it is also why it takes no
-`command`: a read-only tool is auto-allowed, so it must not be able to spawn a
-program a caller chose. No tool here requires a justification, because none has
-an outward side effect: nothing is posted, pushed or sent. `src/index.test.ts`
-asserts all of this per tool — including that the read-only checkers advertise
-no `command` field, and that one smuggled past the schema still never becomes a
-process — so a future addition that forgets a flag fails the suite rather than
-the review.
+engine would believe. The checkers are not destructive — `Typecheck` always
+passes `--noEmit` and `Lint` never passes a fix flag — so auto mode runs them
+without asking, which is why they take no `command`: a tool auto mode runs
+unasked must not be able to spawn a program a caller chose. They are not
+read-only either, because the checker is the project's code (see "Whose code
+runs" above), so plan mode refuses them. No tool here requires a
+justification, because none has an outward side effect: nothing is posted,
+pushed or sent. `src/index.test.ts` asserts all of this per tool — the plan,
+auto and default decisions for each checker, that no checker advertises a
+`command` field, that one smuggled past the schema still never becomes a
+process, and that a checker's child never sees a credential — so a future
+addition that forgets a flag fails the suite rather than the review.

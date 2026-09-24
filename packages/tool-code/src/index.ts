@@ -131,9 +131,10 @@ const timeoutField = z
  *
  * It appears ONLY on the tools marked `destructive` (`RunTests`, `RunBuild`,
  * `Format`). Spawning a program the caller names is arbitrary execution, and
- * the permission engine auto-allows a `readOnly` tool in auto mode and allows
- * it outright in plan mode — so `Typecheck`, `Lint` and `FormatCheck` do not
- * take one, and stay reads that a permission engine can believe.
+ * the permission engine runs a tool that is not destructive without asking in
+ * auto mode — so `Typecheck`, `Lint`, `FormatCheck` and `Diagnostics` do not
+ * take one: an auto-allowed checker that took an argv would be an unreviewed
+ * `sh -c`.
  */
 const commandField = z
   .array(z.string().min(1))
@@ -157,11 +158,11 @@ const extensionsField = z
   .describe("file extensions to scan, with the dot; defaults to the JS/TS family");
 
 /**
- * Safety flags for a tool that spawns a program but asks it only to report:
- * a type check with `--noEmit`, a linter without `--fix`. Spawning is still
- * crossing a process boundary, so `scope`/`ioCapability` say so. Never
- * concurrency-safe: two type checks racing on one `.tsbuildinfo` is exactly
- * the contention the flag exists to prevent.
+ * Safety flags for a tool that runs the project's own checker and asks it
+ * only to report: a type check with `--noEmit`, a linter without `--fix`.
+ * Spawning is crossing a process boundary, so `scope`/`ioCapability` say so.
+ * Never concurrency-safe: two type checks racing on one `.tsbuildinfo` is
+ * exactly the contention the flag exists to prevent.
  *
  * NOT `readOnly` (0.7.1, permission-integration#7). None of these accepts a
  * caller-supplied `command` — the program is worked out from the project's
@@ -173,8 +174,12 @@ const extensionsField = z
  * apps/cli/src/flag-rules.test.ts: a read-only tool may spawn only a program
  * the tool itself fixes. Not `destructive` either: a checker is not expected
  * to change anything, so auto mode still runs it without asking, as before.
+ * Because auto mode runs it unasked and the program is the project's, each
+ * of these spawns WITHOUT the harness's credentials in its environment (see
+ * `runProcess`'s `withoutCredentials`): a checker has no business with a
+ * provider key, and an `eslint.config.js` would otherwise be handed one.
  */
-const READ_SPAWN = {
+const CHECK_SPAWN = {
   readOnly: false,
   concurrencySafe: false,
   scope: "external",
@@ -215,14 +220,14 @@ const RAW_TAIL_LINES = 25;
 /**
  * What to tell a caller who has nowhere left to go.
  *
- * The three read-only checkers take no `command`, so pointing them at one
- * would be advice that cannot be followed; they are pointed at the
- * destructive tool that does take one instead.
+ * The four checkers take no `command`, so pointing them at one would be
+ * advice that cannot be followed; they are pointed at the destructive tool
+ * that does take one instead.
  */
 const escapeHatch = (toolName: string): string =>
   TAKES_COMMAND.has(toolName)
     ? "Pass `command` with an explicit argv."
-    : `${toolName} deliberately takes no explicit command — it is marked read-only, and a read-only tool that spawned a caller-named program would be auto-allowed by the permission engine. Install the tool, or use RunBuild with \`command\`, which is marked destructive for exactly this reason.`;
+    : `${toolName} deliberately takes no explicit command — it is not destructive, so auto mode runs it without asking, and a tool that ran a caller-named program unasked would be an unreviewed shell. Install the tool, or use RunBuild with \`command\`, which is marked destructive for exactly this reason.`;
 
 /** The tools that accept a caller-supplied argv. Every one is `destructive`. */
 const TAKES_COMMAND: ReadonlySet<string> = new Set(["RunTests", "RunBuild", "Format"]);
@@ -261,14 +266,14 @@ function resolveToolchain(
   requested: string,
 ): Resolution {
   if (explicit !== undefined) {
-    // Belt and braces: the schema of a read-only tool has no `command` field,
-    // so this is unreachable through the runtime's validator. It is here so a
+    // Belt and braces: the schema of a checker has no `command` field, so
+    // this is unreachable through the runtime's validator. It is here so a
     // future edit that adds the field back fails loudly instead of quietly
-    // reopening arbitrary execution behind a `readOnly` flag.
+    // reopening arbitrary execution behind a tool auto mode runs unasked.
     if (!TAKES_COMMAND.has(toolName)) {
       return {
         ok: false,
-        message: `${toolName} does not accept an explicit command: it is marked read-only, and a read-only tool that spawned a caller-named program would be auto-allowed by the permission engine.`,
+        message: `${toolName} does not accept an explicit command: it is not destructive, so auto mode runs it without asking, and a tool that ran a caller-named program unasked would be an unreviewed shell.`,
       };
     }
     const bad = checkArgv(toolName, explicit);
@@ -716,12 +721,12 @@ export const typecheck: RegisteredTool = buildTool({
   name: "Typecheck",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode so nothing is written, and there is no way to point this tool at a different program — that is what keeps it a read; RunBuild is where an arbitrary command belongs.",
+    "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode, and there is no way to point this tool at a different program; RunBuild is where an arbitrary command belongs. The checker and its plugins are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("Typecheck", input.cwd);
     if (!dir.ok) return dir.message;
@@ -738,6 +743,7 @@ export const typecheck: RegisteredTool = buildTool({
     const run = await runProcess(resolution.argv, {
       cwd: dir.value,
       timeoutMs: input.timeout ?? DEFAULT_TIMEOUT_MS,
+      withoutCredentials: true,
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     });
     const failed = spawnFailure("Typecheck", run);
@@ -760,7 +766,7 @@ export const lint: RegisteredTool = buildTool({
   name: "Lint",
   operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
-    "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, so nothing is rewritten and no caller can substitute another program — Format is the tool that writes.",
+    "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, and no caller can substitute another program — Format is the tool that rewrites files. The linter and its config (an eslint.config.js, a cargo build script) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     paths: z
@@ -770,7 +776,7 @@ export const lint: RegisteredTool = buildTool({
       .describe("limit to these files or directories, relative to `cwd`"),
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("Lint", input.cwd);
     if (!dir.ok) return dir.message;
@@ -795,6 +801,7 @@ export const lint: RegisteredTool = buildTool({
     const run = await runProcess(argv, {
       cwd: dir.value,
       timeoutMs: input.timeout ?? DEFAULT_TIMEOUT_MS,
+      withoutCredentials: true,
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     });
     const failed = spawnFailure("Lint", run);
@@ -816,7 +823,7 @@ export const format: RegisteredTool = buildTool({
     { field: "command", kind: "command" },
   ],
   description:
-    "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the read-only counterpart.",
+    "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the counterpart that only reports.",
   inputSchema: z.object({
     cwd: cwdField,
     command: commandField,
@@ -908,12 +915,12 @@ export const formatCheck: RegisteredTool = buildTool({
   name: "FormatCheck",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program.",
+    "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program. The formatter and its config (a prettier.config.js and its plugins) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("FormatCheck", input.cwd);
     if (!dir.ok) return dir.message;
@@ -931,6 +938,7 @@ export const formatCheck: RegisteredTool = buildTool({
     const run = await runProcess(argv, {
       cwd: dir.value,
       timeoutMs: input.timeout ?? DEFAULT_TIMEOUT_MS,
+      withoutCredentials: true,
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     });
     const failed = spawnFailure("FormatCheck", run);
@@ -955,7 +963,7 @@ export const diagnostics: RegisteredTool = buildTool({
   name: "Diagnostics",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and nothing is written.",
+    "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and no source file is rewritten. Each checker is the project's own code (a cargo build may also write its target directory), so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     include: z
@@ -966,7 +974,7 @@ export const diagnostics: RegisteredTool = buildTool({
       .describe("which checks to run; all three when omitted"),
     timeout: timeoutField,
   }),
-  ...READ_SPAWN,
+  ...CHECK_SPAWN,
   execute: async (input, ctx) => {
     const dir = resolveDir("Diagnostics", input.cwd);
     if (!dir.ok) return dir.message;
@@ -1011,6 +1019,7 @@ export const diagnostics: RegisteredTool = buildTool({
       const run = await runProcess(argv, {
         cwd: dir.value,
         timeoutMs: remaining,
+        withoutCredentials: true,
         ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
       });
       const failed = spawnFailure("Diagnostics", run);

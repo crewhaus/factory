@@ -20,6 +20,7 @@
  */
 import { statSync } from "node:fs";
 import * as path from "node:path";
+import { withoutCredentials } from "@crewhaus/tool-safety/env";
 import { ToolPermissionError, resolveSafe } from "./paths";
 
 /** Default wall-clock budget for one toolchain invocation. */
@@ -226,6 +227,18 @@ export type SpawnOptions = {
   readonly maxOutputChars?: number;
   readonly maxStderrChars?: number;
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * Hand the child this process's environment WITHOUT the variables that
+   * hold a credential (a credential-shaped name, or a value in a known token
+   * format). Set by the checkers — Typecheck, Lint, FormatCheck, Diagnostics
+   * — which auto mode runs without asking and which run the project's own
+   * code (an `eslint.config.js`, a `build.rs`). Everything a toolchain needs
+   * (PATH, CARGO_HOME, GOPATH, VIRTUAL_ENV, proxies, CA bundles) is kept.
+   * The destructive runners (RunTests, RunBuild, Format) keep the full
+   * environment: a person approved them, and a test suite may legitimately
+   * need a DATABASE_URL.
+   */
+  readonly withoutCredentials?: boolean;
 };
 
 /**
@@ -312,11 +325,10 @@ async function drain(
 /** Run one command, bounded by a deadline and the caller's abort signal. */
 export async function runProcess(argv: readonly string[], opts: SpawnOptions): Promise<RunResult> {
   const cap = opts.maxOutputChars ?? MAX_OUTPUT_CHARS;
-  const env: Record<string, string | undefined> = {
-    ...process.env,
-    ...PINNED_ENV,
-    ...opts.env,
-  };
+  const env: Record<string, string | undefined> =
+    opts.withoutCredentials === true
+      ? withoutCredentials(process.env, { ...PINNED_ENV, ...opts.env }).env
+      : { ...process.env, ...PINNED_ENV, ...opts.env };
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {

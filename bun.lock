@@ -2326,9 +2326,11 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
+        "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
       },
     },

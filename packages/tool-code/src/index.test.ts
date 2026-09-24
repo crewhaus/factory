@@ -16,6 +16,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -23,6 +24,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type RuleSet, evaluate } from "@crewhaus/permission-engine";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { detectFormat, detectLint, detectPackageManager, detectTests, isMissing } from "./detect";
 import {
@@ -80,8 +82,8 @@ function write(relative: string, contents: string): void {
  * Install a stand-in for a toolchain binary in the project's own
  * `node_modules/.bin`, where `detect` looks for it.
  *
- * The read-only checkers take no `command`, deliberately — a tool the
- * permission engine auto-allows must not let a caller name the program — so
+ * The checkers take no `command`, deliberately — a tool the permission
+ * engine auto-allows must not let a caller name the program — so
  * the only honest way to test their parsing against a real process is to give
  * detection a real binary to find. That also exercises the half of the code a
  * caller-supplied argv used to skip: the config sniffing, the local-install
@@ -460,19 +462,60 @@ describe("the checkers cannot be pointed at another program", () => {
     ["Lint", lint],
     ["FormatCheck", formatCheck],
   ];
+  /** The three above plus Diagnostics, which runs all three. */
+  const allCheckers: ReadonlyArray<[string, RegisteredTool]> = [
+    ...checkers,
+    ["Diagnostics", diagnostics],
+  ];
+  const noRules: RuleSet = { flag: [], settings: [], yaml: [], hooks: [], builtin: [] };
 
-  test("each one is auto-allowed, and denied in plan mode", () => {
-    for (const [name, tool] of checkers) {
-      expect({ name, readOnly: tool.readOnly, destructive: tool.destructive }).toEqual({
+  test("each one is auto-allowed, asks in default mode, and is denied in plan mode", () => {
+    // C006: the program each runs is the project's (node_modules/.bin, an
+    // eslint.config.js, a cargo build script), so plan mode must not run it.
+    for (const [name, tool] of allCheckers) {
+      const call = {
+        toolName: name,
+        input: {},
+        readOnly: tool.readOnly,
+        destructive: tool.destructive,
+      };
+      expect({
+        name,
+        readOnly: tool.readOnly,
+        destructive: tool.destructive,
+        plan: evaluate(call, "plan", noRules),
+        auto: evaluate(call, "auto", noRules),
+        default: evaluate(call, "default", noRules),
+      }).toEqual({
         name,
         readOnly: false,
         destructive: false,
+        plan: "deny",
+        auto: "allow",
+        default: "ask",
       });
     }
   });
 
+  test("every process-spawning tool here is either destructive or not read-only", () => {
+    // The package-level form of the registry rule in apps/cli's
+    // flag-rules.test.ts: nothing in tool-code spawns a fixed system program,
+    // so no spawning tool here may be read-only.
+    const spawning = CODE_TOOLS.filter((t) => t.ioCapability === "process");
+    expect(spawning.map((t) => t.name).sort()).toEqual([
+      "Diagnostics",
+      "Format",
+      "FormatCheck",
+      "Lint",
+      "RunBuild",
+      "RunTests",
+      "Typecheck",
+    ]);
+    expect(spawning.filter((t) => t.readOnly === true).map((t) => t.name)).toEqual([]);
+  });
+
   test("none of them advertises a `command` field", () => {
-    for (const [name, tool] of checkers) {
+    for (const [name, tool] of allCheckers) {
       const shape = (tool.inputSchema as unknown as { shape: Record<string, unknown> }).shape;
       expect({ name, hasCommand: Object.hasOwn(shape, "command") }).toEqual({
         name,
@@ -501,8 +544,8 @@ describe("the checkers cannot be pointed at another program", () => {
     }
   }, 20_000);
 
-  test("no read-only checker ever runs a package.json script", async () => {
-    // A script is whatever the project wrote in it, so a read-only tool that
+  test("no checker ever runs a package.json script", async () => {
+    // A script is whatever the project wrote in it, so a checker that
     // could reach one would be the same hole as an explicit `command` by
     // another route. `detect` deliberately routes scripts to RunBuild and
     // RunTests only; this is the guard on that.
@@ -526,6 +569,78 @@ describe("the checkers cannot be pointed at another program", () => {
       });
     }
   }, 20_000);
+
+  test("a checker's child gets no credential from the harness's environment", async () => {
+    // C006: the checker is the project's own code, and auto mode runs it
+    // unasked. Each stand-in records the environment it was given.
+    const envFile = (tool: string) => join(workspace, `child-env.${tool}.txt`);
+    for (const bin of ["tsc", "biome"]) {
+      installBinary(bin, `env > ${JSON.stringify(envFile(bin))}\nexit 0`);
+    }
+    write("tsconfig.json", "{}");
+    write("biome.json", "{}");
+    const key = ["sk-ant-api03-", "C".repeat(24), "anary000"].join("");
+    const saved = {
+      key: process.env["CREWHAUS_TEST_API_KEY"],
+      odd: process.env["CREWHAUS_TEST_ODD_NAME"],
+      cargo: process.env["CARGO_HOME"],
+    };
+    process.env["CREWHAUS_TEST_API_KEY"] = key; // credential-shaped name
+    process.env["CREWHAUS_TEST_ODD_NAME"] = key; // innocuous name, secret value
+    process.env["CARGO_HOME"] = "/opt/cargo-for-this-test";
+    try {
+      const seen: Record<string, { key: boolean; path: boolean; cargo: boolean; ci: boolean }> = {};
+      for (const [name, tool] of allCheckers) {
+        rmSync(envFile("tsc"), { force: true });
+        rmSync(envFile("biome"), { force: true });
+        await call(tool, {});
+        for (const bin of ["tsc", "biome"]) {
+          if (!existsSync(envFile(bin))) continue;
+          const env = readFileSync(envFile(bin), "utf8");
+          seen[`${name}/${bin}`] = {
+            key: env.includes(key),
+            path: /^PATH=/m.test(env),
+            cargo: env.includes("CARGO_HOME=/opt/cargo-for-this-test"),
+            ci: /^CI=1$/m.test(env),
+          };
+        }
+      }
+      // Hit count: Typecheck and Diagnostics ran tsc; Lint, FormatCheck and
+      // Diagnostics (twice, lint and format, the second overwriting) ran biome.
+      expect(Object.keys(seen).sort()).toEqual([
+        "Diagnostics/biome",
+        "Diagnostics/tsc",
+        "FormatCheck/biome",
+        "Lint/biome",
+        "Typecheck/tsc",
+      ]);
+      for (const [where, facts] of Object.entries(seen)) {
+        expect({ where, ...facts }).toEqual({
+          where,
+          key: false,
+          path: true,
+          cargo: true,
+          ci: true,
+        });
+      }
+
+      // The destructive runners keep the full environment: a person approved
+      // them, and a test suite may need a DATABASE_URL. Pinned so the
+      // difference is a decision, not an accident.
+      const out = join(workspace, "child-env.runtests.txt");
+      await call(runTests, { command: ["sh", "-c", `env > ${JSON.stringify(out)}`] });
+      expect(readFileSync(out, "utf8").includes(key)).toBe(true);
+    } finally {
+      for (const [name, value] of [
+        ["CREWHAUS_TEST_API_KEY", saved.key],
+        ["CREWHAUS_TEST_ODD_NAME", saved.odd],
+        ["CARGO_HOME", saved.cargo],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  }, 30_000);
 
   test("the tools that DO take a command are the destructive ones", () => {
     for (const [name, tool] of [

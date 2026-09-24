@@ -1787,7 +1787,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "diagnostics",
     name: "Diagnostics",
     description:
-      "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and nothing is written.",
+      "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and no source file is rewritten. Each checker is the project's own code (a cargo build may also write its target directory), so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -2835,7 +2835,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "format",
     name: "Format",
     description:
-      "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the read-only counterpart.",
+      "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the counterpart that only reports.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -2854,7 +2854,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "formatCheck",
     name: "FormatCheck",
     description:
-      "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program.",
+      "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program. The formatter and its config (a prettier.config.js and its plugins) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -4735,7 +4735,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "lint",
     name: "Lint",
     description:
-      "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, so nothing is rewritten and no caller can substitute another program — Format is the tool that writes.",
+      "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, and no caller can substitute another program — Format is the tool that rewrites files. The linter and its config (an eslint.config.js, a cargo build script) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -7816,7 +7816,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "typecheck",
     name: "Typecheck",
     description:
-      "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode so nothing is written, and there is no way to point this tool at a different program — that is what keeps it a read; RunBuild is where an arbitrary command belongs.",
+      "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode, and there is no way to point this tool at a different program; RunBuild is where an arbitrary command belongs. The checker and its plugins are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
