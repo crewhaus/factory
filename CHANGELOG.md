@@ -98,8 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sub-agents get the tools their `tools:` list names.** A category or a spec
   key (`tools: [all-data]`, `tools: [read]`) gave the child no tools at all,
   silently. Both now work. A sub-agent that names a tool its parent never
-  registers gets a `sub-agent-tool-ungranted` warning: add the tool to the
-  parent, or remove it from the sub-agent.
+  registers gets a `sub-agent-tool-ungranted` warning (an error under
+  `--strict`): add the tool to the parent, or remove it from the sub-agent.
 - **`compile --emit-as cf-worker` says which tools it leaves out.** A builtin
   the edge does not run was dropped without a word, even under `--strict`.
   Each one is now an `edge-unsafe-tool` warning with the reason, `--strict`
