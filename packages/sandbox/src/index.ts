@@ -374,8 +374,10 @@ function liveForwarder(
 
 /**
  * One stream's text for the result: everything, or the kept start, a line
- * saying how many bytes were dropped, and the kept end. The count is taken
- * from the text itself, so a character cut at either edge is counted too.
+ * saying how many bytes were dropped, and the kept end. For UTF-8 output the
+ * count is taken from the text itself, so a character cut at either edge is
+ * counted too; bytes that are not UTF-8 decode to replacement characters,
+ * which are longer, so the count is never less than the bytes not kept.
  */
 function keptText(
   label: "stdout" | "stderr",
@@ -383,10 +385,14 @@ function keptText(
   truncated: boolean,
   tail: string | undefined,
   totalBytes: number,
+  omittedBytes: number,
 ): { readonly text: string; readonly dropped: number } {
   if (!truncated) return { text: head, dropped: 0 };
   const end = tail ?? "";
-  const dropped = totalBytes - Buffer.byteLength(head, "utf8") - Buffer.byteLength(end, "utf8");
+  const dropped = Math.max(
+    omittedBytes,
+    totalBytes - Buffer.byteLength(head, "utf8") - Buffer.byteLength(end, "utf8"),
+  );
   const sep = head.length === 0 || head.endsWith("\n") ? "" : "\n";
   return { text: `${head}${sep}[${label} truncated: ${dropped} bytes dropped]\n${end}`, dropped };
 }
@@ -463,8 +469,22 @@ async function superviseExec(o: SuperviseOptions): Promise<SandboxExecResult> {
     await o.afterKill().catch(() => undefined);
   }
 
-  const out = keptText("stdout", r.stdout, r.stdoutTruncated, r.stdoutTail, r.stdoutBytes);
-  const err = keptText("stderr", r.stderr, r.stderrTruncated, r.stderrTail, r.stderrBytes);
+  const out = keptText(
+    "stdout",
+    r.stdout,
+    r.stdoutTruncated,
+    r.stdoutTail,
+    r.stdoutBytes,
+    r.stdoutOmittedBytes,
+  );
+  const err = keptText(
+    "stderr",
+    r.stderr,
+    r.stderrTruncated,
+    r.stderrTail,
+    r.stderrBytes,
+    r.stderrOmittedBytes,
+  );
   return {
     stdout: out.text,
     stderr: err.text,

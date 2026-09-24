@@ -834,6 +834,18 @@ describe.if(posix)("output is capped as it arrives", () => {
     expect(kept).toBeLessThanOrEqual(1_001);
   }, 20_000);
 
+  test("binary output past the cap never reports fewer dropped bytes than were not kept", async () => {
+    // 0xFF is not UTF-8: each kept byte decodes to a 3-byte replacement
+    // character, so a count taken from the text alone came out negative.
+    const result = await createSandbox({ backend: "noop" }).exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "head -c 100000 /dev/zero | tr '\\0' '\\377'"],
+      maxOutputBytes: 1_000,
+    });
+    expect(result.stdoutBytes).toBe(100_000);
+    expect(result.stdoutDroppedBytes).toBe(99_000);
+  }, 20_000);
+
   test("a live consumer that throws does not stop the run", async () => {
     const result = await createSandbox({ backend: "noop" }).exec({
       image: "alpine:3.19",
