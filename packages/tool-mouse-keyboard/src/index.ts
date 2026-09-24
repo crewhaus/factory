@@ -13,6 +13,17 @@
  *   - `Type(text)`           — typed input.
  *   - `Key(combo)`           — special-key combos ("Enter", "Tab", "Control+a").
  *   - `Scroll(dx, dy)`       — wheel scroll in pixels.
+ *
+ * Pillar 3 (0.7.1): `Type`, `Key` and `Click` act on a page that is
+ * connected to the network (the one `Navigate` loaded, or with the `host`
+ * backend whatever app has focus), and that page's script can read and send
+ * what is typed into it. So they are `scope: "external"` with
+ * `ioCapability: "network"`: `Type`'s text and `Key`'s combo go through the
+ * egress classifier, on the warn tier (`external-configured`), and the
+ * strict audit counts them. `Click`'s payload is only coordinates, so the
+ * classifier finds nothing in it; it is external because a click submits
+ * what was typed. `Scroll` carries no data and moves nothing off the page,
+ * so it stays internal.
  */
 import type { Driver, MouseButton } from "@crewhaus/computer-use-driver";
 import { CrewhausError } from "@crewhaus/errors";
@@ -69,6 +80,8 @@ export function createClickTool(opts: CreateMouseKeyboardToolsOptions): Register
     destructive: true,
     concurrencySafe: false,
     classifyOutput: false,
+    scope: "external",
+    ioCapability: "network",
     execute: async (input) => {
       const button: MouseButton = input.button ?? "left";
       try {
@@ -91,6 +104,8 @@ export function createTypeTool(opts: CreateMouseKeyboardToolsOptions): Registere
     destructive: true,
     concurrencySafe: false,
     classifyOutput: false,
+    scope: "external",
+    ioCapability: "network",
     execute: async (input) => {
       try {
         await opts.driver.type(input.text);
@@ -112,6 +127,8 @@ export function createKeyTool(opts: CreateMouseKeyboardToolsOptions): Registered
     destructive: true,
     concurrencySafe: false,
     classifyOutput: false,
+    scope: "external",
+    ioCapability: "network",
     execute: async (input) => {
       try {
         await opts.driver.key(input.combo);

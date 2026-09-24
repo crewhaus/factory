@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { Driver } from "@crewhaus/computer-use-driver";
+import { auditToolScopes } from "@crewhaus/tool-builder";
 import {
   MouseKeyboardError,
   createAllMouseKeyboardTools,
@@ -109,6 +110,25 @@ describe("Mouse + keyboard tools (T1 wrapping)", () => {
     expect(tools.type.destructive).toBe(true);
     expect(tools.key.destructive).toBe(true);
     expect(tools.scroll.destructive).toBe(true);
+  });
+
+  // 0.7.1 (C046): what is typed into a page, the page's script can send.
+  // Type, Key and Click are egress sinks; Scroll carries no data.
+  test("Type, Key and Click are external with ioCapability network; Scroll stays internal", () => {
+    const { driver } = recordingDriver();
+    const tools = createAllMouseKeyboardTools({ driver });
+    const flags = Object.values(tools).map((t) => `${t.name}:${t.scope}:${t.ioCapability ?? "-"}`);
+    expect(flags).toEqual([
+      "Click:external:network",
+      "Type:external:network",
+      "Key:external:network",
+      "Scroll:internal:-",
+    ]);
+    expect(auditToolScopes(Object.values(tools))).toEqual([]);
+    // Unchanged: every one still asks (destructive), none opts into the classifier.
+    expect(Object.values(tools).every((t) => t.destructive && t.classifyOutput === false)).toBe(
+      true,
+    );
   });
 
   test("createAllMouseKeyboardTools returns the four named tools", () => {
