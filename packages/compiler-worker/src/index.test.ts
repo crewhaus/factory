@@ -76,6 +76,31 @@ agent:
     expect(file?.content).toContain("runWorkerLoop");
   });
 
+  test("POST /compile emitAs:cf-worker returns a warning for each builtin the worker leaves out", async () => {
+    const yaml = `
+name: edge
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [webFetch, gitStatus]
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      bundle: { warnings?: Array<{ code: string; message: string }> };
+    };
+    expect(body.bundle.warnings?.map((w) => w.code)).toEqual(["edge-unsafe-tool"]);
+    expect(body.bundle.warnings?.[0]?.message).toContain('tool "gitStatus" is a builtin');
+  });
+
   test("POST /compile emitAs:cf-worker with a workflow spec returns a worker.js bundle", async () => {
     const yaml = `
 name: hello-workflow
@@ -163,6 +188,68 @@ voice:
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("UNSUPPORTED_TARGET");
+  });
+
+  test("POST /compile emitAs:cf-worker reports an unsupported target before its tools", async () => {
+    // The channel starter's host tools would be refused on the edge too; the
+    // caller must hear about the target first, with the code 0.7.0 returned.
+    const yaml = `
+name: hello-channel
+target: channel
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: Reply in the thread.
+  tools: [read, bash]
+channels:
+  slack:
+    botToken: $SLACK_BOT_TOKEN
+    signingSecret: $SLACK_SIGNING_SECRET
+routing:
+  sessionKey: thread
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("UNSUPPORTED_TARGET");
+    expect(body.error.message).toBe(
+      "cf-worker emit supports target=cli|workflow|graph, got channel",
+    );
+  });
+
+  test("POST /compile accepts a sub-agent that lists builtin web tools (the trader starter's shape)", async () => {
+    // Lowering spells a sub-agent's list with registered names (`WebSearch`);
+    // the strict gate must still read them as the vetted builtins they are.
+    const yaml = `
+name: trader-like
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: Research, then trade on paper.
+  sub_agents:
+    researcher:
+      description: Looks things up.
+      instructions: Search, then fetch one page.
+      tools: [webSearch, webFetch, read]
+tools: [read, write, edit, glob, grep, webSearch, webFetch, todoWrite]
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml }),
+      }),
+      env,
+    );
+    const body = (await res.json()) as { error?: { message: string } };
+    expect(body.error?.message).toBeUndefined();
+    expect(res.status).toBe(200);
   });
 
   // FR-002 — Pillar 3 sink-side scope gate. The Worker compiles arbitrary

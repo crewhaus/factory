@@ -16,8 +16,9 @@
  * does — this package holds no endpoint list of its own and there is no
  * caller-supplied URL anywhere in it.
  */
-import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
-import { assertReadOnlyMethod } from "@crewhaus/chain-adapter-base";
+import type { ChainAdapter, ChainAdapterConfig } from "@crewhaus/chain-adapter-base";
+import { CHAINS_BLOCK_EXAMPLE, assertReadOnlyMethod } from "@crewhaus/chain-adapter-base";
+import { createEvmAdapters } from "@crewhaus/chain-adapter-evm";
 import { CrewhausError } from "@crewhaus/errors";
 
 /** A refusal raised by this package: a bad input, a broken promise, a limit. */
@@ -62,6 +63,21 @@ export function chainRpcFromAdapter(adapter: ChainAdapter): ChainRpc {
 }
 
 /**
+ * Bind the transports from the spec's `chains` block — what every generated
+ * bundle, `crewhaus run` and `crewhaus eval` call at boot when a spec lists
+ * one of these tools. Each chain gets the adapter `tool-evm` gets.
+ */
+export function bindChainCallChains(config: {
+  readonly chains: ReadonlyArray<ChainAdapterConfig>;
+}): void {
+  const adapters = createEvmAdapters(config.chains);
+  setChainRpcResolver((chainId) => {
+    const adapter = adapters.get(chainId);
+    return adapter === undefined ? undefined : chainRpcFromAdapter(adapter);
+  });
+}
+
+/**
  * Test-only injection point, the convention every networked package here
  * follows: one transport for every chain id. `undefined` unbinds, and a
  * suite that sets it must restore it, or the next file in the same bun
@@ -75,7 +91,7 @@ export function _setRpc(fn: ChainRpc | undefined): void {
 export function resolveRpc(chainId: string, toolName: string): ChainRpc {
   if (resolver === undefined) {
     throw new ChainCallError(
-      `${toolName}: no chain transport is bound — the runtime must call setChainRpcResolver() at boot with the chains from spec.chains[]`,
+      `${toolName}: no chain is configured. Declare one in the spec — ${CHAINS_BLOCK_EXAMPLE}.`,
     );
   }
   const rpc = resolver(chainId);

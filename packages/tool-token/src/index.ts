@@ -30,11 +30,14 @@
  *
  * There is no RPC client and no HTTP client in this package. Chain reads
  * leave through `_setChainReader` and metadata fetches through
- * `_setMetadataFetch`; the runtime binds both at boot and every test drives
+ * `_setMetadataFetch`. A bundle binds them at boot from the spec —
+ * `bindTokenChains` from its `chains` block, `registerTokenConfig` from
+ * `tool_config.token.metadata_origins` (`lib/boot.ts`) — and every test drives
  * them from recorded answers, so the suite cannot reach the network even by
  * accident.
  */
 import { createHash } from "node:crypto";
+import { CHAINS_BLOCK_EXAMPLE } from "@crewhaus/chain-adapter-base";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { MULTICALL3_ADDRESS } from "@crewhaus/tool-onchain";
@@ -93,6 +96,7 @@ export {
   chainReaderFromAdapters,
   hasChainReader,
 } from "./lib/chain";
+export { type TokenConfigInput, bindTokenChains, registerTokenConfig } from "./lib/boot";
 export {
   type MetadataFetch,
   type MetadataResponse,
@@ -571,7 +575,7 @@ export const tokenResolve: RegisteredTool = buildTool({
     if (wantsOnchain && !hasChainReader()) {
       if (input.confirmOnchain === true) {
         throw new TokenError(
-          "confirmOnchain was asked for but no chain reader is bound; bind one with _setChainReader() or pass confirmOnchain:false to answer from the lists alone",
+          `confirmOnchain was asked for but no chain is configured. Declare one in the spec — ${CHAINS_BLOCK_EXAMPLE} — or pass confirmOnchain:false to answer from the lists alone`,
         );
       }
     }

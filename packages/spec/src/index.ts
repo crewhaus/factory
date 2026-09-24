@@ -1,4 +1,5 @@
 import { SpecParseError } from "@crewhaus/errors";
+import { toolConfigKeysReaching } from "@crewhaus/tool-categories";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
@@ -219,12 +220,14 @@ const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optio
  * knobs; any sandbox-override key is rejected at parse time (defense in
  * depth, mirroring `permissions.mode: bypass`).
  *
- * The code-execution config can arrive under any of the keys whose
- * BUILTIN_TOOL_MAP entry maps to `registerCodeExecutionConfig` — the
- * `codeExecution`/`code_execution` aliases AND the per-tool keys
- * `python`/`javascript`/`shell` (target-cli `resolveTools` reads the
- * per-tool key first, then the aliases). All of them must be constrained,
- * or the guard is trivially bypassed by nesting the blob under `python`.
+ * The code-execution config can arrive under any key the builtin table's boot
+ * rule sends to `registerCodeExecutionConfig` — the `codeExecution` /
+ * `code_execution` aliases, the per-tool keys `python` / `javascript` /
+ * `shell`, and their registered names (`Python`), compared without case. The
+ * set is read from `@crewhaus/tool-categories` rather than written here, so a
+ * spelling the boot rule accepts cannot slip past this guard: all of them
+ * must be constrained, or the guard is bypassed by nesting the blob under
+ * `Python`.
  */
 const SANDBOX_OVERRIDE_KEYS = [
   "sandbox",
@@ -237,13 +240,7 @@ const SANDBOX_OVERRIDE_KEYS = [
   "mounts",
 ] as const;
 
-const CODE_EXECUTION_CONFIG_KEYS = [
-  "codeExecution",
-  "code_execution",
-  "python",
-  "javascript",
-  "shell",
-] as const;
+const CODE_EXECUTION_CONFIG_KEYS = toolConfigKeysReaching("registerCodeExecutionConfig");
 
 const codeExecutionConfigSchema = z
   .object({
@@ -262,9 +259,8 @@ const codeExecutionConfigSchema = z
 const toolConfigBlock = z
   .record(z.string().min(1), z.unknown())
   .superRefine((cfg, ctx) => {
-    for (const key of CODE_EXECUTION_CONFIG_KEYS) {
-      const value = cfg[key];
-      if (value === undefined) continue;
+    for (const [key, value] of Object.entries(cfg)) {
+      if (value === undefined || !CODE_EXECUTION_CONFIG_KEYS.has(key.toLowerCase())) continue;
       const parsed = codeExecutionConfigSchema.safeParse(value);
       if (!parsed.success) {
         for (const issue of parsed.error.issues) {

@@ -140,7 +140,7 @@ describe("EvmSendTransaction — happy path through wallet-engine", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no wallet registered for walletId/);
+    ).rejects.toThrow(/no wallet "[^"]+" is declared\. Add it to the spec's wallets block/);
   });
 });
 
@@ -156,7 +156,7 @@ describe("resolver-binding guards", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no WalletResolver bound/);
+    ).rejects.toThrow(/no chain or wallet is configured\. Declare them in the spec — wallets:/);
   });
 
   test("throws when no TransactionPolicyResolver is bound", async () => {
@@ -169,7 +169,7 @@ describe("resolver-binding guards", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no TransactionPolicyResolver bound/);
+    ).rejects.toThrow(/no chain or wallet is configured\. Declare them in the spec — wallets:/);
   });
 
   test("throws when the policy resolver returns undefined", async () => {
@@ -196,7 +196,7 @@ describe("resolver-binding guards", () => {
         to: "0xusdc",
         data: "0xabcd",
       }),
-    ).rejects.toThrow(/no WalletEngine bound/);
+    ).rejects.toThrow(/no chain or wallet is configured\. Declare them in the spec — wallets:/);
   });
 
   test("throws when the engine resolver returns undefined (EvmSimulate path)", async () => {

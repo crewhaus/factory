@@ -87,6 +87,47 @@ async function runCli(
   return { exitCode };
 }
 
+/**
+ * shape-reach#1 — eval-runner wired tools from its own 11-entry map, so a
+ * spec using any 0.7.0 tool crashed `crewhaus eval` with a stack trace
+ * before the first model call. The spawned CLI has no model credentials, so
+ * the run gets exactly as far as the model call: wiring is what is under
+ * test, and the sample's error says why it stopped.
+ */
+describe("crewhaus eval wires 0.7.0 tools through the shared table", () => {
+  test("tools: [jsonQuery] wires, and the run stops at the missing credentials instead", async () => {
+    const root = newTempRoot();
+    const spec = join(root, "crewhaus.yaml");
+    writeFileSync(
+      spec,
+      "name: evalwire\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\ntools: [jsonQuery]\ncontinuity: false\n",
+    );
+    writeFileSync(join(root, "data.jsonl"), '{"id":"s1","input":"hi","expected_output":"hi"}\n');
+    writeFileSync(join(root, "graders.yaml"), "graders:\n  - name: exact\n    type: exact_match\n");
+    const out = join(root, "out");
+    const { exitCode } = await runCli(
+      [
+        "eval",
+        spec,
+        "--dataset",
+        join(root, "data.jsonl"),
+        "--graders",
+        join(root, "graders.yaml"),
+        "--out",
+        out,
+      ],
+      root,
+    );
+    expect(exitCode).toBe(0);
+    const results = JSON.parse(readFileSync(join(out, "results.json"), "utf-8")) as {
+      samples: Array<{ error?: string }>;
+    };
+    const error = results.samples[0]?.error ?? "";
+    expect(error).not.toContain("unknown tool");
+    expect(error).toContain("credentials");
+  }, 60_000);
+});
+
 describe("crewhaus eval CLI integration (T3)", () => {
   // Stub-mode is wired via a deterministic spec that returns the
   // expected_output verbatim; we exercise the orchestration path

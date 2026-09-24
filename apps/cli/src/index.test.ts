@@ -397,7 +397,9 @@ describe("crewhaus compile", () => {
     const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
     expect(result.exitCode).toBe(1);
     // Clean die() output: prefixed "crewhaus: " and names the offending tool.
-    expect(result.stderr).toContain('crewhaus: unknown tool "mcp__evil__exfiltrate"');
+    // The compiler names the site (`tools:`) and where MCP tools come from.
+    expect(result.stderr).toContain('crewhaus: tools: unknown tool "mcp__evil__exfiltrate"');
+    expect(result.stderr).toContain("mcp_servers");
     // The gate was bypassed — it is NOT the source of this failure…
     expect(result.stderr).not.toContain("[strict]");
     // …and the emitter error did NOT escape as an uncaught crash: neither the
@@ -420,7 +422,7 @@ describe("crewhaus compile", () => {
     const outDir = join(tmp, "out");
     const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain('crewhaus: unknown tool "not-a-real-tool"');
+    expect(result.stderr).toContain('crewhaus: tools: unknown tool "not-a-real-tool"');
     expect(result.stderr).not.toContain("TargetEmitError");
     expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
@@ -600,6 +602,23 @@ describe("crewhaus compile", () => {
     // …but never escalates, and the bundle is written.
     expect(result.stderr).not.toContain("escalated to errors");
     expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
+  });
+
+  // 0.7.0 accepted plugins: on channel and ignored it, and passed --strict;
+  // the notice that the daemon now loads them must not fail --strict.
+  test("compile --strict does NOT escalate the informational channel-plugins-at-start notice", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: plugged\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: reply kindly\nchannels:\n  slack:\n    botToken: $SLACK_BOT_TOKEN\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\nplugins: [acme-helpers]\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.stderr).toContain("crewhaus: warning[channel-plugins-at-start] plugins:");
+    expect(result.stderr).not.toContain("escalated to errors");
+    expect(result.exitCode).toBe(0);
   });
 
   // 0.6.0 — the model-plan notices that no spec edit can properly clear are
@@ -1325,7 +1344,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
   test("a typo equidistant from a read-only and a mutating tool is NOT auto-applied; prints a suggestion", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     const original =
-      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reit\n";
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools:\n  - Reit\n";
     writeFileSync(specPath, original);
     const result = await runCli(["lint", specPath, "--fix"], {
       env: { ANTHROPIC_API_KEY: "test" },
@@ -1334,9 +1353,10 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(readFileSync(specPath, "utf-8")).toBe(original);
     // A suggestion is printed naming both candidates, not a silent rewrite.
     expect(result.stdout).toContain("suggestion:");
+    // Candidates are the spec keys a tools: list takes (shape-reach#6).
     expect(result.stdout).toContain("Reit");
-    expect(result.stdout).toContain("Read");
-    expect(result.stdout).toContain("Edit");
+    expect(result.stdout).toContain('"read"');
+    expect(result.stdout).toContain('"edit"');
     expect(result.stdout).toContain("ambiguous");
     expect(result.stdout).not.toContain("fixed: tool");
   });
@@ -1347,14 +1367,77 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     // ambiguity, so --fix should still rewrite it in place.
     writeFileSync(
       specPath,
-      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n  tools:\n    - Reed\n",
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools:\n  - Reed\n",
     );
     const result = await runCli(["lint", specPath, "--fix"], {
       env: { ANTHROPIC_API_KEY: "test" },
     });
-    expect(result.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
-    expect(readFileSync(specPath, "utf-8")).toContain("- Read");
+    // The spec key, which compile accepts — not the registered name "Read",
+    // which a top-level tools: list rejects (shape-reach#6).
+    expect(result.stdout).toContain('fixed: tool "Reed" → "read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toContain("- read");
     expect(readFileSync(specPath, "utf-8")).not.toContain("Reed");
+    const compiled = await runCli(["compile", specPath, "-o", join(tmp, "fixed-out")], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(compiled.exitCode).toBe(0);
+  });
+
+  test("a sub-agent's registered names are left alone, and its typo keeps their spelling", async () => {
+    // `tools: [Read, Grep]` is how 0.7.0 documented a sub-agent's list, and it
+    // compiles; lint --fix must not churn it or call it a typo.
+    const specPath = join(tmp, "crewhaus.yaml");
+    const spec = (reviewer: string, explorer: string): string =>
+      [
+        "name: t",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: hi",
+        "  sub_agents:",
+        "    reviewer:",
+        "      description: Reviews code.",
+        "      instructions: Review the diff.",
+        `      tools: [${reviewer}]`,
+        "    explorer:",
+        "      description: Explores.",
+        "      instructions: Explore.",
+        "      tools:",
+        `        - ${explorer}`,
+        "tools: [read, grep, webFetch]",
+        "",
+      ].join("\n");
+    writeFileSync(specPath, spec("Read, Grep, WebFetch", "Grep"));
+    const clean = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(clean.stdout).not.toContain("fixed: tool");
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
+    writeFileSync(specPath, spec("Reed, Grep, WebFetch", "Grpe"));
+    const typo = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(typo.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
+  });
+
+  test("a bare word in a list that is not tools: is left alone", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original =
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ncli:\n  banner:\n    taglineMode: random\n    taglines:\n      - Reed\ntools:\n  - read\n";
+    writeFileSync(specPath, original);
+    await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+  });
+
+  test("lint reports a tool the spec's shape cannot compile, in compile's words", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools: [evmCall, nosuchtool]\n",
+    );
+    const result = await runCli(["lint", specPath], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain(
+      '[tool] tools: tool "evmCall" is a builtin, but the cli shape cannot run it',
+    );
+    expect(result.stdout).toContain('[tool] tools: unknown tool "nosuchtool"');
   });
 });
 
@@ -3670,5 +3753,52 @@ describe("crewhaus init --hybrid (0.6.0 §9.2)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// docs-claims#1 / shape-reach#10 — `tools suggest` reads the tools a spec
+// GRANTS the way compile does: from the shape's own site (agent.tools on
+// channel), with categories expanded. Before, it read the top-level
+// `tools:` raw, so a channel spec was told to add the tools it already had
+// and a category grant was invisible.
+describe("crewhaus tools suggest — reads grants the way compile does", () => {
+  const CHANNEL =
+    "name: ch\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: |\n    Use the Read filesystem tool and the Bash shell tool to ground answers.\n  tools:\n    - read\n    - bash\nchannels:\n  slack:\n    botToken: $SLACK_BOT_TOKEN\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\n";
+
+  test("a channel spec's agent.tools count as granted", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(specPath, CHANNEL);
+    const result = await runCli(["tools", "suggest", specPath, "--json"]);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      missing: Array<{ key: string }>;
+      present: Array<{ key: string }>;
+    };
+    expect(out.missing.map((m) => m.key)).not.toContain("read");
+    expect(out.missing.map((m) => m.key)).not.toContain("bash");
+    expect(out.present.map((m) => m.key)).toContain("bash");
+  });
+
+  test("a category grant covers the tools it expands to", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: v\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: Check the citations and the coverage report.\ntools: [all-verify, all-toolchain]\n",
+    );
+    const result = await runCli(["tools", "suggest", specPath, "--json"]);
+    expect(result.exitCode).toBe(0);
+    const out = JSON.parse(result.stdout) as {
+      missing: Array<{ key: string }>;
+      unimplied: string[];
+    };
+    expect(out.missing.map((m) => m.key)).not.toContain("citationLint");
+    expect(out.missing.map((m) => m.key)).not.toContain("coverageSummary");
+    // …and they were implied, so the check above is not vacuous.
+    const present = (JSON.parse(result.stdout) as { present: Array<{ key: string }> }).present;
+    expect(present.map((m) => m.key)).toEqual(
+      expect.arrayContaining(["citationLint", "coverageSummary"]),
+    );
+    // The grant is reported per concrete key, never as the selector.
+    expect(out.unimplied).not.toContain("all-verify");
   });
 });

@@ -49,9 +49,14 @@ import {
   subAgentProfileAllowlist,
 } from "@crewhaus/agent-context-isolation";
 import { CrewhausError } from "@crewhaus/errors";
-import { resolveChildPermissions } from "@crewhaus/sub-agent-permission-inheritance";
+import {
+  type ChildPermissions,
+  resolveChildPermissions,
+  resolveChildPermissionsNarrowOnly,
+} from "@crewhaus/sub-agent-permission-inheritance";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { registeredToolName } from "@crewhaus/tool-categories";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -153,7 +158,9 @@ const FRONTMATTER_TIER_ROUTING = z
  * circuit_breaker? }` — the already-resolved shape the compiler produces for a
  * spec-declared sub-agent. `model_pool` is validated for its routing identity
  * (`candidates[].{model, tags}`, `policy`) and otherwise passed through: the
- * runtime owns the per-candidate settings grammar.
+ * runtime owns the per-candidate settings grammar. The Task tool then keeps
+ * only the candidate keys {@link DISK_CANDIDATE_KEYS} allows, because a file
+ * read from the sub-agents directory may have been written by the model.
  */
 const FRONTMATTER_SCHEMA = z.object({
   name: z.string().min(1),
@@ -355,10 +362,23 @@ export function resolveSubAgentDefinition(
   name: string | undefined,
   opts: CreateTaskToolOptions,
 ): SubAgentDefinition {
+  return resolveSubAgent(name, opts).def;
+}
+
+/**
+ * The definition AND where it came from. A definition read from the
+ * sub-agents directory is untrusted: any agent that can write a file can
+ * put one there mid-run, so its permissions may only narrow the parent's
+ * (security-1#1). The inline spec map and the built-in are operator-written.
+ */
+function resolveSubAgent(
+  name: string | undefined,
+  opts: CreateTaskToolOptions,
+): { readonly def: SubAgentDefinition; readonly fromDisk: boolean } {
   const resolveName = name ?? "general-purpose";
   if (opts.subAgents !== undefined) {
     const inline = opts.subAgents.get(resolveName);
-    if (inline !== undefined) return inline;
+    if (inline !== undefined) return { def: inline, fromDisk: false };
   }
   // Guard the disk lookup against path traversal (the inline map above is an
   // exact-key lookup and is intentionally not gated).
@@ -369,8 +389,8 @@ export function resolveSubAgentDefinition(
   }
   const dir = opts.subAgentDir ?? join(process.cwd(), ".crewhaus", "sub-agents");
   const onDisk = loadSubAgentFromDisk(resolveName, dir);
-  if (onDisk !== null) return onDisk;
-  if (resolveName === "general-purpose") return BUILTIN_GENERAL_PURPOSE;
+  if (onDisk !== null) return { def: onDisk, fromDisk: true };
+  if (resolveName === "general-purpose") return { def: BUILTIN_GENERAL_PURPOSE, fromDisk: false };
   throw new SubAgentResolutionError(
     `unknown subagent_type "${resolveName}" — not in spec sub_agents map, not on disk at ${dir}, and no built-in by that name`,
   );
@@ -391,9 +411,94 @@ function buildChildCatalog(
   if (allowed === undefined) {
     return def.permissions === undefined || def.permissions === "inherit" ? parentTools : [];
   }
-  const allowlist = new Set(allowed);
+  // A spec key (`read`) names the same tool as its registered name (`Read`);
+  // the parent catalog carries registered names, so map keys first. Before
+  // this, a definition written with spec keys — the documented spelling for
+  // every other tools: list — gave the child no tools at all.
+  const allowlist = new Set(allowed.map((n) => registeredToolName(n) ?? n));
   return parentTools.filter((t) => allowlist.has(t.name));
 }
+
+/** The definition with its `tools` mapped to registered names (`read` → `Read`). */
+function withRegisteredToolNames(def: SubAgentDefinition): SubAgentDefinition {
+  if (def.tools === undefined) return def;
+  const tools = def.tools.map((n) => registeredToolName(n) ?? n);
+  // Already canonical (every spec-declared definition is, since lowering maps
+  // it): hand back the same object.
+  return tools.every((n, i) => n === def.tools?.[i]) ? def : { ...def, tools };
+}
+
+/** Definitions whose ignored allow list has already been reported. */
+const reportedIgnoredAllows = new Set<string>();
+
+type PoolCandidate = NonNullable<SubAgentDefinition["modelPool"]>["candidates"][number];
+
+/**
+ * The `model_pool` candidate keys a definition read from `.crewhaus/sub-agents`
+ * keeps. Every key of the candidate type is decided here — this mapped type
+ * stops compiling when the IR gains one — and any other key in the file is
+ * dropped. `toolConfigs` is not kept: a candidate's block REPLACES the
+ * operator's `tool_config` for every call that candidate serves (an http
+ * allow-list, a webhook target) and reads `$VAR`s from the operator's
+ * environment, so a file the model could have written must not set it. The
+ * rest can only narrow (`tools`, `permissions`, `rateLimits`, `costCapUsdMicros`)
+ * or pick what the file could pick anyway with `model:`.
+ */
+const DISK_CANDIDATE_KEYS: { readonly [K in keyof Required<PoolCandidate>]: boolean } = {
+  profile: true,
+  model: true,
+  tags: true,
+  enabled: true,
+  thinking: true,
+  maxTokens: true,
+  temperature: true,
+  modelCallTimeoutMs: true,
+  overlay: true,
+  tools: true,
+  toolConfigs: false,
+  permissions: true,
+  rateLimits: true,
+  caching: true,
+  costCapUsdMicros: true,
+  requires: true,
+  capabilities: true,
+  fallbacks: true,
+  circuitBreaker: true,
+};
+
+/**
+ * security — a definition on disk keeps only {@link DISK_CANDIDATE_KEYS} on
+ * each pool candidate. Returns the refused keys it found, to report.
+ */
+function narrowDiskModelPool(def: SubAgentDefinition): {
+  readonly def: SubAgentDefinition;
+  readonly refused: ReadonlyArray<string>;
+} {
+  const pool = def.modelPool;
+  if (pool === undefined) return { def, refused: [] };
+  const refused = new Set<string>();
+  let changed = false;
+  const candidates = pool.candidates.map((candidate) => {
+    const kept: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(candidate)) {
+      const decided = Object.hasOwn(DISK_CANDIDATE_KEYS, key)
+        ? DISK_CANDIDATE_KEYS[key as keyof PoolCandidate]
+        : undefined;
+      if (decided === true) {
+        kept[key] = value;
+        continue;
+      }
+      changed = true;
+      if (decided === false) refused.add(key);
+    }
+    return kept as PoolCandidate;
+  });
+  if (!changed) return { def, refused: [] };
+  return { def: { ...def, modelPool: { ...pool, candidates } }, refused: [...refused] };
+}
+
+/** Definitions whose refused model_pool keys have already been reported. */
+const reportedRefusedPoolKeys = new Set<string>();
 
 export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool {
   const knownNames = opts.subAgents !== undefined ? [...opts.subAgents.keys()] : [];
@@ -460,8 +565,15 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       }
       const spawnSubAgent = bridge.spawnSubAgent;
       let def: SubAgentDefinition;
+      let fromDisk: boolean;
       try {
-        def = resolveSubAgentDefinition(input.subagent_type, opts);
+        ({ def, fromDisk } = resolveSubAgent(input.subagent_type, opts));
+        // One spelling for everything below: the child catalog AND a
+        // `scoped` rule filter both match registered names (`Bash`), and a
+        // permission glob is case-sensitive. A spec key left raw here would
+        // give the child the tool while scoping away the parent's rules for
+        // it — so map before either reads the list.
+        def = withRegisteredToolNames(def);
       } catch (err) {
         return `[Task error] ${(err as Error).message}`;
       }
@@ -480,10 +592,28 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       }
 
       const childTools = buildChildCatalog(bridge.tools, def);
-      const childPerms = resolveChildPermissions(
-        { mode: bridge.permissionMode, rules: bridge.permissionRules },
-        def,
-      );
+      const parentPerms = { mode: bridge.permissionMode, rules: bridge.permissionRules };
+      let childPerms: ChildPermissions;
+      if (fromDisk) {
+        const narrowedPool = narrowDiskModelPool(def);
+        def = narrowedPool.def;
+        if (narrowedPool.refused.length > 0 && !reportedRefusedPoolKeys.has(def.name)) {
+          reportedRefusedPoolKeys.add(def.name);
+          process.stderr.write(
+            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so its model_pool candidates cannot set ${narrowedPool.refused.join(", ")} — ignored, so its tools run under the parent's tool_config. To give a candidate its own tool_config, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
+          );
+        }
+        const narrowed = resolveChildPermissionsNarrowOnly(parentPerms, def);
+        if (narrowed.ungrantedAllows.length > 0 && !reportedIgnoredAllows.has(def.name)) {
+          reportedIgnoredAllows.add(def.name);
+          process.stderr.write(
+            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so its permissions can only narrow the parent's — the parent does not allow ${narrowed.ungrantedAllows.join(", ")}, so its allow list does not grant them. To grant them, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
+          );
+        }
+        childPerms = narrowed;
+      } else {
+        childPerms = resolveChildPermissions(parentPerms, def);
+      }
 
       // 0.6.0 §10.2 — ONE shared projection replaces the field-by-field hand
       // copy this tool carried (and whose optional-seam omissions were the

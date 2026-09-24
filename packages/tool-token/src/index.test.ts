@@ -537,10 +537,10 @@ describe("Erc20Balance", () => {
     ).rejects.toThrow("is not a block tag");
   });
 
-  test("refuses when there is no chain reader, naming the setter", async () => {
+  test("refuses when there is no chain reader, naming the spec block to write", async () => {
     await expect(
       call(erc20Balance, { chainId: 1, token: USDC, accounts: [ALICE] }),
-    ).rejects.toThrow("_setChainReader");
+    ).rejects.toThrow("no chain is configured, so chain 1 cannot be read. Declare it in the spec");
   });
 
   test("a Multicall3 that answers with something else is refused, with the way out", async () => {
@@ -870,7 +870,7 @@ describe("TokenResolve", () => {
         lists: [UNISWAP_LIST],
         confirmOnchain: true,
       }),
-    ).rejects.toThrow("no chain reader is bound");
+    ).rejects.toThrow("confirmOnchain was asked for but no chain is configured");
   });
 
   test("with no reader bound and nothing asked for, it answers from the lists and says so", async () => {

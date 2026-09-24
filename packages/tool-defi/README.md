@@ -192,8 +192,9 @@ than a negative number.
 
 ## Configuration
 
-Endpoints and pinned feeds come from the `defi` `tool_config` block, or from
-`registerDefiConfig(...)` at boot. **No caller ever supplies a URL** — that is
+Endpoints and pinned feeds come from the `defi` `tool_config` block (a
+compiled bundle and `crewhaus run` register it at boot), or from
+`registerDefiConfig(...)`. **No caller ever supplies a URL** — that is
 what keeps the network surface short: there is no model-chosen host to defend,
 so no allow-list to widen and no SSRF gate to get subtly wrong, and an
 operator's own node on `127.0.0.1:8545` is a first-class endpoint rather than
@@ -201,7 +202,7 @@ something a private-address rule has to be argued out of.
 
 ```jsonc
 {
-  "rpc":        { "1": "https://eth-mainnet.example/v2/KEY" },
+  "rpc":        { "1": "$ETH_RPC_URL" },
   "multicall3": { "1": "0xcA11bde05977b3631167028862bE2a173976CA11" },
   "feeds": {
     "eth-usd": {
@@ -213,6 +214,11 @@ something a private-address rule has to be argued out of.
   }
 }
 ```
+
+A provider keeps its API key in the RPC URL's path, so write the endpoint as a
+`$VAR` reference: the bundle reads it from the environment when it starts, and
+the key never sits in the spec, the spec registry or the compiled bundle. An
+unset variable stops the start and names it.
 
 A per-call block **replaces** the boot registration rather than merging into it,
 which is the same replace semantics every other tool_config block here has.

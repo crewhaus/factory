@@ -2676,6 +2676,7 @@ export {
   type BundleReadmeSection,
   type CollectedSecretRefs,
   type EmitReadmeOptions,
+  type ReadmeToolFacts,
   GENERATED_README_MARKER,
   collectSecretRefs,
   renderBundleReadme,

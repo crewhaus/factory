@@ -170,7 +170,7 @@ describe("emitBrowserDriver — tool wiring (parity with runRunBrowser)", () => 
     expect(code).toContain('import { todoWrite } from "@crewhaus/tool-todo";');
   });
 
-  test("unknown tool throws TargetEmitError naming the offender + known names", () => {
+  test("unknown tool throws TargetEmitError naming the offender and a next step", () => {
     const ir: IrBrowserV0 = { ...baseIr, tools: ["unknownTool"] };
     expect(() => emitBrowserDriver(ir)).toThrow(TargetEmitError);
     try {
@@ -178,8 +178,7 @@ describe("emitBrowserDriver — tool wiring (parity with runRunBrowser)", () => 
     } catch (e) {
       expect(e).toBeInstanceOf(TargetEmitError);
       expect((e as Error).message).toContain('unknown tool "unknownTool"');
-      expect((e as Error).message).toContain("known tools:");
-      expect((e as Error).message).toContain("read");
+      expect((e as Error).message).toContain("crewhaus tools search");
     }
   });
 

@@ -198,6 +198,15 @@ describe("toolConfigFor", () => {
   });
   test("nothing declared for the tool (or no map at all) is undefined", () => {
     expect(toolConfigFor(cfg, "Bash")).toBeUndefined();
+    // 0.7.1 — a package's documented key reaches every tool of the package,
+    // as it does at boot (config-delivery#0): `tool_config.http` for HttpRequest.
+    expect(
+      toolConfigFor({ http: { allowed_origins: ["https://a.example"] } }, "HttpRequest"),
+    ).toEqual({
+      allowed_origins: ["https://a.example"],
+    });
+    expect(toolConfigFor({ codehost: { host: "github" } }, "PrList")).toEqual({ host: "github" });
+    expect(toolConfigFor({ http: { a: 1 } }, "WebFetch")).toBeUndefined();
     expect(toolConfigFor(undefined, "Fetch")).toBeUndefined();
   });
 });

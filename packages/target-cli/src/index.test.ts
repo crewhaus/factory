@@ -117,17 +117,36 @@ describe("emitCli — tool wiring (Section 2)", () => {
     expect(content).toContain('import { todoWrite } from "@crewhaus/tool-todo"');
   });
 
-  test("an unknown tool name throws TargetEmitError listing known names", () => {
+  test("an unknown tool name throws TargetEmitError naming it and the next step", () => {
     expect(() => emitCli(baseIr({ tools: ["unknownTool"] }))).toThrow(TargetEmitError);
     try {
       emitCli(baseIr({ tools: ["unknownTool"] }));
     } catch (e) {
       expect(e).toBeInstanceOf(TargetEmitError);
       expect((e as Error).message).toContain('unknown tool "unknownTool"');
-      expect((e as Error).message).toContain("known tools:");
-      // proves the error is helpful — names a real builtin
-      expect((e as Error).message).toContain("read");
+      // One next step, not a dump of every builtin's name.
+      expect((e as Error).message).toContain("crewhaus tools search");
+      expect((e as Error).message.length).toBeLessThan(300);
     }
+  });
+
+  test("a typo gets the nearest builtin as a hint", () => {
+    expect(() => emitCli(baseIr({ tools: ["raed"] }))).toThrow(
+      /unknown tool "raed" — Did you mean "read"/,
+    );
+  });
+
+  test("a capitalised name is pointed at its spec key", () => {
+    expect(() => emitCli(baseIr({ tools: ["Read"] }))).toThrow(
+      /unknown tool "Read" — write "read"/,
+    );
+  });
+
+  test("a 0.7.0 builtin compiles: its package is imported and registered", () => {
+    const code = emitCli(baseIr({ tools: ["jsonQuery", "gitStatus"] })).files[0]?.content ?? "";
+    expect(code).toContain('import { jsonQuery } from "@crewhaus/tool-data";');
+    expect(code).toContain('import { gitStatus } from "@crewhaus/tool-git";');
+    expect(code).toContain("defaultCatalog.register(jsonQuery);");
   });
 });
 
@@ -1528,12 +1547,14 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
   test("plugins: list → activates them and registers contributed tools on the catalog", () => {
     const c = emitCli(baseIr({ plugins: ["acme-tools", "beta-pack"] })).files[0]?.content ?? "";
     expect(c).toContain(
-      'import { activatePlugins, createDefaultPluginRuntime } from "@crewhaus/plugin-loader";',
+      'import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";',
     );
     // Names are emitted verbatim, in load order.
     expect(c).toContain('names: ["acme-tools","beta-pack"]');
-    // Fail-closed loader, dev opt-out via env.
-    expect(c).toContain('allowUnsigned: process.env.CREWHAUS_PLUGIN_ALLOW_UNSIGNED === "1"');
+    // The operator's trust anchors and the announced dev opt-in both come from
+    // the one boot runtime `crewhaus run` uses too (extension-path#0).
+    expect(c).toContain("...createBootPluginRuntime(),");
+    expect(c).not.toContain("allowUnsigned");
     // Contributed tools land on the shared catalog, first-party wins collisions.
     expect(c).toContain("for (const __t of __plugins.tools)");
     expect(c).toContain("defaultCatalog.register(__t);");

@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flags live only on the tool objects themselves. So they are projected once,
   by `scripts/gen-tool-registry.ts`, into a dependency-free package — the shape
   `@crewhaus/docker-images` already uses for its Dockerfile bodies. The key set
-  is derived from the emitter's map rather than written out, so it is a
+  is derived from the builtin table rather than written out, so it is a
   projection and not one more list to keep in sync, and
   `apps/cli/src/tool-registry.test.ts` re-projects every row and fails when the
   checked-in data has gone stale.
@@ -64,6 +64,164 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer says which list it used. The set comes from `BUILTIN_TOOL_MAP`, which
   this package already reaches and which is keys without prose, so no bundle
   granting a `tool-crewhaus` tool pays for the manifest's 455 KB.
+
+- **A tool a shape cannot run is refused by name.** A builtin the spec's
+  shape does not carry now fails with `tool "evmCall" is a builtin, but the
+  cli shape cannot run it: only the graph, workflow and crew shapes carry it`
+  instead of `unknown tool`. `unknown tool` is kept for names that are not
+  builtins, and it now suggests the nearest builtin and how to search for one
+  instead of listing every builtin. Compile errors about tools start with the
+  spec path they concern (`nodes.plan.tools:`).
+- **`evmSendTransaction` says it cannot sign.** It compiles on graph,
+  workflow and crew, but no custody provider that can sign ships in this
+  release, so every call fails. Compile now warns (`tool-unwired`, an error
+  under `--strict`). Remove it from `tools:`; `evmSimulate` runs the same
+  transaction without signing.
+- **Two different `tool_config` blocks for one package are a compile error.**
+  A package reads one block, so `tool_config.http` and
+  `tool_config.httpRequest` with different settings — or two workflow steps,
+  graph nodes or crew roles configuring `fetch` differently — used to compile
+  and silently use the first. The error names both keys; keep one block.
+- **A `tool_config` key that nothing reads is a `tool-config-unused` warning**
+  (an error under `--strict`). A restriction written under a misspelled key,
+  or for a tool that is not in `tools:`, is not in force, and compile now
+  says so and names the key to write instead. `crewhaus run` and
+  `crewhaus lint` print the same warning.
+
+### Fixed
+
+- **Every shape can use the 0.7.0 tools and categories.** `tools: [jsonQuery]`
+  or `tools: [all-data]` compiled only on the cli shape; on graph nodes,
+  workflow steps, crew roles, and the channel, managed, research, batch and
+  browser shapes it failed with `unknown tool`. Every shape now reads one
+  builtin table, so a spec that compiles on one shape compiles on the others
+  that can run the same tools.
+- **`crewhaus eval` and `crewhaus optimize` run specs that use the new tools.**
+  They used to stop with a stack trace before the first model call. They now
+  wire the same tools the compiled bundle does, apply the same `tool_config`,
+  and report a problem as a one-line error.
+- **Code execution works on every shape that registers it.** The managed
+  daemon registered `python`, `javascript` and `shell` but denied every call,
+  and pointed you at `CREWHAUS_SANDBOX`, which it never read. Every shape that
+  registers one of them, and `crewhaus eval`, now honours `CREWHAUS_SANDBOX`
+  the way the cli bundle does.
+- **Sub-agents get the tools their `tools:` list names.** A category or a spec
+  key (`tools: [all-data]`, `tools: [read]`) gave the child no tools at all,
+  silently. Both now work. A sub-agent that names a tool its parent never
+  registers gets a `sub-agent-tool-ungranted` warning (an error under
+  `--strict`): add the tool to the parent, or remove it from the sub-agent.
+- **`compile --emit-as cf-worker` says which tools it leaves out.** A builtin
+  the edge does not run was dropped without a word, even under `--strict`.
+  Each one is now an `edge-unsafe-tool` warning with the reason, `--strict`
+  fails on it, and the bundle README marks it "not wired".
+- **`crewhaus lint` agrees with `crewhaus compile` about tools.** It reported
+  "clean" for tools compile rejects. `lint --fix` now fixes a typo to a
+  spelling compile accepts (`read`, not `Read`), and only inside a `tools:`
+  list. A sub-agent's list accepts either spelling, so `lint --fix` leaves
+  `Read` there alone and fixes a typo in the spelling it was written in.
+- **`crewhaus tools suggest` and `tools audit` read the tools a spec really
+  grants**: categories expanded, exclusions applied, and tools listed under
+  `agent.tools` or per step, node or role included. `suggest` no longer
+  proposes a tool the spec's shape cannot run. `audit` no longer reports an
+  exclusion such as `-gitCommit` as unused — following that advice granted
+  the tool — and for a tool granted by a category it tells you to add
+  `-<tool>` instead of deleting a line. `tools show evmCall` now says which
+  shapes carry it.
+- **`plugins:` on a channel daemon is loaded.** It was accepted and did
+  nothing, even under `--strict`. A daemon that ran that way keeps starting:
+  a plugin it cannot load (not installed, or not verified by a key in
+  `~/.crewhaus/plugin-trust`) is skipped with a warning at every start, and is
+  never imported. Compile notes this with `channel-plugins-at-start`, which
+  `--strict` does not escalate.
+- **The onchain and onchain-game shapes say `tools:` is not wired yet**, with
+  an `accepted-but-unwired` warning, as voice does. Bundle READMEs for
+  cf-worker, voice, onchain, onchain-game and Claude Code plugin exports mark
+  the tools they do not carry as "not wired" instead of "built-in".
+- **`tool_config.codeExecution` configures code execution only.** It also
+  reached `webFetch`, `fetch` and `imageGenerate` when those had no config of
+  their own. Give each tool its own `tool_config` entry.
+- **`tool_config` reaches every tool that reads it.** The http, codehost,
+  notify, obs and defi tools ignored the blocks their READMEs document
+  (`tool_config.http`, `tool_config.codehost`, …), so their network tools
+  refused every request whatever the spec said. Each package's block now
+  reaches its tools in a compiled bundle on every shape, in `crewhaus run` and
+  in `crewhaus eval`, and a model pool candidate reads the same keys. Write it
+  under the package key (`http`), a tool's key (`httpRequest`) or its
+  registered name (`HttpRequest`). `crewhaus tools show <tool>` names the key.
+  Because a block 0.7.0 ignored is now applied, a malformed one no longer
+  passes unnoticed. `compile` and `lint` report an allow-list entry that is not
+  an origin (`api.example.com` instead of `https://api.example.com`) and a key
+  the tool refuses (`tool_config.chainread.allow_private_hosts`), naming the key
+  and what to write. Anything else a tool refuses in its block stops the
+  harness at start, naming the key.
+- **`tool_config.WebFetch` restricts WebFetch.** Written with the registered
+  name — the spelling permission rules use — the block was dropped at boot and
+  WebFetch could reach any host.
+- **`tool_config.fetch` reaches DependencyAudit's OSV-mirror allow-list**
+  without `fetch` in `tools:`, as its refusal message always said.
+- **`crewhaus run` applies the same `tool_config` as the compiled bundle**,
+  including `imageGenerate`, and the browser shape registers
+  `tool_config.imageGenerate` too.
+- **Tools that read a chain work when the spec declares one.** The chaincall
+  tools, `erc20Balance`, `erc721TokenInfo` and TokenResolve's on-chain check,
+  and on graph, workflow and crew the `evm*` readers and `evmSimulate`, get
+  their RPC transport from the spec's `chains` block. Without one they refuse
+  and name the block to write, and compile warns (`tool-unwired`).
+- **VectorDelete deletes from the store `tool_config.vectorDelete` names**
+  (`backend`, `url`, `collection`, `api_key`). It used to refuse every call.
+- **`erc721TokenInfo` reads token metadata** from the https origins
+  `tool_config.token.metadata_origins` allows, through the http tools' gate.
+- **The chainread tools and FederationDiscover take an allow-list from the
+  spec**: `tool_config.chainread.allowed_origins` and
+  `tool_config.federationDiscover.allowed_origins`. It can only narrow what
+  they reach; a spec cannot open loopback or private addresses.
+- **The bundle README tells the truth about each tool.** Scope and "every call
+  carries a justification" are read off the tool rather than guessed from its
+  name, and "configured by `tool_config.http`" appears only when the bundle
+  applies that block. `$VAR` names a block reads are listed with the other
+  environment variables.
+
+### Security
+
+- **ImageGenerate sends `OPENAI_API_KEY` only to api.openai.com unless you
+  approve another endpoint.** `tool_config.imageGenerate.openaiBaseUrl` used to
+  send the key wherever it pointed, plain http included, so a spec from a
+  template or a pull request could collect it. Another origin now needs
+  `OPENAI_BASE_URL` set to the same origin in the environment; plain http is
+  refused except on loopback with that approval. A 0.7.0 spec that points at a
+  proxy fails at boot until you set it.
+- **Secrets in `tool_config` can stay out of the spec.** A value written as
+  `$UPPER_SNAKE` is read from the environment when the harness starts, as
+  `mcp_servers` values are; a missing variable stops the start and names it.
+  A value read that way is never repeated in an error, and chain RPC errors
+  name only the endpoint's origin, never the path a provider keeps its key in.
+  A 0.7.0 spec that meant such a value literally now needs the variable set.
+  Compile refuses a credential value that looks like a reference but is not
+  one (`${API_KEY}`, `$api_key`): write `$API_KEY`. A literal that merely starts
+  with `$`, such as a bcrypt hash, is left alone. With `--emit-as cf-worker`,
+  compile refuses any `$VAR` value, because a Worker has no environment at
+  boot: write the value itself.
+- **Signed plugins verify on every boot path.** The cli and channel bundles
+  and `crewhaus run` read trust anchors from `~/.crewhaus/plugin-trust/*.pem`
+  and `CREWHAUS_PLUGIN_TRUST_ANCHORS`, so a signed plugin loads; before, no
+  boot path had an anchor and only unsigned dev mode worked. Unsigned plugins
+  are still refused unless `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1`, which now
+  prints a warning on every boot and for every plugin it lets through. With
+  neither a key nor the opt-in, a cli bundle or `crewhaus run` that names
+  plugins stops at boot and says where to put the publisher's key; a channel
+  daemon says the same and starts without them.
+- **A sub-agent written to `.crewhaus/sub-agents/` can only narrow what its
+  parent allows.** Any agent with a file-write tool can add a file there while
+  it runs. Its `permissions: { allow }` block replaced the parent's rules —
+  enough to lift an operator's `alwaysDeny` such as `Bash(curl**)` — and a
+  `model_pool` candidate's `toolConfigs` replaced the operator's `tool_config`
+  for every call it served, widening an http allow-list. A definition from
+  that directory now runs under its own rules and the parent's together: a
+  call is allowed only when both allow it, and a deny or ask in either one
+  applies. An operator's own file with a narrow allow list restricts the
+  sub-agent as it always did; no file can lift a parent's deny. Candidate
+  `toolConfigs` and `inherit_bypass` in such a file are ignored with a notice.
+  To grant a sub-agent more, declare it under `sub_agents` in `crewhaus.yaml`.
 
 ## [0.7.0] - 2026-09-22
 

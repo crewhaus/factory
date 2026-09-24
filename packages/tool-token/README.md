@@ -136,7 +136,29 @@ not promised by this paragraph.
 ## No dialling code at all
 
 There is no RPC client and no HTTP client in this package. Both boundaries are
-injected:
+injected, and a compiled bundle, `crewhaus run` and `crewhaus eval` bind them at
+boot from the spec:
+
+```yaml
+chains:                              # the chain reader
+  - id: "1"
+    kind: evm
+    rpcUrls: [$ETH_RPC_URL]          # read from the environment, never compiled in
+    finality: { kind: finalized }
+
+tool_config:
+  token:
+    metadata_origins: [https://ipfs.io]   # the only origins a tokenURI is read from
+```
+
+Without a `chains` block, a chain read refuses and names the block to write.
+Without `metadata_origins`, metadata is not fetched, and the answer says why.
+The metadata fetch goes through `@crewhaus/tool-http`'s gate: https only, the
+SSRF refusal, no redirects, a byte cap. The caller's own `allowedHosts` and
+`ipfsGateway` still decide what is attempted; this list decides what can be
+dialled, and a model cannot widen it.
+
+A host that builds its own wiring can still call the seams directly:
 
 ```ts
 import { _setChainReader, chainReaderFromAdapters, _setMetadataFetch } from "@crewhaus/tool-token";

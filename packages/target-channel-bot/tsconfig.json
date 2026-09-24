@@ -12,6 +12,7 @@
     { "path": "../ir" },
     { "path": "../memory-service" },
     { "path": "../model-router" },
-    { "path": "../model-service" }
+    { "path": "../model-service" },
+    { "path": "../tool-categories" }
   ]
 }

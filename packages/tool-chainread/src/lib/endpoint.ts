@@ -11,8 +11,8 @@
  * So the host is vetted before the socket opens, the vetted IP is what gets
  * dialled (resolving here and letting `fetch` re-resolve at connect time is a
  * DNS-rebinding TOCTOU), and the loopback/private ranges are refused unless an
- * OPERATOR opened them — `setRpcEndpointPolicy` is bound at boot by the
- * runtime, exactly like `setEvmAdapterResolver` in `tool-evm`. It is
+ * OPERATOR opened them — `setRpcEndpointPolicy`, bound at boot from the spec's
+ * `tool_config.chainread` block (which can only narrow it), or by a host. It is
  * deliberately not a field in any tool's input schema: a gate a model can open
  * for itself is not a gate.
  *
@@ -50,9 +50,66 @@ export type RpcEndpointPolicy = {
 
 let policy: RpcEndpointPolicy = {};
 
-/** Bind the endpoint policy at boot. Generated daemons call this before registering the tools. */
+/**
+ * Bind the endpoint policy. A compiled bundle, `crewhaus run` and `crewhaus
+ * eval` bind it at boot through {@link registerChainreadConfig}, from the
+ * spec's `tool_config.chainread` block; a host may call it directly.
+ */
 export function setRpcEndpointPolicy(next: RpcEndpointPolicy): void {
   policy = next;
+}
+
+/** The spec's `tool_config.chainread` block — or any chainread tool's own key. */
+export type ChainreadConfigInput = {
+  readonly allowed_origins?: ReadonlyArray<string>;
+  readonly allowedOrigins?: ReadonlyArray<string>;
+};
+
+/**
+ * Deliver the spec's block at boot: `allowed_origins` becomes the ONLY RPC
+ * origins these tools may dial. It can only narrow. Opening loopback and the
+ * private ranges stays out of a spec's reach — a spec may come from a template
+ * or a pull request, and that address is every unauthenticated service on the
+ * box — so a block that tries is refused rather than ignored.
+ */
+export function registerChainreadConfig(input: ChainreadConfigInput): void {
+  const block = (input ?? {}) as Record<string, unknown>;
+  for (const key of ["allow_private_hosts", "allowPrivateHosts"]) {
+    if (Object.hasOwn(block, key)) {
+      throw new RpcEndpointError(
+        `tool_config.chainread.${key} is not accepted: a spec cannot open loopback or private addresses. Remove it, and list the public RPC origins under allowed_origins.`,
+      );
+    }
+  }
+  if (Object.hasOwn(block, "allowed_origins") && Object.hasOwn(block, "allowedOrigins")) {
+    throw new RpcEndpointError(
+      "tool_config.chainread sets both allowed_origins and allowedOrigins. Write the list once, as allowed_origins.",
+    );
+  }
+  const raw = block["allowed_origins"] ?? block["allowedOrigins"];
+  if (raw === undefined) return;
+  if (!Array.isArray(raw) || raw.some((o) => typeof o !== "string")) {
+    throw new RpcEndpointError(
+      'tool_config.chainread.allowed_origins must be a list of origins, for example ["https://mainnet.base.org"].',
+    );
+  }
+  const origins = (raw as string[]).map((o) => {
+    let url: URL;
+    try {
+      url = new URL(o);
+    } catch {
+      throw new RpcEndpointError(
+        `tool_config.chainread.allowed_origins has "${o}", which is not an origin. Write it as https://host[:port].`,
+      );
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw new RpcEndpointError(
+        `tool_config.chainread.allowed_origins has "${url.protocol}//${url.host}", which is not http(s). Write it as https://host[:port].`,
+      );
+    }
+    return url.origin;
+  });
+  setRpcEndpointPolicy({ ...policy, allowedOrigins: origins });
 }
 
 /** Read the policy back — for `EvmRpcHealth`, which reports the posture it is operating under. */

@@ -29,6 +29,7 @@
 import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
 import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { builtinToolsFor, registeredToolName, toolConfigHint } from "@crewhaus/tool-categories";
 
 // -------- tools list --------
 
@@ -1176,6 +1177,36 @@ export function formatSuggestLines(result: ToolSuggestResult): string[] {
   return lines;
 }
 
+/**
+ * The tool keys a spec names LITERALLY in its shape tool lists — the entries
+ * that are neither an `all-<category>` selector nor an `-exclusion`.
+ * Sub-agent and model-profile lists are not grants and are skipped.
+ */
+export function literalToolKeys(spec: unknown): ReadonlySet<string> {
+  const out = new Set<string>();
+  const visit = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item, path);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === "sub_agents" || (path === "" && key === "models")) continue;
+      if (key === "tools" && Array.isArray(value)) {
+        for (const entry of value) {
+          if (typeof entry === "string" && !entry.startsWith("-") && !entry.startsWith("all-")) {
+            out.add(entry);
+          }
+        }
+        continue;
+      }
+      visit(value, path === "" ? key : `${path}.${key}`);
+    }
+  };
+  visit(spec, "");
+  return out;
+}
+
 // -------- tools audit --------
 
 /** Per-tool aggregate over a session set's `tool_stats` lines, keyed by the
@@ -1225,8 +1256,17 @@ export const DEFAULT_AUDIT_THRESHOLDS: AuditThresholds = Object.freeze({
 });
 
 export type ToolAuditFinding =
-  /** A tool granted in the spec but never called across the mined sessions. */
-  | { readonly kind: "unused"; readonly key: string; readonly name: string }
+  /**
+   * A tool granted in the spec but never called across the mined sessions.
+   * `viaCategory` — granted by an `all-<category>` selector rather than by
+   * name, so the fix is an exclusion (`-key`), not deleting a line.
+   */
+  | {
+      readonly kind: "unused";
+      readonly key: string;
+      readonly name: string;
+      readonly viaCategory?: boolean;
+    }
   /** A granted tool whose error rate crosses the threshold. */
   | {
       readonly kind: "failing";
@@ -1264,7 +1304,14 @@ export type ToolAuditResult = {
  */
 export function auditTools(opts: {
   readonly sessions: ReadonlyArray<SessionEvents>;
+  /** Concrete keys the spec grants — categories expanded, exclusions applied. */
   readonly specTools: ReadonlyArray<string>;
+  /**
+   * The keys the spec names literally. A granted key missing from this set
+   * came from a category; its "unused" advice is to exclude it. Absent: every
+   * key is treated as literal (the pre-0.7.1 behaviour).
+   */
+  readonly literalKeys?: ReadonlySet<string>;
   readonly usage: ReadonlyMap<string, ToolUsageStats>;
   readonly toolMap: Readonly<Record<string, RegisteredTool>>;
   readonly hasExplicitToolList: boolean;
@@ -1275,7 +1322,8 @@ export function auditTools(opts: {
 
   // Index usage by the RegisteredTool `.name` (already the usage key) and
   // build a spec-key → name resolver.
-  const nameFor = (key: string): string => opts.toolMap[key]?.name ?? key;
+  const nameFor = (key: string): string =>
+    opts.toolMap[key]?.name ?? registeredToolName(key) ?? key;
 
   // (a) unused grants — only when the spec declared an explicit list.
   if (opts.hasExplicitToolList) {
@@ -1283,7 +1331,8 @@ export function auditTools(opts: {
       const name = nameFor(key);
       const stats = opts.usage.get(name);
       if (stats === undefined || stats.calls === 0) {
-        findings.push({ kind: "unused", key, name });
+        const viaCategory = opts.literalKeys !== undefined && !opts.literalKeys.has(key);
+        findings.push({ kind: "unused", key, name, ...(viaCategory ? { viaCategory } : {}) });
       }
     }
   }
@@ -1346,7 +1395,9 @@ export function formatAuditLines(result: ToolAuditResult): string[] {
     switch (f.kind) {
       case "unused":
         lines.push(
-          `[remove?] ${f.key} (${f.name}) — granted but never called in the mined sessions; drop it from tools: unless it's for a path these sessions didn't exercise`,
+          f.viaCategory === true
+            ? `[remove?] ${f.key} (${f.name}) — granted by a category but never called in the mined sessions; add -${f.key} to tools: to exclude it, unless it's for a path these sessions didn't exercise`
+            : `[remove?] ${f.key} (${f.name}) — granted but never called in the mined sessions; drop it from tools: unless it's for a path these sessions didn't exercise`,
         );
         break;
       case "failing":
@@ -1367,566 +1418,13 @@ export function formatAuditLines(result: ToolAuditResult): string[] {
 // -------- map-sync guard --------
 
 /**
- * The canonical set of built-in tool KEYS the CLI runtime can resolve at
- * `crewhaus run` time — the exact key set of `loadToolMap()` in
- * `apps/cli/src/index.ts`. It MUST equal `BUILTIN_TOOL_MAP`'s keys in
- * `packages/target-cli/src/index.ts`: that map decides which `tools:` names
- * COMPILE, this one decides which RUN, and a name in one but not the other is
- * a latent break (compiles then crashes, or runs a name the emitter rejects).
- * The sync test in `tools-cli.test.ts` asserts the two are equal; `loadToolMap`
- * is built to cover exactly these keys.
+ * The builtin tool KEYS the CLI runtime resolves at `crewhaus run` time —
+ * exactly the builtins the cli shape compiles. Derived from the one builtin
+ * table in `@crewhaus/tool-categories`, so the set that compiles and the set
+ * that runs cannot drift apart (they were two hand-kept lists until 0.7.1).
  */
 export const CLI_RUNTIME_TOOL_KEYS: ReadonlyArray<string> = Object.freeze([
-  "read",
-  "write",
-  "edit",
-  "glob",
-  "grep",
-  "bash",
-  "bashOutput",
-  "killShell",
-  "todoWrite",
-  "webFetch",
-  "webSearch",
-  "readImage",
-  "fetch",
-  "python",
-  "javascript",
-  "shell",
-  "imageGenerate",
-  "ingestDocument",
-  "codegraphSearch",
-  "codegraphCallers",
-  "codegraphCallees",
-  "codegraphImpact",
-  "compactLog",
-  "countTokens",
-  "escapeString",
-  "extractEntities",
-  "extractKeywords",
-  "fuzzyMatch",
-  "glossaryReplace",
-  "markdownOutline",
-  "markdownTable",
-  "normalizeText",
-  "regexExtract",
-  "renderTemplate",
-  "ruleClassify",
-  "sortLines",
-  "textDiff",
-  "textSimilarity",
-  "truncateToBudget",
-  "wrapText",
-  "jsonQuery",
-  "jsonPatch",
-  "jsonMergePatch",
-  "jsonFormat",
-  "dataDiff",
-  "dataConvert",
-  "csvParse",
-  "csvWrite",
-  "tableQuery",
-  "tableAggregate",
-  "tableJoin",
-  "recordsToColumns",
-  "columnsToRecords",
-  "flattenObject",
-  "unflattenObject",
-  "jsonlParse",
-  "jsonlWrite",
-  "xmlParse",
-  "sortRecords",
-  "dedupeRecords",
-  "sampleRecords",
-  "dataShape",
-  "jsonSortKeys",
-  "hash",
-  "hmac",
-  "checksum",
-  "hexEncode",
-  "hexDecode",
-  "urlEncode",
-  "urlDecode",
-  "urlParse",
-  "urlBuild",
-  "urlNormalize",
-  "uuid",
-  "ulid",
-  "nanoId",
-  "slugify",
-  "jwtDecode",
-  "jwtVerify",
-  "dateParse",
-  "dateFormat",
-  "dateConvertTimezone",
-  "dateAdd",
-  "dateDiff",
-  "durationParse",
-  "durationFormat",
-  "businessDays",
-  "dateRange",
-  "cronNext",
-  "cronDescribe",
-  "recurrenceExpand",
-  "weekOfYear",
-  "dayOfYear",
-  "isLeapYear",
-  "quarterOf",
-  "timestampConvert",
-  "jsonSchemaValidate",
-  "jsonSchemaInfer",
-  "validateRecords",
-  "assert",
-  "compareGolden",
-  "deepEqual",
-  "matchSubset",
-  "checkRequiredFields",
-  "validateEnum",
-  "validateFormat",
-  "validateUniqueKeys",
-  "validateReferences",
-  "schemaDiff",
-  "schemaSummarize",
-  "gitStatus",
-  "gitDiff",
-  "gitLog",
-  "gitShow",
-  "gitBlame",
-  "gitBranchList",
-  "gitTagList",
-  "gitRemoteList",
-  "gitMergeBase",
-  "gitRevParse",
-  "gitFileHistory",
-  "gitStashList",
-  "gitConflicts",
-  "gitWorktreeList",
-  "gitAdd",
-  "gitCommit",
-  "gitSwitch",
-  "gitBranchCreate",
-  "gitBranchDelete",
-  "gitStashPush",
-  "gitStashPop",
-  "gitTagCreate",
-  "gitApplyPatch",
-  "gitCherryPick",
-  "gitResetPaths",
-  "gitWorktreeAdd",
-  "gitWorktreeRemove",
-  "stat",
-  "fileHash",
-  "tree",
-  "diskUsage",
-  "findFiles",
-  "readLines",
-  "tailFile",
-  "makeDirectory",
-  "touchFile",
-  "tempDir",
-  "copyPath",
-  "movePath",
-  "removePath",
-  "splitFile",
-  "concatFiles",
-  "archiveList",
-  "archiveCreate",
-  "archiveExtract",
-  "frontmatterRead",
-  "frontmatterWrite",
-  "notebookRead",
-  "notebookEdit",
-  "runCommand",
-  "runPipeline",
-  "retry",
-  "processStart",
-  "processStatus",
-  "processOutput",
-  "processStop",
-  "processList",
-  "waitForPort",
-  "waitForFile",
-  "waitForOutput",
-  "commandExists",
-  "envInspect",
-  "base64Encode",
-  "base64Decode",
-  "httpRequest",
-  "httpPaginate",
-  "graphqlQuery",
-  "httpBatch",
-  "downloadFile",
-  "headRequest",
-  "urlReachable",
-  "linkCheck",
-  "httpWaitFor",
-  "sseRead",
-  "webhookSign",
-  "webhookVerify",
-  "dnsLookup",
-  "tlsInspect",
-  "robotsCheck",
-  "sitemapParse",
-  "feedParse",
-  "kvSet",
-  "kvGet",
-  "kvDelete",
-  "kvList",
-  "counterIncrement",
-  "counterGet",
-  "checkpointSave",
-  "checkpointLoad",
-  "checkpointList",
-  "journalAppend",
-  "journalRead",
-  "blackboardPost",
-  "blackboardRead",
-  "noteWrite",
-  "noteSearch",
-  "indexBuild",
-  "indexSearch",
-  "stateExport",
-  "stateImport",
-  "dedupeMark",
-  "specValidate",
-  "specCompileCheck",
-  "specSummarize",
-  "specDiff",
-  "toolInventory",
-  "permissionAudit",
-  "preflightRun",
-  "harnessInventory",
-  "bundleFreshness",
-  "auditVerify",
-  "evalBaselineCompare",
-  "sessionSummarize",
-  "traceQuery",
-  "costSummarize",
-  "runTests",
-  "testFailureSummary",
-  "runBuild",
-  "typecheck",
-  "lint",
-  "format",
-  "formatCheck",
-  "diagnostics",
-  "astQuery",
-  "symbolOutline",
-  "findReferences",
-  "importGraph",
-  "deadFileScan",
-  "todoScan",
-  "dependencyList",
-  "dependencyOutdated",
-  "packageScripts",
-  "workspacePackages",
-  "coverageSummary",
-  "stackTraceParse",
-  "prList",
-  "prGet",
-  "prFiles",
-  "prComments",
-  "prReviews",
-  "issueList",
-  "issueGet",
-  "checkRuns",
-  "workflowRuns",
-  "workflowRunLogs",
-  "releaseList",
-  "releaseGet",
-  "repoGet",
-  "compareRefs",
-  "searchCode",
-  "searchIssues",
-  "rateLimitStatus",
-  "prCreate",
-  "prUpdate",
-  "prComment",
-  "prReviewSubmit",
-  "issueCreate",
-  "issueUpdate",
-  "issueComment",
-  "releaseCreate",
-  "workflowRunRerun",
-  "sqlQuery",
-  "sqlExec",
-  "sqlTransaction",
-  "sqlExplain",
-  "dbSchemaDiff",
-  "schemaList",
-  "schemaDescribe",
-  "tableStats",
-  "integrityCheck",
-  "importCsv",
-  "importJson",
-  "exportCsv",
-  "exportJson",
-  "databaseBackup",
-  "migrationStatus",
-  "migrationApply",
-  "docxRead",
-  "docxWrite",
-  "xlsxRead",
-  "xlsxWrite",
-  "pptxRead",
-  "pdfInfo",
-  "pdfText",
-  "pdfSplit",
-  "pdfMerge",
-  "emlParse",
-  "mboxSplit",
-  "icsParse",
-  "icsWrite",
-  "vcardParse",
-  "documentText",
-  "documentDiff",
-  "piiScan",
-  "piiRedact",
-  "pseudonymize",
-  "depseudonymize",
-  "secretScan",
-  "entropyScore",
-  "promptInjectionScan",
-  "invisibleCharScan",
-  "homoglyphNormalize",
-  "urlSafetyCheck",
-  "allowlistCheck",
-  "contentPolicyCheck",
-  "hashChainVerify",
-  "signPayload",
-  "verifyPayload",
-  "redactForExport",
-  "evaluate",
-  "statistics",
-  "percentile",
-  "correlation",
-  "linearRegression",
-  "histogram",
-  "outliers",
-  "moneyAdd",
-  "moneyMultiply",
-  "moneyAllocate",
-  "currencyConvert",
-  "unitConvert",
-  "round",
-  "numberFormat",
-  "numberParse",
-  "percent",
-  "amortize",
-  "npv",
-  "irr",
-  "geoDistance",
-  "geoBoundingBox",
-  "geoPointInPolygon",
-  "chatPost",
-  "chatUpdate",
-  "chatDelete",
-  "chatReact",
-  "emailCompose",
-  "emailSend",
-  "webhookPost",
-  "smsSend",
-  "pushNotify",
-  "deliveryCheck",
-  "notifyDigest",
-  "quietHours",
-  "rateLimitGate",
-  "messageTemplate",
-  "eventQuery",
-  "eventCounts",
-  "toolCallStats",
-  "errorCluster",
-  "runTimeline",
-  "costReport",
-  "budgetCheck",
-  "sloEvaluate",
-  "incidentBundle",
-  "metricsQuery",
-  "logsQuery",
-  "alertList",
-  "alertAck",
-  "statusPagePost",
-  "healthProbe",
-  "imageInfo",
-  "imageKind",
-  "pngRead",
-  "pngWrite",
-  "imageResize",
-  "imageCrop",
-  "imageDiff",
-  "exifRead",
-  "exifStrip",
-  "qrEncode",
-  "barcodeEncode",
-  "chartRender",
-  "sparklineRender",
-  "diagramRender",
-  "colorConvert",
-  "colorContrast",
-  "subtitleParse",
-  "subtitleWrite",
-  "mediaProbe",
-  "branch",
-  "consensusVote",
-  "deadlineCheck",
-  "decisionTable",
-  "errorClassify",
-  "ruleScore",
-  "stallDetect",
-  "licenseAggregate",
-  "lockfileDiff",
-  "packagePublishPreflight",
-  "packageTarballInspect",
-  "semverResolve",
-  "costBasisCompute",
-  "glCodeSuggest",
-  "paymentIdentifierValidate",
-  "purchaseOrderMatch",
-  "refundAbuseCheck",
-  "refundAmountCompute",
-  "spendLimitCheck",
-  "statementParse",
-  "taxCalculate",
-  "webhookSignatureVerify",
-  "abiDecode",
-  "abiEncodeCall",
-  "addressCheck",
-  "defiMath",
-  "functionSelector",
-  "typedDataHash",
-  "tokenUnits",
-  "htmlForms",
-  "htmlLinks",
-  "htmlQuery",
-  "htmlRecords",
-  "htmlStructuredData",
-  "htmlTable",
-  "htmlText",
-  "acceptanceCheck",
-  "checksumVerify",
-  "citationLint",
-  "goldenCompare",
-  "goldenUpdate",
-  "markdownLinkCheck",
-  "contactNormalize",
-  "fixedWidthParse",
-  "recordLinkage",
-  "tableDiff",
-  "tableProfile",
-  "tableReshape",
-  "tableShard",
-  "diffParse",
-  "diffLint",
-  "docsSymbolCheck",
-  "bundleSizeCheck",
-  "benchmarkCompare",
-  "flakyTestDetect",
-  "registryPackageInfo",
-  "registrySearch",
-  "registryOutdated",
-  "manifestDependencySet",
-  "dependencyAudit",
-  "ciWorkflowAudit",
-  "containerImageInspect",
-  "containerImageTags",
-  "dataDriftCheck",
-  "evmGetBlock",
-  "evmBlockAtTimestamp",
-  "evmRpcHealth",
-  "evmNonceStatus",
-  "evmWaitForReceipt",
-  "evmTransactionSummary",
-  "evmEventScan",
-  "evmMulticall",
-  "contractInspect",
-  "evmSimulateBundle",
-  "gasMarketRead",
-  "tokenResolve",
-  "erc20Balance",
-  "erc721TokenInfo",
-  "priceQuote",
-  "oraclePriceRead",
-  "defiPositionRead",
-  "portfolioValuation",
-  "ledgerPost",
-  "ledgerQuery",
-  "ledgerReconcile",
-  "invoiceRender",
-  "eInvoiceBuild",
-  "eInvoiceParse",
-  "paymentFileBuild",
-  "vatIdValidate",
-  "entityRegistryLookup",
-  "sanctionsScreen",
-  "objectPresign",
-  "systemInfo",
-  "networkInfo",
-  "portInspect",
-  "secretLookup",
-  "envFileUpsert",
-  "secretRotate",
-  "watchPath",
-  "trashPath",
-  "osIndexSearch",
-  "cronList",
-  "cronDelete",
-  "packageManifestGenerate",
-  "packageManifestVerify",
-  "packageQuery",
-  "packageInstall",
-  "clipboardRead",
-  "clipboardWrite",
-  "desktopNotify",
-  "openExternal",
-  "printDocument",
-  "windowList",
-  "userPresence",
-  "powerAssertion",
-  "specPatchApply",
-  "specUpgrade",
-  "specAdvise",
-  "doctorFix",
-  "evalHistory",
-  "evalAggregate",
-  "evalBaselinePin",
-  "evalCoverage",
-  "graderMetaTest",
-  "datasetPut",
-  "datasetInspect",
-  "datasetLint",
-  "datasetMine",
-  "approvalStatus",
-  "approvalsInbox",
-  "permissionsSuggest",
-  "harnessRetire",
-  "storeMigrate",
-  "retentionEnforce",
-  "knowledgeSync",
-  "harnessRegister",
-  "harnessJobStatus",
-  "compileBundle",
-  "cliVersionPin",
-  "hooksManage",
-  "specPin",
-  "deployRollback",
-  "deployInspect",
-  "routeControl",
-  "experimentLedger",
-  "flywheelStatus",
-  "watchmeReport",
-  "marketplaceSearch",
-  "federationDiscover",
-  "factCrossCheck",
-  "vectorDelete",
-  "emailSendPreflight",
-  "deliverabilityCheck",
-  "emitTraceEvent",
-  "localTime",
-  "leadAssign",
-  "sequenceRun",
-  "onchainTransactionsSync",
-  "seoLint",
-  "toolRegistry",
+  ...builtinToolsFor("cli"),
 ]);
 
 /**
@@ -2041,6 +1539,8 @@ export type ToolDetail = {
   readonly concurrencySafe: boolean;
   /** Top-level input field names, derived from the tool's own JSON Schema. */
   readonly inputFields: ReadonlyArray<string>;
+  /** What a spec writes to configure it (`tool_config.http`), when it takes any. */
+  readonly configure?: string;
 };
 
 /**
@@ -2069,6 +1569,7 @@ export function buildToolDetail(
     requireJustification: tool.requireJustification ?? false,
     concurrencySafe: tool.concurrencySafe ?? false,
     inputFields: inputFieldNames(tool),
+    ...(toolConfigHint(key) !== undefined ? { configure: toolConfigHint(key) } : {}),
   };
 }
 
@@ -2128,6 +1629,7 @@ export function formatToolDetailLines(d: ToolDetail): string[] {
     `  flags       ${flags.join(", ")}`,
     `  categories  ${d.categories.length > 0 ? d.categories.map((c) => `all-${c}`).join(", ") : "(uncategorized)"}`,
     `  input       ${d.inputFields.length > 0 ? d.inputFields.join(", ") : "(no declared fields)"}`,
+    ...(d.configure !== undefined ? [`  configure   ${d.configure}`] : []),
     "",
     `  enable with  tools: [${d.key}]`,
   ];

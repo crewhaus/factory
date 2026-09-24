@@ -33,6 +33,14 @@ import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
 import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
+import {
+  BUILTIN_TOOLS,
+  BuiltinToolError,
+  type ToolPackageImporter,
+  checkBuiltinTool,
+  registerToolConfigs,
+  sandboxAvailableFromEnv,
+} from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { RunnerError } from "./errors";
@@ -41,6 +49,12 @@ type SpawnSubAgentFn = typeof spawnSubAgent;
 
 export type SharedAgentDeps = {
   readonly tools: ReadonlyArray<RegisteredTool>;
+  /**
+   * Some wired tool runs model-written code, and the environment's sandbox
+   * backend (CREWHAUS_SANDBOX, the grammar the cli bundle uses) is not
+   * `noop`. Absent when no such tool is wired.
+   */
+  readonly sandboxAvailable?: boolean;
   readonly hooks: ReadonlyArray<HookDef>;
   readonly skills: ReadonlyArray<SkillRef>;
   readonly slashCommands: ReadonlyMap<string, SlashCommand>;
@@ -56,23 +70,94 @@ export type SharedAgentDeps = {
 
 const logger = createLogger({ bindings: { module: "eval-runner.wire" } });
 
-export async function wireRunOnce(ir: IrV0, opts: { cwd?: string } = {}): Promise<SharedAgentDeps> {
+export type WireRunOnceOptions = {
+  readonly cwd?: string;
+  /**
+   * How to import a tool package. The default is a plain `import(pkg)`,
+   * which works wherever the packages resolve from this module (an installed
+   * bundle, whose manifest pins them). The CLI passes its literal loader
+   * table, because a single-binary build only embeds literal specifiers; an
+   * eval bundle passes the modules it imported statically.
+   */
+  readonly importToolPackage?: ToolPackageImporter;
+};
+
+const defaultImportToolPackage: ToolPackageImporter = (pkg) => import(pkg);
+
+/**
+ * The spec's `tools:` → RegisteredTools, through the one builtin table
+ * (`@crewhaus/tool-categories`) every emitter and `crewhaus run` read — so
+ * `crewhaus eval` and `crewhaus optimize` wire exactly the tools the compiled
+ * bundle registers, the 0.7.0 builtins included. `tool_config` is applied
+ * through the same hook first. A name the shape cannot run is a RunnerError
+ * with the compiler's own message.
+ */
+async function wireBuiltinTools(
+  ir: IrV0,
+  importPackage: ToolPackageImporter,
+): Promise<{ tools: RegisteredTool[]; sandbox: boolean }> {
+  if (ir.tools.length === 0) return { tools: [], sandbox: false };
+  const problems: string[] = [];
+  for (const key of ir.tools) {
+    const verdict = checkBuiltinTool(key, "eval");
+    if (verdict.kind === "unknown" || verdict.kind === "refused") {
+      problems.push(`tools: ${verdict.message}`);
+    }
+  }
+  if (problems.length > 0) throw new RunnerError(problems.join("\n"));
+  const modules = new Map<string, Readonly<Record<string, unknown>>>();
+  const load = async (pkg: string): Promise<Readonly<Record<string, unknown>>> => {
+    const cached = modules.get(pkg);
+    if (cached !== undefined) return cached;
+    let mod: Readonly<Record<string, unknown>>;
+    try {
+      mod = await importPackage(pkg);
+    } catch (err) {
+      throw new RunnerError(
+        `could not load ${pkg}: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+    modules.set(pkg, mod);
+    return mod;
+  };
+  try {
+    // The same registrations a compiled bundle makes: tool_config blocks with
+    // their `$VAR` values read from this process, and the chain blocks.
+    await registerToolConfigs([{ tools: ir.tools, toolConfigs: ir.toolConfigs }], load, {
+      env: process.env,
+      chains: ir,
+    });
+  } catch (err) {
+    if (err instanceof BuiltinToolError) throw new RunnerError(err.message, err);
+    throw err;
+  }
+  let sandbox = false;
+  const tools: RegisteredTool[] = [];
+  for (const key of ir.tools) {
+    const entry = BUILTIN_TOOLS[key];
+    if (entry === undefined) continue; // unreachable: checked above
+    const tool = (await load(entry.package))[entry.export] as RegisteredTool | undefined;
+    if (tool === undefined || typeof tool.name !== "string") {
+      throw new RunnerError(
+        `${entry.package} does not export the tool "${entry.export}" that the builtin table names for "${key}"`,
+      );
+    }
+    if (entry.sandbox === true) sandbox = true;
+    tools.push(tool);
+  }
+  return { tools, sandbox };
+}
+
+export async function wireRunOnce(
+  ir: IrV0,
+  opts: WireRunOnceOptions = {},
+): Promise<SharedAgentDeps> {
   const cwd = opts.cwd ?? process.cwd();
 
   // Tools.
-  let tools: RegisteredTool[] = [];
-  if (ir.tools.length > 0) {
-    await applyToolConfigs(ir.tools, ir.toolConfigs);
-    const toolMap = await loadToolMap();
-    tools = ir.tools.map((name) => {
-      const tool = toolMap[name];
-      if (!tool) {
-        const known = Object.keys(toolMap).sort().join(", ");
-        throw new RunnerError(`unknown tool "${name}" — known tools: ${known}`);
-      }
-      return tool;
-    });
-  }
+  const builtin = await wireBuiltinTools(ir, opts.importToolPackage ?? defaultImportToolPackage);
+  let tools: RegisteredTool[] = builtin.tools;
 
   // MCP servers (shared across samples).
   let mcpHost: McpHost | undefined;
@@ -140,48 +225,10 @@ export async function wireRunOnce(ir: IrV0, opts: { cwd?: string } = {}): Promis
     instructions: ir.agent.instructions,
     sessionName: ir.name,
     sessionTarget: ir.target,
+    ...(builtin.sandbox ? { sandboxAvailable: sandboxAvailableFromEnv(process.env) } : {}),
     ...(subAgents !== undefined ? { subAgents, spawnSubAgent } : {}),
     ...(mcpHost !== undefined ? { mcpHost } : {}),
   };
-}
-
-async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
-  const [fs, bash, todo, web, image, fetchPkg] = await Promise.all([
-    import("@crewhaus/tool-fs"),
-    import("@crewhaus/tool-bash"),
-    import("@crewhaus/tool-todo"),
-    import("@crewhaus/tool-web"),
-    import("@crewhaus/tool-image"),
-    import("@crewhaus/tool-fetch"),
-  ]);
-  return {
-    read: fs.read,
-    write: fs.write,
-    edit: fs.edit,
-    glob: fs.glob,
-    grep: fs.grep,
-    bash: bash.bash,
-    todoWrite: todo.todoWrite,
-    webFetch: web.webFetch,
-    webSearch: web.webSearch,
-    readImage: image.readImage,
-    fetch: fetchPkg.fetch,
-  };
-}
-
-async function applyToolConfigs(
-  toolNames: readonly string[],
-  toolConfigs: Readonly<Record<string, unknown>>,
-): Promise<void> {
-  const used = new Set(toolNames);
-  if (used.has("fetch") && toolConfigs["fetch"] !== undefined) {
-    const { registerFetchConfig } = await import("@crewhaus/tool-fetch");
-    registerFetchConfig(toolConfigs["fetch"] as Parameters<typeof registerFetchConfig>[0]);
-  }
-  if (used.has("webFetch") && toolConfigs["webFetch"] !== undefined) {
-    const { registerWebFetchConfig } = await import("@crewhaus/tool-web");
-    registerWebFetchConfig(toolConfigs["webFetch"] as Parameters<typeof registerWebFetchConfig>[0]);
-  }
 }
 
 function buildRuleSet(

@@ -106,6 +106,7 @@ export {
   type ChainRpc,
   type ChainRpcResolver,
   _setRpc,
+  bindChainCallChains,
   chainRpcFromAdapter,
   setChainRpcResolver,
 } from "./lib/rpc";

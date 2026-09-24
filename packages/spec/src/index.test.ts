@@ -169,12 +169,18 @@ tools:
 // keys python/javascript/shell (target-cli reads the per-tool key first),
 // so every one of those must be rejected.
 describe("tool_config code-execution sandbox-override hardening", () => {
+  // 0.7.1 — the boot rule also delivers a tool's registered name (`Python`)
+  // and any casing of these keys, so each of those spellings is guarded too.
   const codeExecKeys = [
     "codeExecution",
     "code_execution",
     "python",
     "javascript",
     "shell",
+    "Python",
+    "JavaScript",
+    "Shell",
+    "CODEEXECUTION",
   ] as const;
   const overrideKeys = [
     ["backend", "backend: noop"],

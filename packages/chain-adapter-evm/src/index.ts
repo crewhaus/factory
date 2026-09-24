@@ -70,6 +70,62 @@ export function createEvmAdapter(
   };
 }
 
+/**
+ * One adapter per declared chain, keyed by chain id — what a bundle builds
+ * from the spec's `chains` block at boot, and what every chain-reading tool
+ * package binds its seam to. Each RPC URL must be an absolute http(s) URL; a
+ * refusal names the position, never the URL, whose path is where a provider
+ * keeps its key.
+ */
+export function createEvmAdapters(
+  chains: ReadonlyArray<ChainAdapterConfig>,
+): ReadonlyMap<string, ChainAdapter> {
+  const out = new Map<string, ChainAdapter>();
+  chains.forEach((chain, i) => {
+    if (chain.rpcUrls.length === 0) {
+      throw new ChainAdapterError(chain.chainId, "boot", `chains[${i}] has no rpcUrls`);
+    }
+    chain.rpcUrls.forEach((raw, j) => {
+      let url: URL | undefined;
+      try {
+        url = new URL(raw);
+      } catch {
+        url = undefined;
+      }
+      if (url === undefined || (url.protocol !== "https:" && url.protocol !== "http:")) {
+        throw new ChainAdapterError(
+          chain.chainId,
+          "boot",
+          `chains[${i}].rpcUrls[${j}] is not an absolute http(s) URL`,
+        );
+      }
+    });
+    if (out.has(chain.chainId)) {
+      throw new ChainAdapterError(
+        chain.chainId,
+        "boot",
+        `chains[${i}] repeats chain id "${chain.chainId}"`,
+      );
+    }
+    out.set(chain.chainId, createEvmAdapter(chain));
+  });
+  return out;
+}
+
+/**
+ * An RPC endpoint as a message may name it: scheme, host and port. Providers
+ * put the API key in the path (`/v2/<key>`), and an error travels into tool
+ * results and transcripts.
+ */
+function endpointLabel(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "the RPC endpoint";
+  }
+}
+
 async function fallbackDispatch(
   chainId: string,
   urls: readonly string[],
@@ -144,10 +200,13 @@ async function dispatchOne(
       body: JSON.stringify(body),
     });
   } catch (err) {
-    throw new ChainAdapterError(chainId, method, `network error: ${(err as Error).message}`, err);
+    // No `cause`: a dialler's error can quote the URL it failed on, and a
+    // provider keeps its key in the URL's path.
+    const message = (err as Error).message.split(url).join(endpointLabel(url));
+    throw new ChainAdapterError(chainId, method, `network error: ${message}`);
   }
   if (!res.ok) {
-    throw new ChainAdapterError(chainId, method, `HTTP ${res.status} from ${url}`);
+    throw new ChainAdapterError(chainId, method, `HTTP ${res.status} from ${endpointLabel(url)}`);
   }
   const text = await res.text();
 

@@ -5,8 +5,9 @@
  * Why this has to be generated rather than written:
  *
  *   Nothing already in the tree lets a compiled bundle say "here is a tool
- *   you are not running, and this is what it does". `BUILTIN_TOOL_MAP`
- *   (packages/target-cli) carries a package and an export name and no prose.
+ *   you are not running, and this is what it does". The builtin table
+ *   (`BUILTIN_TOOLS` in packages/tool-categories) carries a package, an
+ *   export and a name, and no prose.
  *   `@crewhaus/tool-categories` is forbidden from importing a tool package,
  *   because the compiler imports it and codegen must stay offline, so it
  *   carries one title per CATEGORY and nothing per tool. The descriptions and
@@ -18,9 +19,9 @@
  * `scripts/gen-dockerfile-bodies.ts` bakes the Dockerfile bodies, and for the
  * same reason: one artifact every path can read identically.
  *
- * The KEY SET is derived from `BUILTIN_TOOL_MAP`, never hand-written. That is
- * what keeps this from becoming a sixth list to keep in sync — it is a
- * projection of the fifth. `apps/cli/src/tool-registry.test.ts` re-runs this
+ * The KEY SET is every builtin the cli shape compiles, read from the builtin
+ * table — never hand-written. That is what keeps this from becoming another
+ * list to keep in sync: it is a projection of the table. `apps/cli/src/tool-registry.test.ts` re-runs this
  * projection and fails when the checked-in data no longer matches, so adding
  * or reworded a builtin without re-running this script fails CI rather than
  * silently shipping a stale answer to "what am I missing".
@@ -33,9 +34,12 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CLI_RUNTIME_TOOL_KEYS, TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
-import { BUILTIN_TOOL_MAP } from "../packages/target-cli/src/index";
-import { categoriesForTool } from "../packages/tool-categories/src/index";
+import { TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
+import {
+  BUILTIN_TOOLS,
+  builtinToolsFor,
+  categoriesForTool,
+} from "../packages/tool-categories/src/index";
 import { projectRegistryEntry } from "../packages/tool-registry-manifest/src/types";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -48,27 +52,18 @@ const version = (
   }
 ).version;
 
-const keys = Object.keys(BUILTIN_TOOL_MAP).sort();
+const keys = [...builtinToolsFor("cli")].sort();
 if (keys.length === 0)
-  throw new Error("BUILTIN_TOOL_MAP is empty — refusing to write an empty manifest");
+  throw new Error("the builtin table has no cli tools — refusing to write an empty manifest");
 
 // The generated file says MCP tools "cannot be added". Make that true of the
 // generator rather than only of the tests that read its output: nothing about
-// `Record<string, BuiltinToolEntry>` stops an `mcp__` key being put there, and
-// one such row would turn "this is the builtin set" into "this is the set".
+// the table's type stops an `mcp__` key being put there, and one such row
+// would turn "this is the builtin set" into "this is the set".
 const mcpKeys = keys.filter((k) => k.startsWith("mcp__"));
 if (mcpKeys.length > 0) {
   throw new Error(
-    `BUILTIN_TOOL_MAP has mcp__ keys, which this manifest cannot describe — a spec declares an MCP server, not its tools: ${mcpKeys.join(", ")}`,
-  );
-}
-
-// Both halves of the wiring, checked here rather than left to a later test:
-// this script's whole claim is that the manifest covers the builtin set.
-const onlyInRuntime = CLI_RUNTIME_TOOL_KEYS.filter((k) => !(k in BUILTIN_TOOL_MAP));
-if (onlyInRuntime.length > 0) {
-  throw new Error(
-    `these keys run but do not compile, so the manifest cannot describe them: ${onlyInRuntime.join(", ")}`,
+    `the builtin table has mcp__ keys, which this manifest cannot describe — a spec declares an MCP server, not its tools: ${mcpKeys.join(", ")}`,
   );
 }
 
@@ -85,8 +80,8 @@ type ToolLike = {
 
 const rows: string[] = [];
 for (const key of keys) {
-  const entry = BUILTIN_TOOL_MAP[key];
-  if (entry === undefined) throw new Error(`no BUILTIN_TOOL_MAP entry for ${key}`);
+  const entry = BUILTIN_TOOLS[key];
+  if (entry === undefined) throw new Error(`no builtin table entry for ${key}`);
   // Workspace deps are linked per package, not hoisted to the root, so a
   // bare `@crewhaus/tool-fs` specifier does not resolve from `scripts/`.
   // Resolve to the checkout instead — the same module either way.

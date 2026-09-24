@@ -46,6 +46,7 @@
     { "path": "../cost-tracker" },
     { "path": "../circuit-breaker" },
     { "path": "../prompt-cache-manager" },
-    { "path": "../rate-limiter" }
+    { "path": "../rate-limiter" },
+    { "path": "../tool-categories" }
   ]
 }

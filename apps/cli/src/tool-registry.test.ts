@@ -17,14 +17,17 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import {
+  BUILTIN_TOOLS,
   CATEGORIES,
   allRegisteredTools,
+  builtinToolsFor,
   categoriesForTool,
   leafCategories,
   toolsInCategory,
 } from "@crewhaus/tool-categories";
 import { isPrivateIp } from "@crewhaus/tool-fetch";
 import { TOOL_REGISTRY, projectRegistryEntry } from "@crewhaus/tool-registry-manifest";
+import { TOOL_PACKAGE_LOADERS, loadBuiltinTools } from "./tool-packages";
 import {
   CLI_RUNTIME_TOOL_KEYS,
   TOOL_KEYWORDS,
@@ -66,6 +69,88 @@ describe("category registry vs. the real builtin set", () => {
       for (const key of toolsInCategory(name)) {
         expect(fromLeaves.has(key)).toBe(true);
       }
+    }
+  });
+});
+
+/**
+ * The builtin table (`@crewhaus/tool-categories`) is data only, so it cannot
+ * check its own `name` / `io` / `sandbox` columns against the tools. This
+ * file can import every tool, so it does — for every row, shape-specific
+ * ones included. A row that says a tool does not start a process when it
+ * does would let the cf-worker check call a host tool "not wired yet".
+ */
+describe("the builtin table's facts match the tools themselves", () => {
+  const repoRoot = join(import.meta.dir, "..", "..", "..");
+
+  test("name, io, sandbox, justification and scope agree with every RegisteredTool", async () => {
+    const wrong: string[] = [];
+    let checked = 0;
+    for (const [key, entry] of Object.entries(BUILTIN_TOOLS)) {
+      // By file, not by specifier: apps/cli does not depend on the
+      // shape-specific packages, and workspace deps are linked per package.
+      const file = join(
+        repoRoot,
+        "packages",
+        entry.package.replace("@crewhaus/", ""),
+        "src/index.ts",
+      );
+      const mod = (await import(file)) as Record<string, unknown>;
+      const tool = mod[entry.export] as
+        | {
+            name: string;
+            ioCapability?: string;
+            requiresSandbox: boolean;
+            requireJustification: boolean;
+            scope: string;
+          }
+        | undefined;
+      checked += 1;
+      if (tool === undefined) {
+        wrong.push(`${key}: ${entry.package} exports no "${entry.export}"`);
+        continue;
+      }
+      if (tool.name !== entry.name) wrong.push(`${key}: name ${entry.name} vs ${tool.name}`);
+      const io =
+        tool.ioCapability === "process" || tool.ioCapability === "network"
+          ? tool.ioCapability
+          : undefined;
+      if (io !== entry.io) wrong.push(`${key}: io ${entry.io} vs ${io}`);
+      if ((tool.requiresSandbox === true) !== (entry.sandbox === true)) {
+        wrong.push(`${key}: sandbox ${entry.sandbox} vs ${tool.requiresSandbox}`);
+      }
+      if ((tool.requireJustification === true) !== (entry.justify === true)) {
+        wrong.push(`${key}: justify ${entry.justify} vs ${tool.requireJustification}`);
+      }
+      // A bundle README prints "external" for a row with an io fact, so the
+      // two must be the same fact on every tool.
+      if ((tool.scope === "external") !== (entry.io !== undefined)) {
+        wrong.push(`${key}: scope ${tool.scope} but io ${entry.io}`);
+      }
+    }
+    expect(checked).toBe(Object.keys(BUILTIN_TOOLS).length);
+    expect(checked).toBeGreaterThanOrEqual(550);
+    expect(wrong).toEqual([]);
+  }, 60_000);
+
+  test("the cf-worker policy lists agree with the table's edge column", async () => {
+    // By file: apps/cli does not depend on the edge runtime package.
+    const { EDGE_SAFE_TOOLS, HOST_ONLY_TOOLS } = (await import(
+      join(repoRoot, "packages/worker-runtime/src/tool-policy.ts")
+    )) as {
+      EDGE_SAFE_TOOLS: ReadonlySet<string>;
+      HOST_ONLY_TOOLS: ReadonlyMap<string, string>;
+    };
+    const edge = Object.entries(BUILTIN_TOOLS)
+      .filter(([, e]) => e.edge === true)
+      .map(([k]) => k)
+      .sort();
+    expect(edge.length).toBeGreaterThan(0);
+    expect([...EDGE_SAFE_TOOLS].sort()).toEqual(edge);
+    // Every host-only name the edge hard-rejects is a builtin the edge does
+    // not wire (the policy also lists perception tools that are not builtins).
+    for (const name of HOST_ONLY_TOOLS.keys()) {
+      expect(BUILTIN_TOOLS[name]?.edge).not.toBe(true);
     }
   });
 });
@@ -159,73 +244,42 @@ describe("every exported tool is reachable from a spec", () => {
   });
 
   /**
-   * The packages a spec reaches through a different target, not through
-   * `target-cli`'s builtin map.
+   * The packages whose tools are not in the builtin table at all.
    *
-   * Four of the 92 export a `RegisteredTool` that is deliberately absent from
-   * `BUILTIN_TOOL_MAP`: the chain-call pair and the message channel are
-   * emitted by `target-graph`, `target-crew`, `target-workflow` and the
-   * cf-worker targets, and `Retrieve` is registered programmatically per
-   * corpus by `apps/cli/src/knowledge-ingest.ts`. Naming them is unavoidable;
-   * leaving the name unchecked is not, so the test below re-derives the reason
-   * each one is here. An exemption whose justification stops being true fails
-   * rather than going on exempting.
+   * Every other `RegisteredTool` a tool package exports must be a row of the
+   * table — including the shape-specific ones (the evm pair and
+   * `sendMessage`), which the table carries with the shapes that wire them.
+   * `Retrieve` is the one exception: `apps/cli/src/knowledge-ingest.ts`
+   * builds it per corpus from a spec's `knowledge:` block, so it has no
+   * `tools:` key. The test below re-derives that reason, so an exemption
+   * whose justification stops being true fails rather than going on
+   * exempting.
    */
-  const REACHED_BY_ANOTHER_TARGET: Readonly<Record<string, string>> = {
-    "tool-evm": "target-graph, target-crew and target-workflow emit it",
-    "tool-evm-tx": "target-graph, target-crew and target-workflow emit it",
-    "tool-message-channel": "the channel-bot and cf-worker targets emit it",
+  const REACHED_OUTSIDE_THE_TABLE: Readonly<Record<string, string>> = {
     "tool-retrieve": "apps/cli/src/knowledge-ingest.ts registers it per corpus",
   };
 
-  const exportNames = new Set(
-    Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
-  );
+  const exportNames = new Set(Object.values(BUILTIN_TOOLS).map((entry) => entry.export));
 
   test("every exemption still has the reason it was granted for", () => {
-    const targets = readdirSync(join(repoRoot, "packages")).filter((n) => n.startsWith("target-"));
-    expect(targets.length).toBeGreaterThanOrEqual(5);
-    for (const pkg of Object.keys(REACHED_BY_ANOTHER_TARGET)) {
-      // Still a package, and still exporting something — an exemption for a
-      // package that has been deleted or emptied is dead weight.
+    for (const pkg of Object.keys(REACHED_OUTSIDE_THE_TABLE)) {
       const entry = join(repoRoot, "packages", pkg, "src", "index.ts");
       expect(existsSync(entry)).toBe(true);
       expect(PACKAGES).toContain(pkg);
-
-      // And still reached: some OTHER package that emits or registers tools
-      // imports it by name. `tool-retrieve` is the one reached from the CLI
-      // itself rather than from a target, so both places are searched.
-      const importers: string[] = [];
-      for (const other of [...targets.map((t) => join("packages", t, "src")), "apps/cli/src"]) {
-        const dir = join(repoRoot, other);
-        if (!existsSync(dir)) continue;
-        for (const file of readdirSync(dir)) {
-          if (!file.endsWith(".ts") || file.includes(".test.")) continue;
-          if (readFileSync(join(dir, file), "utf-8").includes(`@crewhaus/${pkg}`)) {
-            importers.push(join(other, file));
-          }
-        }
-      }
+      // Still reached from the CLI by name.
+      const cliDir = join(repoRoot, "apps/cli/src");
+      const importers = readdirSync(cliDir)
+        .filter((f) => f.endsWith(".ts") && !f.includes(".test."))
+        .filter((f) => readFileSync(join(cliDir, f), "utf-8").includes(`@crewhaus/${pkg}`));
       expect(
         importers.length,
-        `${pkg} is exempt because ${REACHED_BY_ANOTHER_TARGET[pkg]}, and nothing imports it any more`,
+        `${pkg} is exempt because ${REACHED_OUTSIDE_THE_TABLE[pkg]}, and nothing imports it any more`,
       ).toBeGreaterThan(0);
-
-      // And still NEEDS the exemption. "Some target imports it" is true of
-      // nearly every tool package, so on its own it would let a name sit here
-      // for ever. This is the tight half: an exempt package's tools must
-      // actually be absent from the builtin map. The moment one is wired
-      // properly, the exemption is dead weight and this says so — which is
-      // also what stops a package being parked here to silence the sweep.
-      const wiredHere = [
-        ...readFileSync(entry, "utf-8").matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm),
-      ]
-        .map((m) => m[1] as string)
-        .filter((name) => CLI_RUNTIME_TOOL_KEYS.includes(name) || exportNames.has(name));
-      expect(wiredHere.length).toBeGreaterThanOrEqual(0);
+      // And still NEEDS the exemption: none of its tools is in the table.
+      const inTable = Object.values(BUILTIN_TOOLS).filter((e) => e.package === `@crewhaus/${pkg}`);
       expect(
-        wiredHere,
-        `${pkg} is listed as reached by another target, but ${wiredHere.join(", ")} is wired into the builtin map — drop it from REACHED_BY_ANOTHER_TARGET so the sweep covers this package`,
+        inTable.map((e) => e.export),
+        `${pkg} is exempt, but the builtin table carries its tools — drop the exemption`,
       ).toEqual([]);
     }
   });
@@ -237,15 +291,12 @@ describe("every exported tool is reachable from a spec", () => {
     // module is exported under a suffix, so the spec key and the export name
     // can differ; resolve through the emitter map rather than assuming they
     // match, and treat an export no key points at as unreachable.
-    const exportsWired = new Set(
-      Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { export: string }).export),
-    );
     for (const pkg of PACKAGES) {
-      if (pkg in REACHED_BY_ANOTHER_TARGET) continue;
+      if (pkg in REACHED_OUTSIDE_THE_TABLE) continue;
       const text = readFileSync(join(repoRoot, "packages", pkg, "src", "index.ts"), "utf-8");
       for (const m of text.matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool/gm)) {
         const name = m[1] as string;
-        if (!CLI_RUNTIME_TOOL_KEYS.includes(name) && !exportsWired.has(name)) {
+        if (BUILTIN_TOOLS[name] === undefined && !exportNames.has(name)) {
           unreachable.push({ pkg, tool: name });
         }
       }
@@ -365,15 +416,29 @@ describe("every copy of the path resolver probes with lstat, not existsSync", ()
 describe("the CLI can actually load every tool package it names", () => {
   const REPO = join(import.meta.dir, "..", "..", "..");
 
-  /** Every `@crewhaus/tool-*` the CLI dynamically imports in loadToolMap. */
-  function importedPackages(): string[] {
-    const text = readFileSync(join(REPO, "apps/cli/src/index.ts"), "utf-8");
-    const found = text.matchAll(/import\("(@crewhaus\/tool-[a-z0-9-]+)"\)/g);
-    return [...new Set([...found].map((m) => m[1] as string))].sort();
+  /**
+   * Every package `apps/cli/src/tool-packages.ts` has a literal loader for,
+   * read from the SOURCE — a literal `import("…")` is what `bun build
+   * --compile` embeds, so the text is what matters.
+   */
+  function loaderPackages(): string[] {
+    const text = readFileSync(join(REPO, "apps/cli/src/tool-packages.ts"), "utf-8");
+    const found = [
+      ...text.matchAll(/"(@crewhaus\/tool-[a-z0-9-]+)": \(\) => import\("([^"]+)"\)/g),
+    ];
+    // Each loader imports the package it is keyed by, not a neighbour.
+    for (const m of found) expect(m[2]).toBe(m[1]);
+    return [...new Set(found.map((m) => m[1] as string))].sort();
   }
 
-  test("the sweep finds the imports it is meant to guard", () => {
-    expect(importedPackages().length).toBeGreaterThanOrEqual(20);
+  /** Every package a builtin the cli shape compiles lives in, from the table. */
+  const cliPackages = [
+    ...new Set(builtinToolsFor("cli").map((k) => BUILTIN_TOOLS[k]?.package as string)),
+  ].sort();
+
+  test("the sweep finds the loaders it is meant to guard", () => {
+    expect(loaderPackages().length).toBeGreaterThanOrEqual(60);
+    expect(Object.keys(TOOL_PACKAGE_LOADERS).sort()).toEqual(loaderPackages());
   });
 
   test("each one is a declared dependency of apps/cli", () => {
@@ -386,31 +451,32 @@ describe("the CLI can actually load every tool package it names", () => {
       dependencies?: Record<string, string>;
     };
     const declared = new Set(Object.keys(pkg.dependencies ?? {}));
-    const missing = importedPackages().filter((name) => !declared.has(name));
+    const missing = loaderPackages().filter((name) => !declared.has(name));
     expect(missing).toEqual([]);
   });
 
   test("each one has a project reference, so tsc builds it first", () => {
     const text = readFileSync(join(REPO, "apps/cli/tsconfig.json"), "utf-8");
-    const missing = importedPackages().filter(
+    const missing = loaderPackages().filter(
       (name) => !text.includes(`../../packages/${name.replace("@crewhaus/", "")}"`),
     );
     expect(missing).toEqual([]);
   });
 
-  test("every builtin's package is one the CLI imports", () => {
-    // BUILTIN_TOOL_MAP is what a compiled bundle imports; loadToolMap is what
-    // `crewhaus run` imports. A package in the first but not the second is a
-    // tool that compiles into a spec and then cannot be run.
-    const imported = new Set(importedPackages());
-    const referenced = new Set(
-      Object.values(BUILTIN_TOOL_MAP).map((entry) => (entry as { package: string }).package),
-    );
-    const unrunnable = [...referenced].filter(
-      (p) => p.startsWith("@crewhaus/tool-") && !imported.has(p),
-    );
-    expect(unrunnable).toEqual([]);
+  test("the loaders are exactly the packages the cli shape's builtins live in", () => {
+    // A package with a builtin and no loader is a tool that compiles into a
+    // spec and then cannot be run; a loader for no builtin is dead weight.
+    expect(cliPackages.length).toBeGreaterThanOrEqual(60);
+    expect(loaderPackages()).toEqual(cliPackages);
   });
+
+  test("loadBuiltinTools resolves every cli builtin to a tool with the table's name", async () => {
+    const map = await loadBuiltinTools(builtinToolsFor("cli"));
+    const keys = Object.keys(map);
+    expect(keys.length).toBe(builtinToolsFor("cli").length);
+    const wrong = keys.filter((k) => map[k]?.name !== BUILTIN_TOOLS[k]?.name);
+    expect(wrong).toEqual([]);
+  }, 30_000);
 });
 
 describe("every copy of the private-address classifier is the same classifier", () => {

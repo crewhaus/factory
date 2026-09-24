@@ -15,13 +15,12 @@
  * package claims to. Leaving a tool out of a spec is what shapes a harness;
  * this file just makes the omission legible.
  *
- * WHY GENERATED. There is no other source for it. `BUILTIN_TOOL_MAP` in
- * `@crewhaus/target-cli` carries a package and an export name with no prose.
- * `@crewhaus/tool-categories` must never import a tool package — the compiler
- * imports it and codegen stays offline — so it has one title per category and
- * none per tool. The descriptions and flags exist only on the `RegisteredTool`
- * objects, reachable only by importing all 66 tool packages, which is
- * `loadToolMap()` in apps/cli and is off limits to every `packages/*`. So the
+ * WHY GENERATED. There is no other source for it. The builtin table
+ * (`BUILTIN_TOOLS` in `@crewhaus/tool-categories`) carries a package, an
+ * export and a name with no prose, and must never import a tool package — the
+ * compiler imports it and codegen stays offline. The descriptions and flags
+ * exist only on the `RegisteredTool` objects, reachable only by importing
+ * every tool package, which the CLI does and every `packages/*` must not. So the
  * data is projected once, by `scripts/gen-tool-registry.ts`, and checked into
  * `src/generated.ts` — the shape `packages/docker-images` already uses for its
  * Dockerfile bodies.

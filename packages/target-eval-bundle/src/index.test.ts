@@ -47,6 +47,32 @@ describe("target-eval-bundle — T1 emitted bundle structure", () => {
     expect(code).toContain("@crewhaus/eval-runner");
   });
 
+  test("a spec's tools are imported statically and handed to the runner (shape-reach#1)", () => {
+    const ir = makeIr({
+      agent: { model: "m", instructions: "i", tools: ["gitStatus", "jsonQuery"] },
+    });
+    const code = emitEval(ir).files[0]?.content ?? "";
+    expect(code).toContain('import * as __toolPackage0 from "@crewhaus/tool-data";');
+    expect(code).toContain('import * as __toolPackage1 from "@crewhaus/tool-git";');
+    expect(code).toContain(
+      "importToolPackage: async (pkg: string) => TOOL_PACKAGES[pkg] ?? import(pkg),",
+    );
+    // No tools, no plumbing: the tool-free bundle keeps its bytes.
+    expect(emitEval(makeIr()).files[0]?.content).not.toContain("TOOL_PACKAGES");
+  });
+
+  test("a tool-less bundle keeps 0.7.0's bytes: no blank line after AGENT_TOOLS", () => {
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    expect(code).toContain("const AGENT_TOOLS = [];\nconst CONCURRENCY = ");
+  });
+
+  test("a name the eval shape cannot run fails the emit by name", () => {
+    const ir = makeIr({ agent: { model: "m", instructions: "i", tools: ["evmCall"] } });
+    expect(() => emitEval(ir)).toThrow(
+      /tool "evmCall" is a builtin, but the eval shape cannot run it/,
+    );
+  });
+
   test("agent.ts contains the spec model + instructions verbatim", () => {
     const ir = makeIr({
       agent: {

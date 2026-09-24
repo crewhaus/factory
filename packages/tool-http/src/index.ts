@@ -98,6 +98,7 @@ export {
   __setPrivateHostsAllowedForTest,
   canonicalizeOrigin,
   getHttpConfig,
+  guardedGet,
   registerHttpConfig,
 } from "./net";
 export { ToolPermissionError } from "./paths";

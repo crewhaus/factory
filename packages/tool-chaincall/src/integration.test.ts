@@ -164,7 +164,7 @@ describe("dispatch through executeTool", () => {
       { toolUseId: "t4" },
     );
     expect(result.isError).toBe(true);
-    expect(text(result)).toContain("setChainRpcResolver");
+    expect(text(result)).toContain("no chain is configured. Declare one in the spec — chains:");
   });
 
   test("a degraded simulation is a successful RESULT, because it is an answer", async () => {

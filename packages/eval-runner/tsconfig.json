@@ -73,6 +73,9 @@
       "path": "../tool-catalog"
     },
     {
+      "path": "../tool-categories"
+    },
+    {
       "path": "../tool-fetch"
     },
     {

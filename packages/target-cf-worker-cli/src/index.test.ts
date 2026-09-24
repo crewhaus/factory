@@ -356,6 +356,27 @@ describe("resolveEdgeTools — the cf-worker tool gate (G12/G83)", () => {
     expect(wiring.imports.match(/@crewhaus\/tool-web/g)?.length).toBe(1);
   });
 
+  test("imports keep 0.7.0's bytes: tools in spec order, then the sorted registrars", () => {
+    // A redeploy of an unchanged spec must not change the worker's hash.
+    // These strings are what 0.7.0 emitted for the same input.
+    const wiring = resolveEdgeTools(["webSearch", "webFetch", "fetch"], {
+      fetch: { allowedHosts: ["a.example"] },
+      webFetch: { allowedHosts: ["a.example"] },
+    });
+    expect(wiring.imports).toBe(
+      [
+        'import { fetch as __t_fetch, registerFetchConfig } from "@crewhaus/tool-fetch";',
+        'import { webSearch as __t_webSearch, webFetch as __t_webFetch, registerWebFetchConfig } from "@crewhaus/tool-web";',
+      ].join("\n"),
+    );
+    expect(wiring.inits).toBe(
+      [
+        'registerWebFetchConfig({"allowedHosts":["a.example"]});',
+        'registerFetchConfig({"allowedHosts":["a.example"]});',
+      ].join("\n"),
+    );
+  });
+
   test("tool_config for an edge tool emits its init call", () => {
     const wiring = resolveEdgeTools(["fetch"], { fetch: { allowedHosts: ["api.example.com"] } });
     expect(wiring.imports).toContain("registerFetchConfig");

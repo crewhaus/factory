@@ -292,6 +292,14 @@ describe("resolveWorkflowTools — the cf-worker tool gate (G12/G83)", () => {
     expect(() => emitCfWorkerWorkflow(ir)).toThrow(/cf-worker target cannot run 1 host tool/);
   });
 
+  test("imports keep 0.7.0's bytes: a workflow worker sorts its tool imports", () => {
+    const wiring = resolveWorkflowTools([step({ tools: ["webSearch", "webFetch"] })]);
+    expect(wiring.imports).toBe(
+      'import { webFetch as __t_webFetch, webSearch as __t_webSearch } from "@crewhaus/tool-web";',
+    );
+    expect(wiring.stepTools).toEqual(["[__t_webSearch, __t_webFetch]"]);
+  });
+
   test("edge-safe tools wire per step; imports dedupe across steps", () => {
     const wiring = resolveWorkflowTools([
       step({ name: "a", tools: ["webSearch", "todoWrite"] }),

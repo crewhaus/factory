@@ -1,3 +1,4 @@
+import type { ProviderFeatures } from "@crewhaus/adapter-anthropic";
 /**
  * `buildAdvertisement` (§4.4, §5) — the SUBSET-ONLY per-candidate toolset.
  *
@@ -15,7 +16,7 @@
  * gate that makes it a subset in EXECUTION lives in runtime-core (§4.4 item
  * 3) and reads the same `names` set this returns.
  */
-import type { ProviderFeatures } from "@crewhaus/adapter-anthropic";
+import { toolConfigBlockFor } from "@crewhaus/tool-categories";
 import type { CandidateCapabilities, FeatureRequirement, ModelProfile } from "./types.js";
 
 /** The minimum a tool must carry to be advertised — `RegisteredTool` satisfies it. */
@@ -162,36 +163,21 @@ export function matchesToolPattern(pattern: string, name: string): boolean {
   return globToRegExp(pattern).test(name);
 }
 
-/** The spec keys whose `tool_config` block every code-execution tool shares. */
-const CODE_EXECUTION_CONFIG_ALIASES = ["codeExecution", "code_execution"] as const;
-const CODE_EXECUTION_TOOL_NAMES = new Set(["python", "javascript", "shell"]);
-
 /**
  * 0.6.0 §4.4 — the per-candidate `tool_config` block that applies to ONE
- * tool: the entry keyed by the tool's registered name, else by its spec
- * spelling (the same case-insensitive rule `matchesToolPattern` applies),
- * else — for the code-execution family (`Python` / `JavaScript` / `Shell`)
- * — the shared `codeExecution` / `code_execution` alias codegen's
- * `resolveTools` honours for the boot-time registration. `undefined` when
- * the candidate declares nothing for the tool, so the tool reads its
- * registered config as before.
+ * tool: the entry keyed by the tool's registered name or its spec key (the
+ * same case-insensitive rule `matchesToolPattern` applies), else its
+ * package's documented key — `tool_config.http` for `HttpRequest`,
+ * `codeExecution` for `Python`. The rule is the builtin table's
+ * (`toolConfigBlockFor` in `@crewhaus/tool-categories`), so a candidate reads
+ * the keys a boot registration reads. `undefined` when the candidate declares
+ * nothing for the tool, so the tool reads its registered config as before.
  */
 export function toolConfigFor(
   toolConfigs: Readonly<Record<string, unknown>> | undefined,
   toolName: string,
 ): unknown {
-  if (toolConfigs === undefined) return undefined;
-  if (toolConfigs[toolName] !== undefined) return toolConfigs[toolName];
-  const lower = toolName.toLowerCase();
-  for (const [key, value] of Object.entries(toolConfigs)) {
-    if (key.toLowerCase() === lower && value !== undefined) return value;
-  }
-  if (CODE_EXECUTION_TOOL_NAMES.has(lower)) {
-    for (const alias of CODE_EXECUTION_CONFIG_ALIASES) {
-      if (toolConfigs[alias] !== undefined) return toolConfigs[alias];
-    }
-  }
-  return undefined;
+  return toolConfigBlockFor(toolConfigs, toolName);
 }
 
 function globToRegExp(pattern: string): RegExp {

@@ -124,7 +124,7 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     // other (pure-compute) tool still fails closed to "internal".
     scope: def.scope ?? (isOutwardName(def.name) ? "external" : "internal"),
     // Pillar 3 intent gate: fail-closed at false. Destructive or external
-    // tools should opt in explicitly (see tool-fetch, tool-evm-tx,
+    // tools should opt in explicitly (see tool-http, tool-evm-tx,
     // tool-message-channel, federation-router).
     requireJustification: def.requireJustification ?? false,
     ...(def.jsonSchema !== undefined ? { jsonSchema: def.jsonSchema } : {}),

@@ -95,7 +95,7 @@ import {
 } from "@crewhaus/model-service";
 import {
   SPEC_PROFILE_NAME_RE,
-  type Spec,
+  Spec,
   type SpecChannel,
   type SpecCrewRole,
   type SpecDiscordChannel,
@@ -127,7 +127,22 @@ import { emitResearchBundle } from "@crewhaus/target-research-bundle";
 import { emitVoice } from "@crewhaus/target-voice";
 import { emitWorkflow } from "@crewhaus/target-workflow";
 import { type ScopeFinding, isOutwardName } from "@crewhaus/tool-builder";
-import { ToolCategoryError, expandToolSelectors } from "@crewhaus/tool-categories";
+import {
+  BUILTIN_TOOLS,
+  SHAPE_TOOL_PROFILES,
+  type ShapeToolProfile,
+  ToolCategoryError,
+  type ToolShape,
+  builtinKeyForName,
+  chainBootConfig,
+  checkBuiltinTool,
+  checkCandidateToolConfigs,
+  checkToolConfigs,
+  expandToolSelectors,
+  malformedToolConfigRefs,
+  registeredToolName,
+  toolConfigProblems,
+} from "@crewhaus/tool-categories";
 // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
 // lives in `@crewhaus/worker-runtime` (the runtime that would execute the
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
@@ -230,7 +245,7 @@ export type LowerOptions = {
  * Loop contract 0.4 (Batch A, G45 warnings framework) — one non-fatal
  * compile diagnostic. `code` is a stable machine key
  * (`"accepted-but-unwired"`, `"edge-unsafe-tool"`,
- * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`,
+ * `"channel-reactions-join"`, `"channel-plugins-at-start"`, `"cli-autodistill-toolchain"`,
  * `"managed-feedback-unsupported"`, `"budget-degrade-outside-pool"`, and from
  * 0.6.0 the field-precise model-plan notices `"model-plan-ignored-on-shape"`,
  * `"model-plan-ignored-on-slot"`, `"model-plan-candidate-only"`,
@@ -261,6 +276,13 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
   if (opts.strict === true) {
     assertToolScopesStrict(ir);
   }
+  // Every tool site against what its shape can run: a precise error for a
+  // name the shape cannot compile, a warning for a builtin that is inert.
+  // After the scope gate, so an unvettable outward sink still reads as that.
+  const shapeTools = checkShapeTools(ir);
+  if (shapeTools.errors.length > 0) {
+    throw new CompilerError(shapeTools.errors.map((e) => `${e.path}: ${e.message}`).join("\n"));
+  }
   // G45 — the VALIDATING ir-passes (graph reachability + edge/message-schema
   // resolution, §47 chain referential integrity, memory/continuity
   // integrity) run UNCONDITIONALLY: they rewrite nothing, so they cannot
@@ -286,7 +308,10 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
       ? (emitSourceBundleWithEvalEntry(ir, { readme: opts.readme !== false }) ??
         emit(ir, { readme: opts.readme !== false }))
       : emit(ir, { readme: opts.readme !== false });
-  return { files: bundle.files, warnings: [...collectCompileWarnings(spec), ...lowered.warnings] };
+  return {
+    files: bundle.files,
+    warnings: [...collectCompileWarnings(spec), ...lowered.warnings, ...shapeTools.warnings],
+  };
 }
 
 /**
@@ -393,15 +418,33 @@ const ACCEPTED_BUT_UNWIRED: Readonly<Partial<Record<Spec["target"], ReadonlyArra
   voice: [
     unwired("mcp_servers", "voice", "no MCP host is booted in the voice daemon"),
     unwired("tools", "voice", "the realtime voice loop does not register a tool catalog"),
+    unwired("tool_config", "voice", "the realtime voice loop does not register a tool catalog"),
     unwired("continuity", "voice", "the generated daemon prints the ignored-note comment"),
   ],
   browser: [
     unwired("mcp_servers", "browser", "no MCP host is booted in the browser daemon"),
     unwired("continuity", "browser", "the generated daemon prints the ignored-note comment"),
   ],
-  onchain: [unwired("mcp_servers", "onchain", "no MCP host is booted in the onchain daemon")],
+  // shape-reach#7 — onchain / onchain-game run no agent loop yet (the
+  // emitters wire the chain adapter and trigger metadata only), so a tools:
+  // list registers nothing. Say so, the way voice does.
+  onchain: [
+    unwired("mcp_servers", "onchain", "no MCP host is booted in the onchain daemon"),
+    unwired(
+      "tools",
+      "onchain",
+      "the onchain daemon runs no agent loop yet, so nothing registers them",
+    ),
+    unwired("tool_config", "onchain", "the onchain daemon runs no agent loop yet"),
+  ],
   "onchain-game": [
     unwired("mcp_servers", "onchain-game", "no MCP host is booted in the onchain-game daemon"),
+    unwired(
+      "tools",
+      "onchain-game",
+      "the onchain-game daemon runs no agent loop yet, so nothing registers them",
+    ),
+    unwired("tool_config", "onchain-game", "the onchain-game daemon runs no agent loop yet"),
   ],
 };
 
@@ -504,6 +547,18 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
         "Distill a bundle's accumulated ratings with `crewhaus distill --register`,",
         "or drive the harness with `crewhaus run`",
       ].join(" "),
+    });
+  }
+  // 0.7.0 accepted `plugins:` on channel and ignored it; the daemon now loads
+  // them at start. One it cannot load is skipped with a warning rather than
+  // stopping the start, so a daemon that ran then keeps running — and this
+  // says so before the first boot does. Informational: no spec edit clears it.
+  if (spec.target === "channel" && (spec.plugins?.length ?? 0) > 0) {
+    out.push({
+      code: "channel-plugins-at-start",
+      path: "plugins",
+      message:
+        "the channel daemon loads these plugins when it starts. One that is not installed, or that no key in ~/.crewhaus/plugin-trust verifies, is skipped with a warning, and the daemon starts without it.",
     });
   }
   // D40 — channel 👍/👎 reactions attribute to the exact reacted-to turn
@@ -614,21 +669,29 @@ function budgetDegradeOutsidePool(
  */
 function collectToolNames(ir: unknown): string[] {
   const names = new Set<string>();
-  const visit = (node: unknown): void => {
+  // Lowering spells a sub-agent's list with registered names (`WebSearch`) so
+  // the child catalog filter matches; on 0.7.0 it kept the spec keys the
+  // author wrote. Read a builtin there back to its key, so the gate sees what
+  // it saw on 0.7.0: a builtin is vetted (`apps/cli/src/tool-registry.test.ts`
+  // pins each one's scope to its io facts), and an `mcp__*` name, which is no
+  // builtin, stays gated. Every other list keeps its spelling.
+  const visit = (node: unknown, inSubAgent: boolean): void => {
     if (Array.isArray(node)) {
-      for (const item of node) visit(item);
+      for (const item of node) visit(item, inSubAgent);
       return;
     }
     if (node !== null && typeof node === "object") {
       for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
         if (key === "tools" && Array.isArray(value)) {
-          for (const v of value) if (typeof v === "string") names.add(v);
+          for (const v of value) {
+            if (typeof v === "string") names.add(inSubAgent ? (builtinKeyForName(v) ?? v) : v);
+          }
         }
-        visit(value);
+        visit(value, inSubAgent || key === "subAgents");
       }
     }
   };
-  visit(ir);
+  visit(ir, false);
   return [...names];
 }
 
@@ -664,36 +727,336 @@ export function assertToolScopesStrict(ir: IrNode): void {
 }
 
 /**
+ * One list of builtin tools a lowered IR registers, with the spec path a
+ * diagnostic should point at (`tools`, `agent.tools`, `steps[1].tools`,
+ * `nodes.plan.tools`, `roles.researcher.tools`). Sub-agent and model-profile
+ * lists are not sites: they narrow tools a site already registers.
+ */
+export type IrToolSite = {
+  readonly path: string;
+  readonly tools: ReadonlyArray<string>;
+  readonly toolConfigs?: Readonly<Record<string, unknown>>;
+  /**
+   * The `model_pool` candidates of the block that owns the site, each with
+   * the spec path of its `tool_config`. A candidate's block is read per call.
+   */
+  readonly candidates?: ReadonlyArray<{
+    readonly path: string;
+    readonly toolConfigs?: Readonly<Record<string, unknown>>;
+  }>;
+};
+
+/** The pool candidates of the block that owns a site (an agent, step, node or role). */
+function candidatesOf(
+  owner: unknown,
+  path: string,
+): NonNullable<IrToolSite["candidates"]> | undefined {
+  const pool = (owner as { modelPool?: { candidates?: ReadonlyArray<unknown> } } | undefined)
+    ?.modelPool;
+  if (pool?.candidates === undefined) return undefined;
+  return pool.candidates.map((c, i) => {
+    const toolConfigs = (c as { toolConfigs?: Readonly<Record<string, unknown>> }).toolConfigs;
+    return {
+      path: `${path}.model_pool.candidates[${i}].tool_config`,
+      ...(toolConfigs !== undefined ? { toolConfigs } : {}),
+    };
+  });
+}
+
+function withCandidates(site: IrToolSite, owner: unknown, ownerPath: string): IrToolSite {
+  const candidates = candidatesOf(owner, ownerPath);
+  return candidates === undefined ? site : { ...site, candidates };
+}
+
+/** The spec path of a site's `tool_config`: its `tools` path with the last key swapped. */
+function toolConfigPathOf(site: IrToolSite): string {
+  return site.path.replace(/tools$/, "tool_config");
+}
+
+/**
+ * Every tool site of a lowered IR, per variant. Exhaustive over the IR
+ * union, so a new target cannot ship without saying where its tools live.
+ */
+export function toolSitesOf(ir: IrNode): ReadonlyArray<IrToolSite> {
+  switch (ir.target) {
+    case "cli":
+    case "research":
+    case "batch":
+    case "voice":
+    case "browser":
+    case "onchain":
+    case "onchain-game":
+      return [
+        withCandidates(
+          { path: "tools", tools: ir.tools, toolConfigs: ir.toolConfigs },
+          ir.agent,
+          "agent",
+        ),
+      ];
+    case "channel":
+      return [
+        withCandidates(
+          { path: "agent.tools", tools: ir.tools, toolConfigs: ir.toolConfigs },
+          ir.agent,
+          "agent",
+        ),
+      ];
+    case "managed":
+      return [
+        withCandidates(
+          { path: "agent.tools", tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {} },
+          ir.agent,
+          "agent",
+        ),
+      ];
+    case "eval":
+      return [{ path: "agent.tools", tools: ir.agent.tools }];
+    case "workflow":
+      return ir.steps.map((step, i) =>
+        withCandidates(
+          { path: `steps[${i}].tools`, tools: step.tools, toolConfigs: step.toolConfigs },
+          step,
+          `steps[${i}]`,
+        ),
+      );
+    case "graph":
+      return ir.nodes.map((node) =>
+        withCandidates(
+          { path: `nodes.${node.name}.tools`, tools: node.tools, toolConfigs: node.toolConfigs },
+          node,
+          `nodes.${node.name}`,
+        ),
+      );
+    case "crew":
+      return ir.roles.map((role) =>
+        withCandidates(
+          { path: `roles.${role.name}.tools`, tools: role.tools, toolConfigs: role.toolConfigs },
+          role,
+          `roles.${role.name}`,
+        ),
+      );
+    case "pipeline":
+      return [];
+    default:
+      return assertNever(ir);
+  }
+}
+
+/**
+ * Every spec target has a tool profile. A compile error here means a target
+ * was added without deciding which builtins it can run.
+ */
+const PROFILE_FOR_TARGET: Readonly<Record<Spec["target"], ShapeToolProfile>> = SHAPE_TOOL_PROFILES;
+
+/**
+ * Check every tool site of a lowered IR against what its shape can run.
+ *
+ * - a name that is not a builtin, or a builtin the shape cannot run, is an
+ *   ERROR naming the site, the tool and the reason;
+ * - a builtin that compiles but can never succeed (nothing binds what it
+ *   needs) is a `tool-unwired` WARNING, which `--strict` escalates;
+ * - a sub-agent that lists a builtin its parent never registers is a
+ *   `sub-agent-tool-ungranted` WARNING: the child is filtered from the
+ *   parent's tools, so it can never have it.
+ *
+ * Shapes with no tool catalog (voice, onchain, onchain-game, pipeline) are
+ * skipped: their `tools:` key is reported by the accepted-but-unwired table.
+ * The cf-worker flavour has its own gate, {@link assertCfWorkerToolsEdgeSafe}.
+ */
+export function checkShapeTools(ir: IrNode): {
+  readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>;
+  readonly warnings: ReadonlyArray<CompileWarning>;
+} {
+  const shape: ToolShape = ir.target;
+  if (PROFILE_FOR_TARGET[ir.target].runtime !== "host") return { errors: [], warnings: [] };
+  const errors: Array<{ path: string; message: string }> = [];
+  const warnings: CompileWarning[] = [];
+  for (const site of toolSitesOf(ir)) {
+    for (const key of new Set(site.tools)) {
+      const verdict = checkBuiltinTool(key, shape);
+      if (verdict.kind === "unknown" || verdict.kind === "refused") {
+        errors.push({ path: site.path, message: verdict.message });
+      } else if (verdict.kind === "inert") {
+        warnings.push({ code: "tool-unwired", path: site.path, message: verdict.message });
+      }
+    }
+  }
+  warnings.push(...ungrantedSubAgentTools(ir));
+  const config = checkToolConfigDelivery(ir);
+  errors.push(...config.errors);
+  warnings.push(...config.warnings);
+  return { errors, warnings };
+}
+
+/**
+ * Where each `tool_config` block goes, checked before anything is emitted:
+ *
+ * - two different blocks for one boot registrar (`http` and `httpRequest`,
+ *   or `fetch` in two steps of one process) are an ERROR naming both — the
+ *   registrar holds one setting, so one block would be dropped;
+ * - a credential-shaped value that looks like a `$UPPER_SNAKE` reference but
+ *   is not a valid one is an ERROR, since it would ship as a literal;
+ * - a block its registrar would refuse at boot (a refused key, an allow-list
+ *   entry that is not an origin) is an ERROR naming the key and the fix;
+ * - a key no listed tool reads is a `tool-config-unused` WARNING, which
+ *   `--strict` escalates — a restriction written under a key nothing reads
+ *   is a restriction that is not in force;
+ * - a tool that reads a chain, with no `chains` block, is a `tool-unwired`
+ *   WARNING naming the block to write.
+ */
+function checkToolConfigDelivery(ir: IrNode): {
+  readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>;
+  readonly warnings: ReadonlyArray<CompileWarning>;
+} {
+  const errors: Array<{ path: string; message: string }> = [];
+  const warnings: CompileWarning[] = [];
+  const sites = toolSitesOf(ir);
+  const check = checkToolConfigs(
+    sites.map((site) => ({
+      tools: site.tools,
+      ...(site.toolConfigs !== undefined ? { toolConfigs: site.toolConfigs } : {}),
+      path: toolConfigPathOf(site),
+    })),
+  );
+  for (const c of check.conflicts) errors.push({ path: c.path, message: c.message });
+  for (const u of check.unused) {
+    warnings.push({ code: "tool-config-unused", path: u.path, message: u.message });
+  }
+  // A block the registrar would refuse at boot fails here, with its key.
+  // 0.7.0 ignored many of these blocks, so a spec that ran then can meet
+  // this now; compile is the place to find out, not the harness's start.
+  for (const init of check.inits) errors.push(...toolConfigProblems(init));
+  for (const site of sites) {
+    for (const bad of malformedToolConfigRefs(site.toolConfigs ?? {}, toolConfigPathOf(site))) {
+      errors.push(bad);
+    }
+    for (const candidate of site.candidates ?? []) {
+      const blocks = candidate.toolConfigs ?? {};
+      const c = checkCandidateToolConfigs(site.tools, blocks, candidate.path);
+      for (const x of c.conflicts) errors.push({ path: x.path, message: x.message });
+      for (const u of c.unused) {
+        warnings.push({ code: "tool-config-unused", path: u.path, message: u.message });
+      }
+      for (const bad of malformedToolConfigRefs(blocks, candidate.path)) errors.push(bad);
+    }
+  }
+  const chained = chainBootConfig(ir as Parameters<typeof chainBootConfig>[0]) !== undefined;
+  if (!chained) {
+    // Read off the spec schema, so a shape that gains a `chains` block starts
+    // getting the "declare one" advice without an edit here.
+    const option = Spec.optionsMap.get(ir.target) as
+      | { shape?: Record<string, unknown> }
+      | undefined;
+    const acceptsChains = option?.shape?.["chains"] !== undefined;
+    for (const site of sites) {
+      for (const key of new Set(site.tools)) {
+        if (BUILTIN_TOOLS[key]?.chainSymbol === undefined) continue;
+        warnings.push({
+          code: "tool-unwired",
+          path: site.path,
+          message: acceptsChains
+            ? `tool "${key}" reads a chain, and the spec declares none, so every call returns an error. Declare it — ${CHAINS_BLOCK_EXAMPLE}.`
+            : `tool "${key}" reads a chain, and the ${ir.target} shape cannot declare one, so every call returns an error. Remove it from tools, or use a shape that takes a chains block, such as cli.`,
+        });
+      }
+    }
+  }
+  return { errors, warnings };
+}
+
+/** What a spec writes to give a chain tool its chain. Mirrors `@crewhaus/chain-adapter-base`. */
+const CHAINS_BLOCK_EXAMPLE =
+  'chains: [{ id: "1", kind: evm, rpcUrls: [$ETH_RPC_URL], finality: { kind: finalized } }]';
+
+/**
+ * A sub-agent's child catalog is the parent's registered tools filtered by
+ * the sub-agent's list, so a builtin the parent never registers is dead
+ * config — the child silently goes without it. Walks the IR generically:
+ * any object carrying both `subAgents` and a `tools` list is a parent.
+ */
+function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
+  const out: CompileWarning[] = [];
+  const visit = (node: unknown, path: string): void => {
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => {
+        const name = (item as { name?: unknown } | null)?.name;
+        visit(item, typeof name === "string" ? `${path}.${name}` : `${path}[${i}]`);
+      });
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    const rec = node as Record<string, unknown>;
+    const subAgents = rec["subAgents"];
+    const tools = rec["tools"];
+    if (Array.isArray(subAgents) && Array.isArray(tools)) {
+      const granted = new Set(
+        tools.filter((t): t is string => typeof t === "string").map((t) => registeredToolName(t)),
+      );
+      const where = path === "" ? "agent" : path;
+      for (const def of subAgents as ReadonlyArray<{
+        name: string;
+        tools: ReadonlyArray<string>;
+      }>) {
+        for (const name of def.tools) {
+          const key = builtinKeyForName(name);
+          if (key === undefined || granted.has(registeredToolName(key))) continue;
+          out.push({
+            code: "sub-agent-tool-ungranted",
+            path: `${where}.sub_agents.${def.name}.tools`,
+            message: `sub-agent "${def.name}" lists ${name}, but its parent does not register it, so the sub-agent never gets it. Add ${key} to the parent's tools, or remove it from the sub-agent.`,
+          });
+        }
+      }
+    }
+    for (const [key, value] of Object.entries(rec)) {
+      if (key === "subAgents" || typeof value !== "object" || value === null) continue;
+      visit(value, path === "" ? key : `${path}.${key}`);
+    }
+  };
+  visit(ir, "");
+  return out;
+}
+
+/**
  * Loop contract 0.4 (Batch F, G12/G83) — the cf-worker tool-allow gate.
  *
- * The cf-worker emitters USED to reject ANY tool at compile time ("does not
- * yet support tools"). Now that the deployed path runs the real
- * `@crewhaus/worker-runtime` loop, tools are ALLOWED — but only the edge-safe
- * ones. This gate (the cf-worker analog of {@link assertToolScopesStrict})
- * partitions a lowered IR's tool names through the single-source-of-truth
- * `partitionEdgeTools` policy and:
- *   - THROWS `CompilerError` when any HOST tool (bash/fs/code-execution/…)
- *     is referenced — those cannot run on a stateless Worker, so a clear
- *     compile error beats a bundle that 500s at runtime;
- *   - RETURNS `CompileWarning`s (code `"edge-unsafe-tool"`) for unrecognised
- *     CUSTOM tools whose edge-safety the compiler cannot verify offline —
- *     permitted, but flagged so a host-reaching custom tool is not shipped
- *     silently.
+ * A Cloudflare Worker has `fetch` and KV and nothing else, so its tool gate
+ * differs from a host shape's:
+ *   - THROWS `CompilerError` for the host tools the edge has always refused
+ *     (bash / the filesystem / code execution / devices — the
+ *     `@crewhaus/worker-runtime` policy);
+ *   - WARNS (`edge-unsafe-tool`) for any other builtin the worker does not
+ *     wire, with the reason — it is left out of the worker. A spec that
+ *     compiled on 0.7.0 keeps compiling; `--strict` makes it an error;
+ *   - WARNS (`edge-unsafe-tool`) for a custom name whose edge-safety cannot
+ *     be verified offline.
  *
- * Exported for the cf-worker emit paths (the three `target-cf-worker-*`
- * emitters + the compiler-worker's `cf-worker` branch) to call in place of
- * the old blanket rejection, over their already-lowered IR — so the
- * edge-safety rule has one home and cannot drift per emitter.
+ * Called by the cf-worker emit paths over their already-lowered IR, so the
+ * edge rule has one home and cannot drift per emitter.
  */
 export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWarning> {
-  const { rejected, warned } = partitionEdgeTools(collectToolNames(ir));
+  const sites = toolSitesOf(ir);
+  const { rejected, warned } = partitionEdgeTools(sites.flatMap((site) => site.tools));
   if (rejected.length > 0) {
-    const detail = rejected.map((r) => r.reason).join("; ");
     throw new CompilerError(
-      `cf-worker target cannot run ${rejected.length} host tool(s): ${detail}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
+      `cf-worker target cannot run ${rejected.length} host tool(s): ${rejected.map((r) => r.reason).join("; ")}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
     );
   }
-  return warned.map((w) => ({ code: "edge-unsafe-tool", path: "tools", message: w.warning }));
+  const warnings: CompileWarning[] = [];
+  const reported = new Set<string>();
+  for (const site of sites) {
+    for (const key of new Set(site.tools)) {
+      if (reported.has(key) || !warned.some((w) => w.name === key)) continue;
+      reported.add(key);
+      const verdict = checkBuiltinTool(key, "cf-worker");
+      const message =
+        verdict.kind === "refused"
+          ? verdict.message
+          : (warned.find((w) => w.name === key)?.warning ?? key);
+      warnings.push({ code: "edge-unsafe-tool", path: site.path, message });
+    }
+  }
+  return warnings;
 }
 
 type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
@@ -1019,7 +1382,11 @@ function lowerSubAgents(
       name,
       description: def.description,
       instructions: def.instructions,
-      tools: def.tools ?? [],
+      // The child catalog is the parent's tools filtered by REGISTERED name
+      // (`Read`), so a spec key (`read`) or a category expansion is mapped to
+      // it here; a registered name, an MCP name or a custom name passes
+      // through unchanged.
+      tools: (def.tools ?? []).map((t) => registeredToolName(t) ?? t),
       ...(slot !== undefined ? { model: slot.model } : {}),
       permissions: def.permissions ?? "inherit",
       inheritBypass: def.inherit_bypass ?? false,

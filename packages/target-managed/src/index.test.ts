@@ -213,8 +213,22 @@ describe("emitManaged — builtin tools + tool_config (loop contract 0.4, Batch 
       emitManaged({ ...ir, tools: ["nopeTool"] });
     } catch (e) {
       expect((e as Error).message).toContain('unknown tool "nopeTool"');
-      expect((e as Error).message).toContain("known tools:");
+      expect((e as Error).message).toContain("crewhaus tools search");
     }
+  });
+
+  test("code-execution tools wire sandboxAvailable, so the floor can let them run (shape-reach#5)", () => {
+    const c = agentOf({ ...ir, tools: ["python"] });
+    expect(c).toContain(
+      'sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop"),',
+    );
+    expect(agentOf({ ...ir, tools: ["read"] })).not.toContain("sandboxAvailable");
+  });
+
+  test("a 0.7.0 builtin resolves on managed", () => {
+    const c = agentOf({ ...ir, tools: ["gitStatus"] });
+    expect(c).toContain('import { gitStatus } from "@crewhaus/tool-git";');
+    expect(c).toContain("defaultCatalog.register(gitStatus);");
   });
 
   test("no tools block → no catalog wiring beyond thredz/knowledge (byte-stable)", () => {

@@ -438,7 +438,7 @@ describe("the list fingerprint", () => {
 });
 
 describe("the chain seam", () => {
-  test("with nothing bound, a read refuses and names the setter", async () => {
+  test("with nothing bound, a read refuses and names the spec block to write", async () => {
     expect(hasChainReader()).toBe(false);
     await expect(
       readCalls({
@@ -447,7 +447,7 @@ describe("the chain seam", () => {
         blockTag: "latest",
         batch: false,
       }),
-    ).rejects.toThrow("_setChainReader");
+    ).rejects.toThrow('chains: [{ id: "1", kind: evm, rpcUrls: [$ETH_RPC_URL]');
   });
 
   test("a write method is refused before it reaches the reader", () => {
@@ -705,9 +705,9 @@ describe("what may be done with a URI a contract handed back", () => {
     expect((planUri("", {}) as { reason: string }).reason).toContain("no URI");
   });
 
-  test("with nothing bound, a fetch refuses and names the setter", async () => {
+  test("with nothing bound, a fetch refuses and names the spec block to write", async () => {
     await expect(fetchDocument("https://metadata.example/1.json", 1024)).rejects.toThrow(
-      "_setMetadataFetch",
+      "tool_config.token: { metadata_origins: [https://ipfs.io] }",
     );
   });
 

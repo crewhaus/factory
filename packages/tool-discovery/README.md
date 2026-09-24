@@ -110,17 +110,30 @@ recorded and not followed.
 Neither gate is a field in any tool's input schema. A gate a model can open for
 itself is not a gate.
 
+A spec restricts `FederationDiscover` to known peers, and a compiled bundle,
+`crewhaus run` and `crewhaus eval` apply it at boot:
+
+```yaml
+tool_config:
+  federationDiscover:
+    allowed_origins: [https://peer.example]   # the ONLY peers it dials
+```
+
+An empty `allowed_origins` list means *nothing* may be dialled, not *anything*.
+A spec cannot open loopback or the private ranges — `allow_private_hosts` in the
+block is refused. A host that needs a local federation fixture, or wants to
+check manifest signatures, sets the gates in code:
+
 ```ts
 import { setPeerPolicy, setMarketplaceTrustRoot } from "@crewhaus/tool-discovery";
 
-// Reach a local federation fixture, or restrict dialling to known origins.
-setPeerPolicy({ allowPrivateHosts: false, allowedOrigins: ["https://peer.example"] });
+// Reach a local federation fixture.
+setPeerPolicy({ allowPrivateHosts: true, allowedOrigins: ["https://127.0.0.1:8443"] });
 
-// The keys manifest signatures are checked against.
+// The keys manifest signatures are checked against. Unset, a signed
+// manifest's verdict is reported as unknown — never as trusted.
 setMarketplaceTrustRoot({ publicKeys: [pem] });
 ```
-
-An empty `allowedOrigins` array means *nothing* may be dialled, not *anything*.
 
 ## Could not determine is not no
 

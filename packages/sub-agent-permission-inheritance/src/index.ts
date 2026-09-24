@@ -43,6 +43,7 @@ import {
   emptyRuleSet,
 } from "@crewhaus/permission-engine";
 import { compilePattern } from "@crewhaus/tool-permission-matcher";
+import { meetRuleSets } from "./meet.js";
 
 export type ChildPermissions = {
   readonly mode: PermissionMode;
@@ -140,6 +141,44 @@ export function resolveChildPermissions(
   }
   // perm = { allow, deny }
   return { mode, rules: buildReplaceRuleSet(perm.allow, perm.deny) };
+}
+
+/**
+ * security-1#1 — child permissions for a sub-agent definition the operator
+ * may not have written: one loaded from `.crewhaus/sub-agents/` at run time,
+ * a directory any agent with a file-write tool can populate. Such a
+ * definition may only NARROW:
+ *
+ *   - `inherit` / `scoped` behave as for an operator-written definition —
+ *     both are already at most as permissive as the parent;
+ *   - `{ allow, deny }` runs under the MEET of the parent's rules and the set
+ *     that block builds (`meetRuleSets`): a call is allowed only when both
+ *     allow it, and every deny or ask in either one gates. So the file cannot
+ *     lift a parent deny, and an operator's allow list still restricts the
+ *     child the way it did when it replaced the rules outright;
+ *   - `inherit_bypass` is ignored: bypass never reaches a child through a
+ *     definition the model could have written.
+ *
+ * Returns the allow patterns the parent grants no part of, so the caller can
+ * say they are not in force.
+ */
+export function resolveChildPermissionsNarrowOnly(
+  parent: { readonly mode: PermissionMode; readonly rules: RuleSet },
+  def: SubAgentDefinition,
+): ChildPermissions & { readonly ungrantedAllows: ReadonlyArray<string> } {
+  const untrusted: SubAgentDefinition = { ...def, inherit_bypass: false };
+  const perm = def.permissions;
+  if (perm === undefined || perm === "inherit" || perm === "scoped") {
+    return { ...resolveChildPermissions(parent, untrusted), ungrantedAllows: [] };
+  }
+  const own = buildReplaceRuleSet(perm.allow, perm.deny);
+  const meet = meetRuleSets(parent.rules, own);
+  return {
+    mode: resolveChildMode(parent.mode, untrusted),
+    rules: meet.rules,
+    // The floor's own allows (Read, Glob, …) are not the file's to report.
+    ungrantedAllows: meet.ungranted.filter((p) => perm.allow.includes(p)),
+  };
 }
 
 /**
