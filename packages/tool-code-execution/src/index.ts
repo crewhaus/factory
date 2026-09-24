@@ -1,7 +1,10 @@
 import { randomBytes } from "node:crypto";
+import { ConfigError, CrewhausError } from "@crewhaus/errors";
 import {
+  SANDBOX_DEFAULT_TIMEOUT_MS,
   type Sandbox,
   type SandboxBackend,
+  type SandboxExecResult,
   type SandboxMount,
   createSandbox,
 } from "@crewhaus/sandbox";
@@ -26,9 +29,23 @@ import { z } from "zod";
  *
  * Each tool delegates execution to `@crewhaus/sandbox`, which enforces
  * the production safety floor (network=none, read-only root, tmpfs /tmp,
- * 60s timeout, image allowlist, mount whitelist). Without a sandbox
- * registered, the tool returns an error message at first call — the
- * permission engine should refuse them earlier (`requiresSandbox: true`).
+ * image allowlist, mount whitelist, a wall-clock kill, 1 MiB of each output
+ * stream). Without a sandbox registered, the tool returns an error message
+ * at first call — the permission engine should refuse them earlier
+ * (`requiresSandbox: true`).
+ *
+ * Timeout: 60 s unless the operator's `default_timeout_ms` says otherwise.
+ * The model may ask for its own `timeout` (up to 10 minutes) — unless the
+ * operator sets `max_timeout_ms`, which caps every call, the model's and the
+ * default alike; a serving candidate's tool_config may lower that cap, never
+ * raise it (security-6#15).
+ *
+ * `CREWHAUS_SANDBOX=noop` turns code execution OFF: the permission floor
+ * denies these tools, and if a call reaches them anyway (bypass mode, or a
+ * caller that told the loop a sandbox exists) they refuse rather than run
+ * model code on the host. The in-process noop backend runs only when trusted
+ * code chose it — `registerCodeExecutionConfig({ backend: "noop" })` or an
+ * injected `sandbox` — which is how tests use it.
  *
  * Output is streamed line-by-line via `ctx.onStreamChunk` so runtime-core
  * can publish `tool_stream_chunk` trace events.
@@ -42,6 +59,12 @@ export type CodeExecutionConfig = {
   readonly allowedImages?: ReadonlyArray<string>;
   readonly mountWhitelist?: ReadonlyArray<string>;
   readonly defaultTimeoutMs?: number;
+  /**
+   * The longest timeout any call may run with, in ms. The model's `timeout`,
+   * the default and a serving candidate's default are all clamped to it.
+   * Unset: the model may ask for up to 600 000 (the input schema's limit).
+   */
+  readonly maxTimeoutMs?: number;
   /** Optional warm pool size per language. Reserved for v1; v0 ignores. */
   readonly warmPoolSize?: number;
   /** Per-language image override. Defaults to the curated images. */
@@ -67,6 +90,8 @@ export type CodeExecutionConfigInput = {
   readonly mountWhitelist?: ReadonlyArray<string>;
   readonly default_timeout_ms?: number;
   readonly defaultTimeoutMs?: number;
+  readonly max_timeout_ms?: number;
+  readonly maxTimeoutMs?: number;
   readonly warm_pool_size?: number;
   readonly warmPoolSize?: number;
   readonly images?: {
@@ -86,13 +111,27 @@ const DEFAULT_IMAGES = {
 let activeConfig: CodeExecutionConfig = {};
 let activeSandbox: Sandbox | undefined;
 
+/** The model's `timeout` can never exceed this (the input schema's limit). */
+const MODEL_TIMEOUT_LIMIT_MS = 600_000;
+
 export function registerCodeExecutionConfig(input: CodeExecutionConfigInput): void {
+  const maxTimeoutMs = input.maxTimeoutMs ?? input.max_timeout_ms;
+  if (
+    maxTimeoutMs !== undefined &&
+    (typeof maxTimeoutMs !== "number" || !Number.isFinite(maxTimeoutMs) || maxTimeoutMs <= 0)
+  ) {
+    // A cap that cannot be read must not become "no cap".
+    throw new ConfigError(
+      `code execution max_timeout_ms must be a number of milliseconds > 0, got ${JSON.stringify(maxTimeoutMs)}`,
+    );
+  }
   activeConfig = {
     sandbox: input.sandbox,
     backend: input.backend,
     allowedImages: input.allowedImages ?? input.allowed_images,
     mountWhitelist: input.mountWhitelist ?? input.mount_whitelist,
     defaultTimeoutMs: input.defaultTimeoutMs ?? input.default_timeout_ms,
+    ...(maxTimeoutMs !== undefined ? { maxTimeoutMs } : {}),
     warmPoolSize: input.warmPoolSize ?? input.warm_pool_size,
     images: input.images,
     mounts: input.mounts,
@@ -140,29 +179,49 @@ function buildMounts(): ReadonlyArray<SandboxMount> {
   return Object.entries(m).map(([src, dst]) => ({ src, dst, readonly: true }));
 }
 
-function formatResult(opts: {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  timedOut: boolean;
-  durationMs: number;
-}): string {
+/** `text` without its trailing newlines — a loop, not `/\n+$/`, which is quadratic on a long run of newlines. */
+function trimTrailingNewlines(text: string): string {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 10) end--;
+  return text.slice(0, end);
+}
+
+function formatResult(result: SandboxExecResult, timeoutNote: string | undefined): string {
   const parts: string[] = [];
-  if (opts.stdout.length > 0) parts.push(opts.stdout.replace(/\n+$/, ""));
-  if (opts.stderr.length > 0) {
+  if (result.stdout.length > 0) parts.push(trimTrailingNewlines(result.stdout));
+  if (result.stderr.length > 0) {
     parts.push("[stderr]");
-    parts.push(opts.stderr.replace(/\n+$/, ""));
+    parts.push(trimTrailingNewlines(result.stderr));
   }
-  const head = opts.timedOut
-    ? `[exit] ${opts.exitCode} (timed out after ${Math.round(opts.durationMs)}ms)`
-    : `[exit] ${opts.exitCode} (${Math.round(opts.durationMs)}ms)`;
-  parts.push(head);
+  if (result.outputComplete === false) {
+    parts.push(
+      "[output incomplete: reading stopped before the output ended (something the program started still held it open), so the text above may not be all of it]",
+    );
+  }
+  const ms = Math.round(result.durationMs);
+  const how =
+    result.aborted === true
+      ? `cancelled after ${ms}ms`
+      : result.timedOut
+        ? `timed out after ${ms}ms`
+        : `${ms}ms`;
+  parts.push(
+    `[exit] ${result.exitCode} (${how}${timeoutNote !== undefined ? `; ${timeoutNote}` : ""})`,
+  );
   return parts.join("\n");
 }
 
 const codeSchema = z.object({
   code: z.string().min(1),
-  timeout: z.number().int().positive().max(600_000).optional(),
+  timeout: z
+    .number()
+    .int()
+    .positive()
+    .max(MODEL_TIMEOUT_LIMIT_MS)
+    .optional()
+    .describe(
+      "Milliseconds before the program is killed (default 60000, at most 600000). The operator may cap it lower.",
+    ),
 });
 
 type CodeInput = z.infer<typeof codeSchema>;
@@ -192,18 +251,16 @@ function resolveEventBus(ctx?: ToolExecuteContext): TraceEventBus | undefined {
  * emit for chatty programs. Fire-and-forget: a missing bus (no run context)
  * skips silently.
  */
-function publishProgramOutput(
-  bus: TraceEventBus | undefined,
-  summary: { stdout: string; stderr: string; exitCode: number; durationMs: number },
-): void {
+function publishProgramOutput(bus: TraceEventBus | undefined, summary: SandboxExecResult): void {
   if (bus === undefined) return;
   bus.publish({
     ...bus.envelope(),
     kind: "program_output",
     programId: `prog_${randomBytes(6).toString("hex")}`,
     exitCode: summary.exitCode,
-    stdoutBytes: Buffer.byteLength(summary.stdout, "utf8"),
-    stderrBytes: Buffer.byteLength(summary.stderr, "utf8"),
+    // What the program wrote, not what was kept after the output cap.
+    stdoutBytes: summary.stdoutBytes ?? Buffer.byteLength(summary.stdout, "utf8"),
+    stderrBytes: summary.stderrBytes ?? Buffer.byteLength(summary.stderr, "utf8"),
     durationMs: Math.round(summary.durationMs),
   });
 }
@@ -219,13 +276,82 @@ function publishProgramOutput(
  * config, never from a spec block, so a per-call override cannot reach it.
  */
 export function resolveCallTimeoutMs(override: unknown): number | undefined {
+  return readPositiveMs(override, "defaultTimeoutMs", "default_timeout_ms");
+}
+
+/**
+ * The per-call `max_timeout_ms` / `maxTimeoutMs` a serving candidate's
+ * tool_config block supplies, or undefined. It can only LOWER the operator's
+ * cap (see {@link resolveEffectiveTimeout}).
+ */
+export function resolveCallMaxTimeoutMs(override: unknown): number | undefined {
+  return readPositiveMs(override, "maxTimeoutMs", "max_timeout_ms");
+}
+
+function readPositiveMs(override: unknown, camel: string, snake: string): number | undefined {
   if (typeof override !== "object" || override === null || Array.isArray(override)) {
     return undefined;
   }
-  const o = override as { defaultTimeoutMs?: unknown; default_timeout_ms?: unknown };
-  const raw = o.defaultTimeoutMs ?? o.default_timeout_ms;
+  const o = override as Record<string, unknown>;
+  const raw = o[camel] ?? o[snake];
   return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : undefined;
 }
+
+/**
+ * The timeout a call runs with, and a note for the model when its request
+ * was cut. The model's `timeout` wins over the defaults, as before; the cap
+ * (`max_timeout_ms`, lowered further by a candidate's own) bounds all of
+ * them. With no cap configured anywhere this is exactly the 0.7.0 rule.
+ *
+ * `timeoutMs` undefined means "the sandbox's own default", which is only
+ * left to the sandbox when no cap applies or that default is not known here
+ * (an injected sandbox with no `default_timeout_ms` registered).
+ */
+export function resolveEffectiveTimeout(
+  input: { readonly timeout?: number },
+  toolConfig: unknown,
+  config: CodeExecutionConfig = activeConfig,
+): { readonly timeoutMs: number | undefined; readonly note?: string } {
+  const requested = input.timeout ?? resolveCallTimeoutMs(toolConfig);
+  const caps = [config.maxTimeoutMs, resolveCallMaxTimeoutMs(toolConfig)].filter(
+    (c): c is number => c !== undefined,
+  );
+  if (caps.length === 0) return { timeoutMs: requested };
+  const cap = Math.min(...caps);
+  const knownDefault =
+    config.defaultTimeoutMs ??
+    (config.sandbox === undefined ? SANDBOX_DEFAULT_TIMEOUT_MS : undefined);
+  const base = requested ?? knownDefault;
+  if (base === undefined) return { timeoutMs: undefined };
+  if (base <= cap) return { timeoutMs: base };
+  return {
+    timeoutMs: cap,
+    ...(input.timeout !== undefined && input.timeout > cap
+      ? {
+          note: `timeout capped at ${cap}ms by the operator's max_timeout_ms (asked for ${input.timeout}ms)`,
+        }
+      : {}),
+  };
+}
+
+/**
+ * The noop backend runs code on the host. It may run only when trusted code
+ * picked it: an injected sandbox, or `backend: "noop"` registered
+ * programmatically (a spec cannot set `backend`). Picked by
+ * `CREWHAUS_SANDBOX=noop`, it means "code execution off" — the permission
+ * floor already denies these tools, and this refuses what gets past it
+ * (bypass mode, a loop told a sandbox exists) (security-6#1).
+ */
+function refuseEnvironmentNoop(sandbox: Sandbox, toolName: string): void {
+  if (sandbox.backend !== "noop") return;
+  if (activeConfig.sandbox !== undefined || activeConfig.backend === "noop") return;
+  throw new CrewhausError(
+    "tool",
+    `${toolName} refused: CREWHAUS_SANDBOX=noop turns code execution off (the noop backend would run this code on the host with no isolation). Set CREWHAUS_SANDBOX=docker or podman to run it in a container.`,
+  );
+}
+
+const TOOL_NAMES = { python: "Python", javascript: "JavaScript", shell: "Shell" } as const;
 
 async function runInSandbox(
   language: "python" | "javascript" | "shell",
@@ -234,12 +360,8 @@ async function runInSandbox(
   ctx?: ToolExecuteContext,
 ): Promise<string> {
   const sandbox = getOrCreateSandbox();
-  const callTimeoutMs = input.timeout ?? resolveCallTimeoutMs(ctx?.toolConfig);
-  if (sandbox.backend === "noop") {
-    // Allowed for tests, but emit a clear marker so misuse is obvious.
-    // Production permission floor refuses requiresSandbox tools when the
-    // sandbox is noop, so reaching here in production indicates a leak.
-  }
+  refuseEnvironmentNoop(sandbox, TOOL_NAMES[language]);
+  const { timeoutMs: callTimeoutMs, note } = resolveEffectiveTimeout(input, ctx?.toolConfig);
   const image = configuredImage(language);
   const mounts = buildMounts();
   const onStreamChunk = ctx?.onStreamChunk;
@@ -255,7 +377,7 @@ async function runInSandbox(
   // G59 — publish the per-process summary at exit (byte counts + exit code +
   // duration only) for the runtime feedback channel.
   publishProgramOutput(resolveEventBus(ctx), result);
-  return formatResult(result);
+  return formatResult(result, note);
 }
 
 export const python: RegisteredTool = buildTool({

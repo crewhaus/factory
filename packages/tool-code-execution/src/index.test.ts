@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Sandbox, SandboxExecOptions, SandboxExecResult } from "@crewhaus/sandbox";
 import {
   _resetCodeExecutionConfig,
@@ -25,6 +28,7 @@ class StubSandbox implements Sandbox {
       opts.onStderrChunk(this.result.stderr ?? "");
     }
     return {
+      ...this.result,
       stdout: this.result.stdout ?? "",
       stderr: this.result.stderr ?? "",
       exitCode: this.result.exitCode ?? 0,
@@ -200,5 +204,174 @@ describe("input schema", () => {
   test("inputSchema accepts well-formed input", () => {
     const result = python.inputSchema.safeParse({ code: "print('ok')", timeout: 5000 });
     expect(result.success).toBe(true);
+  });
+});
+
+describe("a run that did not finish on its own says so", () => {
+  test("a cancelled run reads as cancelled, not as a normal exit", async () => {
+    const stub = new StubSandbox({
+      stdout: "partial",
+      aborted: true,
+      exitCode: 137,
+      durationMs: 812,
+    });
+    registerCodeExecutionConfig({ sandbox: stub });
+    const out = (await shell.execute({ code: "sleep 100" })) as string;
+    expect(out.endsWith("[exit] 137 (cancelled after 812ms)")).toBe(true);
+  });
+
+  test("a drain cut short is flagged, not presented as the whole output", async () => {
+    const stub = new StubSandbox({ stdout: "first line\n", outputComplete: false });
+    registerCodeExecutionConfig({ sandbox: stub });
+    const out = (await shell.execute({ code: "echo first line; sleep 100 &" })) as string;
+    expect(out).toContain("first line\n[output incomplete:");
+    expect(out).toContain("[exit] 0 (1ms)");
+  });
+
+  test("trailing newlines are trimmed in linear time", async () => {
+    // `/\n+$/` backtracks over every run of newlines: 120 000 of them before
+    // a final character took seconds. The loop takes microseconds.
+    const stub = new StubSandbox({ stdout: `${"\n".repeat(120_000)}x\n\n`, stderr: "e\n" });
+    registerCodeExecutionConfig({ sandbox: stub });
+    const t0 = performance.now();
+    const out = (await shell.execute({ code: "x" })) as string;
+    expect(performance.now() - t0).toBeLessThan(1_500);
+    expect(out.startsWith("\n".repeat(120_000))).toBe(true);
+    expect(out.slice(120_000)).toBe("x\n[stderr]\ne\n[exit] 0 (1ms)");
+  }, 20_000);
+});
+
+// security-12#4: the program's output reached the tool result whole.
+describe("output is capped before it reaches the model", () => {
+  test("a flood from the program comes back as its start, a count, and its end", async () => {
+    registerCodeExecutionConfig({ backend: "noop" });
+    const out = String(
+      await shell.execute({ code: "head -c 3000000 /dev/zero | tr '\\0' a; echo; echo LAST" }),
+    );
+    expect(out.length).toBeLessThan(1_100_000);
+    expect(out).toMatch(/\n\[stdout truncated: \d+ bytes dropped\]\n/);
+    expect(out).toMatch(/\nLAST\n\[exit\] 0 \(\d+ms\)$/);
+  }, 20_000);
+});
+
+// security-6#1, defence in depth: CREWHAUS_SANDBOX=noop means "code execution
+// off". The floor denies these tools; a call that gets past it (bypass mode,
+// a loop told a sandbox exists) must not run the code on the host.
+describe("CREWHAUS_SANDBOX=noop turns code execution off", () => {
+  const before = process.env["CREWHAUS_SANDBOX"];
+  afterEach(() => {
+    if (before === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_SANDBOX");
+    else process.env["CREWHAUS_SANDBOX"] = before;
+  });
+
+  for (const value of ["noop", "noop ", " NOOP\r"]) {
+    test(`with CREWHAUS_SANDBOX=${JSON.stringify(value)} a call is refused and nothing runs`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "code-exec-noop-"));
+      try {
+        const marker = join(dir, "ran");
+        process.env["CREWHAUS_SANDBOX"] = value;
+        registerCodeExecutionConfig({});
+        await expect(shell.execute({ code: `touch ${marker}` })).rejects.toThrow(
+          /Shell refused: CREWHAUS_SANDBOX=noop turns code execution off/,
+        );
+        expect(existsSync(marker)).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("trusted code that picks the noop backend itself still runs it (how tests use it)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "code-exec-noop-"));
+    try {
+      const marker = join(dir, "ran");
+      process.env["CREWHAUS_SANDBOX"] = "noop";
+      registerCodeExecutionConfig({ backend: "noop" });
+      const out = String(await shell.execute({ code: `touch ${marker}` }));
+      expect(out).toContain("[exit] 0");
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// security-6#15: the model's `timeout` (up to 600 s) replaced the operator's
+// default outright, and the operator had no maximum.
+describe("max_timeout_ms caps every call", () => {
+  test("a model timeout above the cap runs at the cap, and the result says so", async () => {
+    const stub = new StubSandbox({ timedOut: true, exitCode: 137, durationMs: 1_000 });
+    registerCodeExecutionConfig({
+      sandbox: stub,
+      default_timeout_ms: 1_000,
+      max_timeout_ms: 1_000,
+    });
+    const out = (await python.execute({ code: "x", timeout: 600_000 })) as string;
+    expect(stub.calls[0]?.timeoutMs).toBe(1_000);
+    expect(out).toContain(
+      "[exit] 137 (timed out after 1000ms; timeout capped at 1000ms by the operator's max_timeout_ms (asked for 600000ms))",
+    );
+  });
+
+  test("below the cap the model's timeout is used as asked", async () => {
+    const stub = new StubSandbox({});
+    registerCodeExecutionConfig({
+      sandbox: stub,
+      default_timeout_ms: 1_000,
+      maxTimeoutMs: 120_000,
+    });
+    await python.execute({ code: "x", timeout: 90_000 });
+    await python.execute({ code: "x", timeout: 600_000 });
+    await python.execute({ code: "x", timeout: 500 });
+    expect(stub.calls.map((c) => c.timeoutMs)).toEqual([90_000, 120_000, 500]);
+  });
+
+  test("the operator's default is clamped too", async () => {
+    const stub = new StubSandbox({});
+    registerCodeExecutionConfig({
+      sandbox: stub,
+      default_timeout_ms: 5_000,
+      max_timeout_ms: 1_000,
+    });
+    await python.execute({ code: "x" });
+    expect(stub.calls[0]?.timeoutMs).toBe(1_000);
+  });
+
+  test("with no cap configured a model timeout is honoured as in 0.7.0", async () => {
+    const stub = new StubSandbox({});
+    registerCodeExecutionConfig({ sandbox: stub, default_timeout_ms: 1_000 });
+    const out = (await python.execute({ code: "x", timeout: 600_000 })) as string;
+    expect(stub.calls[0]?.timeoutMs).toBe(600_000);
+    expect(out).not.toContain("capped");
+  });
+
+  test("a serving candidate's tool_config can lower the cap, never raise it", async () => {
+    const stub = new StubSandbox({});
+    registerCodeExecutionConfig({ sandbox: stub, max_timeout_ms: 5_000 });
+    await python.execute(
+      { code: "x", timeout: 600_000 },
+      { toolConfig: { max_timeout_ms: 2_000 } },
+    );
+    await python.execute(
+      { code: "x", timeout: 600_000 },
+      { toolConfig: { max_timeout_ms: 9_000 } },
+    );
+    await python.execute({ code: "x" }, { toolConfig: { default_timeout_ms: 900_000 } });
+    expect(stub.calls.map((c) => c.timeoutMs)).toEqual([2_000, 5_000, 5_000]);
+  });
+
+  test("a cap that cannot be read is refused at registration, not treated as no cap", () => {
+    for (const bad of [0, -1, Number.NaN, "60000"]) {
+      expect(() =>
+        registerCodeExecutionConfig({ max_timeout_ms: bad as unknown as number }),
+      ).toThrow(/max_timeout_ms must be a number of milliseconds > 0/);
+    }
+  });
+
+  test("the model is told the timeout can be capped", () => {
+    const shape = (
+      python.inputSchema as unknown as { shape: Record<string, { description?: string }> }
+    ).shape;
+    expect(shape["timeout"]?.description).toContain("The operator may cap it lower.");
   });
 });
