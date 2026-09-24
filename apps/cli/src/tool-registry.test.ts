@@ -670,28 +670,39 @@ describe("the generated tool manifest matches the tools it describes", () => {
 });
 
 /**
- * The 455 KB stays where it was declared.
+ * The 455 KB of descriptions stays where it was declared.
  *
  * `collectCrewhausDeps` pins whole PACKAGES into a bundle's `package.json`, so
  * a package that imports the manifest hands the manifest to every bundle that
- * grants any of its tools — importing one small export does not help, because
- * nothing tree-shakes at that boundary. That is why `capability` was given no
- * roll-up: a broad `all-<category>` grant must not drag the description prose
- * into a harness that never asked for it.
+ * grants any of its tools. That is why `capability` was given no roll-up: a
+ * broad `all-<category>` grant must not drag the description prose into a
+ * harness that never asked for it.
  *
  * `toolInventory` defeated that once already. It needs the builtin KEY SET,
  * took it from the manifest, and `@crewhaus/tool-crewhaus` sits in the
- * `crewhaus` leaf — which IS inside the `all-operations` roll-up. So a plain
- * `all-operations` grant paid the 455 KB through the back door, for prose it
- * never reads. It reads `BUILTIN_TOOL_MAP` instead: the same keys, already in
- * its dependency closure, no prose. The key sets being identical is asserted
- * above, in both directions, on every run.
+ * `crewhaus` leaf — which IS inside the `all-operations` roll-up. It reads
+ * `BUILTIN_TOOL_MAP` instead: the same keys, already in its dependency
+ * closure, no prose. The key sets being identical is asserted above.
  *
- * This is the test that keeps the next import from re-opening the door.
+ * 0.7.1 moved the line. `PermissionAudit` (tool-crewhaus) and
+ * `PermissionsSuggest` / `ApprovalStatus` (tool-approvals) need every
+ * builtin's FLAGS — read-only, destructive, external, justification, the
+ * operative arguments — to tell the truth about a spec
+ * (permission-integration#9, #8). Those come from the manifest's `/flags`
+ * entry, a table with no descriptions. A bundle granting those tools now
+ * INSTALLS the manifest package, but never LOADS its prose, and a compiled
+ * single binary embeds only the flags table. The package split that would
+ * avoid the install is a new npm package, which a patch release cannot
+ * first-publish through the trusted-publishing pipeline; it is left to 0.8.
+ *
+ * So the rule held here is about what is loaded: only tool-capability imports
+ * the descriptions, every other carrier imports `/flags` and nothing else,
+ * and the carriers are exactly the reviewed ones.
  */
-describe("the tool manifest is carried only by bundles that asked for it", () => {
+describe("the tool manifest's descriptions are loaded only by bundles that asked for them", () => {
   const ROOT = join(import.meta.dir, "..", "..", "..");
   const MANIFEST = "@crewhaus/tool-registry-manifest";
+  const FLAGS_ONLY = `${MANIFEST}/flags`;
 
   function deps(pkg: string): ReadonlyArray<string> {
     const file = join(ROOT, "packages", pkg.replace("@crewhaus/", ""), "package.json");
@@ -715,22 +726,65 @@ describe("the tool manifest is carried only by bundles that asked for it", () =>
     return seen;
   }
 
-  test("only @crewhaus/tool-capability pulls it in", () => {
+  /** The manifest specifiers a package's non-test sources import. */
+  function manifestImports(pkg: string): string[] {
+    const src = join(ROOT, "packages", pkg.replace("@crewhaus/", ""), "src");
+    if (!existsSync(src)) return [];
+    const out: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith(".ts") && !entry.name.includes(".test.")) {
+          const text = readFileSync(full, "utf-8");
+          for (const m of text.matchAll(/from "(@crewhaus\/tool-registry-manifest[^"]*)"/g)) {
+            out.push(m[1] as string);
+          }
+        }
+      }
+    };
+    walk(src);
+    return out;
+  }
+
+  /** The packages that depend on the manifest, each with why. */
+  const CARRIERS: Readonly<Record<string, string>> = {
+    "tool-approvals":
+      "PermissionsSuggest and ApprovalStatus read each builtin's operativeArgs and readOnly flag",
+    "tool-capability": "ToolRegistry describes the tools a harness lacks — the prose is its answer",
+    "tool-crewhaus": "PermissionAudit reports each builtin's real flags",
+  };
+
+  test("the carriers are exactly the reviewed ones", () => {
     const carriers = readdirSync(join(ROOT, "packages"))
       .filter((name) => name.startsWith("tool-") && name !== "tool-registry-manifest")
       .filter((name) => deps(`@crewhaus/${name}`).includes(MANIFEST));
-    // The sweep found tool packages to look at, and the one legitimate carrier.
+    // The sweep found tool packages to look at.
     expect(carriers.length).toBeGreaterThan(0);
-    expect(carriers).toEqual(["tool-capability"]);
+    expect(carriers.sort()).toEqual(Object.keys(CARRIERS).sort());
   });
 
-  test("a tool-crewhaus bundle does not install it", () => {
+  test("only tool-capability imports the descriptions; every other carrier imports /flags alone", () => {
+    for (const pkg of Object.keys(CARRIERS)) {
+      const imports = manifestImports(`@crewhaus/${pkg}`);
+      // The carrier really imports it — an exemption for a dependency nothing
+      // reads is dead weight.
+      expect({ pkg, imports: imports.length > 0 }).toEqual({ pkg, imports: true });
+      if (pkg === "tool-capability") continue;
+      expect({ pkg, imports: [...new Set(imports)] }).toEqual({ pkg, imports: [FLAGS_ONLY] });
+    }
+  });
+
+  test("a tool-crewhaus bundle loads no description", () => {
     const reach = closure("@crewhaus/tool-crewhaus");
     // `target-cli` is what it reads the key set from, and it was already there.
     expect(reach.has("@crewhaus/target-cli")).toBe(true);
-    expect(reach.has(MANIFEST)).toBe(false);
     // And the closure was really walked, not empty.
     expect(reach.size).toBeGreaterThan(20);
+    const prose = [...reach].filter(
+      (pkg) => pkg !== MANIFEST && manifestImports(pkg).some((spec) => spec !== FLAGS_ONLY),
+    );
+    expect(prose).toEqual([]);
   });
 
   test("a tool-capability bundle does install it, so the check can fail", () => {
