@@ -22,13 +22,29 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { abiDecode, abiEncodeCall, addressCheck } from "@crewhaus/tool-onchain";
 import { ChainCallError } from "./rpc";
 
-/** Read a tool result that is known to be a JSON string. */
+/**
+ * Run one of `tool-onchain`'s tools and read its JSON result.
+ *
+ * The input goes through the tool's own schema first, as it would from a
+ * model. Calling `execute` directly skips the executor that normally parses
+ * it, and with it the limits the schema carries — `AbiDecode`'s cap on the
+ * size of the data it decodes among them — while the data here comes from
+ * a node answering for a contract somebody else deployed.
+ */
 async function toolJson(
   tool: RegisteredTool,
   input: unknown,
   what: string,
 ): Promise<Record<string, unknown>> {
-  const result = await tool.execute(input);
+  const parsed = tool.inputSchema.safeParse(input);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const path = issue === undefined || issue.path.length === 0 ? "" : ` (${issue.path.join(".")})`;
+    throw new ChainCallError(
+      `${what}: ${tool.name} refused the input${path}: ${issue?.message ?? "invalid"}`,
+    );
+  }
+  const result = await tool.execute(parsed.data);
   if (typeof result !== "string") {
     throw new ChainCallError(`${what}: ${tool.name} returned non-text content`);
   }

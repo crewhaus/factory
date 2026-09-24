@@ -13,6 +13,7 @@ import {
   balanceOfData,
   bytes4Arg,
   checkAddress,
+  decodeValues,
   getEthBalanceData,
   supportsInterfaceData,
 } from "./lib/codec";
@@ -176,6 +177,16 @@ describe("codec — the selectors are recomputed, never trusted on sight", () =>
 
   test("a mistyped address is refused rather than checksummed into something", async () => {
     await expect(checkAddress("0x1234", "the target")).rejects.toThrow(ChainCallError);
+  });
+
+  test("return data is held to AbiDecode's own size cap, not decoded past it (C085)", async () => {
+    // A node's answer reaches the decoder without passing a model, so the
+    // schema's cap has to be applied here: 0.7.0 called execute directly.
+    const huge = `0x${"00".repeat(1_000_001)}`;
+    await expect(decodeValues(["uint256"], huge, "calls[0]")).rejects.toThrow(
+      /^calls\[0\]: AbiDecode refused the input \(data\): String must contain at most 2000000/,
+    );
+    expect(await decodeValues(["uint256"], `0x${"00".repeat(31)}2a`, "calls[0]")).toEqual(["42"]);
   });
 });
 
