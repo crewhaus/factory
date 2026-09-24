@@ -267,6 +267,13 @@ function columnProblem(value: unknown): string | null {
     if (typeof counts !== "object" || counts === null || Array.isArray(counts)) {
       return `${label} has a categorical capture with no valueCounts map`;
     }
+    // A count the chi-square adds up. A hand-edited "50" would concatenate
+    // instead of adding, and the category would drop out of the test.
+    for (const [value, count] of Object.entries(counts)) {
+      if (typeof count !== "number" || !Number.isFinite(count) || count < 0) {
+        return `${label} has a non-numeric count for the value ${JSON.stringify(value)} in its valueCounts; it has been edited by hand and cannot be used as a baseline`;
+      }
+    }
     return null;
   }
   return `${label} has a drift capture of unknown kind ${JSON.stringify(capture["kind"])}`;
