@@ -170,7 +170,7 @@ function refusal(key: string, entry: BuiltinToolEntry, shape: ToolShape): string
         : entry.io === "process"
           ? "it starts a host process, and a Worker has none"
           : `the edge worker does not wire it — it wires only ${list(edgeKeys())}`;
-    return `${head}: ${why}. Remove it from tools, or compile without --emit-as cf-worker to get a bundle that runs it.`;
+    return `${head}: ${why}, so the worker leaves it out. Remove it from tools, or compile without --emit-as cf-worker to get a bundle that runs it.`;
   }
   const provided = profile.provides?.[key];
   if (provided !== undefined) return `${head}: ${provided}. Remove it from tools.`;

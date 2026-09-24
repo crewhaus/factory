@@ -137,7 +137,7 @@ describe("assertCfWorkerToolsEdgeSafe", () => {
     expect(warnings).toHaveLength(1);
     expect(warnings[0]?.code).toBe("edge-unsafe-tool");
     expect(warnings[0]?.message).toContain("it starts a host process");
-    expect(warnings[0]?.message).toContain("left out of the worker");
+    expect(warnings[0]?.message).toContain("so the worker leaves it out");
   });
 
   test("the host tools the edge always refused still refuse", () => {

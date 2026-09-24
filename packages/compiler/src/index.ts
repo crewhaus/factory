@@ -896,7 +896,7 @@ export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWa
       const verdict = checkBuiltinTool(key, "cf-worker");
       const message =
         verdict.kind === "refused"
-          ? `${verdict.message} It is left out of the worker.`
+          ? verdict.message
           : (warned.find((w) => w.name === key)?.warning ?? key);
       warnings.push({ code: "edge-unsafe-tool", path: site.path, message });
     }
