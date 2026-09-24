@@ -2,6 +2,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { preferIdentity, readBodyBounded, withRawBody } from "@crewhaus/tool-fetch/body";
 import { load as loadHtml } from "cheerio";
 import TurndownService from "turndown";
 import { z } from "zod";
@@ -18,8 +19,13 @@ import { z } from "zod";
  *     RFC1918, CGNAT, *.local / *.localhost, and DNS-rebinding targets.
  *   - Manual redirect handling, max 5; allow-list re-checked at every hop,
  *     BEFORE any DNS resolution, so a host outside it is never looked up.
- *   - 30 s default timeout (`AbortController`, honours `ctx.signal`).
- *   - 5 MB response body cap.
+ *   - 30 s default timeout (`AbortController`, honours `ctx.signal`),
+ *     covering the body as well as the request.
+ *   - 5 MB response body cap, on the DECODED body: the body is fetched raw
+ *     and decoded under the cap by @crewhaus/tool-fetch/body (edge-safe;
+ *     this package is bundled into workerd), so a compressed reply cannot
+ *     inflate past it in the runtime first. WebSearch's provider replies
+ *     are read the same way.
  *   - HTML pages run through cheerio + turndown to produce markdown that
  *     compresses well in the model's context. Plain text and JSON pass
  *     through. Other content types are summarised in one line.
@@ -45,6 +51,11 @@ import { z } from "zod";
  */
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+let timeoutMs = DEFAULT_TIMEOUT_MS;
+/** Test-only — shorten the per-call deadline; `undefined` restores 30 s. */
+export function _setTimeoutMsForTest(ms: number | undefined): void {
+  timeoutMs = ms ?? DEFAULT_TIMEOUT_MS;
+}
 const MAX_REDIRECTS = 5;
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 
@@ -377,7 +388,8 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const host = original.hostname;
   const hostUnbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
   if (pinnedIp === "" || hostUnbracketed === pinnedIp) {
-    return globalThis.fetch(req);
+    // Raw body on the FINAL call: Bun ignores `decompress` in a Request's init.
+    return globalThis.fetch(req, withRawBody({}));
   }
   const hostForUrl = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
   const pinnedUrl = new URL(original.toString());
@@ -395,7 +407,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     init.body = req.body;
     (init as { duplex?: string }).duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return globalThis.fetch(pinnedUrl.toString(), withRawBody(init));
 }
 
 // Production default — one named fetcher shared by the initial binding and the
@@ -406,42 +418,16 @@ export function _setRawFetch(fn: RawFetch | undefined): void {
   rawFetch = fn ?? defaultRawFetch;
 }
 
+/** The body, decoded under {@link MAX_BODY_BYTES}; a refusal quotes nothing it held. */
 async function readBodyCapped(res: Response): Promise<string> {
-  if (res.body === null) return "";
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
-        try {
-          await reader.cancel();
-        } catch {
-          /* ignore */
-        }
-        throw new WebFetchPermissionError(
-          `response body exceeded ${MAX_BODY_BYTES} bytes — aborted`,
-        );
-      }
-      chunks.push(value);
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      /* ignore */
-    }
-  }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+  const read = await readBodyBounded(res, MAX_BODY_BYTES);
+  if (!read.ok) throw new WebFetchPermissionError(read.reason);
+  return new TextDecoder("utf-8", { fatal: false }).decode(read.bytes);
+}
+
+/** A provider's JSON reply, read under the same cap. */
+async function readJsonCapped(res: Response): Promise<unknown> {
+  return JSON.parse(await readBodyCapped(res));
 }
 
 async function performWebFetch(
@@ -469,12 +455,14 @@ async function performWebFetch(
     // in a private address between this check and connect.
     const pinnedIp = await assertNotSsrf(currentUrl.hostname);
 
+    const headers = new Headers({ "user-agent": "crewhaus-tool-web/0.1" });
+    preferIdentity(headers);
     const res = await rawFetch(
       new Request(currentUrl.toString(), {
         method: "GET",
         redirect: "manual",
         signal,
-        headers: { "user-agent": "crewhaus-tool-web/0.1" },
+        headers,
       }),
       pinnedIp,
     );
@@ -542,7 +530,7 @@ export const webFetch: RegisteredTool = buildTool({
     }
 
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error("fetch timeout")), DEFAULT_TIMEOUT_MS);
+    const timer = setTimeout(() => ctrl.abort(new Error("fetch timeout")), timeoutMs);
     if (ctx?.signal !== undefined) {
       if (ctx.signal.aborted) ctrl.abort(ctx.signal.reason);
       else
@@ -551,12 +539,15 @@ export const webFetch: RegisteredTool = buildTool({
         });
     }
     let res: Response;
+    let body: string;
     try {
       res = await performWebFetch(url, ctrl.signal, resolveWebFetchConfig(ctx?.toolConfig));
+      // Inside the deadline: a server that sends the head and then drips the
+      // body is stopped by the same 30 s as one that never answers.
+      body = await readBodyCapped(res);
     } finally {
       clearTimeout(timer);
     }
-    const body = await readBodyCapped(res);
     const ct = (res.headers.get("content-type") ?? "").toLowerCase();
     let content: string;
     if (ct.includes("text/html") || ct.includes("application/xhtml")) {
@@ -629,17 +620,14 @@ async function braveSearch(
   // (the provider doesn't enforce them server-side).
   const url = `https://api.search.brave.com/res/v1/web/search?${params.toString()}`;
   // Fixed, trusted API host — not model-controlled, so no SSRF pin needed.
-  const res = await rawFetch(
-    new Request(url, {
-      headers: { accept: "application/json", "x-subscription-token": apiKey },
-      signal,
-    }),
-    "",
-  );
+  const headers = new Headers({ accept: "application/json", "x-subscription-token": apiKey });
+  preferIdentity(headers);
+  const res = await rawFetch(new Request(url, { headers, signal }), "");
   if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
     throw new WebFetchPermissionError(`Brave search failed: HTTP ${res.status}`);
   }
-  const json = (await res.json()) as { web?: { results?: BraveResult[] } };
+  const json = (await readJsonCapped(res)) as { web?: { results?: BraveResult[] } };
   const raw = json.web?.results ?? [];
   return raw
     .map((r) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.description ?? "" }))
@@ -659,10 +647,12 @@ async function tavilySearch(
   blocked: readonly string[] | undefined,
   signal: AbortSignal,
 ): Promise<readonly SearchHit[]> {
+  const headers = new Headers({ "content-type": "application/json" });
+  preferIdentity(headers);
   const res = await rawFetch(
     new Request("https://api.tavily.com/search", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify({
         api_key: apiKey,
         query,
@@ -676,9 +666,10 @@ async function tavilySearch(
     "",
   );
   if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
     throw new WebFetchPermissionError(`Tavily search failed: HTTP ${res.status}`);
   }
-  const json = (await res.json()) as { results?: TavilyResult[] };
+  const json = (await readJsonCapped(res)) as { results?: TavilyResult[] };
   const raw = json.results ?? [];
   return raw
     .map((r) => ({ title: r.title ?? "", url: r.url ?? "", snippet: r.content ?? "" }))
@@ -730,7 +721,7 @@ export const webSearch: RegisteredTool = buildTool({
   ioCapability: "network",
   execute: async (input, ctx) => {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error("search timeout")), DEFAULT_TIMEOUT_MS);
+    const timer = setTimeout(() => ctrl.abort(new Error("search timeout")), timeoutMs);
     if (ctx?.signal !== undefined) {
       if (ctx.signal.aborted) ctrl.abort(ctx.signal.reason);
       else

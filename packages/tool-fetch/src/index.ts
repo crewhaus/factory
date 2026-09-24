@@ -3,6 +3,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { preferIdentity, readBodyBounded, withRawBody } from "./body";
 
 /**
  * Section 14 — generic HTTP fetch tool for API integrations.
@@ -19,7 +20,10 @@ import { z } from "zod";
  *   5. Manual redirect handling, max 5; allow-list + SSRF re-checked at
  *      every hop.
  *   6. 30 s default timeout (honours `ctx.signal`).
- *   7. 5 MB response body cap (streaming abort once exceeded).
+ *   7. 5 MB response body cap, on the DECODED body: the body is fetched
+ *      raw and a gzip, deflate, br or zstd body is decoded here with the
+ *      decoder stopped at the cap (see ./body.ts), so a compressed reply
+ *      cannot inflate past it in the runtime first.
  *   8. `Cookie` and `Authorization` headers are stripped from the
  *      response before returning to the model.
  *
@@ -406,49 +410,33 @@ function checkOriginAllowed(url: URL, cfg: FetchConfig): void {
 const STRIPPED_RESPONSE_HEADERS = new Set(["cookie", "set-cookie", "authorization"]);
 
 /**
- * Drain a Response body with a hard byte cap. Aborts the underlying read
- * once the cap is exceeded so a hostile server can't pin memory.
+ * Read the body with its DECODED size capped at {@link MAX_BODY_BYTES}.
+ * Returns the text and the coding that was undone, if any.
  */
-async function readBodyCapped(res: Response): Promise<string> {
-  if (res.body === null) return "";
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
-        try {
-          await reader.cancel();
-        } catch {
-          // ignore — we're already aborting
-        }
-        throw new FetchPermissionError(`response body exceeded ${MAX_BODY_BYTES} bytes — aborted`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // ignore
-    }
-  }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+async function readBodyCapped(
+  res: Response,
+): Promise<{ text: string; decodedFrom: string | null }> {
+  const read = await readBodyBounded(res, MAX_BODY_BYTES);
+  if (!read.ok) throw new FetchPermissionError(read.reason);
+  return {
+    text: new TextDecoder("utf-8", { fatal: false }).decode(read.bytes),
+    decodedFrom: read.decodedFrom,
+  };
 }
 
-function formatResponse(res: Response, body: string): string {
+/**
+ * Response headers that describe the body as it crossed the wire. When the
+ * body shown was decoded here, they no longer describe it, so they are left
+ * out rather than contradict it.
+ */
+const WIRE_FORM_HEADERS = new Set(["content-encoding", "content-length"]);
+
+function formatResponse(res: Response, body: string, decodedFrom: string | null): string {
   const lines: string[] = [`HTTP ${res.status} ${res.statusText}`.trimEnd()];
   for (const [key, value] of res.headers.entries()) {
-    if (STRIPPED_RESPONSE_HEADERS.has(key.toLowerCase())) continue;
+    const lower = key.toLowerCase();
+    if (STRIPPED_RESPONSE_HEADERS.has(lower)) continue;
+    if (decodedFrom !== null && WIRE_FORM_HEADERS.has(lower)) continue;
     lines.push(`${key}: ${value}`);
   }
   lines.push("");
@@ -479,8 +467,10 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const hostUnbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
 
   // Already an IP literal (or no resolution happened) ⇒ nothing to rewrite.
+  // The body is still fetched raw: Bun ignores `decompress` inside a
+  // Request's own init, so it goes on this, the final call.
   if (hostUnbracketed === pinnedIp || pinnedIp === "") {
-    return globalThis.fetch(req);
+    return globalThis.fetch(req, withRawBody({}));
   }
 
   // Rebuild the URL pointing at the pinned IP. Bracket IPv6 literals.
@@ -505,7 +495,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     // Streaming a request body in Bun/undici requires duplex: "half".
     (init as { duplex?: string }).duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return globalThis.fetch(pinnedUrl.toString(), withRawBody(init));
 }
 
 let rawFetch: RawFetch = pinnedFetch;
@@ -517,11 +507,13 @@ async function performFetch(
   initialUrl: URL,
   method: string,
   body: string | undefined,
-  headers: Record<string, string> | undefined,
+  callHeaders: Record<string, string> | undefined,
   signal: AbortSignal,
   cfg: FetchConfig,
 ): Promise<Response> {
   let currentUrl = initialUrl;
+  const headers = new Headers(callHeaders ?? {});
+  preferIdentity(headers);
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (currentUrl.protocol !== "http:" && currentUrl.protocol !== "https:") {
       throw new FetchPermissionError(
@@ -539,7 +531,7 @@ async function performFetch(
       redirect: "manual",
       signal,
       ...(body !== undefined ? { body } : {}),
-      headers: headers ?? {},
+      headers,
     };
     const res = await rawFetch(new Request(currentUrl.toString(), init), pinnedIp);
 
@@ -607,7 +599,7 @@ export const fetch: RegisteredTool = buildTool({
         resolveFetchConfig(ctx?.toolConfig),
       );
       const body = await readBodyCapped(res);
-      return formatResponse(res, body);
+      return formatResponse(res, body.text, body.decodedFrom);
     } finally {
       clearTimeout(timer);
     }
