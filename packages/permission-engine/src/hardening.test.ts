@@ -186,3 +186,88 @@ describe("plan mode honours deny and ask rules (permission-integration#6)", () =
     expect(evaluateWithReason(call("Read", {}, readOnly), "plan", broken).decision).toBe("deny");
   });
 });
+
+describe("plan mode is never wider than auto mode", () => {
+  test("a read-only tool that needs a sandbox is refused in plan mode when there is none", () => {
+    // A custom tool can be read-only and still run in a sandbox. Auto mode
+    // refuses it without one; plan mode used to allow it on readOnly alone.
+    const sandboxed = { ...call("Inspect", {}, { readOnly: true }), requiresSandbox: true };
+    const noSandbox = evaluateWithReason(sandboxed, "plan", emptyRuleSet);
+    expect(noSandbox.decision).toBe("deny");
+    expect(noSandbox.reason).toContain('tool "Inspect" requires a sandbox');
+    expect(evaluateWithReason(sandboxed, "auto", emptyRuleSet).decision).toBe("deny");
+    const withSandbox = { sandboxAvailable: true };
+    expect(evaluateWithReason(sandboxed, "plan", emptyRuleSet, withSandbox).decision).toBe("allow");
+  });
+
+  test("the sandbox refusal names what to set, and that unset means docker", () => {
+    const python = { ...call("Python", { code: "1" }), requiresSandbox: true };
+    const reason = evaluateWithReason(python, "default", emptyRuleSet).reason ?? "";
+    expect(reason).toContain("CREWHAUS_SANDBOX is noop or names no backend");
+    expect(reason).toContain("leave it unset for docker");
+  });
+
+  test("property: over random rules and calls, plan <= auto, and plan never asks", () => {
+    // mulberry32: a seeded generator, so a failure reproduces.
+    let seed = 0x5eed_2026;
+    const random = (): number => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T>(items: ReadonlyArray<T>): T => items[Math.floor(random() * items.length)] as T;
+    const tools = ["Read", "HttpPaginate", "Write", "Python", "Lint"] as const;
+    const types: ReadonlyArray<RuleType> = ["alwaysAllow", "alwaysDeny", "alwaysAsk"];
+    const sources: ReadonlyArray<PermissionRule["source"]> = [
+      "flag",
+      "settings",
+      "yaml",
+      "hooks",
+      "builtin",
+    ];
+    const rank = { deny: 0, ask: 1, allow: 2 } as const;
+    let sandboxCorner = 0;
+    let readOnlyDeniedInAuto = 0;
+    const violations: string[] = [];
+    for (let i = 0; i < 4000; i++) {
+      const rs: { -readonly [K in keyof RuleSet]: PermissionRule[] } = {
+        flag: [],
+        settings: [],
+        yaml: [],
+        hooks: [],
+        builtin: [],
+      };
+      const count = Math.floor(random() * 5);
+      for (let r = 0; r < count; r++) {
+        const tool = pick(tools);
+        const pattern = pick([tool, `${tool}(a*)`, `${tool}(**)`, "*"]);
+        const source = pick(sources);
+        rs[source].push({ type: pick(types), pattern, source });
+      }
+      const c = {
+        ...call(
+          pick(tools),
+          { path: pick(["a.txt", "b.txt"]) },
+          {
+            readOnly: random() < 0.5,
+            destructive: random() < 0.3,
+          },
+        ),
+        requiresSandbox: random() < 0.4,
+      };
+      const opts = { sandboxAvailable: random() < 0.5 };
+      const plan = evaluateWithReason(c, "plan", rs, opts).decision;
+      const auto = evaluateWithReason(c, "auto", rs, opts).decision;
+      if (c.readOnly && c.requiresSandbox && !opts.sandboxAvailable) sandboxCorner++;
+      if (c.readOnly && auto === "deny") readOnlyDeniedInAuto++;
+      if (plan === "ask" || rank[plan] > rank[auto]) {
+        violations.push(`${JSON.stringify({ c, opts, rs })} plan=${plan} auto=${auto}`);
+      }
+    }
+    // The corners the property is about were actually exercised.
+    expect(sandboxCorner).toBeGreaterThan(200);
+    expect(readOnlyDeniedInAuto).toBeGreaterThan(200);
+    expect(violations.slice(0, 3)).toEqual([]);
+  });
+});
