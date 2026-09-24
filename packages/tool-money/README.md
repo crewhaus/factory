@@ -64,11 +64,18 @@ wrong side of a year boundary depending on the machine.
 
 ## Controls, not suggestions
 
-`SpendLimitCheck` is the gate an unattended harness consults before moving
-money. A limit a model is asked to respect is a suggestion; a limit computed
-from the record of what has already been spent is a limit. It reports every
-limit a payment breaks rather than the first, and the headroom that would
-pass.
+`SpendLimitCheck` applies velocity, counterparty and quiet-hours limits to a
+proposed payment, the same way every time, and reports every limit it breaks
+rather than the first, plus the headroom that would pass. It computes over the
+history, the limits and the clock it is given, and enforces nothing by
+itself: when a model supplies those, the verdict is advisory — a model that
+would move money past a limit can equally leave out the history or skip the
+check. So a limit that must hold belongs where the model cannot edit it: in
+the policy of the tool that moves the money (for `EvmSendTransaction`, the
+spec's `transaction_policy`). The result says which clock it used (`clock`),
+and `now` — on this tool, `RefundAbuseCheck` and `WebhookSignatureVerify` —
+is for tests and replays only: it replaces the real clock, and every time
+window, a webhook's replay tolerance included, moves with it.
 
 When `knownCounterparties` is declared, that list **is** the allow-list, and
 payment history does not extend it. Treating anyone previously paid as known

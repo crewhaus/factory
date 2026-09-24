@@ -2,8 +2,11 @@
  * Spending controls and refund-abuse signals.
  *
  * An unattended harness that can move money needs a limit it cannot talk
- * itself past. A limit a model is asked to respect is a suggestion; a limit
- * computed from the record of what has already been spent is a limit.
+ * itself past, and a function cannot be that limit on its own: it computes
+ * over the history, limits and clock it is handed. When a model hands them
+ * over, the verdict is advisory. It is a control only where those inputs come
+ * from a record the model cannot edit, and a limit that must hold belongs in
+ * the policy of whatever actually moves the money.
  *
  * Both functions take the history as an argument and the clock as a
  * parameter. Nothing here reads a database or the time, so the same facts

@@ -97,6 +97,15 @@ function parseInstant(value: string | number, field: string): number {
 
 const instantField = z.union([z.string(), z.number()]);
 
+/**
+ * The `now` a caller may pass. It replaces the real clock, which moves every
+ * time window with it — the spend windows, the quiet hours, a webhook's
+ * replay tolerance — so it is for tests and replays of a recorded event, not
+ * for a live decision.
+ */
+const CLOCK_OVERRIDE =
+  "tests and replays only; omit it for a live decision — it replaces the real clock, and every time window moves with it";
+
 // ---------------------------------------------------------------------------
 
 export const paymentIdentifierValidate: RegisteredTool = buildTool({
@@ -310,7 +319,7 @@ export const costBasisCompute: RegisteredTool = buildTool({
 export const spendLimitCheck: RegisteredTool = buildTool({
   name: "SpendLimitCheck",
   description:
-    "Decide whether a proposed payment fits inside the operator's velocity, counterparty and quiet-hours limits, given what has already been spent. Use it as the gate an unattended harness actually consults before moving money: a limit a model is asked to respect is a suggestion, while one computed from the record of prior spend is a limit. It reports every limit the payment breaks rather than the first, and the headroom that would pass.",
+    "Check a proposed payment against velocity, counterparty and quiet-hours limits, given the payments already made, and report every limit it breaks rather than the first, plus the headroom that would pass. Use it to apply the same limits the same way every time: the window arithmetic is exact and repeatable. It computes over the history, the limits and the clock passed in, and enforces nothing by itself — when the caller writes those inputs the verdict is advisory, so a limit that must hold belongs where the caller cannot edit it: in the policy of the tool that moves the money, such as transaction_policy for EvmSendTransaction.",
   inputSchema: z.object({
     proposed: z.object({ amountMinor: minorUnits, counterparty: z.string().optional() }),
     history: z
@@ -334,15 +343,24 @@ export const spendLimitCheck: RegisteredTool = buildTool({
       knownCounterpartiesOnly: z.boolean().optional(),
       knownCounterparties: z.array(z.string()).max(10_000).optional(),
     }),
-    now: instantField.optional().describe("overrides the real clock, for tests and replays"),
+    now: instantField.optional().describe(CLOCK_OVERRIDE),
   }),
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
     const nowMs = input.now === undefined ? Date.now() : parseInstant(input.now, "now");
-    return json(
-      checkSpendLimit(input.proposed, input.history as ReadonlyArray<Spend>, input.limits, nowMs),
-    );
+    return json({
+      ...checkSpendLimit(
+        input.proposed,
+        input.history as ReadonlyArray<Spend>,
+        input.limits,
+        nowMs,
+      ),
+      // Said in the payload, where whoever acts on the verdict reads it.
+      clock: input.now === undefined ? "runtime" : "caller-supplied",
+      basis:
+        "the history and limits passed in this call; this verdict is only as binding as the record they came from",
+    });
   },
 });
 
@@ -371,7 +389,7 @@ export const refundAbuseCheck: RegisteredTool = buildTool({
         refundCount: z.number().int().nonnegative().optional(),
       })
       .optional(),
-    now: instantField.optional(),
+    now: instantField.optional().describe(CLOCK_OVERRIDE),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -397,7 +415,7 @@ export const webhookSignatureVerify: RegisteredTool = buildTool({
       .describe("NAME of the environment variable holding the signing secret, never the secret"),
     toleranceSeconds: z.number().int().positive().max(86_400).optional().describe("default 300"),
     scheme: z.string().optional().describe("default v1"),
-    now: instantField.optional(),
+    now: instantField.optional().describe(CLOCK_OVERRIDE),
   }),
   readOnly: true,
   concurrencySafe: true,

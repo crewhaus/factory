@@ -284,6 +284,50 @@ describe("SpendLimitCheck", () => {
     expect(result.allowed).toBe(false);
     expect(result.headroomMinor).toBe(20_000);
   });
+
+  test("it claims to compute a verdict, not to be a gate its caller cannot pass (C145)", () => {
+    // The history, the limits and the clock are all inputs, so a model that
+    // supplies them can pass any payment. 0.7.0 called this "the gate an
+    // unattended harness actually consults" and said its result "is a limit".
+    const text = spendLimitCheck.description;
+    expect({
+      consults: text.includes("actually consults"),
+      isALimit: text.includes("is a limit"),
+    }).toEqual({
+      consults: false,
+      isALimit: false,
+    });
+    expect(text).toContain("enforces nothing by itself");
+    expect(text).toContain("passed in");
+  });
+
+  test("the result says which clock the verdict used", async () => {
+    const input = {
+      proposed: { amountMinor: 1 },
+      history: [],
+      limits: { perDayMinor: 100 },
+    };
+    const live = await call<{ clock: string; basis: string }>(spendLimitCheck, input);
+    expect(live.clock).toBe("runtime");
+    expect(live.basis).toContain("passed in this call");
+    const replay = await call<{ clock: string }>(spendLimitCheck, {
+      ...input,
+      now: "2026-01-01T11:00:00Z",
+    });
+    expect(replay.clock).toBe("caller-supplied");
+  });
+
+  test("every tool's `now` says it is for tests and replays, not live decisions", () => {
+    for (const tool of [spendLimitCheck, refundAbuseCheck, webhookSignatureVerify]) {
+      const shape = (
+        tool.inputSchema as unknown as { shape: Record<string, { description?: string }> }
+      ).shape;
+      expect({ tool: tool.name, now: shape["now"]?.description }).toEqual({
+        tool: tool.name,
+        now: expect.stringContaining("omit it for a live decision"),
+      });
+    }
+  });
 });
 
 describe("RefundAbuseCheck", () => {

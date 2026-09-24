@@ -7103,7 +7103,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "spendLimitCheck",
     name: "SpendLimitCheck",
     description:
-      "Decide whether a proposed payment fits inside the operator's velocity, counterparty and quiet-hours limits, given what has already been spent. Use it as the gate an unattended harness actually consults before moving money: a limit a model is asked to respect is a suggestion, while one computed from the record of prior spend is a limit. It reports every limit the payment breaks rather than the first, and the headroom that would pass.",
+      "Check a proposed payment against velocity, counterparty and quiet-hours limits, given the payments already made, and report every limit it breaks rather than the first, plus the headroom that would pass. Use it to apply the same limits the same way every time: the window arithmetic is exact and repeatable. It computes over the history, the limits and the clock passed in, and enforces nothing by itself — when the caller writes those inputs the verdict is advisory, so a limit that must hold belongs where the caller cannot edit it: in the policy of the tool that moves the money, such as transaction_policy for EvmSendTransaction.",
     readOnly: true,
     destructive: false,
     scope: "internal",
