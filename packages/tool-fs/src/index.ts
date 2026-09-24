@@ -1,26 +1,16 @@
-import { randomBytes } from "node:crypto";
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readSync,
-  readlinkSync,
-  realpathSync,
-} from "node:fs";
-import { rename, unlink } from "node:fs/promises";
+import { closeSync, lstatSync, readlinkSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { type SafeFsFailure, openForReadFd, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import {
   type RegexRejectCode,
   describeRegexOutcome,
   openRegexSession,
   screenUserRegex,
 } from "@crewhaus/tool-safety/regex";
-import { readFileBoundedSync } from "@crewhaus/tool-safety/streams";
+import { readFileBoundedSync, readOpenedFileSync } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { renderEditDiff } from "./diff";
 
@@ -140,44 +130,108 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
     if (err instanceof ToolPermissionError) throw err;
     throw new ToolPermissionError(toolName, rel);
   }
-  // Return the validated REAL path, not the lexical one: I/O on the realpath
-  // (with any in-root symlinks already resolved) plus an O_NOFOLLOW open at the
-  // read site closes the check-to-use TOCTOU (CWE-367) — a leaf swapped to a
-  // symlink after this returns is rejected at open, while a legitimate in-root
-  // symlink (resolved here to its real target) still reads fine.
+  // Read, Write and Edit then do their I/O through tool-safety, which
+  // resolves the caller's path again, physically, and checks the open
+  // descriptor (reads) or the directory it wrote into (writes), so a leaf or
+  // directory swapped after this check is refused there. This check stays
+  // first so an escape is the same ToolPermissionError it always was.
   return real;
 }
 
 /**
- * Read a resolveSafe-validated file with O_NOFOLLOW. If the final path
- * component was swapped to a symlink after the containment check, the open
- * fails (ELOOP) and we reject rather than follow it out of the workspace.
- * (Residual: an intermediate-directory swap needs openat-style resolution,
- * which node does not expose — a much harder attack on a much smaller window.)
+ * The most bytes Read and Edit take in. A file is held whole in memory (as
+ * bytes, then as a string twice its size), so 0.7.0's uncapped read let one
+ * call on a multi-gigabyte log or a sparse file exhaust the process. The cap
+ * matches Grep's per-call budget. A tool result over 10 KB is already stored
+ * on disk and previewed by the runtime, so the cap is about memory, not about
+ * the model's context.
  */
-function readFileNoFollow(toolName: string, absPath: string): Buffer {
-  let fd: number;
+export const READ_MAX_BYTES = 64 * 1024 * 1024;
+let readMaxBytes = READ_MAX_BYTES;
+
+/** Test seam: a smaller Read/Edit cap, so the limit is exercised without a 64 MiB file. `undefined` restores. */
+export function _setReadMaxBytesForTest(bytes: number | undefined): void {
+  readMaxBytes = bytes ?? READ_MAX_BYTES;
+}
+
+/**
+ * Turn a tool-safety refusal into this package's error. An escape stays the
+ * `ToolPermissionError` every caller already matches on; anything else keeps
+ * the helper's reason, which names the caller's path and never where a link
+ * led.
+ */
+function fsError(toolName: string, given: string, failure: SafeFsFailure): Error {
+  if (failure.code === "escapes-root") return new ToolPermissionError(toolName, given);
+  return new CrewhausError("tool", `${toolName}: ${failure.reason}`);
+}
+
+const READ_TOO_LARGE_HINT =
+  "read part of it with a line-range tool (ReadLines, TailFile) if you have one, or search it with Grep";
+
+/** `size` undefined: the file grew past the cap while it was being read. */
+function tooLarge(toolName: string, given: string, size: number | undefined): Error {
+  const what =
+    size === undefined
+      ? `grew past the ${readMaxBytes}-byte limit while it was read`
+      : `is ${size} bytes, over the ${readMaxBytes}-byte limit`;
+  return new CrewhausError(
+    "tool",
+    `${toolName}: ${JSON.stringify(given)} ${what}; ${READ_TOO_LARGE_HINT}`,
+  );
+}
+
+/**
+ * Read a workspace file whole, as UTF-8, through tool-safety's contained
+ * open: the path is resolved physically and must land in the workspace, a
+ * FIFO, socket or device is refused BEFORE it is opened (opening a FIFO
+ * blocks the event loop until a writer appears, and no timeout or abort
+ * reaches a blocked open), and a leaf or directory swapped for a link out of
+ * the workspace is refused on the descriptor. A file over the cap is refused
+ * from its size before a byte is read; one that grows past it mid-read is
+ * refused too, never returned cut short.
+ */
+function readWorkspaceText(toolName: string, given: string): string {
+  const opened = openForReadFd(process.cwd(), given);
+  if (!opened.ok) throw fsError(toolName, given, opened);
   try {
-    fd = openSync(absPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
-      throw new ToolPermissionError(toolName, absPath);
+    if (opened.stats.size > readMaxBytes) throw tooLarge(toolName, given, opened.stats.size);
+    const r = readOpenedFileSync(
+      { ok: true, fd: opened.fd, stats: opened.stats },
+      { maxBytes: readMaxBytes },
+    );
+    if (!r.ok) {
+      throw new CrewhausError("tool", `${toolName}: ${JSON.stringify(given)} could not be read`);
     }
-    throw err;
-  }
-  try {
-    const { size } = fstatSync(fd);
-    const buf = Buffer.allocUnsafe(size);
-    let offset = 0;
-    while (offset < size) {
-      const n = readSync(fd, buf, offset, size - offset, offset);
-      if (n === 0) break;
-      offset += n;
-    }
-    return offset === size ? buf : buf.subarray(0, offset);
+    if (r.truncated) throw tooLarge(toolName, given, undefined);
+    return r.text;
   } finally {
-    closeSync(fd);
+    closeSync(opened.fd);
   }
+}
+
+/**
+ * Replace `given`'s content atomically, keeping its permission bits.
+ *
+ * tool-safety's writeFileSafe writes a temp created with O_EXCL|O_NOFOLLOW
+ * under a random name beside the file (at 0600 until it is complete) and
+ * renames it into place. 0.7.0 staged through `Bun.write`, which created the
+ * temp at 0644 and never restored the old mode: an edited script lost its
+ * execute bit and a 0600 `.env` became world-readable. A link at the leaf
+ * that stays inside the workspace is written through (the link stays a
+ * link), as before; one that leads out is refused.
+ */
+function writeWorkspaceText(
+  toolName: string,
+  given: string,
+  content: string,
+  createParents: boolean,
+): void {
+  const w = writeFileSafe(process.cwd(), given, content, {
+    overwrite: true,
+    createParents,
+    leafSymlink: "follow-contained",
+  });
+  if (!w.ok) throw fsError(toolName, given, w);
 }
 
 function rejectTraversalPattern(toolName: string, pattern: string): void {
@@ -238,8 +292,8 @@ export const read: RegisteredTool = buildTool({
   concurrencySafe: true,
   operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
-    const abs = resolveSafe("Read", input.path);
-    return readFileNoFollow("Read", abs).toString("utf8");
+    resolveSafe("Read", input.path);
+    return readWorkspaceText("Read", input.path);
   },
 });
 
@@ -252,15 +306,8 @@ export const write: RegisteredTool = buildTool({
   destructive: true,
   operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
-    const abs = resolveSafe("Write", input.path);
-    const tmp = `${abs}.tmp.${randomBytes(6).toString("hex")}`;
-    try {
-      await Bun.write(tmp, input.content);
-      await rename(tmp, abs);
-    } catch (err) {
-      await unlink(tmp).catch(() => {});
-      throw err;
-    }
+    resolveSafe("Write", input.path);
+    writeWorkspaceText("Write", input.path, input.content, true);
     return `wrote ${input.content.length} bytes to ${input.path}`;
   },
 });
@@ -278,8 +325,8 @@ export const edit: RegisteredTool = buildTool({
   destructive: true,
   operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
-    const abs = resolveSafe("Edit", input.path);
-    const original = readFileNoFollow("Edit", abs).toString("utf8");
+    resolveSafe("Edit", input.path);
+    const original = readWorkspaceText("Edit", input.path);
     const occurrences = original.split(input.oldString).length - 1;
     if (occurrences === 0) {
       throw new Error(`oldString not found in "${input.path}"`);
@@ -289,15 +336,14 @@ export const edit: RegisteredTool = buildTool({
         `oldString matches ${occurrences} times in "${input.path}" — provide more surrounding context to make it unique`,
       );
     }
-    const next = original.replace(input.oldString, input.newString);
-    const tmp = `${abs}.tmp.${randomBytes(6).toString("hex")}`;
-    try {
-      await Bun.write(tmp, next);
-      await rename(tmp, abs);
-    } catch (err) {
-      await unlink(tmp).catch(() => {});
-      throw err;
-    }
+    // Spliced by index, never `original.replace(oldString, newString)`: a
+    // string replacement expands `$$`, `$&`, `` $` `` and `$'` in newString,
+    // so a Makefile's `$$` or JS's "\\$&" was written as something else
+    // while the diff below showed the text the caller asked for.
+    const at = original.indexOf(input.oldString);
+    const next =
+      original.slice(0, at) + input.newString + original.slice(at + input.oldString.length);
+    writeWorkspaceText("Edit", input.path, next, false);
     // M3.3 — return a unified-diff style hunk so the CLI (and the model
     // on subsequent turns) can see exactly what changed. The header
     // line "edited <path>" stays first for backward compatibility with

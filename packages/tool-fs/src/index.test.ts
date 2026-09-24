@@ -1,13 +1,26 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   DEFAULT_IGNORED_DIRS,
+  READ_MAX_BYTES,
   ToolPermissionError,
   _setGrepLimitsForTest,
+  _setReadMaxBytesForTest,
   allFsTools,
   edit,
   glob,
@@ -28,6 +41,7 @@ beforeEach(() => {
 
 afterEach(() => {
   _setGrepLimitsForTest(undefined);
+  _setReadMaxBytesForTest(undefined);
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
 });
@@ -157,6 +171,140 @@ describe("Edit tool", () => {
     await expect(
       edit.execute({ path: "../escape.txt", oldString: "x", newString: "y" }),
     ).rejects.toBeInstanceOf(ToolPermissionError);
+  });
+});
+
+describe("Edit writes newString literally (C134)", () => {
+  // String.prototype.replace(string, string) expands $$, $&, $` and $' in the
+  // replacement: the file got something else while the diff showed newString.
+  const cases: ReadonlyArray<[string, string]> = [
+    ["$$ (a Makefile's escaped $)", "echo pid=$$"],
+    ["$& (the matched text)", 'x="$&"'],
+    ["$' (the text after the match)", "rest=$'"],
+    ["$` (the text before the match)", "head=$`"],
+    ["all of them, plus the group forms", "echo $$ [$&] [$`] [$'] $1 $<n>"],
+  ];
+  for (const [label, newString] of cases) {
+    test(`newString with ${label} lands on disk exactly as written`, async () => {
+      const before = "head\nPLACEHOLDER\ntail\n";
+      await writeFile(path.join(tmp, "f.sh"), before);
+      const result = await edit.execute({ path: "f.sh", oldString: "PLACEHOLDER", newString });
+      const after = readFileSync(path.join(tmp, "f.sh"), "utf8");
+      expect(after).toBe(`head\n${newString}\ntail\n`);
+      // No head or tail of the file was spliced in: the line count holds.
+      expect(after.split("\n").length).toBe(before.split("\n").length);
+      // The diff the caller sees is what is on disk.
+      expect(result).toContain(`+${newString}`);
+    });
+  }
+});
+
+describe("Write and Edit keep the file's permission bits (C213)", () => {
+  const posixOnly = process.platform !== "win32";
+
+  test.if(posixOnly)("an edited script stays executable", async () => {
+    writeFileSync(path.join(tmp, "run.sh"), "#!/bin/sh\necho hi\n");
+    chmodSync(path.join(tmp, "run.sh"), 0o755);
+    await edit.execute({ path: "run.sh", oldString: "hi", newString: "there" });
+    expect(statSync(path.join(tmp, "run.sh")).mode & 0o777).toBe(0o755);
+    expect(readFileSync(path.join(tmp, "run.sh"), "utf8")).toBe("#!/bin/sh\necho there\n");
+  });
+
+  test.if(posixOnly)("a private file stays private when rewritten", async () => {
+    writeFileSync(path.join(tmp, "secret.env"), "K=1\n");
+    chmodSync(path.join(tmp, "secret.env"), 0o600);
+    await write.execute({ path: "secret.env", content: "K=2\n" });
+    expect(statSync(path.join(tmp, "secret.env")).mode & 0o777).toBe(0o600);
+  });
+
+  test.if(posixOnly)(
+    "a new file still gets the usual 0666-minus-umask mode, not 0600",
+    async () => {
+      await write.execute({ path: "fresh.txt", content: "x" });
+      const umask = process.umask();
+      expect(statSync(path.join(tmp, "fresh.txt")).mode & 0o777).toBe(0o666 & ~umask);
+    },
+  );
+
+  test("nothing but the files themselves is left in the directory", async () => {
+    writeFileSync(path.join(tmp, "a.txt"), "one");
+    await write.execute({ path: "a.txt", content: "two" });
+    await edit.execute({ path: "a.txt", oldString: "two", newString: "three" });
+    await write.execute({ path: "b.txt", content: "new" });
+    expect(readdirSync(tmp).sort()).toEqual(["a.txt", "b.txt"]);
+  });
+
+  test("Write still creates missing parent directories, as 0.7.0 did", async () => {
+    await write.execute({ path: "deep/er/c.txt", content: "made" });
+    expect(readFileSync(path.join(tmp, "deep/er/c.txt"), "utf8")).toBe("made");
+  });
+
+  test("an in-workspace link is written through and stays a link", async () => {
+    writeFileSync(path.join(tmp, "real.md"), "old");
+    symlinkSync("real.md", path.join(tmp, "alias.md"));
+    await write.execute({ path: "alias.md", content: "new" });
+    expect(readFileSync(path.join(tmp, "real.md"), "utf8")).toBe("new");
+    expect(lstatSync(path.join(tmp, "alias.md")).isSymbolicLink()).toBe(true);
+  });
+});
+
+describe("Read and Edit read only regular files, and only so much (C074)", () => {
+  test.if(process.platform !== "win32")(
+    "a FIFO is refused before it is opened, so the call returns",
+    async () => {
+      const fifo = path.join(tmp, "pipe.txt");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      // A writer blocked in open() until someone opens the FIFO to read. If a
+      // tool wrongly opened it, this writer would unblock it (so a regression
+      // fails here instead of hanging the suite) and would then exit.
+      const writer = Bun.spawn(["sh", "-c", `printf x > '${fifo}'`], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      try {
+        await Bun.sleep(100);
+        await expect(read.execute({ path: "pipe.txt" })).rejects.toThrow(
+          /Read: "pipe\.txt" is a fifo, not a regular file; it was not opened/,
+        );
+        await expect(
+          edit.execute({ path: "pipe.txt", oldString: "x", newString: "y" }),
+        ).rejects.toThrow(/Edit: "pipe\.txt" is a fifo/);
+        await Bun.sleep(200);
+        // Nobody opened the FIFO: the writer is still waiting.
+        expect(writer.exitCode).toBeNull();
+      } finally {
+        writer.kill("SIGKILL");
+        await writer.exited;
+      }
+    },
+    10_000,
+  );
+
+  test("the cap is 64 MiB, the same budget Grep reads under", () => {
+    expect(READ_MAX_BYTES).toBe(64 * 1024 * 1024);
+  });
+
+  test("a file at the cap is read; one byte over is refused with its size", async () => {
+    _setReadMaxBytesForTest(16);
+    writeFileSync(path.join(tmp, "at.txt"), "x".repeat(16));
+    writeFileSync(path.join(tmp, "over.txt"), "x".repeat(17));
+    expect(await read.execute({ path: "at.txt" })).toBe("x".repeat(16));
+    await expect(read.execute({ path: "over.txt" })).rejects.toThrow(
+      /Read: "over\.txt" is 17 bytes, over the 16-byte limit; read part of it/,
+    );
+    // Edit refuses it too, and leaves it as it was.
+    await expect(
+      edit.execute({ path: "over.txt", oldString: "x".repeat(17), newString: "y" }),
+    ).rejects.toThrow(/Edit: "over\.txt" is 17 bytes, over the 16-byte limit/);
+    expect(readFileSync(path.join(tmp, "over.txt"), "utf8")).toBe("x".repeat(17));
+  });
+
+  test("a sparse file past the default cap is refused from its size, not read", async () => {
+    writeFileSync(path.join(tmp, "sparse.bin"), "");
+    truncateSync(path.join(tmp, "sparse.bin"), 4 * 1024 * 1024 * 1024);
+    await expect(read.execute({ path: "sparse.bin" })).rejects.toThrow(
+      /is 4294967296 bytes, over the 67108864-byte limit/,
+    );
   });
 });
 
