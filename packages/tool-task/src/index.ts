@@ -417,6 +417,15 @@ function buildChildCatalog(
   return parentTools.filter((t) => allowlist.has(t.name));
 }
 
+/** The definition with its `tools` mapped to registered names (`read` → `Read`). */
+function withRegisteredToolNames(def: SubAgentDefinition): SubAgentDefinition {
+  if (def.tools === undefined) return def;
+  const tools = def.tools.map((n) => registeredToolName(n) ?? n);
+  // Already canonical (every spec-declared definition is, since lowering maps
+  // it): hand back the same object.
+  return tools.every((n, i) => n === def.tools?.[i]) ? def : { ...def, tools };
+}
+
 /** Definitions whose ignored allow list has already been reported. */
 const reportedIgnoredAllows = new Set<string>();
 
@@ -488,6 +497,12 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       let fromDisk: boolean;
       try {
         ({ def, fromDisk } = resolveSubAgent(input.subagent_type, opts));
+        // One spelling for everything below: the child catalog AND a
+        // `scoped` rule filter both match registered names (`Bash`), and a
+        // permission glob is case-sensitive. A spec key left raw here would
+        // give the child the tool while scoping away the parent's rules for
+        // it — so map before either reads the list.
+        def = withRegisteredToolNames(def);
       } catch (err) {
         return `[Task error] ${(err as Error).message}`;
       }

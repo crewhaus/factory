@@ -414,6 +414,59 @@ Do what the prompt says.`,
     }
   });
 
+  test("a spec key in a scoped definition keeps the parent's rules for that tool", async () => {
+    const root = newTempDir();
+    const subAgentDir = join(root, "subs");
+    mkdirSync(subAgentDir, { recursive: true });
+    // `bash` (the spec key), scoped: the child must get Bash AND the parent's
+    // Bash rules — a case-sensitive rule filter on the raw key would give it
+    // the tool with the rules scoped away.
+    writeFileSync(
+      join(subAgentDir, "runner.md"),
+      "---\nname: runner\ndescription: d\ntools: [bash]\npermissions: scoped\n---\nRun it.",
+    );
+    try {
+      let captured: SpawnSubAgentOptions | undefined;
+      const spawn: SpawnSubAgentFn = mock(async (_p, opts) => {
+        captured = opts;
+        return {
+          finalMessage: "ok",
+          transcript: [],
+          toolCalls: [],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      });
+      const { bridge, close } = await makeBridge(root, spawn, [makeBashTool()]);
+      const deny = {
+        type: "alwaysDeny" as const,
+        pattern: "Bash(curl**)",
+        source: "yaml" as const,
+      };
+      const guarded: RuntimeBridge = {
+        ...bridge,
+        permissionRules: { ...emptyRuleSet, yaml: [deny], builtin: [...BUILTIN_DEFAULT_RULES] },
+      };
+      await createTaskTool({ subAgentDir }).execute(
+        { description: "x", prompt: "y", subagent_type: "runner" },
+        { bridge: guarded },
+      );
+      if (captured === undefined) throw new Error("spawnSubAgent was not called");
+      expect(captured.childTools.map((t) => t.name)).toEqual(["Bash"]);
+      const curl = {
+        toolName: "Bash",
+        input: { command: "curl https://x.test" },
+        readOnly: false,
+        destructive: false,
+      };
+      expect(
+        evaluateWithReason(curl, captured.permissionMode, captured.permissionRules).decision,
+      ).toBe("deny");
+      await close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("an operator-written inline definition keeps its replace-mode allow list", async () => {
     const root = newTempDir();
     try {
