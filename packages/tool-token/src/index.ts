@@ -420,6 +420,7 @@ const CONCERNING_FLAGS: ReadonlySet<string> = new Set([
 
 export const tokenResolve: RegisteredTool = buildTool({
   name: "TokenResolve",
+  operativeArgs: [{ field: "query", kind: "text", within: "chainId" }],
   description:
     "Turn a token symbol, name or address into ONE checksummed address, confirmed against the contract itself — or refuse and show you why. Use it before any transfer, balance read or approval, because a symbol is not an identifier: nothing stops a second contract calling itself USDC with six decimals and a convincing name, and reputable token lists carry different addresses for the same ticker. When a query could mean more than one address this returns EVERY candidate with resolved:false rather than the first hit or a most-likely, because picking between them is a decision with a wrong answer that costs money. Symbols that differ only by a Cyrillic lookalike or a zero-width space are pulled into the same candidate set on purpose, so an impostor a literal match would miss becomes an ambiguity you have to look at. The contract's own decimals and symbol are compared against what the lists claim, and a decimals mismatch is a refusal rather than a footnote.",
   inputSchema: z
@@ -691,6 +692,7 @@ export const tokenResolve: RegisteredTool = buildTool({
 
 export const erc20Balance: RegisteredTool = buildTool({
   name: "Erc20Balance",
+  operativeArgs: [{ field: "token", kind: "id", within: "chainId" }],
   description:
     "Read ERC-20 balances, and optionally an allowance, for one or many accounts at one block — with the token's decimals taken from the CONTRACT, never from a list and never defaulted. Use it instead of a raw eth_call: every amount comes back both as exact base units and as a decimal string, so a uint256 never becomes a JS number and eighteen digits of precision never quietly become fifteen. A token whose decimals() reverts is reported as unknown and its balances stay in base units rather than being scaled by an assumed 18, which is how a six-decimal transfer becomes a trillion-fold one. Tokens that answer symbol() with a bytes32 instead of a string — MKR and other 2017-era contracts — are decoded rather than crashed on, and an address with no code at it is refused instead of reporting everyone's balance as zero. Pass \"native\" as the token to read the chain's own currency in the same snapshot. It takes a contract ADDRESS, not a symbol: use TokenResolve first.",
   inputSchema: z
@@ -921,6 +923,10 @@ const INTERFACE_KEYS = {
 
 export const erc721TokenInfo: RegisteredTool = buildTool({
   name: "Erc721TokenInfo",
+  operativeArgs: [
+    { field: "contract", kind: "id", within: "chainId" },
+    { field: "ipfsGateway", kind: "url" },
+  ],
   description:
     "Read one NFT: which standard the contract actually implements, the collection's name and symbol, who owns the token (or an ERC-1155 holder's balance of it), and its tokenURI. Use it to check what an NFT is before buying, listing or transferring it. Metadata is read ONLY when it costs no trust: a data: URI is decoded in-process, an ipfs: URI is fetched through a gateway YOU named, and an https: URI only from a host YOU allow-listed — a URL that came out of contract data is not a reason to dial it, and following one is a server-side request forgery with extra steps. The answer lists every URI it read and every one it skipped, with the reason. ERC-1155's {id} placeholder is substituted with the 64-hex-digit zero-padded form the spec requires and almost everyone gets wrong, ERC-1155 has no ownerOf so ownership is answered as a balance or not at all rather than as a misleading null, and a contract that claims to support the invalid interface id is reported as one whose supportsInterface answers mean nothing.",
   inputSchema: z

@@ -541,6 +541,7 @@ function cachedNow(d: Discovery, peer: string, now: number): boolean {
 
 export const federationDiscover: RegisteredTool = buildTool({
   name: "FederationDiscover",
+  operativeArgs: [{ field: "peers", kind: "recipient" }],
   description:
     "Look up federation peers and report which of them are actually reachable. Each peer comes back as exactly one of: healthy (it answered with a well-formed peer record and everything you pinned held), unhealthy (it answered, and its answer is wrong — read the reason), unreachable (nothing came back), refused (a guard stopped the request, so nothing at all is known about that peer) or undetermined (the sweep was cut short before that peer's turn). A peer that did not answer is never reported as absent and never as present. It reaches the network over HTTPS to each peer's /.well-known/crewhaus.json: loopback, link-local, RFC1918 and metadata-service addresses are refused, the vetted IP is what gets dialled, redirects are not followed, and the endpoint a peer advertises is vetted too and reported — because that is the address anything federating with it dials next. It makes no federation call, so healthy means resolvable and self-describing, not able to serve traffic. A pin whose key names no peer in this sweep is listed under `pinsNotApplied` rather than dropped.",
   inputSchema: federationDiscoverSchema,

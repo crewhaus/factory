@@ -72,6 +72,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every builtin that changes something or reaches outside now says which
+  argument a rule is about**, so scoped rules work on all of them, not only
+  the file and shell tools. `HttpRequest(https://api.example.com/**)` is about
+  the URL, `RunCommand(git status)` about the command, `EmailSend(*@example.com)`
+  about every recipient, `IssueCreate(crewhaus/*)` about the repository,
+  `GitAdd(src/**)` about the files (read from the tool's `cwd`). Before, an
+  argument pattern had to match every string in the call — a request body, a
+  commit message — so most scoped allows never matched and the call was asked
+  about; they now match as written. A pattern aimed at something that is not
+  where the tool acts, such as a message body, no longer matches: deny the
+  tool, or deny its destination, instead. `crewhaus lint` points out such
+  rules.
 - **MCP tools are named `mcp__<server>__<tool>`**, the name the docs have
   always used; they were registered as `<server>__<tool>`. This is the name
   the model now sees. Permission rules, model-profile `deny`/`ask`, skill and

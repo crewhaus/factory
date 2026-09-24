@@ -390,6 +390,10 @@ const putSchema = z.object({
 
 export const datasetPut: RegisteredTool = buildTool({
   name: "DatasetPut",
+  operativeArgs: [
+    { field: "registryDir", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Write samples to the dataset registry as a new, auto-bumped, immutable version, keeping every existing row in the split it is already in. Use it to grow an eval dataset without invalidating the baselines keyed on it: the result names every row that changed split (none, in the default mode) and every row the previous version had that this one drops. It never overwrites a version and never deletes one; it reports PII/secret hit counts in what it wrote without ever echoing a match, and dryRun resolves the same version, splits and content hash the real call would write.",
   inputSchema: putSchema,

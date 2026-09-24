@@ -367,6 +367,10 @@ function readLog(toolName: string, root: SafePath, dir: string, name: string): L
 
 export const kvSet: RegisteredTool = stateTool({
   name: "KvSet",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "key", kind: "id", within: "namespace" },
+  ],
   description:
     "Store a JSON value under a key in a namespace, with an optional TTL and an optional compare-and-set on the current version. Use it to remember something across turns, runs or agents; pass `expectedVersion` when another agent might be writing the same key and the write is refused rather than clobbering theirs.",
   inputSchema: z.object({
@@ -517,6 +521,10 @@ export const kvGet: RegisteredTool = stateTool({
 
 export const kvDelete: RegisteredTool = stateTool({
   name: "KvDelete",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "key", kind: "id", within: "namespace" },
+  ],
   description:
     "Delete a key, optionally only while it is still at the version you read. Use it to release a claim or drop state you are finished with; deleting a key that is not there is reported, not an error.",
   inputSchema: z.object({
@@ -660,6 +668,10 @@ function isCounter(value: unknown): value is CounterRecord {
 
 export const counterIncrement: RegisteredTool = stateTool({
   name: "CounterIncrement",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Add to a durable named counter and return the new value, optionally refusing to cross a limit. Use it for attempt counts, quotas and budgets that must survive a restart; the read-modify-write runs under a lock, so two agents incrementing at once both count.",
   inputSchema: z.object({
@@ -822,6 +834,10 @@ function versionFileName(version: number): string {
 
 export const checkpointSave: RegisteredTool = stateTool({
   name: "CheckpointSave",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Save a named JSON checkpoint as a new numbered version, so a long flow can be resumed after a crash or a restart. Use it at each stage boundary; earlier versions are kept unless you set `keep`, and `expectedVersion` refuses the save when somebody else checkpointed in the meantime.",
   inputSchema: z.object({
@@ -1020,6 +1036,10 @@ export const checkpointList: RegisteredTool = stateTool({
 
 export const journalAppend: RegisteredTool = stateTool({
   name: "JournalAppend",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "stream", kind: "id" },
+  ],
   description:
     "Append one entry to an append-only JSONL stream and return its monotonic sequence number. Use it to record what happened, in order, so a later run or a reviewer can replay it; the sequence is allocated under a lock and the line written with O_APPEND, so concurrent writers never interleave.",
   inputSchema: z.object({
@@ -1131,6 +1151,10 @@ export const journalRead: RegisteredTool = stateTool({
 
 export const blackboardPost: RegisteredTool = stateTool({
   name: "BlackboardPost",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "topic", kind: "id" },
+  ],
   description:
     "Post a note to a shared topic that other crew members can read. Use it to leave findings, claims or warnings for agents working the same problem — it is a durable pinboard, not a delivery mechanism, so nobody is notified and nobody is guaranteed to read it.",
   inputSchema: z.object({
@@ -1276,6 +1300,10 @@ function isNote(value: unknown): value is NoteRecord {
 
 export const noteWrite: RegisteredTool = stateTool({
   name: "NoteWrite",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "id", kind: "id" },
+  ],
   description:
     "Write or overwrite a durable note under an id, with an optional title and tags. Use it to keep what the crew learned — a convention, a workaround, an answer worth not deriving twice — somewhere NoteSearch can find it again.",
   inputSchema: z.object({
@@ -1446,6 +1474,10 @@ export const noteSearch: RegisteredTool = stateTool({
 
 export const indexBuild: RegisteredTool = stateTool({
   name: "IndexBuild",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Build a named inverted index over a list of workspace text files, so they can be searched without a model reading them. Use it once per corpus and re-run it when the files change — the index is a snapshot and watches nothing; binary and over-large files are skipped and reported rather than mangled.",
   inputSchema: z.object({
@@ -1738,6 +1770,7 @@ export const stateExport: RegisteredTool = stateTool({
 
 export const stateImport: RegisteredTool = stateTool({
   name: "StateImport",
+  operativeArgs: [{ field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR }],
   description:
     "Restore a state directory from a StateExport document, merging into what is there or replacing it. Use it to seed a fresh workspace or roll state back; `dryRun` reports exactly what would be written first, every entry path is checked for escapes before anything is created, and 'replace' refuses any directory holding anything this package did not put there, so it can never be pointed at a source tree.",
   inputSchema: z.object({
@@ -1843,6 +1876,10 @@ export const stateImport: RegisteredTool = stateTool({
 
 export const dedupeMark: RegisteredTool = stateTool({
   name: "DedupeMark",
+  operativeArgs: [
+    { field: "stateDir", kind: "path" },
+    { field: "scope", kind: "id" },
+  ],
   description:
     "Record that an external id has been handled, and say whether it had been seen before. Use it as the guard in front of anything that must not happen twice — sending a mail, charging a card, filing a ticket — because a retried run marks the same id and gets `alreadySeen: true` instead of doing it again.",
   inputSchema: z.object({
@@ -1917,6 +1954,7 @@ export const dedupeMark: RegisteredTool = stateTool({
 
 export const vectorDelete: RegisteredTool = stateTool({
   name: "VectorDelete",
+  operativeArgs: [{ field: "ids", kind: "id" }],
   description:
     "Delete entries from the registered vector store by id, reporting how many deletes were ATTEMPTED and what the store's count was before and after. Use it to erase indexed content on request, and read the result exactly as it is worded: the store offers no way to ask whether an id exists, so nothing here can tell you an id was present or is now gone, and on an eventually-consistent backend `countAfter` is one indicative observation rather than proof.",
   inputSchema: z.object({

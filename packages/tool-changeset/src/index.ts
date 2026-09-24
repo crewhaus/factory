@@ -69,6 +69,7 @@ const ruleIdField = z.enum(RULE_IDS);
 
 export const diffLint: RegisteredTool = buildTool({
   name: "DiffLint",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
     "Run a policy pass over ONLY the added lines of a change set: focused tests, debugger statements, console.log, committed merge-conflict markers, new @ts-ignore, TODOs with no ticket, machine-specific absolute paths, CRLF, and files that added more than they should. Use it before committing or opening a pull request, in place of reading a diff and hoping to notice. Every finding carries the line number in the NEW file, so it can be fixed without re-reading anything. Give it `diff` text if you already have the patch; otherwise it runs `git diff` for you. The commented-out-code rule is a heuristic and is off unless you enable it.",
   inputSchema: z.object({

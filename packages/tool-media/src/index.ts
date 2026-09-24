@@ -511,6 +511,7 @@ const colorTypeField = z
 
 export const pngWrite: RegisteredTool = buildTool({
   name: "PngWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Encode raw RGBA pixels as a valid PNG file, choosing the smallest lossless colour type by default. Use to write out an image a tool or a script has computed pixel by pixel, without adding an image library to the project.",
   inputSchema: z.object({
@@ -559,6 +560,10 @@ export const pngWrite: RegisteredTool = buildTool({
 
 export const imageResize: RegisteredTool = buildTool({
   name: "ImageResize",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Resize a PNG to a new size and write it out as a PNG, stating the resampling method used. Use to produce a thumbnail or a fixed-width asset; pass only a width or only a height to keep the aspect ratio.",
   inputSchema: z.object({
@@ -612,6 +617,10 @@ export const imageResize: RegisteredTool = buildTool({
 
 export const imageCrop: RegisteredTool = buildTool({
   name: "ImageCrop",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Cut a rectangle out of a PNG and write it out as a PNG. Use to isolate a region of a screenshot — the part a diff flagged, or one panel of a wider capture — before comparing or reading it.",
   inputSchema: z.object({
@@ -645,6 +654,10 @@ export const imageCrop: RegisteredTool = buildTool({
 
 export const exifStrip: RegisteredTool = buildTool({
   name: "ExifStrip",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality.",
   inputSchema: z.object({
@@ -689,6 +702,7 @@ export const exifStrip: RegisteredTool = buildTool({
 
 export const qrEncode: RegisteredTool = buildTool({
   name: "QrEncode",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Generate a QR code from text, as a PNG file or as a text matrix, with a chosen error-correction level. Use to turn a URL, a Wi-Fi string or a payload into a scannable code without a service call; versions 1 to 10 are supported, which is up to 271 bytes at level L.",
   inputSchema: z.object({
@@ -774,6 +788,7 @@ export const qrEncode: RegisteredTool = buildTool({
 
 export const barcodeEncode: RegisteredTool = buildTool({
   name: "BarcodeEncode",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Generate a Code 128 or EAN-13 barcode, as a PNG file or as the raw module pattern, computing the check digit. Use for a label, a product code or an asset tag; EAN-13 accepts twelve digits and computes the thirteenth, or thirteen and verifies it.",
   inputSchema: z.object({
@@ -885,6 +900,7 @@ function emitSvg(
 
 export const chartRender: RegisteredTool = buildTool({
   name: "ChartRender",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Render bar, line, scatter or pie data as an SVG chart with axes, ticks, labels and a legend. Use to turn a query result or a metric series into a picture for a report; the layout is fixed arithmetic, so the same data always produces the same bytes.",
   inputSchema: z.object({
@@ -992,6 +1008,7 @@ export const sparklineRender: RegisteredTool = buildTool({
 
 export const diagramRender: RegisteredTool = buildTool({
   name: "DiagramRender",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Render a node and edge list as a box-and-arrow SVG diagram with a layered layout. Use for a pipeline, a state machine or a service sketch; nodes are placed by layer and declaration order, so the same graph always draws the same, and edges that close a cycle are drawn dashed and reported.",
   inputSchema: z.object({
@@ -1175,6 +1192,7 @@ export const subtitleParse: RegisteredTool = buildTool({
 
 export const subtitleWrite: RegisteredTool = buildTool({
   name: "SubtitleWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write cues out as SRT or WebVTT, optionally shifting every time and re-wrapping the text. Use to fix a track that runs early or late, to convert between the two formats, or to re-wrap long lines to a readable width.",
   inputSchema: z.object({
@@ -1238,6 +1256,7 @@ export const subtitleWrite: RegisteredTool = buildTool({
 
 export const mediaProbe: RegisteredTool = buildTool({
   name: "MediaProbe",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Probe an audio or video file with ffprobe and return its duration, streams, codecs, resolution and bitrate as structured data. Use to learn what a media file actually contains before transcoding or embedding it; ffprobe must be installed, and the tool says so plainly when it is not.",
   inputSchema: z.object({

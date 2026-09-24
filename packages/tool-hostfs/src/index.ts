@@ -341,6 +341,7 @@ function platformRefusal(platform: HostPlatform): string | undefined {
 
 export const trashPath: RegisteredTool = buildTool({
   name: "TrashPath",
+  operativeArgs: [{ field: "paths", kind: "path" }],
   description:
     "Move paths into the operating system's trash, where they can be restored, instead of unlinking them. Use it wherever a harness would otherwise delete something it might want back. LINUX ONLY: it implements the FreeDesktop trash specification — a .trashinfo record naming the original location and the deletion time, the name claimed atomically, and the file MOVED, never copied. It refuses on macOS and Windows rather than approximating, because the only honest implementations there need an OS API this package cannot reach, and a 'trash' that quietly unlinks is worse than no trash at all. A path on a different filesystem from its trash is refused with that reason unless the volume's own top-level trash can be used, because a rename cannot cross a filesystem and a copy is not a trash. Ambiguous input — the same path twice, or a path nested inside another path in the same call — is refused rather than guessed at. Pass dryRun to see exactly what would move, planned by the same code that performs the move.",
   inputSchema: z.object({
@@ -459,6 +460,7 @@ type IndexReport = {
 
 export const osIndexSearch: RegisteredTool = buildTool({
   name: "OsIndexSearch",
+  operativeArgs: [{ field: "roots", kind: "path", default: "." }],
   description:
     "Search the file index the operating system already maintains — Spotlight on macOS, plocate/locate on Linux — for paths inside the workspace. Use it to find a file by name, or (macOS only) by content, across a large tree without walking it. NAMED OsIndexSearch to keep it distinct from IndexSearch, which is BM25 retrieval over an index a harness builds for itself; this one queries the machine's index and builds nothing. A stale, disabled or missing index is reported as its own outcome, never as 'no matches': an empty answer from an index that was never built is a false negative a caller acts on. An empty answer the tool could not CHECK — the index's state could not be determined, or the backend's output was cut off — is 'noMatchesUnverified', which is not evidence that the file is absent. Results are filtered to the search roots AFTER the backend answers, because the backends' own scoping differs and plocate has none, and the limit is applied after that filtering so out-of-scope hits cannot eat the allowance. Content search is refused on Linux, where the locate database indexes names only. The query is matched as a substring; * and ? are wildcards on both backends.",
   inputSchema: z.object({

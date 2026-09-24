@@ -710,6 +710,7 @@ function specNameOf(events: readonly ObsEvent[]): string | undefined {
 
 export const incidentBundle: RegisteredTool = buildTool({
   name: "IncidentBundle",
+  operativeArgs: [{ field: "out", kind: "path" }],
   description:
     "Assemble one failed run's events, clustered errors, tool statistics and spec name into a single contained JSON file a human can be handed. Use it at the end of a triage pass so the findings leave the context window as a durable artefact instead of being re-derived by the next reader. The output path goes through workspace containment like every other path here, and the write refuses an existing file unless overwrite is set, so a second bundle never silently replaces the first. It records no timestamp of its own: pass nowMs if the bundle should say when it was made, because a tool that read the clock would produce a different file from the same log every time.",
   inputSchema: z.object({
@@ -917,6 +918,10 @@ function endsWithoutNewline(real: string, size: number, shown: string): Loaded<b
 
 export const emitTraceEvent: RegisteredTool = buildTool({
   name: "EmitTraceEvent",
+  operativeArgs: [
+    { field: "dir", kind: "path" },
+    { field: "sessionId", kind: "id" },
+  ],
   description:
     "Append one custom event to a harness's own JSONL session log, so a workflow that never calls a model still leaves a record EventQuery, EventCounts and RunTimeline can read back. Use it to mark what a tool-only run did — a milestone reached, a threshold crossed, a check that passed — at the moment it happened, rather than leaving a human to infer it from side effects. The event is written in the runtime's own wire shape but under the kind custom.<name>, a namespace no runtime event can occupy, and the payload records whether a live run context supplied the attribution or the caller merely claimed it, so a line a tool wrote is never mistaken for a line the runtime wrote. Your own fields are nested one level down where no kind-agnostic reader will read them as the runtime's, control characters and invisible or direction-changing text are refused rather than escaped, and the finished line is capped; it records no time of its own, so pass tsMs for the event to carry one.",
   inputSchema: z.object({
@@ -1303,6 +1308,7 @@ function httpFailure(surface: string, result: Extract<RemoteResult, { ok: true }
 
 export const metricsQuery: RegisteredTool = buildTool({
   name: "MetricsQuery",
+  operativeArgs: [],
   description:
     "Run a Prometheus-style instant or range query against the allow-listed metrics endpoint and return the matching series with their labels. Use it to answer a question about a live system from its own metrics instead of guessing from logs. It speaks the Prometheus HTTP API, which is a format rather than a product — Thanos, Cortex, Mimir, VictoriaMetrics and Grafana all serve it — and the query goes in a POST form body so it stays out of the URL and out of any proxy's access log. Evaluation time is an input, never the clock: an instant query with no timeSec asks the server for its own now, which is the one value that cannot be made deterministic, and sample values are returned as strings so NaN, +Inf and full float precision all survive.",
   inputSchema: z.object({
@@ -1398,6 +1404,7 @@ export const metricsQuery: RegisteredTool = buildTool({
 
 export const logsQuery: RegisteredTool = buildTool({
   name: "LogsQuery",
+  operativeArgs: [],
   description:
     "Query a log platform through the endpoint, parameter names and result path declared in the obs tool_config block, returning a bounded, field-projected page of records. Use it to search a production log store from a harness without hard-coding a vendor into the tool. Nothing here knows what Loki, Elasticsearch or CloudWatch call their parameters: the spec maps query, start, end and limit to whatever this platform names them, states the time format it wants, and names the dot path to the records inside the response. Every field is stringified and cut to a budget, because one verbose log field repeated across a hundred hits is an entire context window.",
   inputSchema: z.object({
@@ -1501,6 +1508,7 @@ export const logsQuery: RegisteredTool = buildTool({
 
 export const alertList: RegisteredTool = buildTool({
   name: "AlertList",
+  operativeArgs: [],
   description:
     "List the alerts the configured alerting endpoint is currently reporting, bounded and field-projected. Use it to find out what is already firing before opening an incident or acknowledging anything. Like LogsQuery it is vendor-neutral: the endpoint, the path and the dot path to the alert array all come from the obs tool_config block, and any extra query parameters the platform needs are declared there too. It reads only — acknowledging an alert is AlertAck, which is a separate, justification-gated tool.",
   inputSchema: z.object({
@@ -1591,6 +1599,7 @@ export const alertList: RegisteredTool = buildTool({
 
 export const alertAck: RegisteredTool = buildTool({
   name: "AlertAck",
+  operativeArgs: [{ field: "alertId", kind: "id" }],
   description:
     "Acknowledge one alert through the configured acknowledgement endpoint, recording who acknowledged it and why. Use it to silence a page a harness has confirmed it is already handling, never to make a dashboard look quieter. This mutates state on a system other people are watching and can stop a human being paged, so it is destructive and justification-gated; the alert id is substituted into the configured path template and sent as a JSON body alongside any static fields the spec declares. It does not resolve, close or delete an alert, and it does not create a silence rule — those are different operations with different blast radii and none of them are implemented here.",
   inputSchema: z.object({
@@ -1648,6 +1657,7 @@ export const alertAck: RegisteredTool = buildTool({
 
 export const statusPagePost: RegisteredTool = buildTool({
   name: "StatusPagePost",
+  operativeArgs: [{ field: "incidentId", kind: "id" }],
   description:
     "Publish an incident update to the configured status page endpoint. Use it only when a human has decided the incident should be announced, because what this writes is read by customers. It is destructive and justification-gated for that reason: a status page post is public the moment it lands, cannot be unpublished by this tool, and is frequently the first thing anyone outside the team learns about an outage. The endpoint, the path (with {id} substituted when updating an existing incident) and any static fields come from the obs tool_config block, so nothing about a particular status-page vendor is baked in here.",
   inputSchema: z.object({
@@ -1723,6 +1733,7 @@ export const statusPagePost: RegisteredTool = buildTool({
 
 export const healthProbe: RegisteredTool = buildTool({
   name: "HealthProbe",
+  operativeArgs: [{ field: "urls", kind: "url" }],
   description:
     "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have. The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
   inputSchema: z.object({

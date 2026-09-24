@@ -184,6 +184,7 @@ function outcomeJson(outcome: Awaited<ReturnType<typeof runOnce>>): Record<strin
 
 export const runCommand: RegisteredTool = buildTool({
   name: "RunCommand",
+  operativeArgs: [{ field: "argv", kind: "command" }],
   description:
     "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, and always has a timeout.",
   inputSchema: z.object({
@@ -220,6 +221,7 @@ export const runCommand: RegisteredTool = buildTool({
 
 export const runPipeline: RegisteredTool = buildTool({
   name: "RunPipeline",
+  operativeArgs: [{ field: "steps.argv", kind: "command" }],
   description:
     "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout.",
   inputSchema: z.object({
@@ -322,6 +324,7 @@ const backoffSchema = z
 
 export const retry: RegisteredTool = buildTool({
   name: "Retry",
+  operativeArgs: [{ field: "argv", kind: "command" }],
   description:
     "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported.",
   inputSchema: z.object({
@@ -447,6 +450,7 @@ function noSuchProc(toolName: string, id: string): string {
 
 export const processStart: RegisteredTool = buildTool({
   name: "ProcessStart",
+  operativeArgs: [{ field: "argv", kind: "command" }],
   description:
     "Start a program in the background from an argv array and return an id immediately, without waiting for it to finish. Use it for something that must outlive one tool call — a dev server, a watcher, a tail — then poll it with ProcessStatus and ProcessOutput and end it with ProcessStop. The process is killed if the harness exits, so a session never leaks children.",
   inputSchema: z.object({
@@ -496,6 +500,7 @@ export const processStatus: RegisteredTool = buildTool({
 
 export const processOutput: RegisteredTool = buildTool({
   name: "ProcessOutput",
+  operativeArgs: [],
   description:
     "Return what a background process has written since the last poll, and its current status. Use it to follow a long-running process incrementally instead of buffering everything until it exits. Each call advances a per-stream cursor, so output is returned exactly once — use ProcessStatus for a look that consumes nothing.",
   inputSchema: z.object({
@@ -530,6 +535,7 @@ export const processOutput: RegisteredTool = buildTool({
 
 export const processStop: RegisteredTool = buildTool({
   name: "ProcessStop",
+  operativeArgs: [],
   description:
     "Stop a background process: signal it, wait a bounded grace period, then SIGKILL it if it is still alive. Use it to end a dev server or watcher deterministically rather than leaving it running past the task. Pass reap to drop the entry entirely; otherwise it stays readable so its final output can still be collected.",
   inputSchema: z.object({
@@ -674,6 +680,7 @@ const HOSTNAME = /^[A-Za-z0-9._:-]+$/;
 
 export const waitForPort: RegisteredTool = buildTool({
   name: "WaitForPort",
+  operativeArgs: [{ field: "host", kind: "recipient", default: "127.0.0.1" }],
   description:
     "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline.",
   inputSchema: z.object({

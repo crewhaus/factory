@@ -153,6 +153,7 @@ function factsJson(facts: PackageFacts): Record<string, unknown> {
 
 export const packageQuery: RegisteredTool = buildTool({
   name: "PackageQuery",
+  operativeArgs: [{ field: "name", kind: "id" }],
   description:
     'Ask the system package manager whether a package is installed, at what version, and what its already-downloaded index says is available. Supports Homebrew, apt/dpkg, dnf/rpm, pacman, winget and chocolatey, detecting the manager from the platform unless you name one; a host with none of them is reported as unknown rather than guessed at. It makes NO network call: every answer comes from a local index, which is why winget and chocolatey report installed state only — their available version lives on a remote source. Nothing is ever defaulted: a manager that is not on this host, a probe that timed out, an empty dnf metadata cache or a winget row whose columns could not be split all come back as status "unknown" with the reason and the exact command that was run, never as "not installed". Read-only: it runs only query commands and changes nothing.',
   inputSchema: z.object({
@@ -264,6 +265,7 @@ function refusal(fields: {
 
 export const packageInstall: RegisteredTool = buildTool({
   name: "PackageInstall",
+  operativeArgs: [{ field: "name", kind: "id" }],
   description:
     "Install a package through the system package manager, or report exactly what installing it would do. DESTRUCTIVE: an install can replace a version that is already working, so the plan names the versions currently on disk before anything runs. Pass dryRun to get that plan and install nothing — it is resolved by the same code the real install uses, and includes the transitive packages the manager says it would add (complete from apt and pacman, resolved-then-declined from dnf, derived from `brew deps` for Homebrew, which has no dry run). THIS TOOL NEVER ACQUIRES PRIVILEGE. It runs no sudo, doas, runas or pkexec and raises no UAC prompt. Homebrew needs no root and is the case that genuinely works unattended; apt, dnf and pacman need root, so they work only when this process is ALREADY root and are otherwise refused with the exact command an operator would run themselves; winget and chocolatey installs are refused outright, because both end in an elevation prompt. A version can only be pinned where the manager can express one — apt can, and every other manager here is refused with the reason rather than quietly installing latest. A package name beginning with '-' is refused, because a manager would read it as a flag.",
   inputSchema: z.object({

@@ -290,6 +290,7 @@ const bashIdSchema = z.object({
 
 export const bashOutput: RegisteredTool = buildTool({
   name: "BashOutput",
+  operativeArgs: [],
   description:
     "Return the stdout/stderr a background Bash process has produced since the last poll, plus its status (running / exited with code / killed). Poll a `bash_id` from a `Bash({ background: true })` call.",
   inputSchema: bashIdSchema,
@@ -326,6 +327,7 @@ export const bashOutput: RegisteredTool = buildTool({
 
 export const killShell: RegisteredTool = buildTool({
   name: "KillShell",
+  operativeArgs: [],
   description:
     "Stop a background Bash process (SIGKILL) started with `Bash({ background: true })`. Pass its bash_id.",
   inputSchema: bashIdSchema,

@@ -185,6 +185,7 @@ async function pinBlock(
 
 export const priceQuote: RegisteredTool = buildTool({
   name: "PriceQuote",
+  operativeArgs: [],
   description:
     "Price one asset in another from a public, unauthenticated provider — the ECB's daily euro reference rates for currencies, Coinbase spot for everything else — and return the price with its provenance. Use it whenever a number will be reported to somebody: the result says which source answered, which fixing date it carries, and whether the price is a direct quote, an inversion of the pair the provider actually publishes, or a cross through an intermediate asset (and through which one, with both legs attached). It refuses a historical CRYPTO quote rather than serving one from a spot endpoint that echoes no date, because a price that cannot be told apart from today's must not be labelled as last Tuesday's; a historical currency rate comes from the ECB fixing for that date and says which fixing it resolved to. Nothing here signs or sends anything.",
   inputSchema: z
@@ -241,6 +242,10 @@ export const priceQuote: RegisteredTool = buildTool({
 
 export const oraclePriceRead: RegisteredTool = buildTool({
   name: "OraclePriceRead",
+  operativeArgs: [
+    { field: "feed", kind: "id" },
+    { field: "address", kind: "id", within: "chainId" },
+  ],
   description:
     "Read a Chainlink or Pyth price feed onchain at a pinned block and report the price with EACH FEED'S OWN freshness signal, under its own name. Use it instead of asking whether a feed is 'stale', because that word means two different things: a Chainlink aggregator updates on its heartbeat OR on a deviation threshold, so an unchanged price legitimately looks old and the real incomplete-round signal is answeredInRound being behind roundId — while Pyth's signal is the width of its confidence interval relative to the price, a different quantity entirely. Both are reported, plus the round data, the feed's own description and the publish time the feed itself states; there is deliberately no single boolean called stale. The heartbeat comparison only happens when you supply the heartbeat, because it is a property of the deployment that the aggregator will not tell you. This reads; it never signs or sends.",
   inputSchema: z
@@ -367,6 +372,7 @@ function requirePriceId(priceId: string | undefined): string {
 
 export const defiPositionRead: RegisteredTool = buildTool({
   name: "DefiPositionRead",
+  operativeArgs: [{ field: "contract", kind: "id", within: "chainId" }],
   description:
     "Read one Aave v3, Compound v3 or ERC-4626 position at a pinned block and normalise it into one row, with every figure labelled with the basis it is in. Use it because each protocol answers in its own units and the conversion is where the wrong number gets made: Aave reports in its oracle's base currency and returns type(uint256).max as the health factor of a debt-free account, Compound v3 has one borrowable asset and publishes its own liquidation verdict, and an ERC-4626 share is worth convertToAssets(shares) — not totalAssets/totalSupply, which differs for any vault with a fee. It reports how far the collateral basket may fall before the health factor reaches 1 rather than a liquidation price, because a liquidation price for an aggregate position depends on which collateral you assume moves. A protocol it cannot read is refused with what reading it would take, never probed. It reads; it never signs or sends.",
   inputSchema: z
@@ -490,6 +496,7 @@ const holdingSchema = z
 
 export const portfolioValuation: RegisteredTool = buildTool({
   name: "PortfolioValuation",
+  operativeArgs: [{ field: "wallet", kind: "id", within: "chainId" }],
   description:
     "Value a set of holdings in one currency at one pinned block and return the total, the priced holdings and the UNPRICED ones as three separate fields. Use it for any figure that will be reported: the unpriced bucket names every asset that could not be priced and why, so a total is never quietly the sum of whatever happened to have a price — which is the failure mode that makes a treasury number wrong in the direction that looks good. Amounts can be given, or read as ERC-20 and native balances for a wallet; prices can be given, read from a pinned oracle feed, or quoted from a public provider, and each priced row carries the provenance of its own price. Weights are stated as a share of the PRICED total. A historical valuation must pin both the block and the date, because a current balance multiplied by a historical price is a plausible number that means nothing. It reads; it never signs or sends.",
   inputSchema: z

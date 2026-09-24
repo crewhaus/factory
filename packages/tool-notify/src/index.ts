@@ -534,6 +534,7 @@ function renderMessage(
 
 export const chatPost: RegisteredTool = buildTool({
   name: "ChatPost",
+  operativeArgs: [{ field: "channel", kind: "recipient" }],
   description:
     "Post a message to Slack, Discord, Microsoft Teams or a generic incoming webhook, with optional heading/paragraph/fields/divider/link blocks and a thread id where the platform threads. Use it when a harness needs to tell a room something rather than reply where it was spoken to — a nightly result, an alert, a hand-off. Every value is escaped for the platform before it is sent, so text carrying <!channel>, @everyone or a code fence can change what the message SAYS but never what it DOES; mentions are additionally suppressed at the API level. One tool covers four platforms because the payload differs and the intent does not. It takes an idempotency key so a retried call returns the first result instead of posting twice, and it will not follow a redirect — a webhook URL that moved is a configuration change, not something to chase at send time.",
   inputSchema: z.object({
@@ -656,6 +657,7 @@ export const chatPost: RegisteredTool = buildTool({
 
 export const chatUpdate: RegisteredTool = buildTool({
   name: "ChatUpdate",
+  operativeArgs: [{ field: "channel", kind: "recipient" }],
   description:
     "Edit a message this harness already posted, by its id, on a platform that allows it. Use it to keep one status message current instead of adding a new one every cycle — a deploy that goes queued → running → done reads better as one edited line than as three. It needs a bot token: an incoming webhook cannot edit, and Teams and generic webhooks cannot edit at all, so both are refused rather than silently reposted. An edit still notifies nobody, but the message is in front of people, so it carries the same gate as posting. The previous text is not returned, because the platform does not give it back.",
   inputSchema: z.object({
@@ -743,6 +745,7 @@ export const chatUpdate: RegisteredTool = buildTool({
 
 export const chatDelete: RegisteredTool = buildTool({
   name: "ChatDelete",
+  operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
   description:
     "Remove a message this harness posted, by its id. Use it to retract something that was wrong, or to tidy a transient status line once the run is over. Deleting does not unsend: anyone watching the channel has already seen it, and on most platforms a tombstone or an audit entry remains, so this is a cleanup tool and not a way to take something back. It needs a bot token, works only where the platform supports deletion, and cannot delete a message this harness did not post unless the token's own permissions allow it.",
   inputSchema: z.object({
@@ -805,6 +808,7 @@ export const chatDelete: RegisteredTool = buildTool({
 
 export const chatReact: RegisteredTool = buildTool({
   name: "ChatReact",
+  operativeArgs: [{ field: "messageId", kind: "id", within: "channel" }],
   description:
     "Add an emoji reaction to a message, as the token's own user. Use it to acknowledge something cheaply — a ✅ on the alert that has been handled says as much as a reply and adds no noise. A reaction is visible to the room and shows who left it, so it counts as putting something in front of people and takes the same gate as a post. Give the emoji by name without colons on Slack, and as the literal character or name:id on Discord; an emoji the workspace does not have is refused by the platform, not invented here.",
   inputSchema: z.object({
@@ -1135,6 +1139,11 @@ export const emailCompose: RegisteredTool = buildTool({
 
 export const emailSend: RegisteredTool = buildTool({
   name: "EmailSend",
+  operativeArgs: [
+    { field: "to.address", kind: "recipient" },
+    { field: "cc.address", kind: "recipient" },
+    { field: "bcc.address", kind: "recipient" },
+  ],
   description:
     "Send a message over SMTP: EHLO, STARTTLS, AUTH, MAIL FROM, RCPT TO, DATA, written out rather than delegated. Use it when the thing to report belongs in somebody's inbox rather than in a chat room. STARTTLS is required by default and the session ends before the password is written if the server does not offer it; the credential is an environment variable NAME and the transcript records the AUTH line as redacted. Every recipient must match the operator's allow-list and the SMTP host must be one an operator named, both of which deny everything when unset. The whole session is deadline-bounded and the server's replies are byte-capped. It does not queue, retry, or track bounces — a refused recipient comes back named, and re-sending is the caller's decision.",
   inputSchema: z.object({
@@ -1588,6 +1597,7 @@ export const emailSendPreflight: RegisteredTool = buildTool({
 
 export const webhookPost: RegisteredTool = buildTool({
   name: "WebhookPost",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "POST a JSON payload to an allow-listed URL, optionally HMAC-signed, retrying only on 5xx and only on a backoff the call declares. Use it to hand an event to something that is not a chat platform — a pager, an internal receiver, a partner endpoint. Signing runs over the exact bytes transmitted, in either the timestamped (Stripe-style) or body-only (GitHub-style) scheme, and the timestamp is an argument rather than a clock reading so the same call signs the same way twice. The backoff is exponential with no jitter, because unseeded randomness makes a run unreproducible, and it never sleeps past the deadline. An idempotency key makes a retry safe end to end: the key travels to the receiver and a repeat call returns the first result instead of delivering again.",
   inputSchema: z.object({
@@ -1959,6 +1969,7 @@ async function runProviderSend(
 
 export const smsSend: RegisteredTool = buildTool({
   name: "SmsSend",
+  operativeArgs: [{ field: "to", kind: "recipient" }],
   description:
     "Send an SMS through a REST gateway the operator described in tool_config, rather than through a vendor this tool picked. Use it for the small number of notifications that must reach somebody who is not looking at a screen. The provider block names the endpoint, the auth environment variable and how the canonical fields to, body and from map onto that vendor's own names, so changing gateway is a config diff and not a release. An SMS costs money, arrives on a phone and cannot be recalled, so it is destructive, takes a justification, and takes an idempotency key that makes a retried call return the first result instead of sending a second message. It does not split a long message into parts or tell you what the carrier charged.",
   inputSchema: z.object({
@@ -2009,6 +2020,7 @@ export const smsSend: RegisteredTool = buildTool({
 
 export const pushNotify: RegisteredTool = buildTool({
   name: "PushNotify",
+  operativeArgs: [{ field: "to", kind: "recipient" }],
   description:
     "Send a push notification through a REST provider the operator described in tool_config. Use it to reach an app or a device when a chat message would not be seen in time. It works exactly as SmsSend does — the provider block maps the canonical fields to, title, body and data onto the vendor's names — so one configuration style covers both, and a provider with no title concept simply never receives one. A push lands on a lock screen, so it is destructive and takes a justification; the idempotency key makes a retry safe. It does not manage device tokens, topics or subscriptions, and it reports what the provider answered rather than whether anyone read it.",
   inputSchema: z.object({
@@ -2064,6 +2076,7 @@ export const pushNotify: RegisteredTool = buildTool({
 
 export const deliveryCheck: RegisteredTool = buildTool({
   name: "DeliveryCheck",
+  operativeArgs: [{ field: "messageId", kind: "id", within: "provider" }],
   description:
     "Ask a provider what became of a message it accepted earlier, where its API answers that question. Use it after SmsSend or PushNotify to tell 'the gateway took it' apart from 'the handset got it', which are not the same thing and are reported hours apart. It reads the statusEndpoint and statusPath the operator configured for that provider, substituting the message id into the URL, and it only reads — this is the one outbound tool here that is readOnly and needs no justification. A provider with no status endpoint configured is reported as such rather than guessed at, and an unknown id is whatever the provider says it is.",
   inputSchema: z.object({
@@ -2306,6 +2319,7 @@ function describeDkim(answer: DkimAnswer): Record<string, unknown> {
 
 export const deliverabilityCheck: RegisteredTool = buildTool({
   name: "DeliverabilityCheck",
+  operativeArgs: [{ field: "domain", kind: "recipient" }],
   description:
     "Read what a sending domain publishes about itself in public DNS — its SPF record, its DMARC policy, and the DKIM key record at each selector you name — and report what each one says. Use it to answer why mail from a domain is being refused or filtered, or to check a domain before a campaign leans on it. It reports facts rather than a score, because the facts differ in what you do next: no DMARC record at all and a DMARC record with p=none are the same score and completely different situations, and a lookup that failed is a third thing again — reported as unknown with its reason, never as 'nothing published'. It does NOT verify a message's DKIM signature: that needs canonicalisation this package does not implement, and a partial check that can answer 'pass' is worse than no check. Only domains an operator put in allowed_sender_domains are looked up.",
   inputSchema: z.object({

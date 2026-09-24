@@ -294,6 +294,11 @@ const updateFields = {
 
 export const harnessRegister: RegisteredTool = buildTool({
   name: "HarnessRegister",
+  operativeArgs: [
+    { field: "dir", kind: "path" },
+    { field: "from", kind: "path" },
+    { field: "id", kind: "id" },
+  ],
   description:
     "Add, remove, relocate, list and annotate the harnesses in this machine's registry (<registryRoot>/harnesses.json, from CREWHAUS_REGISTRY_ROOT or ~/.crewhaus — never a caller-supplied path). Every write goes through @crewhaus/harness-registry's own atomic tmp+rename with its read-merge-write retry, so a concurrent session or a running manager cannot lose your edit or you theirs. A relocate keeps the hrn_ id and changes only the directory, and the result proves it: the tool re-reads the registry and reports how many entries carry that id. It REFUSES to mutate a registry file that exists but did not parse (the library reads it as empty and the next write replaces it), refuses when CREWHAUS_NO_REGISTRY has turned writes into silent no-ops, refuses an `id` that is not an hrn_ id, and refuses to add a second row for a directory already registered under its other spelling. A register reads the harness's crewhaus.yaml for its name and shape and refuses one that a symlink puts outside the workspace, rather than recording another harness's identity. A write that the filesystem refuses is REPORTED, and a multi-field update — which is one atomic write per field — names which fields landed and which did not. dryRun defaults to true.",
   inputSchema: z.object({
@@ -893,6 +898,7 @@ export const harnessJobStatus: RegisteredTool = buildTool({
 
 export const compileBundle: RegisteredTool = buildTool({
   name: "CompileBundle",
+  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
   description:
     "Compare a harness's compiled bundle against its spec with @crewhaus/harness-supervisor's spec-hash stamp — the exact comparison the manager gates a start on — and recompile it when it is stale, by running the same `crewhaus compile` (plus `bun install` in the bundle) that `daemon start --compile` runs. THREE verdicts, not two: fresh, stale, and UNDETERMINED. A bundle with no stamp and no usable mtimes, or one whose spec cannot be read or parsed, is undetermined — the supervisor treats that as 'not stale' and carries on, so a tool that reported its success as 'the bundle is current' is exactly how a fleet ends up running last month's CLI with every line green. A real run on an undetermined verdict is refused, with the command that fixes it. The compile spawns with a minimal environment (no .env chain) and, afterwards, the freshness is re-read and reported: a compile that exited 0 and left the bundle stale says so. Every file it opens is contained, including the ones the supervisor's own locators hand back — a crewhaus.yaml or a bundle directory that a symlink puts outside the workspace is refused in the preview and in the real call alike, because the recompile writes into that directory. dryRun defaults to true.",
   inputSchema: z.object({
@@ -1161,6 +1167,7 @@ const VERSION_RE = /\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/;
 
 export const cliVersionPin: RegisteredTool = buildTool({
   name: "CliVersionPin",
+  operativeArgs: [{ field: "dirs", kind: "path" }],
   description:
     "Show which crewhaus CLI each harness would run and which version its bundle was COMPILED WITH, and roll the fleet up by version so a harness left behind on an old CLI is visible. The harnesses come from this machine's registry unless directories are given; the compiledWith stamp is @crewhaus/harness-supervisor's, the binary is its resolver's (harness node_modules/.bin first, then PATH). This tool does NOT install, switch or pin a version — that is @crewhaus/chvm talking to the npm registry, and this package has neither the dependency nor a network call — so the result names the command instead of pretending. With probe:true it runs `<bin> --version` once per DISTINCT binary, with a timeout, and only for a binary inside the workspace unless allowExternalCli is set. A version it could not read is reported as unknown WITH the reason, never as agreeing with the others. It writes NOTHING: the registry is enumerated through @crewhaus/harness-registry's own CREWHAUS_NO_REGISTRY switch, so the missing-directory stamps a plain list() would persist are computed and reported but not written. At most 500 harnesses are inspected; past that the result carries truncated:true and every count describes that subset rather than the fleet. A spec or bundle that a symlink puts outside the workspace is reported as undetermined with the reason, never opened.",
   inputSchema: z.object({
@@ -1451,6 +1458,10 @@ export const cliVersionPin: RegisteredTool = buildTool({
 
 export const hooksManage: RegisteredTool = buildTool({
   name: "HooksManage",
+  operativeArgs: [
+    { field: "dir", kind: "path", default: "." },
+    { field: "command", kind: "command" },
+  ],
   description:
     "List, set and remove the MANAGER hooks in a harness's .crewhaus/settings.json — the postCompile and preSpawn steps @crewhaus/harness-supervisor runs between a compile and a spawn — and report what each declaration actually PARSES to. It never executes a hook. The grammar is the supervisor's: a string is ONE command with no arguments (deliberately never word-split), an array is an argv vector — so \"bun run prep.ts\" declares a command whose FILENAME contains spaces and will refuse every start with ENOENT, and that shape is refused here with the array form spelled out. A command that resolves to a path is probed for existence and the execute bit; a bare name is reported as resolved by the OS at spawn time rather than guessed at. A command that is a directory or a dangling symlink is `not-executable`/`absent` rather than executable, because access(X_OK) says yes to a directory and a hook that cannot spawn refuses every start. Writes preserve every other key in the file (the runtime's own hooks and permissions blocks live there too), are atomic, keep the file's mode, and are refused outright when the existing file does not parse. The settings file and the hook run log are contained before they are READ, so a symlinked .crewhaus/settings.json is refused — on `list` too — instead of reporting another file's hooks as this harness's. After a write the file is re-read THROUGH the supervisor's own reader and the result says whether the hook came back as the argv you asked for. dryRun defaults to true.",
   inputSchema: z.object({

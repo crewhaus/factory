@@ -329,3 +329,49 @@ describe("flag-truth-4#0 / permission-integration#6 — read-only egress tools",
     ).toBe("deny");
   });
 });
+
+describe("F3b — every builtin's declaration is what a rule reads (permission-integration#8)", () => {
+  test("a path in a git tool is read from its cwd, so a deny on the real file fires", async () => {
+    const rs = rules(["alwaysDeny", "GitAdd(pkg/.env)"], ["alwaysAllow", "GitAdd"]);
+    // `.env` relative to cwd `pkg` is pkg/.env, not the workspace's .env.
+    expect(await gate("GitAdd", { cwd: "pkg", paths: [".env"] }, rs)).toBe("deny");
+    expect(await gate("GitAdd", { paths: ["pkg/.env"] }, rs)).toBe("deny");
+    expect(await gate("GitAdd", { cwd: "pkg", paths: ["src/a.ts"] }, rs)).toBe("allow");
+  });
+
+  test("a scoped allow on a repository covers that owner's repos and nothing else", async () => {
+    const rs = rules(["alwaysAllow", "IssueCreate(crewhaus/*)"]);
+    const issue = { owner: "crewhaus", repo: "factory", title: "t", justification: "x" };
+    expect(await gate("IssueCreate", issue, rs, "default")).toBe("allow");
+    expect(await gate("IssueCreate", { ...issue, owner: "attacker" }, rs, "default")).toBe("ask");
+  });
+
+  test("an allow on a recipient domain holds only when every recipient is in it", async () => {
+    const rs = rules(["alwaysAllow", "EmailSend(*@example.com)"]);
+    const mail = {
+      from: { address: "bot@example.com" },
+      to: [{ address: "ops@example.com" }],
+      subject: "s",
+      text: "t",
+      date: "2026-09-24T09:00:00Z",
+      host: "smtp.example.com",
+    };
+    expect(await gate("EmailSend", mail, rs)).toBe("allow");
+    expect(
+      await gate("EmailSend", { ...mail, bcc: [{ address: "leak@elsewhere.example" }] }, rs),
+    ).toBe("ask");
+  });
+
+  test("a URL rule on HttpBatch reads every request's url", async () => {
+    const rs = rules(["alwaysAllow", "HttpBatch(https://api.example.com/**)"]);
+    const ok = { requests: [{ url: "https://api.example.com/a" }] };
+    expect(await gate("HttpBatch", ok, rs)).toBe("allow");
+    expect(
+      await gate(
+        "HttpBatch",
+        { requests: [...ok.requests, { url: "https://evil.example/x" }] },
+        rs,
+      ),
+    ).toBe("ask");
+  });
+});

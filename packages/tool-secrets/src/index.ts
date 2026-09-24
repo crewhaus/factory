@@ -270,6 +270,7 @@ async function lookupOne(
 
 export const secretLookup: RegisteredTool = buildTool({
   name: "SecretLookup",
+  operativeArgs: [{ field: "refs", kind: "id" }],
   description:
     "Check whether a secret reference resolves, and report where it resolves FROM — without returning the secret. Use it to preflight credentials before a run, to find out which of several definitions of the same variable actually wins, or to confirm a rotation took. Each reference comes back with the backend that answered, the source, and a truncated SHA-256 fingerprint that lets you compare two secrets or detect a change without ever seeing either value; a bare NAME is searched across the environment, the .env chain and the secrets directory, and a shadowing definition with a different value is reported as a warning. It deliberately has no option to reveal a value.",
   inputSchema: z.object({
@@ -686,6 +687,7 @@ function previousRef(ref: SecretRef): SecretRef | undefined {
 
 export const secretRotate: RegisteredTool = buildTool({
   name: "SecretRotate",
+  operativeArgs: [{ field: "ref", kind: "id" }],
   description:
     "Replace a stored secret with a new value and prove the new one reads back, without either value appearing in the result. The new value is generated here or taken from another reference; it is written first, verified by re-reading it, and only then is the previous copy retired — so a failure at any step leaves the old secret working, and the result names the step that failed. A rotation takes an exclusive lock, so two callers cannot rotate the same secret at once and invalidate each other. It rotates the STORED value only: a credential issued by a provider stays valid there until you revoke it. dryRun walks the same steps and reports what each one would do.",
   inputSchema: z.object({

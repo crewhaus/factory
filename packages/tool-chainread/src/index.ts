@@ -226,6 +226,7 @@ async function resolveBlockNumber(
 
 export const evmGetBlock: RegisteredTool = buildTool({
   name: "EvmGetBlock",
+  operativeArgs: [{ field: "rpcUrl", kind: "url" }],
   description:
     "Read one block's header from a JSON-RPC endpoint — number, hash, parent, timestamp (unix and ISO), gas limit and usage, base fee and transaction count — by number, by tag, or by block hash. Use it to anchor anything that needs a block: a historical read, a confirmation count, or the time a range covers. It picks getBlockByHash or getBlockByNumber from the shape of what you pass, reports a chain with no base fee as legacy rather than putting a null into your fee arithmetic, and answers a block that does not exist with found:false rather than an error, because that is a fact about the chain and not a failure.",
   inputSchema: z
@@ -275,6 +276,7 @@ export const evmGetBlock: RegisteredTool = buildTool({
 
 export const evmBlockAtTimestamp: RegisteredTool = buildTool({
   name: "EvmBlockAtTimestamp",
+  operativeArgs: [{ field: "rpcUrl", kind: "url" }],
   description:
     "Find the block a chain was at, at a given moment: the LAST block whose timestamp is at or before the one you name, together with the block after it so the answer can be checked. Use it to pin a historical read — an end-of-quarter balance, the state before an incident — to a block number, instead of guessing from an average block time. A timestamp before the chain's first block is refused rather than answered with block zero, a timestamp at or past the head returns the head and says so, and a chain whose block timestamps run backwards is refused rather than searched, because a binary search there has no single right answer.",
   inputSchema: z
@@ -369,6 +371,10 @@ export function parseTimestamp(value: string | number): bigint {
 
 export const evmRpcHealth: RegisteredTool = buildTool({
   name: "EvmRpcHealth",
+  operativeArgs: [
+    { field: "rpcUrl", kind: "url" },
+    { field: "compareWith", kind: "url" },
+  ],
   description:
     "Probe a JSON-RPC endpoint and report what it is and what it can serve: chain id, head block and how old that head is, and whether it keeps archive state. Use it before trusting a chain read, and to compare several endpoints against each other — two endpoints reporting different chain ids is a misconfiguration that would otherwise show up as impossible data. Archive support is decided by reading a historic balance and interpreting the failure, and when the evidence does not settle it — a chain too short to tell, an error that means something else — it reports unknown rather than false, because 'we could not tell' and 'it does not' lead to different decisions.",
   inputSchema: z
@@ -641,6 +647,7 @@ function describePolicy(): Record<string, unknown> {
 
 export const evmNonceStatus: RegisteredTool = buildTool({
   name: "EvmNonceStatus",
+  operativeArgs: [{ field: "rpcUrl", kind: "url" }],
   description:
     "Compare an account's latest and pending nonce and say what that means: clear, transactions waiting, a nonce gap, or — when the evidence does not support a verdict — unknown. Use it before sending anything from an account a harness manages, and to find out why a broadcast seems stuck. Pass the transaction hashes you broadcast and it will tell you which are mined, which are still in this endpoint's mempool and which it has never heard of. It degrades loudly: many endpoints do not track a public mempool and answer the pending nonce with the latest one, so a confident 'clear' from those would be wrong, and this reports the endpoint's mempool visibility instead of guessing.",
   inputSchema: z
@@ -792,6 +799,7 @@ export const evmNonceStatus: RegisteredTool = buildTool({
 
 export const evmWaitForReceipt: RegisteredTool = buildTool({
   name: "EvmWaitForReceipt",
+  operativeArgs: [{ field: "rpcUrl", kind: "url" }],
   description:
     "Wait, with a deadline, for a transaction to be mined, and report which of three things happened: it was mined and succeeded, it was mined and REVERTED, or the deadline passed with it still unmined. Use it after broadcasting anything. The three outcomes are the point — a reverted transaction has a receipt with status 0x0, so a tool that reports 'no receipt' for it tells a caller to broadcast again, which is how a failed transaction becomes two. It also tells a transaction this endpoint has never seen apart from one it is holding in its mempool, and can wait for a number of confirmations or for the chain's own safe/finalized tag instead of a block count.",
   inputSchema: z
@@ -979,6 +987,7 @@ async function settlement(
 
 export const evmTransactionSummary: RegisteredTool = buildTool({
   name: "EvmTransactionSummary",
+  operativeArgs: [{ field: "rpcUrl", kind: "url" }],
   description:
     "Explain one transaction in bookkeeping terms: who sent it, what it called, which tokens and how much native value moved, which approvals it granted, what it cost in fees, and the net change for an address you name. Use it to reconcile or to explain a transaction without reading raw logs. It is explicit about its own blind spots, in the output and not only in the docs: a receipt carries logs and no trace, so native value moved by a CONTRACT during the call is invisible here and the net deltas say so. Fees are computed from the fields the receipt actually has, so an OP-stack L1 data fee is added and an Arbitrum L1 charge is not double-counted.",
   inputSchema: z
@@ -1130,6 +1139,7 @@ function netDeltas(
 
 export const evmEventScan: RegisteredTool = buildTool({
   name: "EvmEventScan",
+  operativeArgs: [{ field: "rpcUrl", kind: "url" }],
   description:
     "Collect every log matching a filter across a block range, paging around whatever limits the endpoint imposes, and refuse rather than return a set it cannot prove is complete. Use it to find what happened onchain over a period — transfers to an address, every emission of one event — without hand-writing the paging. Public endpoints cap log queries and disagree about how: some answer with an error naming a smaller range, and some silently return the first N logs of a range that held more. The first is handled by halving and retrying; the second is caught by re-querying a suspicious chunk in halves and comparing the counts, because a missing log is an event that, to everything downstream, did not happen.",
   inputSchema: z
@@ -1303,6 +1313,7 @@ const unitsField = z
 
 export const onchainTransactionsSync: RegisteredTool = buildTool({
   name: "OnchainTransactionsSync",
+  operativeArgs: [{ field: "rpcUrl", kind: "url" }],
   description:
     "Pull one address's onchain history over a block range and return it as the same normalized rows a bank statement parses into, so a wallet can be reconciled against a ledger instead of read as raw logs. It emits the row shape StatementParse produces and LedgerReconcile consumes — id, date, description, amountMinor, direction, reference, balanceMinor — with the exact uint256 kept alongside each row rather than rounded into it. Use it to close the books on a wallet, or to sync incrementally: it returns a cursor pinned to the block it actually finished at. It refuses rather than under-reporting, the way EvmEventScan does, and it says in the output which movements it cannot see at all: internal native transfers need a trace, and ERC-1155 is not collected.",
   inputSchema: z

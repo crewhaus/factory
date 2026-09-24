@@ -413,6 +413,10 @@ function workspaceRoots(): string[] {
 
 export const runTests: RegisteredTool = buildTool({
   name: "RunTests",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: "." },
+    { field: "command", kind: "command" },
+  ],
   description:
     "Run the project's test suite and return only what failed, as structured JSON: the test name, the failing assertion, its file and line, and a trimmed stack. Use it instead of running a test command and reading the output, because a green run comes back as three counts rather than thousands of lines. The runner is detected from the project (bun, vitest, jest, pytest, go, cargo) or given explicitly, and each one is asked for its machine-readable form. Running tests executes the project's own code, so it is not a read-only operation.",
   inputSchema: z.object({
@@ -656,6 +660,10 @@ function diagnosticsBody(diagnostics: readonly Diagnostic[]): Record<string, unk
 
 export const runBuild: RegisteredTool = buildTool({
   name: "RunBuild",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: "." },
+    { field: "command", kind: "command" },
+  ],
   description:
     "Build the project and return structured diagnostics instead of the build log: file, line, column, severity, rule and message. Use it to find out whether a change compiles and, when it does not, exactly where — without a model reading a compiler's output. The command comes from the project (a build script, cargo, go, tsc) or is given explicitly. A build writes its own output, so this is not a read-only operation.",
   inputSchema: z.object({
@@ -703,6 +711,7 @@ export const runBuild: RegisteredTool = buildTool({
 
 export const typecheck: RegisteredTool = buildTool({
   name: "Typecheck",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode so nothing is written, and there is no way to point this tool at a different program — that is what keeps it a read; RunBuild is where an arbitrary command belongs.",
   inputSchema: z.object({
@@ -746,6 +755,7 @@ export const typecheck: RegisteredTool = buildTool({
 
 export const lint: RegisteredTool = buildTool({
   name: "Lint",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
     "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, so nothing is rewritten and no caller can substitute another program — Format is the tool that writes.",
   inputSchema: z.object({
@@ -798,6 +808,10 @@ export const lint: RegisteredTool = buildTool({
 
 export const format: RegisteredTool = buildTool({
   name: "Format",
+  operativeArgs: [
+    { field: "paths", kind: "path", within: "cwd", default: "." },
+    { field: "command", kind: "command" },
+  ],
   description:
     "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the read-only counterpart.",
   inputSchema: z.object({
@@ -889,6 +903,7 @@ function unformattedFiles(tool: string, run: RunResult, root: string): string[] 
 
 export const formatCheck: RegisteredTool = buildTool({
   name: "FormatCheck",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program.",
   inputSchema: z.object({
@@ -935,6 +950,7 @@ export const formatCheck: RegisteredTool = buildTool({
 
 export const diagnostics: RegisteredTool = buildTool({
   name: "Diagnostics",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and nothing is written.",
   inputSchema: z.object({

@@ -626,6 +626,7 @@ export const permissionAudit: RegisteredTool = buildTool({
 
 export const preflightRun: RegisteredTool = buildTool({
   name: "PreflightRun",
+  operativeArgs: [{ field: "harnessDir", kind: "path", default: "." }],
   description:
     "Run the full preflight over a harness directory against an EXPLICITLY supplied environment, returning the blocking items, the warnings and the remediation for each. Use before spawning a harness, to turn the stack trace the spawn would die with into a list of things to fix. The environment is an input and is never read from this process, so pass the merged env the spawn would actually receive. It binds each declared port briefly to see whether it is free, and it reaches no network beyond that.",
   inputSchema: z.object({

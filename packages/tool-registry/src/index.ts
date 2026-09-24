@@ -109,6 +109,7 @@ function failureLine(
 
 export const registryPackageInfo: RegisteredTool = buildTool({
   name: "RegistryPackageInfo",
+  operativeArgs: [{ field: "name", kind: "id" }],
   description:
     "Ask a public registry what it knows about one package: whether it exists, its latest version and publish date, licence, repository, whether it is deprecated or yanked, and optionally its version list. Use it before adding a dependency, or to settle 'is this still maintained' without a model recalling a version number. Reads npm, PyPI and crates.io anonymously over HTTPS; it never authenticates, never installs and never reaches a private mirror. A package that is not published comes back as exists:false rather than as an error, because that is an answer. Fields the registry does not publish are left out rather than guessed at.",
   inputSchema: z
@@ -205,6 +206,7 @@ export const registryPackageInfo: RegisteredTool = buildTool({
 
 export const registrySearch: RegisteredTool = buildTool({
   name: "RegistrySearch",
+  operativeArgs: [],
   description:
     "Search a package registry's own index and return a structured shortlist — name, latest version, description, repository and, where the registry publishes it, a download count. Use it to find candidate libraries without spending a web search and a model turn on reading blog posts. npm and crates.io are supported; PyPI is refused with a reason, because it publishes no search API and scraping its HTML search page would be a tool that breaks silently on a redesign. Sorting is only reported as applied when the registry itself can do it: npm ranks by its own relevance score and publishes no download counts, so a downloads sort there is declined rather than faked by re-sorting one page.",
   inputSchema: z
@@ -341,6 +343,7 @@ const NOT_A_PACKAGE = new Set(["python"]);
 
 export const registryOutdated: RegisteredTool = buildTool({
   name: "RegistryOutdated",
+  operativeArgs: [{ field: "manifest", kind: "path" }],
   description:
     "Read a project's manifest, ask the registry what is newest for each dependency, and report the drift: the declared range, the highest version that range still allows, the latest published version, how far apart they are, and whether the package is deprecated or yanked. Use it to decide what to upgrade. It contacts npm, PyPI or crates.io anonymously — which is what separates it from DependencyOutdated in @crewhaus/tool-code, which compares a manifest against its own lockfile and never leaves the machine. A range it cannot evaluate exactly (a git or workspace spec, a PEP 440 '!=', a version that does not order as semver) is listed as unchecked with the reason, never counted as up to date.",
   inputSchema: z
@@ -579,6 +582,7 @@ export const registryOutdated: RegisteredTool = buildTool({
 
 export const manifestDependencySet: RegisteredTool = buildTool({
   name: "ManifestDependencySet",
+  operativeArgs: [{ field: "manifest", kind: "path" }],
   description:
     "Set the version of one or more dependencies already declared in a package.json, Cargo.toml or pyproject.toml, preserving the file exactly — comments, key order, indentation and trailing newline all survive, because only the bytes of the version string are replaced. Use it to apply an upgrade without a model rewriting a manifest from memory. It locates every spelling it can locate exactly (a JSON string, a TOML string, an inline table's version key, a dotted key, a [dependencies.name] table, a PEP 621 requirement string) and REFUSES the whole write when any requested edit is a shape it cannot place — a git or path dependency, a duplicate key, a URL requirement — naming which one and why. It never adds a dependency, never removes one, never reserializes, and never runs a package manager, so a lockfile is left stale on purpose.",
   inputSchema: z

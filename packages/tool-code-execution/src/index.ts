@@ -260,6 +260,7 @@ async function runInSandbox(
 
 export const python: RegisteredTool = buildTool({
   name: "Python",
+  operativeArgs: [{ field: "code", kind: "command" }],
   description:
     "Execute Python 3 code in a sandboxed container (network=none, read-only root, /tmp scratch). Equivalent to `python3 -c <code>`.",
   inputSchema: codeSchema,
@@ -270,6 +271,7 @@ export const python: RegisteredTool = buildTool({
 
 export const javascript: RegisteredTool = buildTool({
   name: "JavaScript",
+  operativeArgs: [{ field: "code", kind: "command" }],
   description:
     "Execute JavaScript code in a sandboxed container (network=none, read-only root, /tmp scratch). Equivalent to `node -e <code>`.",
   inputSchema: codeSchema,
@@ -281,6 +283,7 @@ export const javascript: RegisteredTool = buildTool({
 
 export const shell: RegisteredTool = buildTool({
   name: "Shell",
+  operativeArgs: [{ field: "code", kind: "command" }],
   description:
     "Execute a POSIX shell command in a sandboxed container (network=none, read-only root, /tmp scratch). Equivalent to `sh -c <code>`.",
   inputSchema: codeSchema,

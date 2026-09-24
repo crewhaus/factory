@@ -602,6 +602,10 @@ const evalBaselinePinSchema = z.object({
 
 export const evalBaselinePin: RegisteredTool = buildTool({
   name: "EvalBaselinePin",
+  operativeArgs: [
+    { field: "evalsDir", kind: "path" },
+    { field: "dataset", kind: "id", within: "spec" },
+  ],
   description:
     "Show, move or clear the pinned baseline run a lineage's regression gate compares against. Use when a gate needs re-baselining after a deliberate change, or to check what a lineage is being held to — including the case that matters most, a lineage with NO pin, where the gate passes because there is nothing to fail against. The lineage comes from the run's own recorded columns, so pinning can never drop one arm's run onto another arm's key; a partial, budget-aborted run is refused outright; and dryRun runs the same checks and reports the exact pin it would write.",
   inputSchema: evalBaselinePinSchema,

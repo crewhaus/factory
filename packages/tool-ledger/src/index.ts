@@ -250,6 +250,7 @@ const entrySchema = z
 
 export const ledgerPost: RegisteredTool = buildTool({
   name: "LedgerPost",
+  operativeArgs: [{ field: "dbPath", kind: "path", default: DEFAULT_DB_PATH }],
   description:
     "Append balanced double-entry journal entries to a local, hash-chained SQLite ledger, refusing anything that would corrupt it. Use it instead of having a model track what has been booked: debits must equal credits or the entry is rejected with the difference named, a (source system, id) pair can only post once, a closed period stays closed, and the rows, the chain's new head and the idempotency claim all commit in ONE transaction — so a crash mid-batch leaves the book exactly as it was rather than a ledger that verifies while its duplicate suppression has forgotten the entry. Amounts are decimal strings or integer minor units, never floats. Nothing is transmitted anywhere; this writes a file.",
   inputSchema: z
@@ -694,6 +695,10 @@ const partySchema = z
 
 export const invoiceRender: RegisteredTool = buildTool({
   name: "InvoiceRender",
+  operativeArgs: [
+    { field: "dbPath", kind: "path", default: DEFAULT_DB_PATH },
+    { field: "outDir", kind: "path" },
+  ],
   description:
     "Render an invoice, receipt, credit note or quote to HTML, Markdown and JSON with a gap-free document number and totals computed rather than supplied. Use it instead of a model emitting invoice HTML: the number and the document record are allocated in ONE transaction, so a crash cannot burn a number out of a legally required sequence, and repeating the call with the same idempotency key returns the same number and the same bytes. Nothing is formatted through Intl, so the output does not move with an ICU upgrade; the yearly reset takes its year from the issue date, not the clock. Files are written under the workspace. It submits nothing and asks for no payment credentials.",
   inputSchema: z

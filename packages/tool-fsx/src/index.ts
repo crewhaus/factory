@@ -740,6 +740,7 @@ export const tailFile: RegisteredTool = buildTool({
 
 export const makeDirectory: RegisteredTool = buildTool({
   name: "MakeDirectory",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Create a directory inside the workspace, with its parents when asked. Use it before writing output rather than discovering the parent is missing when the write fails.",
   inputSchema: z.object({
@@ -765,6 +766,7 @@ export const makeDirectory: RegisteredTool = buildTool({
 
 export const touchFile: RegisteredTool = buildTool({
   name: "TouchFile",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Create an empty file if it is missing, and set its timestamps when you supply one. Use it to make a marker or placeholder file; with no `mtime` an existing file is left exactly as it is, because bumping it from the clock would make this call's result differ every run.",
   inputSchema: z.object({
@@ -816,6 +818,7 @@ const TEMP_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export const tempDir: RegisteredTool = buildTool({
   name: "TempDir",
+  operativeArgs: [{ field: "base", kind: "path", default: ".tmp" }],
   description:
     "Create a scratch directory inside the workspace under a name you choose, and report its path. Use it as somewhere to stage intermediate files; the name comes from you rather than a random suffix so the same call twice gives the same directory instead of littering.",
   inputSchema: z.object({
@@ -966,6 +969,10 @@ const copyMoveSchema = {
 
 export const copyPath: RegisteredTool = buildTool({
   name: "CopyPath",
+  operativeArgs: [
+    { field: "source", kind: "path" },
+    { field: "destination", kind: "path" },
+  ],
   description:
     "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists.",
   inputSchema: z.object(copyMoveSchema),
@@ -1016,6 +1023,10 @@ export const copyPath: RegisteredTool = buildTool({
 
 export const movePath: RegisteredTool = buildTool({
   name: "MovePath",
+  operativeArgs: [
+    { field: "source", kind: "path" },
+    { field: "destination", kind: "path" },
+  ],
   description:
     "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone.",
   inputSchema: z.object(copyMoveSchema),
@@ -1155,6 +1166,10 @@ function partName(prefix: string, index: number): string {
 
 export const splitFile: RegisteredTool = buildTool({
   name: "SplitFile",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "outputDir", kind: "path" },
+  ],
   description:
     "Split a file into numbered parts by byte size or by line count, streaming rather than loading it. Use it to get a file under a size limit, or to hand a huge log to something that processes one chunk at a time.",
   inputSchema: z
@@ -1306,6 +1321,10 @@ export const splitFile: RegisteredTool = buildTool({
 
 export const concatFiles: RegisteredTool = buildTool({
   name: "ConcatFiles",
+  operativeArgs: [
+    { field: "paths", kind: "path" },
+    { field: "destination", kind: "path" },
+  ],
   description:
     "Join files, in the order you give them, into one output file, streaming rather than buffering. Use it to reassemble SplitFile parts or to merge shards back into a single artifact.",
   inputSchema: z.object({
@@ -1474,6 +1493,10 @@ const timeoutField = z
 
 export const archiveCreate: RegisteredTool = buildTool({
   name: "ArchiveCreate",
+  operativeArgs: [
+    { field: "source", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Pack a file or directory into a tar, tar.gz or zip archive, then read the result back to report what it contains. Use it to bundle build output or a working directory; the format comes from the output name unless you say otherwise.",
   inputSchema: z.object({
@@ -1626,6 +1649,10 @@ function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): StagingScan
 
 export const archiveExtract: RegisteredTool = buildTool({
   name: "ArchiveExtract",
+  operativeArgs: [
+    { field: "archive", kind: "path" },
+    { field: "destination", kind: "path" },
+  ],
   description:
     "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped.",
   inputSchema: z.object({
@@ -1859,6 +1886,7 @@ const frontmatterScalar = z.union([z.string(), z.number(), z.boolean(), z.null()
 
 export const frontmatterWrite: RegisteredTool = buildTool({
   name: "FrontmatterWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description: `Set or remove keys in a markdown file's YAML front matter, leaving the body untouched. Use it to update a document's status or tags without rewriting the file by hand; existing keys keep their position and new ones are appended in sorted order. ${FRONTMATTER_SUBSET}`,
   inputSchema: z.object({
     path: z.string().min(1),
@@ -2004,6 +2032,7 @@ export const notebookRead: RegisteredTool = buildTool({
 
 export const notebookEdit: RegisteredTool = buildTool({
   name: "NotebookEdit",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Replace, insert or delete one cell in a Jupyter .ipynb file, rewriting it the way Jupyter would. Use it rather than editing the JSON by hand; replacing a code cell's source also clears its stale outputs and execution count.",
   inputSchema: z.object({
