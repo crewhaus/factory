@@ -143,6 +143,38 @@ export function resolveChildPermissions(
 }
 
 /**
+ * security-1#1 — child permissions for a sub-agent definition the operator
+ * did NOT write: one loaded from `.crewhaus/sub-agents/` at run time, a
+ * directory any agent with a file-write tool can populate. Such a definition
+ * may only NARROW the parent's surface:
+ *
+ *   - `inherit` / `scoped` behave as for an operator-written definition —
+ *     both are already at most as permissive as the parent;
+ *   - `{ allow, deny }` does NOT replace the parent's rules. Its `deny`
+ *     patterns narrow them (the decision-level meet `narrowRuleSet` uses, so
+ *     a parent deny can never be lifted), and its `allow` list is ignored;
+ *   - `inherit_bypass` is ignored: bypass never reaches a child through a
+ *     definition the model could have written.
+ *
+ * Returns the ignored allow patterns so the caller can say so.
+ */
+export function resolveChildPermissionsNarrowOnly(
+  parent: { readonly mode: PermissionMode; readonly rules: RuleSet },
+  def: SubAgentDefinition,
+): ChildPermissions & { readonly ignoredAllows: ReadonlyArray<string> } {
+  const untrusted: SubAgentDefinition = { ...def, inherit_bypass: false };
+  const perm = def.permissions;
+  if (perm === undefined || perm === "inherit" || perm === "scoped") {
+    return { ...resolveChildPermissions(parent, untrusted), ignoredAllows: [] };
+  }
+  return {
+    mode: resolveChildMode(parent.mode, untrusted),
+    rules: narrowRuleSet(parent.rules, perm.deny, []),
+    ignoredAllows: [...perm.allow],
+  };
+}
+
+/**
  * 0.6.0 §4.4 — a malformed pattern in a profile's `deny` / `ask` list. Thrown
  * at boot, not at call time: permission-engine fails CLOSED on an
  * uncompilable guard rule (it treats the rule as matching every call), so a

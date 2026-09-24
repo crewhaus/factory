@@ -49,9 +49,14 @@ import {
   subAgentProfileAllowlist,
 } from "@crewhaus/agent-context-isolation";
 import { CrewhausError } from "@crewhaus/errors";
-import { resolveChildPermissions } from "@crewhaus/sub-agent-permission-inheritance";
+import {
+  type ChildPermissions,
+  resolveChildPermissions,
+  resolveChildPermissionsNarrowOnly,
+} from "@crewhaus/sub-agent-permission-inheritance";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { registeredToolName } from "@crewhaus/tool-categories";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -355,10 +360,23 @@ export function resolveSubAgentDefinition(
   name: string | undefined,
   opts: CreateTaskToolOptions,
 ): SubAgentDefinition {
+  return resolveSubAgent(name, opts).def;
+}
+
+/**
+ * The definition AND where it came from. A definition read from the
+ * sub-agents directory is untrusted: any agent that can write a file can
+ * put one there mid-run, so its permissions may only narrow the parent's
+ * (security-1#1). The inline spec map and the built-in are operator-written.
+ */
+function resolveSubAgent(
+  name: string | undefined,
+  opts: CreateTaskToolOptions,
+): { readonly def: SubAgentDefinition; readonly fromDisk: boolean } {
   const resolveName = name ?? "general-purpose";
   if (opts.subAgents !== undefined) {
     const inline = opts.subAgents.get(resolveName);
-    if (inline !== undefined) return inline;
+    if (inline !== undefined) return { def: inline, fromDisk: false };
   }
   // Guard the disk lookup against path traversal (the inline map above is an
   // exact-key lookup and is intentionally not gated).
@@ -369,8 +387,8 @@ export function resolveSubAgentDefinition(
   }
   const dir = opts.subAgentDir ?? join(process.cwd(), ".crewhaus", "sub-agents");
   const onDisk = loadSubAgentFromDisk(resolveName, dir);
-  if (onDisk !== null) return onDisk;
-  if (resolveName === "general-purpose") return BUILTIN_GENERAL_PURPOSE;
+  if (onDisk !== null) return { def: onDisk, fromDisk: true };
+  if (resolveName === "general-purpose") return { def: BUILTIN_GENERAL_PURPOSE, fromDisk: false };
   throw new SubAgentResolutionError(
     `unknown subagent_type "${resolveName}" — not in spec sub_agents map, not on disk at ${dir}, and no built-in by that name`,
   );
@@ -391,9 +409,16 @@ function buildChildCatalog(
   if (allowed === undefined) {
     return def.permissions === undefined || def.permissions === "inherit" ? parentTools : [];
   }
-  const allowlist = new Set(allowed);
+  // A spec key (`read`) names the same tool as its registered name (`Read`);
+  // the parent catalog carries registered names, so map keys first. Before
+  // this, a definition written with spec keys — the documented spelling for
+  // every other tools: list — gave the child no tools at all.
+  const allowlist = new Set(allowed.map((n) => registeredToolName(n) ?? n));
   return parentTools.filter((t) => allowlist.has(t.name));
 }
+
+/** Definitions whose ignored allow list has already been reported. */
+const reportedIgnoredAllows = new Set<string>();
 
 export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool {
   const knownNames = opts.subAgents !== undefined ? [...opts.subAgents.keys()] : [];
@@ -460,8 +485,9 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       }
       const spawnSubAgent = bridge.spawnSubAgent;
       let def: SubAgentDefinition;
+      let fromDisk: boolean;
       try {
-        def = resolveSubAgentDefinition(input.subagent_type, opts);
+        ({ def, fromDisk } = resolveSubAgent(input.subagent_type, opts));
       } catch (err) {
         return `[Task error] ${(err as Error).message}`;
       }
@@ -480,10 +506,20 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       }
 
       const childTools = buildChildCatalog(bridge.tools, def);
-      const childPerms = resolveChildPermissions(
-        { mode: bridge.permissionMode, rules: bridge.permissionRules },
-        def,
-      );
+      const parentPerms = { mode: bridge.permissionMode, rules: bridge.permissionRules };
+      let childPerms: ChildPermissions;
+      if (fromDisk) {
+        const narrowed = resolveChildPermissionsNarrowOnly(parentPerms, def);
+        if (narrowed.ignoredAllows.length > 0 && !reportedIgnoredAllows.has(def.name)) {
+          reportedIgnoredAllows.add(def.name);
+          process.stderr.write(
+            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so its permissions can only narrow the parent's — ignoring allow: ${narrowed.ignoredAllows.join(", ")}. To grant them, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
+          );
+        }
+        childPerms = narrowed;
+      } else {
+        childPerms = resolveChildPermissions(parentPerms, def);
+      }
 
       // 0.6.0 §10.2 — ONE shared projection replaces the field-by-field hand
       // copy this tool carried (and whose optional-seam omissions were the
