@@ -308,11 +308,14 @@ export type ResolvedTools = {
  *
  * `chains` is the spec's chain blocks; a tool that reads a chain gets its
  * registrar called with them, and without them it refuses every call.
+ * `layout.edgeImportsInSpecOrder` keeps the edge's tool imports in the order
+ * the spec lists them, the layout the cf-worker cli bundle has always had.
  */
 export function resolveBuiltinTools(
   shape: ToolShape,
   sites: ReadonlyArray<ToolSite>,
   chains?: SpecChainBlocks,
+  layout: { readonly edgeImportsInSpecOrder?: boolean } = {},
 ): ResolvedTools {
   const edge = SHAPE_TOOL_PROFILES[shape].runtime === "edge";
   const groups = new Map<string, { exports: Set<string>; inits: Set<string> }>();
@@ -389,10 +392,13 @@ export function resolveBuiltinTools(
   const packages = [...groups.keys()].sort();
   const imports = packages.map((pkg) => {
     const g = groups.get(pkg) ?? { exports: new Set<string>(), inits: new Set<string>() };
-    // The edge keeps its aliased tools ahead of the registrars; a host bundle
-    // sorts every symbol together. Both are the byte layout 0.7.0 emitted.
+    // The byte layout 0.7.0 emitted, so a redeploy does not change a
+    // bundle's hash: a host bundle sorts every symbol together; the edge puts
+    // its aliased tools ahead of the sorted registrars — in spec order in the
+    // cf-worker cli bundle, sorted in the workflow and graph ones.
+    const tools = layout.edgeImportsInSpecOrder === true ? [...g.exports] : [...g.exports].sort();
     const symbols = edge
-      ? [...[...g.exports].sort(), ...[...g.inits].sort()]
+      ? [...tools, ...[...g.inits].sort()]
       : [...new Set([...g.exports, ...g.inits])].sort();
     return `import { ${symbols.join(", ")} } from "${pkg}";`;
   });

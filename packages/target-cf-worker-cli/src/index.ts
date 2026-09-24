@@ -164,7 +164,9 @@ export function resolveEdgeTools(
   // name, an `mcp__*` name — is returned unwired, in first-seen order. Each
   // wired export is aliased `__t_<name>` so it never collides with a global
   // (`fetch`!) or another package's export.
-  const resolved = resolveBuiltinTools("cf-worker", [{ tools: names, toolConfigs }]);
+  const resolved = resolveBuiltinTools("cf-worker", [{ tools: names, toolConfigs }], undefined, {
+    edgeImportsInSpecOrder: true,
+  });
   return {
     imports: resolved.imports.join("\n"),
     inits: resolved.inits.join("\n"),

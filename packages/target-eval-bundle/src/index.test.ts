@@ -61,6 +61,11 @@ describe("target-eval-bundle — T1 emitted bundle structure", () => {
     expect(emitEval(makeIr()).files[0]?.content).not.toContain("TOOL_PACKAGES");
   });
 
+  test("a tool-less bundle keeps 0.7.0's bytes: no blank line after AGENT_TOOLS", () => {
+    const code = emitEval(makeIr()).files[0]?.content ?? "";
+    expect(code).toContain("const AGENT_TOOLS = [];\nconst CONCURRENCY = ");
+  });
+
   test("a name the eval shape cannot run fails the emit by name", () => {
     const ir = makeIr({ agent: { model: "m", instructions: "i", tools: ["evmCall"] } });
     expect(() => emitEval(ir)).toThrow(

@@ -69,6 +69,7 @@ export function emitEval(ir: IrEvalV0, opts: EmitEvalOptions = {}): Bundle {
   const toolPackageImports = toolPackages
     .map((pkg, i) => `import * as __toolPackage${i} from ${escapeJsonString(pkg)};\n`)
     .join("");
+  // Carries its own newline, so a tool-less bundle keeps 0.7.0's bytes.
   const toolPackagesConst =
     toolPackages.length > 0
       ? `const TOOL_PACKAGES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {\n${toolPackages
@@ -156,8 +157,7 @@ const INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
 const DATASET = ${JSON.stringify(ir.dataset)} as const;
 const GRADER_CONFIGS = ${JSON.stringify(ir.graders)};
 const AGENT_TOOLS = ${JSON.stringify(ir.agent.tools)};
-${toolPackagesConst}
-const CONCURRENCY = ${ir.concurrency};
+${toolPackagesConst}const CONCURRENCY = ${ir.concurrency};
 ${taxonomyConst}${bridgeConsts}${toolsLine}
 async function main(): Promise<void> {
   const registry = createFileBackedRegistry({
