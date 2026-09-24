@@ -55,6 +55,16 @@ several files, and is imported where it is.
 With no trusted key and no opt-in, a spec that names plugins does not start,
 and the message says where to put the key.
 
+## The plugin that loads is the one you installed
+
+A plugin is loaded from the path its install record gives, and the manifest
+there must be that plugin: a record that points at another plugin's files is
+refused. A plugin the registry pins (`pinnedVersion`) loads only at that
+version, so an older release left on disk cannot run in its place, and the
+marketplace's update leaves a pinned plugin where it is. A plugin changed in
+place since it was installed still loads, and the boot says its install record
+is out of date.
+
 ## Which crewhaus a plugin runs on
 
 A manifest may say which crewhaus versions it supports:

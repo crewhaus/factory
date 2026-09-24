@@ -185,8 +185,11 @@ export interface MarketplaceClient {
   /** Inverse of install — removes from registry. Does NOT delete the on-disk source. */
   uninstall(name: string): Promise<void>;
   /**
-   * Compare local pinned version to remote latest; install if newer.
-   * Returns the install result on update, or `undefined` if already current.
+   * Compare the installed version to the remote latest; install if newer.
+   * Returns the install result on update, or `undefined` if already current —
+   * or pinned: a plugin the registry pins stays at its pin (activation loads
+   * a pinned plugin only at that version, so updating past it would stop it
+   * loading).
    */
   update(name: string, opts?: InstallOptions): Promise<InstallResult | undefined>;
   /**
@@ -372,6 +375,7 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
         // Not installed — nothing to update.
         return undefined;
       }
+      if (existing.pinnedVersion !== undefined) return undefined;
       const remote = await opts.registry.getManifest(name);
       const validated = validatePluginManifest(remote);
       if (compareSemver(validated.version, existing.manifest.version) <= 0) {

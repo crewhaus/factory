@@ -60,7 +60,11 @@ export type PluginRegistryEntry = {
   readonly sourcePath: string;
   /** ISO-8601 timestamp. */
   readonly installedAt: string;
-  /** Optional explicit version pin. When empty, follows the manifest's `version`. */
+  /**
+   * Optional explicit version pin. A plugin that is pinned loads only at that
+   * version (activation refuses any other), and the marketplace's `update`
+   * leaves it where it is. When empty, follows the manifest's `version`.
+   */
   readonly pinnedVersion?: string;
 };
 
@@ -189,6 +193,13 @@ function parseRegistryFile(text: string): RegistryFileShape {
     }
     const entry = value as Record<string, unknown>;
     const manifest = validatePluginManifest(entry["manifest"]);
+    // register() keys every entry by its manifest's name; one that is not
+    // would make list/outdated describe one plugin while another loads.
+    if (manifest.name !== name) {
+      throw new PluginRegistryError(
+        `plugin-registry: entry "${name}" holds the manifest of plugin "${manifest.name}"; an entry must be keyed by its plugin's name`,
+      );
+    }
     if (typeof entry["sourcePath"] !== "string" || entry["sourcePath"].length === 0) {
       throw new PluginRegistryError(`plugin-registry: entry "${name}" missing sourcePath`);
     }

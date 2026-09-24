@@ -546,6 +546,34 @@ describe("parseRegistryFile edge cases", () => {
     expect(caught?.message).toContain("not supported");
   });
 
+  // C172: an entry keyed by one name but holding another plugin's manifest
+  // made list/outdated describe one plugin while activation loaded another.
+  test("rejects an entry whose key is not its manifest's name, naming both", async () => {
+    mem.store.set(
+      REG_PATH,
+      JSON.stringify({
+        version: "1",
+        entries: {
+          a: {
+            manifest: { name: "bee", version: "1.0.0" },
+            sourcePath: "/x/plugin.json",
+            installedAt: "2026-01-01T00:00:00Z",
+          },
+        },
+      }),
+    );
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
+    });
+    await expect(reg.list()).rejects.toThrow(
+      'plugin-registry: entry "a" holds the manifest of plugin "bee"; an entry must be keyed by its plugin\'s name',
+    );
+    await expect(reg.get("a")).rejects.toThrow(PluginRegistryError);
+  });
+
   test("rejects malformed JSON", async () => {
     mem.store.set(REG_PATH, "{not json");
     const reg = createPluginRegistry({

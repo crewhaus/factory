@@ -24,6 +24,7 @@ import {
   type PluginTargetEmitter,
   type RegisteredTool,
   type ToolDefinition,
+  canonicalJson,
   crewhausEngineProblem,
   entrypointDigest,
   entrypointImportProblem,
@@ -283,13 +284,42 @@ function writeVerifiedCopy(
   }
 }
 
+/**
+ * Who the caller expects to find at a manifest path: the plugin registry's
+ * name for the entry, and the version it pins. A manifest that is someone
+ * else is refused before it is verified or imported.
+ */
+export type ExpectedPlugin = {
+  readonly name?: string;
+  readonly version?: string;
+};
+
+/**
+ * Why `manifest` (read from `where`) is not the plugin `expected` names, or
+ * undefined when it is.
+ */
+export function pluginIdentityProblem(
+  expected: ExpectedPlugin,
+  manifest: Pick<PluginManifest, "name" | "version">,
+  where: string,
+): string | undefined {
+  if (expected.name !== undefined && manifest.name !== expected.name) {
+    return `the plugin registry lists "${expected.name}" at ${where}, but that manifest is plugin "${manifest.name}" — refusing to load it under "${expected.name}"`;
+  }
+  if (expected.version !== undefined && manifest.version !== expected.version) {
+    return `plugin "${manifest.name}" is pinned to ${expected.version} in the plugin registry, but ${where} is version ${manifest.version} — refusing to load it. Install ${expected.version}, or clear the pin.`;
+  }
+  return undefined;
+}
+
 export interface PluginLoader {
   /**
    * Load + activate a plugin from a manifest path. Throws
    * `PluginLoaderError` if any check fails. The plugin's entrypoint
-   * module is only `import()`-ed after path + signature pass.
+   * module is only `import()`-ed after path + signature pass, and after the
+   * manifest is found to be the plugin `expected` names.
    */
-  load(manifestPath: string): Promise<LoadedPlugin>;
+  load(manifestPath: string, expected?: ExpectedPlugin): Promise<LoadedPlugin>;
 }
 
 export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
@@ -394,7 +424,7 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
   }
 
   return {
-    async load(manifestPath: string): Promise<LoadedPlugin> {
+    async load(manifestPath: string, expected: ExpectedPlugin = {}): Promise<LoadedPlugin> {
       const absManifest = resolvePath(manifestPath);
       // Stat first to surface a clean error if the file is missing /
       // is a directory — realpathSync would throw an opaque ENOENT.
@@ -420,6 +450,8 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
         );
       }
       const manifest = validatePluginManifest(raw);
+      const notExpected = pluginIdentityProblem(expected, manifest, realManifest);
+      if (notExpected !== undefined) throw new PluginLoaderError(notExpected);
       // A plugin that says which crewhaus it runs on is held to it, before
       // anything else about it is trusted or run.
       const engineProblem = crewhausEngineProblem(manifest, hostVersion);
@@ -952,7 +984,28 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
       note(msg);
       continue;
     }
-    const plugin = await opts.loader.load(entry.sourcePath);
+    // The entry's manifest must be the plugin it is listed as, at the version
+    // it is pinned to: a registry entry pointing at another plugin's files,
+    // or at an older release of this one, is refused before it is imported.
+    // Checked again on what a host's own loader returns.
+    const expected: ExpectedPlugin = {
+      name,
+      ...(entry.pinnedVersion !== undefined ? { version: entry.pinnedVersion } : {}),
+    };
+    const plugin = await opts.loader.load(entry.sourcePath, expected);
+    const notExpected = pluginIdentityProblem(expected, plugin.manifest, entry.sourcePath);
+    if (notExpected !== undefined) throw new PluginLoaderError(notExpected);
+    if (canonicalJson(entry.manifest) !== canonicalJson(plugin.manifest)) {
+      // Changed in place since it was installed: the plugin on disk is what
+      // loads, but `crewhaus plugins outdated` reads the stale record.
+      const differs =
+        entry.manifest.version === plugin.manifest.version
+          ? `${entry.sourcePath} differs from its install record (both say ${plugin.manifest.version})`
+          : `the install record says ${entry.manifest.version}, but ${entry.sourcePath} is ${plugin.manifest.version}`;
+      note(
+        `plugin "${name}": ${differs}. The plugin on disk is what loads; install it again to bring the record up to date.`,
+      );
+    }
     loaded.push(plugin);
     const contributions = readContributions(plugin.module.default);
     // Normalize tools through buildTool so plugin tools get the same

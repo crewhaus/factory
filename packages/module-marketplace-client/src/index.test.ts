@@ -87,8 +87,12 @@ function fakePluginRegistry(): PluginRegistry {
     async get(name) {
       return memEntries.get(name);
     },
-    async pin() {
-      throw new Error("not used");
+    async pin(name, version) {
+      const entry = memEntries.get(name);
+      if (entry === undefined) throw new Error(`not registered: ${name}`);
+      const next = { ...entry, pinnedVersion: version };
+      memEntries.set(name, next);
+      return next;
     },
     async verifyEntry() {
       throw new Error("not used");
@@ -344,6 +348,33 @@ describe("update", () => {
     const updated = await c.update("alpha-tools");
     expect(updated).toBeDefined();
     expect(updated?.manifest.version).toBe("2.0.0");
+  });
+});
+
+describe("update leaves a pinned plugin at its pin (C172)", () => {
+  // Activation loads a pinned plugin only at its pin, so updating past it
+  // would stop the plugin loading.
+  test("a newer remote is not installed over a pin", async () => {
+    let calls = 0;
+    const registry = fakePluginRegistry();
+    const c = createMarketplaceClient({
+      registry: fakeRegistrySource({
+        async getManifest() {
+          calls += 1;
+          return calls === 1
+            ? (MANIFESTS["alpha-tools"] as PluginManifest)
+            : { name: "alpha-tools", version: "2.0.0" };
+        },
+      }),
+      pluginRegistry: registry,
+      pluginsDir: PLUGINS_DIR,
+      writeFileImpl: recordWrite,
+    });
+    await c.install("alpha-tools");
+    await registry.pin("alpha-tools", "1.0.0");
+    expect(await c.update("alpha-tools")).toBeUndefined();
+    expect(calls).toBe(1);
+    expect((await registry.get("alpha-tools"))?.manifest.version).toBe("1.0.0");
   });
 });
 
