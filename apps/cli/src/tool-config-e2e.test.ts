@@ -206,6 +206,49 @@ describe("tool_config.proc reaches EnvInspect (0.7.1 C052)", () => {
   });
 });
 
+describe("tool_config.proc reaches WaitForPort (0.7.1 C144)", () => {
+  test("a spec with only WaitForPort still boots the registrar, and only listed hosts are probed", async () => {
+    const source = [
+      "name: port-hosts",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: Wait for the database to accept connections.",
+      "tools:",
+      "  - waitForPort",
+      "tool_config:",
+      "  proc:",
+      "    wait_for_port_hosts: [db.e2e]",
+      "",
+    ].join("\n");
+    const agentTs = compile(source).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('registerProcConfig({"wait_for_port_hosts":["db.e2e"]});');
+    const proc = await importToolPackage("@crewhaus/tool-proc");
+    const setLookup = proc["_setDnsLookup"] as (
+      fn: ((host: string) => Promise<string[]>) | undefined,
+    ) => void;
+    setLookup(async (host) => (host === "db.e2e" ? ["127.0.0.1"] : []));
+    const { createServer } = await import("node:net");
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const waitForPort = (await bootEmitted(agentTs))["WaitForPort"] as RegisteredTool;
+      const listed = JSON.parse(
+        (await waitForPort.execute({ host: "db.e2e", port, timeoutMs: 3_000 })) as string,
+      ) as { satisfied: boolean };
+      expect(listed.satisfied).toBe(true);
+      expect(await waitForPort.execute({ host: "other.e2e", port, timeoutMs: 100 })).toContain(
+        "is not a loopback address",
+      );
+    } finally {
+      setLookup(undefined);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      (proc["_resetProcConfig"] as () => void)();
+    }
+  });
+});
+
 // ---- crewhaus run, driven by an OpenAI-compatible stub ----------------------
 
 const sse = (o: unknown): string => `data: ${JSON.stringify(o)}\n\n`;

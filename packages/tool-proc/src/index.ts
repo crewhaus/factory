@@ -30,8 +30,9 @@ import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog"
 import { checkEnvReveal } from "@crewhaus/tool-safety/env";
 import { describeRegexOutcome, openRegexSession } from "@crewhaus/tool-safety/regex";
 import { z } from "zod";
+import { portTarget } from "./lib/addr";
 import { type BackoffPolicy, backoffDelayMs, totalBackoffMs } from "./lib/backoff";
-import { ENV_REVEAL_KEY, revealAllowFor } from "./lib/config";
+import { ENV_REVEAL_KEY, PORT_HOSTS_KEY, portHostsFor, revealAllowFor } from "./lib/config";
 import { FALLBACK_PATH, buildSpawnEnv, inspectEnv } from "./lib/env";
 import { capText, compileSafePattern, formatArgv } from "./lib/format";
 import { hostPlatform, searchPath } from "./lib/which";
@@ -49,6 +50,7 @@ import { runOnce, sleep } from "./spawn";
 
 export { __resetRegistryForTest };
 export { _resetProcConfig, registerProcConfig } from "./lib/config";
+export { _setDnsLookup } from "./lib/addr";
 
 /** Compact JSON — the reader is a model, not a person. */
 const json = (value: unknown): string => JSON.stringify(value);
@@ -692,7 +694,7 @@ export const waitForPort: RegisteredTool = buildTool({
   name: "WaitForPort",
   operativeArgs: [{ field: "host", kind: "recipient", default: "127.0.0.1" }],
   description:
-    "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline.",
+    "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline. It probes loopback (localhost, 127.0.0.1, ::1); any other host is refused unless the operator lists it in tool_config.proc.wait_for_port_hosts.",
   inputSchema: z.object({
     port: z.number().int().min(1).max(65_535),
     host: z.string().max(255).optional().describe("default 127.0.0.1"),
@@ -711,6 +713,10 @@ export const waitForPort: RegisteredTool = buildTool({
     if (!HOSTNAME.test(host)) {
       return `[WaitForPort error] "${host}" is not a hostname or address.`;
     }
+    // Loopback, or a host the operator listed — decided before any DNS or
+    // socket, and dialled by the address checked (C144).
+    const target = await portTarget(host, portHostsFor(ctx?.toolConfig), PORT_HOSTS_KEY);
+    if (!target.ok) return target.message;
     const want = input.state ?? "open";
     const interval = input.intervalMs ?? DEFAULT_POLL_MS;
     const startedAt = Date.now();
@@ -720,7 +726,7 @@ export const waitForPort: RegisteredTool = buildTool({
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       attempts++;
-      open = await probePort(host, input.port, Math.max(1, Math.min(1_000, remaining)));
+      open = await probePort(target.dial, input.port, Math.max(1, Math.min(1_000, remaining)));
       if ((want === "open") === open) {
         return json({
           satisfied: true,

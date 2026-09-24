@@ -72,7 +72,7 @@ describe("every configurable package is in the registrar table", () => {
       }
     }
     // http, codehost, notify, obs, defi, chainread, token (x2), chaincall,
-    // evm, evm-tx and code-execution today.
+    // evm, evm-tx, code-execution and proc today.
     expect(packageWide).toBeGreaterThanOrEqual(12);
   });
 });

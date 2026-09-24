@@ -27,6 +27,7 @@ import {
   PROC_TOOLS,
   __resetRegistryForTest,
   _resetProcConfig,
+  _setDnsLookup,
   commandExists,
   envInspect,
   processList,
@@ -986,6 +987,110 @@ describe("WaitForPort", () => {
   test("a host that is not a hostname is refused", async () => {
     const out = await call(waitForPort, { port: 80, host: "not a host", timeoutMs: 50 });
     expect(out).toContain("is not a hostname");
+  });
+
+  /**
+   * C144: WaitForPort is read-only, so plan and auto mode run it unasked. It
+   * probes loopback; any other host needs the operator's
+   * tool_config.proc.wait_for_port_hosts, and is refused before a DNS query
+   * or a socket.
+   */
+  describe("what it may probe (C144)", () => {
+    let lookups: string[] = [];
+    let answers: Record<string, string[]> = {};
+    let server: ReturnType<typeof createServer>;
+    let port = 0;
+    beforeEach(async () => {
+      lookups = [];
+      answers = {};
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        return answers[host] ?? [];
+      });
+      server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      port = (server.address() as AddressInfo).port;
+    });
+    afterEach(async () => {
+      _setDnsLookup(undefined);
+      _resetProcConfig();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    test("the metadata address, a LAN address and an unlisted name are refused unprobed", async () => {
+      for (const host of [
+        "169.254.169.254",
+        "10.0.0.5",
+        "0xa9.0xfe.0xa9.0xfe",
+        "x.attacker.test",
+      ]) {
+        const out = await call(waitForPort, { host, port: 80, timeoutMs: 100 });
+        expect({ host, refused: String(out).includes("is not a loopback address") }).toEqual({
+          host,
+          refused: true,
+        });
+        // A refusal is a sentence: no probe ran, so no `attempts`.
+        expect(String(out)).not.toContain('"attempts"');
+      }
+      // Not even a DNS query for the unlisted name.
+      expect(lookups).toEqual([]);
+    });
+
+    test("loopback in any spelling still works, with no configuration", async () => {
+      for (const host of ["127.0.0.1", "0x7f.1", "2130706433", "127.1", "localhost"]) {
+        const out = await call(waitForPort, { host, port, timeoutMs: 3_000 });
+        expect({ host, satisfied: out.satisfied }).toEqual({ host, satisfied: true });
+      }
+      expect(lookups).toEqual([]);
+    });
+
+    test("a listed name is resolved once and its address dialled for every probe", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["db.internal"] });
+      answers["db.internal"] = ["127.0.0.1"];
+      const out = await call(waitForPort, { host: "db.internal", port, timeoutMs: 3_000 });
+      expect(out.satisfied).toBe(true);
+      // A closed wait polls several times; the name is still looked up once.
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      lookups = [];
+      const closed = await call(waitForPort, {
+        host: "db.internal",
+        port,
+        state: "open",
+        timeoutMs: 300,
+        intervalMs: 50,
+      });
+      expect(closed.attempts).toBeGreaterThan(1);
+      expect(lookups).toEqual(["db.internal"]);
+    });
+
+    test("a listed name that resolves to link-local is refused; a listed literal is probed", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["meta.example", "10.255.255.1"] });
+      answers["meta.example"] = ["169.254.169.254"];
+      const meta = await call(waitForPort, { host: "meta.example", port: 80, timeoutMs: 100 });
+      expect(String(meta)).toContain("link-local");
+      const listed = await call(waitForPort, { host: "10.255.255.1", port: 80, timeoutMs: 50 });
+      expect(listed.attempts).toBeGreaterThanOrEqual(1);
+    });
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["10.255.255.1"] });
+      const out = await waitForPort.execute(
+        { host: "10.255.255.1", port: 80, timeoutMs: 50 },
+        { toolConfig: { wait_for_port_hosts: [] } },
+      );
+      expect(String(out)).toContain("is not a loopback address");
+    });
+
+    test("the registrar refuses a malformed host list, naming the key", () => {
+      expect(() => registerProcConfig({ wait_for_port_hosts: "db" })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+      expect(() => registerProcConfig({ wait_for_port_hosts: ["has space"] })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+    });
   });
 });
 

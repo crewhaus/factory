@@ -1,7 +1,11 @@
 /**
  * `tool_config.proc` — what an operator configures for this package.
  *
- * One key today, `env_reveal`: the environment variables whose VALUES
+ * `wait_for_port_hosts` (C144): the hosts WaitForPort may probe besides
+ * loopback — a compose service (`db`), a LAN address. With none listed it
+ * probes loopback only; see ./addr.
+ *
+ * `env_reveal`: the environment variables whose VALUES
  * EnvInspect may show. Before 0.7.1 the tool showed any value the CALL named
  * in `reveal`, so a model (or the text steering it) could read
  * ANTHROPIC_API_KEY into its own context from a read-only tool that plan and
@@ -19,10 +23,41 @@ import { credentialShapeOf, isEnvName } from "@crewhaus/tool-safety/env";
 
 /** The spec key a refusal names. */
 export const ENV_REVEAL_KEY = "tool_config.proc.env_reveal";
+/** The spec key WaitForPort's refusal names. */
+export const PORT_HOSTS_KEY = "tool_config.proc.wait_for_port_hosts";
 
 let envReveal: readonly string[] = [];
+let portHosts: readonly string[] = [];
 
-/** Parse a `tool_config.proc` block; throws with a sentence naming the key. */
+/** A host WaitForPort may be named: the tool's own hostname shape. */
+const HOST_SHAPE = /^[A-Za-z0-9._:-]{1,255}$/;
+
+/**
+ * Parse `wait_for_port_hosts` (or `waitForPortHosts`): host names or IP
+ * literals, compared case-insensitively. Throws with a sentence naming the key.
+ */
+export function parsePortHosts(config: unknown): readonly string[] {
+  if (config === undefined || config === null) return [];
+  if (typeof config !== "object" || Array.isArray(config)) return [];
+  const block = config as Record<string, unknown>;
+  const snake = block["wait_for_port_hosts"];
+  const camel = block["waitForPortHosts"];
+  if (snake !== undefined && camel !== undefined) {
+    throw new Error(
+      "tool_config.proc sets both wait_for_port_hosts and waitForPortHosts; keep one",
+    );
+  }
+  const list = snake ?? camel;
+  if (list === undefined) return [];
+  if (!Array.isArray(list) || list.some((h) => typeof h !== "string" || !HOST_SHAPE.test(h))) {
+    throw new Error(
+      `${PORT_HOSTS_KEY} must be a list of host names or IP addresses (for example [db, 10.0.0.5])`,
+    );
+  }
+  return Object.freeze([...new Set((list as string[]).map((h) => h.toLowerCase()))].sort());
+}
+
+/** Parse a `tool_config.proc` block's `env_reveal`; throws with a sentence naming the key. */
 export function parseProcConfig(config: unknown): readonly string[] {
   if (config === undefined || config === null) return [];
   if (typeof config !== "object" || Array.isArray(config)) {
@@ -56,9 +91,30 @@ export function parseProcConfig(config: unknown): readonly string[] {
   return Object.freeze([...new Set(names)].sort());
 }
 
-/** The boot registrar: `tool_config.proc` (or `tool_config.envInspect`). */
+/**
+ * The boot registrar: `tool_config.proc` (or `tool_config.envInspect`,
+ * `tool_config.waitForPort`). Both keys are parsed before either is stored,
+ * so a block with one bad key changes nothing.
+ */
 export function registerProcConfig(config: unknown): void {
-  envReveal = parseProcConfig(config);
+  const reveal = parseProcConfig(config);
+  const hosts = parsePortHosts(config);
+  envReveal = reveal;
+  portHosts = hosts;
+}
+
+/**
+ * The extra hosts ONE WaitForPort call may probe: the serving candidate's
+ * block when it declares one, else the boot registration. A candidate block
+ * that does not parse allows nothing beyond loopback.
+ */
+export function portHostsFor(override: unknown): readonly string[] {
+  if (override === undefined) return portHosts;
+  try {
+    return parsePortHosts(override);
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -76,7 +132,8 @@ export function revealAllowFor(override: unknown): readonly string[] {
   }
 }
 
-/** Test-only: back to the default, which reveals nothing. */
+/** Test-only: back to the default, which reveals nothing and probes loopback only. */
 export function _resetProcConfig(): void {
   envReveal = [];
+  portHosts = [];
 }
