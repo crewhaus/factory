@@ -6,7 +6,8 @@
     { "path": "../tool-catalog" },
     { "path": "../tool-builder" },
     { "path": "../tool-safety" },
-    { "path": "../tool-executor" }
+    { "path": "../tool-executor" },
+    { "path": "../prompt-injection-detector" }
   ],
   "include": ["src/**/*"]
 }

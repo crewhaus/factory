@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { classifyText } from "@crewhaus/prompt-injection-detector";
+import { executeTool } from "@crewhaus/tool-executor";
 import {
   WebFetchPermissionError,
   _resetWebFetchConfig,
@@ -733,7 +735,7 @@ describe("WebFetch — ctx.signal cancellation wiring", () => {
 
   test("the fetch-timeout setTimeout callback aborts the controller when fired", async () => {
     // Capture the timeout callback instead of waiting 30s, then invoke it by
-    // hand so its body (ctrl.abort(new Error("fetch timeout"))) is exercised
+    // hand so its body (the abort with the timed-out reason) is exercised
     // deterministically — no real timer, no leaked handle.
     const captured: Array<() => void> = [];
     const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
@@ -916,4 +918,53 @@ describe("private-address classifier — spelling matrix", () => {
       expect(isPrivateIp(address)).toBe(false);
     });
   }
+});
+
+describe("WebFetch's timeout is not read as a prompt injection", () => {
+  test("the timed-out result says why, and is not read as an order", async () => {
+    // The stub holds the request open until the tool's own timer aborts it;
+    // the timer is fired by hand, so nothing races a real clock.
+    let reached: () => void = () => undefined;
+    const inFlight = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    _setRawFetch(
+      (req) =>
+        new Promise<Response>((_resolve, reject) => {
+          req.signal.addEventListener("abort", () => reject(req.signal.reason), { once: true });
+          reached();
+        }),
+    );
+    const captured: Array<() => void> = [];
+    const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
+      captured.push(fn);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
+      (() => {}) as typeof clearTimeout,
+    );
+    let content = "";
+    try {
+      const pending = executeTool(
+        webFetch,
+        { url: "https://example.com/slow", prompt: "x" },
+        { toolUseId: "t" },
+      );
+      await inFlight;
+      for (const fn of captured) fn();
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      content = String(result.content);
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+    expect(content).toBe("the request timed out after 30000ms");
+    // 0.7.0 answered "fetch timeout", which the trailing-imperative rule
+    // flags; the check below proves the detector is live, not just lenient.
+    expect([
+      (await classifyText(content)).classification,
+      (await classifyText("fetch timeout")).classification,
+    ]).toEqual(["clean", "suspicious"]);
+  });
 });

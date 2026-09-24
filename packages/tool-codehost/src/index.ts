@@ -1207,7 +1207,9 @@ export const workflowRunLogs: RegisteredTool = readTool({
         job = failed ?? jobs[jobs.length - 1];
         const chosen = job?.["id"];
         if (typeof chosen !== "number") {
-          return `run ${input.runId} reported ${jobs.length} jobs and none of them carries an id to read a log from`;
+          // "workflow run", not "run …": a result that starts with "run" is
+          // what the prompt-injection detector flags as an order.
+          return `workflow run ${input.runId} reported ${jobs.length} jobs and none of them carries an id to read a log from`;
         }
         jobId = chosen;
       }

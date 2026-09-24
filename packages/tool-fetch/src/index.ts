@@ -402,15 +402,25 @@ export function isPrivateIp(address: string): boolean {
 }
 // END SYNCHRONISED BLOCK
 
+/**
+ * Refusals open with a bracketed tag, the runtime's own convention
+ * (`[egress denied]`, `[rate-limited]`). They used to open "Fetch denied:",
+ * and a last line that starts with "fetch" is exactly what the
+ * prompt-injection detector's trailing-imperative rule flags — so Fetch's own
+ * refusal was classified as a suspected injection and spent the session's
+ * single console warning.
+ */
 function checkOriginAllowed(url: URL, cfg: FetchConfig): void {
   if (cfg.allowedOrigins.size === 0) {
     throw new FetchPermissionError(
-      `Fetch denied: origin "${url.origin}" is not in allowed_origins (empty allow-list = deny all)`,
+      `[fetch denied] origin "${url.origin}" is not in allowed_origins (empty allow-list = deny all)`,
     );
   }
   const canonical = canonicalizeOrigin(url.toString());
   if (!cfg.allowedOrigins.has(canonical)) {
-    throw new FetchPermissionError(`Fetch denied: origin "${canonical}" is not in allowed_origins`);
+    throw new FetchPermissionError(
+      `[fetch denied] origin "${canonical}" is not in allowed_origins`,
+    );
   }
 }
 
@@ -550,7 +560,7 @@ async function performFetch(
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (currentUrl.protocol !== "http:" && currentUrl.protocol !== "https:") {
       throw new FetchPermissionError(
-        `Fetch denied: scheme "${currentUrl.protocol}" — only http/https allowed`,
+        `[fetch denied] scheme "${currentUrl.protocol}" — only http/https allowed`,
       );
     }
     checkOriginAllowed(currentUrl, cfg);
@@ -634,7 +644,13 @@ export const fetch: RegisteredTool = buildTool({
     }
 
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error("fetch timeout")), DEFAULT_TIMEOUT_MS);
+    // Worded so no line of it starts with a verb the prompt-injection
+    // detector reads as an order ("fetch …"): a tool's own refusal must not
+    // be flagged as an injection, and use up the session's one warning.
+    const timer = setTimeout(
+      () => ctrl.abort(new Error(`the request timed out after ${DEFAULT_TIMEOUT_MS}ms`)),
+      DEFAULT_TIMEOUT_MS,
+    );
     if (ctx?.signal !== undefined) {
       if (ctx.signal.aborted) ctrl.abort(ctx.signal.reason);
       else

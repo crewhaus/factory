@@ -530,7 +530,12 @@ export const webFetch: RegisteredTool = buildTool({
     }
 
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error("fetch timeout")), timeoutMs);
+    // Not "fetch timeout": a result whose last line starts with "fetch" is
+    // what the prompt-injection detector flags as a trailing order.
+    const timer = setTimeout(
+      () => ctrl.abort(new Error(`the request timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
     if (ctx?.signal !== undefined) {
       if (ctx.signal.aborted) ctrl.abort(ctx.signal.reason);
       else
