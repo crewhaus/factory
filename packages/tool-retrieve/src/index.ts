@@ -179,6 +179,9 @@ function makeRetrieveTool(
     description:
       "Retrieve top-k chunks from the configured vector store for a natural-language query. Pass `query` (required), optional `k` (default 5), and optional `filter` (metadata predicates). Returns a numbered list of hits with citations.",
     inputSchema: retrieveSchema,
+    // No argument decides where it acts: the query goes to the configured
+    // embedder and vector store. (Matched exactly as if undeclared.)
+    operativeArgs: [],
     readOnly: true,
     concurrencySafe: true,
     ...(opts.local === true

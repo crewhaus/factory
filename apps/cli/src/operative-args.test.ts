@@ -63,6 +63,7 @@ const NO_SCOPING_ARGUMENT: Readonly<Record<string, string>> = {
   ProcessStop: "stops a process this session started, by a handle only this session has",
   RateLimitStatus: "reads the configured code host's own rate limit",
   RegistrySearch: "searches a fixed public package registry",
+  Retrieve: "sends the query to the configured embedder and vector store",
   SystemInfo: "reads this machine's hardware and OS facts",
   TodoWrite: "writes this session's own task list",
   UserPresence: "reads this machine's idle time",
