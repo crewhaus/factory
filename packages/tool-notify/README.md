@@ -14,7 +14,7 @@ is a different and more dangerous act.
 ```yaml
 tools:
   - all-notify          # every tool below
-  - -SmsSend            # ...except this one
+  - -smsSend            # ...except this one (a tools: list takes the camelCase key)
 ```
 
 | Tool | What it does |

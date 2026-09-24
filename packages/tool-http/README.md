@@ -10,7 +10,7 @@ of those patterns into a single call with a stated bound.
 
 ```yaml
 tools:
-  - all-http          # every tool below
+  - all-http          # every tool below, plus Fetch (@crewhaus/tool-fetch)
   - -downloadFile     # ...except this one
 
 tool_config:
