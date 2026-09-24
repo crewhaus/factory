@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -7,6 +7,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import {
   DEFAULT_IGNORED_DIRS,
   ToolPermissionError,
+  _setGrepLimitsForTest,
   allFsTools,
   edit,
   glob,
@@ -26,6 +27,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  _setGrepLimitsForTest(undefined);
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
 });
@@ -313,6 +315,99 @@ describe("hasNestedQuantifier (ReDoS guard)", () => {
       expect(hasNestedQuantifier(p)).toBe(false);
     },
   );
+});
+
+describe("Grep never reports what it did not search as a miss (C089)", () => {
+  test("a line the engine gave up on is undetermined, not a non-match", async () => {
+    // JavaScriptCore gives up silently, as a slow "no match". With the
+    // give-up threshold at 1 ms, a cubic pattern's no-match on 70 digits (a
+    // few ms) takes that path, bounded, with no pathological pattern needed.
+    const slow = "1".repeat(70);
+    await writeFile(path.join(tmp, "f.txt"), `${slow}\nbeta\n${slow}\n`);
+    _setGrepLimitsForTest({ giveUpMs: 1 });
+    const hit = String(await grep.execute({ pattern: "\\d+\\d+\\d+x|beta" }));
+    expect(hit.split("\n")[0]).toBe("f.txt:2:beta");
+    expect(hit).toContain("[grep: 2 line(s) could not be evaluated");
+    expect(hit).toContain("(f.txt:1, f.txt:3)");
+    const miss = String(await grep.execute({ pattern: "\\d+\\d+\\d+x" }));
+    expect(miss).not.toBe("no matches");
+    expect(miss.startsWith("no matches in the lines searched")).toBe(true);
+  });
+
+  test("the pattern that fooled 0.7.0 is refused before it runs", async () => {
+    await writeFile(
+      path.join(tmp, "f.txt"),
+      `${Array.from({ length: 8 }, (_, i) => `${"0123456789abcdef".repeat(4)}${i === 4 ? "NEEDLE" : ""}`).join("\n")}\n`,
+    );
+    // 0.7.0 returned a bare "no matches" after six seconds, NEEDLE on line 5.
+    await expect(grep.execute({ pattern: "(\\w|\\d)*!|NEEDLE" })).rejects.toThrow(
+      /invalid regex pattern: overlapping alternation/,
+    );
+    expect(String(await grep.execute({ pattern: "NEEDLE" }))).toBe(
+      `f.txt:5:${"0123456789abcdef".repeat(4)}NEEDLE`,
+    );
+  });
+
+  test("the deadline is checked before every file, not every 1024 lines", async () => {
+    for (const name of ["a.txt", "b.txt", "c.txt"]) {
+      await writeFile(path.join(tmp, name), "alpha\n");
+    }
+    let clock = 0;
+    _setGrepLimitsForTest({
+      now: () => {
+        clock += 1000;
+        return clock;
+      },
+    });
+    const result = String(await grep.execute({ pattern: "zzz" }));
+    expect(result).toContain("scan stopped early — the 2000 ms deadline passed");
+    expect(result).not.toBe("no matches");
+  });
+
+  test("a deadline reached inside a file keeps the hits found and names the rest as unsearched", async () => {
+    // Cubic in the line length: about 20 ms a line here, so forty of them
+    // outlast a 100 ms deadline many times over, and the worker abandoned
+    // at the deadline finishes its line within milliseconds.
+    const slow = "1".repeat(100);
+    await writeFile(path.join(tmp, "a.txt"), `1x\n${Array(40).fill(slow).join("\n")}\n`);
+    _setGrepLimitsForTest({ deadlineMs: 100 });
+    const result = String(await grep.execute({ pattern: "\\d+\\d+\\d+x" }));
+    expect(result).toContain("scan stopped early — the 100 ms deadline passed");
+    expect(result).not.toBe("no matches");
+  }, 20_000);
+
+  test("a line too long to search is named, not silently skipped", async () => {
+    await writeFile(path.join(tmp, "min.js"), `short needle\n${"x".repeat(20_000)}needle\n`);
+    const result = String(await grep.execute({ pattern: "needle" }));
+    expect(result.split("\n")[0]).toBe("min.js:1:short needle");
+    expect(result).toContain("1 line(s) longer than 10000 characters were not searched");
+  });
+
+  test("a file it could not read is counted, not taken as a miss", async () => {
+    if (process.getuid?.() === 0) return; // root reads a mode-000 file anyway
+    await writeFile(path.join(tmp, "locked.txt"), "needle\n");
+    chmodSync(path.join(tmp, "locked.txt"), 0o000);
+    try {
+      const result = String(await grep.execute({ pattern: "needle" }));
+      expect(result).toBe(
+        "no matches in the lines searched\n[grep: 1 file(s) could not be read and were not searched]",
+      );
+    } finally {
+      chmodSync(path.join(tmp, "locked.txt"), 0o600);
+    }
+  });
+
+  test("a complete search with no hits is still a plain 'no matches'", async () => {
+    await writeFile(path.join(tmp, "f.txt"), "alpha\n");
+    expect(await grep.execute({ pattern: "zzz" })).toBe("no matches");
+  });
+
+  test("hasNestedQuantifier covers overlapping alternation, and leaves disjoint alternation alone", () => {
+    expect(hasNestedQuantifier("(\\w|\\d)*!")).toBe(true);
+    expect(hasNestedQuantifier("(=|=)*x")).toBe(true);
+    expect(hasNestedQuantifier("(foo|bar)+")).toBe(false);
+    expect(hasNestedQuantifier("(get|set)Value")).toBe(false);
+  });
 });
 
 describe("allFsTools export", () => {

@@ -14,6 +14,13 @@ import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  type RegexRejectCode,
+  describeRegexOutcome,
+  openRegexSession,
+  screenUserRegex,
+} from "@crewhaus/tool-safety/regex";
+import { readFileBoundedSync } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { renderEditDiff } from "./diff";
 
@@ -344,27 +351,99 @@ const grepSchema = z.object({
   path: z.string().optional(),
 });
 
-// ReDoS bounds. The Grep pattern is model-supplied and model output is
-// attacker-steerable, so a catastrophic-backtracking pattern run over the
-// workspace could pin a CPU core. We bound it three ways:
-//  1. reject nested-quantifier (star-height >= 2) patterns up front — the
-//     shape behind exponential backtracking, which no input cap can save;
-//  2. skip over-long lines so a "safe" (linear/polynomial) pattern can't be
-//     fed a pathological input length;
-//  3. a wall-clock deadline + a scanned-bytes cap bound the aggregate work.
+// The Grep pattern is model-supplied, and model output is attacker-steerable.
+// A synchronous RegExp call cannot be interrupted: no timer fires and no
+// abort is seen while it runs, so a catastrophic pattern froze every session
+// in the process. Worse, JavaScriptCore stops a runaway match after a fixed
+// backtracking budget and answers "no match", indistinguishable from a real
+// one: `(\w|\d)*!|NEEDLE` over 64-character hex lines returned a bare "no
+// matches" after 6 s with NEEDLE on line 5, and the deadline, read only
+// every 1024 lines, let one file run for minutes (security-6#6). So:
+//  1. the pattern is screened up front (tool-safety's `screenUserRegex`,
+//     which refuses nested quantifiers AND overlapping alternation, plus
+//     this package's older nested-quantifier check, which is stricter about
+//     bounded repeats such as `(.*a){10}`);
+//  2. the match runs in tool-safety's regex worker, one `testEach` per file,
+//     under the call's deadline and abort signal: at the deadline the worker
+//     is terminated and the caller's thread is free;
+//  3. an answer the engine gave up on (a slow "no match") is UNDETERMINED,
+//     and so is a line too long to run: the result lists what it could not
+//     search and never says a bare "no matches" when anything went unsearched.
 const GREP_MAX_LINE_LENGTH = 10_000;
 const GREP_MAX_PATTERN_LENGTH = 1_000;
 const GREP_DEADLINE_MS = 2_000;
 const GREP_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+/** Examples of unsearched lines named in the note; the rest are counted. */
+const GREP_UNSEARCHED_EXAMPLES = 5;
+
+type GrepLimits = {
+  readonly deadlineMs: number;
+  readonly giveUpMs: number | undefined;
+  readonly now: () => number;
+};
+const GREP_DEFAULT_LIMITS: GrepLimits = {
+  deadlineMs: GREP_DEADLINE_MS,
+  giveUpMs: undefined,
+  now: () => Date.now(),
+};
+let grepLimits: GrepLimits = GREP_DEFAULT_LIMITS;
+
+/**
+ * Test seam: the deadline, the regex worker's give-up threshold (a no-match
+ * slower than this is undetermined; 0 makes every no-match undetermined, to
+ * exercise that path without a pathological pattern) and the clock. Pass
+ * `undefined` to restore.
+ */
+export function _setGrepLimitsForTest(limits: Partial<GrepLimits> | undefined): void {
+  grepLimits = { ...GREP_DEFAULT_LIMITS, ...limits };
+}
+
+const REJECTION_LABELS: Partial<Record<RegexRejectCode, string>> = {
+  "nested-quantifier": "nested quantifiers",
+  "overlapping-alternation": "overlapping alternation",
+  "invalid-syntax": "invalid syntax",
+  "pattern-too-long": "too long",
+  unanalysable: "too complex to check",
+};
+
+/**
+ * Refuse a pattern that could backtrack catastrophically, with the reason.
+ * Throws the tool's usual "invalid regex pattern" error.
+ */
+function screenGrepPattern(pattern: string): void {
+  if (pattern.length > GREP_MAX_PATTERN_LENGTH) {
+    throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
+  }
+  const screened = screenUserRegex(pattern, "", { maxPatternChars: GREP_MAX_PATTERN_LENGTH });
+  if (!screened.ok) {
+    const label = REJECTION_LABELS[screened.code] ?? screened.code;
+    throw new Error(`invalid regex pattern: ${label} — ${screened.reason}`);
+  }
+  if (hasNestedQuantifier(pattern)) {
+    throw new Error(
+      "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
+    );
+  }
+}
 
 /**
  * True if the pattern nests one unbounded/large quantifier inside another
- * (star-height >= 2, e.g. `(a+)+`, `(a*)*`, `(.*a)+`, `((\d+)x)*`). That is
- * the structural cause of exponential backtracking. Heuristic, not a full
- * analysis — alternation-overlap ReDoS is only partly covered, which is why
- * the line/scan caps exist as a backstop.
+ * (star-height >= 2, e.g. `(a+)+`, `(a*)*`, `(.*a)+`, `((\d+)x)*`), or
+ * repeats an alternation whose branches can match the same text
+ * (`(\w|\d)*`, `(a|ab)*`). Both are shapes behind exponential
+ * backtracking. The alternation half, and the precise nested-quantifier
+ * analysis, are tool-safety's `screenUserRegex`; the structural check below
+ * is the older, stricter one about bounded repeats, kept so no pattern this
+ * refused before is accepted now.
  */
 export function hasNestedQuantifier(pattern: string): boolean {
+  const screened = screenUserRegex(pattern, "", { maxPatternChars: Number.MAX_SAFE_INTEGER });
+  if (
+    !screened.ok &&
+    (screened.code === "nested-quantifier" || screened.code === "overlapping-alternation")
+  ) {
+    return true;
+  }
   // Per group-nesting level, did the body so far contain a quantifier?
   const quantInGroup: boolean[] = [false];
   const isBigQuant = (s: string, at: number): boolean => {
@@ -433,10 +512,44 @@ export function hasNestedQuantifier(pattern: string): boolean {
   return false;
 }
 
+/** What a Grep call could not search, for the note that says so. */
+type Unsearched = {
+  /** Lines the engine gave up on: they may or may not match. */
+  gaveUp: number;
+  /** Lines longer than GREP_MAX_LINE_LENGTH, not run at all. */
+  tooLong: number;
+  /** Files that could not be read (not symlinks, which are skipped by design). */
+  unreadable: number;
+  /** A few `path:line` examples of undetermined lines. */
+  examples: string[];
+  /** Why the scan stopped before the end, when it did. */
+  stopped: string | undefined;
+};
+
+function unsearchedNote(u: Unsearched): string {
+  const parts: string[] = [];
+  if (u.gaveUp > 0) {
+    const shown = u.examples.slice(0, GREP_UNSEARCHED_EXAMPLES).join(", ");
+    parts.push(
+      `\n[grep: ${u.gaveUp} line(s) could not be evaluated — the regex engine gave up on them (${shown}${u.gaveUp > GREP_UNSEARCHED_EXAMPLES ? ", …" : ""}), so they may or may not match; simplify the pattern]`,
+    );
+  }
+  if (u.tooLong > 0) {
+    parts.push(
+      `\n[grep: ${u.tooLong} line(s) longer than ${GREP_MAX_LINE_LENGTH} characters were not searched]`,
+    );
+  }
+  if (u.unreadable > 0) {
+    parts.push(`\n[grep: ${u.unreadable} file(s) could not be read and were not searched]`);
+  }
+  if (u.stopped !== undefined) parts.push(`\n[grep: scan stopped early — ${u.stopped}]`);
+  return parts.join("");
+}
+
 export const grep: RegisteredTool = buildTool({
   name: "Grep",
   description:
-    "Search for a regex pattern across files in the workspace (or a subdirectory). Vendored directories (node_modules, __pycache__) are skipped unless `path` points inside one. Returns lines as path:lineNo:match.",
+    "Search for a regex pattern across files in the workspace (or a subdirectory). Vendored directories (node_modules, __pycache__) are skipped unless `path` points inside one. Returns lines as path:lineNo:match, and names any lines it could not search.",
   inputSchema: grepSchema,
   readOnly: true,
   concurrencySafe: true,
@@ -448,7 +561,7 @@ export const grep: RegisteredTool = buildTool({
     { field: "pattern", kind: "text" },
     { field: "path", kind: "path", default: "." },
   ],
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const root = process.cwd();
     let baseAbs = root;
     let baseRel = "";
@@ -456,25 +569,18 @@ export const grep: RegisteredTool = buildTool({
       baseAbs = resolveSafe("Grep", input.path, root);
       baseRel = path.relative(root, baseAbs);
     }
-    if (input.pattern.length > GREP_MAX_PATTERN_LENGTH) {
-      throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
-    }
-    if (hasNestedQuantifier(input.pattern)) {
-      throw new Error(
-        "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
-      );
-    }
-    let regex: RegExp;
-    try {
-      regex = new RegExp(input.pattern);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`invalid regex pattern: ${msg}`);
-    }
+    screenGrepPattern(input.pattern);
 
-    const deadline = Date.now() + GREP_DEADLINE_MS;
+    const limits = grepLimits;
+    const deadline = limits.now() + limits.deadlineMs;
     let scannedBytes = 0;
-    let truncated = false;
+    const unsearched: Unsearched = {
+      gaveUp: 0,
+      tooLong: 0,
+      unreadable: 0,
+      examples: [],
+      stopped: undefined,
+    };
     // Pointing `path` at (or inside) a vendored directory opts into searching
     // it; otherwise its contents are skipped before they cost a read.
     const ignored = activeIgnoredDirs(input.path ?? "");
@@ -482,49 +588,96 @@ export const grep: RegisteredTool = buildTool({
     const hits: string[] = [];
     const hiddenDirs = new Set<string>();
     let hidden = 0;
-    outer: for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
-      const skippedBy = ignoredSegmentOf(rel, ignored);
-      if (skippedBy !== undefined) {
-        hidden++;
-        hiddenDirs.add(skippedBy);
-        continue;
-      }
-      const fileAbs = path.join(baseAbs, rel);
-      const display = baseRel === "" ? rel : path.join(baseRel, rel);
-      let text: string;
-      try {
-        // O_NOFOLLOW: skip (don't follow) any symlinked entry the glob surfaced.
-        text = readFileNoFollow("Grep", fileAbs).toString("utf8");
-      } catch {
-        continue;
-      }
-      scannedBytes += text.length;
-      if (scannedBytes > GREP_MAX_TOTAL_BYTES) {
-        truncated = true;
+    const session = openRegexSession();
+    try {
+      for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
+        const skippedBy = ignoredSegmentOf(rel, ignored);
+        if (skippedBy !== undefined) {
+          hidden++;
+          hiddenDirs.add(skippedBy);
+          continue;
+        }
+        const remainingMs = deadline - limits.now();
+        if (remainingMs <= 0) {
+          unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed; files after this point were not searched`;
+          break;
+        }
+        const fileAbs = path.join(baseAbs, rel);
+        const display = baseRel === "" ? rel : path.join(baseRel, rel);
+        // Bounded by what is left of the byte budget, never following a
+        // link, and refusing a FIFO before it is opened (it would block).
+        const budget = GREP_MAX_TOTAL_BYTES - scannedBytes;
+        const read = readFileBoundedSync(fileAbs, { maxBytes: budget, followSymlinks: false });
+        if (!read.ok) {
+          // A symlinked entry is skipped by design; anything else is a file
+          // this call did not search, and says so.
+          if (read.code !== "symlink-refused") unsearched.unreadable++;
+          continue;
+        }
+        if (read.truncated) {
+          unsearched.stopped = `the ${GREP_MAX_TOTAL_BYTES / (1024 * 1024)} MiB scan budget ran out at ${display}; it and the files after it were not searched`;
+          break;
+        }
+        scannedBytes += read.bytes.length;
+        const lines = read.text.split("\n");
+        const outcome = await session.run({
+          op: "testEach",
+          pattern: input.pattern,
+          inputs: lines,
+          onGiveUp: "skip",
+          maxItemChars: GREP_MAX_LINE_LENGTH,
+          maxMatches: lines.length,
+          deadlineMs: remainingMs,
+          ...(limits.giveUpMs !== undefined ? { giveUpMs: limits.giveUpMs } : {}),
+          ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+          ...(ctx?.runContext?.sessionId !== undefined
+            ? { runawayKey: ctx.runContext.sessionId }
+            : {}),
+        });
+        const answered = outcome.status === "ok" ? outcome.result : undefined;
+        const partial =
+          answered ??
+          (outcome.status === "timeout" || outcome.status === "gave-up"
+            ? outcome.partial
+            : undefined);
+        for (const index of partial?.matched ?? []) {
+          hits.push(`${display}:${index + 1}:${lines[index] ?? ""}`);
+        }
+        for (const index of partial?.undetermined ?? []) {
+          if ((lines[index] ?? "").length > GREP_MAX_LINE_LENGTH) {
+            unsearched.tooLong++;
+          } else {
+            unsearched.gaveUp++;
+            if (unsearched.examples.length < GREP_UNSEARCHED_EXAMPLES) {
+              unsearched.examples.push(`${display}:${index + 1}`);
+            }
+          }
+        }
+        if (answered !== undefined) continue;
+        // Anything else ends the scan: the deadline, an abort, a worker that
+        // could not run. The rest of this file and every file after it were
+        // not searched, and the note says so.
+        unsearched.stopped =
+          outcome.status === "timeout"
+            ? `the ${limits.deadlineMs} ms deadline passed while searching ${display}; the rest of it and the files after it were not searched`
+            : `${describeRegexOutcome(outcome)} (at ${display}); it and the files after it were not searched`;
         break;
       }
-      const lines = text.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        // Check the deadline between lines — bounds aggregate work even though
-        // it can't interrupt a single `.test()` (which the pattern guard +
-        // line cap keep cheap).
-        if ((i & 0x3ff) === 0 && Date.now() > deadline) {
-          truncated = true;
-          break outer;
-        }
-        const line = lines[i] ?? "";
-        if (line.length > GREP_MAX_LINE_LENGTH) continue;
-        if (regex.test(line)) {
-          hits.push(`${display}:${i + 1}:${line}`);
-        }
-      }
+    } finally {
+      session.close();
     }
-    const note = truncated ? "\n[grep: scan stopped early — workspace too large or slow]" : "";
-    return (
-      (hits.length === 0 ? "no matches" : hits.join("\n")) +
-      note +
-      hiddenNote("Grep", hidden, hiddenDirs)
-    );
+    const incomplete =
+      unsearched.gaveUp > 0 ||
+      unsearched.tooLong > 0 ||
+      unsearched.unreadable > 0 ||
+      unsearched.stopped !== undefined;
+    const body =
+      hits.length > 0
+        ? hits.join("\n")
+        : incomplete
+          ? "no matches in the lines searched"
+          : "no matches";
+    return body + unsearchedNote(unsearched) + hiddenNote("Grep", hidden, hiddenDirs);
   },
 });
 
