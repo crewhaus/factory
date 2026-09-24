@@ -13,6 +13,7 @@ import { jaccard, normalizeValue, tallyVotes } from "./lib/consensus";
 import { checkDeadline } from "./lib/deadline";
 import { evaluateTable, hashTable } from "./lib/decision";
 import { classifyError, parseRetryAfter } from "./lib/errors";
+import { parseHttpDate } from "./lib/http-date";
 import { scoreValue } from "./lib/score";
 import { planSequence } from "./lib/sequence";
 import { detectStall } from "./lib/stall";
@@ -397,6 +398,97 @@ describe("classifyError", () => {
     expect(parseRetryAfter("120")).toEqual({ waitMs: 120_000, retryAt: null });
     expect(parseRetryAfter("")).toEqual({ waitMs: null, retryAt: null });
     expect(parseRetryAfter("soon")).toEqual({ waitMs: null, retryAt: null });
+  });
+
+  describe("an HTTP-date Retry-After is the same instant on every machine", () => {
+    const now = Date.parse("2026-09-23T09:00:00Z");
+    /**
+     * Run `body` with the process's zone set to `tz`, and put it back. Never
+     * by deleting TZ: in Bun that freezes the zone for the rest of the
+     * process. `bun test` runs in UTC when TZ is unset, so that is what an
+     * unset TZ is restored as.
+     */
+    const inZone = <T>(tz: string, body: () => T): T => {
+      const previous = process.env["TZ"];
+      process.env["TZ"] = tz;
+      try {
+        return body();
+      } finally {
+        process.env["TZ"] = previous === undefined || previous === "" ? "Etc/UTC" : previous;
+      }
+    };
+    const ZONES = ["UTC", "America/New_York", "Asia/Tokyo"];
+
+    test("all three RFC 9110 forms are GMT, whatever the host zone", () => {
+      const forms = [
+        "Wed, 23 Sep 2026 10:00:00 GMT", // IMF-fixdate
+        "Wednesday, 23-Sep-26 10:00:00 GMT", // rfc850-date
+        "Wed Sep 23 10:00:00 2026", // asctime-date, GMT by definition
+        "Wed Sep  3 10:00:00 2026".replace(" 3", "23"), // asctime spacing, two digits
+        "wed, 23 sep 2026 10:00:00 gmt", // names are not case-sensitive here
+      ];
+      const seen: Array<{ tz: string; form: string; waitMs: number | null }> = [];
+      for (const tz of ZONES) {
+        // Proves the zone really changed, so the assertion below is not vacuous.
+        const localHour = inZone(tz, () => new Date(now).getHours());
+        expect({ tz, differs: tz === "UTC" || localHour !== 9 }).toEqual({ tz, differs: true });
+        for (const form of forms) {
+          seen.push({ tz, form, waitMs: inZone(tz, () => parseRetryAfter(form, now).waitMs) });
+        }
+      }
+      // 0.7.0: the asctime form waited 0 under Asia/Tokyo and 8 h under
+      // America/Los_Angeles, because Date.parse read it as host-local time.
+      expect(seen.filter((s) => s.waitMs !== 3_600_000)).toEqual([]);
+      expect(seen).toHaveLength(ZONES.length * forms.length);
+      expect(parseRetryAfter("Wed Sep 23 10:00:00 2026", now).retryAt).toBe(
+        "2026-09-23T10:00:00.000Z",
+      );
+    });
+
+    test("a date with no zone is not read at all, rather than read as local time", () => {
+      const refused = [
+        "2026-09-23T10:00:00", // offset-less ISO: local time per ECMAScript
+        "Wed, 23 Sep 2026 10:00:00", // RFC 1123 with the zone left off
+        "23 Sep 2026 10:00", // prose
+        "Wed, 31 Nov 2026 10:00:00 GMT", // a day November does not have
+        "Foo, 23 Sep 2026 10:00:00 GMT", // not a weekday
+        "Wed, 23 Sep 2026 24:00:00 GMT", // not an hour
+        "Wed, 23 Sep 2026 10:00:00 PST", // HTTP-dates are GMT only
+      ];
+      for (const text of refused) {
+        expect({ text, got: inZone("Asia/Tokyo", () => parseRetryAfter(text, now)) }).toEqual({
+          text,
+          got: { waitMs: null, retryAt: null },
+        });
+      }
+    });
+
+    test("an ISO instant that carries its own offset is still read", () => {
+      for (const text of ["2026-09-23T10:00:00Z", "2026-09-23T19:00:00+09:00"]) {
+        expect(inZone("America/New_York", () => parseRetryAfter(text, now).waitMs)).toBe(3_600_000);
+      }
+    });
+
+    test("an rfc850 two-digit year is placed by the RFC's 50-year rule, and needs a now", () => {
+      expect(parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT", now)).toBe(
+        Date.parse("1994-11-06T08:49:37Z"),
+      );
+      expect(parseHttpDate("Wednesday, 23-Sep-26 10:00:00 GMT", now)).toBe(
+        Date.parse("2026-09-23T10:00:00Z"),
+      );
+      // 2076 is within 50 years of 2026; 2077 is not, so '77 is 1977.
+      expect(parseHttpDate("Monday, 01-Jan-76 00:00:00 GMT", now)).toBe(
+        Date.parse("2076-01-01T00:00:00Z"),
+      );
+      expect(parseHttpDate("Monday, 01-Jan-77 00:00:00 GMT", now)).toBe(
+        Date.parse("1977-01-01T00:00:00Z"),
+      );
+      // Without a reference year the century is unknown: no guess.
+      expect(parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT")).toBeUndefined();
+      expect(parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT")).toBe(
+        Date.parse("1994-11-06T08:49:37Z"),
+      );
+    });
   });
 });
 

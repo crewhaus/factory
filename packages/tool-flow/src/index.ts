@@ -202,7 +202,9 @@ export const errorClassify: RegisteredTool = buildTool({
     retryAfter: z
       .string()
       .optional()
-      .describe("the raw Retry-After header: seconds or an HTTP-date"),
+      .describe(
+        "the raw Retry-After header: seconds or an HTTP-date (always GMT); a date with no zone is not read",
+      ),
     attempt: z.number().int().positive().optional().describe("1-based attempt number"),
     maxAttempts: z.number().int().positive().optional(),
     now: instantField
@@ -526,3 +528,10 @@ export const FLOW_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
 ]);
 
 export type { Check };
+
+/**
+ * The strict RFC 9110 HTTP-date reader ErrorClassify uses, for any package
+ * that turns a Retry-After or an Expires header into an instant: it never
+ * reads a zone-less date as the host's local time.
+ */
+export { parseHttpDate } from "./lib/http-date";
