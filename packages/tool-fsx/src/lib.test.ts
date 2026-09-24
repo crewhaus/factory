@@ -29,7 +29,7 @@ import {
   splitFrontmatter,
 } from "./lib/frontmatter";
 import { compileIgnoreRule, isIgnored, parseGitignore } from "./lib/gitignore";
-import { globToRegExpSource, matchGlob } from "./lib/glob";
+import { compileGlob, matchGlob } from "./lib/glob";
 import {
   NotebookError,
   applyNotebookEdit,
@@ -86,8 +86,16 @@ describe("glob", () => {
   });
 
   test("an unterminated class degrades to a literal bracket", () => {
-    expect(globToRegExpSource("[abc")).toBe("\\[abc");
     expect(matchGlob("[abc", "[abc")).toBe(true);
+    expect(matchGlob("[abc", "a")).toBe(false);
+  });
+
+  test("a class never matches a separator, negated or not", () => {
+    // gitignore(5): `*`, `?` and `[...]` do not cross `/`. A negated class
+    // compiled to `[^x]` in the RegExp days, which did.
+    expect(matchGlob("a[!x]b", "a/b")).toBe(false);
+    expect(matchGlob("a[^x]b", "a/b")).toBe(false);
+    expect(matchGlob("a[!x]b", "ayb")).toBe(true);
   });
 });
 
@@ -537,7 +545,6 @@ describe("glob compilation is bounded", () => {
     // non-matching subject took the best part of a second, and a few more
     // segments would never have come back at all.
     const pattern = `${"**/".repeat(12)}zzz`;
-    expect(globToRegExpSource(pattern)).toBe("(?:[^/]+/)*zzz");
     const subject = `${Array.from({ length: 24 }, (_, i) => `seg${i}`).join("/")}/nope`;
     const started = Date.now();
     expect(matchGlob(pattern, subject)).toBe(false);
@@ -550,5 +557,145 @@ describe("glob compilation is bounded", () => {
     expect(matchGlob("**/**/a.ts", "x/y/b.ts")).toBe(false);
     expect(matchGlob("src/**/a.ts", "src/x/a.ts")).toBe(true);
     expect(matchGlob("src/**/a.ts", "other/x/a.ts")).toBe(false);
+  });
+});
+
+/**
+ * The matcher as it was: a pattern compiled to a RegExp, `*` to `[^/]*`
+ * (with negated classes kept off `/`, the one meaning that changed). The
+ * reference the rewrite is compared against on inputs short enough for a
+ * backtracking engine to answer quickly.
+ */
+function referenceGlob(pattern: string): RegExp {
+  const meta = /[.*+?^${}()|[\]\\]/g;
+  const esc = (c: string): string => c.replace(meta, "\\$&");
+  let out = "";
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i] as string;
+    if (c === "\\") {
+      const next = pattern[i + 1];
+      out += next === undefined ? "\\\\" : esc(next);
+      i += next === undefined ? 1 : 2;
+    } else if (c === "*") {
+      const start = i === 0 || pattern[i - 1] === "/";
+      const after = i + 2;
+      const end = after >= pattern.length || pattern[after] === "/";
+      if (pattern[i + 1] === "*" && start && end) {
+        if (after < pattern.length) {
+          if (!out.endsWith("(?:[^/]+/)*")) out += "(?:[^/]+/)*";
+          i = after + 1;
+        } else {
+          out += ".*";
+          i = after;
+        }
+      } else {
+        out += "[^/]*";
+        i += 1;
+      }
+    } else if (c === "?") {
+      out += "[^/]";
+      i += 1;
+    } else if (c === "[") {
+      let j = i + 1;
+      let cls = "[";
+      if (pattern[j] === "!" || pattern[j] === "^") {
+        cls += "^/";
+        j += 1;
+      }
+      if (pattern[j] === "]") {
+        cls += "\\]";
+        j += 1;
+      }
+      let ok = true;
+      while (j < pattern.length && pattern[j] !== "]") {
+        const ch = pattern[j] as string;
+        if (ch === "\\") {
+          const next = pattern[j + 1];
+          if (next === undefined) {
+            ok = false;
+            break;
+          }
+          cls += `\\${next.replace(meta, "\\$&")}`;
+          j += 2;
+          continue;
+        }
+        cls += ch === "[" || ch === "^" ? `\\${ch}` : ch;
+        j += 1;
+      }
+      if (!ok || j >= pattern.length) {
+        out += "\\[";
+        i += 1;
+      } else {
+        out += `${cls}]`;
+        i = j + 1;
+      }
+    } else {
+      out += esc(c);
+      i += 1;
+    }
+  }
+  return new RegExp(`^${out}$`);
+}
+
+describe("the glob matcher cannot be made to backtrack (C081)", () => {
+  test("many-star patterns answer in linear time", () => {
+    const started = performance.now();
+    // Each took seconds as a RegExp: about 4 s and 3.6 s.
+    expect(matchGlob("*a*a*a*a*a*a*b", "a".repeat(80))).toBe(false);
+    expect(matchGlob("*****b", "a".repeat(200))).toBe(false);
+    expect(matchGlob("*a*a*a*a*a*a*b", `${"a".repeat(80)}b`)).toBe(true);
+    expect(performance.now() - started).toBeLessThan(250);
+    // Only safe to ask once the matcher is linear: hours as a RegExp.
+    expect(matchGlob("*a*a*a*a*a*a*a*a*b", "a".repeat(255))).toBe(false);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  test("so do .gitignore rules", () => {
+    const rule = compileIgnoreRule("*a*a*a*a*a*a*b");
+    if (rule === undefined) throw new Error("the rule should compile");
+    const started = performance.now();
+    expect(rule.test("a".repeat(255))).toBe(false);
+    expect(isIgnored([{ base: "", rules: [rule] }], `x/${"a".repeat(255)}`, false)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  test("globstars across many segments stay polynomial", () => {
+    const subject = Array.from({ length: 200 }, () => "a").join("/");
+    const started = performance.now();
+    expect(matchGlob(`${"**/a/".repeat(60)}b`, subject)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(250);
+  });
+
+  test("it agrees with the RegExp translation on every short input", () => {
+    const atoms = ["a", "b", "*", "?", "/", "[ab]", "[!a]", "**", "\\*", "[", "]", "-", "[a-b]"];
+    const letters = ["a", "b", "/", "*", "["];
+    let seed = 7;
+    const rnd = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let compared = 0;
+    for (let k = 0; k < 20_000; k++) {
+      let pattern = "";
+      for (let i = 1 + rnd(6); i > 0; i--) pattern += atoms[rnd(atoms.length)];
+      let subject = "";
+      for (let i = rnd(12); i > 0; i--) subject += letters[rnd(letters.length)];
+      let reference: RegExp;
+      try {
+        reference = referenceGlob(pattern);
+      } catch {
+        continue; // an out-of-order range: the RegExp refused to compile it
+      }
+      const expected = reference.test(subject);
+      expect({ pattern, subject, match: compileGlob(pattern)(subject) }).toEqual({
+        pattern,
+        subject,
+        match: expected,
+      });
+      compared += 1;
+    }
+    // The guard's hit count: nearly every generated pair was compared.
+    expect(compared).toBeGreaterThan(18_000);
   });
 });

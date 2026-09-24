@@ -97,6 +97,16 @@ data. Time bounds come from the caller as ISO strings, never from the clock;
 `TouchFile` will not bump an mtime unless you give it one. Nothing samples a
 random source except the temp-file suffix of an atomic write.
 
+## Globs
+
+`FindFiles` names, `exclude` patterns and `.gitignore` rules share one
+matcher (`compileGlob`, exported for other packages). It is not a RegExp: a
+pattern is split into path segments and matched with the two-pointer
+wildcard walk, so `*a*a*a*a*a*a*b` against a 255-character name costs
+microseconds where a backtracking engine took hours, and a committed
+`.gitignore` line cannot freeze `Tree`. A character class never matches `/`,
+negated or not (`a[!x]b` does not match `a/b`), as gitignore(5) says.
+
 ## What is deliberately not here
 
 `WatchPath`: unbounded in time, so it has no place among tools a harness may

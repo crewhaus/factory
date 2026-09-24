@@ -80,7 +80,7 @@ import {
   serializeFrontmatter,
   splitFrontmatter,
 } from "./lib/frontmatter";
-import { matchGlob } from "./lib/glob";
+import { compileGlob } from "./lib/glob";
 import {
   NotebookError,
   applyNotebookEdit,
@@ -558,12 +558,12 @@ export const findFiles: RegisteredTool = buildTool({
 
     const wantType = input.type ?? "file";
     const namePattern = input.name;
+    // Compiled once for the whole walk, not once per entry.
+    const nameTest = namePattern === undefined ? undefined : compileGlob(namePattern);
+    const byPath = namePattern?.includes("/") === true;
     const matches = result.entries.filter((entry) => {
       if (wantType !== "any" && entry.kind !== wantType) return false;
-      if (namePattern !== undefined) {
-        const subject = namePattern.includes("/") ? entry.rel : entry.name;
-        if (!matchGlob(namePattern, subject)) return false;
-      }
+      if (nameTest !== undefined && !nameTest(byPath ? entry.rel : entry.name)) return false;
       if (input.minSize !== undefined && entry.size < input.minSize) return false;
       if (input.maxSize !== undefined && entry.size > input.maxSize) return false;
       if (after !== undefined && entry.mtimeMs < after) return false;
@@ -2212,3 +2212,8 @@ export const FSX_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
 ]);
 
 export { ToolPermissionError } from "./paths";
+/**
+ * The package's glob matcher, for other tool packages that match paths:
+ * segment-aware and linear, where a pattern compiled to a RegExp backtracks.
+ */
+export { compileGlob, matchGlob } from "./lib/glob";

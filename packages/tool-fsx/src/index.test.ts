@@ -348,6 +348,34 @@ describe("Stat and FileHash", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("a hostile glob cannot hang a listing (C081)", () => {
+  // Each of these took about four seconds per entry when a pattern compiled
+  // to a backtracking RegExp, and a 255-character name took hours: a
+  // committed .gitignore line was enough to freeze Tree, which plan mode
+  // runs without asking.
+  const hostile = "*a*a*a*a*a*a*b";
+  const longName = "a".repeat(80);
+
+  test("Tree with a many-star .gitignore rule and a long name", async () => {
+    write(".gitignore", `${hostile}\n`);
+    write(longName, "x");
+    const started = performance.now();
+    const out = await run(tree, { path: "." });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(out).toContain(longName);
+  }, 20_000);
+
+  test("FindFiles with a many-star name pattern, and as an exclude", async () => {
+    write(longName, "x");
+    const started = performance.now();
+    const found = await run(findFiles, { name: hostile, respectGitignore: false });
+    const kept = await run(findFiles, { exclude: [hostile] });
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(found.count).toBe(0);
+    expect(kept.matches.map((m: { path: string }) => m.path)).toEqual([longName]);
+  }, 20_000);
+});
+
 describe("Tree", () => {
   beforeEach(() => {
     write("src/b.ts", "b");

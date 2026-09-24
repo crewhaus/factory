@@ -16,7 +16,7 @@
 import { type Dirent, lstatSync, readFileSync, readdirSync } from "node:fs";
 import * as path from "node:path";
 import { type IgnoreLayer, type IgnoreRule, isIgnored, parseGitignore } from "./lib/gitignore";
-import { matchGlob } from "./lib/glob";
+import { compileGlob } from "./lib/glob";
 
 export type NodeKind = "file" | "dir" | "symlink" | "other";
 
@@ -71,9 +71,13 @@ export function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-function excluded(patterns: ReadonlyArray<string>, rel: string, name: string): boolean {
-  for (const pattern of patterns) {
-    if (matchGlob(pattern, name) || matchGlob(pattern, rel)) return true;
+function excluded(
+  patterns: ReadonlyArray<(subject: string) => boolean>,
+  rel: string,
+  name: string,
+): boolean {
+  for (const test of patterns) {
+    if (test(name) || test(rel)) return true;
   }
   return false;
 }
@@ -87,7 +91,12 @@ export function loadIgnoreRules(file: string): IgnoreRule[] | undefined {
   }
 }
 
-type WalkState = { remaining: number; truncated: boolean };
+type WalkState = {
+  remaining: number;
+  truncated: boolean;
+  /** `options.exclude`, compiled once per walk rather than once per entry. */
+  readonly exclude: ReadonlyArray<(subject: string) => boolean>;
+};
 
 /**
  * Walk `rootAbs`, which must already have passed the containment check.
@@ -104,7 +113,11 @@ export function walkTree(rootAbs: string, options: WalkOptions): WalkResult {
     mtimeMs: Math.floor(rootStat.mtimeMs),
   };
   const entries: WalkNode[] = [];
-  const state: WalkState = { remaining: options.maxEntries, truncated: false };
+  const state: WalkState = {
+    remaining: options.maxEntries,
+    truncated: false,
+    exclude: options.exclude.map(compileGlob),
+  };
   if (root.kind === "dir") {
     root.children = [];
     const layers: IgnoreLayer[] = [];
@@ -140,7 +153,7 @@ function descend(
     if (!options.includeHidden && name.startsWith(".")) continue;
 
     const rel = parent.rel === "" ? name : `${parent.rel}/${name}`;
-    if (excluded(options.exclude, rel, name)) continue;
+    if (excluded(state.exclude, rel, name)) continue;
 
     const kind = kindOf(dirent);
     const isDir = kind === "dir";
