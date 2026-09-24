@@ -21,7 +21,15 @@
  *     version whose file is gone, which is why `probeVersion` exists.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { createDeploymentController } from "@crewhaus/deployment-controller";
@@ -31,6 +39,7 @@ import {
   CHANGELOG_FILENAME,
   MANIFEST_FILENAME,
   TENANTS_DIRNAME,
+  isListedSpecName,
   predictRegistration,
   probeTenantOverlay,
   probeVersion,
@@ -120,6 +129,45 @@ test("a name that maps onto the shared fallback directory is refused, not mapped
   if (!odd.ok) throw new Error("unreachable");
   expect(odd.value.registryName).toBe("-");
   expect(odd.value.mapped).toBe(true);
+});
+
+test("a name the registry's listing hides is refused for a write, and marked for a read (security-11#9)", () => {
+  // On 0.7.0 all four resolved: SpecPin pinned "_hidden" where DeployInspect's
+  // enumeration never showed it, and wrote a manifest into "_tenants".
+  for (const given of ["_hidden", "_tenants", "._hidden", "__x"]) {
+    const r = resolveName(given);
+    expect({ given, ok: r.ok }).toEqual({ given, ok: false });
+    if (r.ok) throw new Error("unreachable");
+    expect(r.code).toBe("bad-input");
+    expect(r.reason).toContain("listSpecs");
+    expect(r.reason).toContain("tenant-overlay directory");
+    const read = resolveName(given, "read");
+    expect({ given, ok: read.ok }).toEqual({ given, ok: true });
+    if (!read.ok) throw new Error("unreachable");
+    expect(read.value.hiddenFromListing).toBe(true);
+  }
+  // A leading "-", or an "_" anywhere but first, is listed and stays usable.
+  for (const given of ["-dash", "demo_1", "My Agent"]) {
+    const r = resolveName(given);
+    expect({ given, ok: r.ok }).toEqual({ given, ok: true });
+    if (!r.ok) throw new Error("unreachable");
+    expect(r.value.hiddenFromListing).toBeUndefined();
+  }
+});
+
+test("the mirrored listing rule is the one the real registry applies", async () => {
+  // If spec-registry's listSpecs ever changes what it skips, this fails here
+  // instead of the refusal above drifting from what is really hidden.
+  const registry = openRegistry();
+  const names = ["demo", "_legacy", "-dash", "a_b", "__x"];
+  for (const name of names) await registry.put(name, "v1", `name: ${name}\n`);
+  await registry.pinForTenant("acme", "demo", "prod", "v1");
+  const listed = new Set(await registry.listSpecs());
+  const onDisk = readdirSync(rootAbs()).sort();
+  expect(onDisk).toContain(TENANTS_DIRNAME);
+  expect(onDisk.map((n) => [n, isListedSpecName(n)])).toEqual(
+    onDisk.map((n) => [n, listed.has(n)]),
+  );
 });
 
 test("a NUL in a spec name is refused before it becomes a path component", () => {
