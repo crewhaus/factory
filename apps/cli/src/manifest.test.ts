@@ -11,9 +11,9 @@
  * way, and `zod` had been imported the same way since before it.
  *
  * `tool-registry.test.ts` holds the dynamic `import("@crewhaus/tool-…")`
- * calls of `loadToolMap`; this holds the static ones. Only line-anchored
- * `import`/`export … from "…"` statements in non-test sources count — the
- * same narrow reading as runtime-core's `manifest.test.ts`.
+ * calls of `loadToolMap`; this holds the static ones: every line-anchored
+ * `import`/`export … from "…"` statement in a non-test source, including one
+ * whose specifier list spans lines.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
@@ -48,11 +48,15 @@ describe("crewhaus CLI package manifest", () => {
     ...Object.keys(manifest.optionalDependencies ?? {}),
     ...Object.keys(manifest.peerDependencies ?? {}),
   ]);
-  const importRe = /^(?:import|export)\s[^\n]*?from\s+"([^"]+)"/gm;
+  // An import may span lines (biome breaks a long specifier list), so the
+  // match runs to `from "…"` across newlines — but never across a quote, a
+  // backtick or a `;`, so it cannot run from one statement into the next or
+  // through a string.
+  const importRe = /^(?:import|export)\s[^;"'`]*?\bfrom\s+"([^"]+)"|^import\s+"([^"]+)"/gm;
   const imports: Array<{ pkg: string; file: string }> = [];
   for (const file of sourceFiles(join(PKG_DIR, "src"))) {
     for (const match of readFileSync(file, "utf8").matchAll(importRe)) {
-      const specifier = match[1] as string;
+      const specifier = (match[1] ?? match[2]) as string;
       if (specifier.startsWith(".") || /^(?:node|bun):/.test(specifier)) continue;
       imports.push({ pkg: packageOf(specifier), file: relative(PKG_DIR, file) });
     }
