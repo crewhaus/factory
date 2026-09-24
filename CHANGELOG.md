@@ -72,11 +72,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builtins, and it now suggests the nearest builtin and how to search for one
   instead of listing every builtin. Compile errors about tools start with the
   spec path they concern (`nodes.plan.tools:`).
-- **`evmSendTransaction` and `evmSimulate` no longer compile.** They compiled
-  on graph, workflow and crew, but nothing bound the wallet they sign with, so
-  every call failed. Remove them from `tools:`. The six read-only `evm*` tools
-  still compile on those shapes, with a `tool-unwired` warning (an error under
-  `--strict`), because nothing binds their chain adapter either.
+- **`evmSendTransaction` no longer compiles.** It compiled on graph, workflow
+  and crew, but no custody provider that can sign ships in this release, so
+  every call failed. Remove it from `tools:`; `evmSimulate` runs the same
+  transaction without signing.
+- **Two different `tool_config` blocks for one package are a compile error.**
+  A package reads one block, so `tool_config.http` and
+  `tool_config.httpRequest` with different settings — or two workflow steps,
+  graph nodes or crew roles configuring `fetch` differently — used to compile
+  and silently use the first. The error names both keys; keep one block.
+- **A `tool_config` key that nothing reads is a `tool-config-unused` warning**
+  (an error under `--strict`). A restriction written under a misspelled key,
+  or for a tool that is not in `tools:`, is not in force, and compile now
+  says so and names the key to write instead. `crewhaus run` and
+  `crewhaus lint` print the same warning.
 
 ### Fixed
 
@@ -125,9 +134,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`tool_config.codeExecution` configures code execution only.** It also
   reached `webFetch`, `fetch` and `imageGenerate` when those had no config of
   their own. Give each tool its own `tool_config` entry.
+- **`tool_config` reaches every tool that reads it.** The http, codehost,
+  notify, obs and defi tools ignored the blocks their READMEs document
+  (`tool_config.http`, `tool_config.codehost`, …), so their network tools
+  refused every request whatever the spec said. Each package's block now
+  reaches its tools in a compiled bundle on every shape, in `crewhaus run` and
+  in `crewhaus eval`, and a model pool candidate reads the same keys. Write it
+  under the package key (`http`), a tool's key (`httpRequest`) or its
+  registered name (`HttpRequest`). `crewhaus tools show <tool>` names the key.
+- **`tool_config.WebFetch` restricts WebFetch.** Written with the registered
+  name — the spelling permission rules use — the block was dropped at boot and
+  WebFetch could reach any host.
+- **`tool_config.fetch` reaches DependencyAudit's OSV-mirror allow-list**
+  without `fetch` in `tools:`, as its refusal message always said.
+- **`crewhaus run` applies the same `tool_config` as the compiled bundle**,
+  including `imageGenerate`, and the browser shape registers
+  `tool_config.imageGenerate` too.
+- **Tools that read a chain work when the spec declares one.** The chaincall
+  tools, `erc20Balance`, `erc721TokenInfo` and TokenResolve's on-chain check,
+  and on graph, workflow and crew the `evm*` readers and `evmSimulate`, get
+  their RPC transport from the spec's `chains` block. Without one they refuse
+  and name the block to write, and compile warns (`tool-unwired`).
+- **VectorDelete deletes from the store `tool_config.vectorDelete` names**
+  (`backend`, `url`, `collection`, `api_key`). It used to refuse every call.
+- **`erc721TokenInfo` reads token metadata** from the https origins
+  `tool_config.token.metadata_origins` allows, through the http tools' gate.
+- **The chainread tools and FederationDiscover take an allow-list from the
+  spec**: `tool_config.chainread.allowed_origins` and
+  `tool_config.federationDiscover.allowed_origins`. It can only narrow what
+  they reach; a spec cannot open loopback or private addresses.
+- **The bundle README tells the truth about each tool.** Scope and "every call
+  carries a justification" are read off the tool rather than guessed from its
+  name, and "configured by `tool_config.http`" appears only when the bundle
+  applies that block. `$VAR` names a block reads are listed with the other
+  environment variables.
 
 ### Security
 
+- **ImageGenerate sends `OPENAI_API_KEY` only to api.openai.com unless you
+  approve another endpoint.** `tool_config.imageGenerate.openaiBaseUrl` used to
+  send the key wherever it pointed, plain http included, so a spec from a
+  template or a pull request could collect it. Another origin now needs
+  `OPENAI_BASE_URL` set to the same origin in the environment; plain http is
+  refused except on loopback with that approval. A 0.7.0 spec that points at a
+  proxy fails at boot until you set it.
+- **Secrets in `tool_config` can stay out of the spec.** A value written as
+  `$UPPER_SNAKE` is read from the environment when the harness starts, as
+  `mcp_servers` values are; a missing variable stops the start and names it.
+  A value read that way is never repeated in an error, and chain RPC errors
+  name only the endpoint's origin, never the path a provider keeps its key in.
+- **Signed plugins verify on every boot path.** The cli and channel bundles
+  and `crewhaus run` read trust anchors from `~/.crewhaus/plugin-trust/*.pem`
+  and `CREWHAUS_PLUGIN_TRUST_ANCHORS`, so a signed plugin loads; before, no
+  boot path had an anchor and only unsigned dev mode worked. Unsigned plugins
+  are still refused unless `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1`, which now
+  prints a warning on every boot and for every plugin it lets through. With
+  neither a key nor the opt-in, a spec that names plugins stops at boot and
+  says where to put the publisher's key.
 - **A sub-agent written to `.crewhaus/sub-agents/` can only narrow its
   parent's permissions.** Any agent with a file-write tool can add a file
   there while it runs, and its `permissions: { allow }` block replaced the
