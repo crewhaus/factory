@@ -210,14 +210,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   neither a key nor the opt-in, a cli bundle or `crewhaus run` that names
   plugins stops at boot and says where to put the publisher's key; a channel
   daemon says the same and starts without them.
-- **A sub-agent written to `.crewhaus/sub-agents/` can only narrow its
-  parent's permissions.** Any agent with a file-write tool can add a file
-  there while it runs, and its `permissions: { allow }` block replaced the
-  parent's rules — enough to lift an operator's `alwaysDeny` such as
-  `Bash(curl**)`. A definition loaded from that directory now keeps the
-  parent's rules: its `deny` list still narrows them, its `allow` list is
-  ignored with a notice, and `inherit_bypass` is ignored. To grant a
-  sub-agent more, declare it under `sub_agents` in `crewhaus.yaml`.
+- **A sub-agent written to `.crewhaus/sub-agents/` can only narrow what its
+  parent allows.** Any agent with a file-write tool can add a file there while
+  it runs. Its `permissions: { allow }` block replaced the parent's rules —
+  enough to lift an operator's `alwaysDeny` such as `Bash(curl**)` — and a
+  `model_pool` candidate's `toolConfigs` replaced the operator's `tool_config`
+  for every call it served, widening an http allow-list. A definition from
+  that directory now runs under its own rules and the parent's together: a
+  call is allowed only when both allow it, and a deny or ask in either one
+  applies. An operator's own file with a narrow allow list restricts the
+  sub-agent as it always did; no file can lift a parent's deny. Candidate
+  `toolConfigs` and `inherit_bypass` in such a file are ignored with a notice.
+  To grant a sub-agent more, declare it under `sub_agents` in `crewhaus.yaml`.
 
 ## [0.7.0] - 2026-09-22
 

@@ -158,7 +158,9 @@ const FRONTMATTER_TIER_ROUTING = z
  * circuit_breaker? }` — the already-resolved shape the compiler produces for a
  * spec-declared sub-agent. `model_pool` is validated for its routing identity
  * (`candidates[].{model, tags}`, `policy`) and otherwise passed through: the
- * runtime owns the per-candidate settings grammar.
+ * runtime owns the per-candidate settings grammar. The Task tool then keeps
+ * only the candidate keys {@link DISK_CANDIDATE_KEYS} allows, because a file
+ * read from the sub-agents directory may have been written by the model.
  */
 const FRONTMATTER_SCHEMA = z.object({
   name: z.string().min(1),
@@ -429,6 +431,75 @@ function withRegisteredToolNames(def: SubAgentDefinition): SubAgentDefinition {
 /** Definitions whose ignored allow list has already been reported. */
 const reportedIgnoredAllows = new Set<string>();
 
+type PoolCandidate = NonNullable<SubAgentDefinition["modelPool"]>["candidates"][number];
+
+/**
+ * The `model_pool` candidate keys a definition read from `.crewhaus/sub-agents`
+ * keeps. Every key of the candidate type is decided here — this mapped type
+ * stops compiling when the IR gains one — and any other key in the file is
+ * dropped. `toolConfigs` is not kept: a candidate's block REPLACES the
+ * operator's `tool_config` for every call that candidate serves (an http
+ * allow-list, a webhook target) and reads `$VAR`s from the operator's
+ * environment, so a file the model could have written must not set it. The
+ * rest can only narrow (`tools`, `permissions`, `rateLimits`, `costCapUsdMicros`)
+ * or pick what the file could pick anyway with `model:`.
+ */
+const DISK_CANDIDATE_KEYS: { readonly [K in keyof Required<PoolCandidate>]: boolean } = {
+  profile: true,
+  model: true,
+  tags: true,
+  enabled: true,
+  thinking: true,
+  maxTokens: true,
+  temperature: true,
+  modelCallTimeoutMs: true,
+  overlay: true,
+  tools: true,
+  toolConfigs: false,
+  permissions: true,
+  rateLimits: true,
+  caching: true,
+  costCapUsdMicros: true,
+  requires: true,
+  capabilities: true,
+  fallbacks: true,
+  circuitBreaker: true,
+};
+
+/**
+ * security — a definition on disk keeps only {@link DISK_CANDIDATE_KEYS} on
+ * each pool candidate. Returns the refused keys it found, to report.
+ */
+function narrowDiskModelPool(def: SubAgentDefinition): {
+  readonly def: SubAgentDefinition;
+  readonly refused: ReadonlyArray<string>;
+} {
+  const pool = def.modelPool;
+  if (pool === undefined) return { def, refused: [] };
+  const refused = new Set<string>();
+  let changed = false;
+  const candidates = pool.candidates.map((candidate) => {
+    const kept: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(candidate)) {
+      const decided = Object.hasOwn(DISK_CANDIDATE_KEYS, key)
+        ? DISK_CANDIDATE_KEYS[key as keyof PoolCandidate]
+        : undefined;
+      if (decided === true) {
+        kept[key] = value;
+        continue;
+      }
+      changed = true;
+      if (decided === false) refused.add(key);
+    }
+    return kept as PoolCandidate;
+  });
+  if (!changed) return { def, refused: [] };
+  return { def: { ...def, modelPool: { ...pool, candidates } }, refused: [...refused] };
+}
+
+/** Definitions whose refused model_pool keys have already been reported. */
+const reportedRefusedPoolKeys = new Set<string>();
+
 export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool {
   const knownNames = opts.subAgents !== undefined ? [...opts.subAgents.keys()] : [];
   // 0.6.0 §7.7 — advertise the `profile` argument only when some definition
@@ -524,11 +595,19 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       const parentPerms = { mode: bridge.permissionMode, rules: bridge.permissionRules };
       let childPerms: ChildPermissions;
       if (fromDisk) {
+        const narrowedPool = narrowDiskModelPool(def);
+        def = narrowedPool.def;
+        if (narrowedPool.refused.length > 0 && !reportedRefusedPoolKeys.has(def.name)) {
+          reportedRefusedPoolKeys.add(def.name);
+          process.stderr.write(
+            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so its model_pool candidates cannot set ${narrowedPool.refused.join(", ")} — ignored, so its tools run under the parent's tool_config. To give a candidate its own tool_config, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
+          );
+        }
         const narrowed = resolveChildPermissionsNarrowOnly(parentPerms, def);
-        if (narrowed.ignoredAllows.length > 0 && !reportedIgnoredAllows.has(def.name)) {
+        if (narrowed.ungrantedAllows.length > 0 && !reportedIgnoredAllows.has(def.name)) {
           reportedIgnoredAllows.add(def.name);
           process.stderr.write(
-            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so its permissions can only narrow the parent's — ignoring allow: ${narrowed.ignoredAllows.join(", ")}. To grant them, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
+            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so its permissions can only narrow the parent's — the parent does not allow ${narrowed.ungrantedAllows.join(", ")}, so its allow list does not grant them. To grant them, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
           );
         }
         childPerms = narrowed;
