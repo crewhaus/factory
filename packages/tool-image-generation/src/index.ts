@@ -34,7 +34,12 @@ export type ImageGenerationConfig = {
   readonly provider?: ImageGenerationProvider;
   /** Provider-specific model id. Defaults: openai → "dall-e-3", replicate → "stability-ai/sdxl". */
   readonly model?: string;
-  /** Override the OpenAI base URL (for proxies / Azure OpenAI). */
+  /**
+   * Override the OpenAI base URL (for a proxy or Azure OpenAI). OPENAI_API_KEY
+   * goes wherever this points, so anything but `https://api.openai.com` must
+   * also be approved by the operator outside the spec — see
+   * {@link resolveOpenAIBaseUrl}.
+   */
   readonly openaiBaseUrl?: string;
   /** Override fetch implementation for tests. */
   readonly fetch?: typeof globalThis.fetch;
@@ -74,7 +79,88 @@ let registeredConfig: ImageGenerationConfig | undefined;
  * env-driven defaults work without re-registering.
  */
 export function registerImageGenerationConfig(config: ImageGenerationConfig): void {
+  if (config.fetch !== undefined && typeof config.fetch !== "function") {
+    throw new ImageGenerationError(
+      "tool_config.imageGenerate.fetch is not a setting a spec can write. Remove it.",
+    );
+  }
+  // Checked here as well as on every call, so a spec that points the key
+  // somewhere the operator did not approve fails at boot, where someone is
+  // looking, and not at the first image.
+  if (config.openaiBaseUrl !== undefined) resolveOpenAIBaseUrl(config, processEnv());
   registeredConfig = config;
+}
+
+/** The environment, or nothing where there is no `process` (a Worker without Node compat). */
+function processEnv(): Readonly<Record<string, string | undefined>> {
+  return typeof process === "undefined" ? {} : process.env;
+}
+
+const OPENAI_ORIGIN = "https://api.openai.com";
+const OPENAI_DEFAULT_BASE_URL = `${OPENAI_ORIGIN}/v1`;
+
+function isLoopbackHost(host: string): boolean {
+  const h = host.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  return h === "localhost" || h === "::1" || /^127(\.\d{1,3}){3}$/.test(h);
+}
+
+/**
+ * Where OPENAI_API_KEY may be sent, and the only place it is sent.
+ *
+ * The base URL is `openaiBaseUrl` from the tool's config, else
+ * `https://api.openai.com/v1`. A spec can come from a template or a pull
+ * request, so it cannot choose where the key goes on its own:
+ *
+ *  - any origin but `https://api.openai.com` needs the operator's approval:
+ *    `OPENAI_BASE_URL` in the environment naming the same origin;
+ *  - plain http is refused, except on loopback (a local proxy) with that
+ *    same approval — the key would otherwise cross the network unencrypted;
+ *  - a URL with `user:password@` in it is refused.
+ */
+export function resolveOpenAIBaseUrl(
+  cfg: ImageGenerationConfig,
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  const operator = env["OPENAI_BASE_URL"];
+  const raw = cfg.openaiBaseUrl ?? OPENAI_DEFAULT_BASE_URL;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new ImageGenerationError(
+      `the OpenAI base URL "${raw}" is not an absolute URL. Write it as https://host/v1.`,
+    );
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new ImageGenerationError(
+      `the OpenAI base URL for ${url.protocol}//${url.host} carries user:password@. Remove it; the key is sent from OPENAI_API_KEY.`,
+    );
+  }
+  let approved = false;
+  if (operator !== undefined && operator !== "") {
+    try {
+      approved = new URL(operator).origin === url.origin;
+    } catch {
+      approved = false;
+    }
+  }
+  const approve = `set OPENAI_BASE_URL=${url.origin}${url.pathname.replace(/\/+$/, "")} in the environment the harness starts in`;
+  if (url.protocol === "http:") {
+    if (!isLoopbackHost(url.hostname) || !approved) {
+      throw new ImageGenerationError(
+        `the OpenAI base URL ${url.origin} is plain http, which would send OPENAI_API_KEY unencrypted. Use https. A proxy on loopback is allowed when the operator approves it: ${approve}.`,
+      );
+    }
+  } else if (url.protocol !== "https:") {
+    throw new ImageGenerationError(
+      `the OpenAI base URL ${url.origin} is not https. Write it as https://host/v1.`,
+    );
+  } else if (url.origin !== OPENAI_ORIGIN && !approved) {
+    throw new ImageGenerationError(
+      `tool_config.imageGenerate.openaiBaseUrl would send OPENAI_API_KEY to ${url.origin}. A spec cannot choose where the key goes; to approve this endpoint, ${approve}.`,
+    );
+  }
+  return raw.replace(/\/+$/, "");
 }
 
 /**
@@ -136,7 +222,7 @@ async function generateOpenAI(
       "OPENAI_API_KEY is not set — required for provider=openai. Set the env var or switch to provider=mock for offline testing.",
     );
   }
-  const baseUrl = cfg.openaiBaseUrl ?? "https://api.openai.com/v1";
+  const baseUrl = resolveOpenAIBaseUrl(cfg, processEnv());
   const model = cfg.model ?? "dall-e-3";
   const fetchFn = cfg.fetch ?? globalThis.fetch;
   const body = JSON.stringify({
