@@ -184,9 +184,64 @@ function admissibleNear(target: Spec["target"], path: ReadonlyArray<string>): st
   const head = path[0];
   if (head === undefined) return [];
   const near = entries
+    // Never point a model at a path this tool refuses anyway.
+    .filter((entry) => modelTurnRefusal(entry) === undefined)
     .filter((entry) => entry[0] === head || entry[0] === "*")
     .map((entry) => entry.join("."));
   return [...new Set(near)].sort(compareStrings).slice(0, 8);
+}
+
+/**
+ * Paths a MODEL TURN may never patch, although `OPTIMIZABLE_PATHS` admits
+ * some of them (C126).
+ *
+ * `OPTIMIZABLE_PATHS` is the eval-gated optimizer's surface: `crewhaus
+ * optimize` writes `transaction_policy`, `chains`, `security.justification`
+ * and `agent.instructions` only as the outcome of an eval that scored the
+ * change. SpecPatchApply is one model turn, with no eval behind it, and its
+ * description promises that prompts, permissions, credentials and the
+ * security surfaces are human-owned. So these are refused here, before the
+ * allow-list is consulted — the order hangar-server's `classifyPath` uses
+ * for the same reason. A patch at an ANCESTOR of a row (a whole `agent`
+ * block) is refused too, so a parent cannot carry a child past the row.
+ *
+ * Only rows the allow-list admits somewhere are listed: permissions, wallets,
+ * contracts, credentials and the model roster are never in it, and keep the
+ * allow-list's own, more specific refusal.
+ */
+const MODEL_TURN_REFUSED: ReadonlyArray<{
+  readonly prefix: readonly string[];
+  readonly reason: string;
+}> = [
+  {
+    prefix: ["agent", "instructions"],
+    reason:
+      "the agent's instructions are its prompt: a model turn rewriting the prompt it runs under would make a steered turn permanent",
+  },
+  {
+    prefix: ["transaction_policy"],
+    reason:
+      "the transaction policy is the on-chain spend limit (value ceiling, simulation, approvals)",
+  },
+  {
+    prefix: ["chains"],
+    reason: "chain bindings decide which network is written to, and through which RPC",
+  },
+  {
+    prefix: ["security"],
+    reason: "the security block is the harness's own defence configuration",
+  },
+];
+
+/** Why a model turn may not patch `path`, or undefined when this layer admits it. */
+export function modelTurnRefusal(path: ReadonlyArray<string>): string | undefined {
+  for (const row of MODEL_TURN_REFUSED) {
+    const n = Math.min(row.prefix.length, path.length);
+    let same = n > 0;
+    for (let i = 0; i < n && same; i++) same = row.prefix[i] === path[i];
+    if (same) return row.reason;
+  }
+  return undefined;
 }
 
 /**
@@ -267,7 +322,7 @@ export const specPatchApply: RegisteredTool = buildTool({
   name: "SpecPatchApply",
   operativeArgs: [{ field: "path", kind: "path" }],
   description:
-    "Apply structured patches to a CrewHaus spec as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path. Use to change a tunable field - a token cap, a threshold, a pool policy - in a spec a human maintains, without reformatting their file. Defaults to a DRY RUN: it returns the patched YAML and the field-level diff and writes nothing until you pass dryRun: false with a path. The batch is applied in memory and re-validated after every patch, so a batch that breaks the schema never reaches the file. It refuses the identity, security and roster fields by design - model rosters, permissions, credentials and prompts are human-owned, and the refusal says which rule owns them.",
+    "Apply structured patches to a CrewHaus spec as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path. Use to change a tunable field - a token cap, a threshold, a pool policy - in a spec a human maintains, without reformatting their file. Defaults to a DRY RUN: it returns the patched YAML and the field-level diff and writes nothing until you pass dryRun: false with a path. The batch is applied in memory and re-validated after every patch, so a batch that breaks the schema never reaches the file. Human-owned fields are refused with the reason: the agent's instructions (its prompt), permissions, the security block, credentials, the model roster, and the on-chain spend surface (transaction_policy, chains, wallets, contracts).",
   inputSchema: z.object({
     ...specSourceFields,
     patches: z
@@ -331,6 +386,17 @@ export const specPatchApply: RegisteredTool = buildTool({
           index: item.index,
           path: dotted,
           reason: `op "${item.op}" needs a value`,
+        });
+        continue;
+      }
+      const surface = modelTurnRefusal(item.path);
+      if (surface !== undefined) {
+        refused.push({
+          index: item.index,
+          path: dotted,
+          reason: `${dotted} is human-owned: a model turn cannot write it. Edit crewhaus.yaml by hand, or run crewhaus optimize, which changes it only as the outcome of an eval.`,
+          humanOwned: surface,
+          admissibleNearby: admissibleNear(spec.target, item.path),
         });
         continue;
       }

@@ -7027,7 +7027,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "specPatchApply",
     name: "SpecPatchApply",
     description:
-      "Apply structured patches to a CrewHaus spec as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path. Use to change a tunable field - a token cap, a threshold, a pool policy - in a spec a human maintains, without reformatting their file. Defaults to a DRY RUN: it returns the patched YAML and the field-level diff and writes nothing until you pass dryRun: false with a path. The batch is applied in memory and re-validated after every patch, so a batch that breaks the schema never reaches the file. It refuses the identity, security and roster fields by design - model rosters, permissions, credentials and prompts are human-owned, and the refusal says which rule owns them.",
+      "Apply structured patches to a CrewHaus spec as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path. Use to change a tunable field - a token cap, a threshold, a pool policy - in a spec a human maintains, without reformatting their file. Defaults to a DRY RUN: it returns the patched YAML and the field-level diff and writes nothing until you pass dryRun: false with a path. The batch is applied in memory and re-validated after every patch, so a batch that breaks the schema never reaches the file. Human-owned fields are refused with the reason: the agent's instructions (its prompt), permissions, the security block, credentials, the model roster, and the on-chain spend surface (transaction_policy, chains, wallets, contracts).",
     readOnly: false,
     destructive: true,
     scope: "internal",

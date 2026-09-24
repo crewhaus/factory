@@ -19,7 +19,7 @@ tools:
 
 | Tool | What it does |
 |---|---|
-| `SpecPatchApply` | Applies structured patches as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path |
+| `SpecPatchApply` | Applies structured patches as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit, and the prompt, spend and security fields a model turn may not write, naming the reason per path |
 | `SpecAdvise` | Mines the harness's session logs with the shipped advice rules: ranked findings with their evidence, and a pre-validated patch where one exists |
 | `SpecUpgrade` | The post-release upgrade notes whose detectors actually fire for this spec, and whether an unacknowledged one is blocking |
 | `DoctorFix` | The mechanical repairs `doctor` only prints — scaffold a spec, create the state dir, mark a tool `scope: external`, stub missing credentials commented-out |
@@ -40,19 +40,29 @@ guessing.
 
 ## The two gates, which are not the same gate
 
-`SpecPatchApply` enforces the optimizer surface. A path outside
-`OPTIMIZABLE_PATHS` is refused, and the refusal carries the §10.3 reason that
-path is human-owned plus the admissible paths nearby — because a bare
-rejection sends an autonomous caller into a retry loop:
+`SpecPatchApply` enforces the optimizer surface, narrowed for a model turn.
+A path outside `OPTIMIZABLE_PATHS` is refused, and the refusal carries the
+§10.3 reason that path is human-owned plus the admissible paths nearby —
+because a bare rejection sends an autonomous caller into a retry loop:
 
 ```json
 {
   "path": "agent.model",
   "reason": "path agent.model is not listed in OPTIMIZABLE_PATHS for target \"cli\"",
   "humanOwned": "the model roster is human-owned (the standing agent.model exclusion)",
-  "admissibleNearby": ["agent.instructions", "agent.max_tokens", "agent.model_pool.policy", "..."]
+  "admissibleNearby": ["agent.max_tokens", "agent.model_pool.policy", "..."]
 }
 ```
+
+`OPTIMIZABLE_PATHS` is the surface of `crewhaus optimize`, which changes a
+field only as the outcome of an eval that scored the change. One model turn
+has no eval behind it, so `SpecPatchApply` also refuses four families the
+allow-list admits: `agent.instructions` (the agent's own prompt — a steered
+turn must not be able to make itself permanent), `transaction_policy`,
+`chains` and `security` (the on-chain spend limit, the network written to,
+and the harness's own defences). A patch at an ancestor (`agent`) is refused
+the same way, and `admissibleNearby` never lists a refused path. Edit these
+by hand, or through `crewhaus optimize`.
 
 `DoctorFix` deliberately does not go through that allow-list. Its one spec
 edit — `tool_config.<tool>.scope: "external"` — is a path the allow-list does
