@@ -451,6 +451,35 @@ describe("rateLimitGate", () => {
     expect(decision.nextState).toEqual({});
   });
 
+  test('every key is limited, "__proto__" and the Object.prototype names included', () => {
+    // The state a harness keeps is JSON, so each call gets back what
+    // JSON.stringify wrote.
+    const sequence = (key: string) => {
+      let state = {};
+      const allowed: boolean[] = [];
+      const persisted: string[] = [];
+      for (const i of [0, 1, 2]) {
+        const decision = rateLimitGate({
+          key,
+          nowMs: now + i * 60_000,
+          windowMs: 3_600_000,
+          limit: 1,
+          state,
+        });
+        allowed.push(decision.allowed);
+        persisted.push(JSON.stringify(decision.nextState));
+        state = JSON.parse(persisted[persisted.length - 1] as string);
+      }
+      return { key, allowed, ownKey: persisted[0]?.includes(`"${key}":`) === true };
+    };
+    const keys = ["__proto__", "constructor", "toString", "hasOwnProperty", "disk-full"];
+    // 0.7.0: "__proto__" was written as the object's prototype, JSON dropped
+    // it, and the gate said [true, true, true].
+    expect(keys.map(sequence)).toEqual(
+      keys.map((key) => ({ key, allowed: [true, false, false], ownKey: true })),
+    );
+  });
+
   test("long-expired keys are pruned, so the persisted record cannot grow forever", () => {
     const stale = { old: { windowStart: now - 10_000, count: 1, last: now - 10_000 } };
     const decision = rateLimitGate({ key: "new", nowMs: now, windowMs: 1000, state: stale });

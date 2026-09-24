@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { type Server, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { executeTool } from "@crewhaus/tool-executor";
 import {
   NOTIFY_TOOLS,
   __setPrivateHostsAllowedForTest,
@@ -1581,6 +1582,84 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
     });
     expect(second.allowed).toBe(false);
     expect(second.retryAt).toBe("2026-09-17T10:00:00.000Z");
+  });
+
+  test('RateLimitGate refuses the key "__proto__", which its JSON state could never hold', async () => {
+    const outs: string[] = [];
+    let state: unknown;
+    for (const minute of ["00", "01", "02"]) {
+      const out = String(
+        await executeTool(
+          rateLimitGate,
+          {
+            key: "__proto__",
+            now: `2026-09-17T10:${minute}:00Z`,
+            windowMs: 3_600_000,
+            ...(state !== undefined ? { state } : {}),
+          },
+          { toolUseId: "t" },
+        ).then((r) => r.content),
+      );
+      outs.push(out);
+      try {
+        state = JSON.parse(out).nextState;
+      } catch {
+        state = undefined;
+      }
+    }
+    // 0.7.0 said allowed:true three times: the entry never survived the
+    // state round-trip, so the gate failed open for this one key.
+    expect(outs.filter((o) => o.includes('"allowed":true'))).toEqual([]);
+    expect(outs.every((o) => o.includes('"__proto__" cannot be kept'))).toBe(true);
+
+    // Any other name, including the Object.prototype ones, is limited as
+    // usual through the real input parser.
+    const names: Array<{ key: string; allowed: unknown[] }> = [];
+    for (const key of ["constructor", "toString", "alert:__proto__"]) {
+      const allowed: unknown[] = [];
+      let kept: unknown;
+      for (const minute of ["00", "01", "02"]) {
+        const out = String(
+          await executeTool(
+            rateLimitGate,
+            {
+              key,
+              now: `2026-09-17T10:${minute}:00Z`,
+              windowMs: 3_600_000,
+              ...(kept !== undefined ? { state: kept } : {}),
+            },
+            { toolUseId: "t" },
+          ).then((r) => r.content),
+        );
+        const decision = JSON.parse(out);
+        allowed.push(decision.allowed);
+        kept = JSON.parse(JSON.stringify(decision.nextState));
+      }
+      names.push({ key, allowed });
+    }
+    expect(names).toEqual(
+      ["constructor", "toString", "alert:__proto__"].map((key) => ({
+        key,
+        allowed: [true, false, false],
+      })),
+    );
+  });
+
+  test("MessageTemplate finds only the operator's own templates, not Object.prototype names", async () => {
+    const outs = [];
+    for (const name of ["constructor", "toString", "hasOwnProperty"]) {
+      outs.push(
+        String(
+          await messageTemplate.execute({
+            templates: { deploy: "x" },
+            name,
+            data: {},
+            platform: "slack",
+          }),
+        ),
+      );
+    }
+    expect(outs.filter((o) => !o.includes("no template named"))).toEqual([]);
   });
 
   test("MessageTemplate renders a named template and escapes every value", async () => {

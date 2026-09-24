@@ -2705,7 +2705,9 @@ export const rateLimitGate: RegisteredTool = buildTool({
       .string()
       .min(1)
       .max(500)
-      .describe("what is being rate-limited: an alert name, a host, a customer id"),
+      .describe(
+        'what is being rate-limited: an alert name, a host, a customer id (any string except "__proto__", which a JSON state record cannot hold)',
+      ),
     now: z
       .string()
       .min(1)
@@ -2748,6 +2750,13 @@ export const rateLimitGate: RegisteredTool = buildTool({
     };
     const now = parseOffsetInstant(args.now, "2026-09-17T03:14:00Z");
     if (!now.ok) return now.message;
+    // The state is a JSON record, and a JSON record cannot carry this one
+    // key back: the input parser drops an own "__proto__" key, so the entry
+    // this call wrote would be gone on the next call and the gate would say
+    // "allowed" every time. Refused, so the gate never fails open.
+    if (args.key === "__proto__") {
+      return 'the key "__proto__" cannot be kept in a JSON state record, so it could never be limited — choose another, e.g. prefix it as "alert:__proto__"';
+    }
     return json(
       evaluateRateLimit({
         key: args.key,
@@ -2793,7 +2802,10 @@ export const messageTemplate: RegisteredTool = buildTool({
       platform: Platform;
       maxLength?: number;
     };
-    const template = args.templates[args.name];
+    // Own names only: "constructor" or "toString" is not a template.
+    const template = Object.hasOwn(args.templates, args.name)
+      ? args.templates[args.name]
+      : undefined;
     if (template === undefined) {
       const known = Object.keys(args.templates).sort(byString);
       return known.length === 0

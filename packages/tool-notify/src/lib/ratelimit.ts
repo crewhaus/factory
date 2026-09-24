@@ -55,7 +55,10 @@ function prune(
   windowMs: number,
   keep: string,
 ): { readonly kept: Record<string, RateEntry>; readonly pruned: string[] } {
-  const kept: Record<string, RateEntry> = {};
+  // A record indexed by a caller's string has no prototype: on a plain `{}`,
+  // `kept["__proto__"] = entry` sets the object's prototype instead of adding
+  // the key, JSON drops it, and that key was never limited at all.
+  const kept: Record<string, RateEntry> = Object.create(null);
   const pruned: string[] = [];
   for (const name of Object.keys(state).sort()) {
     const entry = state[name] as RateEntry;
@@ -90,7 +93,7 @@ export function rateLimitGate(options: RateOptions): RateDecision {
   const state = options.state ?? {};
   const { kept, pruned } = prune(state, options.nowMs, windowMs, options.key);
 
-  const existing = kept[options.key];
+  const existing = Object.hasOwn(kept, options.key) ? kept[options.key] : undefined;
   const inWindow = existing !== undefined && options.nowMs - existing.windowStart < windowMs;
   const current = inWindow ? (existing as RateEntry) : undefined;
   const count = current?.count ?? 0;
@@ -121,7 +124,7 @@ export function rateLimitGate(options: RateOptions): RateDecision {
     };
   }
 
-  const next: Record<string, RateEntry> = { ...kept };
+  const next: Record<string, RateEntry> = Object.assign(Object.create(null), kept);
   next[options.key] = {
     windowStart: current?.windowStart ?? options.nowMs,
     count: count + 1,
