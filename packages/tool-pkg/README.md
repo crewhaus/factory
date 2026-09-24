@@ -73,8 +73,18 @@ which would read as an all-clear.
 
 A `node_modules` entry is very often a symlink — that is how pnpm and the
 workspace protocol work — so links are followed when they stay inside the
-workspace and skipped when they leave it. The number skipped is reported, so
-a tree that is mostly elsewhere does not look like a small clean one.
+workspace and skipped when they leave it. That holds for the `package.json`
+inside an entry as well as for the entry itself: a manifest linked out of the
+workspace is skipped and counted, never read. The number skipped is reported
+(`skippedOutsideWorkspace`), so a tree that is mostly elsewhere does not look
+like a small clean one, and so is the number of manifests that were there but
+could not be used (`skippedUnreadableManifests`: not JSON, too large, not a
+regular file).
+
+`PackagePublishPreflight` refuses a `package.json` linked out of the workspace
+the same way the other tools refuse an escaping path, and reports an invalid
+manifest as "not valid JSON" without quoting it. Every file these tools read
+is refused unopened when it is a FIFO or device.
 
 ## Shared implementations
 

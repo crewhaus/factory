@@ -9,20 +9,29 @@
  *
  * Paths are read, never written. Every caller-supplied path goes through the
  * same containment resolver the other filesystem packages use, so a symlink
- * pointing out of the workspace is refused rather than followed.
+ * pointing out of the workspace is refused rather than followed. So does
+ * every file a tool reads UNDER one — a directory's `package.json` included
+ * (0.7.1, security-7#1): the file itself must physically be in the workspace,
+ * and a FIFO or device is refused without being opened.
  */
-import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { LOCKFILE_NAMES, type LockedVersion, parseLockfileDetailed } from "@crewhaus/tool-code";
+import {
+  type SafeFsFailure,
+  joinRel,
+  openForRead,
+  openForReadSync,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { type LicenseFinding, declaredLicense, splitExpression, summarize } from "./lib/license";
 import { diffLocks } from "./lib/lockdiff";
 import { type PreflightProbe, preflight } from "./lib/preflight";
 import { resolveRange } from "./lib/resolve";
 import { listTar } from "./lib/tar";
-import { archiveEntryEscapes, isInside, resolveSafe, workspaceRoot } from "./paths";
+import { ToolPermissionError, archiveEntryEscapes, resolveSafe, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -36,12 +45,46 @@ const LIMITS = {
   versions: 5_000,
 } as const;
 
-function readCapped(abs: string, limit: number, what: string): Buffer {
-  const size = statSync(abs).size;
-  if (size > limit) {
-    throw new Error(`${what} is ${size} bytes, over the ${limit}-byte limit — narrow the input`);
+/**
+ * Read `rel` (workspace-relative) whole, refusing anything over `limit`.
+ *
+ * The WHOLE path is resolved physically and must land in the workspace, so a
+ * leaf joined onto a contained directory cannot lead out through a link
+ * planted at its name; a FIFO or device is refused before it is opened (an
+ * open would block); and the read itself is capped. Escapes throw
+ * {@link ToolPermissionError}, like every other containment refusal here.
+ * No message says where a link leads or quotes what is there.
+ */
+async function readContained(
+  toolName: string,
+  rel: string,
+  limit: number,
+  what: string,
+): Promise<Uint8Array> {
+  const read = await openForRead(workspaceRoot(), rel, { maxBytes: limit });
+  if (!read.ok) throw readFailure(toolName, read, what);
+  if (read.truncated) {
+    throw new Error(
+      `${what} is ${read.size} bytes, over the ${limit}-byte limit — narrow the input`,
+    );
   }
-  return readFileSync(abs);
+  return read.bytes;
+}
+
+function readFailure(toolName: string, failure: SafeFsFailure, what: string): Error {
+  switch (failure.code) {
+    case "escapes-root":
+      return new ToolPermissionError(toolName, what);
+    case "not-found":
+    case "not-directory":
+      return new Error(`${what} does not exist`);
+    case "not-regular-file":
+      return new Error(
+        `${what} is not a regular file${failure.kind !== undefined ? ` (it is a ${failure.kind})` : ""} — refused without opening it`,
+      );
+    default:
+      return new Error(`${what} could not be read`);
+  }
 }
 
 /**
@@ -136,8 +179,15 @@ export const lockfileDiff: RegisteredTool = buildTool({
   execute: async (input) => {
     const a = resolveSafe("LockfileDiff", input.before);
     const b = resolveSafe("LockfileDiff", input.after);
-    const before = parseLock(a.rel, readCapped(a.real, LIMITS.lockBytes, a.rel).toString("utf-8"));
-    const after = parseLock(b.rel, readCapped(b.real, LIMITS.lockBytes, b.rel).toString("utf-8"));
+    const decode = (bytes: Uint8Array): string => new TextDecoder().decode(bytes);
+    const before = parseLock(
+      a.rel,
+      decode(await readContained("LockfileDiff", a.rel, LIMITS.lockBytes, a.rel)),
+    );
+    const after = parseLock(
+      b.rel,
+      decode(await readContained("LockfileDiff", b.rel, LIMITS.lockBytes, b.rel)),
+    );
     const diff = diffLocks(before, after);
     const limit = input.limit ?? 200;
     const body = {
@@ -192,6 +242,7 @@ export const licenseAggregate: RegisteredTool = buildTool({
     const findings: LicenseFinding[] = [];
     const root_ = workspaceRoot();
     let escaped = 0;
+    let unreadable = 0;
     const visit = (dir: string, label: string): void => {
       if (findings.length >= LIMITS.packages) return;
       // A node_modules entry is very often a symlink — that is how pnpm and
@@ -199,21 +250,27 @@ export const licenseAggregate: RegisteredTool = buildTool({
       // Links that stay inside are followed, which is what makes a workspace
       // tree readable at all; one that leaves is skipped and counted, never
       // read, because the containment boundary is the whole promise here.
-      let real: string;
-      try {
-        real = realpathSync(dir);
-      } catch {
+      // That holds for the MANIFEST as well as the directory: a real package
+      // directory whose package.json is a link out of the workspace used to
+      // be read, its name and license reported (security-7#1). The whole
+      // path is resolved, so either link counts as one skip.
+      const read = openForReadSync(root_, join(dir, "package.json"), {
+        maxBytes: LIMITS.manifestBytes,
+      });
+      if (!read.ok) {
+        if (read.code === "escapes-root") escaped += 1;
+        else if (read.code !== "not-found" && read.code !== "not-directory") unreadable += 1;
         return;
       }
-      if (!isInside(root_, real)) {
-        escaped += 1;
+      if (read.truncated) {
+        unreadable += 1;
         return;
       }
       let manifest: Record<string, unknown>;
       try {
-        const raw = readFileSync(join(real, "package.json"), "utf-8");
-        manifest = JSON.parse(raw) as Record<string, unknown>;
+        manifest = JSON.parse(read.text) as Record<string, unknown>;
       } catch {
+        unreadable += 1;
         return;
       }
       const license = declaredLicense(manifest);
@@ -248,6 +305,10 @@ export const licenseAggregate: RegisteredTool = buildTool({
       ...report,
       ...(input.listPackages ? { all: findings } : {}),
       ...(escaped > 0 ? { skippedOutsideWorkspace: escaped } : {}),
+      // A manifest that is there and could not be used (not JSON, over the
+      // cap, a FIFO) is not a package with no license: it is counted, so a
+      // clean-looking roll-up says what it could not see.
+      ...(unreadable > 0 ? { skippedUnreadableManifests: unreadable } : {}),
       capped: findings.length >= LIMITS.packages,
     });
   },
@@ -271,7 +332,9 @@ export const packageTarballInspect: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const at = resolveSafe("PackageTarballInspect", input.file);
-    const listing = listTar(new Uint8Array(readCapped(at.real, LIMITS.tarballBytes, at.rel)));
+    const listing = listTar(
+      await readContained("PackageTarballInspect", at.rel, LIMITS.tarballBytes, at.rel),
+    );
     const files = listing.entries.filter((e) => e.type === "file");
     const totalBytes = files.reduce((sum, e) => sum + e.size, 0);
 
@@ -326,12 +389,28 @@ export const packagePublishPreflight: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const at = resolveSafe("PackagePublishPreflight", input.directory ?? ".");
+    // The manifest LEAF is contained, not only the directory (security-7#1):
+    // a package.json linked out of the workspace throws ToolPermissionError
+    // before anything is read.
+    const manifestRel = joinRel(at.rel, "package.json");
+    let raw: Uint8Array;
+    try {
+      raw = await readContained(
+        "PackagePublishPreflight",
+        manifestRel,
+        LIMITS.manifestBytes,
+        manifestRel,
+      );
+    } catch (err) {
+      if (err instanceof ToolPermissionError) throw err;
+      return `could not read ${manifestRel}: ${(err as Error).message}`;
+    }
     let manifest: Record<string, unknown>;
     try {
-      const raw = readCapped(join(at.real, "package.json"), LIMITS.manifestBytes, "package.json");
-      manifest = JSON.parse(raw.toString("utf-8")) as Record<string, unknown>;
-    } catch (err) {
-      return `could not read ${at.rel}/package.json: ${(err as Error).message}`;
+      manifest = JSON.parse(new TextDecoder().decode(raw)) as Record<string, unknown>;
+    } catch {
+      // Not the parser's message: it quotes the file's first token.
+      return `${manifestRel} is not valid JSON`;
     }
 
     const probe: PreflightProbe = {
