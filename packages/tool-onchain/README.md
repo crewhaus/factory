@@ -66,6 +66,15 @@ nothing on a chain. So:
   percentage, because a percentage invites a decimal and a decimal invites a
   float.
 
+- **Data that decodes to far more than itself.** Return data comes from
+  whoever deployed the contract, and nothing in the ABI format stops two
+  offsets pointing at the same bytes: a few kilobytes whose heads all share
+  one tail decode to millions of values. `AbiDecode` (and every package that
+  decodes through it) refuses data that decodes to more than four times its
+  own size — no encoder writes such data — and checks an array's length
+  against the bytes that follow it before building anything. Type strings
+  are capped at 8,192 characters and 32 levels of nesting.
+
 An address with no checksum is reported as valid **and** as unverifiable,
 rather than letting `valid: true` be read as "no typo". A position with no
 debt has no health factor rather than an infinite one — `Infinity` would read

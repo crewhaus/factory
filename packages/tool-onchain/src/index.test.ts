@@ -122,6 +122,18 @@ describe("AbiDecode", () => {
   test("truncated data is an error", async () => {
     await expect(raw(abiDecode, { data: "0x00", types: ["uint256"] })).rejects.toThrow(/truncated/);
   });
+
+  test("offsets that share one tail are refused rather than decoded a million times (C085)", async () => {
+    // uint256[][][][][] where each of five levels' 16 heads share one child:
+    // 1,048,576 values from about 5 KB of hex on 0.7.0.
+    const word = (n: number): string => n.toString(16).padStart(64, "0");
+    let hex = word(32);
+    for (let level = 1; level < 5; level++) hex += word(16) + word(16 * 32).repeat(16);
+    hex += word(16) + word(1).repeat(16);
+    await expect(
+      raw(abiDecode, { data: `0x${hex}`, types: ["uint256[][][][][]"] }),
+    ).rejects.toThrow(/decodes to more than 4 times its own size/);
+  });
 });
 
 describe("FunctionSelector", () => {

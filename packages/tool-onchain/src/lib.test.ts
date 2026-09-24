@@ -150,6 +150,102 @@ describe("ABI decoding", () => {
   });
 });
 
+/** One ABI word holding `n`. */
+const word = (n: number | bigint): string => BigInt(n).toString(16).padStart(64, "0");
+
+/**
+ * `uint256` nested `depth` arrays deep, where every level's `w` heads point at
+ * ONE shared child: `w^depth` values from about `depth * (w + 1)` words. No
+ * encoder writes this; a hostile contract's return data can.
+ */
+function sharedOffsets(depth: number, w: number): string {
+  let hex = word(32);
+  for (let level = 1; level < depth; level++) hex += word(w) + word(w * 32).repeat(w);
+  return `0x${hex}${word(w)}${word(7).repeat(w)}`;
+}
+
+describe("ABI decoding cannot be made to inflate (C085)", () => {
+  test("heads that share one tail are refused, not decoded again and again", () => {
+    // 196 words that decode to 262,144 values on 0.7.0.
+    const data = sharedOffsets(3, 64);
+    expect(data.length).toBeLessThan(13_000);
+    expect(() => decodeData(["uint256[][][]"], data)).toThrow(
+      /decodes to more than 4 times its own size — its offsets point at the same bytes/,
+    );
+  });
+
+  test("a hundred strings sharing one 10,000-byte tail are refused", () => {
+    const text = `${word(10_000)}${"61".repeat(10_000)}${"00".repeat(16)}`;
+    const data = `0x${word(32)}${word(100)}${word(100 * 32).repeat(100)}${text}`;
+    expect(() => decodeData(["string[]"], data)).toThrow(/decodes to more than 4 times/);
+  });
+
+  test("a batch whose rows share one revert blob is a batch-level refusal", () => {
+    // (bool,bytes)[] with 1,000 rows: every row's head points at one row,
+    // whose bytes point at one 4 KB blob.
+    const rows = 1_000;
+    const row = `${word(1)}${word(64)}${word(4096)}${"ab".repeat(4096)}`;
+    const data = `0x${word(32)}${word(rows)}${word(rows * 32).repeat(rows)}${row}`;
+    expect(() => decodeAggregate3(data, rows)).toThrow(
+      /^the batch's own return data is not \(bool,bytes\)\[\].*decodes to more than 4 times/,
+    );
+  });
+
+  test("a length the data cannot hold is refused before anything is allocated", () => {
+    // 0.7.0 built a 20,000,000-slot array from the type string first, then
+    // failed on the empty data.
+    expect(() => decodeData(["uint256[20000000]"], "0x")).toThrow(
+      "value[0]: claims 20000000 items, more than the data could hold",
+    );
+    expect(() => decodeData(["uint256[4294967295]"], "0x")).toThrow(/claims 4294967295 items/);
+    // A dynamic length is checked against what follows its own offset, not
+    // against the whole blob.
+    const data = `0x${word(64)}${word(0)}${word(3)}${word(1)}${word(2)}`;
+    expect(() => decodeData(["uint256[]"], data)).toThrow(/claims 3 items/);
+    expect(() => decodeData(["(uint256[1000000])[1000000]"], "0x")).toThrow(/claims 1000000 items/);
+  });
+
+  test("an array of a type that takes no bytes cannot claim a length", () => {
+    expect(() => decodeData(["()[]"], `0x${word(32)}${word(1_000_000_000)}`)).toThrow(
+      /an array of \(\) holds nothing the data can back/,
+    );
+  });
+
+  test("honest encodings, however large, still decode exactly", () => {
+    const square = Array.from({ length: 200 }, (_, i) =>
+      Array.from({ length: 200 }, (_, j) => String(i * 200 + j)),
+    );
+    const t = parseType("uint256[][]");
+    const hex = `0x${encodeCall("f(uint256[][])", [square]).slice(10)}`;
+    expect(decodeData([t.canonical], hex)).toEqual([square]);
+    const strings = Array.from({ length: 300 }, (_, i) => "x".repeat(i));
+    const packed = `0x${encodeCall("f(string[],bytes[2])", [strings, ["0xabcd", "0x"]]).slice(10)}`;
+    expect(decodeData(["string[]", "bytes[2]"], packed)).toEqual([strings, ["0xabcd", "0x"]]);
+  });
+});
+
+describe("type strings are parsed in linear time (C085)", () => {
+  test("nesting past the depth limit is refused, at any length", () => {
+    expect(() => parseType(`uint256${"[1]".repeat(33)}`)).toThrow(/more than 32 levels deep/);
+    expect(() => parseType(`${"(".repeat(40)}uint256${")".repeat(40)}`)).toThrow(
+      /more than 32 levels deep/,
+    );
+    expect(parseType(`uint256${"[1]".repeat(32)}`).canonical).toEndWith("[1]");
+  });
+
+  test("a type or signature longer than the cap is refused before it is scanned", () => {
+    const long = `(${Array.from({ length: 1200 }, () => "uint256").join(",")})`;
+    expect(long.length).toBeGreaterThan(8192);
+    expect(() => parseType(long)).toThrow(/characters is longer than the 8192 this reads/);
+    expect(() => parseSignature(`f${long}`)).toThrow(/signature of \d+ characters/);
+  });
+
+  test("a fixed length past the safe-integer range is refused", () => {
+    expect(() => parseType("uint256[99999999999999999999]")).toThrow(/too large to lay out/);
+    expect(() => parseType("uint256[4294967295][4294967295]")).toThrow(/too large to lay out/);
+  });
+});
+
 describe("EIP-712, against the specification's own example", () => {
   const types = {
     EIP712Domain: [
