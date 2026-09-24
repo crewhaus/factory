@@ -59,7 +59,18 @@ const checkSchema = z.object({
   message: z.string().optional(),
 });
 
-const minorUnits = z.number().int();
+/**
+ * An amount in minor units: an integer a double holds exactly. Past 2^53 − 1
+ * a JSON number has already been rounded before the tool sees it, so it is
+ * refused rather than computed with.
+ */
+const UNSAFE_AMOUNT =
+  "is past ±(2^53 − 1) minor units, the largest amount computed exactly — express it in a larger unit";
+const minorUnits = z
+  .number()
+  .int()
+  .min(Number.MIN_SAFE_INTEGER, UNSAFE_AMOUNT)
+  .max(Number.MAX_SAFE_INTEGER, UNSAFE_AMOUNT);
 
 /**
  * An instant, as epoch milliseconds or ISO-8601 WITH an offset.
@@ -168,7 +179,7 @@ export const refundAmountCompute: RegisteredTool = buildTool({
       .array(
         z.object({
           id: z.string().min(1),
-          quantity: z.number().int().positive(),
+          quantity: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
           unitPriceMinor: minorUnits,
           taxMinor: minorUnits.optional(),
           discountMinor: minorUnits.optional(),
@@ -177,7 +188,12 @@ export const refundAmountCompute: RegisteredTool = buildTool({
       .min(1)
       .max(LIMITS.lines),
     returned: z
-      .array(z.object({ lineId: z.string().min(1), quantity: z.number().int().positive() }))
+      .array(
+        z.object({
+          lineId: z.string().min(1),
+          quantity: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        }),
+      )
       .min(1)
       .max(LIMITS.lines),
     orderDiscountMinor: minorUnits.optional(),

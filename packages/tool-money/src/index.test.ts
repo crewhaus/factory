@@ -176,6 +176,42 @@ describe("TaxCalculate", () => {
   });
 });
 
+describe("amounts past 2^53 − 1 minor units are refused at the schema (C218)", () => {
+  test("every minor-unit field takes a safe integer and nothing larger", () => {
+    const tax = taxCalculate.inputSchema.safeParse({
+      lines: [{ id: "a", amountMinor: 2 ** 53, taxCodes: ["Z"] }],
+      rates: [{ code: "Z", bps: 0 }],
+    });
+    expect(tax.success).toBe(false);
+    expect(JSON.stringify(tax.error?.issues)).toContain("express it in a larger unit");
+    expect(
+      costBasisCompute.inputSchema.safeParse({
+        lots: [{ id: "l", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: 1e18 }],
+        disposals: [],
+        method: "fifo",
+      }).success,
+    ).toBe(false);
+    expect(
+      taxCalculate.inputSchema.safeParse({
+        lines: [{ id: "a", amountMinor: Number.MAX_SAFE_INTEGER, taxCodes: ["Z"] }],
+        rates: [{ code: "Z", bps: 0 }],
+      }).success,
+    ).toBe(true);
+  });
+
+  test("a total past it is an error naming the figure, not JSON one unit off", async () => {
+    await expect(
+      raw(taxCalculate, {
+        lines: [
+          { id: "a", amountMinor: Number.MAX_SAFE_INTEGER, taxCodes: ["Z"] },
+          { id: "b", amountMinor: 2, taxCodes: ["Z"] },
+        ],
+        rates: [{ code: "Z", bps: 0 }],
+      }),
+    ).rejects.toThrow(/cannot be reported exactly/);
+  });
+});
+
 describe("RefundAmountCompute", () => {
   test("a full return refunds what was charged", async () => {
     const result = await call<{ totalMinor: number; fullReturn: boolean }>(refundAmountCompute, {

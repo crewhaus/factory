@@ -13,6 +13,8 @@
  * rounding drift.
  */
 
+import { addExact, big, sumExact, toNumber } from "./exact";
+
 export const LOT_METHODS = ["fifo", "lifo", "hifo", "specific"] as const;
 export type LotMethod = (typeof LOT_METHODS)[number];
 
@@ -66,6 +68,12 @@ export type CostBasisResult = {
 
 const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 
+/**
+ * A remainder smaller than this share of its lot is binary-fraction noise
+ * from earlier subtractions, not a holding: it is consumed with the take.
+ */
+const DUST = 1e-9;
+
 function instant(value: string, what: string): number {
   if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value.trim())) {
     throw new Error(
@@ -89,6 +97,7 @@ export function computeCostBasis(
     if (lot.quantity <= 0) throw new Error(`lot "${lot.id}" has quantity ${lot.quantity}`);
     if (!Number.isInteger(lot.costMinor))
       throw new Error(`lot "${lot.id}" cost must be minor units`);
+    big(lot.costMinor, `lot "${lot.id}" costMinor`);
     instant(lot.acquiredAt, `lot "${lot.id}" acquiredAt`);
   }
 
@@ -143,18 +152,25 @@ export function computeCostBasis(
 
     for (const lot of order) {
       if (toConsume <= 0) break;
-      const take = Math.min(toConsume, lot.remainingQuantity);
       // Taking the whole remainder consumes the whole remaining cost. That
       // is what keeps a lot's costs summing to exactly what it cost, however
-      // many partial disposals came before.
-      const takeCost =
-        take === lot.remainingQuantity
-          ? lot.remainingCostMinor
-          : Math.round((lot.remainingCostMinor * take) / lot.remainingQuantity);
-      lot.remainingQuantity -= take;
-      lot.remainingCostMinor -= takeCost;
+      // many partial disposals came before. A remainder within a billionth of
+      // the lot of this take IS the remainder: quantities are binary
+      // fractions, so ten disposals of 0.1 from a lot of 1 otherwise left
+      // 1.4e-16 of it open, holding cost nobody could ever dispose of.
+      const whole = toConsume >= lot.remainingQuantity - lot.quantity * DUST;
+      const take = whole ? lot.remainingQuantity : toConsume;
+      const takeCost = whole
+        ? lot.remainingCostMinor
+        : Math.round((lot.remainingCostMinor * take) / lot.remainingQuantity);
+      lot.remainingQuantity = whole ? 0 : lot.remainingQuantity - take;
+      lot.remainingCostMinor = addExact(
+        lot.remainingCostMinor,
+        -takeCost,
+        `lot "${lot.id}" remaining cost`,
+      );
       toConsume -= take;
-      costMinor += takeCost;
+      costMinor = addExact(costMinor, takeCost, `disposal "${disposal.id}" cost`);
       consumed.push({
         lotId: lot.id,
         quantity: take,
@@ -172,15 +188,20 @@ export function computeCostBasis(
 
     // Proceeds follow the units, so the split between short and long term is
     // allocated by quantity rather than by cost.
-    const gainMinor = disposal.proceedsMinor - costMinor;
-    let longTermProceeds = 0;
-    let longTermCost = 0;
+    const what = `disposal "${disposal.id}"`;
+    const proceeds = big(disposal.proceedsMinor, `${what} proceedsMinor`);
+    const gainMinor = toNumber(proceeds - big(costMinor, what), `${what} gain`);
+    let longTermProceeds = 0n;
+    let longTermCost = 0n;
     for (const entry of consumed) {
       if (!entry.longTerm) continue;
-      longTermProceeds += Math.round((disposal.proceedsMinor * entry.quantity) / disposal.quantity);
-      longTermCost += entry.costMinor;
+      longTermProceeds += big(
+        Math.round((disposal.proceedsMinor * entry.quantity) / disposal.quantity),
+        `${what} long-term proceeds`,
+      );
+      longTermCost += big(entry.costMinor, what);
     }
-    const longTermGainMinor = longTermProceeds - longTermCost;
+    const longTermGainMinor = toNumber(longTermProceeds - longTermCost, `${what} long-term gain`);
 
     results.push({
       id: disposal.id,
@@ -189,7 +210,7 @@ export function computeCostBasis(
       costMinor,
       gainMinor,
       longTermGainMinor,
-      shortTermGainMinor: gainMinor - longTermGainMinor,
+      shortTermGainMinor: addExact(gainMinor, -longTermGainMinor, `${what} short-term gain`),
       consumed,
     });
   }
@@ -198,7 +219,10 @@ export function computeCostBasis(
   return {
     method,
     disposals: results,
-    realizedGainMinor: results.reduce((s, r) => s + r.gainMinor, 0),
+    realizedGainMinor: sumExact(
+      results.map((r) => r.gainMinor),
+      "the realized gain",
+    ),
     remainingLots: remaining.map((l) => ({
       id: l.id,
       acquiredAt: l.acquiredAt,
@@ -206,6 +230,9 @@ export function computeCostBasis(
       costMinor: l.remainingCostMinor,
     })),
     remainingQuantity: remaining.reduce((s, l) => s + l.remainingQuantity, 0),
-    remainingCostMinor: remaining.reduce((s, l) => s + l.remainingCostMinor, 0),
+    remainingCostMinor: sumExact(
+      remaining.map((l) => l.remainingCostMinor),
+      "the remaining cost",
+    ),
   };
 }

@@ -910,3 +910,202 @@ describe("GL coding", () => {
     );
   });
 });
+
+describe("amounts are exact, or refused — never silently rounded (C218)", () => {
+  const MAX = Number.MAX_SAFE_INTEGER;
+
+  test("a tax whose product passes 2^53 is still exact", () => {
+    // amount × bps = 3.19e18: past 2^53, though the amount and the tax are not.
+    const amount = 1_595_908_809_793_069;
+    const exact = (BigInt(amount) * 1999n + 5000n) / 10_000n;
+    const result = calculateTax(
+      [{ id: "a", amountMinor: amount, taxCodes: ["V"] }],
+      [{ code: "V", bps: 1999 }],
+    );
+    expect(result.taxMinor).toBe(Number(exact));
+    // What 0.7.0 answered.
+    expect(result.taxMinor).not.toBe(319_022_171_077_635);
+    expect(result.taxMinor).toBe(319_022_171_077_634);
+    // Tax-inclusive recovery multiplies by 10,000 first: exact too.
+    const inclusive = calculateTax(
+      [{ id: "a", amountMinor: amount, taxCodes: ["V"] }],
+      [{ code: "V", bps: 1999 }],
+      { pricesIncludeTax: true },
+    );
+    expect(inclusive.netMinor).toBe(
+      Number((BigInt(amount) * 10_000n * 2n + 11_999n) / (11_999n * 2n)),
+    );
+  });
+
+  test("a total past 2^53 is refused by name, not reported one unit off", () => {
+    expect(() =>
+      calculateTax(
+        [
+          { id: "a", amountMinor: MAX, taxCodes: ["Z"] },
+          { id: "b", amountMinor: 2, taxCodes: ["Z"] },
+        ],
+        [{ code: "Z", bps: 0 }],
+      ),
+    ).toThrow("the invoice's net comes to 9007199254740993, past ±2^53 − 1");
+    expect(() =>
+      computeCostBasis(
+        [
+          { id: "a", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: 1 },
+          { id: "b", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: MAX },
+        ],
+        [],
+        "fifo",
+      ),
+    ).toThrow(/the remaining cost comes to 9007199254740992/);
+    expect(() =>
+      checkSpendLimit(
+        { amountMinor: 1 },
+        [
+          { id: "h1", at: "2026-01-01T00:00:00Z", amountMinor: MAX },
+          { id: "h2", at: "2026-01-01T00:00:01Z", amountMinor: 1 },
+        ],
+        { perDayMinor: MAX },
+        Date.parse("2026-01-01T01:00:00Z"),
+      ),
+    ).toThrow(/the spend in the last day comes to 9007199254740992/);
+  });
+
+  test("an unsafe amount handed to the library is refused, not computed with", () => {
+    expect(() =>
+      calculateTax([{ id: "a", amountMinor: 2 ** 53, taxCodes: ["Z"] }], [{ code: "Z", bps: 0 }]),
+    ).toThrow(/line "a" amountMinor \(9007199254740992\) is not an integer within/);
+  });
+
+  test("a fractional quantity's exposure is whole minor units, with no float noise", () => {
+    const report = matchInvoiceToPurchaseOrder(
+      [
+        { id: "i1", poLineId: "p1", quantity: 1.2, unitPriceMinor: 1001 },
+        { id: "i2", poLineId: "p2", quantity: 2.3, unitPriceMinor: 1001 },
+      ],
+      [
+        { id: "p1", quantity: 1, unitPriceMinor: 1000 },
+        { id: "p2", quantity: 2.3, unitPriceMinor: 1001 },
+      ],
+      [
+        { poLineId: "p1", quantity: 1.2 },
+        { poLineId: "p2", quantity: 2.1 },
+      ],
+    );
+    const [first, second] = report.pairs;
+    // 1.2 × 1001 − 1.2 × 1000 = 1.2 (0.7.0: 1.2000000000000455).
+    expect(first?.exposureMinor).toBe(1);
+    // 2.3 × 1001 − 2.1 × 1001 = 200.2 (0.7.0: 200.19999999999982).
+    expect(second?.exposureMinor).toBe(200);
+    expect(report.totalExposureMinor).toBe(201);
+    for (const pair of report.pairs) expect(Number.isInteger(pair.exposureMinor)).toBe(true);
+    const delta = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.1, unitPriceMinor: 100 }],
+    ).pairs[0]?.quantityDelta;
+    expect(delta).toBe(0.2);
+    // A true half is a half: 0.145 × 100 is 14.499999999999998 in binary,
+    // and rounds to 15 (half away from zero), not 14.
+    const half = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.145, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.145, unitPriceMinor: 100 }],
+      [{ poLineId: "p", quantity: 0 }],
+    ).pairs[0];
+    expect(half?.status).toBe("not-received");
+    expect(half?.exposureMinor).toBe(15);
+  });
+
+  test("every exposure is an integer, for any fractional quantity", () => {
+    let seed = 7;
+    const next = (): number => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31;
+      return seed / 2 ** 31;
+    };
+    for (let i = 0; i < 500; i++) {
+      const invoiceQuantity = Math.round(next() * 1000) / 100;
+      const report = matchInvoiceToPurchaseOrder(
+        [
+          {
+            id: "i",
+            poLineId: "p",
+            quantity: invoiceQuantity,
+            unitPriceMinor: 1 + Math.floor(next() * 99_999),
+          },
+        ],
+        [
+          {
+            id: "p",
+            quantity: Math.round(next() * 1000) / 100,
+            unitPriceMinor: 1 + Math.floor(next() * 99_999),
+          },
+        ],
+        [{ poLineId: "p", quantity: Math.round(next() * 1000) / 100 }],
+      );
+      const pair = report.pairs[0];
+      expect({ invoiceQuantity, integer: Number.isInteger(pair?.exposureMinor) }).toEqual({
+        invoiceQuantity,
+        integer: true,
+      });
+    }
+  });
+
+  test("ten disposals of 0.1 consume a lot of 1 completely, and its cost to the unit", () => {
+    const disposals = Array.from({ length: 10 }, (_, i) => ({
+      id: `d${i}`,
+      disposedAt: `2026-02-01T00:00:0${i}Z`,
+      quantity: 0.1,
+      proceedsMinor: 100,
+    }));
+    const result = computeCostBasis(
+      [{ id: "lot", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: 1001 }],
+      disposals,
+      "fifo",
+    );
+    // 0.7.0 left 1.39e-16 of the lot open.
+    expect(result.remainingLots).toEqual([]);
+    expect(result.remainingQuantity).toBe(0);
+    expect(result.remainingCostMinor).toBe(0);
+    expect(result.disposals.reduce((s, d) => s + d.costMinor, 0)).toBe(1001);
+  });
+
+  test("a refund's per-unit split is computed, not allocated unit by unit", () => {
+    // 0.7.0 built an array of one entry per unit: this line has 2^40.
+    const refund = computeRefund(
+      [{ id: "a", quantity: 2 ** 40, unitPriceMinor: 1, taxMinor: 7 }],
+      [{ lineId: "a", quantity: 3 }],
+    );
+    expect(refund.lines[0]).toMatchObject({ grossMinor: 3, taxMinor: 3 });
+  });
+
+  test("the computed split is the unit-by-unit allocation, for every small case", () => {
+    for (let total = 1; total <= 12; total++) {
+      for (const amount of [-17, -1, 0, 1, 5, 12, 13, 100]) {
+        const perUnit = allocateProportional(amount, new Array(total).fill(1));
+        for (let returned = 1; returned <= total; returned++) {
+          const refund = computeRefund(
+            [{ id: "a", quantity: total, unitPriceMinor: 10, taxMinor: amount }],
+            [{ lineId: "a", quantity: returned }],
+          );
+          const expected = perUnit.slice(0, returned).reduce((s, p) => s + p, 0);
+          expect({ total, amount, returned, tax: refund.lines[0]?.taxMinor }).toEqual({
+            total,
+            amount,
+            returned,
+            tax: expected,
+          });
+        }
+      }
+    }
+  });
+
+  test("an allocation whose products pass 2^53 is exact and still sums to the total", () => {
+    const weights = [2 ** 52, 3, 2 ** 51 + 1];
+    const parts = allocateProportional(MAX, weights);
+    expect(parts.reduce((s, p) => s + p, 0)).toBe(MAX);
+    const sum = weights.reduce((s, w) => s + BigInt(w), 0n);
+    parts.forEach((part, i) => {
+      const floor = (BigInt(MAX) * BigInt(weights[i] as number)) / sum;
+      expect(BigInt(part) - floor).toBeGreaterThanOrEqual(0n);
+      expect(BigInt(part) - floor).toBeLessThanOrEqual(1n);
+    });
+  });
+});

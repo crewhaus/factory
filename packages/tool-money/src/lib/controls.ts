@@ -11,6 +11,8 @@
  * afterwards.
  */
 
+import { addExact, mathRound, sumExact, toNumber } from "./exact";
+
 export type Spend = {
   readonly id: string;
   /** ISO-8601 with an offset. */
@@ -74,15 +76,19 @@ export function checkSpendLimit(
   const entries = history.map((s) => ({ ...s, atMs: instant(s.at, `spend "${s.id}" at`) }));
   const since = (ms: number): typeof entries =>
     entries.filter((e) => nowMs - e.atMs < ms && e.atMs <= nowMs);
-  const sum = (list: typeof entries): number => list.reduce((t, e) => t + e.amountMinor, 0);
+  const sum = (list: typeof entries, what: string): number =>
+    sumExact(
+      list.map((e) => e.amountMinor),
+      what,
+    );
 
   const hour = since(HOUR);
   const day = since(DAY);
   const week = since(WEEK);
   const windows = {
-    hourMinor: sum(hour),
-    dayMinor: sum(day),
-    weekMinor: sum(week),
+    hourMinor: sum(hour, "the spend in the last hour"),
+    dayMinor: sum(day, "the spend in the last day"),
+    weekMinor: sum(week, "the spend in the last week"),
     hourCount: hour.length,
   };
 
@@ -94,7 +100,7 @@ export function checkSpendLimit(
   }> = [];
   const check = (name: string, cap: number | undefined, spent: number): void => {
     if (cap === undefined) return;
-    const wouldBe = spent + proposed.amountMinor;
+    const wouldBe = addExact(spent, proposed.amountMinor, `the ${name} spend with this payment`);
     if (wouldBe > cap) {
       violations.push({
         limit: name,
@@ -121,7 +127,10 @@ export function checkSpendLimit(
   check("perWeek", limits.perWeekMinor, windows.weekMinor);
 
   if (limits.perCounterpartyPerDayMinor !== undefined && proposed.counterparty !== undefined) {
-    const spent = sum(day.filter((e) => e.counterparty === proposed.counterparty));
+    const spent = sum(
+      day.filter((e) => e.counterparty === proposed.counterparty),
+      "the spend to this counterparty in the last day",
+    );
     check(
       `perCounterpartyPerDay:${proposed.counterparty}`,
       limits.perCounterpartyPerDayMinor,
@@ -189,11 +198,13 @@ export function checkSpendLimit(
 
   // Headroom is the tightest remaining amount limit, which is the number a
   // caller needs to propose something that would pass.
+  const room = (cap: number | undefined, spent: number, what: string): number | undefined =>
+    cap === undefined ? undefined : addExact(cap, -spent, what);
   const caps = [
     limits.perTransactionMinor,
-    limits.perHourMinor === undefined ? undefined : limits.perHourMinor - windows.hourMinor,
-    limits.perDayMinor === undefined ? undefined : limits.perDayMinor - windows.dayMinor,
-    limits.perWeekMinor === undefined ? undefined : limits.perWeekMinor - windows.weekMinor,
+    room(limits.perHourMinor, windows.hourMinor, "the hourly headroom"),
+    room(limits.perDayMinor, windows.dayMinor, "the daily headroom"),
+    room(limits.perWeekMinor, windows.weekMinor, "the weekly headroom"),
   ].filter((v): v is number => v !== undefined);
 
   return {
@@ -246,8 +257,14 @@ export function refundAbuseSignals(
     const cutoff = nowMs - days * DAY;
     const r = refunds.filter((x) => instant(x.at, `refund "${x.id}" at`) >= cutoff);
     const o = orders.filter((x) => instant(x.at, `order "${x.id}" at`) >= cutoff);
-    const refundedMinor = r.reduce((s, x) => s + x.amountMinor, 0);
-    const spentMinor = o.reduce((s, x) => s + x.amountMinor, 0);
+    const refundedMinor = sumExact(
+      r.map((x) => x.amountMinor),
+      `the refunds in ${days} days`,
+    );
+    const spentMinor = sumExact(
+      o.map((x) => x.amountMinor),
+      `the orders in ${days} days`,
+    );
     return {
       days,
       refunds: r.length,
@@ -256,7 +273,13 @@ export function refundAbuseSignals(
       spentMinor,
       // Undefined rather than infinite when nothing was spent: a ratio
       // against zero is not a large number, it is not a number.
-      ratioBps: spentMinor === 0 ? null : Math.round((refundedMinor * 10_000) / spentMinor),
+      ratioBps:
+        spentMinor === 0
+          ? null
+          : toNumber(
+              mathRound(BigInt(refundedMinor) * 10_000n, BigInt(spentMinor)),
+              `the ${days}-day refund ratio`,
+            ),
     };
   });
 

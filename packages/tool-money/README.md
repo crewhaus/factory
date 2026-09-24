@@ -27,6 +27,16 @@ Cents, pence, yen. Floating point produces totals that do not add up, and
 that fails reconciliation. Every amount in and out of these tools is an
 integer, and the schemas reject anything else.
 
+An amount must also be one a JSON number holds exactly: at most 2^53 − 1
+minor units (about 90 trillion dollars in cents). A larger one has already
+been rounded by the time it arrives, so it is refused, with a pointer to a
+larger unit. Inside, the arithmetic is exact however large the intermediate
+products get — a tax rate times an amount passes 2^53 long before the amount
+does — and a total that would itself pass the limit is refused by name
+rather than reported a unit off. `PurchaseOrderMatch` takes fractional
+quantities (kilograms, hours); its exposure figures are rounded to whole
+minor units, half away from zero.
+
 Splitting is largest-remainder, so the parts always sum to the whole. 100
 cents three ways is 34, 33, 33 — never 33, 33, 33 with a cent unaccounted
 for. A full return refunds exactly what was charged, and a lot's partial
