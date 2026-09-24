@@ -1834,10 +1834,16 @@ export const tlsInspect: RegisteredTool = buildTool({
     { field: "servername", kind: "recipient" },
   ],
   description:
-    "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock.",
+    "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock. The host must be named by an allow-listed origin; the port is the caller's choice on that host (443 by default), and a service on it that does not speak TLS is reported as such.",
   inputSchema: z.object({
     host: z.string().min(1).describe("hostname; must be named by an allow-listed origin"),
-    port: z.number().int().min(1).max(65_535).optional().describe("default 443"),
+    port: z
+      .number()
+      .int()
+      .min(1)
+      .max(65_535)
+      .optional()
+      .describe("default 443; any port on the allow-listed host, e.g. 465 or 993 for mail"),
     servername: z.string().min(1).optional().describe("SNI name, when it differs from host"),
     timeoutMs: z
       .number()
@@ -1895,6 +1901,26 @@ function inspectCertificate(
       () => {
         try {
           const leaf = socket.getPeerCertificate(true);
+          const cipher = socket.getCipher();
+          // A peer that never spoke TLS still gets here on this runtime: an
+          // SSH banner or an HTTP error page "completes" a handshake with no
+          // certificate, a cipher whose name is null and protocol TLSv1.2.
+          // Reporting that would invent a verdict ("wrong SAN") for a service
+          // that has no certificate at all.
+          if (
+            leaf === null ||
+            leaf === undefined ||
+            leaf.raw === undefined ||
+            Object.keys(leaf).length === 0 ||
+            typeof cipher?.name !== "string"
+          ) {
+            reject(
+              new Error(
+                `no TLS handshake with ${host}:${port}: the service accepted the connection but presented no certificate, so it does not appear to speak TLS on this port`,
+              ),
+            );
+            return;
+          }
           // One clock reading for the whole chain, so two certificates that
           // expire on the same day never report different days remaining.
           const now = Date.now();
@@ -1909,7 +1935,6 @@ function inspectCertificate(
             const issuer: DetailedPeerCertificate | undefined = node.issuerCertificate;
             node = issuer === node ? undefined : issuer;
           }
-          const cipher = socket.getCipher();
           resolve(
             json({
               host,
@@ -1920,7 +1945,7 @@ function inspectCertificate(
                 ? { authorizationError: String(socket.authorizationError) }
                 : {}),
               ...(socket.getProtocol() !== null ? { protocol: socket.getProtocol() } : {}),
-              ...(cipher !== null ? { cipher: cipher.name } : {}),
+              cipher: cipher.name,
               certificate: chain[0] ?? {},
               chainLength: chain.length,
               chain: chain.slice(1),

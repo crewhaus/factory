@@ -7612,7 +7612,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "tlsInspect",
     name: "TlsInspect",
     description:
-      "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock.",
+      "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock. The host must be named by an allow-listed origin; the port is the caller's choice on that host (443 by default), and a service on it that does not speak TLS is reported as such.",
     readOnly: true,
     destructive: false,
     scope: "external",

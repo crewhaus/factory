@@ -52,7 +52,11 @@ second HTTP surface with a weaker gate would be the same hole twice.
 1. **Empty allow-list denies everything.** There is no "allow all" value.
 2. Scheme must be `http` or `https`.
 3. Origin must match an allow-list entry exactly after canonicalisation
-   (lowercase host, default port elided).
+   (lowercase host, default port elided). The two tools addressed by host
+   rather than URL — `DnsLookup` and `TlsInspect` — need the host to be named
+   by an allow-listed origin; `TlsInspect`'s port is the caller's choice on
+   that host, and a service there that does not speak TLS is reported as
+   "no TLS handshake", never as a certificate.
 4. **SSRF**: loopback, link-local (including the cloud metadata address),
    RFC1918, CGNAT, multicast, reserved and mDNS targets are refused *even when
    allow-listed* — as an IP literal in any encoding and as the DNS-resolved

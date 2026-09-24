@@ -28,6 +28,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { auditToolScopes } from "@crewhaus/tool-builder";
@@ -1715,6 +1716,43 @@ describe("DnsLookup / TlsInspect", () => {
     expect(await run(tlsInspect, { host: "127.0.0.1", port: main.port })).toContain("SSRF");
   });
 
+  test("TlsInspect says a service that does not speak TLS presented no certificate", async () => {
+    // Two services that answer a ClientHello with something other than TLS.
+    // On this runtime the handshake callback still fires, with an empty
+    // certificate, a cipher named null and "TLSv1.2" — which 0.7.0 reported
+    // as a certificate with the wrong name.
+    const speakers = [
+      (socket: import("node:net").Socket) => socket.write("SSH-2.0-OpenSSH_9.6\r\n"),
+      (socket: import("node:net").Socket) =>
+        socket.once("data", () =>
+          socket.end("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"),
+        ),
+    ];
+    const outs: string[] = [];
+    for (const speak of speakers) {
+      const server = createTcpServer(speak);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const port = (server.address() as { port: number }).port;
+      try {
+        registerHttpConfig({ allowed_origins: [`https://127.0.0.1:${port}`] });
+        outs.push(
+          String(
+            await tlsInspect.execute({
+              host: "127.0.0.1",
+              port,
+              servername: "crewhaus.test",
+              timeoutMs: 10_000,
+            }),
+          ),
+        );
+      } finally {
+        server.close();
+      }
+    }
+    expect(outs.filter((o) => !o.includes("no TLS handshake with 127.0.0.1:"))).toEqual([]);
+    expect(outs.filter((o) => o.includes('"protocol"') || o.includes('"certificate"'))).toEqual([]);
+  });
+
   test.skipIf(!hasOpenssl())(
     "TlsInspect reads a real certificate chain from a local TLS server",
     async () => {
@@ -1773,6 +1811,7 @@ describe("DnsLookup / TlsInspect", () => {
             "DNS:crewhaus.test",
             "IP Address:127.0.0.1",
           ]);
+          expect(typeof result.cipher).toBe("string");
           // Self-signed: the handshake completes, but nothing vouches for it.
           expect(result.authorized).toBe(false);
           expect(result.authorizationError).toBeDefined();
