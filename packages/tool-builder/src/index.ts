@@ -94,6 +94,15 @@ const OPERATIVE_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set([
   "path",
   "url",
   "command",
+  "recipient",
+  "text",
+  "id",
+]);
+
+/** The kinds whose value can be qualified by another field (`within`). */
+const QUALIFIABLE_KINDS: ReadonlySet<OperativeArgKind> = new Set([
+  "path",
+  "recipient",
   "text",
   "id",
 ]);
@@ -231,6 +240,25 @@ function resolveFieldShape(schema: unknown, segments: readonly string[], i: numb
 }
 
 /**
+ * Why `name` cannot qualify another operative field, or `undefined` when it
+ * can: it must be a top-level field holding one string or number, not a
+ * list, since the qualified value is `<qualifier>/<value>`.
+ */
+function scalarFieldShape(inputSchema: unknown, name: string): string | undefined {
+  const s = unwrapZod(inputSchema);
+  if (zodTypeName(s) !== "ZodObject") return "is not an object";
+  const shape = (zodDef(s)["shape"] as () => Record<string, unknown>)();
+  if (!Object.hasOwn(shape, name)) return `has no top-level field "${name}"`;
+  if (zodTypeName(unwrapZod(shape[name])) === "ZodArray") {
+    return `field "${name}" is a list; a qualifier must hold one value`;
+  }
+  const leaf = leafShape(shape[name]);
+  return leaf === "string" || leaf === "number"
+    ? undefined
+    : `field "${name}" is not a string or a number`;
+}
+
+/**
  * Check a tool's `operativeArgs` against its input schema. A declaration that
  * names a field the schema does not have would make every scoped rule for the
  * tool silently miss, so it is refused when the tool is built, not discovered
@@ -273,11 +301,26 @@ function checkOperativeArgs(
     if (shape === "number" && kind !== "id") {
       fail(`${at}: "${field}" is a number; only kind "id" can hold a number`);
     }
+    const { within } = arg;
+    if (within !== undefined) {
+      if (!QUALIFIABLE_KINDS.has(kind)) {
+        fail(
+          `${at}.within: a "${kind}" value cannot be qualified; only ${[...QUALIFIABLE_KINDS].join(", ")} can`,
+        );
+      }
+      if (typeof within !== "string" || !/^[A-Za-z_$][\w$]*$/.test(within)) {
+        fail(`${at}.within must name one top-level input field, e.g. "owner"`);
+      }
+      if (within === field) fail(`${at}.within names "${field}" itself`);
+      const qualifier = scalarFieldShape(inputSchema, within);
+      if (qualifier !== undefined) fail(`${at}.within: the input schema ${qualifier}`);
+    }
     out.push(
       Object.freeze({
         field,
         kind,
         ...(arg.default !== undefined ? { default: arg.default } : {}),
+        ...(within !== undefined ? { within } : {}),
       }),
     );
   }

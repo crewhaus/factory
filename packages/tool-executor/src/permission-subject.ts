@@ -26,7 +26,12 @@
  *      is flagged as outside, which no allow rule matches and every deny
  *      does.
  *    - a `url` is parsed (WHATWG) and matched as its `href`.
- *    - a `command` held as an array (an argv) is joined with spaces.
+ *    - a `command` held as an array (an argv) is joined with spaces; each
+ *      word is kept as another spelling, so a deny or ask rule naming one
+ *      word (`RunCommand(rm)`) still fires on the whole argv.
+ *    - a field declared `within` another is written `<qualifier>/<value>`.
+ *    A tool that declares `[]` has no field that decides where it acts, and
+ *    is matched on its string values like a tool that declares nothing.
  *
  * Nothing here touches the filesystem or imports a `node:` builtin: this
  * package is part of the worker runtime's import graph.
@@ -92,19 +97,19 @@ export function preparePermissionSubject(
 
 /**
  * The canonical operative values of an ALREADY PARSED input, or `undefined`
- * when the tool declares no `operativeArgs` (the matcher then falls back to
- * the input's string values).
+ * when the tool declares no `operativeArgs`, or declares `[]` (the matcher
+ * then falls back to the input's string values).
  */
 export function operativeValuesFor(
   tool: RegisteredTool,
   parsedInput: unknown,
   opts: PermissionSubjectOptions = {},
 ): ReadonlyArray<OperativeValue> | undefined {
-  if (tool.operativeArgs === undefined) return undefined;
+  if (tool.operativeArgs === undefined || tool.operativeArgs.length === 0) return undefined;
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
   for (const arg of tool.operativeArgs) {
-    for (const raw of readOperativeField(parsedInput, arg)) {
+    for (const { value: raw, words } of readField(parsedInput, arg)) {
       switch (arg.kind) {
         case "path":
           values.push(...canonicalizePath(raw));
@@ -113,21 +118,33 @@ export function operativeValuesFor(
           values.push(canonicalUrl(raw));
           break;
         default:
-          values.push({ kind: arg.kind, canonical: [raw] });
+          values.push({
+            kind: arg.kind,
+            canonical: [raw],
+            ...(words !== undefined ? { spellings: words } : {}),
+          });
       }
     }
   }
   return values;
 }
 
+/** One value of a declared field; `words` is the argv it was joined from. */
+type FieldReading = { readonly value: string; readonly words?: ReadonlyArray<string> };
+
 /**
  * Every value of one declared field. Dots descend into objects; an array
  * anywhere on the way is walked element by element — except a `command`
- * field that IS an array of strings, which is one argv and is joined.
+ * field that IS an array of strings, which is one argv and is joined. A
+ * field declared `within` another comes back as `<qualifier>/<value>`.
  */
 export function readOperativeField(input: unknown, arg: OperativeArg): string[] {
+  return readField(input, arg).map((r) => r.value);
+}
+
+function readField(input: unknown, arg: OperativeArg): FieldReading[] {
   const segments = arg.field.split(".");
-  const out: string[] = [];
+  const out: FieldReading[] = [];
   const walk = (value: unknown, i: number, depth: number): void => {
     if (depth > 64) return;
     if (Array.isArray(value)) {
@@ -137,16 +154,16 @@ export function readOperativeField(input: unknown, arg: OperativeArg): string[] 
         value.length > 0 &&
         value.every((v) => typeof v === "string")
       ) {
-        out.push(value.join(" "));
+        out.push({ value: value.join(" "), words: value as string[] });
         return;
       }
       for (const element of value) walk(element, i, depth + 1);
       return;
     }
     if (i === segments.length) {
-      if (typeof value === "string") out.push(value);
+      if (typeof value === "string") out.push({ value });
       else if (arg.kind === "id" && typeof value === "number" && Number.isFinite(value)) {
-        out.push(String(value));
+        out.push({ value: String(value) });
       }
       return;
     }
@@ -156,8 +173,28 @@ export function readOperativeField(input: unknown, arg: OperativeArg): string[] 
     walk((value as Record<string, unknown>)[key], i + 1, depth + 1);
   };
   walk(input, 0, 0);
-  if (out.length === 0 && arg.default !== undefined) out.push(arg.default);
-  return out;
+  if (out.length === 0 && arg.default !== undefined) out.push({ value: arg.default });
+  const qualifier = arg.within !== undefined ? qualifierOf(input, arg.within) : undefined;
+  if (qualifier === undefined) return out;
+  return out.map((r) =>
+    // A path relative to a directory field; an absolute one ignores it.
+    arg.kind === "path" && isAbsolutePath(r.value) ? r : { ...r, value: `${qualifier}/${r.value}` },
+  );
+}
+
+function isAbsolutePath(value: string): boolean {
+  return value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+/** The top-level `within` field's value, when the call carries one. */
+function qualifierOf(input: unknown, field: string): string | undefined {
+  if (input === null || typeof input !== "object" || !Object.hasOwn(input, field)) {
+    return undefined;
+  }
+  const value = (input as Record<string, unknown>)[field];
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
 }
 
 /**

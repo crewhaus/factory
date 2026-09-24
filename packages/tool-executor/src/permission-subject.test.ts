@@ -132,6 +132,91 @@ describe("url, command and id values", () => {
     expect(readOperativeField({ issue: 12 }, { field: "issue", kind: "text" })).toEqual([]);
   });
 
+  test("a deny naming one word of an argv fires; an allow needs the whole command", () => {
+    const tool = buildTool({
+      name: "Run",
+      description: "d",
+      inputSchema: z.object({ argv: z.array(z.string()), cwd: z.string().optional() }),
+      operativeArgs: [{ field: "argv", kind: "command" }],
+      execute: async () => "ok",
+    });
+    const values = operativeValuesFor(tool, { argv: ["rm", "-rf", "src"] });
+    expect(values).toEqual([
+      { kind: "command", canonical: ["rm -rf src"], spellings: ["rm", "-rf", "src"] },
+    ]);
+    const match = (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(
+        compilePattern(pattern),
+        "Run",
+        {},
+        { polarity, operativeValues: values ?? [] },
+      );
+    expect(match("Run(rm)", "restrict")).toBe(true);
+    expect(match("Run(rm)", "allow")).toBe(false);
+    expect(match("Run(rm -rf src)", "allow")).toBe(true);
+  });
+
+  test("a field declared within another is matched as qualifier/value", () => {
+    const repo = { field: "repo", kind: "recipient", within: "owner" } as const;
+    expect(readOperativeField({ owner: "crewhaus", repo: "factory" }, repo)).toEqual([
+      "crewhaus/factory",
+    ]);
+    // A group path keeps its own slashes; a numeric qualifier is its decimal.
+    expect(readOperativeField({ owner: "g/sub", repo: "p" }, repo)).toEqual(["g/sub/p"]);
+    expect(
+      readOperativeField(
+        { chainId: 1, address: "0xab" },
+        { field: "address", kind: "id", within: "chainId" },
+      ),
+    ).toEqual(["1/0xab"]);
+    // Left out, the value is matched on its own.
+    expect(readOperativeField({ repo: "factory" }, repo)).toEqual(["factory"]);
+  });
+
+  test("a path within a directory field is resolved from that directory", () => {
+    const tool = buildTool({
+      name: "Stage",
+      description: "d",
+      inputSchema: z.object({ cwd: z.string().optional(), paths: z.array(z.string()).optional() }),
+      operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
+      execute: async () => "ok",
+    });
+    const canonical = (input: unknown) =>
+      (operativeValuesFor(tool, input) ?? []).map((v) => v.canonical[0]);
+    expect(canonical({ cwd: "pkg", paths: ["src/a.ts"] })).toEqual(["pkg/src/a.ts"]);
+    expect(canonical({ paths: ["src/a.ts"] })).toEqual(["src/a.ts"]);
+    // Left out, the paths default to the directory itself.
+    expect(canonical({ cwd: "pkg" })).toEqual(["pkg"]);
+    expect(canonical({})).toEqual(["."]);
+    // `..` in the directory is collapsed with the rest.
+    expect(canonical({ cwd: "pkg/..", paths: [".env"] })).toEqual([".env"]);
+    expect(canonical({ cwd: "pkg", paths: ["/etc/passwd"] })).toEqual(["/etc/passwd"]);
+  });
+
+  test("an empty declaration is matched like no declaration: on the string values", () => {
+    const tool = buildTool({
+      name: "Clip",
+      description: "d",
+      inputSchema: z.object({ text: z.string() }),
+      operativeArgs: [],
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(tool, { text: "secret" })).toBeUndefined();
+    const subject = preparePermissionSubject(tool, { text: "secret" });
+    expect(subject.ok && subject.operativeValues).toBe(undefined);
+    // So a deny on the content still fires, as it did in 0.7.0.
+    expect(
+      matchesPattern(
+        compilePattern("Clip(*secret*)"),
+        "Clip",
+        { text: "a secret" },
+        {
+          polarity: "restrict",
+        },
+      ),
+    ).toBe(true);
+  });
+
   test("dotted fields walk objects and every array element", () => {
     const arg = { field: "requests.url", kind: "url" } as const;
     expect(

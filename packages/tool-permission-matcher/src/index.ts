@@ -383,7 +383,7 @@ export function matchesToolName(compiled: CompiledPattern, toolName: string): bo
 export type RulePolarity = "allow" | "restrict";
 
 /** Mirrors `OperativeArgKind` in `@crewhaus/tool-catalog`. */
-export type OperativeValueKind = "path" | "url" | "command" | "text" | "id";
+export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "text" | "id";
 
 /**
  * One value a rule's argument glob is checked against, prepared by the
@@ -416,7 +416,8 @@ export type MatchOptions = {
   readonly polarity?: RulePolarity;
   /**
    * The tool's declared operative values, canonicalised by the runtime.
-   * Absent ⇒ the tool declared none, and the matcher falls back to the
+   * Absent ⇒ the tool declared none (or declared `[]`: no argument decides
+   * where it acts), and the matcher falls back to the
    * {@link OPERATIVE_ARG_FIELDS} name table, then to every string in `input`.
    * Present but empty ⇒ the tool declares operative fields and this call
    * carries none of them, so no argument-scoped rule can match it.

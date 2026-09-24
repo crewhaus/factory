@@ -396,7 +396,7 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
         ...echoDef,
         operativeArgs: [{ field: "message", kind: "glob" as unknown as "text" }],
       }),
-    ).toThrow(/kind "glob" is not one of path, url, command, text, id/);
+    ).toThrow(/kind "glob" is not one of path, url, command, recipient, text, id/);
     expect(() =>
       buildTool({ ...echoDef, operativeArgs: [{ field: "message.", kind: "text" }] }),
     ).toThrow(/empty segment/);
@@ -409,6 +409,57 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
         ],
       }),
     ).toThrow(/names "message" twice/);
+  });
+
+  test("an empty declaration is kept: the tool says no argument scopes it", () => {
+    const tool = buildTool({ ...echoDef, operativeArgs: [] });
+    expect(tool.operativeArgs).toEqual([]);
+  });
+
+  describe("within — one field qualified by another", () => {
+    const repoSchema = z.object({
+      owner: z.string(),
+      repo: z.string(),
+      chainId: z.number().int(),
+      tags: z.array(z.string()),
+      path: z.string(),
+      nested: z.object({ org: z.string() }),
+    });
+    const def = { name: "Repo", description: "d", inputSchema: repoSchema, execute: exec };
+
+    test("a recipient, text or id field can name a top-level string or number", () => {
+      const tool = buildTool({
+        ...def,
+        operativeArgs: [
+          { field: "repo", kind: "recipient", within: "owner" },
+          { field: "owner", kind: "id", within: "chainId" },
+        ],
+      });
+      expect(tool.operativeArgs?.[0]).toEqual({
+        field: "repo",
+        kind: "recipient",
+        within: "owner",
+      });
+    });
+
+    test("each way a qualifier can be wrong is refused, saying why", () => {
+      const bad =
+        (within: string, kind: "recipient" | "path" = "recipient") =>
+        () =>
+          buildTool({
+            ...def,
+            operativeArgs: [{ field: kind === "path" ? "path" : "repo", kind, within }],
+          });
+      expect(() =>
+        buildTool({ ...def, operativeArgs: [{ field: "owner", kind: "url", within: "repo" }] }),
+      ).toThrow(/a "url" value cannot be qualified/);
+      expect(bad("owner", "path")).not.toThrow();
+      expect(bad("missing")).toThrow(/has no top-level field "missing"/);
+      expect(bad("tags")).toThrow(/field "tags" is a list/);
+      expect(bad("nested")).toThrow(/field "nested" is not a string or a number/);
+      expect(bad("nested.org")).toThrow(/must name one top-level input field/);
+      expect(bad("repo")).toThrow(/names "repo" itself/);
+    });
   });
 
   test("an opaque schema (an MCP tool's z.unknown()) accepts any field", () => {

@@ -166,7 +166,7 @@ export type ModelFeatureRequirement = {
  * or becomes required is a major one.
  *
  * - `1.0.0` — the contract as released in crewhaus 0.7.0.
- * - `1.1.0` — adds `operativeArgs`.
+ * - `1.1.0` — adds `operativeArgs` (crewhaus 0.7.1).
  */
 export const TOOL_CONTRACT_VERSION = "1.1.0";
 
@@ -185,10 +185,20 @@ export const TOOL_CONTRACT_VERSION = "1.1.0";
  *   `HTTP://Example.COM` and `http://example.com/` are one value.
  * - `"command"` — a command line. An array (an argv) is joined with single
  *   spaces, so `Tool(git status)` matches `["git", "status"]`.
+ *   An allow rule must match the whole command; a deny or ask rule also fires
+ *   on any single word of an argv, so `RunCommand(rm)` catches
+ *   `["rm", "-rf", "src"]`.
+ * - `"recipient"` — who or where the tool delivers to, when that is not
+ *   written as a URL: an email address, a phone number, a host name, a
+ *   repository. Compared as written.
  * - `"text"` and `"id"` — compared as written. An `"id"` field may also hold a
  *   number, which is compared as its decimal string.
+ *
+ * `"url"` and `"recipient"` are the destination kinds: an external tool that
+ * declares one sends to a place the model chooses (see
+ * {@link hasModelChosenDestination}).
  */
-export type OperativeArgKind = "path" | "url" | "command" | "text" | "id";
+export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text" | "id";
 
 /**
  * One input field a permission rule's argument glob constrains — the rule
@@ -203,6 +213,15 @@ export type OperativeArgKind = "path" | "url" | "command" | "text" | "id";
  * a call that leaves the field out would carry no value for a deny rule to
  * catch, while the tool still acts on the default.
  *
+ * `within` names a second, top-level field that qualifies this one. Its value
+ * is written in front, with a `/` between: `{ field: "repo", kind:
+ * "recipient", within: "owner" }` is matched as `crewhaus/factory`, so one rule
+ * can say `IssueCreate(crewhaus/*)`. For a `path`, `within` names the
+ * directory the path is relative to (`{ field: "paths", kind: "path", within:
+ * "cwd" }`), and the joined path is what gets resolved; an absolute path is
+ * left as it is. When the call leaves the qualifying field out, the value is
+ * matched on its own. A `url` or `command` cannot be qualified.
+ *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
@@ -213,7 +232,31 @@ export type OperativeArg = {
   readonly field: string;
   readonly kind: OperativeArgKind;
   readonly default?: string;
+  readonly within?: string;
 };
+
+/** The kinds that name where a tool sends: see {@link OperativeArgKind}. */
+export const DESTINATION_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set(["url", "recipient"]);
+
+/**
+ * True when the tool sends to a destination the model picks: it is
+ * `scope: "external"` and one of its `operativeArgs` is a URL or a
+ * recipient. Such a tool can carry whatever the model puts in the call to
+ * wherever the model points it, so the egress fabric treats it as a dynamic
+ * sink.
+ *
+ * Taken structurally, so a data-only description of a tool (the builtin
+ * manifest) answers the same way as the live one.
+ */
+export function hasModelChosenDestination(tool: {
+  readonly scope: string;
+  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+}): boolean {
+  return (
+    tool.scope === "external" &&
+    (tool.operativeArgs ?? []).some((a) => DESTINATION_ARG_KINDS.has(a.kind as OperativeArgKind))
+  );
+}
 
 export interface ToolDefinition<TInput = unknown> {
   name: string;
@@ -343,6 +386,16 @@ export interface ToolDefinition<TInput = unknown> {
    * every one of them to match, a deny or ask fires on any. That is safe but
    * blunt: a tool with a message or a note field can rarely be given a scoped
    * allow. Declaring the operative field is what makes a scoped allow usable.
+   *
+   * `[]` says, deliberately, that no argument decides where the tool acts —
+   * it writes to the clipboard, or stops a process by a handle only this
+   * session has. A rule with an argument pattern is then matched against the
+   * call's string values, exactly as for a tool that declares nothing, and
+   * `crewhaus lint` points out that such a rule scopes nothing.
+   *
+   * Every builtin that is not read-only, or is `scope: "external"`, declares
+   * this (an empty array included); `apps/cli/src/operative-args.test.ts`
+   * holds that.
    */
   operativeArgs?: ReadonlyArray<OperativeArg>;
 }

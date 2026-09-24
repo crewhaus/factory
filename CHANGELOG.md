@@ -62,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packages written outside this repo can check `TOOL_CONTRACT_VERSION` in
   `@crewhaus/tool-catalog`.
 
+  Two more things a declaration can say. A `recipient` is where a tool
+  delivers when that is not a URL — an email address, a phone number, a host,
+  a repository. And `within` reads one field in the light of another: a
+  repository is matched as `owner/repo`, so `IssueCreate(crewhaus/*)` means
+  what it looks like, and a path is resolved from the directory the tool runs
+  in. An empty list says no argument decides where the tool acts; rules about
+  such a tool are matched on the text of the call, as before.
+
 ### Changed
 
 - **MCP tools are named `mcp__<server>__<tool>`**, the name the docs have
