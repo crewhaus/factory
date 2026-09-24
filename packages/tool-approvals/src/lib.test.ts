@@ -16,6 +16,7 @@ import {
   filterApprovals,
   foldApprovals,
   isApprovalId,
+  isOffsetlessDateTime,
   operativeOf,
   orderApprovals,
   parseInstant,
@@ -244,6 +245,66 @@ describe("parseInstant", () => {
     expect(parseInstant("")).toBeNull();
     expect(parseInstant("2026-13-45T99:99:99Z")).toBeNull();
   });
+
+  test("a time without an offset is refused, never read in the host's zone (security-2#5)", () => {
+    // On 0.7.0 each of these parsed, as HOST-local time: a different number
+    // on every machine, and a negative age on one east of the writer.
+    expect(parseInstant("2026-09-19T14:00:00")).toBeNull();
+    expect(parseInstant("2026-09-19T14:00")).toBeNull();
+    expect(parseInstant("2026-09-19 14:00")).toBeNull();
+    expect(parseInstant("2026-09-19T14:00:00.250")).toBeNull();
+    expect(isOffsetlessDateTime("2026-09-19T14:00:00")).toBe(true);
+    expect(isOffsetlessDateTime("2026-09-19 14:00")).toBe(true);
+    expect(isOffsetlessDateTime("2026-09-19T14:00:00Z")).toBe(false);
+    expect(isOffsetlessDateTime("2026-09-19")).toBe(false);
+  });
+
+  test("every accepted spelling is the instant it names; a bare date is 00:00:00Z", () => {
+    const twoPmUtc = Date.UTC(2026, 8, 19, 14);
+    expect(parseInstant("2026-09-19T14:00:00Z")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19T16:00:00+02:00")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19T16:00:00+0200")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19 14:00Z")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19T09:30-04:30")).toBe(twoPmUtc);
+    expect(parseInstant("2026-09-19")).toBe(Date.UTC(2026, 8, 19));
+  });
+
+  test("the same inputs parse to the same numbers under every host zone", () => {
+    // The property the package states (DETERMINISM), measured where it
+    // breaks: in processes whose TZ differs. An offset-less time is in the
+    // list on purpose — it must come back null everywhere, not as three
+    // different instants.
+    const inputs = [
+      "2026-09-19T14:00:00",
+      "2026-09-19 14:00",
+      "2026-09-19T14:00:00Z",
+      "2026-09-19T16:00:00+02:00",
+      "2026-09-19",
+    ];
+    const module = path.join(import.meta.dir, "lib", "approvals.ts");
+    const script = `const { parseInstant } = await import(${JSON.stringify(module)}); console.log(JSON.stringify(${JSON.stringify(inputs)}.map(parseInstant)));`;
+    const outputs = ["UTC", "America/Los_Angeles", "Asia/Tokyo"].map((TZ) => {
+      const run = Bun.spawnSync([process.execPath, "-e", script], {
+        env: { ...process.env, TZ },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect({ TZ, exit: run.exitCode, stderr: run.stderr.toString() }).toEqual({
+        TZ,
+        exit: 0,
+        stderr: "",
+      });
+      return run.stdout.toString().trim();
+    });
+    const expected = JSON.stringify([
+      null,
+      null,
+      Date.UTC(2026, 8, 19, 14),
+      Date.UTC(2026, 8, 19, 14),
+      Date.UTC(2026, 8, 19),
+    ]);
+    expect(outputs).toEqual([expected, expected, expected]);
+  }, 20_000);
 
   test("an offset instant compares by INSTANT, which a string compare gets backwards", () => {
     const withOffset = "2026-09-19T00:30:00+02:00"; // 22:30Z on the 18th
