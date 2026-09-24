@@ -52,44 +52,55 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
+/** Mode bits, FIFOs and unprivileged symlinks are POSIX facts; Windows has none of them. */
+const posixTest = test.skipIf(process.platform === "win32");
+
 const parse = (out: unknown): Record<string, unknown> =>
   JSON.parse(String(out)) as Record<string, unknown>;
 
-test("the record lives in a private per-user directory outside the workspace, 0700/0600", async () => {
-  const file = powerStateFile();
-  expect(file.startsWith(join(tmp, "crewhaus"))).toBe(true);
-  expect(file.startsWith(process.cwd())).toBe(false);
-  expect(parse(await powerAssertion.execute({ action: "hold" } as never))["outcome"]).toBe("held");
-  expect(lstatSync(dirname(file)).mode & 0o777).toBe(0o700);
-  expect(lstatSync(file).mode & 0o777).toBe(0o600);
-  expect(JSON.parse(readFileSync(file, "utf8"))["pid"]).toBe(4242);
-});
+posixTest(
+  "the record lives in a private per-user directory outside the workspace, 0700/0600",
+  async () => {
+    const file = powerStateFile();
+    expect(file.startsWith(join(tmp, "crewhaus"))).toBe(true);
+    expect(file.startsWith(process.cwd())).toBe(false);
+    expect(parse(await powerAssertion.execute({ action: "hold" } as never))["outcome"]).toBe(
+      "held",
+    );
+    expect(lstatSync(dirname(file)).mode & 0o777).toBe(0o700);
+    expect(lstatSync(file).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(file, "utf8"))["pid"]).toBe(4242);
+  },
+);
 
-test("a symlink at the record's path is not followed: the state is unreadable, nothing is signalled", async () => {
-  const file = powerStateFile();
-  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
-  const planted = join(tmp, "planted.json");
-  writeFileSync(
-    planted,
-    JSON.stringify({
-      pid: 4242,
-      marker: "caffeinate",
-      backend: "caffeinate",
-      platform: "darwin",
-      scope: "system",
-      startedAt: 1,
-      expiresAt: 2,
-      reason: null,
-    }),
-  );
-  symlinkSync(planted, file);
-  const out = parse(await powerAssertion.execute({ action: "release" } as never));
-  expect(out["outcome"]).toBe("unreadableState");
-  expect(String(out["reason"])).toContain("symbolic link");
-  expect(ran).toEqual([]);
-});
+posixTest(
+  "a symlink at the record's path is not followed: the state is unreadable, nothing is signalled",
+  async () => {
+    const file = powerStateFile();
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+    const planted = join(tmp, "planted.json");
+    writeFileSync(
+      planted,
+      JSON.stringify({
+        pid: 4242,
+        marker: "caffeinate",
+        backend: "caffeinate",
+        platform: "darwin",
+        scope: "system",
+        startedAt: 1,
+        expiresAt: 2,
+        reason: null,
+      }),
+    );
+    symlinkSync(planted, file);
+    const out = parse(await powerAssertion.execute({ action: "release" } as never));
+    expect(out["outcome"]).toBe("unreadableState");
+    expect(String(out["reason"])).toContain("symbolic link");
+    expect(ran).toEqual([]);
+  },
+);
 
-test("a directory other users can write is not trusted", () => {
+posixTest("a directory other users can write is not trusted", () => {
   const file = powerStateFile();
   mkdirSync(dirname(file), { recursive: true });
   chmodSync(dirname(file), 0o777);
@@ -98,7 +109,7 @@ test("a directory other users can write is not trusted", () => {
   expect(() => fs().readText(file)).toThrow("can be written by other users");
 });
 
-test("a FIFO at the record's path is refused without blocking", async () => {
+posixTest("a FIFO at the record's path is refused without blocking", async () => {
   const file = powerStateFile();
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   const mkfifo = Bun.spawnSync(["mkfifo", file]);
@@ -108,7 +119,7 @@ test("a FIFO at the record's path is refused without blocking", async () => {
   expect(String(out["reason"])).toContain("not trusted");
 });
 
-test("a link planted at the old predictable temp name is not written through", async () => {
+posixTest("a link planted at the old predictable temp name is not written through", async () => {
   const file = powerStateFile();
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   const victim = join(tmp, "victim");

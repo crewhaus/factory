@@ -104,6 +104,7 @@ import {
   MAX_COPIES,
   classifyPrint,
   parseQueues,
+  parseWindowsQueues,
   planPrint,
   planPrinterProbe,
   refusePrintOptions,
@@ -695,12 +696,14 @@ export const printDocument: RegisteredTool = buildTool({
       probe.refused === true || probe.missing || probe.timedOut
         ? unreadableQueues(
             probe.missing
-              ? "lpstat is not installed on this host, so the queue could not be read"
+              ? `${platform === "win32" ? "PowerShell" : "lpstat"} is not installed on this host, so the queue could not be read`
               : probe.timedOut
                 ? "the queue probe did not finish within its timeout and was killed, so whether this host has printers is unknown — it is NOT that it has none"
                 : probe.stderr,
           )
-        : parseQueues(probe.stdout, probe.stderr);
+        : platform === "win32"
+          ? parseWindowsQueues(probe.stdout, probe.stderr)
+          : parseQueues(probe.stdout, probe.stderr);
 
     const queueJson = {
       printers: queues.printers,

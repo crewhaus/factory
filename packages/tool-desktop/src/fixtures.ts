@@ -128,6 +128,18 @@ export const LOGINCTL_STDOUT = "LockedHint=no\nType=x11\nActive=yes\n";
 export const WINDOWS_PRESENCE_STDOUT = "idleMs=42000\nlocked=no\n";
 
 // ---------------------------------------------------------------------------
+// printing — Windows, DOCUMENTED (the printer-list script's own JSON shape)
+// ---------------------------------------------------------------------------
+
+/**
+ * What WINDOWS_PRINTER_LIST prints: the in-box PDF printer (spaces in its
+ * name) and a shared queue (a UNC name with a comma), CRLF-terminated as
+ * PowerShell writes on Windows.
+ */
+export const WINDOWS_PRINTER_LIST_STDOUT =
+  '{"printers":[{"name":"Microsoft Print to PDF","status":"Normal"},{"name":"\\\\\\\\print-01\\\\Front Desk, 2F","status":"Offline"}],"default":"Microsoft Print to PDF"}\r\n';
+
+// ---------------------------------------------------------------------------
 // printing — RECORDED on macOS 26.6.2, CUPS 2.4
 // ---------------------------------------------------------------------------
 

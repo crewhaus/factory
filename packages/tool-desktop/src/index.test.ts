@@ -25,7 +25,12 @@
  * ran it.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { LPSTAT_STDOUT, PS_CAFFEINATE_STDOUT, PS_REUSED_PID_STDOUT } from "./fixtures";
+import {
+  LPSTAT_STDOUT,
+  PS_CAFFEINATE_STDOUT,
+  PS_REUSED_PID_STDOUT,
+  WINDOWS_PRINTER_LIST_STDOUT,
+} from "./fixtures";
 import {
   HEADLESS_ENV,
   type SessionEnv,
@@ -1257,6 +1262,32 @@ test("the Windows print path that DOES work carries its values in the environmen
   }
   expect(print?.env?.["CREWHAUS_PRINT_DEST"]).toBe("Front_Desk");
   expect(String(print?.env?.["CREWHAUS_PRINT_PATH"])).toMatch(/notes\.txt$/);
+});
+
+test("a Windows queue is read whole, and an unreadable one is never 'no printers'", async () => {
+  // reliability#7: 0.7.0 fed `printer <Name> is <Status>` to the lpstat
+  // parser, so "Microsoft Print to PDF" came back as a printer "Microsoft".
+  _setPlatform("win32");
+  answers["powershell.exe"] = { code: 0, stdout: WINDOWS_PRINTER_LIST_STDOUT };
+  const out = JSON.parse(
+    String(await printDocument.execute({ path: "notes.txt", dryRun: true } as never)),
+  ) as Record<string, unknown>;
+  const queue = out["queue"] as Record<string, unknown>;
+  expect((queue["printers"] as Array<{ name: string }>).map((p) => p.name)).toEqual([
+    "Microsoft Print to PDF",
+    "\\\\print-01\\Front Desk, 2F",
+  ]);
+  expect(queue["defaultPrinter"]).toBe("Microsoft Print to PDF");
+
+  // Get-Printer failed: stderr and no JSON. 0.7.0 answered printers: [] with
+  // nothing to say the list was not read.
+  answers["powershell.exe"] = { code: 0, stdout: "", stderr: "The spooler is not running.\r\n" };
+  const failed = JSON.parse(
+    String(await printDocument.execute({ path: "notes.txt", dryRun: true } as never)),
+  ) as Record<string, unknown>;
+  const failedQueue = failed["queue"] as Record<string, unknown>;
+  expect(failedQueue["printers"]).toEqual([]);
+  expect(String(failedQueue["queueUnreadable"])).toContain("NOT that it has none");
 });
 
 test("a hold refuses when it cannot tell whether the last holder is still running", async () => {
