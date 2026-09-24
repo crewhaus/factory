@@ -32,7 +32,7 @@ import {
   writeApprovals,
   writeSession,
 } from "./fixtures";
-import { approvalStatus, permissionsSuggest, verifyRule } from "./index";
+import { approvalStatus, approvalsInbox, permissionsSuggest, verifyRule } from "./index";
 
 const originalCwd = process.cwd();
 let tmp: string;
@@ -417,6 +417,40 @@ describe("a session log that links outside the workspace", () => {
       expect(out.unknown.map((u) => u.field)).toContain("mined.unreadable");
       expect(raw).not.toContain("sk-OUTSIDE-SECRET");
     } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("an .env that links outside the workspace", () => {
+  test("is not read by ApprovalStatus or ApprovalsInbox: the one-bit oracle is closed", async () => {
+    // The PoC from security-2#2: the outside file DOES assign the variable, so
+    // reading it would surface "assigns CREWHAUS_SESSION_DIR" — a fact about a
+    // file the caller never named. The tools must say "not read" instead.
+    const saved = process.env["CREWHAUS_SESSION_DIR"];
+    delete process.env["CREWHAUS_SESSION_DIR"];
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-tool-approvals-outside-"));
+    try {
+      writeFileSync(path.join(outside, "secret.env"), "CREWHAUS_SESSION_DIR=/x\n");
+      const h = path.join(tmp, "h");
+      mkdirSync(h, { recursive: true });
+      writeFileSync(path.join(h, "crewhaus.yaml"), "name: h\n");
+      symlinkSync(path.join(outside, "secret.env"), path.join(h, ".env"));
+      const status = await approvalStatus.execute({ dir: "h" });
+      const inbox = await approvalsInbox.execute({});
+      for (const [tool, raw] of [
+        ["ApprovalStatus", status],
+        ["ApprovalsInbox", inbox],
+      ] as const) {
+        expect({
+          tool,
+          readTheOutsideFile: raw.includes(".env assigns CREWHAUS_SESSION_DIR"),
+          saidNotRead: raw.includes("outside the workspace, which is not read here"),
+        }).toEqual({ tool, readTheOutsideFile: false, saidNotRead: true });
+      }
+    } finally {
+      if (saved === undefined) delete process.env["CREWHAUS_SESSION_DIR"];
+      else process.env["CREWHAUS_SESSION_DIR"] = saved;
       rmSync(outside, { recursive: true, force: true });
     }
   });
