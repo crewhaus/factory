@@ -429,3 +429,37 @@ describe("F3b — every builtin's declaration is what a rule reads (permission-i
     ).toBe("ask");
   });
 });
+
+// C033 (permission-integration#3, #4). On 0.7.0 a scoped allow on a tool
+// outside the ten-name table had to match EVERY string in the call, so
+// `RunCommand(git status*)` and `HttpRequest(https://api.example.com/**)`
+// never fired and operators granted the bare name. Every acting builtin now
+// declares its operative field, and an allow is read against that field
+// alone. A boolean switch is still not operative (the documented 0.8 key
+// work): the last test pins that, so a change to it is deliberate.
+describe("C033 — a scoped allow on a multi-field builtin is usable", () => {
+  test("RunCommand(git status*) allows `git status` and nothing else", async () => {
+    const rs = rules(["alwaysAllow", "RunCommand(git status*)"]);
+    expect(await gate("RunCommand", { argv: ["git", "status"] }, rs)).toBe("allow");
+    expect(await gate("RunCommand", { argv: ["git", "status", "--short"] }, rs)).toBe("allow");
+    expect(await gate("RunCommand", { argv: ["rm", "-rf", "src"] }, rs)).toBe("ask");
+  });
+
+  test("HttpRequest(https://api.example.com/**) allows a call with a method and headers", async () => {
+    const rs = rules(["alwaysAllow", "HttpRequest(https://api.example.com/**)"]);
+    const call = {
+      url: "https://api.example.com/v1/items",
+      method: "GET",
+      headers: { accept: "application/json" },
+    };
+    expect(await gate("HttpRequest", call, rs)).toBe("allow");
+    expect(await gate("HttpRequest", { ...call, url: "https://evil.example/v1" }, rs)).toBe("ask");
+  });
+
+  test("a boolean switch is not part of what a rule sees (documented; 0.8)", async () => {
+    const rs = rules(["alwaysAllow", "RemovePath(build/**)"]);
+    const call = { path: "build/nothing-here", recursive: true, dryRun: false };
+    expect(await gate("RemovePath", call, rs)).toBe("allow");
+    expect(await gate("RemovePath", { ...call, path: "src/app.ts" }, rs)).toBe("ask");
+  });
+});

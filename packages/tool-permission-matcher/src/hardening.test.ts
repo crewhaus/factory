@@ -127,6 +127,24 @@ describe("the linear-time glob accepts exactly the old regex's language", () => 
   });
 });
 
+// C037 — the cases a plain two-pointer "back up to the last star" matcher
+// gets wrong when `*` (no `/`) and `**` (anything) mix, and the regex's
+// UTF-16 code-unit reading of `?`; each row is checked against the 0.7.0
+// regex too, so the rows themselves cannot be wrong.
+describe("the linear-time glob keeps the cases a naive matcher breaks", () => {
+  test.each([
+    ["**x*y", "x/xay", true],
+    ["**x*y", "xa/y", false],
+    ["a*b**c", "a/b/c", false],
+    ["a*b**c", "axb/c", true],
+    ["?", "\u{1F600}", false],
+    ["??", "\u{1F600}", true],
+  ] as const)("%j against %j is %p", (glob, value, want) => {
+    expect(oracleGlobToRegex(glob).test(value)).toBe(want);
+    expect(compilePattern(`T(${glob})`)._argRe?.test(value)).toBe(want);
+  });
+});
+
 describe("security-8#2 — a glob cannot stall the event loop", () => {
   // The audit's reproductions. Under the old regex the first took 12 s at
   // 18 KB (cubic), and the second did not finish inside 110 s at 20 KB.
