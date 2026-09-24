@@ -1061,6 +1061,7 @@ import {
   formatLintJson,
   formatLintText,
   nearestToolName,
+  permissionRuleProblemsOf,
   runLint,
   suggestSafeName,
   suggestSecretFix,
@@ -2100,7 +2101,11 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // `wrote …` stream). With --strict any REMEDIABLE warning fails the
   // compile HERE — before any file is written, so a strict-failed build
   // emits nothing.
-  for (const warning of bundle.warnings) {
+  // 0.7.1 (permission-integration#12) — permission rules that can never do
+  // what they say, the same check `crewhaus lint` runs. Remediable, so
+  // --strict fails on them like any other compile warning.
+  const warnings = [...bundle.warnings, ...(await permissionRuleWarnings(yamlText))];
+  for (const warning of warnings) {
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
   // D40 — channel-reactions-join is INFORMATIONAL: it fires on a fully
@@ -2133,7 +2138,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     "model-strongest-crosses-provider",
     "model-sunset",
   ]);
-  const escalatedWarnings = bundle.warnings.filter((w) => !INFORMATIONAL_WARNING_CODES.has(w.code));
+  const escalatedWarnings = warnings.filter((w) => !INFORMATIONAL_WARNING_CODES.has(w.code));
   if (strictWarnings && escalatedWarnings.length > 0) {
     die(
       `--strict: ${escalatedWarnings.length} compile warning(s) escalated to errors (see lines above)`,
@@ -2588,6 +2593,30 @@ async function autoRegisterSpec(
   } catch (err) {
     process.stderr.write(`[register] skipped: ${(err as Error).message}\n`);
   }
+}
+
+/**
+ * The permission rules in a spec that can never do what they say, as compile
+ * warnings (code `permission-rule`). A spec that does not parse or lower has
+ * none here — the compile itself reports why.
+ */
+async function permissionRuleWarnings(
+  yamlText: string,
+): Promise<Array<{ code: string; path: string; message: string }>> {
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch {
+    return [];
+  }
+  const rules = (ir as { permissions?: { rules?: readonly unknown[] } }).permissions?.rules;
+  if (rules === undefined || rules.length === 0) return [];
+  const toolMap = await loadToolMap();
+  const byRegisteredName: Record<string, RegisteredTool> = {};
+  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  return permissionRuleProblemsOf(ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
+    (p) => ({ code: "permission-rule", path: "permissions.rules", message: p.message }),
+  );
 }
 
 /**

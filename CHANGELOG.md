@@ -141,6 +141,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`crewhaus lint` and `compile` point out permission rules that can never
+  fire.** A rule written with the spec key (`removePath(tmp/**)` — rules use
+  the tool's name, `RemovePath`), a URL rule with a method in front
+  (`HttpRequest(GET https://…)`), a near-miss tool name, an MCP server the
+  spec does not declare, and an argument pattern on a tool that has no
+  argument saying where it acts each get a warning with the corrected rule.
+  `compile --strict` fails on them, like other fixable warnings.
 - **A permission pattern can no longer stall the daemon.** A rule with several
   `*` in it, matched against a long command, could block the event loop for
   seconds or indefinitely. Patterns are now matched in time proportional to

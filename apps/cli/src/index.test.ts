@@ -563,6 +563,32 @@ describe("crewhaus compile", () => {
     expect(existsSync(outDir)).toBe(false);
   });
 
+  // 0.7.1 (permission-integration#12) — a rule written with the spec key
+  // (`removePath`) never matches the tool's name (`RemovePath`); compile says
+  // so and --strict refuses it, like any remediable warning.
+  test("compile warns on a permission rule that can never fire, and --strict refuses it", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      'name: deadrule\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: tidy up\ntools: [removePath]\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "removePath(tmp/**)" }\n',
+    );
+    const outDir = join(tmp, "out");
+    const loose = await runCli(["compile", specPath, "--no-register", "-o", outDir], { cwd: tmp });
+    expect(loose.exitCode).toBe(0);
+    expect(loose.stderr).toContain(
+      'crewhaus: warning[permission-rule] permissions.rules: rule "removePath(tmp/**)" names removePath',
+    );
+    expect(loose.stderr).toContain('Write "RemovePath(tmp/**)"');
+    const strictOut = join(tmp, "strict-out");
+    const strict = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", strictOut],
+      { cwd: tmp },
+    );
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
+    expect(existsSync(strictOut)).toBe(false);
+  }, 30_000);
+
   test("compile --strict passes a warning-free spec (and prints no warning lines)", async () => {
     const outDir = join(tmp, "out");
     const result = await runCli(

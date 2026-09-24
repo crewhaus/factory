@@ -548,3 +548,12 @@ export function matchesPattern(
     ? values.every((v) => valueMatches(v, argRe, absoluteGlob, polarity))
     : values.some((v) => valueMatches(v, argRe, absoluteGlob, polarity));
 }
+
+export {
+  type PermissionRuleProblem,
+  type PermissionRuleProblemCode,
+  type PermissionRuleProblemsInput,
+  type RuleToolDescriptor,
+  argGlobCanMatchUrl,
+  permissionRuleProblems,
+} from "./rule-problems";

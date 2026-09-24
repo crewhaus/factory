@@ -226,3 +226,53 @@ describe("formatters", () => {
     expect(json.findings[0]).toHaveProperty("path");
   });
 });
+
+describe("runLint — permission rules that can never do what they say (permission-integration#12)", () => {
+  // The audit's spec: every rule compiled and linted clean on 0.7.0.
+  const spec = `${validCli}tools: [removePath, httpRequest, runCommand, write, clipboardWrite]
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: "RemovePath(build/**)" }
+    - { type: alwaysAllow, pattern: "HttpRequest(GET https://api.example.com/**)" }
+    - { type: alwaysAllow, pattern: "RunCommand(git status)" }
+    - { type: alwaysDeny, pattern: "RunCommand(rm)" }
+    - { type: alwaysDeny, pattern: "removePath(tmp/**)" }
+    - { type: alwaysDeny, pattern: "ClipboardWrite(*secret*)" }
+    - { type: alwaysDeny, pattern: "HttpReqest" }
+    - { type: alwaysDeny, pattern: "mcp__github__*" }
+`;
+
+  test("each dead or unscoped rule is a warning naming the fix; live rules are not", () => {
+    // `noTools`: the builtin manifest stands in for the live tools.
+    const result = runLint(spec, noTools);
+    const permission = result.findings.filter((f) => f.rule.startsWith("permission-rule:"));
+    expect(permission.map((f) => [f.rule, f.path])).toEqual([
+      [
+        "permission-rule:argument-cannot-match",
+        "permissions.rules[alwaysAllow HttpRequest(GET https://api.example.com/**)]",
+      ],
+      ["permission-rule:tool-key-not-name", "permissions.rules[alwaysDeny removePath(tmp/**)]"],
+      [
+        "permission-rule:argument-not-scoped",
+        "permissions.rules[alwaysDeny ClipboardWrite(*secret*)]",
+      ],
+      ["permission-rule:unknown-tool", "permissions.rules[alwaysDeny HttpReqest]"],
+      ["permission-rule:unknown-mcp-server", "permissions.rules[alwaysDeny mcp__github__*]"],
+    ]);
+    expect(permission.every((f) => f.severity === "warning")).toBe(true);
+    expect(permission[1]?.message).toContain('Write "RemovePath(tmp/**)"');
+    // Warnings inform: lint still passes.
+    expect(result.ok).toBe(true);
+  });
+
+  test("the live tool's declaration is what is checked", () => {
+    const declaresNothing = { name: "ClipboardWrite" } as RegisteredTool;
+    const result = runLint(spec, (name) =>
+      name === "clipboardWrite" ? declaresNothing : undefined,
+    );
+    // A tool that declares no operativeArgs leaves nothing to check the pattern against.
+    expect(result.findings.some((f) => f.rule === "permission-rule:argument-not-scoped")).toBe(
+      false,
+    );
+  });
+});
