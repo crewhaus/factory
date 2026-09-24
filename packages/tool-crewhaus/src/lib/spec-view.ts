@@ -21,11 +21,13 @@
  * so a token in a query string (or a `user:pass@` in its authority) is not
  * echoed into a report, and a stdio server's ARGV — which is the third place
  * an operator pastes a credential, `["--api-key", "sk-…"]` being the usual
- * shape — is redacted by `redactArgs` before it is shown.
+ * shape, and a database URL with its password the next — is redacted by
+ * `redactArgs` before it is shown.
  */
 
 import { createHash } from "node:crypto";
-import { ENV_REF_RE } from "@crewhaus/preflight";
+import { ENV_REF_RE, UNPARSED_ENV_REF_RE } from "@crewhaus/preflight";
+import { isCredentialShapedName, redactUrlCredentialsInText } from "@crewhaus/tool-safety/env";
 
 export type LooseRecord = Record<string, unknown>;
 
@@ -254,46 +256,131 @@ function isCredentialFlag(arg: string): boolean {
 }
 
 /**
+ * Flags whose value is an HTTP header, `Name: value` — `mcp-remote`'s
+ * `--header`, curl's `-H`. The value is withheld whatever the name: an
+ * `sse` server's headers are reported by key only, and this is the same
+ * data reached through a stdio bridge.
+ */
+const HEADER_FLAGS: ReadonlySet<string> = new Set(["--header", "--headers", "-H"]);
+
+/** An HTTP header name (RFC 9110 `token`). */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+
+/** `Name: value`, or undefined when the text is not header-shaped. */
+function splitHeader(text: string): { name: string; value: string } | undefined {
+  const colon = text.indexOf(":");
+  if (colon <= 0) return undefined;
+  const name = text.slice(0, colon).trim();
+  if (!HEADER_NAME_RE.test(name)) return undefined;
+  return { name, value: text.slice(colon + 1) };
+}
+
+/**
+ * A header value that is only an env REFERENCE — `${AUTH_HEADER}`,
+ * `$TOKEN`, `Bearer ${TOKEN}` — which `mcp-remote` substitutes itself (the
+ * form its README documents). It carries no secret, and hiding it costs the
+ * reader the variable name.
+ */
+function isEnvRefHeaderValue(value: string): boolean {
+  const bare = value.trim().replace(/^(?:Bearer|Basic|Token)\s+/i, "");
+  return UNPARSED_ENV_REF_RE.test(bare);
+}
+
+/** `Name: (redacted)` — or the text unchanged when there is nothing to hide. */
+function redactHeader(text: string): string {
+  const header = splitHeader(text);
+  if (header === undefined) return text;
+  if (header.value.trim() === "" || isEnvRefHeaderValue(header.value)) return text;
+  return `${header.name}: ${REDACTED}`;
+}
+
+/**
+ * A bearer credential anywhere in an entry: `Bearer eyJ…` inside a JSON
+ * blob or a `KEY=Bearer …` pair. (`Basic` is not matched outside a header:
+ * it is an English word too.) The class after the whitespace excludes
+ * whitespace, so each match is linear.
+ */
+const BEARER_TOKEN_RE = /\bBearer(\s+)(?!\$)[A-Za-z0-9._~+/=-]{8,}/g;
+
+/**
+ * The credential-carrying PARTS of an entry that is not itself a secret:
+ * a URL's userinfo and credential-named query or fragment parameters
+ * (`postgresql://admin:…@db/prod`, `https://host/sse?token=…` — the scheme,
+ * host and path stay, so the report still says what the server is), a
+ * credential header written as one entry (`Authorization: Bearer …`,
+ * `X-Api-Key: …`, `Cookie: …`), and a `Bearer` credential inside any text.
+ */
+function redactEmbedded(text: string): string {
+  let out = redactUrlCredentialsInText(text, REDACTED);
+  const header = splitHeader(out);
+  if (header !== undefined && isCredentialShapedName(header.name)) out = redactHeader(out);
+  return out.replace(BEARER_TOKEN_RE, (_m, gap: string) => `Bearer${gap}${REDACTED}`);
+}
+
+/**
  * Redact the credential-shaped entries of an MCP server's argv.
  *
- * Three shapes are caught, and only these: `--api-key VALUE` (the entry
- * AFTER a credential-named flag), `--api-key=VALUE` (the half after the
- * `=`), and a bare value that is a credential on its own evidence. Exported
- * because the honest thing to do with a redaction rule is test it directly.
+ * Caught, and only these:
+ *
+ * - `--api-key VALUE` (the entry AFTER a credential-named flag) and
+ *   `--api-key=VALUE` (the half after the `=`);
+ * - a bare value that is a credential on its own evidence (a vendor-prefixed
+ *   key, a JWT, a long opaque token);
+ * - `--header VALUE`, `-H VALUE` and `--header=VALUE`: the header keeps its
+ *   name and loses its value, unless the value is only an env reference;
+ * - inside any other entry, or the value half of any `--flag=VALUE`: a
+ *   URL's userinfo and its credential-named query or fragment parameters, a
+ *   credential header written as one entry, and a `Bearer` credential.
+ *
+ * A `$NAME` env reference is shown as written wherever a whole value is
+ * one. Exported because the honest thing to do with a redaction rule is
+ * test it directly.
  */
 export function redactArgs(args: readonly string[]): { args: string[]; redacted: number } {
   const out: string[] = [];
   let redacted = 0;
-  let previousWasCredentialFlag = false;
+  let previous: "credential-flag" | "header-flag" | undefined;
+  const push = (value: string, original: string): void => {
+    out.push(value);
+    if (value !== original) redacted += 1;
+  };
   for (const arg of args) {
     const eq = arg.startsWith("-") ? arg.indexOf("=") : -1;
+    const after = previous;
+    previous = undefined;
     // A `$UPPER_SNAKE` value is an env REFERENCE, not a credential: hiding it
     // costs the reader the variable name and protects nothing.
-    if (previousWasCredentialFlag && !arg.startsWith("-") && !ENV_REF_RE.test(arg)) {
-      out.push(REDACTED);
-      redacted += 1;
-      previousWasCredentialFlag = false;
+    if (after === "credential-flag" && !arg.startsWith("-") && !ENV_REF_RE.test(arg)) {
+      push(REDACTED, arg);
       continue;
     }
-    if (
-      eq > 0 &&
-      isCredentialFlag(arg.slice(0, eq)) &&
-      arg.length > eq + 1 &&
-      !ENV_REF_RE.test(arg.slice(eq + 1))
-    ) {
-      out.push(`${arg.slice(0, eq)}=${REDACTED}`);
-      redacted += 1;
-      previousWasCredentialFlag = false;
+    if (after === "header-flag" && !arg.startsWith("-")) {
+      // Not `Name: value` (curl-style CLIs also spell a HOST flag `-H`):
+      // only the embedded rules apply.
+      push(splitHeader(arg) === undefined ? redactEmbedded(arg) : redactHeader(arg), arg);
+      continue;
+    }
+    if (eq > 0) {
+      const flag = arg.slice(0, eq);
+      const value = arg.slice(eq + 1);
+      if (isCredentialFlag(flag) && value.length > 0 && !ENV_REF_RE.test(value)) {
+        push(`${flag}=${REDACTED}`, arg);
+        continue;
+      }
+      if (HEADER_FLAGS.has(flag)) {
+        push(`${flag}=${redactHeader(value)}`, arg);
+        continue;
+      }
+      push(`${flag}=${redactEmbedded(value)}`, arg);
       continue;
     }
     if (!arg.startsWith("-") && looksLikeSecretValue(arg)) {
-      out.push(REDACTED);
-      redacted += 1;
-      previousWasCredentialFlag = false;
+      push(REDACTED, arg);
       continue;
     }
-    out.push(arg);
-    previousWasCredentialFlag = isCredentialFlag(arg) && eq === -1;
+    push(arg.startsWith("-") ? arg : redactEmbedded(arg), arg);
+    if (HEADER_FLAGS.has(arg)) previous = "header-flag";
+    else if (isCredentialFlag(arg)) previous = "credential-flag";
   }
   return { args: out, redacted };
 }

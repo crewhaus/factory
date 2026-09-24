@@ -1202,6 +1202,65 @@ describe("secret hygiene", () => {
     expect(raw).not.toContain("ghp_ABCDEFGH0123456789abcdefghijklmnop");
   });
 
+  test("a credential in a stdio URL or header argv reaches neither SpecSummarize nor SpecDiff", async () => {
+    // Built from parts: no secret-shaped literal in the source.
+    const pw = ["Hunter", "2", "Secret"].join("");
+    const tok = ["plain", "secret", "tok"].join("");
+    const hdr = ["abcdef", "0123", "456789"].join("");
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const spec = [
+      ...base,
+      "mcp_servers:",
+      "  pg:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      '      - "-y"',
+      '      - "@modelcontextprotocol/server-postgres"',
+      `      - "postgresql://admin:${pw}@db.internal:5432/prod"`,
+      "  remote:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      '      - "mcp-remote"',
+      `      - "https://mcp.example.com/sse?token=${tok}"`,
+      '      - "--header"',
+      `      - "Authorization: Bearer ${hdr}"`,
+    ].join("\n");
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, {
+      before: { spec: base.join("\n") },
+      after: { spec },
+    });
+    for (const [label, raw] of [
+      ["SpecSummarize", summary],
+      ["SpecDiff", diff],
+    ] as const) {
+      expect({
+        label,
+        pw: raw.includes(pw),
+        tok: raw.includes(tok),
+        hdr: raw.includes(hdr),
+      }).toEqual({ label, pw: false, tok: false, hdr: false });
+    }
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; redactedArgs?: number }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.redactedArgs])).toEqual([
+      ["pg", 1],
+      ["remote", 2],
+    ]);
+    // What the server IS still shows.
+    expect(summary).toContain("db.internal:5432/prod");
+    expect(diff).toContain("https://mcp.example.com/sse?token=(redacted)");
+  });
+
   test("an sse endpoint keeps neither its query string nor its userinfo", async () => {
     const spec = [
       "name: remote",

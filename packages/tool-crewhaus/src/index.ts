@@ -445,7 +445,7 @@ export const specCompileCheck: RegisteredTool = buildTool({
 export const specSummarize: RegisteredTool = buildTool({
   name: "SpecSummarize",
   description:
-    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path, and a stdio server's argv has its credential-shaped entries redacted, so a credential pasted into a spec is not echoed into the report.",
+    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path, and a stdio server's argv has its credentials redacted (a credential flag's value, a header value, a URL's userinfo and token parameters), so a credential pasted into a spec is not echoed into the report.",
   inputSchema: specSourceSchema,
   readOnly: true,
   concurrencySafe: true,

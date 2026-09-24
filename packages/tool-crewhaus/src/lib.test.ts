@@ -1112,6 +1112,103 @@ describe("redactArgs", () => {
     const token = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6";
     expect(redactArgs([token]).args).toEqual(["(redacted)"]);
   });
+
+  // Every secret below is built from parts (see the xoxb test above), and
+  // none has a vendor prefix or a 32-character run, so the old rules never
+  // saw one: on 0.7.0 each case came back verbatim with `redacted: 0`.
+  const pw = ["Hunter", "2", "Secret"].join("");
+  const tok = ["plain", "secret", "tok"].join("");
+  const hdr = ["abcdef", "0123", "456789"].join("");
+
+  test("a database URL loses its userinfo and keeps what the server is", () => {
+    expect(
+      redactArgs([
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        `postgresql://admin:${pw}@db.internal:5432/prod?sslmode=require`,
+      ]),
+    ).toEqual({
+      args: [
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "postgresql://(redacted)@db.internal:5432/prod?sslmode=require",
+      ],
+      redacted: 1,
+    });
+    expect(redactArgs([`redis://:${pw}@cache:6379`]).args).toEqual([
+      "redis://(redacted)@cache:6379",
+    ]);
+    expect(redactArgs([`mongodb+srv://u:${pw}%40x@c/db?retryWrites=true`]).args).toEqual([
+      "mongodb+srv://(redacted)@c/db?retryWrites=true",
+    ]);
+  });
+
+  test("a credential-named query parameter loses its value, and a header its value", () => {
+    expect(
+      redactArgs([
+        "mcp-remote",
+        `https://mcp.example.com/sse?transport=sse&token=${tok}`,
+        "--header",
+        `Authorization: Bearer ${hdr}`,
+      ]),
+    ).toEqual({
+      args: [
+        "mcp-remote",
+        "https://mcp.example.com/sse?transport=sse&token=(redacted)",
+        "--header",
+        "Authorization: (redacted)",
+      ],
+      redacted: 2,
+    });
+  });
+
+  test("every header-flag spelling withholds the value and keeps the name", () => {
+    expect(redactArgs(["-H", `X-Api-Key: ${hdr}`]).args).toEqual(["-H", "X-Api-Key: (redacted)"]);
+    expect(redactArgs(["--headers", `Cookie: session=${hdr}`]).args).toEqual([
+      "--headers",
+      "Cookie: (redacted)",
+    ]);
+    expect(redactArgs([`--header=Authorization: Bearer ${hdr}`])).toEqual({
+      args: ["--header=Authorization: (redacted)"],
+      redacted: 1,
+    });
+    // Headers are reported by key only, as an `sse` server's are.
+    expect(redactArgs(["--header", `X-Tenant: ${hdr}`]).args).toEqual([
+      "--header",
+      "X-Tenant: (redacted)",
+    ]);
+  });
+
+  test("a credential header written as one entry, and a Bearer token inside any entry", () => {
+    expect(redactArgs([`Authorization: Bearer ${hdr}`]).args).toEqual([
+      "Authorization: (redacted)",
+    ]);
+    expect(redactArgs([`--config={"auth":"Bearer ${hdr}"}`]).args).toEqual([
+      '--config={"auth":"Bearer (redacted)"}',
+    ]);
+  });
+
+  test("the value half of any --flag= is searched for a URL credential", () => {
+    expect(redactArgs([`--url=https://u:${pw}@h/x`])).toEqual({
+      args: ["--url=https://(redacted)@h/x"],
+      redacted: 1,
+    });
+  });
+
+  test("an env reference in a header, and a URL with nothing to hide, stay as written", () => {
+    const args = [
+      "mcp-remote",
+      "https://mcp.example.com/sse",
+      "--header",
+      "Authorization:${AUTH_HEADER}",
+      "--header",
+      "Authorization: Bearer ${API_TOKEN}",
+      "-H",
+      "0.0.0.0",
+      "--dsn=postgresql://db.internal:5432/prod?sslmode=require",
+    ];
+    expect(redactArgs(args)).toEqual({ args: [...args], redacted: 0 });
+  });
 });
 
 describe("compileToolGlob mirrors the runtime matcher", () => {

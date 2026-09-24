@@ -22,7 +22,7 @@ tools:
 |---|---|
 | `SpecValidate` | Every YAML, schema and cross-field issue in a spec, with the path that owns it |
 | `SpecCompileCheck` | Lower and compile in memory — the offline "will this build" check, no bundle written |
-| `SpecSummarize` | Shape, models, tools, MCP servers, permissions and declared blocks as structured JSON — `env`/`headers` by key, `sse` URLs cut to origin and path, stdio argv redacted |
+| `SpecSummarize` | Shape, models, tools, MCP servers, permissions and declared blocks as structured JSON — `env`/`headers` by key, `sse` URLs cut to origin and path, stdio argv redacted (credential flags, header values, URL userinfo and token parameters) |
 | `SpecDiff` | What changed between two specs, semantically, and which changes widen capability |
 | `ToolInventory` | The tools a spec grants, builtin vs MCP, with `all-<category>` selectors expanded |
 | `PermissionAudit` | Which rule covers each granted tool, and which outward tools no rule names |
