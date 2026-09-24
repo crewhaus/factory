@@ -499,6 +499,31 @@ test("a package whose tarball would miss LICENSE fails the --dry-run pre-flight,
   expect(r.stdout).toContain("Published: 0  Skipped: 0  Failed: 2");
 }, 30_000);
 
+test("--dry-run --no-registry never runs npm, still checks packed contents and the plan, and says ownership was not checked", () => {
+  const root = makeWorkspace([{ ...A, omit: ["NOTICE"] }, B, D]);
+  const r = run(root, {}, "--dry-run", "--no-registry");
+  expect(r.calls).toEqual([]);
+  expect(r.exitCode).toBe(1);
+  expect(r.stdout).toContain("Registry not consulted (--no-registry): ownership is NOT checked.");
+  expect(r.stderr).toContain("✗ @crewhaus/zz-a (packages/zz-a): NOTICE is missing");
+  expect(r.stderr).toContain(`@crewhaus/zz-b@${V} (blocked: @crewhaus/zz-a`);
+  expect(r.stdout).toContain("Published: 1  Skipped: 0  Failed: 2");
+
+  // A dependency outside the run cannot be confirmed without the registry.
+  const filtered = run(root, {}, "--dry-run", "--no-registry", "--filter", "@crewhaus/zz-b");
+  expect(filtered.calls).toEqual([]);
+  expect(filtered.exitCode).toBe(1);
+  expect(filtered.stderr).toContain(
+    `@crewhaus/zz-a@${V} (could not check the registry: --no-registry)`,
+  );
+
+  // And a real publish refuses the flag outright.
+  const real = run(root, {}, "--no-registry");
+  expect(real.exitCode).toBe(1);
+  expect(real.stderr).toContain("--no-registry is a --dry-run option");
+  expect(real.calls).toEqual([]);
+}, 30_000);
+
 // ─── the real npm CLI against a local registry ────────────────────────────────
 // The classifier above is only as good as its reading of npm's actual output,
 // which changes between npm majors (`npm ERR!` → `npm error`, JSON on stdout).

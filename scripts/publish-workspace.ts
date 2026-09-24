@@ -41,10 +41,12 @@
  *   bun scripts/publish-workspace.ts --dry-run                  # plan only
  *   bun scripts/publish-workspace.ts --filter @crewhaus/errors  # canary a leaf first
  *   bun scripts/publish-workspace.ts                            # full run
+ *   bun scripts/publish-workspace.ts --dry-run --no-registry    # offline pack check (CI)
  *
- * Every form, --dry-run included, needs `npm` and a registry that answers (the
- * ownership guard below will not guess), and a tree already stamped by
- * `release-prep.ts --for-publish` (an unstamped one fails the manifest check).
+ * Every form except --no-registry needs `npm` and a registry that answers (the
+ * ownership guard below will not guess), and every form needs a tree already
+ * stamped by `release-prep.ts --for-publish` (an unstamped one fails the
+ * manifest check).
  *
  * Brand-new package names can 404 on the registry for a few minutes after a
  * successful publish — poll before assuming failure or re-running.
@@ -99,6 +101,10 @@ const has = (name: string) => args.includes(`--${name}`);
 
 const DRY = has("dry-run");
 const FILTER = flag("filter"); // exact package name to publish, useful for retries
+// --dry-run only: leave the registry out entirely, so CI can run the packed-contents
+// and dependency-plan checks on every PR without a network. Ownership is then NOT
+// checked, and a dependency outside the run cannot be confirmed (so it blocks).
+const NO_REGISTRY = has("no-registry");
 const ROOT = resolve(flag("root") ?? process.cwd());
 
 function readJson<T = unknown>(path: string): T {
@@ -544,6 +550,15 @@ export function unmetDependencies(
 
 // ─── main ──────────────────────────────────────────────────────────────────
 function main(): void {
+  if (NO_REGISTRY) {
+    if (!DRY) {
+      console.error(
+        "✗ --no-registry is a --dry-run option: a real publish must check the registry.",
+      );
+      process.exit(1);
+    }
+    console.log("Registry not consulted (--no-registry): ownership is NOT checked.");
+  }
   // `npm whoami` is a TOKEN identity check and there is no equivalent under OIDC:
   // trusted publishing mints a short-lived, package-scoped credential during
   // `npm publish` itself, so there is no logged-in user to report and whoami
@@ -595,6 +610,7 @@ function main(): void {
     unavailable,
     inRun: new Set(filtered.map((p) => p.name)),
     registry: (name, version) => {
+      if (NO_REGISTRY) return { kind: "unknown", reason: "--no-registry" };
       const key = `${name}@${version}`;
       let state = registryMemo.get(key);
       if (state === undefined) {
@@ -613,7 +629,7 @@ function main(): void {
     // Ownership first, even on the would-skip path: a version-exists skip is
     // exactly how a hijacked name hides ("already on registry" tells you
     // nothing about WHOSE content that is). Runs in dry-run too.
-    const mismatch = ownershipMismatch(p);
+    const mismatch = NO_REGISTRY ? null : ownershipMismatch(p);
     if (mismatch) {
       fail(p, `${p.name}@${p.version} (ownership)`);
       console.error(`✗ ${p.name}: ${mismatch}`);

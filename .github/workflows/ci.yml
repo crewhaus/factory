@@ -69,6 +69,19 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      - name: Pack pre-flight
+        # What every published tarball would carry, checked on every PR instead
+        # of first at release time, when a gap has already reached npm: each
+        # entry point built, each `files` entry present, README.md, LICENSE and
+        # NOTICE in place. npm packs a missing `files` entry as nothing, silently.
+        # It runs the release job's own two steps over the dist/ the Typecheck
+        # step emitted (`tsc -b` builds), with the registry left out — ownership
+        # is checked by the release job, which can reach npm. Last, because
+        # release-prep rewrites every package.json the way the release does.
+        run: |
+          bun scripts/release-prep.ts --version 0.0.0-ci --for-publish
+          bun scripts/publish-workspace.ts --dry-run --no-registry
+
   # HM-188 — the harness manager's process layer, executed on Windows.
   #
   # `createWindowsProcessOps` (PowerShell `Get-Process` for liveness and start
