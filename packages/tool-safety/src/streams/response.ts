@@ -1,4 +1,6 @@
 import * as zlib from "node:zlib";
+import { onAbort } from "../signal";
+import { byteBudget, graceMs } from "./limits";
 import { concatBytes, decodeHead } from "./utf8";
 
 /**
@@ -12,10 +14,18 @@ import { concatBytes, decodeHead } from "./utf8";
  * the COMPRESSED size, so a response gives no sign that it was decoded. A
  * reader that counts bytes as they arrive is counting after the damage.
  *
- * So the bound has to start at the request: fetch with {@link withRawBody}
- * (`decompress: false`), and this reader decodes the body itself, in small
- * steps, stopping the decoder as soon as `maxBytes` of decoded output exist.
- * A 256 MB gzip, brotli or zstd bomb then costs a few megabytes.
+ * So the bound has to start at the request: fetch with {@link fetchRaw}, or
+ * with {@link withRawBody} as the init of the final `fetch` call, and this
+ * module decodes the body itself, in small steps, stopping the decoder as
+ * soon as `maxBytes` of decoded output exist. A 256 MB gzip, brotli or zstd
+ * bomb then costs a few megabytes.
+ *
+ * `decodeBody` hands the decoded bytes over chunk by chunk, for a reader
+ * that parses as it goes (server-sent events) or writes as it goes (a
+ * download); `readResponseBounded` collects them.
+ *
+ * Every read is raced against the signal and against `idleTimeoutMs`, so a
+ * server that sends one chunk and then stalls cannot hold the reader.
  *
  * MISUSE IS DETECTED WHERE IT CAN BE. A body that was already decoded by the
  * runtime is recognised when it runs past its own `Content-Length`, or when
@@ -28,9 +38,32 @@ import { concatBytes, decodeHead } from "./utf8";
  */
 
 export type ResponseReadOptions = {
-  /** Most DECODED bytes held. */
+  /**
+   * Most DECODED bytes held: a finite number >= 0. NaN, a negative number or
+   * a missing value throws a `RangeError` rather than reading nothing.
+   */
   readonly maxBytes: number;
+  /** Abandon the read when this fires, even while waiting for a chunk: `aborted`. */
   readonly signal?: AbortSignal;
+  /**
+   * Abandon the read when no chunk arrives for this long: `stalled`.
+   * Default: no idle limit (pass `signal: AbortSignal.timeout(ms)` for an
+   * overall one).
+   */
+  readonly idleTimeoutMs?: number;
+};
+
+export type ResponseReadFailure = {
+  readonly ok: false;
+  readonly code:
+    | "unsupported-encoding"
+    | "auto-decompressed"
+    | "decode-error"
+    | "read-error"
+    | "aborted"
+    | "stalled";
+  readonly reason: string;
+  readonly encodedBytes: number;
 };
 
 export type ResponseReadResult =
@@ -53,24 +86,51 @@ export type ResponseReadResult =
       /** The coding that was undone, or null for an identity body. */
       readonly contentEncoding: string | null;
     }
+  | ResponseReadFailure;
+
+/** How a {@link decodeBody} iteration ended. */
+export type DecodedBodyOutcome =
   | {
-      readonly ok: false;
-      readonly code:
-        | "unsupported-encoding"
-        | "auto-decompressed"
-        | "decode-error"
-        | "read-error"
-        | "aborted";
-      readonly reason: string;
+      readonly ok: true;
+      /** The decoded body was longer than `maxBytes`; the chunks stop there. */
+      readonly truncated: boolean;
+      /** As {@link ResponseReadResult}'s. */
+      readonly decodedBytes: number;
       readonly encodedBytes: number;
-    };
+      readonly contentEncoding: string | null;
+    }
+  | ResponseReadFailure;
+
+/**
+ * Decoded chunks of a body, at most `maxBytes` of them in all. Iterate it
+ * once; `outcome` is set when the iteration ends, and says whether the body
+ * ended, was cut at the cap, or failed. Breaking out of the loop early
+ * cancels the body.
+ */
+export type DecodedBody = AsyncIterable<Uint8Array> & {
+  readonly outcome: DecodedBodyOutcome | undefined;
+};
 
 /**
  * The request options that keep a body raw so {@link readResponseBounded}
- * can bound its decoded size. Merge into every `fetch` whose body it reads.
+ * can bound its decoded size.
+ *
+ * It must be the init of the FINAL `fetch` call: `fetch(input, withRawBody(init))`,
+ * where `input` may be a URL or a `Request`. Bun ignores `decompress` in a
+ * `Request`'s own init, so `new Request(url, withRawBody({}))` handed to a
+ * plain `fetch(request)` is inflated anyway (measured on Bun 1.3.14). A
+ * pinned-fetch seam that passes a `Request` should call {@link fetchRaw}.
  */
 export function withRawBody<T extends object>(init: T): T & { readonly decompress: false } {
   return { ...init, decompress: false };
+}
+
+/**
+ * `fetch` with the body kept raw, whatever `input` is: a URL or a `Request`.
+ * For helpers that build a `Request` first and fetch it later.
+ */
+export function fetchRaw(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, withRawBody(init) as RequestInit);
 }
 
 /** Input fed to the decoder per step. Small, so one step cannot inflate far past the cap. */
@@ -130,139 +190,220 @@ function declaredLength(res: Response): number | undefined {
   return Number(raw.trim());
 }
 
-export async function readResponseBounded(
+type Raced<T> = { readonly value: T } | { readonly stopped: "aborted" | "stalled" };
+
+/** `promise`, unless the signal fires or `idleMs` passes first. */
+function race<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  idleMs: number | undefined,
+): Promise<Raced<T>> {
+  if (signal === undefined && idleMs === undefined) return promise.then((value) => ({ value }));
+  return new Promise<Raced<T>>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (signal?.aborted === true) {
+      resolve({ stopped: "aborted" });
+      return;
+    }
+    const unsubscribe = onAbort(signal, () => {
+      done();
+      resolve({ stopped: "aborted" });
+    });
+    const done = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      unsubscribe();
+    };
+    if (idleMs !== undefined) {
+      timer = setTimeout(() => {
+        done();
+        resolve({ stopped: "stalled" });
+      }, idleMs);
+    }
+    promise.then(
+      (value) => {
+        done();
+        resolve({ value });
+      },
+      (err: unknown) => {
+        done();
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * The body's decoded bytes as they arrive, never more than `maxBytes` of
+ * them, with the decoder stopped at the cap. See {@link DecodedBody}.
+ */
+export function decodeBody(res: Response, options: ResponseReadOptions): DecodedBody {
+  const maxBytes = byteBudget("maxBytes", options.maxBytes);
+  const idleMs =
+    options.idleTimeoutMs === undefined
+      ? undefined
+      : graceMs("idleTimeoutMs", options.idleTimeoutMs, 0);
+  const state: { outcome: DecodedBodyOutcome | undefined } = { outcome: undefined };
+  let started = false;
+  const body: DecodedBody = {
+    get outcome() {
+      return state.outcome;
+    },
+    [Symbol.asyncIterator]() {
+      if (started) throw new TypeError("a decoded body can be iterated only once");
+      started = true;
+      return iterate(res, maxBytes, options.signal, idleMs, state)[Symbol.asyncIterator]();
+    },
+  };
+  return body;
+}
+
+async function* iterate(
   res: Response,
-  options: ResponseReadOptions,
-): Promise<ResponseReadResult> {
-  const maxBytes = Math.max(0, Math.floor(options.maxBytes));
+  maxBytes: number,
+  signal: AbortSignal | undefined,
+  idleMs: number | undefined,
+  state: { outcome: DecodedBodyOutcome | undefined },
+): AsyncGenerator<Uint8Array, void, undefined> {
   const coding = codingOf(res.headers.get("content-encoding"));
   if (coding !== null && typeof coding === "object") {
     await res.body?.cancel().catch(() => undefined);
-    return {
+    state.outcome = {
       ok: false,
       code: "unsupported-encoding",
       reason: `the response is encoded as "${coding.unsupported}", which this reader cannot decode within a memory bound`,
       encodedBytes: 0,
     };
+    return;
   }
   const contentEncoding = coding;
   const declared = declaredLength(res);
+  let encodedBytes = 0;
+  let decodedBytes = 0;
+  let given = 0;
+  let full = false;
+  const succeed = (): void => {
+    state.outcome = { ok: true, truncated: full, decodedBytes, encodedBytes, contentEncoding };
+  };
   if (res.body === null) {
-    return {
-      ok: true,
-      bytes: new Uint8Array(0),
-      text: "",
-      truncated: false,
-      decodedBytes: 0,
-      encodedBytes: 0,
-      contentEncoding,
-    };
+    succeed();
+    return;
   }
 
   const reader = res.body.getReader();
-  let encodedBytes = 0;
-  const kept: Uint8Array[] = [];
-  let keptLength = 0;
-  let decodedBytes = 0;
-  let full = false; // decoded output passed maxBytes
-
-  const keep = (chunk: Uint8Array): void => {
-    decodedBytes += chunk.length;
-    if (keptLength < maxBytes) {
-      const take = Math.min(maxBytes - keptLength, chunk.length);
-      kept.push(chunk.slice(0, take));
-      keptLength += take;
-    }
-    if (decodedBytes > maxBytes) full = true;
+  let cancelled = false;
+  const cancel = async (): Promise<void> => {
+    if (cancelled) return;
+    cancelled = true;
+    await reader.cancel().catch(() => undefined);
+  };
+  const failWith = async (code: ResponseReadFailure["code"], reason: string): Promise<void> => {
+    await cancel();
+    state.outcome = { ok: false, code, reason, encodedBytes };
   };
 
-  const fail = async (
-    code: "auto-decompressed" | "decode-error" | "read-error" | "aborted",
-    reason: string,
-  ): Promise<ResponseReadResult> => {
-    await reader.cancel().catch(() => undefined);
-    return { ok: false, code, reason, encodedBytes };
+  /** Decoded output waiting to be handed over, cut to the cap. */
+  const pending: Uint8Array[] = [];
+  const accept = (chunk: Uint8Array): void => {
+    // Counted even past the cap: `decodedBytes` is what the decoder really
+    // produced, so a decoder that is not stopped here shows up.
+    decodedBytes += chunk.length;
+    if (given < maxBytes) {
+      const take = Math.min(maxBytes - given, chunk.length);
+      pending.push(take === chunk.length ? chunk : chunk.slice(0, take));
+      given += take;
+    }
+    if (decodedBytes > maxBytes) full = true;
   };
 
   let decoder: Decoder | undefined;
   let decoderError: string | undefined;
   let decoderEnded: Promise<void> | undefined;
+  let finished = false;
 
   try {
     for (;;) {
-      if (options.signal?.aborted === true) return await fail("aborted", "the read was aborted");
-      let next: Awaited<ReturnType<typeof reader.read>>;
+      let next: Raced<Awaited<ReturnType<typeof reader.read>>>;
       try {
-        next = await reader.read();
+        next = await race(reader.read(), signal, idleMs);
       } catch (err) {
-        return await fail("read-error", err instanceof Error ? err.message : String(err));
+        await failWith("read-error", err instanceof Error ? err.message : String(err));
+        return;
       }
-      if (next.done) break;
-      const chunk = next.value;
+      if ("stopped" in next) {
+        await failWith(
+          next.stopped,
+          next.stopped === "aborted"
+            ? "the read was aborted"
+            : `no data arrived for ${idleMs} ms, so the read was abandoned`,
+        );
+        return;
+      }
+      if (next.value.done) break;
+      const chunk = next.value.value;
       if (chunk.length === 0) continue;
       const before = encodedBytes;
       encodedBytes += chunk.length;
 
       if (contentEncoding === null) {
-        keep(chunk);
-        if (full) break;
-        continue;
-      }
-
-      if (declared !== undefined && encodedBytes > declared) {
-        return await fail(
-          "auto-decompressed",
-          `the ${contentEncoding} body ran past its Content-Length (${declared}), so the runtime had already decoded it: fetch it with withRawBody()/decompress:false, or the decoded size is unbounded`,
-        );
-      }
-      if (before === 0) {
-        if (magicMismatch(contentEncoding, chunk)) {
-          return await fail(
+        accept(chunk);
+      } else {
+        if (declared !== undefined && encodedBytes > declared) {
+          await failWith(
             "auto-decompressed",
-            `the body is labelled ${contentEncoding} but does not start with that format's signature — the runtime already decoded it (fetch with withRawBody()/decompress:false), or the server mislabelled it`,
+            `the ${contentEncoding} body ran past its Content-Length (${declared}), so the runtime had already decoded it: fetch it with fetchRaw() or withRawBody(), or the decoded size is unbounded`,
           );
+          return;
         }
-        decoder = makeDecoder(contentEncoding, chunk);
-        if (decoder === undefined) {
-          return await fail("decode-error", `this runtime has no ${contentEncoding} decoder`);
-        }
-        const d = decoder;
-        d.on("data", (out: Uint8Array) => {
-          // Counted even past the cap: `decodedBytes` is what the decoder
-          // really produced, so a decoder that is not stopped here shows up.
-          keep(out);
-          if (full && !d.destroyed) d.destroy();
-        });
-        decoderEnded = new Promise<void>((resolve) => {
-          d.once("end", () => resolve());
-          d.once("close", () => resolve());
-          d.once("error", (err: Error) => {
-            decoderError = err.message;
-            resolve();
-          });
-        });
-      }
-      const d = decoder as Decoder;
-      for (
-        let off = 0;
-        off < chunk.length && !full && decoderError === undefined;
-        off += DECODE_STEP
-      ) {
-        const step = chunk.subarray(off, off + DECODE_STEP);
-        await new Promise<void>((resolve) => {
-          if (d.destroyed) {
-            resolve();
+        if (before === 0) {
+          if (magicMismatch(contentEncoding, chunk)) {
+            await failWith(
+              "auto-decompressed",
+              `the body is labelled ${contentEncoding} but does not start with that format's signature — the runtime already decoded it (fetch with fetchRaw() or withRawBody()), or the server mislabelled it`,
+            );
             return;
           }
-          d.write(step, () => resolve());
-        });
+          decoder = makeDecoder(contentEncoding, chunk);
+          if (decoder === undefined) {
+            await failWith("decode-error", `this runtime has no ${contentEncoding} decoder`);
+            return;
+          }
+          const d = decoder;
+          d.on("data", (out: Uint8Array) => {
+            accept(out);
+            if (full && !d.destroyed) d.destroy();
+          });
+          decoderEnded = new Promise<void>((resolve) => {
+            d.once("end", () => resolve());
+            d.once("close", () => resolve());
+            d.once("error", (err: Error) => {
+              decoderError = err.message;
+              resolve();
+            });
+          });
+        }
+        const d = decoder as Decoder;
+        for (
+          let off = 0;
+          off < chunk.length && !full && decoderError === undefined;
+          off += DECODE_STEP
+        ) {
+          const step = chunk.subarray(off, off + DECODE_STEP);
+          await new Promise<void>((resolve) => {
+            if (d.destroyed) {
+              resolve();
+              return;
+            }
+            d.write(step, () => resolve());
+          });
+          // Hand over what this step produced before feeding the next.
+          while (pending.length > 0) yield pending.shift() as Uint8Array;
+        }
+        if (decoderError !== undefined) {
+          await failWith("decode-error", `the ${contentEncoding} body is corrupt: ${decoderError}`);
+          return;
+        }
       }
-      if (decoderError !== undefined) {
-        return await fail(
-          "decode-error",
-          `the ${contentEncoding} body is corrupt: ${decoderError}`,
-        );
-      }
+      while (pending.length > 0) yield pending.shift() as Uint8Array;
       if (full) break;
     }
 
@@ -270,25 +411,50 @@ export async function readResponseBounded(
       decoder.end();
       await decoderEnded;
       if (decoderError !== undefined) {
-        return await fail(
-          "decode-error",
-          `the ${contentEncoding} body is corrupt: ${decoderError}`,
-        );
+        await failWith("decode-error", `the ${contentEncoding} body is corrupt: ${decoderError}`);
+        return;
       }
+      while (pending.length > 0) yield pending.shift() as Uint8Array;
     }
+    finished = true;
+    succeed();
   } finally {
     if (decoder !== undefined && !decoder.destroyed) decoder.destroy();
-    if (full) await reader.cancel().catch(() => undefined);
+    // Cut at the cap, or the consumer stopped iterating: the rest is unread.
+    if (full || !finished) await cancel();
+    if (state.outcome === undefined) {
+      state.outcome = {
+        ok: false,
+        code: "aborted",
+        reason: "the reader stopped before the body ended",
+        encodedBytes,
+      };
+    }
   }
+}
 
+/** Read a body into memory with its DECODED size bounded. See the module comment. */
+export async function readResponseBounded(
+  res: Response,
+  options: ResponseReadOptions,
+): Promise<ResponseReadResult> {
+  const body = decodeBody(res, options);
+  const kept: Uint8Array[] = [];
+  let keptLength = 0;
+  for await (const chunk of body) {
+    kept.push(chunk);
+    keptLength += chunk.length;
+  }
+  const outcome = body.outcome as DecodedBodyOutcome;
+  if (!outcome.ok) return outcome;
   const bytes = concatBytes(kept, keptLength);
   return {
     ok: true,
     bytes,
-    text: decodeHead(bytes, !full),
-    truncated: full,
-    decodedBytes,
-    encodedBytes,
-    contentEncoding,
+    text: decodeHead(bytes, !outcome.truncated),
+    truncated: outcome.truncated,
+    decodedBytes: outcome.decodedBytes,
+    encodedBytes: outcome.encodedBytes,
+    contentEncoding: outcome.contentEncoding,
   };
 }

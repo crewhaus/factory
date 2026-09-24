@@ -129,3 +129,24 @@ describe("collectBounded", () => {
     expect(r.text).toBe("A".repeat(25));
   });
 });
+
+describe("collectBounded budgets", () => {
+  test("a NaN, negative or missing maxBytes throws instead of reading the stream as empty and complete", async () => {
+    for (const maxBytes of [Number.NaN, -1, undefined, Number.POSITIVE_INFINITY]) {
+      await expect(
+        collectBounded(
+          new Response("hello world").body as ReadableStream<Uint8Array>,
+          {
+            maxBytes,
+          } as unknown as { maxBytes: number },
+        ),
+      ).rejects.toThrow(RangeError);
+    }
+    await expect(
+      collectBounded(new Response("hello world").body as ReadableStream<Uint8Array>, {
+        maxBytes: 4,
+        tailBytes: Number.NaN,
+      }),
+    ).rejects.toThrow(RangeError);
+  });
+});

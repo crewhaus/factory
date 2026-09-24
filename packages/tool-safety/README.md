@@ -2,11 +2,11 @@
 
 The guards tool packages import instead of each hand-rolling its own. An audit of the 0.7.0 builtins found the same defects in dozens of packages that share no code: caller-supplied regexes that freeze the process, output capped only after it was buffered, a compressed response inflated to gigabytes, a FIFO that blocks a read for ever, a write that follows a planted symlink out of the workspace, and a model that picks any environment variable as a credential. Each helper here closes one of those, once.
 
-Zero runtime dependencies: Bun and `node:*` only. **Bun only** — it uses Bun Workers and `Bun.spawn`, so it is not for the cf-worker targets.
+Zero runtime dependencies: Bun and `node:*` only. **Bun only.** It uses Bun Workers, `Bun.spawn`, `node:fs` and Bun's `decompress: false` fetch option, so the tools a cf-worker target bundles (`tool-fetch`, `tool-web`, `tool-message-channel`, `tool-image-generation`, `tool-todo`) must not depend on it. `edge-targets.test.ts` reads each target's `EDGE_TOOL_IMPORTS` and fails if one of them reaches this package through its dependencies. An edge tool needs its own bound.
 
 ```ts
 import { runRegex, screenUserRegex } from "@crewhaus/tool-safety/regex";
-import { spawnBounded, readResponseBounded, withRawBody, readFileBounded } from "@crewhaus/tool-safety/streams";
+import { spawnBounded, readResponseBounded, decodeBody, fetchRaw, readFileBounded, openRegularFile } from "@crewhaus/tool-safety/streams";
 import { openForRead, writeFileSafe, createExclusive, walkContained, copyTreeSafe } from "@crewhaus/tool-safety/fs";
 import { resolveCredentialEnv, checkEnvReveal, redactKnownSecrets, redactUrlCredentials } from "@crewhaus/tool-safety/env";
 ```
@@ -115,33 +115,52 @@ At the deadline the caller's event loop is free. The worker thread, though, can'
 
 ## `./streams`: bounded reading
 
+Every budget is parsed before anything is read. A `maxBytes` that is NaN, negative or missing throws a `RangeError`. It used to become NaN, and every file and stream then read as empty and complete, so a scanner handed `Number(config.maxBytes)` with the key unset reported "nothing found". The same applies to `tailBytes`, `position`, `timeoutMs` and the grace periods.
+
+A caller's `AbortSignal` is watched without ever being left listener-less. Measured on Bun 1.3.14, removing the last listener from an `AbortSignal.timeout()` signal cancels its timer for good. A helper that added and removed its own listener therefore disarmed the caller's deadline for the next call it was passed to.
+
 ### `collectBounded(stream, { maxBytes, tailBytes?, onChunk?, signal? })`
 
 `collectBounded` applies the cap as bytes arrive. Past the cap it still reads to the end, because a child blocked on a full pipe never exits, but it counts the bytes and drops them. The result reports `truncated`, `totalBytes`, `omittedBytes`, an optional `tail`/`tailText`, and `complete` (whether the end of the stream was reached). An error is returned in `error`, not thrown.
 
 ### `spawnBounded({ cmd, cwd, env, stdin, timeoutMs, maxStdoutBytes, maxStderrBytes, signal, … })`
 
-`spawnBounded` runs argv without a shell. The child leads its own process group, and a timeout or abort sends SIGTERM to the whole group, then SIGKILL after `killGraceMs`. On Windows it runs `taskkill /T /F`, best effort.
+`spawnBounded` runs argv without a shell. The child leads its own process group. A timeout or abort sends SIGTERM to the whole group, then SIGKILL after `killGraceMs`, even when the child itself has already exited: another member of its group may ignore SIGTERM. On Windows it runs `taskkill /T /F`, best effort. `timeoutMs: Infinity` means no timeout.
 
-The result carries `exitCode` (null when signalled), `signal`, `timedOut`, `aborted`, `stdout`/`stderr` with their `…Truncated` flags and byte counts, and `outputComplete`.
+The result carries:
+
+- `exitCode` (null when signalled) and `signal`, `timedOut`, `aborted`;
+- `stdout`/`stderr` as text, `stdoutRaw`/`stderrRaw` as the exact bytes kept, with their `…Truncated` flags, byte counts and `…OmittedBytes`;
+- `outputComplete`;
+- `spawnError` and `spawnErrorCode` (`ENOENT` for a command that is not installed) when it could not start.
+
+The caps are in bytes. For a cap in characters, collect three bytes per character (no UTF-16 code unit takes more than three bytes of UTF-8), cut the decoded text, and add the bytes of the text cut off to `…OmittedBytes`.
 
 When a grandchild keeps a pipe open after the child exits, reading stops after `drainGraceMs`. The helper returns the bytes that did arrive, with `outputComplete: false`. It never reports an empty string as if it were the output.
 
 `onOverflow: "kill"` stops a producer at its cap. That grandchild itself is not killed after a normal exit, because it may be a daemon the command meant to start.
 
-### `readResponseBounded(res, { maxBytes })` with `withRawBody(init)`
+**When the host goes away.** A child in its own group does not get the terminal's Ctrl-C. So while a command runs, its group is killed if the host exits (`process.exit`, or the event loop ending), and on SIGINT, SIGTERM or SIGHUP when nothing else in the process listens for that signal; the host then dies of the signal as it would have. A host with its own handler keeps its policy. Adopters must pass `ctx.signal`, so a turn aborted by the first Ctrl-C kills the group. `setHostExitCleanup(false)` turns the hooks off.
+
+### `readResponseBounded(res, { maxBytes, signal?, idleTimeoutMs? })`, `decodeBody` and `fetchRaw`
 
 Measured on Bun 1.3.14: unless a request passes `decompress: false`, `fetch` inflates a gzip, deflate, br or zstd body in native code before JavaScript sees a byte. A 65 KB gzip body put 273 MB on the heap before the first `read()` returned. Bun also **keeps** the `Content-Encoding` header, and it keeps `Content-Length` at the compressed size, so the response gives no sign it was decoded.
 
-The bound therefore has to start at the request. Fetch with `withRawBody({...})`, and this reader decodes the body itself, stopping the decoder once `maxBytes` of decoded output exist. Against 1 GiB bombs it decoded the cap plus one 16 KiB chunk, with peak RSS up about 20–25 MB, in all four codings. Without `withRawBody`, the same bombs cost +1.5 GB (gzip) and +3.5 GB (br) before any reader saw them.
+The bound therefore has to start at the request. Fetch with `fetchRaw(input, init)`, or with `withRawBody(init)` as the init of the **final** `fetch` call. Bun ignores `decompress` inside a `Request`'s own init, so `fetch(new Request(url, withRawBody({})))` is inflated anyway; a pinned-fetch helper that passes a `Request` should call `fetchRaw(request)`. This reader then decodes the body itself, stopping the decoder once `maxBytes` of decoded output exist. Against 1 GiB bombs it decoded the cap plus one 16 KiB chunk, with peak RSS up about 20–25 MB, in all four codings. Without the raw body, the same bombs cost +1.5 GB (gzip) and +3.5 GB (br) before any reader saw them.
 
-The reader refuses a body the runtime already decoded, with the code `auto-decompressed`. It detects that when the body runs past its own `Content-Length`, or when a gzip or zstd body lacks its magic bytes. A double-decoded br or deflate body surfaces as `decode-error` instead. The memory is spent by then, so the check exists to make a missing `withRawBody` fail a test. Every adopting package should keep a gzip-bomb test against a local server.
+Every read is raced against `signal` and `idleTimeoutMs`, so a server that sends one chunk and stalls cannot hold the reader: it ends as `aborted` or `stalled`.
 
-### `readFileBounded(path, { maxBytes, followSymlinks? })` and `readFileBoundedSync`
+`decodeBody(res, options)` yields the decoded chunks as they are produced, at most `maxBytes` in all, and sets `outcome` when the iteration ends. Use it for a reader that works as bytes arrive: `SseRead` feeds each chunk to its event decoder, and a large `DownloadFile` writes each chunk to a `beginAtomicWrite` writer instead of holding the body. `readResponseBounded` is `decodeBody`, collected.
 
-The helper reads at most `maxBytes` plus one byte (to tell whether more exists); it never reads the whole file and then slices. A FIFO, socket, device or directory is refused with `not-regular-file` and its `kind` **before it is opened**. Opening a FIFO unblocks whoever is waiting to write it, and opening some devices has side effects.
+The reader refuses a body the runtime already decoded, with the code `auto-decompressed`. It detects that when the body runs past its own `Content-Length`, or when a gzip or zstd body lacks its magic bytes. A double-decoded br or deflate body surfaces as `decode-error` instead. The memory is spent by then, so the check exists to make a missing raw body fail a test. Every adopting package should keep a gzip-bomb test against a local server.
+
+### `readFileBounded(path, { maxBytes, position?, followSymlinks? })`, `readFileBoundedSync` and `openRegularFile`
+
+The helper reads at most `maxBytes` plus one byte (to tell whether more exists), from `position` (default 0); it never reads the whole file and then slices. A FIFO, socket, device or directory is refused with `not-regular-file` and its `kind` **before it is opened**. Opening a FIFO unblocks whoever is waiting to write it, and opening some devices has side effects.
 
 The open descriptor is checked again with `fstat`, and it must be the same file (`dev`/`ino`) as the one checked. The open uses `O_NONBLOCK`, so a path swapped for a FIFO between the two checks cannot block. `followSymlinks: false` refuses a symlink and opens with `O_NOFOLLOW`.
+
+`openRegularFile(path)` (and `openRegularFileAsync`) makes the same checks and returns the open descriptor with its `stats`, for a reader that streams: `ReadLines` up to line N, `TailFile` from `size − n`, `SplitFile`'s source. `readOpenedFileSync(opened, { maxBytes, position })` reads from it. The caller closes it.
 
 ## `./fs`: the leaf, not just the directory
 
@@ -236,11 +255,12 @@ A secret in a URL's PATH, such as a Slack webhook's, is not recognisable by shap
 |---|---|---|
 | flag-truth-1#5, security-1#2, security-2#1, security-6#6, security-8#9, security-8#12, security-9#7, security-12#1, flag-truth-2#6, security-5#20 | `new RegExp(callerPattern)` + synchronous `test`/`exec`/`replace` | `screenUserRegex` in the input schema, plus `runRegex`/a session with a batch op at run time, passing `signal: ctx.signal` and `runawayKey`. A synchronous evaluator runs one `testMatrix` first and looks answers up (see above). Surface non-`ok` as undetermined. |
 | security-10#0 | a literal regex with an overlap (`\s+[^:]*`) | Fix the literal and cap line length. `runRegex({ op: "testEach" })` is the fallback if the pattern must stay. |
-| security-8#7, security-8#8, security-10#9 | `new Response(proc.stdout).text()` + `capText` | `spawnBounded`, reporting `outputComplete: false` as unreadable. |
+| security-8#7, security-8#8, security-10#9 | `new Response(proc.stdout).text()` + `capText` | `spawnBounded` with `signal: ctx.signal`, reporting `outputComplete: false` as unreadable. A chars cap becomes three bytes per char (see above); `stdoutRaw` serves binary output. |
 | security-6#8, security-12#4 | `collectStream` → `new Response(stream).text()` | `collectBounded` (with `onOverflow: "kill"` semantics where the output past the cap is worthless). |
-| security-5#7, security-9#4 | `fetch(url)` + a capped reader | `fetch(url, withRawBody(init))` + `readResponseBounded`, plus a local gzip-bomb test. |
+| security-5#7 (tool-notify) | `fetch(url)` + a capped reader | `fetchRaw(url, init)` (or `fetchRaw(request)` in `pinnedFetch`) + `readResponseBounded`, plus a local gzip-bomb test. `SseRead` and a large `DownloadFile` use `decodeBody`. |
+| security-9#4 (tool-fetch) | — | **Not adoptable here.** `tool-fetch` ships in the cf-worker targets, and `edge-targets.test.ts` refuses this package in its dependencies. Its fix must also work on workerd, which has no `decompress: false`. |
 | security-12#3, flag-truth-6#5 | `Buffer.allocUnsafe(size)` + read all | `readFileBounded` / `readFileBoundedSync`. |
-| security-11#8 | line reads with no byte budget | `readFileBounded` for the budget; the per-line cap stays in the tool. |
+| security-11#8 | line reads with no byte budget | `openRegularFile` for the checked descriptor, then the tool's own streaming read with a per-line byte cap. |
 | flag-truth-6#4, security-12#8 | a preview capped by lines only | The UTF-8-safe cut in `collectBounded` is the model; the preview fix itself lives in `tool-result-store`. |
 | flag-truth-6#3, security-11#7, security-6#12, security-7#8 | `statSync` / `openSync` + `readFileSync` of a caller-named path | `openForRead` (or `assertRegularFile` before handing the path on). |
 | security-9#2, security-7#1, security-7#12, security-5#2, flag-truth-3#6 | `readFileSync(join(dir.real, "package.json"))` after containing only `dir` | ``openForRead(root, `${dir.rel}/package.json`, { maxBytes })``. For a directory of leaves (AuditVerify), `walkContained` first, refusing any entry whose `kind` is not `file`. |

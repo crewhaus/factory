@@ -1,3 +1,5 @@
+import { onAbort } from "../signal";
+import { byteBudget, optionalByteBudget } from "./limits";
 import { concatBytes, decodeHead, decodeTail } from "./utf8";
 
 /**
@@ -17,7 +19,10 @@ import { concatBytes, decodeHead, decodeTail } from "./utf8";
  */
 
 export type CollectOptions = {
-  /** Most bytes kept in memory, head and tail together. */
+  /**
+   * Most bytes kept in memory, head and tail together: a finite number >= 0.
+   * NaN, a negative number or a missing value throws a `RangeError`.
+   */
   readonly maxBytes: number;
   /**
    * Of `maxBytes`, how many to keep from the END of the stream when it
@@ -87,8 +92,8 @@ export async function collectBounded(
   source: ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>,
   options: CollectOptions,
 ): Promise<CollectResult> {
-  const maxBytes = Math.max(0, Math.floor(options.maxBytes));
-  const tailBytes = Math.min(maxBytes, Math.max(0, Math.floor(options.tailBytes ?? 0)));
+  const maxBytes = byteBudget("maxBytes", options.maxBytes);
+  const tailBytes = Math.min(maxBytes, optionalByteBudget("tailBytes", options.tailBytes, 0));
   const headCap = maxBytes - tailBytes;
 
   const head: Uint8Array[] = [];
@@ -104,11 +109,10 @@ export async function collectBounded(
   const reader = readerFor(source);
   const signal = options.signal;
   let stopped = signal?.aborted === true;
-  const stop = (): void => {
+  const unsubscribe = onAbort(signal, () => {
     stopped = true;
     void reader.cancel();
-  };
-  signal?.addEventListener("abort", stop, { once: true });
+  });
 
   try {
     while (!stopped) {
@@ -144,7 +148,7 @@ export async function collectBounded(
       }
     }
   } finally {
-    signal?.removeEventListener("abort", stop);
+    unsubscribe();
     if (stopped || error !== undefined) await reader.cancel();
   }
 

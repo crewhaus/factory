@@ -1,3 +1,4 @@
+import { onAbort } from "../signal";
 import { type RegexLimits, type RegexRejectCode, screenUserRegex } from "./screen";
 import { REGEX_WORKER_SOURCE } from "./worker-source";
 
@@ -1009,16 +1010,11 @@ function dispatch(
     let settled = false;
     const progress = progressFor(prepared);
     slot.runawayKey = prepared.runawayKey;
-    const onAbort = (): void => {
-      discard();
-      abandon(slot);
-      finish(abortedOutcome());
-    };
     const finish = (outcome: RegexOutcome<unknown>): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+      unsubscribe();
       slot.onMessage = undefined;
       slot.onFailure = undefined;
       resolve(outcome);
@@ -1042,7 +1038,11 @@ function dispatch(
             },
       );
     }, budget);
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const unsubscribe = onAbort(signal, () => {
+      discard();
+      abandon(slot);
+      finish(abortedOutcome());
+    });
 
     slot.onFailure = (why) => {
       discard();

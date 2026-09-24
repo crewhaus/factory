@@ -574,6 +574,30 @@ describe("abort and busy", () => {
     expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
   }, 90_000);
 
+  test("a caller's AbortSignal.timeout still fires after an earlier run finished with it", async () => {
+    await settleWorkers(60_000);
+    // Bun 1.3.14 cancels an AbortSignal.timeout() for good when its last
+    // listener is removed, so a finished run must not leave it without one.
+    const signal = AbortSignal.timeout(300);
+    const session = openRegexSession();
+    try {
+      expect((await session.run({ op: "test", pattern: "a", input: "a", signal })).status).toBe(
+        "ok",
+      );
+      const outcome = await session.run({
+        op: "test",
+        pattern: "\\s+$|x",
+        input: `${" ".repeat(40_000)}x`,
+        deadlineMs: 60_000,
+        signal,
+      });
+      expect(outcome).toMatchObject({ status: "error", code: "aborted" });
+    } finally {
+      session.close();
+    }
+    expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
+  }, 90_000);
+
   test("abandoned workers make only their own runawayKey busy", async () => {
     await settleWorkers(60_000);
     const hostile = await runRegex({

@@ -9,9 +9,18 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
+import { closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openCheckedAndRead, readFileBounded, readFileBoundedSync } from "./file";
+import {
+  openCheckedAndRead,
+  openRegularFile,
+  openRegularFileAsync,
+  readFileBounded,
+  readFileBoundedSync,
+  readOpenedFile,
+  readOpenedFileSync,
+} from "./file";
 
 const posix = process.platform !== "win32";
 const dir = mkdtempSync(join(tmpdir(), "tool-safety-file-"));
@@ -175,4 +184,88 @@ describe("readFileBounded", () => {
     const r = await openCheckedAndRead(path, stale, { maxBytes: 100 });
     expect(r).toMatchObject({ ok: false, code: "changed-while-opening" });
   });
+});
+
+describe("budgets, offsets and the open descriptor", () => {
+  const file = join(dir, "twelve.txt");
+  writeFileSync(file, "hello world!");
+
+  test("a NaN, negative or missing maxBytes throws instead of reading an empty 'complete' file", async () => {
+    for (const maxBytes of [Number.NaN, -1, undefined, Number.POSITIVE_INFINITY, "10"]) {
+      const options = { maxBytes } as unknown as { maxBytes: number };
+      expect(() => readFileBoundedSync(file, options)).toThrow(RangeError);
+      await expect(readFileBounded(file, options)).rejects.toThrow(RangeError);
+    }
+    // The budget is checked before the path: a bad budget never looks like a bad file.
+    expect(() => readFileBoundedSync(join(dir, "missing"), { maxBytes: Number.NaN })).toThrow(
+      RangeError,
+    );
+    expect(readFileBoundedSync(file, { maxBytes: 0 })).toMatchObject({
+      ok: true,
+      text: "",
+      truncated: true,
+    });
+  });
+
+  test("position starts the read at a byte offset, and truncation is about what follows it", async () => {
+    for (const [, read] of readers) {
+      expect(await read(file, { maxBytes: 5, position: 6 })).toMatchObject({
+        ok: true,
+        text: "world",
+        truncated: true,
+        size: 12,
+      });
+      expect(await read(file, { maxBytes: 6, position: 6 })).toMatchObject({
+        text: "world!",
+        truncated: false,
+      });
+      expect(await read(file, { maxBytes: 6, position: 40 })).toMatchObject({
+        text: "",
+        truncated: false,
+      });
+    }
+    expect(() => readFileBoundedSync(file, { maxBytes: 5, position: -1 })).toThrow(RangeError);
+  });
+
+  test.if(posix)(
+    "openRegularFile hands over a checked descriptor, and refuses a FIFO before opening it",
+    async () => {
+      const opened = openRegularFile(file);
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) return;
+      try {
+        expect(opened.stats.size).toBe(12);
+        expect(readOpenedFileSync(opened, { maxBytes: 5, position: 6 })).toMatchObject({
+          text: "world",
+        });
+      } finally {
+        closeSync(opened.fd);
+      }
+      const fifo = join(dir, "open-fifo");
+      mkfifo(fifo);
+      // Opening a FIFO for reading would block until a writer appears.
+      expect(openRegularFile(fifo)).toMatchObject({
+        ok: false,
+        code: "not-regular-file",
+        kind: "fifo",
+      });
+      expect(await openRegularFileAsync(fifo)).toMatchObject({ ok: false, kind: "fifo" });
+      const link = join(dir, "open-link");
+      symlinkSync(file, link);
+      expect(openRegularFile(link, { followSymlinks: false })).toMatchObject({
+        ok: false,
+        code: "symlink-refused",
+      });
+      const handle = await openRegularFileAsync(link);
+      expect(handle.ok).toBe(true);
+      if (!handle.ok) return;
+      try {
+        expect(await readOpenedFile(handle.handle, handle.stats, { maxBytes: 5 })).toMatchObject({
+          text: "hello",
+        });
+      } finally {
+        await handle.handle.close();
+      }
+    },
+  );
 });
