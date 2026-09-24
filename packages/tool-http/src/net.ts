@@ -119,6 +119,13 @@ export type HttpConfig = {
    * them.
    */
   readonly authEnvs: ReadonlyMap<string, ReadonlySet<string> | null>;
+  /**
+   * The environment variables `WebhookSign` and `WebhookVerify` may use as
+   * an HMAC key. Empty (the default) refuses both: a call that could name
+   * any variable could mint a valid signature with any secret in the
+   * process.
+   */
+  readonly signingEnvs: ReadonlySet<string>;
 };
 
 /**
@@ -133,15 +140,21 @@ export type HttpConfigInput = {
   readonly allowedOrigins?: readonly string[];
   readonly allowed_auth_envs?: AuthEnvsInput;
   readonly allowedAuthEnvs?: AuthEnvsInput;
+  readonly allowed_signing_envs?: readonly string[];
+  readonly allowedSigningEnvs?: readonly string[];
 };
 
 /** Where an operator allows an auth profile's variable. Every refusal names it. */
 export const AUTH_ENVS_KEY = "tool_config.http.allowed_auth_envs";
 
+/** Where an operator allows a webhook signing secret's variable. */
+export const SIGNING_ENVS_KEY = "tool_config.http.allowed_signing_envs";
+
 const EMPTY_CONFIG: HttpConfig = {
   allowedOrigins: new Set<string>(),
   allowedHosts: new Set<string>(),
   authEnvs: new Map(),
+  signingEnvs: new Set(),
 };
 
 let httpConfig: HttpConfig = EMPTY_CONFIG;
@@ -157,7 +170,50 @@ export function buildHttpConfig(input: HttpConfigInput): HttpConfig {
     hosts.add(new URL(canonical).hostname.toLowerCase());
   }
   const authEnvs = buildAuthEnvs(input.allowedAuthEnvs ?? input.allowed_auth_envs, origins);
-  return { allowedOrigins: origins, allowedHosts: hosts, authEnvs };
+  const signingEnvs = buildSigningEnvs(input.allowedSigningEnvs ?? input.allowed_signing_envs);
+  return { allowedOrigins: origins, allowedHosts: hosts, authEnvs, signingEnvs };
+}
+
+/** Check `allowed_signing_envs` at boot; an entry is never quoted, as for auth envs. */
+function buildSigningEnvs(raw: unknown): ReadonlySet<string> {
+  const out = new Set<string>();
+  if (raw === undefined || raw === null) return out;
+  if (!Array.isArray(raw)) {
+    throw new HttpPermissionError(`${SIGNING_ENVS_KEY} must be a list of variable names`);
+  }
+  raw.forEach((name, index) => {
+    if (!isEnvName(name) || looksLikePastedSecret(name)) {
+      throw new HttpPermissionError(
+        `${SIGNING_ENVS_KEY} lists environment variable NAMES (such as WEBHOOK_SECRET, written without a $); entry ${index + 1} is not one, and has not been echoed back`,
+      );
+    }
+    out.add(name);
+  });
+  return out;
+}
+
+/**
+ * The HMAC key a `WebhookSign` or `WebhookVerify` call names, when the
+ * operator listed its variable in `allowed_signing_envs`. Anything else is
+ * refused before the environment is read, with the same words whether or
+ * not it is set, and a pasted secret is never quoted (security-8#20).
+ */
+export function resolveSigningSecret(
+  name: string,
+  cfg: HttpConfig,
+  env: Record<string, string | undefined> = process.env,
+):
+  | { readonly ok: true; readonly secret: string }
+  | { readonly ok: false; readonly message: string } {
+  const resolved = resolveCredentialEnv(name, {
+    allowed: [...cfg.signingEnvs],
+    purpose: "secretEnvVar",
+    configKey: SIGNING_ENVS_KEY,
+    env,
+  });
+  return resolved.ok
+    ? { ok: true, secret: resolved.value }
+    : { ok: false, message: resolved.reason };
 }
 
 /**

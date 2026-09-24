@@ -90,6 +90,7 @@ import {
   redactHeaders,
   rejectInlineCredentials,
   resolveHttpConfig,
+  resolveSigningSecret,
   responseHeaders,
   safeUrlLabel,
   sleep,
@@ -1604,14 +1605,16 @@ const schemeSchema = z
 export const webhookSign: RegisteredTool = buildTool({
   name: "WebhookSign",
   description:
-    "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
+    "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs, and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
   inputSchema: z.object({
     scheme: schemeSchema,
     payload: z.string().describe("the exact body bytes to sign — not a re-serialised object"),
     secretEnvVar: z
       .string()
       .min(1)
-      .describe("NAME of the environment variable holding the signing secret"),
+      .describe(
+        "NAME of the environment variable holding the signing secret; it must be listed in tool_config.http.allowed_signing_envs",
+      ),
     timestamp: z
       .number()
       .int()
@@ -1626,11 +1629,10 @@ export const webhookSign: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const secret = process.env[input.secretEnvVar];
-    if (secret === undefined || secret === "") {
-      return `environment variable "${input.secretEnvVar}" is unset or empty in this process`;
-    }
+  execute: async (input, ctx) => {
+    const resolved = resolveSigningSecret(input.secretEnvVar, configFor(ctx));
+    if (!resolved.ok) return resolved.message;
+    const secret = resolved.secret;
     if (input.scheme === "timestamped" && input.timestamp === undefined) {
       return 'the timestamped scheme needs an explicit timestamp (unix seconds) — it is not defaulted to "now", so that the same call always produces the same signature';
     }
@@ -1653,7 +1655,7 @@ export const webhookSign: RegisteredTool = buildTool({
 export const webhookVerify: RegisteredTool = buildTool({
   name: "WebhookVerify",
   description:
-    "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
+    "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
   inputSchema: z.object({
     scheme: schemeSchema,
     payload: z
@@ -1665,7 +1667,9 @@ export const webhookVerify: RegisteredTool = buildTool({
     secretEnvVar: z
       .string()
       .min(1)
-      .describe("NAME of the environment variable holding the signing secret"),
+      .describe(
+        "NAME of the environment variable holding the signing secret; it must be listed in tool_config.http.allowed_signing_envs",
+      ),
     algorithm: z.enum(["sha256", "sha1"]).optional().describe("default sha256"),
     toleranceSeconds: z
       .number()
@@ -1682,11 +1686,10 @@ export const webhookVerify: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const secret = process.env[input.secretEnvVar];
-    if (secret === undefined || secret === "") {
-      return `environment variable "${input.secretEnvVar}" is unset or empty in this process`;
-    }
+  execute: async (input, ctx) => {
+    const resolved = resolveSigningSecret(input.secretEnvVar, configFor(ctx));
+    if (!resolved.ok) return resolved.message;
+    const secret = resolved.secret;
     const result = verifySignature({
       scheme: input.scheme,
       body: input.payload,

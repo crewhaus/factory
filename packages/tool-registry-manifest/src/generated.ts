@@ -8268,7 +8268,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "webhookSign",
     name: "WebhookSign",
     description:
-      "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
+      "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs, and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -8296,7 +8296,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "webhookVerify",
     name: "WebhookVerify",
     description:
-      "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
+      "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
     readOnly: true,
     destructive: false,
     scope: "internal",

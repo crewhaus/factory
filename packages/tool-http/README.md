@@ -20,6 +20,7 @@ tool_config:
       - https://api.github.com
     allowed_auth_envs:  # the only variables an auth profile may read
       GITHUB_TOKEN: [https://api.github.com]  # ...and where each may be sent
+    allowed_signing_envs: [WEBHOOK_SECRET]    # WebhookSign / WebhookVerify keys
 ```
 
 | Tool | What it does |
@@ -118,6 +119,12 @@ before it is sent. Whatever the server echoes back (a 401 that quotes the
 key, a debug endpoint that repeats the headers) is scrubbed from the result,
 in its URL-encoded and base64 spellings too, and for `basic` the
 `user:secret` pair as well.
+
+`WebhookSign` and `WebhookVerify` take the signing secret the same way, from
+a variable you list in `tool_config.http.allowed_signing_envs`
+(`[WEBHOOK_SECRET]`). A call that could name any variable could mint a valid
+signature over any payload with any secret in the process; with no list,
+both tools refuse.
 
 Echoed request headers come back as `<redacted>` — including the one a
 `{ "type": "header", "headerName": "X-Api-Key" }` profile set, which is just as

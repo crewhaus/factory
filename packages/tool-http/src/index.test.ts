@@ -319,6 +319,7 @@ beforeEach(() => {
   registerHttpConfig({
     allowed_origins: [origin, otherOrigin],
     allowed_auth_envs: [TOKEN_VAR, "CREWHAUS_TEST_ABSENT"],
+    allowed_signing_envs: [SECRET_VAR, "CREWHAUS_TEST_NO_SUCH_SECRET"],
   });
   __setPrivateHostsAllowedForTest(true);
   process.env[TOKEN_VAR] = "s3cret-token";
