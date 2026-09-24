@@ -180,8 +180,16 @@ async function gate(
     _adapter: adapterFor(name, input),
   });
   const first = events.find((e) => e.kind === "permission_decision");
+  lastReason = first?.kind === "permission_decision" ? first.reason : undefined;
   return first?.kind === "permission_decision" ? first.decision : undefined;
 }
+
+/**
+ * The reason on the last {@link gate}'s decision, where the engine words one
+ * (plan mode names the rule). A test that expects a deny from a RULE must
+ * show it was the rule: an input the tool's schema rejects never reaches one.
+ */
+let lastReason: string | undefined;
 
 describe("p1 — a scoped deny/ask with a bare allow behind it (permission-integration#0)", () => {
   const rs = rules(
@@ -310,23 +318,40 @@ describe("p12/security-8#0 — argv and extra fields in front of a deny", () => 
 });
 
 describe("flag-truth-4#0 / permission-integration#6 — read-only egress tools", () => {
+  // The inputs carry every field the tools require. Before 0.7.1 stopped
+  // counting a schema rejection as a permission decision, these asserted
+  // "deny" on inputs missing `maxPages` / `timeoutMs` and passed without the
+  // rule ever being read.
   test("a scoped deny on HttpPaginate holds in default, auto and plan", async () => {
     const rs = rules(["alwaysDeny", "HttpPaginate(https://internal.corp/**)"]);
-    const input = { url: "https://internal.corp/items", style: "page", pageParam: "page" };
+    const input = {
+      url: "https://internal.corp/items",
+      style: "page",
+      pageParam: "page",
+      maxPages: 2,
+      timeoutMs: 1000,
+    };
     for (const mode of ["default", "auto", "plan"] as const) {
-      expect(await gate("HttpPaginate", input, rs, mode)).toBe("deny");
+      expect({ mode, decision: await gate("HttpPaginate", input, rs, mode) }).toEqual({
+        mode,
+        decision: "deny",
+      });
+      // Plan mode names the rule; default and auto do not word a rule deny.
+      if (mode === "plan")
+        expect(lastReason ?? "").toContain("HttpPaginate(https://internal.corp/**)");
     }
+    // Control: the same input with a URL the rule does not cover is allowed,
+    // so the input is one the tool accepts and the deny above is the rule's.
+    const other = { ...input, url: "https://ok.example/items" };
+    expect(await gate("HttpPaginate", other, rs, "auto")).toBe("allow");
   });
 
   test("plan mode no longer runs a read-only tool the operator denied", async () => {
-    expect(
-      await gate(
-        "SseRead",
-        { url: "https://x.example/stream" },
-        rules(["alwaysDeny", "SseRead(**)"]),
-        "plan",
-      ),
-    ).toBe("deny");
+    const input = { url: "https://x.example/stream", timeoutMs: 1000 };
+    expect(await gate("SseRead", input, rules(["alwaysDeny", "SseRead(**)"]), "plan")).toBe("deny");
+    expect(lastReason ?? "").toContain("SseRead(**)");
+    // Control: without the rule, plan mode runs a read-only tool.
+    expect(await gate("SseRead", input, rules(), "plan")).toBe("allow");
   });
 });
 
