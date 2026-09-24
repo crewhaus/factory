@@ -24,7 +24,11 @@
  * - {@link sanitizeGeminiSchema} — Gemini's OpenAPI-3.0-derived `Schema`
  *   (allow-list of keywords; `nullable` instead of null-typed unions;
  *   `oneOf`→`anyOf`; `allOf` merged; single-branch unions flattened;
- *   unsupported `format` values dropped; `const`→single-value `enum`).
+ *   unsupported `format` values dropped; a string `const`→single-value
+ *   `enum`; Gemini's `enum` is string-only, so a number, boolean or other
+ *   non-string `enum`/`const` is dropped and its allowed values are written
+ *   into the `description` instead, while the tool's own validator still
+ *   enforces them).
  *
  * - {@link sanitizeBedrockSchema} — Converse `toolSpec.inputSchema.json`
  *   (deny-list strip of the structural metadata Converse models choke
@@ -361,7 +365,39 @@ function sanitizeGeminiNode(node: JsonSchema): JsonSchema {
     out["format"] = format;
   }
 
-  return filterGeminiKeys(out);
+  return filterGeminiKeys(normaliseGeminiEnum(out));
+}
+
+/**
+ * Gemini's `Schema.enum` is `string[]` (the proto field is a repeated
+ * string; the SDK types it so, and writes integer enums as strings). A
+ * `{type: "number", enum: [0, 1]}` or a numeric `const` (zod's
+ * `z.literal(1)`) would reach the API as numbers in a string field.
+ *
+ * - `null` among the values becomes `nullable: true`.
+ * - All strings: kept as the enum.
+ * - Anything else: the enum is dropped and the allowed values are written
+ *   into the description, so the model still sees them. The tool's own
+ *   validator enforces them either way. (Stringifying them with
+ *   `format: "enum"` would keep the choice structural, but whether Gemini
+ *   then returns `"1"` or `1` is unverified, and `"1"` fails `z.literal(1)`.)
+ */
+function normaliseGeminiEnum(node: JsonSchema): JsonSchema {
+  const values = node["enum"];
+  if (!Array.isArray(values)) return node;
+  const out = omit(node, ["enum"]);
+  if (values.includes(null)) out["nullable"] = true;
+  const rest = values.filter((v) => v !== null);
+  if (rest.length === 0) return out;
+  if (rest.every((v) => typeof v === "string")) {
+    out["enum"] = rest;
+    return out;
+  }
+  const listed = rest.map((v) => JSON.stringify(v)).join(", ");
+  const note = rest.length === 1 ? `Must be ${listed}.` : `Allowed values: ${listed}.`;
+  const existing = typeof out["description"] === "string" ? out["description"].trim() : "";
+  out["description"] = existing === "" ? note : `${existing} ${note}`;
+  return out;
 }
 
 function isSupportedGeminiFormat(type: unknown, format: string): boolean {

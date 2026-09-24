@@ -203,6 +203,83 @@ describe("sanitizeGeminiSchema — projects onto the OpenAPI subset", () => {
   });
 });
 
+describe("Gemini enums are always string[]", () => {
+  /** Every node that carries an enum, anywhere in the sanitised schema. */
+  function enumsIn(node: unknown, out: unknown[][] = []): unknown[][] {
+    if (Array.isArray(node)) {
+      for (const n of node) enumsIn(n, out);
+    } else if (node !== null && typeof node === "object") {
+      const record = node as Record<string, unknown>;
+      if (Array.isArray(record["enum"])) out.push(record["enum"]);
+      for (const value of Object.values(record)) enumsIn(value, out);
+    }
+    return out;
+  }
+
+  test("numeric and boolean enums and consts move into the description", () => {
+    // The two shapes 0.7.0 shipped: Npv.firstPeriod (`z.union([z.literal(0),
+    // z.literal(1)])`) and StateImport.document.version (`z.literal(1)`).
+    const out = sanitizeGeminiSchema({
+      type: "object",
+      properties: {
+        firstPeriod: { type: "number", enum: [0, 1], description: "d" },
+        version: { type: "number", const: 1 },
+        flag: { type: "boolean", const: true },
+        mode: { type: ["string", "null"], enum: ["x", null] },
+        kind: { type: "string", const: "only" },
+      },
+      required: ["version"],
+    });
+    const props = out["properties"] as Record<string, JsonSchema>;
+    expect(props["firstPeriod"]).toEqual({
+      type: "number",
+      description: "d Allowed values: 0, 1.",
+    });
+    expect(props["version"]).toEqual({ type: "number", description: "Must be 1." });
+    expect(props["flag"]).toEqual({ type: "boolean", description: "Must be true." });
+    expect(props["mode"]).toEqual({ type: "string", nullable: true, enum: ["x"] });
+    expect(props["kind"]).toEqual({ type: "string", enum: ["only"] });
+    expect(out["required"]).toEqual(["version"]);
+  });
+
+  test("inside unions, arrays and $refs too", () => {
+    const out = sanitizeGeminiSchema({
+      $defs: { level: { type: "integer", enum: [1, 2, 3] } },
+      type: "object",
+      properties: {
+        a: {
+          anyOf: [
+            { type: "number", enum: [0, 1] },
+            { type: "string", enum: ["auto"] },
+          ],
+        },
+        b: { type: "array", items: { $ref: "#/$defs/level" } },
+        c: { oneOf: [{ const: 5 }, { const: "five" }] },
+      },
+    });
+    const enums = enumsIn(out);
+    expect(enums.length).toBeGreaterThan(0);
+    for (const values of enums) expect(values.every((v) => typeof v === "string")).toBe(true);
+    const props = out["properties"] as Record<string, JsonSchema>;
+    expect((props["b"] as { items: JsonSchema }).items).toEqual({
+      type: "integer",
+      description: "Allowed values: 1, 2, 3.",
+    });
+  });
+
+  test("a string-only enum is unchanged, and an enum of only null becomes nullable", () => {
+    expect(sanitizeGeminiSchema({ type: "string", enum: ["a", "b"] })).toEqual({
+      type: "string",
+      enum: ["a", "b"],
+    });
+    expect(sanitizeGeminiSchema({ type: "string", const: "x" })).toEqual({
+      type: "string",
+      enum: ["x"],
+    });
+    expect(sanitizeGeminiSchema({ enum: [null] })).toEqual({ nullable: true });
+  });
+});
+
 describe("sanitizeBedrockSchema — strips structural metadata, keeps the rest", () => {
   test("the ref-heavy schema loses $ref/$defs/additionalProperties", () => {
     const out = sanitizeBedrockSchema(refHeavySchema());
