@@ -312,3 +312,69 @@ describe("crewhaus run honours the same block", () => {
     for (const r of without) expect(r).toContain("empty allow-list = deny all");
   }, 90_000);
 });
+
+// C142 (config-delivery#12) — DependencyAudit's OSV-mirror gate reads
+// tool_config.fetch through tool-fetch's getFetchConfig(), and 0.7.0 filled
+// that only when Fetch itself was enabled: a spec with dependencyAudit alone
+// had its mirror refused, by a message telling it to set the block it had
+// set. The block is now delivered whenever a reader of it is enabled, on
+// both paths, once.
+describe("tool_config.fetch reaches DependencyAudit without Fetch", () => {
+  const MIRROR = "https://osv-mirror.example.com";
+  const auditSpec = (tools: string): string =>
+    [
+      "name: supply",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: Audit the dependencies against the OSV mirror.",
+      `tools: ${tools}`,
+      "tool_config:",
+      "  fetch:",
+      `    allowed_origins: ["${MIRROR}"]`,
+      "",
+    ].join("\n");
+  const agentOf = (tools: string): string =>
+    compile(auditSpec(tools)).files.find((f) => f.path === "agent.ts")?.content ?? "";
+
+  test("the bundle registers the block before DependencyAudit, from tool-fetch, once", async () => {
+    const agentTs = agentOf("[dependencyAudit]");
+    const call = `registerFetchConfig({"allowed_origins":["${MIRROR}"]});`;
+    expect(agentTs).toMatch(/^import \{ registerFetchConfig \} from "@crewhaus\/tool-fetch";$/m);
+    expect(agentTs.split(call)).toHaveLength(2);
+    expect(agentTs.indexOf(call)).toBeLessThan(
+      agentTs.indexOf("defaultCatalog.register(dependencyAudit);"),
+    );
+    const both = agentOf("[fetch, dependencyAudit]");
+    expect(both.split("registerFetchConfig({")).toHaveLength(2);
+
+    const fetchPkg = await importToolPackage("@crewhaus/tool-fetch");
+    const reset = fetchPkg["_resetFetchConfig"] as () => void;
+    const read = fetchPkg["getFetchConfig"] as () => { allowedOrigins: ReadonlySet<string> };
+    reset();
+    try {
+      await bootEmitted(agentTs);
+      expect(read().allowedOrigins.has(MIRROR)).toBe(true);
+    } finally {
+      reset();
+    }
+  });
+
+  test("crewhaus run's registration delivers it the same way", async () => {
+    const { registerToolConfigs } = await import("@crewhaus/tool-categories");
+    const fetchPkg = await importToolPackage("@crewhaus/tool-fetch");
+    const reset = fetchPkg["_resetFetchConfig"] as () => void;
+    const read = fetchPkg["getFetchConfig"] as () => { allowedOrigins: ReadonlySet<string> };
+    reset();
+    try {
+      const plan = await registerToolConfigs(
+        [{ tools: ["dependencyAudit"], toolConfigs: { fetch: { allowed_origins: [MIRROR] } } }],
+        importToolPackage,
+      );
+      expect(plan.map((p) => p.initSymbol)).toEqual(["registerFetchConfig"]);
+      expect(read().allowedOrigins.has(MIRROR)).toBe(true);
+    } finally {
+      reset();
+    }
+  });
+});
