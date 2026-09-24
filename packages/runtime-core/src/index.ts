@@ -2783,6 +2783,19 @@ const MODEL_DESTINATION_SINKS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * 0.7.1 — the tool-name fields of a `pre-tool` / `post-tool` hook payload.
+ * `name` is the registered name; an MCP tool also carries `legacyName`, the
+ * `<server>__<tool>` spelling it had before 0.7.1. A hook matcher accepts
+ * either spelling, but a script that reads `name` from its stdin and compares
+ * it cannot know about the rename, and a guard that stops matching is a
+ * guard that silently stops guarding — so it gets a stable field to compare.
+ */
+function hookToolName(name: string): { name: string; legacyName?: string } {
+  const legacyName = legacyMcpToolName(name);
+  return legacyName !== undefined ? { name, legacyName } : { name };
+}
+
+/**
  * 0.7.1 — re-key a tool-name map (rate limits) written with the pre-0.7.1
  * MCP spelling `<server>__<tool>` onto the registered `mcp__<server>__<tool>`
  * name. A key that already names a tool, `"*"`, or an old spelling whose new
@@ -5700,7 +5713,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // the prior turn in some streaming scenarios).
       const post = await fireHook("post-tool", {
         id: tu.id,
-        name: tu.name,
+        ...hookToolName(tu.name),
         isError: result.is_error === true,
       });
       if (!post.allowed) {
@@ -5741,7 +5754,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
     // Section 11 — pre-tool hook: short-circuit with the hook's reason
     // when any matching hook returns deny/block.
-    const preHook = await fireHook("pre-tool", { id: tu.id, name: tu.name, input: tu.input });
+    const preHook = await fireHook("pre-tool", {
+      id: tu.id,
+      ...hookToolName(tu.name),
+      input: tu.input,
+    });
     if (!preHook.allowed) {
       return finish({
         type: "tool_result",
@@ -5942,7 +5959,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // actually RUN, so re-fire it against the substituted input.
               const replayHook = await fireHook("pre-tool", {
                 id: tu.id,
-                name: tu.name,
+                ...hookToolName(tu.name),
                 input: tu.input,
               });
               if (!replayHook.allowed) {

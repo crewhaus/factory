@@ -18,7 +18,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
-import { runHooks } from "@crewhaus/hooks-engine";
+import { type HookDef, runHooks } from "@crewhaus/hooks-engine";
 import type { McpHost } from "@crewhaus/mcp-host";
 import { buildAdvertisement, matchesToolPattern } from "@crewhaus/model-plan";
 import {
@@ -185,6 +185,69 @@ describe("a documented MCP deny rule fires (flag-truth-1#1)", () => {
       }
       expect(evaluate(call, "default", rules(["alwaysAllow", pattern]))).toBe("allow");
     }
+  });
+});
+
+describe("a hook script that reads the tool name from its payload (0.7.1)", () => {
+  const { host, calls } = fakeHost();
+  const tool = buildMcpRegisteredTool(
+    host,
+    "github",
+    { name: "create_issue", inputSchema: { type: "object" } },
+    flags,
+  );
+
+  /** Run one call through the loop with `hooks`; report whether the tool ran. */
+  async function run(hooks: HookDef[]): Promise<{ ran: boolean; fired: TraceEvent[] }> {
+    const state = mkdtempSync(join(tmpdir(), "mcp-hooks-"));
+    try {
+      const runContext = createRunContext();
+      const fired: TraceEvent[] = [];
+      runContext.eventBus.subscribe((e) => {
+        if (e.kind === "hook_fired") fired.push(e);
+      });
+      const before = calls();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "mcp hooks",
+        runContext,
+        sessionRootDir: state,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        permissionMode: "auto",
+        permissionRules: emptyRuleSet,
+        tools: [tool],
+        hooks,
+        _adapter: adapterFor(tool.name, { title: "x" }),
+      });
+      return { ran: calls() > before, fired };
+    } finally {
+      rmSync(state, { recursive: true, force: true });
+    }
+  }
+
+  const denyIf = (needle: string, event: "pre-tool" | "post-tool" = "pre-tool"): HookDef => ({
+    event,
+    command: `if grep -q '${needle}'; then printf '{"decision":"deny","reason":"blocked"}'; else printf '{"decision":"allow"}'; fi`,
+  });
+
+  test("a guard comparing the old spelling reads it from legacyName, before and after the call", async () => {
+    const pre = await run([denyIf('"legacyName":"github__create_issue"')]);
+    expect(pre.ran).toBe(false);
+    const post = await run([denyIf('"legacyName":"github__create_issue"', "post-tool")]);
+    expect(post.fired.map((e) => (e.kind === "hook_fired" ? e.allowed : undefined))).toEqual([
+      false,
+    ]);
+  });
+
+  test("a guard comparing the registered name blocks it", async () => {
+    expect((await run([denyIf('"name":"mcp__github__create_issue"')])).ran).toBe(false);
+  });
+
+  test("name is the registered name now, so a guard on the old name alone lets it run", async () => {
+    // The behaviour change the CHANGELOG names: such a script must compare
+    // legacyName (or accept both spellings) to keep blocking.
+    expect((await run([denyIf('"name":"github__create_issue"')])).ran).toBe(true);
   });
 });
 

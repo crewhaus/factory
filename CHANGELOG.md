@@ -99,10 +99,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sub-agent `tools:` lists, hook matchers, `rate_limits` and the tool names an
   eval expects (a `tool_call_sequence` grader's `expected`, a sample's
   `expected_tools` or `expectedTool`) written with the old spelling keep
-  working, so no spec needs to change — but instructions
-  that tell the model to call a tool by its old name should be updated. A
-  model profile's `tools: [mcp__<server>__*]` now selects that server's tools,
-  where before it selected none.
+  working. Two things may need updating. Instructions that tell the model to
+  call a tool by its old name. And **hook scripts that read the tool name
+  from their input**: a `pre-tool` or `post-tool` hook's `name` is now
+  `mcp__<server>__<tool>`, so a script that compares it with
+  `<server>__<tool>` stops matching and lets the call through. The input now
+  also carries `legacyName`, the old spelling, for MCP tools; compare that, or
+  accept both. A model profile's `tools: [mcp__<server>__*]` now selects that
+  server's tools, where before it selected none.
 - **MCP calls get the stricter egress check the docs describe.** Now that
   MCP tools are recognisable by name, an MCP call whose input carries text
   that came from a tool result, an MCP response, a sub-agent or another source
