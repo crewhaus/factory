@@ -8126,7 +8126,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [{ field: "ids", kind: "id" }],
-    categories: ["data-stores", "memory", "state"],
+    categories: ["network", "vector"],
     package: "@crewhaus/tool-state",
     keywords: ["delete vectors", "remove embeddings", "vector store", "purge namespace"],
   },

@@ -348,8 +348,18 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "stateExport",
       "stateImport",
       "dedupeMark",
-      "vectorDelete",
     ],
+  },
+
+  // VectorDelete lives in its own leaf, not in `state`: every state tool
+  // stays inside the workspace (tool-state's STATE_TOOLS promise, which a
+  // test holds), while VectorDelete deletes from a vector store that may be
+  // a qdrant, pinecone or weaviate service over HTTP. `network` includes
+  // this leaf; `memory` and `data-stores` do not.
+  vector: {
+    title:
+      "Delete entries from a vector store (reaches the network, destructive, asks for a justification)",
+    tools: ["vectorDelete"],
   },
 
   crewhaus: {
@@ -954,6 +964,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "chaincall",
       "token",
       "defi",
+      "vector",
     ],
   },
   compute: {

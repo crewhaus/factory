@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  BUILTIN_TOOLS,
   CATEGORIES,
   ToolCategoryError,
   allRegisteredTools,
@@ -93,6 +94,30 @@ describe("toolsInCategory", () => {
     } catch (err) {
       expect((err as Error).message).toContain("Did you mean");
     }
+  });
+});
+
+// 0.7.1 (C149): `all-state` (and the `all-memory` / `all-data-stores`
+// roll-ups over it) granted VectorDelete, a network tool that deletes from a
+// remote vector store, while `all-network` did not.
+describe("the state leaf stays inside the workspace", () => {
+  test("no state tool reaches the network or starts a process", () => {
+    const state = toolsInCategory("state");
+    const crossing = state.filter((k) => BUILTIN_TOOLS[k]?.io !== undefined);
+    expect(crossing).toEqual([]);
+    // tool-state's STATE_TOOLS: twenty tools, all inside the workspace.
+    expect(state.length).toBe(20);
+  });
+
+  test("VectorDelete is reached through all-vector and all-network, not the local roll-ups", () => {
+    expect(toolsInCategory("vector")).toEqual(["vectorDelete"]);
+    expect(toolsInCategory("network")).toContain("vectorDelete");
+    for (const local of ["state", "memory", "data-stores"]) {
+      expect(`${local}:${toolsInCategory(local).includes("vectorDelete")}`).toBe(`${local}:false`);
+    }
+    expect(expandToolSelectors(["all-memory"]).tools).not.toContain("vectorDelete");
+    expect(expandToolSelectors(["all-data-stores"]).tools).not.toContain("vectorDelete");
+    expect([...categoriesForTool("vectorDelete")].sort()).toEqual(["network", "vector"]);
   });
 });
 
