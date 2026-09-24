@@ -202,6 +202,12 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     binds: ["setPeerPolicy"],
     checks: NO_PRIVATE_HOSTS("peer origins"),
   },
+  registerObjectStoreConfig: {
+    package: "@crewhaus/tool-objectstore",
+    source: "tool_config",
+    label: "ObjectPresign's credential profiles",
+    keys: ["objectstore"],
+  },
   registerSecureConfig: {
     package: "@crewhaus/tool-secure",
     source: "tool_config",
@@ -2186,6 +2192,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-objectstore",
     export: "objectPresign",
     name: "ObjectPresign",
+    initSymbol: "registerObjectStoreConfig",
   },
   systemInfo: {
     package: "@crewhaus/tool-host",
