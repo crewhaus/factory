@@ -209,12 +209,24 @@ export const vatIdValidate: RegisteredTool = buildTool({
       });
     }
 
-    const requester =
+    const parsedRequester =
       input.requesterVatId === undefined ? undefined : parseVatId(input.requesterVatId);
-    if (requester !== undefined && !requester.ok) {
-      return `VatIdValidate could not read requesterVatId "${input.requesterVatId}": ${requester.reason}`;
+    if (parsedRequester !== undefined && !parsedRequester.ok) {
+      return `VatIdValidate could not read requesterVatId "${input.requesterVatId}": ${parsedRequester.reason}`;
     }
-    if (requester?.ok === true) {
+    // The requester is held to its country's grammar too, before anything is
+    // dialled: it becomes part of HMRC's request path, and an unchecked one
+    // rewrote that path to ask about a different number.
+    const requesterSyntax =
+      parsedRequester === undefined ? undefined : checkSyntax(parsedRequester);
+    if (requesterSyntax !== undefined && !requesterSyntax.wellFormed) {
+      return `VatIdValidate will not use requesterVatId "${input.requesterVatId}": ${requesterSyntax.reason}`;
+    }
+    const requester =
+      requesterSyntax === undefined
+        ? undefined
+        : { country: { code: requesterSyntax.country }, number: requesterSyntax.number };
+    if (requester !== undefined && requesterSyntax !== undefined) {
       // The two registers issue their receipt to their OWN kind of requester:
       // HMRC takes a GB VRN, VIES takes a member state's number. Sending the
       // wrong one means the number part is read as if it belonged to the other
@@ -224,7 +236,7 @@ export const vatIdValidate: RegisteredTool = buildTool({
       const targetIsGb = syntax.country === "GB";
       const requesterIsGb = requester.country.code === "GB";
       if (targetIsGb !== requesterIsGb) {
-        return `VatIdValidate will not use requesterVatId ${requester.canonical} for ${syntax.canonical}: ${
+        return `VatIdValidate will not use requesterVatId ${requesterSyntax.canonical} for ${syntax.canonical}: ${
           targetIsGb
             ? "HMRC issues a consultation number only to a GB requester"
             : "VIES issues a consultation number only to a requester registered in a member state, and GB is no longer one"
@@ -236,17 +248,8 @@ export const vatIdValidate: RegisteredTool = buildTool({
     try {
       const answer =
         syntax.country === "GB"
-          ? await askHmrc(
-              syntax.number,
-              requester?.ok === true ? requester.number : undefined,
-              deadline.signal,
-            )
-          : await askVies(
-              syntax.country,
-              syntax.number,
-              requester?.ok === true ? requester : undefined,
-              deadline.signal,
-            );
+          ? await askHmrc(syntax.number, requester?.number, deadline.signal)
+          : await askVies(syntax.country, syntax.number, requester, deadline.signal);
       return json({
         ...base,
         ...answer.answer,
@@ -288,7 +291,7 @@ async function askVies(
   const twoParty = requester !== undefined;
   const url = twoParty
     ? `${ORIGINS.vies}/taxation_customs/vies/rest-api/check-vat-number`
-    : `${ORIGINS.vies}/taxation_customs/vies/rest-api/ms/${country}/vat/${number}`;
+    : `${ORIGINS.vies}/taxation_customs/vies/rest-api/ms/${encodeURIComponent(country)}/vat/${encodeURIComponent(number)}`;
   const result = await getJson(url, {
     signal,
     ...(twoParty
@@ -317,16 +320,20 @@ async function askHmrc(
   requesterNumber: string | undefined,
   signal: AbortSignal,
 ): Promise<AskResult> {
-  const path =
-    requesterNumber === undefined
-      ? `/organisations/vat/check-vat-number/lookup/${number}`
-      : `/organisations/vat/check-vat-number/lookup/${number}/${requesterNumber}`;
+  // Both numbers passed their country's grammar before this is reached (GB:
+  // digits, or GD/HA and digits); encoding them anyway means no value can
+  // ever be read as more path.
+  const segments = [number, ...(requesterNumber === undefined ? [] : [requesterNumber])];
+  const path = `/organisations/vat/check-vat-number/lookup/${segments.map(encodeURIComponent).join("/")}`;
   const url = `${ORIGINS.hmrc}${path}`;
   // HMRC versions its APIs through the Accept header and answers 406 without
   // one. It is not a credential — every caller sends the same string.
   const result = await getJson(url, { signal, accept: "application/vnd.hmrc.1.0+json" });
   if (!result.ok) {
-    if (result.kind === "notFound") {
+    // A 404 is about the subject only when HMRC's own code says so. Any other
+    // 404 — no code, a body that is not JSON, or a route that matches nothing
+    // — says nothing about whether the number is registered.
+    if (result.kind === "notFound" && result.code === "NOT_FOUND") {
       return {
         answer: {
           outcome: "notFound",
@@ -337,10 +344,22 @@ async function askHmrc(
         sourceUrl: safeLabel(url),
       };
     }
+    if (result.kind === "notFound") {
+      return {
+        answer: {
+          outcome: "unavailable",
+          basis: hmrcErrorMeaning(result.code, result.status),
+          retryable: false,
+          code: result.code ?? `HTTP ${result.status ?? 404}`,
+        },
+        register: "hmrc",
+        sourceUrl: safeLabel(url),
+      };
+    }
     return { answer: unavailableFrom(result, "HMRC"), register: "hmrc", sourceUrl: safeLabel(url) };
   }
   return {
-    answer: mapHmrcResponse(result.value, requesterNumber !== undefined),
+    answer: mapHmrcResponse(result.value, requesterNumber !== undefined, number),
     register: "hmrc",
     sourceUrl: safeLabel(url),
   };
