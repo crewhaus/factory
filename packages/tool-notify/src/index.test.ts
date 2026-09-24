@@ -1629,6 +1629,114 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
 });
 
 // ---------------------------------------------------------------------------
+// instants
+// ---------------------------------------------------------------------------
+
+describe("an instant means the same moment on every machine", () => {
+  /**
+   * Run `body` with the process's zone set to `tz`, then put it back. Never
+   * by deleting TZ: in Bun that freezes the zone for the rest of the process.
+   * `bun test` runs in UTC when TZ is unset, so that is what an unset TZ is
+   * restored as.
+   */
+  const inZone = async <T>(tz: string, body: () => Promise<T>): Promise<T> => {
+    const previous = process.env["TZ"];
+    process.env["TZ"] = tz;
+    try {
+      return await body();
+    } finally {
+      process.env["TZ"] = previous === undefined || previous === "" ? "Etc/UTC" : previous;
+    }
+  };
+  const ZONES = ["UTC", "Asia/Tokyo", "America/Los_Angeles"];
+  const QUIET = { timezone: "UTC", quietWindows: [{ start: "22:00", end: "07:00" }] };
+  const MAIL = {
+    from: { address: "ci@example.com" },
+    to: [{ address: "ops@example.com" }],
+    subject: "s",
+    text: "t",
+  };
+
+  test("a time with no offset is refused by every tool that takes one, with the reason", async () => {
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const seen: Array<{ tool: string; now: string; out: string }> = [];
+      for (const now of ["2026-09-17T23:30:00", "2026-09-17", "2026-09-17 23:30"]) {
+        const calls: Array<[string, () => Promise<unknown>]> = [
+          ["QuietHours", () => quietHours.execute({ schedule: QUIET, now })],
+          ["RateLimitGate", () => rateLimitGate.execute({ key: "k", now, windowMs: 3_600_000 })],
+          ["EmailCompose", () => emailCompose.execute({ ...MAIL, date: now })],
+          [
+            "EmailSend",
+            () =>
+              emailSend.execute({ ...MAIL, date: now, host: "127.0.0.1", port, requireTls: false }),
+          ],
+        ];
+        for (const [tool, call] of calls) seen.push({ tool, now, out: String(await call()) });
+      }
+      // 0.7.0 read each of these as the host's local time (or, for the bare
+      // date, UTC midnight) and answered: a decision, a message, a send.
+      expect(seen.filter((s) => !s.out.includes("not an instant with a UTC offset"))).toEqual([]);
+      expect(seen.filter((s) => s.out.includes('"allowed"') || s.out.includes("Date: "))).toEqual(
+        [],
+      );
+      expect(seen).toHaveLength(12);
+      // Nothing reached the SMTP server: the date is checked before the dial.
+      expect(log.commands).toEqual([]);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("EmailSendPreflight fails the date check for the same value, as the send would", async () => {
+    const result = await run(emailSendPreflight, { ...DRAFT, date: "2026-09-17T09:30:00" });
+    const row = check(result, "date");
+    expect(row.status).toBe("fail");
+    expect(row.detail).toContain("not an instant with a UTC offset");
+    expect(result.verdict).not.toBe("ready");
+  });
+
+  test("an offset in any spelling is read, and the answer does not move with the host zone", async () => {
+    const seen = new Map<string, string[]>();
+    for (const tz of ZONES) {
+      // Proves the zone really changed, so the comparison below is not vacuous.
+      const hour = await inZone(tz, async () => new Date(Date.UTC(2026, 8, 17, 23, 30)).getHours());
+      expect({ tz, moved: tz === "UTC" || hour !== 23 }).toEqual({ tz, moved: true });
+      for (const now of [
+        "2026-09-17T23:30:00Z",
+        "2026-09-18T08:30:00+09:00",
+        "2026-09-17T16:30:00-0700",
+      ]) {
+        const quiet = String(await inZone(tz, () => quietHours.execute({ schedule: QUIET, now })));
+        const gate = String(
+          await inZone(tz, () => rateLimitGate.execute({ key: "k", now, windowMs: 3_600_000 })),
+        );
+        const mail = String(await inZone(tz, () => emailCompose.execute({ ...MAIL, date: now })));
+        for (const [name, out] of [
+          ["QuietHours", quiet],
+          ["RateLimitGate", gate],
+          ["EmailCompose", mail],
+        ] as const) {
+          seen.set(name, [...(seen.get(name) ?? []), out]);
+        }
+      }
+    }
+    for (const [name, outs] of seen) {
+      expect({ name, distinct: new Set(outs).size, runs: outs.length }).toEqual({
+        name,
+        distinct: 1,
+        runs: 9,
+      });
+    }
+    const decision = JSON.parse(seen.get("QuietHours")?.[0] ?? "{}");
+    expect(decision).toMatchObject({ allowed: false, localTime: "23:30" });
+    expect(JSON.parse(seen.get("EmailCompose")?.[0] ?? "{}").message).toContain(
+      "Date: Thu, 17 Sep 2026 23:30:00 +0000",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // EmailSendPreflight
 // ---------------------------------------------------------------------------
 

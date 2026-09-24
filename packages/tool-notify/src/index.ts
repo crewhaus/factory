@@ -63,6 +63,7 @@ import {
   parseDmarc,
   parseSpf,
 } from "./lib/dns-records";
+import { parseOffsetInstant } from "./lib/instant";
 import type { Attachment, Mailbox } from "./lib/mime";
 import { composeMessage, isValidAddress } from "./lib/mime";
 import type { Check, CheckStatus } from "./lib/preflight";
@@ -1156,13 +1157,9 @@ function buildMessage(
 ):
   | { ok: true; message: string; messageId: string; bytes: number; envelopeTo: readonly string[] }
   | { ok: false; message: string } {
-  const when = new Date(args.date);
-  if (Number.isNaN(when.getTime())) {
-    return {
-      ok: false,
-      message: `"${args.date}" is not an instant this tool can read — use ISO-8601 with an offset, e.g. 2026-09-17T09:30:00Z`,
-    };
-  }
+  const instant = parseOffsetInstant(args.date);
+  if (!instant.ok) return { ok: false, message: instant.message };
+  const when = new Date(instant.ms);
   const loaded = loadAttachments(toolName, args.attachments);
   if (!loaded.ok) return { ok: false, message: loaded.message };
 
@@ -2691,11 +2688,9 @@ export const quietHours: RegisteredTool = buildTool({
       };
       now: string;
     };
-    const now = new Date(args.now);
-    if (Number.isNaN(now.getTime())) {
-      return `"${args.now}" is not an instant this tool can read — use ISO-8601 with an offset, e.g. 2026-09-17T03:14:00Z`;
-    }
-    const decision = quietDecision(args.schedule as QuietSchedule, now.getTime());
+    const now = parseOffsetInstant(args.now, "2026-09-17T03:14:00Z");
+    if (!now.ok) return now.message;
+    const decision = quietDecision(args.schedule as QuietSchedule, now.ms);
     if ("error" in decision) return decision.error;
     return json(decision);
   },
@@ -2751,14 +2746,12 @@ export const rateLimitGate: RegisteredTool = buildTool({
       mode?: "consume" | "peek";
       state?: RateState;
     };
-    const now = new Date(args.now);
-    if (Number.isNaN(now.getTime())) {
-      return `"${args.now}" is not an instant this tool can read — use ISO-8601 with an offset, e.g. 2026-09-17T03:14:00Z`;
-    }
+    const now = parseOffsetInstant(args.now, "2026-09-17T03:14:00Z");
+    if (!now.ok) return now.message;
     return json(
       evaluateRateLimit({
         key: args.key,
-        nowMs: now.getTime(),
+        nowMs: now.ms,
         windowMs: args.windowMs,
         ...(args.limit !== undefined ? { limit: args.limit } : {}),
         ...(args.mode !== undefined ? { mode: args.mode } : {}),
