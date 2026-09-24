@@ -363,3 +363,26 @@ describe("replayingTools", () => {
     expect(calls).toHaveLength(1);
   });
 });
+
+describe("a 0.7.0 cassette with MCP tools still replays after the rename", () => {
+  test("mcp__<server>__<tool> finds an entry recorded as <server>__<tool>", () => {
+    const replayer = new ToolReplayer({
+      dir: "/x",
+      path: "/x/tools.jsonl",
+      hash: "0",
+      records: [
+        {
+          sampleId: "s1",
+          toolName: "github__create_issue",
+          argsHash: "h",
+          args: {},
+          result: "old",
+          ts: "t1",
+        },
+      ],
+    });
+    expect(replayer.take("s1", "mcp__github__create_issue", "h")?.result).toBe("old");
+    // A non-MCP name gets no alias.
+    expect(replayer.take("s1", "create_issue", "h")).toBeUndefined();
+  });
+});

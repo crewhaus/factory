@@ -200,6 +200,12 @@ export type OperativeArgKind = "path" | "url" | "command" | "text" | "id";
  * that fills the default in `execute` rather than in its schema. Without it,
  * a call that leaves the field out would carry no value for a deny rule to
  * catch, while the tool still acts on the default.
+ *
+ * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
+ * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
+ * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
+ * whose dangerous mode hangs on a flag should gate that mode itself — for
+ * example with `requireJustification` — rather than rely on a scoped rule.
  */
 export type OperativeArg = {
   readonly field: string;
