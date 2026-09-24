@@ -9,7 +9,8 @@
     { "path": "../plugin-registry" },
     { "path": "../plugin-sdk" },
     { "path": "../tool-builder" },
-    { "path": "../tool-registry-manifest" }
+    { "path": "../tool-registry-manifest" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

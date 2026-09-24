@@ -68,3 +68,9 @@ with no parameters and the boot says so.
 `index.js` next to its `plugin.json` in `~/.crewhaus/plugins/<name>/`; when the
 manifest has an `entrypointDigest`, the file's sha256 must match it. A plugin
 with no `index.js` is refused at boot with the path it expected.
+
+`index.js` must be a regular file inside the plugin's own directory. It may be
+a link to another file in that directory (`index.js -> dist/index.js`), but a
+link that leads anywhere else — outside `~/.crewhaus/plugins`, or into another
+plugin's directory — is refused, and so is a FIFO or a device. `plugin.json`
+is read up to 1 MiB and `index.js` up to 64 MiB.

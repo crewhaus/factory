@@ -1,7 +1,7 @@
 import { createPublicKey, verify } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join, resolve as resolvePath, sep } from "node:path";
+import { basename, delimiter, dirname, join, resolve as resolvePath, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type PluginRegistry, createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
@@ -21,6 +21,8 @@ import {
 } from "@crewhaus/plugin-sdk";
 import { buildTool } from "@crewhaus/tool-builder";
 import { RUNTIME_TOOL_NAMES, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
+import { openForRead, probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
+import { readFileBounded } from "@crewhaus/tool-safety/streams";
 import type { ZodType as Zod4Type } from "zod/v4";
 import pkg from "../package.json" with { type: "json" };
 
@@ -32,6 +34,11 @@ import pkg from "../package.json" with { type: "json" };
  */
 export const PLUGIN_HOST_VERSION: string = typeof pkg.version === "string" ? pkg.version : "0.0.0";
 
+/** The largest `plugin.json` the loader reads. A manifest is metadata; this is generous. */
+export const MAX_PLUGIN_MANIFEST_BYTES = 1024 * 1024;
+/** The largest `index.js` the loader reads for its digest check (the marketplace's cap too). */
+export const MAX_PLUGIN_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
+
 /**
  * Section 41 — `@crewhaus/plugin-loader`.
  *
@@ -39,10 +46,13 @@ export const PLUGIN_HOST_VERSION: string = typeof pkg.version === "string" ? pkg
  *
  *   1. **Path allow-list.** Plugin sources may only be loaded from
  *      configured trusted roots (typically `~/.crewhaus/plugins/`).
- *      Symlinks are resolved to a real path before the check, so
- *      `ln -s /etc/passwd ~/.crewhaus/plugins/x/index.ts` can't trick
- *      the loader. This mirrors the §31 plugin-sandbox content
- *      isolation pattern.
+ *      Symlinks are resolved to a real path before the check: the
+ *      manifest must really sit under a trusted root, and its `index.js`
+ *      must really sit inside the manifest's own directory, so
+ *      `ln -s /tmp/evil.js ~/.crewhaus/plugins/x/index.js` is refused
+ *      rather than imported. The entrypoint must be a regular file (a
+ *      FIFO or device is refused, never read), and both files are read
+ *      with a byte cap.
  *
  *   2. **Signature verification.** Manifests carry an Ed25519
  *      detached signature over their canonical-JSON form. The loader
@@ -154,6 +164,65 @@ function isUnderRoot(real: string, root: string): boolean {
   return real.startsWith(root + sep);
 }
 
+/** The default manifest reader: at most {@link MAX_PLUGIN_MANIFEST_BYTES}, a regular file only. */
+async function readManifestBounded(absPath: string): Promise<unknown> {
+  const read = await readFileBounded(absPath, { maxBytes: MAX_PLUGIN_MANIFEST_BYTES });
+  if (!read.ok) throw new Error(read.reason);
+  if (read.truncated) throw new Error(`it is larger than ${MAX_PLUGIN_MANIFEST_BYTES} bytes`);
+  return JSON.parse(read.text);
+}
+
+/**
+ * The default entrypoint reader: the file at `absPath` (already resolved and
+ * contained), read only if it is still a regular file there and not a link —
+ * a swap between the check and the read is refused, not followed — and at
+ * most {@link MAX_PLUGIN_ENTRYPOINT_BYTES}.
+ */
+async function readEntrypointBounded(absPath: string): Promise<Uint8Array> {
+  const read = await openForRead(dirname(absPath), basename(absPath), {
+    maxBytes: MAX_PLUGIN_ENTRYPOINT_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok) {
+    throw Object.assign(
+      new Error(read.reason),
+      read.code === "not-found" ? { code: "ENOENT" } : {},
+    );
+  }
+  if (read.truncated) throw new Error(`it is larger than ${MAX_PLUGIN_ENTRYPOINT_BYTES} bytes`);
+  return read.bytes;
+}
+
+/**
+ * The file a plugin's `<manifestDir>/index.js` really is. It must be inside
+ * the plugin's own directory — a link to another directory, even another
+ * plugin's, is refused — and a regular file: a FIFO would block the read and
+ * a device never ends. When there is nothing there at all the name is
+ * returned as it is, and reading or importing it reports the missing code.
+ */
+function resolveEntrypoint(pluginName: string, manifestDir: string): string {
+  const shown = join(manifestDir, "index.js");
+  const contained = resolveContained(manifestDir, "index.js");
+  if (!contained.ok) {
+    throw new PluginLoaderError(
+      contained.code === "escapes-root"
+        ? `plugin "${pluginName}": ${shown} is a link that leads outside the plugin's directory ${manifestDir}; only code inside it is loaded — refusing to load it`
+        : `plugin "${pluginName}": ${shown}: ${contained.reason} — refusing to load it`,
+    );
+  }
+  const probe = probeKind(contained.real, { given: shown });
+  if (!probe.ok) {
+    if (probe.code === "not-found") return contained.real;
+    throw new PluginLoaderError(`plugin "${pluginName}": ${probe.reason} — refusing to load it`);
+  }
+  if (probe.kind !== "file") {
+    throw new PluginLoaderError(
+      `plugin "${pluginName}": ${shown} is a ${probe.kind}, not a regular file — refusing to load it`,
+    );
+  }
+  return contained.real;
+}
+
 export interface PluginLoader {
   /**
    * Load + activate a plugin from a manifest path. Throws
@@ -176,22 +245,14 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
     );
   }
 
-  const readManifest =
-    opts.readManifestFile ??
-    (async (absPath) => {
-      const file = Bun.file(absPath);
-      const text = await file.text();
-      return JSON.parse(text);
-    });
+  const readManifest = opts.readManifestFile ?? readManifestBounded;
   const importEntry =
     opts.importEntrypoint ??
     (async (absPath) => {
       const mod = (await import(absPath)) as { default?: unknown };
       return mod;
     });
-  const readEntrypoint =
-    opts.readEntrypoint ??
-    (async (absPath) => new Uint8Array(await Bun.file(absPath).arrayBuffer()));
+  const readEntrypoint = opts.readEntrypoint ?? readEntrypointBounded;
 
   function assertUnderTrustedRoot(realPath: string): void {
     if (!roots.some((root) => isUnderRoot(realPath, root))) {
@@ -307,15 +368,14 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
       }
       const signed = verifySignature(manifest);
 
-      // Resolve the entrypoint. The convention is "the manifest sits
-      // next to an index.ts / index.js / dist/index.js"; for v1 we
-      // accept an explicit `entrypoint` field via a sibling file in
-      // the same directory. Default: `<manifest-dir>/index.js`.
-      // (Plugins shipped uncompiled use `index.ts` and rely on the
-      // runtime importer accepting it.)
-      const manifestDir = realManifest.slice(0, realManifest.lastIndexOf(sep));
-      const entrypointPath = resolvePath(manifestDir, "index.js");
-      assertUnderTrustedRoot(entrypointPath);
+      // The entrypoint is `<manifest-dir>/index.js`. `entrypointPath` is that
+      // name (activatePlugins finds `<plugin>/skills` beside it);
+      // `realEntry` is the file it really is, which is what gets hashed and
+      // imported, so a link out of the plugin's directory cannot smuggle in
+      // code from elsewhere.
+      const manifestDir = dirname(realManifest);
+      const entrypointPath = join(manifestDir, "index.js");
+      const realEntry = resolveEntrypoint(manifest.name, manifestDir);
 
       // Code-integrity: the signature only attests to the MANIFEST. When the
       // manifest carries an entrypointDigest (which is covered by the
@@ -325,7 +385,7 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
       if (manifest.entrypointDigest !== undefined) {
         let bytes: Uint8Array;
         try {
-          bytes = await readEntrypoint(entrypointPath);
+          bytes = await readEntrypoint(realEntry);
         } catch (err) {
           throw entrypointError(
             manifest,
@@ -344,7 +404,7 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
 
       let module: { default?: unknown };
       try {
-        module = await importEntry(entrypointPath);
+        module = await importEntry(realEntry);
       } catch (err) {
         throw entrypointError(
           manifest,
