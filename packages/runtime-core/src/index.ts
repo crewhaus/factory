@@ -159,7 +159,7 @@ import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool, ToolExecuteModel } from "@crewhaus/tool-catalog";
 import { stripJustificationField, withJustificationField } from "@crewhaus/tool-catalog";
-import { executeTool } from "@crewhaus/tool-executor";
+import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
@@ -5704,6 +5704,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // `justificationInjectedTools` comment at loop start for the full split.
     let operativeInput = operativeToolInput(tu.name, tu.input);
 
+    // 0.7.1 — rules are checked against the call the tool will RUN: the
+    // input parsed by the tool's own schema (unknown keys stripped, defaults
+    // filled in) and the tool's declared operative values canonicalised
+    // (paths resolved against the workspace, URLs parsed). Matching the raw
+    // input let a decoy key, an extra argument, an omitted default, a `..` or
+    // a symlinked directory walk past a rule. An input the schema rejects
+    // could not run anyway, so it is denied here with the schema's message,
+    // before any approval is asked for.
+    const subject = preparePermissionSubject(tool, operativeInput);
+    if (!subject.ok) {
+      bus.publish({
+        ...bus.envelope(),
+        kind: "permission_decision",
+        toolName: tu.name,
+        decision: "deny",
+        mode: permissionMode,
+        reason: subject.reason,
+        ...callAttribution,
+      });
+      return finish({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: subject.reason,
+        is_error: true,
+      });
+    }
+
     // 0.6.0 §4.4 — the SERVING candidate's rule set: the run's rules narrowed
     // by the profile's `permissions.deny` / `.ask` through `narrowRuleSet`
     // (a decision-level meet — a profile can only tighten). The primary plan
@@ -5711,7 +5738,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
-        input: operativeInput,
+        input: subject.input,
+        ...(subject.operativeValues !== undefined
+          ? { operativeValues: subject.operativeValues }
+          : {}),
         readOnly: tool.readOnly,
         destructive: tool.destructive,
         requiresSandbox: tool.requiresSandbox,
@@ -5814,18 +5844,27 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // §10.1 — approval replay across candidates uses the SERVING
             // candidate's rule set: a grant parked while the strong arm
             // served does not run under a narrower arm's denies.
-            const recheck = evaluateWithReason(
-              {
-                toolName: tu.name,
-                input: approvedOperative,
-                readOnly: tool.readOnly,
-                destructive: tool.destructive,
-                requiresSandbox: tool.requiresSandbox,
-              },
-              permissionMode,
-              servingPlan.permissionRules,
-              { sandboxAvailable: opts.sandboxAvailable === true },
-            );
+            // 0.7.1 — the recheck, like the first check, reads the PARSED
+            // approved input and its canonical operative values; an approved
+            // input that no longer parses is a denial, never a run.
+            const approvedSubject = preparePermissionSubject(tool, approvedOperative);
+            const recheck = approvedSubject.ok
+              ? evaluateWithReason(
+                  {
+                    toolName: tu.name,
+                    input: approvedSubject.input,
+                    ...(approvedSubject.operativeValues !== undefined
+                      ? { operativeValues: approvedSubject.operativeValues }
+                      : {}),
+                    readOnly: tool.readOnly,
+                    destructive: tool.destructive,
+                    requiresSandbox: tool.requiresSandbox,
+                  },
+                  permissionMode,
+                  servingPlan.permissionRules,
+                  { sandboxAvailable: opts.sandboxAvailable === true },
+                )
+              : { decision: "deny" as const, reason: approvedSubject.reason };
             if (recheck.decision === "deny") {
               approved = false;
               denialMessage =

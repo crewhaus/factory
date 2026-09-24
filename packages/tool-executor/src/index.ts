@@ -2,6 +2,15 @@ import { CrewhausError, isRunFailedError } from "@crewhaus/errors";
 import type { RegisteredTool, ToolExecuteModel, ToolExecuteResult } from "@crewhaus/tool-catalog";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
+import { operativeValuesFor } from "./permission-subject";
+
+export {
+  type PermissionSubject,
+  type PermissionSubjectOptions,
+  operativeValuesFor,
+  preparePermissionSubject,
+  readOperativeField,
+} from "./permission-subject";
 
 /**
  * Section 14 — `content` widened from `string` to `string | ToolResultContent`
@@ -17,7 +26,11 @@ export type ToolResult = {
 
 export type ExecutionContext = {
   readonly toolUseId: string;
-  /** When present, the tool call must match at least one pattern. Absent = allow all. */
+  /**
+   * When present, the tool call must match at least one pattern, read as an
+   * allow rule: every operative value of the PARSED input must match its
+   * argument glob. Absent = allow all.
+   */
   readonly allowedPatterns?: ReadonlyArray<string>;
   /** Optional cooperative-cancellation signal forwarded to the tool. */
   readonly signal?: AbortSignal;
@@ -65,8 +78,17 @@ export async function executeTool(
   }
 
   if (allowedPatterns !== undefined) {
+    // Match what the tool will run on — the parsed input, with its operative
+    // values canonicalised — never the raw input, which can carry a decoy key
+    // the schema strips (#145, security-1#0).
     const compiled = allowedPatterns.map(compilePattern);
-    const permitted = compiled.some((p) => matchesPattern(p, tool.name, rawInput));
+    const operativeValues = operativeValuesFor(tool, validation.value);
+    const permitted = compiled.some((p) =>
+      matchesPattern(p, tool.name, validation.value, {
+        polarity: "allow",
+        ...(operativeValues !== undefined ? { operativeValues } : {}),
+      }),
+    );
     if (!permitted) {
       return {
         toolUseId,
