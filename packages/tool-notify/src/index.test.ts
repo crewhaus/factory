@@ -320,6 +320,16 @@ beforeEach(() => {
 
   registerNotifyConfig({
     allowed_origins: [origin],
+    // PROVIDER_VAR is deliberately NOT listed: a provider's own auth
+    // variable is operator-written and needs no listing.
+    allowed_secret_envs: [
+      WEBHOOK_VAR,
+      TOKEN_VAR,
+      SECRET_VAR,
+      SMTP_USER_VAR,
+      SMTP_PASS_VAR,
+      "NOT_SET_ANYWHERE",
+    ],
     allowed_recipients: ["ops@example.com", "*@team.test"],
     allowed_smtp_hosts: ["127.0.0.1"],
     allowed_sender_domains: ["example.com"],
@@ -589,7 +599,8 @@ describe("ChatPost", () => {
   });
 
   test("REFUSAL: an empty allow-list denies everything", async () => {
-    _resetNotifyConfig();
+    // The variable is allowed, so what refuses is the empty origin list.
+    registerNotifyConfig({ allowed_secret_envs: [WEBHOOK_VAR] });
     const result = await chatPost.execute({
       platform: "slack",
       webhookUrlEnv: WEBHOOK_VAR,
@@ -616,7 +627,8 @@ describe("ChatPost", () => {
       }),
     );
     expect(result).not.toContain("xoxb-1234-actual-secret");
-    expect(result).toContain("NAME of an environment variable");
+    expect(result).toContain("must name an environment variable");
+    expect(result).toContain("has not been echoed back");
   });
 
   test("REFUSAL: a webhook path never appears in a failure message", async () => {

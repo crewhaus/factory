@@ -29,10 +29,13 @@
  *      real endpoint. Only the read-only `DeliveryCheck` follows, and then
  *      the allow-list, the SSRF gate and the credential rules run again on
  *      every hop.
- *   7. Credentials are environment variable NAMES, never values. Whatever
- *      header a profile sets is dropped the moment a redirect leaves the
- *      origin it was minted for, and every result — success or failure —
- *      goes through a redactor built from the resolved secret.
+ *   7. Credentials are environment variable NAMES, never values, and only
+ *      names the operator listed (`allowed_secret_envs`, or a provider's own
+ *      `auth.envVar` for that provider): a call chooses among them and can
+ *      never add one. Whatever header a profile sets is dropped the moment a
+ *      redirect leaves the origin it was minted for, and every result —
+ *      success or failure — goes through a redactor built from the resolved
+ *      secret.
  *   8. Every request is deadline-bounded and every response is byte-capped,
  *      with the cap bounding memory rather than applied after buffering.
  *
@@ -42,6 +45,7 @@
 import { Buffer } from "node:buffer";
 import { lookup as dnsLookup, resolveTxt } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
 import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import { joinTxtChunks, normalizeDomain } from "./lib/dns-records";
 
@@ -129,6 +133,14 @@ export type NotifyConfig = {
   readonly allowedSenderDomains: ReadonlySet<string>;
   /** Named REST providers for SMS, push and delivery lookups. */
   readonly providers: ReadonlyMap<string, ProviderProfile>;
+  /**
+   * The environment variables a tool call may name as a credential: a bot
+   * token, a webhook URL, a WebhookPost auth or signing secret, SMTP
+   * credentials. Empty (the default) refuses every such name. A provider's
+   * own `auth.envVar` is operator-written and needs no listing, but it is
+   * read only for that provider, never by a name a call supplies.
+   */
+  readonly allowedSecretEnvs: readonly string[];
 };
 
 export type NotifyConfigInput = {
@@ -141,7 +153,12 @@ export type NotifyConfigInput = {
   readonly allowed_sender_domains?: readonly string[];
   readonly allowedSenderDomains?: readonly string[];
   readonly providers?: Readonly<Record<string, ProviderProfile>>;
+  readonly allowed_secret_envs?: readonly string[];
+  readonly allowedSecretEnvs?: readonly string[];
 };
+
+/** Where an operator allows a credential variable. Every refusal names it. */
+export const SECRET_ENVS_KEY = "tool_config.notify.allowed_secret_envs";
 
 const EMPTY_CONFIG: NotifyConfig = {
   allowedOrigins: new Set<string>(),
@@ -149,6 +166,7 @@ const EMPTY_CONFIG: NotifyConfig = {
   allowedSmtpHosts: new Set<string>(),
   allowedSenderDomains: new Set<string>(),
   providers: new Map<string, ProviderProfile>(),
+  allowedSecretEnvs: [],
 };
 
 let notifyConfig: NotifyConfig = EMPTY_CONFIG;
@@ -195,7 +213,32 @@ export function buildNotifyConfig(input: NotifyConfigInput): NotifyConfig {
     allowedSmtpHosts: smtpHosts,
     allowedSenderDomains: senderDomains,
     providers,
+    allowedSecretEnvs: buildSecretEnvs(input.allowedSecretEnvs ?? input.allowed_secret_envs),
   };
+}
+
+/**
+ * Check `allowed_secret_envs` at boot: a list of variable NAMES. A
+ * malformed entry throws, so a misconfiguration surfaces when the harness
+ * starts, and it is never quoted: an operator who pasted a token here, or
+ * wrote `$SLACK_BOT_TOKEN` (which the bundle resolves to the token itself),
+ * would otherwise see it printed.
+ */
+function buildSecretEnvs(raw: unknown): readonly string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    throw new NotifyPermissionError(`${SECRET_ENVS_KEY} must be a list of variable names`);
+  }
+  const names = new Set<string>();
+  raw.forEach((name, index) => {
+    if (!isEnvName(name) || looksLikePastedSecret(name)) {
+      throw new NotifyPermissionError(
+        `${SECRET_ENVS_KEY} lists environment variable NAMES (such as SLACK_BOT_TOKEN, written without a $); entry ${index + 1} is not one, and has not been echoed back`,
+      );
+    }
+    names.add(name);
+  });
+  return [...names].sort(byString);
 }
 
 /** Replace the process-global allow-list. Codegen calls this at boot. */
@@ -870,69 +913,39 @@ export type AuthProfile = {
   readonly prefix?: string;
 };
 
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const MAX_ENV_NAME_LENGTH = 64;
-const SECRET_PREFIXES: readonly string[] = [
-  "xoxb-",
-  "xoxp-",
-  "xoxa-",
-  "xapp-",
-  "sk_live_",
-  "sk_test_",
-  "ghp_",
-  "github_pat_",
-  "glpat-",
-  "whsec_",
-  "bearer ",
-  "sk-",
-  "ac", // Twilio account sids are `AC` + 32 hex, and are paired with a token
-];
-
-/** True when a value that arrived as a NAME is really a secret. */
-function looksLikeASecret(value: string): boolean {
-  const lower = value.toLowerCase();
-  if (lower.startsWith("ac") && /^ac[0-9a-f]{32}$/.test(lower)) return true;
-  return SECRET_PREFIXES.filter((p) => p !== "ac").some((prefix) => lower.startsWith(prefix));
-}
-
 export type ResolvedSecret =
   | { readonly ok: true; readonly value: string }
   | { readonly ok: false; readonly message: string };
 
 /**
- * Read a secret out of the named environment variable.
+ * Read a secret out of the named environment variable, if and only if
+ * `allowed` lists it.
  *
- * The NAME travels through the tool call; the value never does. A value that
- * is not shaped like an environment variable name, or that carries a known
- * secret prefix, is refused as a pasted credential — and the refusal quotes
- * nothing, because a tool result is a transcript, a trace and usually an
- * eval report.
+ * The NAME travels through the tool call; the value never does. `allowed`
+ * is the operator's `allowed_secret_envs` for a name a call supplies, or a
+ * provider's own `auth.envVar` for that provider's call: a call may choose
+ * among the listed names and never add one, so it cannot send another
+ * process secret (the LLM provider's key, say) to an allowed origin, where
+ * the egress classifier would see only the name. The refusal names the key
+ * to set, reads the same whether or not an unlisted variable is set, and
+ * never quotes a value or a "name" that is really a pasted secret, because a
+ * tool result is a transcript, a trace and usually an eval report.
  */
 export function resolveSecret(
   envVar: string | undefined,
   what: string,
+  allowed: readonly string[],
   env: Record<string, string | undefined> = process.env,
 ): ResolvedSecret {
-  if (envVar === undefined || envVar === "") {
-    return {
-      ok: false,
-      message: `no ${what}: name the environment variable holding it — the secret itself is never accepted as an argument`,
-    };
-  }
-  if (!ENV_NAME.test(envVar) || envVar.length > MAX_ENV_NAME_LENGTH || looksLikeASecret(envVar)) {
-    return {
-      ok: false,
-      message: `${what} must be the NAME of an environment variable (letters, digits and underscores, e.g. SLACK_WEBHOOK_URL), not the secret. The value given is not a usable name and has not been echoed back; if it was the secret itself, treat it as exposed to whoever wrote it and set the variable instead`,
-    };
-  }
-  const value = env[envVar];
-  if (value === undefined || value === "") {
-    return {
-      ok: false,
-      message: `${what} names environment variable "${envVar}", which is unset or empty in this process`,
-    };
-  }
-  return { ok: true, value };
+  const resolved = resolveCredentialEnv(envVar, {
+    allowed,
+    purpose: what,
+    configKey: SECRET_ENVS_KEY,
+    env,
+  });
+  return resolved.ok
+    ? { ok: true, value: resolved.value }
+    : { ok: false, message: resolved.reason };
 }
 
 /** Header names that must never be supplied inline, and never survive a hop. */
@@ -969,10 +982,11 @@ export type AppliedAuth =
 export function applyAuth(
   headers: Record<string, string>,
   auth: AuthProfile | undefined,
+  allowed: readonly string[],
   env: Record<string, string | undefined> = process.env,
 ): AppliedAuth {
   if (auth === undefined) return { ok: true, secretHeaders: new Set(), secrets: [] };
-  const resolved = resolveSecret(auth.envVar, "auth profile envVar", env);
+  const resolved = resolveSecret(auth.envVar, "the auth profile", allowed, env);
   if (!resolved.ok) return { ok: false, message: resolved.message };
   const secret = resolved.value;
   if (auth.type === "bearer") {

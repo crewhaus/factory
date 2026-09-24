@@ -92,7 +92,7 @@ twice. In summary:
 ## Credentials
 
 No tool accepts a secret. Every credential is the **NAME** of an environment
-variable, read at call time:
+variable, read at call time, and only a name you list:
 
 ```yaml
 tool_config:
@@ -101,7 +101,17 @@ tool_config:
     allowed_recipients: ["ops@example.com", "*@team.example.com"]
     allowed_smtp_hosts: ["smtp.example.com"]
     allowed_sender_domains: ["example.com"]
+    allowed_secret_envs: [SLACK_OPS_WEBHOOK, SLACK_BOT_TOKEN]
 ```
+
+`allowed_secret_envs` covers every name a call supplies: `webhookUrlEnv` and
+`tokenEnv` for the chat tools, `WebhookPost`'s `urlEnv`, `auth.envVar` and
+`signing.secretEnv`, and `EmailSend`'s `usernameEnv` and `passwordEnv`. A call
+may choose among the listed names and can never add one, so it cannot send
+another process secret (your LLM provider key, say) to an allowed origin.
+With no list, every such name is refused. A provider's own `auth.envVar`
+(under `providers`) is yours already and needs no listing, but it is read
+only for that provider's calls.
 
 ```jsonc
 { "platform": "slack", "webhookUrlEnv": "SLACK_OPS_WEBHOOK", "text": "…" }

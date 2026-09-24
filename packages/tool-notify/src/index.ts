@@ -22,9 +22,12 @@
  *      every outbound byte passes through them. Recipients and SMTP hosts
  *      have their own allow-lists, equally fail-closed. See that file's
  *      header.
- *   3. **Credentials are environment variable NAMES.** A Slack or Discord
- *      incoming-webhook URL is itself a credential, so it is named rather
- *      than passed, and no refusal ever prints a webhook path.
+ *   3. **Credentials are environment variable NAMES**, and only names the
+ *      operator listed in `allowed_secret_envs` (or a provider's own
+ *      `auth.envVar`, for that provider): a call chooses among them and can
+ *      never add one. A Slack or Discord incoming-webhook URL is itself a
+ *      credential, so it is named rather than passed, and no refusal ever
+ *      prints a webhook path.
  *   4. **Determinism, and no clock.** Listings sort, comparisons are
  *      locale-free, nothing is random — MIME boundaries are derived from the
  *      message's own content — and anything that needs "now" takes it as an
@@ -156,7 +159,9 @@ const envVarSchema = (what: string) =>
     .string()
     .min(1)
     .max(64)
-    .describe(`NAME of the environment variable holding ${what} — never the value itself`);
+    .describe(
+      `NAME of the environment variable holding ${what} — never the value itself; it must be listed in tool_config.notify.allowed_secret_envs`,
+    );
 
 const timeoutSchema = z
   .number()
@@ -244,15 +249,28 @@ type PreparedRequest =
     }
   | { readonly ok: false; readonly message: string };
 
-/** Reject inline credentials, then attach the auth profile's secret. */
+/**
+ * The variable a provider's operator-written auth profile names: allowed for
+ * that provider's own calls without being listed in allowed_secret_envs, and
+ * for nothing else.
+ */
+function providerAuthEnvs(profile: ProviderProfile): readonly string[] {
+  return profile.auth === undefined ? [] : [profile.auth.envVar];
+}
+
+/**
+ * Reject inline credentials, then attach the auth profile's secret, read
+ * only from a variable `allowed` (the operator's allowed_secret_envs) lists.
+ */
 function prepareHeaders(
   raw: Record<string, string> | undefined,
   auth: AuthProfile | undefined,
+  allowed: readonly string[],
 ): PreparedRequest {
   const headers: Record<string, string> = { ...(raw ?? {}) };
   const inline = rejectInlineCredentials(headers);
   if (inline !== null) return { ok: false, message: inline };
-  const applied = applyAuth(headers, auth);
+  const applied = applyAuth(headers, auth, allowed);
   if (!applied.ok) return { ok: false, message: applied.message };
   return {
     ok: true,
@@ -332,9 +350,12 @@ function postedMessageId(platform: Platform, outcome: SendOutcome): string | und
   return typeof raw === "string" ? raw : undefined;
 }
 
-/** Resolve a webhook URL held in an environment variable. */
-function webhookUrlFrom(envVar: string): { url: URL; secret: string } | string {
-  const resolved = resolveSecret(envVar, "the webhook URL");
+/** Resolve a webhook URL held in an environment variable `allowed` lists. */
+function webhookUrlFrom(
+  envVar: string,
+  allowed: readonly string[],
+): { url: URL; secret: string } | string {
+  const resolved = resolveSecret(envVar, "the webhook URL", allowed);
   if (!resolved.ok) return resolved.message;
   const parsed = parseUrl(resolved.value);
   if (typeof parsed === "string") {
@@ -378,7 +399,7 @@ const chatTargetShape = {
     .max(64)
     .optional()
     .describe(
-      "NAME of the environment variable holding the incoming-webhook URL. The URL is the credential — a Slack /services/… or Discord /api/webhooks/… path grants posting rights to anyone holding it — so it is named, never passed, and never printed in an error",
+      "NAME of the environment variable holding the incoming-webhook URL, listed in tool_config.notify.allowed_secret_envs. The URL is the credential — a Slack /services/… or Discord /api/webhooks/… path grants posting rights to anyone holding it — so it is named, never passed, and never printed in an error",
     ),
   apiBaseUrl: z
     .string()
@@ -392,7 +413,9 @@ const chatTargetShape = {
     .min(1)
     .max(64)
     .optional()
-    .describe("NAME of the environment variable holding the bot token, for API mode"),
+    .describe(
+      "NAME of the environment variable holding the bot token, for API mode; it must be listed in tool_config.notify.allowed_secret_envs",
+    ),
   channel: z
     .string()
     .min(1)
@@ -432,7 +455,12 @@ type ChatRoute =
  * configuration mistake rather than a preference, so it is refused instead
  * of resolved by precedence.
  */
-function routeChat(target: ChatTarget, apiPath: string, allowWebhook: boolean): ChatRoute {
+function routeChat(
+  target: ChatTarget,
+  apiPath: string,
+  allowWebhook: boolean,
+  allowed: readonly string[],
+): ChatRoute {
   const hasWebhook = target.webhookUrlEnv !== undefined;
   const hasApi = target.apiBaseUrl !== undefined || target.tokenEnv !== undefined;
   if (hasWebhook && hasApi) {
@@ -450,7 +478,7 @@ function routeChat(target: ChatTarget, apiPath: string, allowWebhook: boolean): 
           "an incoming webhook can only create messages; editing, deleting and reacting need apiBaseUrl and tokenEnv",
       };
     }
-    const resolved = webhookUrlFrom(target.webhookUrlEnv as string);
+    const resolved = webhookUrlFrom(target.webhookUrlEnv as string, allowed);
     if (typeof resolved === "string") return { ok: false, message: resolved };
     return {
       ok: true,
@@ -469,7 +497,7 @@ function routeChat(target: ChatTarget, apiPath: string, allowWebhook: boolean): 
   }
   const base = parseUrl(target.apiBaseUrl);
   if (typeof base === "string") return { ok: false, message: base };
-  const token = resolveSecret(target.tokenEnv, "the bot token");
+  const token = resolveSecret(target.tokenEnv, "the bot token", allowed);
   if (!token.ok) return { ok: false, message: token.message };
   const url = new URL(`${base.pathname.replace(/\/+$/, "")}/${apiPath.replace(/^\/+/, "")}`, base);
   return {
@@ -591,7 +619,12 @@ export const chatPost: RegisteredTool = buildTool({
       apiPath = pathSpec.path;
       method = pathSpec.method;
     }
-    const route = routeChat(args, apiPath, true);
+    const route = routeChat(
+      args,
+      apiPath,
+      true,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (route.mode === "api" && args.channel === undefined) {
       return notSentBecause("API mode addresses a channel — set channel");
@@ -694,7 +727,12 @@ export const chatUpdate: RegisteredTool = buildTool({
 
     const pathSpec = apiPathFor(args.platform, "update", args.channel, args.messageId, undefined);
     if (typeof pathSpec === "string") return notSentBecause(pathSpec);
-    const route = routeChat(args, pathSpec.path, false);
+    const route = routeChat(
+      args,
+      pathSpec.path,
+      false,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (args.platform === "slack" && args.channel === undefined) {
       return notSentBecause("Slack identifies a message by channel plus ts — set channel");
@@ -765,7 +803,12 @@ export const chatDelete: RegisteredTool = buildTool({
     }
     const pathSpec = apiPathFor(args.platform, "delete", args.channel, args.messageId, undefined);
     if (typeof pathSpec === "string") return notSentBecause(pathSpec);
-    const route = routeChat(args, pathSpec.path, false);
+    const route = routeChat(
+      args,
+      pathSpec.path,
+      false,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (args.platform === "slack" && args.channel === undefined) {
       return notSentBecause("Slack identifies a message by channel plus ts — set channel");
@@ -840,7 +883,12 @@ export const chatReact: RegisteredTool = buildTool({
     }
     const pathSpec = apiPathFor(args.platform, "react", args.channel, args.messageId, args.emoji);
     if (typeof pathSpec === "string") return notSentBecause(pathSpec);
-    const route = routeChat(args, pathSpec.path, false);
+    const route = routeChat(
+      args,
+      pathSpec.path,
+      false,
+      resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs,
+    );
     if (!route.ok) return notSentBecause(route.message);
     if (args.platform === "slack" && args.channel === undefined) {
       return notSentBecause("Slack identifies a message by channel plus ts — set channel");
@@ -1167,13 +1215,17 @@ export const emailSend: RegisteredTool = buildTool({
       .min(1)
       .max(64)
       .optional()
-      .describe("NAME of the environment variable holding the SMTP username"),
+      .describe(
+        "NAME of the environment variable holding the SMTP username, listed in tool_config.notify.allowed_secret_envs",
+      ),
     passwordEnv: z
       .string()
       .min(1)
       .max(64)
       .optional()
-      .describe("NAME of the environment variable holding the SMTP password"),
+      .describe(
+        "NAME of the environment variable holding the SMTP password, listed in tool_config.notify.allowed_secret_envs",
+      ),
     authMethod: z
       .enum(["plain", "login", "auto"])
       .optional()
@@ -1230,9 +1282,9 @@ export const emailSend: RegisteredTool = buildTool({
       if (args.usernameEnv === undefined || args.passwordEnv === undefined) {
         return notSentBecause("set both usernameEnv and passwordEnv, or neither");
       }
-      const user = resolveSecret(args.usernameEnv, "the SMTP username");
+      const user = resolveSecret(args.usernameEnv, "the SMTP username", cfg.allowedSecretEnvs);
       if (!user.ok) return notSentBecause(user.message);
-      const pass = resolveSecret(args.passwordEnv, "the SMTP password");
+      const pass = resolveSecret(args.passwordEnv, "the SMTP password", cfg.allowedSecretEnvs);
       if (!pass.ok) return notSentBecause(pass.message);
       username = user.value;
       password = pass.value;
@@ -1614,7 +1666,7 @@ export const webhookPost: RegisteredTool = buildTool({
       .max(64)
       .optional()
       .describe(
-        "NAME of an environment variable holding the URL, for an endpoint whose path is itself a secret",
+        "NAME of an environment variable holding the URL, for an endpoint whose path is itself a secret; it must be listed in tool_config.notify.allowed_secret_envs",
       ),
     payload: z
       .union([z.record(z.unknown()), z.array(z.unknown()), z.string()])
@@ -1705,10 +1757,11 @@ export const webhookPost: RegisteredTool = buildTool({
     if ((args.url === undefined) === (args.urlEnv === undefined)) {
       return notSentBecause("give exactly one of url or urlEnv");
     }
+    const allowedEnvs = resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs;
     const urlSecrets: string[] = [];
     let url: URL;
     if (args.urlEnv !== undefined) {
-      const resolved = webhookUrlFrom(args.urlEnv);
+      const resolved = webhookUrlFrom(args.urlEnv, allowedEnvs);
       if (typeof resolved === "string") return notSentBecause(resolved);
       url = resolved.url;
       urlSecrets.push(resolved.secret, resolved.url.pathname);
@@ -1724,13 +1777,14 @@ export const webhookPost: RegisteredTool = buildTool({
     const headerPrep = prepareHeaders(
       { "content-type": "application/json", ...(args.headers ?? {}) },
       args.auth,
+      allowedEnvs,
     );
     if (!headerPrep.ok) return notSentBecause(headerPrep.message);
     const headers = headerPrep.headers;
     const secrets = [...urlSecrets, ...headerPrep.secrets];
 
     if (args.signing !== undefined) {
-      const secret = resolveSecret(args.signing.secretEnv, "the signing secret");
+      const secret = resolveSecret(args.signing.secretEnv, "the signing secret", allowedEnvs);
       if (!secret.ok) return notSentBecause(secret.message);
       secrets.push(secret.value);
       if (args.signing.scheme === "timestamped" && args.signing.timestampSeconds === undefined) {
@@ -1871,7 +1925,7 @@ function buildProviderCall(
     return { ok: false, message: `provider "${providerName}" has an unusable endpoint` };
 
   const headers: Record<string, string> = {};
-  const applied = applyAuth(headers, profile.auth);
+  const applied = applyAuth(headers, profile.auth, providerAuthEnvs(profile));
   if (!applied.ok) return { ok: false, message: applied.message };
   if (idempotencyKey !== undefined && profile.idempotencyHeader !== undefined) {
     headers[profile.idempotencyHeader] = idempotencyKey;
@@ -2120,7 +2174,7 @@ export const deliveryCheck: RegisteredTool = buildTool({
       return `provider "${args.provider}" has an unusable statusEndpoint`;
 
     const headers: Record<string, string> = {};
-    const applied = applyAuth(headers, profile.auth);
+    const applied = applyAuth(headers, profile.auth, providerAuthEnvs(profile));
     if (!applied.ok) return applied.message;
 
     const cfgForCall: NotifyConfig = cfg;
