@@ -655,6 +655,14 @@ export const TEXT_TOOLS: ReadonlyArray<RegisteredTool> = Object.freeze([
  * parsers means two numberings, one of which is wrong. This is the same
  * reason `@crewhaus/tool-code` exports its lockfile readers beside its tools.
  */
+/**
+ * The ATX heading reader and the offset-to-line index, re-exported so a
+ * package that reports "line 12" of a Markdown file, or reads its headings,
+ * asks the same code this one does (`@crewhaus/tool-verify` does both).
+ */
+export { parseAtxHeading } from "./lib/markdown";
+export { lineStarts, offsetToLineCol } from "./lib/locate";
+
 export {
   type DiffFileStatus,
   type DiffLineKind,

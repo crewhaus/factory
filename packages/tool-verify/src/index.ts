@@ -29,6 +29,7 @@ import {
   textOf,
 } from "@crewhaus/tool-html";
 import { openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { describeRegexOutcome, openRegexSession, runRegex } from "@crewhaus/tool-safety/regex";
 import { textSimilarity } from "@crewhaus/tool-text";
 import { z } from "zod";
 import {
@@ -40,7 +41,14 @@ import {
   lintCitations,
   splitLinkTarget,
 } from "./lib/markdown";
-import { NORMALIZERS, type Normalizer, firstDifferences, normalizeOutput } from "./lib/normalize";
+import {
+  NORMALIZERS,
+  type NormalizeOptions,
+  type Normalizer,
+  ReplaceRuleError,
+  firstDifferences,
+  normalizeOutput,
+} from "./lib/normalize";
 import {
   LONG_SENTENCE_WORDS,
   SCHEMA_RULES,
@@ -80,6 +88,11 @@ import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot
 
 const json = (value: unknown): string => JSON.stringify(value);
 
+/** Longest file body a caller's `fileMatches` pattern runs over, in characters. */
+const MATCH_INPUT_CHARS = 16 * 1024 * 1024;
+/** How long one `fileMatches` pattern may run before the check is undetermined. */
+const MATCH_DEADLINE_MS = 5_000;
+
 const LIMITS = {
   files: 20_000,
   fileBytes: 256 * 1024 * 1024,
@@ -116,11 +129,24 @@ function filesUnder(root: string, rel = "", out: string[] = []): string[] {
 const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
 
 function readCapped(abs: string, what: string): Buffer {
-  const size = statSync(abs).size;
+  const stat = statSync(abs);
+  // Opening a FIFO blocks until something writes to it, and a directory
+  // throws an error nobody catches: neither is a file to compare or hash.
+  if (!stat.isFile()) throw new Error(`${what} is not a regular file`);
+  const size = stat.size;
   if (size > LIMITS.fileBytes) {
     throw new Error(`${what} is ${size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
   }
   return readFileSync(abs);
+}
+
+/** The regex context a tool call hands to caller patterns: its abort signal and session. */
+function regexContext(ctx: unknown): NonNullable<NormalizeOptions["regex"]> {
+  const c = ctx as { signal?: AbortSignal; runContext?: { sessionId?: string } } | undefined;
+  return {
+    ...(c?.signal === undefined ? {} : { signal: c.signal }),
+    ...(c?.runContext?.sessionId === undefined ? {} : { runawayKey: c.runContext.sessionId }),
+  };
 }
 
 const normalizerField = z
@@ -156,92 +182,128 @@ export const goldenCompare: RegisteredTool = buildTool({
     }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const root = workspaceRoot();
-    const apply = (input.normalize ?? []) as ReadonlyArray<Normalizer>;
-    const goldenAt = resolveSafe("GoldenCompare", input.golden);
-    const maxDiffLines = input.maxDiffLines ?? 20;
-
-    const isTree =
-      input.actualFile !== undefined &&
-      (() => {
-        try {
-          return statSync(
-            resolveSafe("GoldenCompare", input.actualFile as string).real,
-          ).isDirectory();
-        } catch {
-          return false;
-        }
-      })();
-
-    if (isTree) {
-      const actualAt = resolveSafe("GoldenCompare", input.actualFile as string);
-      let goldenFiles: string[];
-      try {
-        goldenFiles = filesUnder(goldenAt.real);
-      } catch {
-        return `the golden directory "${goldenAt.rel}" does not exist — create it with GoldenUpdate once the output is right`;
-      }
-      const actualFiles = filesUnder(actualAt.real);
-      const added = actualFiles.filter((f) => !goldenFiles.includes(f));
-      const removed = goldenFiles.filter((f) => !actualFiles.includes(f));
-      const changed: string[] = [];
-      for (const file of goldenFiles.filter((f) => actualFiles.includes(f))) {
-        const a = normalizeOutput(readCapped(join(goldenAt.real, file), file).toString("utf-8"), {
-          apply,
-          root,
-          replace: input.replace,
-        }).text;
-        const b = normalizeOutput(readCapped(join(actualAt.real, file), file).toString("utf-8"), {
-          apply,
-          root,
-          replace: input.replace,
-        }).text;
-        if (a !== b) changed.push(file);
-      }
-      return json({
-        mode: "tree",
-        golden: goldenAt.rel,
-        actual: actualAt.rel,
-        match: added.length === 0 && removed.length === 0 && changed.length === 0,
-        fileCount: actualFiles.length,
-        added,
-        removed,
-        changed,
-      });
-    }
-
-    let goldenText: string;
+  execute: async (input, ctx) => {
+    // One worker for every caller rule over every file of this call.
+    const session = input.replace === undefined ? undefined : openRegexSession();
     try {
-      goldenText = readCapped(goldenAt.real, goldenAt.rel).toString("utf-8");
-    } catch {
-      return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+      return await goldenCompareRun(input, {
+        ...regexContext(ctx),
+        ...(session === undefined ? {} : { session }),
+      });
+    } catch (err) {
+      if (err instanceof ReplaceRuleError) {
+        return `GoldenCompare could not compare, so this is not a verdict: ${err.message}`;
+      }
+      throw err;
+    } finally {
+      session?.close();
     }
-    const actualRaw =
-      input.actual ??
-      readCapped(resolveSafe("GoldenCompare", input.actualFile as string).real, "actual").toString(
-        "utf-8",
-      );
-
-    const expected = normalizeOutput(goldenText, { apply, root, replace: input.replace });
-    const actual = normalizeOutput(actualRaw, { apply, root, replace: input.replace });
-    const match = expected.text === actual.text;
-
-    return json({
-      mode: "text",
-      golden: goldenAt.rel,
-      match,
-      normalized: actual.applied,
-      ...(match
-        ? {}
-        : {
-            differences: firstDifferences(expected.text, actual.text, maxDiffLines),
-            expectedLines: expected.text.split("\n").length,
-            actualLines: actual.text.split("\n").length,
-          }),
-    });
   },
 });
+
+async function goldenCompareRun(
+  input: {
+    actual?: string | undefined;
+    actualFile?: string | undefined;
+    golden: string;
+    normalize?: ReadonlyArray<string> | undefined;
+    replace?: NormalizeOptions["replace"] | undefined;
+    maxDiffLines?: number | undefined;
+  },
+  regex: NonNullable<NormalizeOptions["regex"]>,
+): Promise<string> {
+  const root = workspaceRoot();
+  const apply = (input.normalize ?? []) as ReadonlyArray<Normalizer>;
+  const goldenAt = resolveSafe("GoldenCompare", input.golden);
+  const maxDiffLines = input.maxDiffLines ?? 20;
+  const options: NormalizeOptions = {
+    apply,
+    root,
+    ...(input.replace === undefined ? {} : { replace: input.replace }),
+    regex,
+  };
+
+  const isTree =
+    input.actualFile !== undefined &&
+    (() => {
+      try {
+        return statSync(
+          resolveSafe("GoldenCompare", input.actualFile as string).real,
+        ).isDirectory();
+      } catch {
+        return false;
+      }
+    })();
+
+  if (isTree) {
+    const actualAt = resolveSafe("GoldenCompare", input.actualFile as string);
+    let goldenFiles: string[];
+    try {
+      goldenFiles = filesUnder(goldenAt.real);
+    } catch {
+      return `the golden directory "${goldenAt.rel}" does not exist — create it with GoldenUpdate once the output is right`;
+    }
+    const actualFiles = filesUnder(actualAt.real);
+    const added = actualFiles.filter((f) => !goldenFiles.includes(f));
+    const removed = goldenFiles.filter((f) => !actualFiles.includes(f));
+    const changed: string[] = [];
+    for (const file of goldenFiles.filter((f) => actualFiles.includes(f))) {
+      const a = (
+        await normalizeOutput(
+          readCapped(join(goldenAt.real, file), file).toString("utf-8"),
+          options,
+        )
+      ).text;
+      const b = (
+        await normalizeOutput(
+          readCapped(join(actualAt.real, file), file).toString("utf-8"),
+          options,
+        )
+      ).text;
+      if (a !== b) changed.push(file);
+    }
+    return json({
+      mode: "tree",
+      golden: goldenAt.rel,
+      actual: actualAt.rel,
+      match: added.length === 0 && removed.length === 0 && changed.length === 0,
+      fileCount: actualFiles.length,
+      added,
+      removed,
+      changed,
+    });
+  }
+
+  let goldenText: string;
+  try {
+    goldenText = readCapped(goldenAt.real, goldenAt.rel).toString("utf-8");
+  } catch {
+    return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+  }
+  const actualRaw =
+    input.actual ??
+    readCapped(resolveSafe("GoldenCompare", input.actualFile as string).real, "actual").toString(
+      "utf-8",
+    );
+
+  const expected = await normalizeOutput(goldenText, options);
+  const actual = await normalizeOutput(actualRaw, options);
+  const match = expected.text === actual.text;
+
+  return json({
+    mode: "text",
+    golden: goldenAt.rel,
+    match,
+    normalized: actual.applied,
+    ...(match
+      ? {}
+      : {
+          differences: firstDifferences(expected.text, actual.text, maxDiffLines),
+          expectedLines: expected.text.split("\n").length,
+          actualLines: actual.text.split("\n").length,
+        }),
+  });
+}
 
 export const goldenUpdate: RegisteredTool = buildTool({
   name: "GoldenUpdate",
@@ -260,13 +322,20 @@ export const goldenUpdate: RegisteredTool = buildTool({
   destructive: true,
   requireJustification: true,
   concurrencySafe: false,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const at = resolveSafe("GoldenUpdate", input.golden);
-    const normalized = normalizeOutput(input.actual, {
-      apply: (input.normalize ?? []) as ReadonlyArray<Normalizer>,
-      root: workspaceRoot(),
-      replace: input.replace,
-    });
+    let normalized: Awaited<ReturnType<typeof normalizeOutput>>;
+    try {
+      normalized = await normalizeOutput(input.actual, {
+        apply: (input.normalize ?? []) as ReadonlyArray<Normalizer>,
+        root: workspaceRoot(),
+        ...(input.replace === undefined ? {} : { replace: input.replace }),
+        regex: regexContext(ctx),
+      });
+    } catch (err) {
+      if (err instanceof ReplaceRuleError) return `GoldenUpdate wrote nothing: ${err.message}`;
+      throw err;
+    }
     const root = workspaceRoot();
     // The old golden, read no further than one byte past the new one: that is
     // enough to say whether it changed, and a FIFO or a link out of the
@@ -427,8 +496,24 @@ export const acceptanceCheck: RegisteredTool = buildTool({
     .strict(),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const results = input.checks.map((check, index) => {
+  execute: async (input, ctx) => {
+    const regex = regexContext(ctx);
+    type CheckResult = {
+      index: number;
+      check: string;
+      ok: boolean;
+      detail: string;
+      undetermined?: true;
+    };
+    const results: CheckResult[] = [];
+    for (const [index, check] of input.checks.entries()) {
+      results.push(await runCheck(check, index));
+    }
+
+    async function runCheck(
+      check: (typeof input.checks)[number],
+      index: number,
+    ): Promise<CheckResult> {
       const label = `${check.kind}(${check.path})`;
       let exists = false;
       let body: string | null = null;
@@ -478,22 +563,44 @@ export const acceptanceCheck: RegisteredTool = buildTool({
         default: {
           if (body === null)
             return { index, check: label, ok: false, detail: "the file could not be read" };
-          let re: RegExp;
-          try {
-            re = new RegExp(check.pattern, check.flags ?? "");
-          } catch (err) {
+          // The caller's pattern runs in a worker under a deadline, never on
+          // this thread; a check it cannot answer fails closed and says so,
+          // never "does not match".
+          if (body.length > MATCH_INPUT_CHARS) {
             return {
               index,
               check: label,
               ok: false,
-              detail: `invalid pattern: ${(err as Error).message}`,
+              undetermined: true,
+              detail: `could not verify: the file has ${body.length} characters, more than the ${MATCH_INPUT_CHARS} a pattern is run over`,
             };
           }
-          const hit = re.test(body);
+          const outcome = await runRegex({
+            op: "test",
+            pattern: check.pattern,
+            flags: check.flags ?? "",
+            input: body,
+            deadlineMs: MATCH_DEADLINE_MS,
+            maxInputChars: MATCH_INPUT_CHARS,
+            ...regex,
+          });
+          if (outcome.status === "rejected") {
+            return { index, check: label, ok: false, detail: `invalid pattern: ${outcome.reason}` };
+          }
+          if (outcome.status !== "ok") {
+            return {
+              index,
+              check: label,
+              ok: false,
+              undetermined: true,
+              detail: `could not verify: ${describeRegexOutcome(outcome)}`,
+            };
+          }
+          const hit = outcome.result.matched;
           return { index, check: label, ok: hit, detail: hit ? "" : "the pattern does not match" };
         }
       }
-    });
+    }
 
     const failed = results.filter((r) => !r.ok);
     return json({
@@ -531,6 +638,9 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
     const root = isDir ? at.real : dirname(at.real);
 
     const broken: Array<{ file: string; line: number; href: string; reason: string }> = [];
+    // Anchors of each target document, computed once however many links
+    // point at it: fifty links into one README used to parse it fifty times.
+    const anchorsOf = new Map<string, Set<string>>();
     let checked = 0;
     let external = 0;
     const limit = input.limit ?? 500;
@@ -604,7 +714,21 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
           continue;
         }
         if (input.checkAnchors && fragment !== undefined && /\.(md|mdx|markdown)$/i.test(target)) {
-          const targetAnchors = headingAnchors(readCapped(targetAt.real, target).toString("utf-8"));
+          let targetAnchors = anchorsOf.get(targetAt.real);
+          if (targetAnchors === undefined) {
+            try {
+              targetAnchors = headingAnchors(readCapped(targetAt.real, target).toString("utf-8"));
+            } catch (err) {
+              broken.push({
+                file: label,
+                line: link.line,
+                href: link.href,
+                reason: `the target could not be read: ${(err as Error).message}`,
+              });
+              continue;
+            }
+            anchorsOf.set(targetAt.real, targetAnchors);
+          }
           if (!targetAnchors.has(fragment.toLowerCase())) {
             broken.push({
               file: label,

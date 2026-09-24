@@ -35,6 +35,24 @@ not a hash.
 Absolute paths are replaced first, because a temporary directory carries
 digits a later rule would mask, leaving the path unrecognisable.
 
+## A caller's pattern never runs on the harness thread
+
+A `replace` rule's pattern and an `AcceptanceCheck` `fileMatches` pattern
+are screened for the shapes that backtrack exponentially (`(a+)+`, `(a|a)*`)
+and refused with the reason, then run in a worker that is stopped at a
+deadline (5 s). A pattern that is slow in a way no screen can see (`a*a*a*b`
+over a long file) is stopped too. A check that could not be answered fails
+closed with `undetermined: true` and "could not verify", never "does not
+match"; a replace rule that could not be applied makes GoldenCompare say it
+could not compare, and GoldenUpdate write nothing. A `fileMatches` pattern
+runs over at most 16 Mi characters of a file. The `with` of a replace rule
+is literal text, as it always was.
+
+The Markdown readers behind `MarkdownLinkCheck`, `CitationLint` and
+`FactCrossCheck` are linear in the document, whatever it holds. Headings are
+read as CommonMark reads them, through the same reader as `MarkdownOutline`:
+the `#` run must be followed by a space or tab on the same line.
+
 ## Failure modes are kept apart
 
 A tool that collapses distinct problems into one boolean makes the caller

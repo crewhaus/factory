@@ -22,6 +22,7 @@ import { compactLogLines, looksLikeError, stripTimestamps } from "./lib/log";
 import {
   codeBlocks,
   markdownTable,
+  parseAtxHeading,
   parseHeadings,
   renderOutline,
   sectionBody,
@@ -818,6 +819,28 @@ describe("markdown", () => {
   test("a hash inside a fenced block is not a heading", () => {
     expect(parseHeadings(doc).some((h) => h.title === "not a heading")).toBe(false);
   });
+
+  test("the heading reader follows CommonMark on the closing sequence and the space", () => {
+    expect(parseAtxHeading("## Title ##")).toEqual({ depth: 2, title: "Title" });
+    // A closing run needs a space before it; 0.7.0 read this as "C".
+    expect(parseAtxHeading("# C#")).toEqual({ depth: 1, title: "C#" });
+    expect(parseAtxHeading("# Foo#bar")).toEqual({ depth: 1, title: "Foo#bar" });
+    expect(parseAtxHeading("#\tTabbed #")).toEqual({ depth: 1, title: "Tabbed" });
+    expect(parseAtxHeading("# Crlf\r")).toEqual({ depth: 1, title: "Crlf" });
+    expect(parseAtxHeading("#NoSpace")).toBeNull();
+    expect(parseAtxHeading("####### seven")).toBeNull();
+    expect(parseAtxHeading("# ###")).toBeNull();
+    // A lone `#` does not take the next line as its title.
+    expect(parseHeadings("#\nnot a heading").map((h) => h.title)).toEqual([]);
+  });
+
+  test("a heading with a long run of spaces is read in linear time", () => {
+    // 0.7.0's `/^(#{1,6})\s+(.+?)\s*#*\s*$/` took 1.5 s at 2,000 spaces.
+    const t0 = performance.now();
+    const h = parseHeadings(`# a${" ".repeat(20_000)}b ##`);
+    expect(performance.now() - t0).toBeLessThan(1_000);
+    expect(h[0]?.title).toBe(`a${" ".repeat(20_000)}b`);
+  }, 60_000);
 
   test("slugify matches the GitHub anchor shape", () => {
     expect(slugify("Hello, World!")).toBe("hello-world");
