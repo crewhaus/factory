@@ -15,6 +15,7 @@ import { basename, delimiter, dirname, join, resolve as resolvePath, sep } from 
 import { CrewhausError } from "@crewhaus/errors";
 import { type PluginRegistry, createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
+  PLUGIN_TOOL_NAME_PATTERN,
   type PluginChannelAdapter,
   type PluginContributions,
   type PluginGrader,
@@ -971,9 +972,6 @@ function shown(value: unknown): string {
   return `${typeof value} ${String(value)}`;
 }
 
-/** The names every model provider accepts for a tool. */
-const PLUGIN_TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
-
 /** The flags every consumer reads as booleans (`=== true`, or truthiness). */
 const TOOL_FLAG_FIELDS = [
   "concurrencySafe",
@@ -989,7 +987,7 @@ function pluginToolNameProblem(tool: unknown): string | undefined {
   if (!isPlainObject(tool)) return `is ${shown(tool)}, not a tool definition`;
   const name = tool["name"];
   if (typeof name !== "string") return `has no name (name is ${shown(name)})`;
-  if (!PLUGIN_TOOL_NAME.test(name)) {
+  if (!PLUGIN_TOOL_NAME_PATTERN.test(name)) {
     return `name ${JSON.stringify(name)} must be 1-64 letters, digits, "_" or "-", the names model providers accept`;
   }
   return undefined;
@@ -1115,6 +1113,65 @@ function readContributions(moduleDefault: unknown): PluginContributions {
 }
 
 /**
+ * The imported code must be the plugin its manifest describes. A module whose
+ * default export says it is another plugin (`definePlugin({ name })`) is the
+ * wrong code at this path, and is refused. A differing version or
+ * permissions block is only noted — the manifest is what crewhaus goes by —
+ * and the note is returned.
+ */
+function moduleIdentity(plugin: LoadedPlugin): string | undefined {
+  const declared = plugin.module.default;
+  if (!isPlainObject(declared)) return undefined;
+  const { name, version } = plugin.manifest;
+  if (typeof declared["name"] === "string" && declared["name"] !== name) {
+    throw new PluginLoaderError(
+      `plugin "${name}": its code says it is plugin ${JSON.stringify(declared["name"])}, so the index.js beside "${name}"'s manifest is another plugin's code — refusing to load it`,
+    );
+  }
+  const differs: string[] = [];
+  if (typeof declared["version"] === "string" && declared["version"] !== version) {
+    differs.push(`version ${declared["version"]} (the manifest says ${version})`);
+  }
+  if (declared["permissions"] !== undefined) {
+    let same = false;
+    try {
+      same =
+        canonicalJson(declared["permissions"]) === canonicalJson(plugin.manifest.permissions ?? {});
+    } catch {
+      same = false;
+    }
+    if (!same) differs.push("permissions that differ from the manifest's");
+  }
+  if (differs.length === 0) return undefined;
+  return `plugin "${name}": its code declares ${differs.join(" and ")}. The manifest is what crewhaus goes by; rebuild the plugin so they agree.`;
+}
+
+/**
+ * Why a plugin's contributed tools are not the ones its manifest's
+ * `provides.tools` lists, or undefined when they are (or it lists none).
+ */
+function providesMismatch(
+  manifest: PluginManifest,
+  contributed: ReadonlyArray<unknown>,
+): string | undefined {
+  const listed = manifest.provides?.tools;
+  if (listed === undefined) return undefined;
+  const names = contributed
+    .map((t) => (isPlainObject(t) ? t["name"] : undefined))
+    .filter((n): n is string => typeof n === "string");
+  const quoted = (xs: ReadonlyArray<string>) => xs.map((x) => JSON.stringify(x)).join(", ");
+  const extra = names.filter((n) => !listed.includes(n));
+  if (extra.length > 0) {
+    return `its code contributes ${quoted(extra)}, which its manifest's provides.tools does not list`;
+  }
+  const missing = listed.filter((n) => !names.includes(n));
+  if (missing.length > 0) {
+    return `its manifest's provides.tools lists ${quoted(missing)}, which its code does not contribute`;
+  }
+  return undefined;
+}
+
+/**
  * Item 3 (G32) — activate the named plugins and collect their contributions.
  * This is the wiring that closes §41 `plugin-loader`'s previously zero-caller
  * `load` path: for each name it resolves the pinned §42 `plugin-registry`
@@ -1176,11 +1233,27 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
       );
     }
     loaded.push(plugin);
+    const moduleNote = moduleIdentity(plugin);
+    if (moduleNote !== undefined) note(moduleNote);
+    const unenforced = (["fs", "net", "secrets"] as const).filter(
+      (k) => plugin.permissions[k] !== undefined,
+    );
+    if (unenforced.length > 0) {
+      note(
+        `plugin "${name}" declares ${unenforced.map((k) => `permissions.${k}`).join(", ")}; crewhaus does not enforce ${unenforced.length === 1 ? "it" : "these"} on plugin code, which runs inside this process with its full authority (environment, files, network). Only permissions.tools is applied.`,
+      );
+    }
     const contributions = readContributions(plugin.module.default);
     const contributed = contributions.tools ?? [];
     if (!Array.isArray(contributed)) {
       throw new PluginLoaderError(
         `plugin "${name}": contributions.tools is ${shown(contributed)}, not a list of tools — refusing to load the plugin`,
+      );
+    }
+    const providesProblem = providesMismatch(plugin.manifest, contributed);
+    if (providesProblem !== undefined) {
+      throw new PluginLoaderError(
+        `plugin "${name}": ${providesProblem} — refusing to load the plugin`,
       );
     }
     // Every tool is checked before any is kept: a malformed one refuses the

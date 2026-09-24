@@ -196,6 +196,15 @@ export type PluginManifest = {
    */
   readonly engines?: { readonly crewhaus?: string };
   readonly permissions?: PluginPermissions;
+  /**
+   * What the plugin's code contributes, listed in the manifest so it is
+   * signed and can be read before anything runs. When `provides.tools` is
+   * present, the plugin loads only if its code contributes exactly those
+   * tools — no more, no fewer. Optional: a manifest without it loads as
+   * before. (This makes the manifest the contract for what loads; it is not
+   * a sandbox: the code has already run by the time the list is compared.)
+   */
+  readonly provides?: { readonly tools?: ReadonlyArray<string> };
   readonly contributions?: PluginContributions;
   /**
    * Lowercase hex SHA-256 of the plugin's entrypoint (`index.js`). It is part
@@ -231,6 +240,8 @@ export type PluginManifest = {
 // ---------------------------------------------------------------------------
 
 const NAME_PATTERN = /^[a-z][a-z0-9-]{1,62}[a-z0-9]$/;
+/** A tool name every model provider accepts. */
+export const PLUGIN_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
 const SEMVER_PATTERN = /^\d+\.\d+\.\d+(?:-[\w.+-]+)?(?:\+[\w.-]+)?$/;
 
 function assertString(value: unknown, field: string): asserts value is string {
@@ -324,6 +335,25 @@ export function validatePluginManifest(m: unknown): PluginManifest {
     assertOptionalStringArray(p["net"], "permissions.net");
     assertOptionalStringArray(p["tools"], "permissions.tools");
     assertOptionalStringArray(p["secrets"], "permissions.secrets");
+  }
+
+  if (manifest["provides"] !== undefined) {
+    const provides = manifest["provides"];
+    if (provides === null || typeof provides !== "object" || Array.isArray(provides)) {
+      throw new PluginSdkError("plugin manifest: `provides` must be an object");
+    }
+    const tools = (provides as Record<string, unknown>)["tools"];
+    assertOptionalStringArray(tools, "provides.tools");
+    for (const tool of tools ?? []) {
+      if (!PLUGIN_TOOL_NAME_PATTERN.test(tool)) {
+        throw new PluginSdkError(
+          `plugin manifest: \`provides.tools\` entry ${JSON.stringify(tool)} must be 1-64 letters, digits, "_" or "-"`,
+        );
+      }
+    }
+    if (tools !== undefined && new Set(tools).size !== tools.length) {
+      throw new PluginSdkError("plugin manifest: `provides.tools` lists a tool twice");
+    }
   }
 
   if (manifest["signature"] !== undefined) {

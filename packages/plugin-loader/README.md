@@ -102,6 +102,28 @@ permission engine, the justification gate or the egress check, so name only
 tools the plugin may drive unchecked. `fs`, `net` and `secrets` are not
 enforced on plugin code.
 
+A manifest that declares `permissions.fs`, `net` or `secrets` gets a boot note
+saying they are not enforced, so nobody reads them as a sandbox.
+
+## The manifest is the contract
+
+The code must be the plugin its manifest describes: a module whose default
+export says it is another plugin (`definePlugin({ name: "other" })`) is
+refused. A differing version or `permissions` in the code is noted; the
+manifest is what crewhaus goes by.
+
+A manifest may list the tools its code contributes:
+
+```json
+{ "name": "my-plugin", "version": "1.0.0", "provides": { "tools": ["lookup"] } }
+```
+
+The list is signed with the manifest, so you can read it before anything
+runs. When it is there, the plugin loads only if its code contributes exactly
+those tools. It is not a sandbox — the code has run by the time the list is
+compared — but it makes a plugin that grew a tool its manifest never mentioned
+fail at boot. Without the list, a plugin loads as before.
+
 ## Tool definitions are checked at boot
 
 A plugin is JavaScript, so nothing typed its tools. Each one is checked before
