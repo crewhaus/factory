@@ -424,7 +424,7 @@ const chatTargetShape = {
     .max(64)
     .optional()
     .describe(
-      "NAME of the environment variable holding the bot token, for API mode; it must be listed in tool_config.notify.allowed_secret_envs",
+      "NAME of the environment variable holding the bot token, for API mode; it must be listed in tool_config.notify.allowed_secret_envs. It is sent as `Authorization: Bot <token>` to Discord and `Authorization: Bearer <token>` to Slack",
     ),
   channel: z
     .string()
@@ -520,12 +520,17 @@ function routeChat(
         "a channel, message id or emoji in this call would change which API endpoint is requested, not just name the item",
     };
   }
+  // Discord authenticates a bot token with the `Bot` scheme; `Bearer` there
+  // means an OAuth2 user token, which cannot post, edit, delete or react as
+  // the bot, so every Discord API-mode call answered 401. Slack's bot token
+  // is a Bearer token.
+  const scheme = target.platform === "discord" ? "Bot" : "Bearer";
   return {
     ok: true,
     url,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      Authorization: `Bearer ${token.value}`,
+      Authorization: `${scheme} ${token.value}`,
     },
     secrets: [token.value],
     secretHeaders: new Set(["authorization"]),

@@ -128,6 +128,10 @@ only for that provider's calls.
 { "platform": "slack", "webhookUrlEnv": "SLACK_OPS_WEBHOOK", "text": "…" }
 ```
 
+In API mode (`apiBaseUrl` plus `tokenEnv`) the variable holds a bot token.
+Discord receives it as `Authorization: Bot <token>` and Slack as
+`Authorization: Bearer <token>`, which is what each platform expects of a bot.
+
 A Slack incoming-webhook URL (`/services/T…/B…/…`) and a Discord one
 (`/api/webhooks/<id>/<token>`) carry their whole authority in the **path**, so
 the URL is itself a credential: it is named rather than passed, and no error

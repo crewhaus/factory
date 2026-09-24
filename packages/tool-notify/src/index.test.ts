@@ -769,6 +769,35 @@ describe("ChatUpdate, ChatDelete and ChatReact", () => {
     expect(requests[0]?.pathname).toBe("/api/channels/555/messages/999");
   });
 
+  test("Discord takes its bot token with the Bot scheme on every API-mode call; Slack keeps Bearer", async () => {
+    const discord = {
+      platform: "discord",
+      apiBaseUrl: `${origin}/api/v10`,
+      tokenEnv: TOKEN_VAR,
+      channel: "555",
+    };
+    const outputs = [
+      await chatPost.execute({ ...discord, text: "hello" }),
+      await chatUpdate.execute({ ...discord, messageId: "999", text: "edited" }),
+      await chatDelete.execute({ ...discord, messageId: "999" }),
+      await chatReact.execute({ ...discord, messageId: "999", emoji: "white_check_mark" }),
+    ].map(String);
+    // 0.7.0 sent "Bearer <token>" here, which Discord reads as an OAuth2 user
+    // token and answers 401 for every one of these calls.
+    expect(requests.map((r) => `${r.method} ${r.pathname} ${r.headers["authorization"]}`)).toEqual([
+      "POST /api/v10/channels/555/messages Bot xoxb-test-token-value-1234",
+      "PATCH /api/v10/channels/555/messages/999 Bot xoxb-test-token-value-1234",
+      "DELETE /api/v10/channels/555/messages/999 Bot xoxb-test-token-value-1234",
+      "PUT /api/v10/channels/555/messages/999/reactions/white_check_mark/@me Bot xoxb-test-token-value-1234",
+    ]);
+    // The scheme changed; the redaction did not.
+    expect(outputs.filter((o) => o.includes("xoxb-test-token-value-1234"))).toEqual([]);
+
+    requests.length = 0;
+    await chatDelete.execute({ platform: "slack", ...api(), messageId: "1758100000.000100" });
+    expect(requests[0]?.headers["authorization"]).toBe("Bearer xoxb-test-token-value-1234");
+  });
+
   test("REFUSAL: Teams cannot be edited, and says so instead of reposting", async () => {
     const result = String(
       await chatUpdate.execute({
