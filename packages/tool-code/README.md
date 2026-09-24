@@ -35,7 +35,7 @@ tools:
 | `SymbolOutline` | What one file declares, with line ranges — read the outline, then the part you need |
 | `TestFailureSummary` | The failures out of test output you already have; runs nothing |
 | `TodoScan` | TODO / FIXME / HACK / XXX notes from comments, with author and position |
-| `Typecheck` | Type check in no-emit mode, as diagnostics |
+| `Typecheck` | Type check in no-emit mode, as diagnostics; tsc's build info goes to a temp file, not the project |
 | `WorkspacePackages` | Monorepo members and their interdependencies, with cycles |
 
 ## Machine-readable by preference
@@ -162,6 +162,16 @@ report as a clean result.
   toolchain needs (`PATH`, `CARGO_HOME`, `GOPATH`, `VIRTUAL_ENV`, proxies, CA
   bundles) is kept. The destructive runners keep the full environment: a
   person approved them, and a test suite may need its `DATABASE_URL`.
+- **What a checker writes.** No-emit is not no-write: `tsc --noEmit` still
+  writes `.tsbuildinfo` for an incremental or composite project — beside the
+  tsconfig, into a `dist/` it creates, or wherever a committed
+  `tsBuildInfoFile` points, which can be outside the workspace. `Typecheck`
+  and `Diagnostics` therefore pass tsc `--incremental --tsBuildInfoFile` with
+  a per-user temp file keyed by the project (so a repeat run stays
+  incremental), mypy `--cache-dir=/dev/null`, and ruff `--no-cache`. The
+  `command` in a result shows the temp file as
+  `<tmp>/crewhaus-typecheck.tsbuildinfo`. TypeScript older than 4.0 rejects
+  `--incremental` with `--noEmit`, and reports that as a diagnostic.
 - **Bounds.** Every spawn carries a deadline (SIGTERM, then SIGKILL) and reads
   its pipes through a cap, so a runner that prints a gigabyte costs a bounded
   amount of *memory*, not just bounded output. `Diagnostics` spends ONE

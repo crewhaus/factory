@@ -26,7 +26,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type RuleSet, evaluate } from "@crewhaus/permission-engine";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { detectFormat, detectLint, detectPackageManager, detectTests, isMissing } from "./detect";
+import {
+  detectFormat,
+  detectLint,
+  detectPackageManager,
+  detectTests,
+  detectTypecheck,
+  isMissing,
+} from "./detect";
 import {
   CODE_TOOLS,
   astQuery,
@@ -296,6 +303,10 @@ describe("diagnostic tools against the project's own toolchain", () => {
     // wherever it is checked out.
     expect(result["command"]).toContain("node_modules/.bin/tsc --noEmit");
     expect(String(result["command"]).startsWith("/")).toBe(false);
+    // The temp build-info file is shown as a placeholder, so the command
+    // still names no path on this machine (C150).
+    expect(result["command"]).toContain("--tsBuildInfoFile <tmp>/crewhaus-typecheck.tsbuildinfo");
+    expect(String(result["command"])).not.toContain(tmpdir());
   }, 20_000);
 
   test("Typecheck on a clean run returns zero errors and no noise", async () => {
@@ -1210,6 +1221,30 @@ describe("toolchain detection", () => {
     const formatter = detectFormat(workspace, workspace, true);
     expect(formatter).toMatchObject({ tool: "gofmt" });
     expect((formatter as { argv: string[] }).argv).toEqual(["gofmt", "-w"]);
+  });
+
+  test("no checker is told to keep its cache in the project (C150)", () => {
+    write("tsconfig.json", "{}");
+    installBinary("tsc", "exit 0");
+    const tsc = (detectTypecheck(workspace, workspace) as { argv: string[] }).argv;
+    const at = tsc.indexOf("--tsBuildInfoFile");
+    expect(at).toBeGreaterThan(0);
+    expect(tsc).toContain("--incremental");
+    expect(tsc).toContain("--noEmit");
+    const info = tsc[at + 1] as string;
+    expect(info.startsWith(realpathSync(tmpdir())) || info.startsWith(tmpdir())).toBe(true);
+    expect(info.startsWith(workspace)).toBe(false);
+    rmSync(join(workspace, "tsconfig.json"));
+
+    write("pyproject.toml", "[tool.ruff]\n");
+    installBinary("mypy", "exit 0");
+    installBinary("ruff", "exit 0");
+    const mypy = (detectTypecheck(workspace, workspace) as { argv: string[] }).argv;
+    expect(mypy).toContain("--cache-dir=/dev/null");
+    expect((detectLint(workspace, workspace) as { argv: string[] }).argv).toContain("--no-cache");
+    expect((detectFormat(workspace, workspace, false) as { argv: string[] }).argv).toContain(
+      "--no-cache",
+    );
   });
 
   test("a configured node tool with no local install is reported as missing", () => {

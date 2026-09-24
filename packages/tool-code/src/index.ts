@@ -723,7 +723,7 @@ export const typecheck: RegisteredTool = buildTool({
   name: "Typecheck",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode, and there is no way to point this tool at a different program; RunBuild is where an arbitrary command belongs. The checker and its plugins are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
+    "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode with its incremental cache in a temp directory rather than the project, and there is no way to point this tool at a different program; RunBuild is where an arbitrary command belongs. The checker and its plugins are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
@@ -965,7 +965,7 @@ export const diagnostics: RegisteredTool = buildTool({
   name: "Diagnostics",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and no source file is rewritten. Each checker is the project's own code (a cargo build may also write its target directory), so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
+    "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and no source file is rewritten; tsc's, mypy's and ruff's caches are kept out of the project. Each checker is the project's own code (a cargo build may also write its target directory), so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
   inputSchema: z.object({
     cwd: cwdField,
     include: z

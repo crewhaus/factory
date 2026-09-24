@@ -15,6 +15,7 @@
  * because there is nowhere else for them to come from.
  */
 import * as path from "node:path";
+import { typecheckBuildInfoFile } from "./lib/checker-cache";
 import { parsePackageJson } from "./lib/deps";
 import { type SkippedFile, fileExists, readTextFile } from "./walk";
 
@@ -251,10 +252,15 @@ export function detectBuild(
 /**
  * The project's type checker.
  *
- * `--noEmit` is not optional here and is not a caller's choice: `tsc -b` writes
- * `.tsbuildinfo` and, for a project without `noEmit`, a whole `dist`. A tool
- * that advertises itself as a read gets to stay one. `RunBuild` is where
- * emitting belongs.
+ * `--noEmit` is not optional here and is not a caller's choice: emitting
+ * belongs to `RunBuild`. And no-emit is not no-write: tsc still writes
+ * `.tsbuildinfo` for an incremental or composite project — next to the
+ * tsconfig, into a `dist/` it creates, or wherever a committed
+ * `tsBuildInfoFile` points, even outside the workspace. So the build info
+ * is sent to a per-user temp file keyed by the project (./lib/checker-cache,
+ * C150) with `--incremental --tsBuildInfoFile`, which the command line lets
+ * override the tsconfig. mypy gets `--cache-dir=/dev/null` (its documented
+ * way to write no cache) and ruff `--no-cache`, for the same reason.
  */
 export function detectTypecheck(
   dir: string,
@@ -264,8 +270,19 @@ export function detectTypecheck(
   if (tsconfig !== undefined) {
     const binary = localBinary(dir, root, "tsc");
     if (binary === undefined) return { missing: "typescript" };
+    const config = path.join(dir, tsconfig);
     return {
-      argv: [binary, "--noEmit", "--pretty", "false", "-p", path.join(dir, tsconfig)],
+      argv: [
+        binary,
+        "--noEmit",
+        "--incremental",
+        "--tsBuildInfoFile",
+        typecheckBuildInfoFile(config),
+        "--pretty",
+        "false",
+        "-p",
+        config,
+      ],
       tool: "tsc",
       reason: tsconfig,
     };
@@ -273,7 +290,12 @@ export function detectTypecheck(
   const mypy = localBinary(dir, root, "mypy");
   if (mypy !== undefined && fileExists(path.join(dir, "pyproject.toml"))) {
     return {
-      argv: [mypy, "--no-color-output", "--no-error-summary"],
+      argv: [
+        mypy,
+        "--no-color-output",
+        "--no-error-summary",
+        `--cache-dir=${process.platform === "win32" ? "nul" : "/dev/null"}`,
+      ],
       tool: "mypy",
       reason: "mypy installed",
     };
@@ -305,7 +327,7 @@ export function detectLint(dir: string, root: string): Toolchain | { missing: st
   ) {
     const binary = localBinary(dir, root, "ruff") ?? "ruff";
     return {
-      argv: [binary, "check", "--output-format", "json"],
+      argv: [binary, "check", "--no-cache", "--output-format", "json"],
       tool: "ruff",
       reason: "ruff configuration",
     };
@@ -371,7 +393,7 @@ export function detectFormat(
   ) {
     const binary = localBinary(dir, root, "ruff") ?? "ruff";
     return {
-      argv: write ? [binary, "format"] : [binary, "format", "--check"],
+      argv: write ? [binary, "format"] : [binary, "format", "--check", "--no-cache"],
       tool: "ruff",
       reason: "ruff configuration",
     };

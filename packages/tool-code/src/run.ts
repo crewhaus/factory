@@ -21,6 +21,7 @@
 import { statSync } from "node:fs";
 import * as path from "node:path";
 import { withoutCredentials } from "@crewhaus/tool-safety/env";
+import { CHECKER_CACHE_PLACEHOLDER, isCheckerCachePath } from "./lib/checker-cache";
 import { ToolPermissionError, resolveSafe } from "./paths";
 
 /** Default wall-clock budget for one toolchain invocation. */
@@ -456,7 +457,17 @@ export function truncationNote(run: RunResult, cap = MAX_OUTPUT_CHARS): string |
  */
 export function displayCommand(argv: readonly string[], root: string): string {
   const prefix = `${path.resolve(root)}${path.sep}`;
-  return argv.map((arg) => (arg.startsWith(prefix) ? relPosix(root, arg) : arg)).join(" ");
+  return argv
+    .map((arg) =>
+      // The checker's temp cache file names this machine's temp directory
+      // and a hash of this checkout's path: shown as a placeholder instead.
+      isCheckerCachePath(arg)
+        ? CHECKER_CACHE_PLACEHOLDER
+        : arg.startsWith(prefix)
+          ? relPosix(root, arg)
+          : arg,
+    )
+    .join(" ");
 }
 
 /** Slash-separated path relative to `root`, stable across operating systems. */
