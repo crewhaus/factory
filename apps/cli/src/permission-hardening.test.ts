@@ -282,6 +282,35 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
     expect(readFileSync(join(ws, "src", "app.ts"), "utf8")).toBe("original");
   });
 
+  test("a path deny fires on every spelling of the file it names (permission-integration#1, deny side)", async () => {
+    // The audit's deny-side escapes: `./`, `src/../`, a trailing `/.` and the
+    // absolute in-workspace path all reach the file a relative deny names.
+    const readRules = rules(["alwaysDeny", "Read(.env)"], ["alwaysAllow", "Read"]);
+    const envSpellings = ["./.env", "src/../.env", ".env/.", join(ws, ".env")];
+    for (const path of envSpellings) {
+      expect({ path, decision: await gate("Read", { path }, readRules) }).toEqual({
+        path,
+        decision: "deny",
+      });
+    }
+    const writeRules = rules(["alwaysDeny", "Write(.crewhaus/**)"], ["alwaysAllow", "Write"]);
+    const settingsSpellings = [
+      "./.crewhaus/settings.json",
+      "src/../.crewhaus/settings.json",
+      ".crewhaus//settings.json",
+      join(ws, ".crewhaus", "settings.json"),
+    ];
+    for (const path of settingsSpellings) {
+      expect({ path, decision: await gate("Write", { path, content: "{}" }, writeRules) }).toEqual({
+        path,
+        decision: "deny",
+      });
+    }
+    expect(existsSync(join(ws, ".crewhaus", "settings.json"))).toBe(false);
+    // Control: the bare allow still grants a file the deny does not name.
+    expect(await gate("Read", { path: "./src/app.ts" }, readRules)).toBe("allow");
+  }, 30_000);
+
   test("Grep(src/**) is not satisfied by a regex that names src/", async () => {
     expect(
       await gate(
