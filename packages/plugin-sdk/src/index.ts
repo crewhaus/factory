@@ -26,8 +26,11 @@ import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
  *      the `Emitter` contract from `compiler-core`.
  *
  * The contributions are *declarations*; `plugin-loader` is responsible
- * for wiring each declaration into the host's registry at runtime
- * (and for enforcing the `permissions` allow-list).
+ * for wiring each declaration into the host's registry at runtime.
+ *
+ * A plugin is code that runs INSIDE the crewhaus process, with its full
+ * authority, from the moment it is imported. Of its declared
+ * `permissions`, only `tools` is applied; see {@link PluginPermissions}.
  *
  * The SDK is intentionally **dependency-light**: it only imports
  * `@crewhaus/errors` + `@crewhaus/tool-catalog` (to expose the
@@ -120,17 +123,32 @@ export interface PluginTargetEmitter {
 // ---------------------------------------------------------------------------
 
 /**
- * Capability declarations. Fail-closed — an undefined section means the
- * plugin has zero access to that resource class.
+ * What a plugin declares it needs. Read this before trusting one.
+ *
+ * A plugin's code is imported into the crewhaus process and runs with that
+ * process's full authority — its environment (secrets included), files,
+ * network and child processes — from the moment it is imported, before any
+ * tool is called. Whether it runs at all is decided by its signature
+ * (`plugin-loader`), not by these declarations.
+ *
+ * - `tools` IS applied. A plugin tool finds on `ctx.bridge` only
+ *   `runContext` and the host tools listed here (none when it is absent).
+ *   A host tool called that way runs directly: the permission engine, the
+ *   justification gate and the egress check that guard a model's call do
+ *   not run for it. List only tools the plugin may drive unchecked.
+ * - `fs`, `net` and `secrets` are NOT enforced on plugin code. The Hangar
+ *   console evaluates `fs` and `net` for the panes it serves, whose code runs
+ *   in a sandboxed browser iframe rather than in crewhaus; everywhere else
+ *   they state what the plugin says it will touch, for the operator to read.
  */
 export type PluginPermissions = {
-  /** Filesystem allow-list (minimatch globs relative to the plugin's sandbox root). */
+  /** Filesystem globs the plugin says it reads or writes (`read:`/`write:` prefixed). Not enforced on plugin code. */
   readonly fs?: ReadonlyArray<string>;
-  /** URL prefix allow-list for `fetch()` from inside the plugin. */
+  /** URL globs the plugin says it fetches (`fetch:` prefixed). Not enforced on plugin code. */
   readonly net?: ReadonlyArray<string>;
-  /** Names of host-provided tools the plugin's tools may call. */
+  /** Host tools the plugin's tools may reach through `ctx.bridge`. Enforced. */
   readonly tools?: ReadonlyArray<string>;
-  /** Env-var names the plugin is permitted to read via the host's `secrets-manager`. */
+  /** Environment variables the plugin says it reads. Not enforced: plugin code sees the whole environment. */
   readonly secrets?: ReadonlyArray<string>;
 };
 

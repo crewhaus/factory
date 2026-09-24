@@ -145,7 +145,12 @@ describe("well-formed plugin tools load as before (C105)", () => {
   test("a valid tool builds exactly as buildTool builds it", async () => {
     const def = good({ readOnly: true, destructive: false, scope: "internal" });
     const activated = await activate({ maker: [def] });
-    expect(activated.tools).toEqual([buildTool(def as Parameters<typeof buildTool>[0])]);
+    // Every field is buildTool's; execute is the plugin's own, behind the
+    // bridge view (C106).
+    const { execute: run, ...got } = activated.tools[0] ?? buildTool(good());
+    const { execute: _, ...want } = buildTool(def as Parameters<typeof buildTool>[0]);
+    expect(got).toEqual(want);
+    expect(await run({ path: "x" })).toBe("ran");
     expect(activated.tools[0]?.readOnly).toBe(true);
     expect(activated.warnings).toEqual([]);
   });

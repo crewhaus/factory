@@ -83,11 +83,14 @@ export const MAX_PLUGIN_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
  *      the digest was checked against — which is why a signed plugin
  *      must be one file with no imports but runtime builtins.
  *
- *   3. **Capability gating.** The returned `LoadedPlugin` exposes the
- *      plugin's contributions and its declared `PluginPermissions`.
- *      Hosts (the runtime / studio-server / channel gateway) consult
- *      the permissions before binding a contribution to a registry
- *      slot or before forwarding a sandboxed `fs` / `net` call.
+ *   3. **What a plugin can reach.** A plugin's code is imported into this
+ *      process and runs with its full authority — environment, files,
+ *      network — from the moment it is imported. `permissions.tools` is
+ *      applied: a plugin tool's `ctx.bridge` shows only `runContext` and
+ *      the host tools it names (see {@link pluginBridgeView}). `fs`, `net`
+ *      and `secrets` are declarations crewhaus does not enforce on plugin
+ *      code; only the Hangar's declarative panes evaluate them (with
+ *      {@link isFsAllowed} / {@link isNetAllowed}).
  *
  * The loader does NOT itself bind contributions to registries — that
  * is the responsibility of the calling host (which knows which
@@ -160,7 +163,11 @@ export type PluginLoaderOptions = {
 export type LoadedPlugin = {
   readonly manifest: PluginManifest;
   readonly entrypointPath: string;
-  /** Declared capability allow-list — fail-closed if undefined. */
+  /**
+   * The manifest's declared permissions. Only `tools` is applied at runtime
+   * (it bounds what `ctx.bridge` shows the plugin's tools); the rest are
+   * declarations. See {@link pluginBridgeView}.
+   */
   readonly permissions: PluginPermissions;
   /**
    * `true` when the manifest's signature verified against a trust anchor, and
@@ -813,6 +820,55 @@ export function createBootPluginRuntime(
 }
 
 /**
+ * What a plugin tool sees as `ctx.bridge`. The runtime hands every tool the
+ * same bridge — the whole tool catalog (each tool's raw `execute`), the
+ * permission rules, the approvals store, the sub-agent spawner, the run
+ * state — which first-party tools like `Task` need. A plugin tool gets
+ * `runContext` (boundary tagging reads it) and only the host tools its
+ * manifest's `permissions.tools` names, each a frozen copy. A host tool
+ * reached this way runs directly: the permission engine, the justification
+ * gate and the egress check that guard a model's call do not run for it, so
+ * name only tools the plugin may drive unchecked.
+ *
+ * This bounds what the bridge hands a plugin; it is not a sandbox. Plugin
+ * code runs in this process and can import anything itself.
+ */
+export function pluginBridgeView(bridge: unknown, allowedTools: ReadonlySet<string>): unknown {
+  if (bridge === null || typeof bridge !== "object") return undefined;
+  const { runContext, tools } = bridge as { runContext?: unknown; tools?: unknown };
+  const visible = Array.isArray(tools)
+    ? tools
+        .filter(
+          (t): t is RegisteredTool =>
+            t !== null &&
+            typeof t === "object" &&
+            typeof (t as { name?: unknown }).name === "string" &&
+            allowedTools.has((t as { name: string }).name),
+        )
+        .map((t) => Object.freeze({ ...t }))
+    : [];
+  return Object.freeze({
+    ...(runContext !== undefined ? { runContext } : {}),
+    tools: Object.freeze(visible),
+  });
+}
+
+/** `tool`, whose `execute` sees {@link pluginBridgeView} in place of the runtime's bridge. */
+function withPluginBridge(tool: RegisteredTool, allowedTools: ReadonlySet<string>): RegisteredTool {
+  const run = tool.execute;
+  return {
+    ...tool,
+    execute: (input, ctx) =>
+      run(
+        input,
+        ctx?.bridge === undefined
+          ? ctx
+          : { ...ctx, bridge: pluginBridgeView(ctx.bridge, allowedTools) },
+      ),
+  };
+}
+
+/**
  * Item 3 (G32) — the aggregate of every activated plugin's contributions,
  * bucketed by kind for the host to bind. Tools are already normalized through
  * `buildTool` (so the security-relevant `scope` / `ioCapability` inference runs
@@ -1134,6 +1190,8 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
     // first-party tools. A plugin is signed, in-process code, so its
     // descriptions are not boundary-classified the way a remote MCP
     // server's are.
+    // The host tools this plugin's tools may reach through ctx.bridge.
+    const bridgeTools: ReadonlySet<string> = new Set(plugin.permissions.tools ?? []);
     for (const [index, tool] of contributed.entries()) {
       const label =
         isPlainObject(tool) && typeof tool["name"] === "string"
@@ -1183,7 +1241,7 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
         built = { ...built, scope: "external" };
       }
       toolOwners.set(def.name, name);
-      tools.push(built);
+      tools.push(withPluginBridge(built, bridgeTools));
     }
     for (const channel of contributions.channels ?? []) channels.push(channel);
     for (const model of contributions.models ?? []) models.push(model);

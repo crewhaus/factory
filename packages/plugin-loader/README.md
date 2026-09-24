@@ -87,6 +87,21 @@ left out with a warning, and the plugin's other tools load. Permission rules
 and crewhaus's own grants key on tool names, so a plugin `Grep` would otherwise
 run under the grant crewhaus gives the builtin one.
 
+## What a plugin can reach
+
+A plugin is code that runs inside the crewhaus process, with its full
+authority — environment and secrets, files, network, child processes — from
+the moment it is imported. The signature decides whether it runs; nothing
+after that contains it.
+
+Of the manifest's `permissions`, only `tools` is applied: a plugin tool's
+`ctx.bridge` shows `runContext` and the host tools `permissions.tools` names,
+and nothing else — not the permission rules, the approvals store or the other
+tools. A host tool a plugin calls that way runs directly, without the
+permission engine, the justification gate or the egress check, so name only
+tools the plugin may drive unchecked. `fs`, `net` and `secrets` are not
+enforced on plugin code.
+
 ## Tool definitions are checked at boot
 
 A plugin is JavaScript, so nothing typed its tools. Each one is checked before
