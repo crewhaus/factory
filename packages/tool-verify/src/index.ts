@@ -13,7 +13,7 @@
  */
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, posix, resolve } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -409,6 +409,16 @@ export const goldenUpdate: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * One spelling for a path in a manifest and a path a caller asks about, so
+ * `./a.txt` (what `find . | xargs sha256sum` writes) and `a.txt` (what the
+ * walk and `files` produce) name the same entry instead of one missing and
+ * one unexpected.
+ */
+function manifestKey(rel: string): string {
+  return rel === "" ? rel : posix.normalize(rel);
+}
+
 export const checksumVerify: RegisteredTool = buildTool({
   name: "ChecksumVerify",
   description:
@@ -420,7 +430,13 @@ export const checksumVerify: RegisteredTool = buildTool({
         .string()
         .optional()
         .describe("workspace-relative SHA256SUMS file to check against"),
-      files: z.array(z.string()).max(LIMITS.files).optional().describe("hash just these"),
+      files: z
+        .array(z.string())
+        .max(LIMITS.files)
+        .optional()
+        .describe(
+          "hash just these, and check the manifest for these entries only; its other entries are counted as notChecked",
+        ),
       exclude: z
         .array(z.string().min(1).max(1_024))
         .max(64)
@@ -447,6 +463,14 @@ export const checksumVerify: RegisteredTool = buildTool({
     const unreadable: string[] = [];
     /** Everything the walk found, hashable or not: what "unexpected" is measured against. */
     const onDisk = new Set<string>();
+    /**
+     * With `files`, the entries this run is about. A manifest entry outside
+     * it is not checked (and counted as such), rather than reported missing
+     * while it sits on disk untouched.
+     */
+    const requested = input.files === undefined ? null : new Set<string>();
+    /** Requested files that are not on disk at all. */
+    const absent = new Set<string>();
     const symlinks: Array<{ path: string; target: string }> = [];
     let truncated = false;
 
@@ -461,15 +485,26 @@ export const checksumVerify: RegisteredTool = buildTool({
       }
     };
 
-    if (input.files !== undefined) {
-      for (const rel of input.files) {
-        try {
-          const at = resolveSafe("ChecksumVerify", join(input.directory ?? ".", rel));
-          digests.set(rel, sha256(readCapped(at.real, rel)));
-          onDisk.add(rel);
-        } catch (err) {
-          unreadable.push(`${rel}: ${(err as Error).message}`);
+    if (requested !== null) {
+      for (const given of input.files ?? []) {
+        if (posix.isAbsolute(given)) {
+          unreadable.push(`${given}: an absolute path; files are relative to the directory`);
+          continue;
         }
+        const rel = manifestKey(given);
+        if (requested.has(rel)) continue;
+        requested.add(rel);
+        // Read like every walked file: contained, never through a link that
+        // leads out, and a FIFO or device is refused instead of opened.
+        const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
+        if (!read.ok && read.code === "not-found") {
+          absent.add(rel);
+          continue;
+        }
+        onDisk.add(rel);
+        if (!read.ok) unreadable.push(`${rel}: ${read.reason}`);
+        else if (read.truncated) unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
+        else digests.set(rel, sha256(Buffer.from(read.bytes)));
       }
     } else {
       const walk = integrityWalk(root, base.rel, {
@@ -522,6 +557,7 @@ export const checksumVerify: RegisteredTool = buildTool({
     };
 
     if (writing) {
+      for (const rel of absent) unreadable.push(`${rel}: does not exist`);
       if (truncated) {
         // A partial manifest would later verify a partial tree.
         return json({
@@ -553,13 +589,16 @@ export const checksumVerify: RegisteredTool = buildTool({
     for (const line of manifestText.split("\n")) {
       const m = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line.trim());
       if (m === null) continue;
-      expected.set((m[2] as string).trim(), (m[1] as string).toLowerCase());
+      expected.set(manifestKey((m[2] as string).trim()), (m[1] as string).toLowerCase());
     }
 
     const mismatched: string[] = [];
     const missing: string[] = [];
     const unexpected: string[] = [];
+    let checked = 0;
     for (const [rel, want] of expected) {
+      if (requested !== null && !requested.has(rel)) continue;
+      checked += 1;
       const got = digests.get(rel);
       // Listed and on disk but not hashable is in `unreadable` already.
       if (got === undefined) {
@@ -567,6 +606,12 @@ export const checksumVerify: RegisteredTool = buildTool({
       } else if (got !== want) mismatched.push(rel);
     }
     for (const rel of onDisk) if (!expected.has(rel)) unexpected.push(rel);
+    // Asked for, not on disk, and not listed either: not "missing" (the
+    // manifest never promised it), but not a pass.
+    for (const rel of absent) {
+      if (!expected.has(rel))
+        unreadable.push(`${rel}: does not exist, and the manifest does not list it`);
+    }
 
     return json({
       directory: base.rel,
@@ -581,7 +626,8 @@ export const checksumVerify: RegisteredTool = buildTool({
         unexpected.length === 0 &&
         unreadable.length === 0 &&
         !truncated,
-      checked: expected.size,
+      checked,
+      ...(requested === null ? {} : { notChecked: expected.size - checked }),
       mismatched,
       missing,
       unexpected,

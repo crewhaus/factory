@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 /**
  * Every tool this package registers, against a real temporary workspace.
  */
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -314,6 +316,156 @@ describe("ChecksumVerify", () => {
 
   test("a missing manifest says how to make one", async () => {
     expect(await raw(checksumVerify, { manifest: "nope" })).toContain("write:true");
+  });
+
+  describe("files checks just those entries of the manifest", () => {
+    type Subset = {
+      ok: boolean;
+      checked: number;
+      notChecked?: number;
+      mismatched: string[];
+      missing: string[];
+      unexpected: string[];
+      unreadable: string[];
+    };
+    const sha = (text: string): string => createHash("sha256").update(text).digest("hex");
+    beforeEach(() => {
+      writeFileSync(join(workspace, "a.txt"), "alpha\n");
+      writeFileSync(join(workspace, "b.txt"), "bravo\n");
+      writeFileSync(
+        join(workspace, "SHA256SUMS"),
+        `${sha("alpha\n")}  a.txt\n${sha("bravo\n")}  b.txt\n`,
+      );
+    });
+    const summary = (r: Subset) => ({
+      ok: r.ok,
+      checked: r.checked,
+      notChecked: r.notChecked,
+      mismatched: r.mismatched,
+      missing: r.missing,
+      unexpected: r.unexpected,
+      unreadable: r.unreadable,
+    });
+
+    test("an intact subset passes, and says how much of the manifest it did not check", async () => {
+      // 0.7.0: ok false, missing ["b.txt"] (on disk and intact), checked 2.
+      const r = await call<Subset>(checksumVerify, { manifest: "SHA256SUMS", files: ["a.txt"] });
+      expect(summary(r)).toEqual({
+        ok: true,
+        checked: 1,
+        notChecked: 1,
+        mismatched: [],
+        missing: [],
+        unexpected: [],
+        unreadable: [],
+      });
+    });
+
+    test("a changed requested file is mismatched, and nothing outside the subset is reported", async () => {
+      writeFileSync(join(workspace, "a.txt"), "changed");
+      const r = await call<Subset>(checksumVerify, { manifest: "SHA256SUMS", files: ["a.txt"] });
+      expect(summary(r)).toEqual({
+        ok: false,
+        checked: 1,
+        notChecked: 1,
+        mismatched: ["a.txt"],
+        missing: [],
+        unexpected: [],
+        unreadable: [],
+      });
+    });
+
+    test("a requested file gone from disk is missing, once, with no second report", async () => {
+      rmSync(join(workspace, "b.txt"));
+      const r = await call<Subset>(checksumVerify, { manifest: "SHA256SUMS", files: ["b.txt"] });
+      // 0.7.0 listed it under missing AND under unreadable, with an ENOENT message.
+      expect(summary(r)).toEqual({
+        ok: false,
+        checked: 1,
+        notChecked: 1,
+        mismatched: [],
+        missing: ["b.txt"],
+        unexpected: [],
+        unreadable: [],
+      });
+    });
+
+    test("a requested file that is neither on disk nor listed is not a pass", async () => {
+      writeFileSync(join(workspace, "ONLY_A"), `${sha("alpha\n")}  a.txt\n`);
+      const r = await call<Subset>(checksumVerify, {
+        manifest: "ONLY_A",
+        files: ["a.txt", "c.txt"],
+      });
+      expect(r.ok).toBe(false);
+      expect(r.missing).toEqual([]);
+      expect(r.unreadable).toEqual(["c.txt: does not exist, and the manifest does not list it"]);
+    });
+
+    test("./a.txt and a.txt name the same entry, in files and in the manifest", async () => {
+      writeFileSync(join(workspace, "DOTSUMS"), `${sha("alpha\n")}  ./a.txt\n`);
+      const viaFiles = await call<Subset>(checksumVerify, {
+        manifest: "SHA256SUMS",
+        files: ["./a.txt"],
+      });
+      const viaManifest = await call<Subset>(checksumVerify, {
+        manifest: "DOTSUMS",
+        files: ["a.txt"],
+      });
+      const clean = {
+        ok: true,
+        checked: 1,
+        mismatched: [],
+        missing: [],
+        unexpected: [],
+        unreadable: [],
+      };
+      expect(summary(viaFiles)).toEqual({ ...clean, notChecked: 1 });
+      expect(summary(viaManifest)).toEqual({ ...clean, notChecked: 0 });
+    });
+
+    test("a subset under a directory is keyed relative to it", async () => {
+      mkdirSync(join(workspace, "dist"));
+      writeFileSync(join(workspace, "dist/x.bin"), "x");
+      writeFileSync(join(workspace, "dist/y.bin"), "y");
+      writeFileSync(join(workspace, "dist/SUMS"), `${sha("x")}  x.bin\n${sha("y")}  y.bin\n`);
+      const r = await call<Subset>(checksumVerify, {
+        directory: "dist",
+        manifest: "dist/SUMS",
+        files: ["x.bin"],
+      });
+      expect(summary(r)).toEqual({
+        ok: true,
+        checked: 1,
+        notChecked: 1,
+        mismatched: [],
+        missing: [],
+        unexpected: [],
+        unreadable: [],
+      });
+    });
+
+    test("a FIFO named in files is refused, not opened", async () => {
+      execFileSync("mkfifo", [join(workspace, "pipe")]);
+      writeFileSync(join(workspace, "PIPESUMS"), `${"0".repeat(64)}  pipe\n`);
+      const r = await call<Subset>(checksumVerify, { manifest: "PIPESUMS", files: ["pipe"] });
+      expect(r.ok).toBe(false);
+      expect(r.unreadable.length).toBe(1);
+      expect(r.unreadable[0]).toMatch(/^pipe: /);
+      expect(r.missing).toEqual([]);
+    });
+
+    test("a full walk, with no files, still checks every entry and carries no notChecked", async () => {
+      const r = await call<Subset>(checksumVerify, { manifest: "SHA256SUMS" });
+      expect(summary(r)).toEqual({
+        ok: true,
+        checked: 2,
+        notChecked: undefined,
+        mismatched: [],
+        missing: [],
+        unexpected: [],
+        unreadable: [],
+      });
+    });
   });
 
   describe("every entry is walked, and an early stop is not ok", () => {
