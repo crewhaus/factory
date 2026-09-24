@@ -1,6 +1,6 @@
 # @crewhaus/tool-safety
 
-The guards tool packages import instead of each hand-rolling its own. An audit of the 0.7.0 builtins found the same defects in dozens of packages that share no code: caller-supplied regexes that freeze the process, output capped only after it was buffered, a compressed response inflated to gigabytes, a FIFO that blocks a read for ever, and a write that follows a planted symlink out of the workspace. Each helper here closes one of those, once.
+The guards tool packages import instead of each hand-rolling its own. An audit of the 0.7.0 builtins found the same defects in dozens of packages that share no code: caller-supplied regexes that freeze the process, output capped only after it was buffered, a compressed response inflated to gigabytes, a FIFO that blocks a read for ever, a write that follows a planted symlink out of the workspace, and a model that picks any environment variable as a credential. Each helper here closes one of those, once.
 
 Zero runtime dependencies: Bun and `node:*` only. **Bun only** — it uses Bun Workers and `Bun.spawn`, so it is not for the cf-worker targets.
 
@@ -8,6 +8,7 @@ Zero runtime dependencies: Bun and `node:*` only. **Bun only** — it uses Bun W
 import { runRegex, screenUserRegex } from "@crewhaus/tool-safety/regex";
 import { spawnBounded, readResponseBounded, withRawBody, readFileBounded } from "@crewhaus/tool-safety/streams";
 import { openForRead, writeFileSafe, createExclusive, walkContained, copyTreeSafe } from "@crewhaus/tool-safety/fs";
+import { resolveCredentialEnv, checkEnvReveal, redactKnownSecrets, redactUrlCredentials } from "@crewhaus/tool-safety/env";
 ```
 
 ## `./regex`: caller-supplied regular expressions
@@ -168,6 +169,48 @@ These tell what a path is without opening it: a `stat` never blocks on a FIFO, b
 
 Node has no `openat` or `mkdirat`. A directory swapped for a link between a check and the call that uses it is caught after the call, by comparing the directory's identity (`dev`/`ino`), not prevented. What the call created through the swap is then removed while the name still leads to it. Identity rather than spelling is compared because a case-insensitive volume makes `Docs` and `docs` one directory.
 
+## `./env`: credentials and the environment
+
+### `resolveCredentialEnv(name, { allowed, purpose, configKey, env? })`
+
+A tool may read a credential from environment variable `name` only if the operator listed exactly that name in `allowed`, which comes from tool_config. The model may choose among the listed names but can never add one. Today the model can name `ANTHROPIC_API_KEY` as a bearer token for an allow-listed origin, sign a forged JWT with the app's secret, or override the operator's `token_env`. The egress classifier sees only the name. (config-delivery#4, flag-truth-3#1, flag-truth-4#2, flag-truth-2#0, security-8#4, security-10#8, flag-truth-5#11, security-8#20.)
+
+```ts
+const cred = resolveCredentialEnv(input.auth.envVar, {
+  allowed: cfg.authEnvs,                      // tool_config, never tool input
+  purpose: "the HttpRequest auth profile",
+  configKey: "tool_config.http.auth_envs",
+});
+if (!cred.ok) return refuse(cred.reason);    // names the key to set; never a value
+```
+
+The result is `{ ok: true, name, value }`, or a refusal with a `code` and a `reason`:
+
+- `missing-name`: no name was given.
+- `invalid-name`: the value is not a variable name, or it looks like a pasted token. It is never quoted back.
+- `not-allowed`: the name is not listed. The refusal is worded identically whether or not the variable is set, so the call cannot probe which variables exist.
+- `unset`: the name is listed but unset or empty.
+
+A package whose config has one `token_env` passes `[cfg.tokenEnv, ...cfg.tokenEnvs]` as `allowed`.
+
+### `checkEnvReveal(name, { allowed, configKey })`
+
+Answers whether a tool that reports on variables (EnvInspect) may show a value. The name must be listed, and never credential-shaped, listed or not (flag-truth-4#1, security-8#3, docs-claims#6). Presence and length are all a model learns about a key.
+
+### `isCredentialShapedName(name)` and `credentialShapeOf(name)`
+
+One heuristic for "this name holds a credential": KEY, TOKEN, SECRET, PASSWORD, PASSPHRASE, CREDENTIAL, PAT, AUTH, DSN and the like, whole words or run together (`PGPASSWORD`, `apiKey`, `x-api-key`), plus URLs that carry one (`DATABASE_URL`, `SLACK_WEBHOOK_URL`). It flags everything the repo's other copies flag. Those copies are the compiler's and preflight's `CREDENTIAL_SHAPED_KEY_RE`, tool-secrets' `SECRETISH_KEY_RE`, tool-crewhaus's CLI-flag regex, and ir's and spec-patch's `isCredentialKey`. `names.test.ts` finds them by shape and checks this. `PWD` and `OLDPWD` are the only exceptions. It is deliberately broad: a false positive hides a harmless value, and a false negative shows a key.
+
+`looksLikePastedSecret(value)` spots a "name" that is really a token (`ghp_…`, `sk_live_…`, `AKIA…`, a long random string).
+
+### Redaction
+
+- `redactKnownSecrets(text, values)` and `createSecretRedactor(values)` replace each known secret in text. They also catch its URL-encoded, base64, base64url and JSON-escaped spellings and a trimmed copy. A composite, such as a Basic header's `base64(user:secret)`, cannot be derived from the secret alone, so pass it as a value of its own.
+- `redactKnownSecretsDeep(value, values)` redacts every string in a result object, keys included, and the result still round-trips through JSON.
+- `redactUrlCredentials(url)` replaces the whole userinfo and the value of each query or fragment parameter whose name is credential-shaped (`token`, `api_key`, `X-Amz-Signature`, `access_token` …) or whose value looks like a token. Everything else is left as written. `redactUrlCredentialsInText(text)` does this for every URL in an error message or a log line.
+
+A secret in a URL's PATH, such as a Slack webhook's, is not recognisable by shape; `redactKnownSecrets` catches it when the value is known.
+
 ## Adopting it
 
 | Finding(s) | Replace | With |
@@ -188,3 +231,5 @@ Node has no `openat` or `mkdirat`. A directory swapped for a link between a chec
 | security-11#5 | a lexical `path.resolve(dir, linkTarget)` check of staged links | `walkContained(staging, ".")` and refuse any entry with `link.inside === false`. |
 | flag-truth-6#2, security-11#3 | `zip -r` without `-y` | Add `-y` to the argv. `walkContained` can refuse a source holding a link that leads out. |
 | security-10#2 | `mkdirSync(trash, { recursive: true })` | `ensureDirContained(root, trashRel, { symlinks: "refuse" })`. The owner check stays in the tool. |
+| config-delivery#4, flag-truth-3#1, flag-truth-4#2, flag-truth-2#0, security-8#4, security-10#8, flag-truth-5#11, security-8#20 | `process.env[input.envVar]`, `input.tokenEnv ?? cfg.tokenEnv` | `resolveCredentialEnv(name, { allowed: <tool_config list>, purpose, configKey })`, plus `redactKnownSecretsDeep` on everything returned. |
+| flag-truth-4#1, security-8#3, docs-claims#6 | `reveal` from tool input | `checkEnvReveal(name, { allowed: <tool_config list>, configKey })`. |
