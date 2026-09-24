@@ -25,6 +25,9 @@
     },
     {
       "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-executor"
     }
   ],
   "include": ["src/**/*"]

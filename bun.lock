@@ -3437,6 +3437,9 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+      },
     },
     "packages/tool-web": {
       "name": "@crewhaus/tool-web",

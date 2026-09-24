@@ -31,6 +31,9 @@
  *  - The call sends the screenshot and the model's `description` to the
  *    grounding model's provider, so the tool is `scope: "external"` with
  *    `ioCapability: "network"` (readOnly kept), like `ImageGenerate`.
+ *  - When both attempts fail, the tool throws a `VisionGroundingError`
+ *    (`[FindElement error] …`), so the call is recorded as failed. It used
+ *    to return that sentence as an ordinary result.
  *  - Each grounding request is published on the run's trace bus as a
  *    `model_request` / `model_response` pair with role `"grounding"`, so
  *    cost-tracker prices it and `budget:` counts it; it used to be spent
@@ -333,14 +336,20 @@ export function createFindElementTool(opts: CreateFindElementToolOptions): Regis
           lastErr = err;
         }
       }
-      // Only this package's own fixed sentences are shown. Any other error
-      // (a provider's, which can quote a response body) is named, not quoted.
+      // Both attempts failed: the call failed, so it throws (is_error), as a
+      // driver or config failure here already does. Only this package's own
+      // fixed sentences are shown. Any other error (a provider's, which can
+      // quote a response body) is named, not quoted; it stays as the cause,
+      // which the executor never puts in the result.
       if (lastErr instanceof VisionGroundingError) {
-        return `[FindElement error] ${lastErr.message}`;
+        throw new VisionGroundingError(`[FindElement error] ${lastErr.message}`, lastErr);
       }
       const name =
         lastErr instanceof Error && /^[A-Za-z]{1,64}$/.test(lastErr.name) ? lastErr.name : "Error";
-      return `[FindElement error] the grounding call failed (${name})`;
+      throw new VisionGroundingError(
+        `[FindElement error] the grounding call failed (${name})`,
+        lastErr,
+      );
     },
   });
 }

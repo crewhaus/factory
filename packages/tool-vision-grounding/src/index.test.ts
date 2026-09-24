@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
 import type { Driver } from "@crewhaus/computer-use-driver";
 import { auditToolScopes } from "@crewhaus/tool-builder";
-import { createFindElementTool } from "./index.js";
+import { executeTool } from "@crewhaus/tool-executor";
+import { VisionGroundingError, createFindElementTool } from "./index.js";
 
 function stubDriver(pngBytes: Uint8Array): Driver {
   return {
@@ -48,6 +49,19 @@ function scriptedAdapter(reply: string): ProviderAdapter {
         yield { kind: "message_stop" };
       })(),
   };
+}
+
+/** The VisionGroundingError a failed call throws; fails the test if it resolves. */
+async function failure(p: Promise<unknown>): Promise<VisionGroundingError> {
+  const outcome = await p.then(
+    (r) => ({ resolved: r }),
+    (e: unknown) => ({ rejected: e }),
+  );
+  if (!("rejected" in outcome)) {
+    throw new Error(`expected a rejection, got ${JSON.stringify(outcome.resolved)}`);
+  }
+  expect(outcome.rejected).toBeInstanceOf(VisionGroundingError);
+  return outcome.rejected as VisionGroundingError;
 }
 
 describe("createFindElementTool — vision feature gate (Section 17)", () => {
@@ -125,9 +139,8 @@ describe("createFindElementTool", () => {
     const adapter = scriptedAdapter("not json");
     const driver = stubDriver(new Uint8Array());
     const tool = createFindElementTool({ driver, model: "stub", _adapter: adapter });
-    const r = await tool.execute({ description: "x" }, {});
-    if (typeof r !== "string") throw new Error("expected string result");
-    expect(r).toContain("[FindElement error]");
+    const err = await failure(tool.execute({ description: "x" }, {}));
+    expect(err.message).toContain("[FindElement error]");
   });
 
   test("missing bbox numeric fields → error", async () => {
@@ -136,9 +149,8 @@ describe("createFindElementTool", () => {
     );
     const driver = stubDriver(new Uint8Array());
     const tool = createFindElementTool({ driver, model: "stub", _adapter: adapter });
-    const r = await tool.execute({ description: "x" }, {});
-    if (typeof r !== "string") throw new Error("expected string result");
-    expect(r).toContain("[FindElement error]");
+    const err = await failure(tool.execute({ description: "x" }, {}));
+    expect(err.message).toContain("[FindElement error]");
   });
 
   test("flag profile: read-only, not destructive (vision-only — no UI mutation)", () => {
@@ -276,7 +288,7 @@ describe("a failed grounding reply is never quoted back", () => {
         model: "stub",
         _adapter: scriptedAdapter(reply),
       });
-      const r = String(await tool.execute({ description: "the Submit button" }, {}));
+      const r = (await failure(tool.execute({ description: "the Submit button" }, {}))).message;
       expect(r).toMatch(FIXED);
       expect(echoed(r, reply)).toEqual([]);
     });
@@ -298,8 +310,70 @@ describe("a failed grounding reply is never quoted back", () => {
       model: "stub",
       _adapter: failing,
     });
-    const r = String(await tool.execute({ description: "x" }, {}));
-    expect(r).toBe("[FindElement error] the grounding call failed (AdapterError)");
+    const err = await failure(tool.execute({ description: "x" }, {}));
+    expect(err.message).toBe("[FindElement error] the grounding call failed (AdapterError)");
+    // What the model is shown is the executor's content: the message alone.
+    const r = await executeTool(tool, { description: "x" }, { toolUseId: "t" });
+    expect(r.isError).toBe(true);
+    expect(String(r.content)).toBe("[FindElement error] the grounding call failed (AdapterError)");
+    expect(echoed(String(r.content), INJECTION)).toEqual([]);
+  });
+});
+
+/**
+ * 0.7.1 (C206) — when both grounding attempts fail the call failed, and it is
+ * reported so. FindElement used to return "[FindElement error] …" as an
+ * ordinary result (is_error false), while a driver or config failure in the
+ * same tool, and Navigate and Screenshot beside it, threw.
+ */
+describe("a failed grounding is a failed call", () => {
+  test("through the executor: is_error, the same sentence, and two attempts", async () => {
+    let streams = 0;
+    const base = scriptedAdapter("no box here");
+    const adapter: ProviderAdapter = {
+      ...base,
+      stream: (req) => {
+        streams += 1;
+        return base.stream(req);
+      },
+    };
+    const tool = createFindElementTool({
+      driver: stubDriver(new Uint8Array([1])),
+      model: "stub",
+      _adapter: adapter,
+    });
+    const r = await executeTool(tool, { description: "the Submit button" }, { toolUseId: "t" });
+    expect(r.isError).toBe(true);
+    expect(String(r.content)).toBe(
+      "[FindElement error] the grounding model's reply had no JSON block (11 chars)",
+    );
+    expect(streams).toBe(2);
+  });
+
+  test("the thrown error keeps the last attempt's error as its cause", async () => {
+    const tool = createFindElementTool({
+      driver: stubDriver(new Uint8Array([1])),
+      model: "stub",
+      _adapter: scriptedAdapter("not json"),
+    });
+    const err = await failure(tool.execute({ description: "x" }, {}));
+    expect(err.cause).toBeInstanceOf(VisionGroundingError);
+    expect((err.cause as VisionGroundingError).message).toBe(
+      "the grounding model's reply had no JSON block (8 chars)",
+    );
+  });
+
+  test("a box the model does find is still a success", async () => {
+    const tool = createFindElementTool({
+      driver: stubDriver(new Uint8Array([1])),
+      model: "stub",
+      _adapter: scriptedAdapter(
+        '```json\n{"bbox":{"x":10,"y":20,"width":30,"height":40},"confidence":"high"}\n```',
+      ),
+    });
+    const r = await executeTool(tool, { description: "the Submit button" }, { toolUseId: "t" });
+    expect(r.isError).toBe(false);
+    expect(JSON.parse(String(r.content)).centerX).toBe(25);
   });
 });
 
