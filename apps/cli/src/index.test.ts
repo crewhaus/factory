@@ -3898,3 +3898,65 @@ describe("crewhaus tools suggest — reads grants the way compile does", () => {
     expect(out.unimplied).not.toContain("all-verify");
   });
 });
+
+// C123 (docs-claims#1) — `tools audit` read the top-level `tools:` raw, so on
+// `[all-git, -gitCommit]` it called both entries "never called ... drop it
+// from tools:" although GitStatus (in all-git) was called, and dropping the
+// exclusion re-grants the destructive gitCommit. The grant is now the one
+// compile sees, credited per concrete key.
+describe("crewhaus tools audit — reads grants the way compile does", () => {
+  function seedAudit(root: string, tools: string, toolName = "GitStatus"): void {
+    writeFileSync(
+      join(root, "crewhaus.yaml"),
+      `name: x\ntarget: cli\nagent:\n  model: claude-haiku-4-5-20251001\n  instructions: Report status.\ntools: ${tools}\n`,
+    );
+    const dir = join(root, ".crewhaus", "sessions");
+    mkdirSync(dir, { recursive: true });
+    const stat = JSON.stringify({
+      ts: 1,
+      version: 1,
+      kind: "tool_stats",
+      payload: { toolName, durationMs: 5, isError: false },
+    });
+    writeFileSync(join(dir, "sess_0123456789abcdef.jsonl"), `${stat}\n${stat}\n${stat}\n`);
+  }
+  type Finding = { kind: string; key: string; viaCategory?: boolean };
+
+  test("an exclusion and a selector are never findings, and a called tool is credited", async () => {
+    seedAudit(sandboxCwd, "[all-git, -gitCommit]");
+    const result = await runCli(["tools", "audit", "--json"]);
+    expect(result.exitCode).toBe(0);
+    const findings = (JSON.parse(result.stdout) as { findings: Finding[] }).findings;
+    const keys = findings.map((f) => f.key);
+    for (const never of ["-gitCommit", "all-git", "gitStatus", "gitCommit"]) {
+      expect(keys).not.toContain(never);
+    }
+    // The rest of all-git went unused, and every one of those is advised as
+    // an exclusion (it was never written, so it cannot be dropped).
+    const unused = findings.filter((f) => f.kind === "unused");
+    expect(unused.length).toBeGreaterThan(5);
+    expect(unused.every((f) => f.viaCategory === true)).toBe(true);
+    const text = await runCli(["tools", "audit"]);
+    expect(text.stdout).toContain("add -gitLog to tools: to exclude it");
+    expect(text.stdout).not.toContain("drop it from tools:");
+  });
+
+  test("a spec that names its tools literally keeps the 0.7.0 advice", async () => {
+    seedAudit(sandboxCwd, "[gitStatus, gitLog]");
+    const result = await runCli(["tools", "audit"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("[remove?] gitLog (GitLog)");
+    expect(result.stdout).toContain("drop it from tools:");
+    expect(result.stdout).not.toContain("gitStatus (");
+  });
+
+  test("a spec that does not compile says so and audits usage only", async () => {
+    seedAudit(sandboxCwd, "[all-nosuchcategory]");
+    const result = await runCli(["tools", "audit", "--json"]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("crewhaus.yaml did not compile");
+    expect(result.stderr).toContain("auditing usage only");
+    const findings = (JSON.parse(result.stdout) as { findings: Finding[] }).findings;
+    expect(findings.filter((f) => f.kind === "unused")).toEqual([]);
+  });
+});
