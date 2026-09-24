@@ -202,6 +202,18 @@ describe("WatchPath: containment and input", () => {
     expect(result).toContain("refused path");
   });
 
+  test("a dangling link's target is walked as the kernel walks it (C068)", async () => {
+    // `a/y -> ..` is the workspace root, so `a/y/..` is the workspace's
+    // parent. Folded as text, `a/y/../nowhere` read as the in-root
+    // `a/nowhere` and was answered "no such path" instead of refused.
+    mkdirSync(join(workspace, "a"));
+    symlinkSync("..", join(workspace, "a", "y"));
+    symlinkSync("a/y/../nowhere", join(workspace, "evil"));
+    const result = await call(watchPath, { path: "evil", timeoutMs: 50 });
+    expect(result).toContain("refused path");
+    expect(result).toContain("outside the workspace root");
+  });
+
   test("a path that does not exist is refused with that reason", async () => {
     const result = await call(watchPath, { path: "nope", timeoutMs: 50 });
     expect(result).toContain("no such path");
