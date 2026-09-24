@@ -1894,7 +1894,9 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  (a sub-agent lists a builtin its parent never registers),\n" +
         "  channel-reactions-join\n" +
         "  (informational — reaction feedback attributes to the exact turn\n" +
-        "  only once the outbound-ts join file accumulates), and the 0.6.0\n" +
+        "  only once the outbound-ts join file accumulates),\n" +
+        "  channel-plugins-at-start (informational — a channel daemon skips a\n" +
+        "  plugin it cannot load, with a warning), and the 0.6.0\n" +
         "  model-plan-* / model-sunset / model-capabilities-unknown /\n" +
         "  model-strongest-crosses-provider notices (a `models:` profile\n" +
         "  field the shape or the slot does not serve — model-plan-\n" +
@@ -1903,6 +1905,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  --strict   Escalate compile warnings to errors: any remediable\n" +
         "             warning fails the compile (exit 1) before files are\n" +
         "             written. Informational codes (channel-reactions-join,\n" +
+        "             channel-plugins-at-start,\n" +
         "             cli-autodistill-toolchain, model-plan-candidate-only,\n" +
         "             model-capabilities-unknown, model-sunset,\n" +
         "             model-strongest-crosses-provider) still print but\n" +
@@ -2128,6 +2131,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   for (const warning of bundle.warnings) {
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
+  // channel-plugins-at-start is informational too: it describes how a
+  // channel daemon treats its plugins, and a 0.7.0 spec that passed --strict
+  // must keep passing it.
+  //
   // D40 — channel-reactions-join is INFORMATIONAL: it fires on a fully
   // wired, correctly configured feature (the outbound-ts join file just has
   // to accumulate at runtime), so no spec edit can ever clear it. Escalating
@@ -2152,6 +2159,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // `retiresOn` a `models:` profile is already a hard error at lower time).
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
+    "channel-plugins-at-start",
     "cli-autodistill-toolchain",
     "model-plan-candidate-only",
     "model-capabilities-unknown",

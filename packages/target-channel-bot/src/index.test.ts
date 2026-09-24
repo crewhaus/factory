@@ -419,15 +419,14 @@ describe("emitChannelBot — daemon.ts wiring", () => {
   test("plugins: activates at boot and registers after every first-party tool (extension-path#4)", () => {
     const c =
       fileMap({ ...MIN_IR, tools: ["read"], plugins: ["two-tools"] }).get("daemon.ts") ?? "";
-    expect(c).toContain(
-      'import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";',
-    );
+    // The lenient activation: a daemon that ran on 0.7.0 keeps starting when
+    // a plugin cannot load (plugin-loader's boot.test.ts drives it).
+    expect(c).toContain('import { activatePluginsOrStartWithout } from "@crewhaus/plugin-loader";');
     expect(c).toContain('names: ["two-tools"],');
-    expect(c).toContain("...createBootPluginRuntime(),");
     expect(c).toContain("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })");
     // Activation precedes skill discovery; registration follows the builtins
     // and precedes the agent's catalog snapshot.
-    const activate = c.indexOf("await activatePlugins(");
+    const activate = c.indexOf("await activatePluginsOrStartWithout(");
     const discover = c.indexOf("discoverSkills(");
     const builtin = c.indexOf("defaultCatalog.register(read);");
     const register = c.indexOf("for (const __t of __plugins.tools)");

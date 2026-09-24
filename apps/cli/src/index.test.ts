@@ -604,6 +604,23 @@ describe("crewhaus compile", () => {
     expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
   });
 
+  // 0.7.0 accepted plugins: on channel and ignored it, and passed --strict;
+  // the notice that the daemon now loads them must not fail --strict.
+  test("compile --strict does NOT escalate the informational channel-plugins-at-start notice", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    writeFileSync(
+      specPath,
+      "name: plugged\ntarget: channel\nagent:\n  model: claude-sonnet-4-6\n  instructions: reply kindly\nchannels:\n  slack:\n    botToken: $SLACK_BOT_TOKEN\n    signingSecret: $SLACK_SIGNING_SECRET\nrouting:\n  sessionKey: thread\nplugins: [acme-helpers]\n",
+    );
+    const outDir = join(tmp, "out");
+    const result = await runCli(["compile", specPath, "--strict", "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(result.stderr).toContain("crewhaus: warning[channel-plugins-at-start] plugins:");
+    expect(result.stderr).not.toContain("escalated to errors");
+    expect(result.exitCode).toBe(0);
+  });
+
   // 0.6.0 — the model-plan notices that no spec edit can properly clear are
   // informational too: model-plan-candidate-only fires on a `models:` profile
   // field that only a model_pool CANDIDATE serves, and model-sunset is a

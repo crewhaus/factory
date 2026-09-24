@@ -298,6 +298,19 @@ describe("compile() warnings — channel-reactions-join (D40)", () => {
     expect(compile(channelYaml(["feedback:", "  channelReactions: false"])).warnings).toEqual([]);
     expect(compile(channelYaml([])).warnings).toEqual([]);
   });
+
+  test("plugins: on channel says how the daemon treats them (0.7.0 ignored them)", () => {
+    const result = compile(channelYaml(["plugins: [acme-helpers]"]));
+    expect(result.warnings).toEqual([
+      {
+        code: "channel-plugins-at-start",
+        path: "plugins",
+        message:
+          "the channel daemon loads these plugins when it starts. One that is not installed, or that no key in ~/.crewhaus/plugin-trust verifies, is skipped with a warning, and the daemon starts without it.",
+      },
+    ]);
+    expect(compile(channelYaml(["plugins: []"])).warnings).toEqual([]);
+  });
 });
 
 describe("compile() warnings — cli-autodistill-toolchain (item 1)", () => {

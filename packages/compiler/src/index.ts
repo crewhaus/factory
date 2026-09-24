@@ -245,7 +245,7 @@ export type LowerOptions = {
  * Loop contract 0.4 (Batch A, G45 warnings framework) — one non-fatal
  * compile diagnostic. `code` is a stable machine key
  * (`"accepted-but-unwired"`, `"edge-unsafe-tool"`,
- * `"channel-reactions-join"`, `"cli-autodistill-toolchain"`,
+ * `"channel-reactions-join"`, `"channel-plugins-at-start"`, `"cli-autodistill-toolchain"`,
  * `"managed-feedback-unsupported"`, `"budget-degrade-outside-pool"`, and from
  * 0.6.0 the field-precise model-plan notices `"model-plan-ignored-on-shape"`,
  * `"model-plan-ignored-on-slot"`, `"model-plan-candidate-only"`,
@@ -547,6 +547,18 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
         "Distill a bundle's accumulated ratings with `crewhaus distill --register`,",
         "or drive the harness with `crewhaus run`",
       ].join(" "),
+    });
+  }
+  // 0.7.0 accepted `plugins:` on channel and ignored it; the daemon now loads
+  // them at start. One it cannot load is skipped with a warning rather than
+  // stopping the start, so a daemon that ran then keeps running — and this
+  // says so before the first boot does. Informational: no spec edit clears it.
+  if (spec.target === "channel" && (spec.plugins?.length ?? 0) > 0) {
+    out.push({
+      code: "channel-plugins-at-start",
+      path: "plugins",
+      message:
+        "the channel daemon loads these plugins when it starts. One that is not installed, or that no key in ~/.crewhaus/plugin-trust verifies, is skipped with a warning, and the daemon starts without it.",
     });
   }
   // D40 — channel 👍/👎 reactions attribute to the exact reacted-to turn

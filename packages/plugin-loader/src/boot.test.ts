@@ -22,6 +22,7 @@ import {
   PLUGIN_ALLOW_UNSIGNED_ENV,
   PLUGIN_TRUST_ANCHORS_ENV,
   activatePlugins,
+  activatePluginsOrStartWithout,
   createBootPluginRuntime,
   defaultPluginPaths,
   defaultTrustAnchorDir,
@@ -198,5 +199,62 @@ describe("loadTrustAnchors", () => {
 
   test("a missing default directory is not a problem", () => {
     expect(loadTrustAnchors({ homeDir: home, env: {} })).toEqual({ anchors: [], problems: [] });
+  });
+});
+
+describe("the channel daemon starts without a plugin it cannot load", () => {
+  // 0.7.0 accepted `plugins:` on channel and ignored it, so a daemon that ran
+  // then must keep starting on 0.7.1; what cannot load is skipped, loudly,
+  // and never imported.
+  test("with no trust anchor and no opt-in, it starts with no plugins and says why", async () => {
+    await install("greeter", { key: keypair().privateKey });
+    const warnings: string[] = [];
+    const activated = await activatePluginsOrStartWithout({
+      names: ["greeter"],
+      homeDir: home,
+      env: {},
+      warn: (l) => warnings.push(l),
+    });
+    expect(activated.loaded).toEqual([]);
+    expect(activated.tools).toEqual([]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toStartWith(
+      '[plugins] "greeter" not loaded: no plugin can be verified: no trust anchor is configured.',
+    );
+    expect(warnings[0]).toEndWith("The daemon starts without it.");
+  });
+
+  test("a plugin that verifies loads; one not installed is skipped by name", async () => {
+    const k = keypair();
+    trust(k.pem);
+    await install("greeter", { key: k.privateKey });
+    const warnings: string[] = [];
+    const activated = await activatePluginsOrStartWithout({
+      names: ["absent", "greeter"],
+      homeDir: home,
+      env: {},
+      warn: (l) => warnings.push(l),
+    });
+    expect(activated.tools.map((t) => t.name)).toEqual(["Greet"]);
+    expect(warnings).toEqual([
+      '[plugins] "absent" not loaded: plugin "absent" is named in plugins: but is not installed in the plugin registry. The daemon starts without it.',
+    ]);
+  });
+
+  test("a signature that does not verify is skipped, never imported", async () => {
+    const k = keypair();
+    trust(k.pem);
+    await install("greeter", { key: k.privateKey, tamper: true });
+    const warnings: string[] = [];
+    const activated = await activatePluginsOrStartWithout({
+      names: ["greeter"],
+      homeDir: home,
+      env: {},
+      warn: (l) => warnings.push(l),
+    });
+    expect(activated.loaded).toEqual([]);
+    expect(warnings[0]).toContain(
+      'plugin manifest "greeter" signature does not verify against any configured trustAnchor',
+    );
   });
 });

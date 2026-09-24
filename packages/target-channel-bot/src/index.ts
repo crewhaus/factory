@@ -655,12 +655,15 @@ defaultCatalog.register(__knowledgeTool);`;
 }
 
 /**
- * Item 3 (G32) — plugin activation for the channel daemon. Mirror of target-cli's
- * renderPlugins (keep in sync): when the spec declares `plugins:`, `daemon.ts`
- * activates the named plugins at boot via `@crewhaus/plugin-loader` (registry
- * read → Ed25519 signature + entrypoint-digest verify → import) and registers
- * the contributed tools on the shared `defaultCatalog`, so they ride
- * `defaultCatalog.list()` into `createAgent`.
+ * Item 3 (G32) — plugin activation for the channel daemon. Like target-cli's
+ * renderPlugins: when the spec declares `plugins:`, `daemon.ts` activates the
+ * named plugins at boot via `@crewhaus/plugin-loader` (registry read →
+ * Ed25519 signature + entrypoint-digest verify → import) and registers the
+ * contributed tools on the shared `defaultCatalog`, so they ride
+ * `defaultCatalog.list()` into `createAgent`. Unlike the cli bundle, a plugin
+ * that cannot load is skipped with a warning instead of stopping the start
+ * (`activatePluginsOrStartWithout`): 0.7.0 ignored `plugins:` here, so a
+ * daemon that ran then must keep running.
  *
  * Split so ordering is safe inside `main()`:
  *   - `activateBoot` runs EARLY (before skill discovery) so `__plugins.skillDirs`
@@ -684,12 +687,12 @@ function renderPlugins(ir: IrChannelV0): {
   }
   return {
     hasAny: true,
-    imports: [
-      `import { activatePlugins, createBootPluginRuntime } from "@crewhaus/plugin-loader";`,
-    ],
-    activateBoot: `  const __plugins = await activatePlugins({
+    imports: [`import { activatePluginsOrStartWithout } from "@crewhaus/plugin-loader";`],
+    // 0.7.0 accepted `plugins:` here and ignored it, so a daemon that ran
+    // then keeps starting: a plugin that is not installed or does not verify
+    // is skipped with a warning on every start, and never imported.
+    activateBoot: `  const __plugins = await activatePluginsOrStartWithout({
     names: ${JSON.stringify(names)},
-    ...createBootPluginRuntime(),
   });`,
     registerBoot: `  for (const __t of __plugins.tools) {
     if (defaultCatalog.get(__t.name) !== undefined) {

@@ -126,7 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-<tool>` instead of deleting a line. `tools show evmCall` now says which
   shapes carry it.
 - **`plugins:` on a channel daemon is loaded.** It was accepted and did
-  nothing, even under `--strict`.
+  nothing, even under `--strict`. A daemon that ran that way keeps starting:
+  a plugin it cannot load (not installed, or not verified by a key in
+  `~/.crewhaus/plugin-trust`) is skipped with a warning at every start, and is
+  never imported. Compile notes this with `channel-plugins-at-start`, which
+  `--strict` does not escalate.
 - **The onchain and onchain-game shapes say `tools:` is not wired yet**, with
   an `accepted-but-unwired` warning, as voice does. Bundle READMEs for
   cf-worker, voice, onchain, onchain-game and Claude Code plugin exports mark
@@ -201,8 +205,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boot path had an anchor and only unsigned dev mode worked. Unsigned plugins
   are still refused unless `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1`, which now
   prints a warning on every boot and for every plugin it lets through. With
-  neither a key nor the opt-in, a spec that names plugins stops at boot and
-  says where to put the publisher's key.
+  neither a key nor the opt-in, a cli bundle or `crewhaus run` that names
+  plugins stops at boot and says where to put the publisher's key; a channel
+  daemon says the same and starts without them.
 - **A sub-agent written to `.crewhaus/sub-agents/` can only narrow its
   parent's permissions.** Any agent with a file-write tool can add a file
   there while it runs, and its `permissions: { allow }` block replaced the

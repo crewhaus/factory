@@ -685,3 +685,77 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
   }
   return { loaded, tools, channels, models, graders, targetEmitters, skillDirs, warnings };
 }
+
+/**
+ * Boot activation for the channel daemon, which accepted `plugins:` and
+ * ignored it before 0.7.1: a daemon that ran then must keep starting. Each
+ * named plugin that is installed and verifies is activated, exactly as
+ * {@link activatePlugins} does it. Anything else — no trust anchor, a plugin
+ * that is not installed, a signature that does not verify — is reported
+ * through `warn`, once per start, and that plugin is skipped. Nothing that
+ * fails verification is ever imported; the daemon only goes without it.
+ */
+export async function activatePluginsOrStartWithout(opts: {
+  readonly names: ReadonlyArray<string>;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly homeDir?: string;
+  readonly warn?: (line: string) => void;
+}): Promise<ActivatedPlugins> {
+  const warn = opts.warn ?? ((line: string) => process.stderr.write(`${line}\n`));
+  const names = [...new Set(opts.names)];
+  const merged: {
+    loaded: LoadedPlugin[];
+    tools: RegisteredTool[];
+    channels: PluginChannelAdapter[];
+    models: PluginModelAdapter[];
+    graders: PluginGrader[];
+    targetEmitters: PluginTargetEmitter[];
+    skillDirs: string[];
+    warnings: string[];
+  } = {
+    loaded: [],
+    tools: [],
+    channels: [],
+    models: [],
+    graders: [],
+    targetEmitters: [],
+    skillDirs: [],
+    warnings: [],
+  };
+  const skip = (what: string, err: unknown, without: "it" | "them"): void => {
+    const raw = (err instanceof Error ? err.message : String(err)).replace(
+      /^activatePlugins: /,
+      "",
+    );
+    const why = /[.!?]$/.test(raw) ? raw : `${raw}.`;
+    const line = `[plugins] ${what} not loaded: ${why} The daemon starts without ${without}.`;
+    merged.warnings.push(line);
+    warn(line);
+  };
+  let runtime: { readonly registry: PluginRegistry; readonly loader: PluginLoader };
+  try {
+    runtime = createBootPluginRuntime({
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
+      ...(opts.homeDir !== undefined ? { homeDir: opts.homeDir } : {}),
+      warn,
+    });
+  } catch (err) {
+    skip(names.map((n) => `"${n}"`).join(", "), err, names.length === 1 ? "it" : "them");
+    return merged;
+  }
+  for (const name of names) {
+    try {
+      const one = await activatePlugins({ names: [name], ...runtime, onMissing: "throw" });
+      merged.loaded.push(...one.loaded);
+      merged.tools.push(...one.tools);
+      merged.channels.push(...one.channels);
+      merged.models.push(...one.models);
+      merged.graders.push(...one.graders);
+      merged.targetEmitters.push(...one.targetEmitters);
+      merged.skillDirs.push(...one.skillDirs);
+    } catch (err) {
+      skip(`"${name}"`, err, "it");
+    }
+  }
+  return merged;
+}
