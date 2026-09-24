@@ -26,9 +26,11 @@
  *     and nothing inside it). The result says so rather than letting the
  *     caller assume the tree was covered.
  */
+import { createHash } from "node:crypto";
 import { type Dirent, readdirSync, watch } from "node:fs";
 import * as path from "node:path";
-import { type PathFacts, monotonicNow, probePath } from "../host";
+import { readFileBoundedSync } from "@crewhaus/tool-safety/streams";
+import { type PathFacts, monotonicNow, now, probePath } from "../host";
 import { type CoalesceResult, EventCoalescer, type EventKind, type StopReason } from "./coalesce";
 
 /**
@@ -76,12 +78,87 @@ const defaultFactory: WatchFactory = (target, options, emit) => {
 export type EntryState = {
   readonly changeStamp: string;
   readonly sizeBytes: number;
+  /**
+   * sha256 of the content, taken when the stamp was too recent to prove that
+   * a later notification with the same stamp means "unchanged".
+   */
+  readonly digest?: string;
+  /** Too recent to trust, and too large (or over the budget) to hash. */
+  readonly unverifiable?: true;
 };
 
-/** Did anything about the path actually change since it was last seen? */
+/**
+ * How recent a stamp must be for equal stamps to prove nothing. Linux stamps
+ * inodes from the coarse kernel clock, so a same-size rewrite within one
+ * tick (1-10 ms) of the snapshot keeps byte-identical stamps; HFS+ keeps
+ * whole seconds and FAT two. Two seconds covers all of those.
+ */
+export const STAMP_TRUST_WINDOW_MS = 2_000;
+/** A recent file larger than this is not hashed; its equal-stamp notifications are counted. */
+export const DIGEST_MAX_BYTES = 1024 * 1024;
+/** Bytes hashed per snapshot, and again per session, before recent files go unverified. */
+export const DIGEST_BUDGET_BYTES = 16 * 1024 * 1024;
+
+/** Bytes left to hash; shared by one snapshot or one session. */
+export type DigestBudget = { remaining: number };
+
+/**
+ * The content's sha256, or undefined when it could not be read whole within
+ * DIGEST_MAX_BYTES. Read through tool-safety: a link is not followed and a
+ * FIFO is refused before it is opened, so a notification cannot block here.
+ */
+function digestOf(absolute: string): string | undefined {
+  const read = readFileBoundedSync(absolute, {
+    maxBytes: DIGEST_MAX_BYTES,
+    followSymlinks: false,
+  });
+  if (!read.ok || read.truncated) return undefined;
+  return createHash("sha256").update(read.bytes).digest("hex");
+}
+
+/**
+ * What a path looks like now, as the state a later notification is compared
+ * with. A regular file whose stamp is within STAMP_TRUST_WINDOW_MS of
+ * `atMs` (the wall clock: stamps are wall-clock times) also carries its
+ * content's digest, within the budget; past that it is marked unverifiable.
+ */
+export function entryStateOf(
+  absolute: string,
+  facts: PathFacts,
+  atMs: number,
+  budget: DigestBudget,
+): EntryState {
+  const base = { changeStamp: facts.changeStamp, sizeBytes: facts.sizeBytes };
+  if (facts.isDirectory || facts.isSymlink) return base;
+  const stampMs = Math.max(facts.mtimeMs, facts.ctimeMs ?? facts.mtimeMs);
+  if (stampMs < atMs - STAMP_TRUST_WINDOW_MS) return base;
+  if (facts.sizeBytes > DIGEST_MAX_BYTES || facts.sizeBytes > budget.remaining) {
+    return { ...base, unverifiable: true };
+  }
+  const digest = digestOf(absolute);
+  if (digest === undefined) return { ...base, unverifiable: true };
+  budget.remaining -= facts.sizeBytes;
+  return { ...base, digest };
+}
+
+/** Did the stamp or the size change since the path was last seen? */
 function differs(before: EntryState | undefined, facts: PathFacts | undefined): boolean {
   if (facts === undefined || before === undefined) return true;
   return before.changeStamp !== facts.changeStamp || before.sizeBytes !== facts.sizeBytes;
+}
+
+/**
+ * Given equal stamps and size: is that proof the content is the same?
+ * `"same"` when the stamp was old enough to trust, or the digest still
+ * matches; `"changed"` when the digest does not; `"unknown"` when the file
+ * was too recent to trust and could not be hashed.
+ */
+function contentVerdict(before: EntryState, absolute: string): "same" | "changed" | "unknown" {
+  if (before.unverifiable === true) return "unknown";
+  if (before.digest === undefined) return "same";
+  const now = digestOf(absolute);
+  if (now === undefined) return "unknown";
+  return now === before.digest ? "same" : "changed";
 }
 
 export type SnapshotResult = {
@@ -110,10 +187,13 @@ export function snapshotTree(
   const entries = new Map<string, EntryState>();
   const facts = probePath(rootAbs);
   if (facts === undefined) return { entries, truncated: false };
+  // Read once: every stamp is judged against the moment the snapshot began.
+  const atMs = now();
+  const budget: DigestBudget = { remaining: DIGEST_BUDGET_BYTES };
   if (!facts.isDirectory) {
     // A watched FILE is its own single entry, named "" the way events for it
     // are named.
-    entries.set("", { changeStamp: facts.changeStamp, sizeBytes: facts.sizeBytes });
+    entries.set("", entryStateOf(rootAbs, facts, atMs, budget));
     return { entries, truncated: false };
   }
   // The watched DIRECTORY is an entry too, under the same `""` a file gets.
@@ -148,11 +228,14 @@ export function snapshotTree(
         return { entries, truncated };
       }
       const childRelative = relative === "" ? entry.name : `${relative}/${entry.name}`;
-      const childFacts = probePath(path.join(rootAbs, ...childRelative.split("/")));
-      entries.set(childRelative, {
-        changeStamp: childFacts?.changeStamp ?? "",
-        sizeBytes: childFacts?.sizeBytes ?? 0,
-      });
+      const childAbs = path.join(rootAbs, ...childRelative.split("/"));
+      const childFacts = probePath(childAbs);
+      entries.set(
+        childRelative,
+        childFacts === undefined
+          ? { changeStamp: "", sizeBytes: 0 }
+          : entryStateOf(childAbs, childFacts, atMs, budget),
+      );
       // `isDirectory()` is false for a symlink to a directory, which is what
       // is wanted: following one would walk out of the watched tree.
       if (recursive && entry.isDirectory()) queue.push(childRelative);
@@ -186,6 +269,12 @@ export type WatchSessionOutcome = {
   readonly reconciledEvents: number;
   /** Notifications about a path that turned out to be unchanged. */
   readonly staleNotifications: number;
+  /**
+   * Notifications about a recently written path whose stamps and size had
+   * not moved, but whose content could not be compared (too large to hash).
+   * They were COUNTED: equal stamps within one clock tick prove nothing.
+   */
+  readonly unverifiedNotifications: number;
   /**
    * Times the temp-file signature asked for a directory re-read and the read
    * could not be done — too many entries, or the directory could not be read.
@@ -226,7 +315,10 @@ export async function runWatchSession(options: WatchSessionOptions): Promise<Wat
   let watchError: string | undefined;
   let reconciledEvents = 0;
   let staleNotifications = 0;
+  let unverifiedNotifications = 0;
   let reconcileSkipped = 0;
+  /** What this session may hash while refreshing `lastSeen`. */
+  const digestBudget: DigestBudget = { remaining: DIGEST_BUDGET_BYTES };
   /**
    * What each path looked like the last time this session looked at it,
    * seeded from the pre-watch snapshot. Only the reconciliation below reads
@@ -256,6 +348,7 @@ export async function runWatchSession(options: WatchSessionOptions): Promise<Wat
         endedAtMs,
         reconciledEvents,
         staleNotifications,
+        unverifiedNotifications,
         reconcileSkipped,
         ...(watchError !== undefined ? { watchError } : {}),
       });
@@ -296,7 +389,9 @@ export async function runWatchSession(options: WatchSessionOptions): Promise<Wat
       if (facts === undefined) {
         lastSeen.delete(relative);
       } else {
-        lastSeen.set(relative, { changeStamp: facts.changeStamp, sizeBytes: facts.sizeBytes });
+        // With the digest when the stamp is recent: a second rewrite in the
+        // same clock tick as this one keeps the same stamps too.
+        lastSeen.set(relative, entryStateOf(absolute, facts, now(), digestBudget));
       }
       coalescer.push({
         atMs: monotonicNow(),
@@ -350,9 +445,14 @@ export async function runWatchSession(options: WatchSessionOptions): Promise<Wat
       }
       for (const entry of entries) {
         const relative = relativeDir === "" ? entry.name : `${relativeDir}/${entry.name}`;
-        const facts = probePath(path.join(absoluteDir, entry.name));
+        const entryAbs = path.join(absoluteDir, entry.name);
+        const facts = probePath(entryAbs);
         if (facts === undefined) continue;
-        if (!differs(lastSeen.get(relative), facts)) continue;
+        const before = lastSeen.get(relative);
+        if (before !== undefined && !differs(before, facts)) {
+          // Equal stamps are only proof for a stamp old enough to trust.
+          if (contentVerdict(before, entryAbs) !== "changed") continue;
+        }
         reconciledEvents += 1;
         record(relative, "reconciled");
       }
@@ -386,15 +486,27 @@ export async function runWatchSession(options: WatchSessionOptions): Promise<Wat
       // BEFORE the watch was attached arrives as the watch's first event
       // (observed on macOS 15.6 under Bun 1.3.14), so a caller who writes a
       // file and then waits for the next change is told at once that it
-      // changed. The one blind spot is a change that preserves all three,
-      // which takes deliberate effort to produce.
+      // changed.
+      //
+      // But equal stamps are only as strong as the filesystem's clock. Linux
+      // stamps inodes from the coarse kernel clock, so a same-size rewrite in
+      // the same tick as the last look keeps byte-identical stamps, and 0.7.0
+      // reported a real save as "unchanged" (C124). So for a file written
+      // within STAMP_TRUST_WINDOW_MS of the last look, the content decides:
+      // the digest taken then is compared with the content now. A recent
+      // file too large to hash is counted, and named in a note.
       //
       // A notification with NO filename is exempt: it says only "something
       // happened here", so there is nothing to compare and dropping it would
       // lose the only signal the platform gave.
-      if (filename !== null && !vanished && !differs(lastSeen.get(relative), facts)) {
-        staleNotifications += 1;
-        return;
+      const before = lastSeen.get(relative);
+      if (filename !== null && !vanished && before !== undefined && !differs(before, facts)) {
+        const verdict = contentVerdict(before, absolute);
+        if (verdict === "same") {
+          staleNotifications += 1;
+          return;
+        }
+        if (verdict === "unknown") unverifiedNotifications += 1;
       }
       record(relative, eventType);
       // The temp-file signature: something we never knew about is already

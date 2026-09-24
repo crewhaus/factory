@@ -652,8 +652,131 @@ describe("WatchPath: what it reports", () => {
     const result = await callJson(watchPath, { path: ".", timeoutMs: 400, settleMs: 20 });
     expect(result["eventCount"]).toBe(0);
     expect(result["stoppedBy"]).toBe("deadline");
-    expect((result["notes"] as string[]).join(" ")).toContain("unchanged");
+    expect((result["notes"] as string[]).join(" ")).toContain(
+      "1 notification(s) named a path whose modification time, inode-change time and size had not moved",
+    );
   }, 15_000);
+
+  describe("equal timestamps inside one coarse clock tick (C124)", () => {
+    /**
+     * A probe that reports what Linux reports inside one tick of its coarse
+     * inode clock: real facts, except that every non-directory keeps the SAME
+     * mtime and ctime however often it is written. `stampMs` is the stamp's
+     * age anchor, a wall-clock time.
+     */
+    function coarseTickProbe(stampMs: number): void {
+      const tick = `${BigInt(stampMs) * 1_000_000n}`;
+      _setPathProbe((p): PathFacts | undefined => {
+        const st = lstatSync(p, { bigint: true, throwIfNoEntry: false });
+        if (st === undefined) return undefined;
+        const dir = st.isDirectory();
+        return {
+          exists: true,
+          device: Number(st.dev),
+          isDirectory: dir,
+          isSymlink: st.isSymbolicLink(),
+          mode: Number(st.mode),
+          mtimeMs: dir ? Number(st.mtimeMs) : stampMs,
+          ctimeMs: dir ? Number(st.ctimeMs) : stampMs,
+          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${tick}:${tick}`,
+          sizeBytes: Number(st.size),
+          uid: Number(st.uid),
+        };
+      });
+    }
+
+    test("a same-size rewrite in the snapshot's tick is still an event", async () => {
+      const clock = holdMonotonicClock();
+      coarseTickProbe(Date.now());
+      writeFileSync(join(workspace, "a.txt"), "aa");
+      scriptedWatcher((emit) => {
+        writeFileSync(join(workspace, "a.txt"), "bb");
+        emit("change", "a.txt");
+        clock.advance(1_000);
+      });
+      const result = await callJson(watchPath, {
+        path: ".",
+        timeoutMs: 5_000,
+        maxEvents: 1,
+        settleMs: 20,
+      });
+      expect(result["eventCount"]).toBe(1);
+      expect(result["stoppedBy"]).toBe("eventCap");
+      expect((result["events"] as Array<Record<string, unknown>>)[0]?.["kind"]).toBe("modified");
+      expect(result["notes"]).toBeUndefined();
+    }, 20_000);
+
+    test("the same notification about content that did not change is still not an event", async () => {
+      coarseTickProbe(Date.now());
+      writeFileSync(join(workspace, "settled.txt"), "same");
+      scriptedWatcher((emit) => {
+        writeFileSync(join(workspace, "settled.txt"), "same");
+        emit("rename", "settled.txt");
+      });
+      const result = await callJson(watchPath, { path: ".", timeoutMs: 300, settleMs: 20 });
+      expect(result["eventCount"]).toBe(0);
+      expect(result["stoppedBy"]).toBe("deadline");
+      expect((result["notes"] as string[]).join(" ")).toContain("1 notification(s) named a path");
+    }, 15_000);
+
+    test("a second rewrite in the same tick as a counted one is caught too", async () => {
+      const clock = holdMonotonicClock();
+      coarseTickProbe(Date.now());
+      writeFileSync(join(workspace, "a.txt"), "aa");
+      scriptedWatcher(async (emit) => {
+        writeFileSync(join(workspace, "a.txt"), "bb");
+        emit("change", "a.txt");
+        clock.advance(1_000);
+        await sleep(200);
+        // Same size, same stamps as the change just counted.
+        writeFileSync(join(workspace, "a.txt"), "cc");
+        emit("change", "a.txt");
+        clock.advance(1_000);
+      });
+      const result = await callJson(watchPath, {
+        path: ".",
+        timeoutMs: 5_000,
+        maxEvents: 2,
+        settleMs: 20,
+      });
+      expect(result["eventCount"]).toBe(2);
+      expect(result["stoppedBy"]).toBe("eventCap");
+    }, 20_000);
+
+    test("a recent file too large to compare is counted, and the note says why", async () => {
+      const clock = holdMonotonicClock();
+      coarseTickProbe(Date.now());
+      const big = "z".repeat(1024 * 1024 + 1);
+      writeFileSync(join(workspace, "big.bin"), big);
+      scriptedWatcher((emit) => {
+        emit("change", "big.bin");
+        clock.advance(1_000);
+      });
+      const result = await callJson(watchPath, {
+        path: ".",
+        timeoutMs: 5_000,
+        maxEvents: 1,
+        settleMs: 20,
+      });
+      expect(result["eventCount"]).toBe(1);
+      expect((result["notes"] as string[]).join(" ")).toContain(
+        "1 notification(s) named a recently written file whose timestamps and size had not moved but which was too large to compare, and were counted",
+      );
+    }, 20_000);
+
+    test("a stamp older than the trust window is trusted, and nothing is read", async () => {
+      // Equal stamps from long before the watch prove nothing moved: a write
+      // would have restamped the file. The content is not consulted.
+      coarseTickProbe(Date.now() - 60_000);
+      writeFileSync(join(workspace, "old.txt"), "aa");
+      scriptedWatcher((emit) => {
+        emit("rename", "old.txt");
+      });
+      const result = await callJson(watchPath, { path: ".", timeoutMs: 300, settleMs: 20 });
+      expect(result["eventCount"]).toBe(0);
+      expect((result["notes"] as string[]).join(" ")).toContain("1 notification(s) named a path");
+    }, 15_000);
+  });
 
   test("a chmod is a change, even though it leaves mtime alone", async () => {
     // Which is why ctime is compared too: a permission change moves ctime

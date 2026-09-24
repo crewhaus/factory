@@ -106,6 +106,15 @@ timestamps are compared at nanosecond resolution and include ctime, because a
 `chmod` moves ctime and not mtime, and on APFS a chmod microseconds after a
 write lands in the same millisecond.
 
+Equal timestamps are only as good as the filesystem's clock, though. Linux
+stamps inodes from the coarse kernel clock (one tick is 1–10 ms before kernel
+6.13), HFS+ keeps whole seconds and FAT two, so a same-size rewrite within a
+tick of the last look keeps identical stamps. For a file written within two
+seconds of the last look, the content decides: its sha256 is taken then (files
+up to 1 MiB, 16 MiB per snapshot) and compared when an equal-stamp
+notification arrives. A recent file too large to hash is counted, and a note
+says so, rather than being called unchanged.
+
 **Two platform limits are reported rather than hidden.** On Linux a file
 created inside a directory that was itself created during the watch may never
 be reported (a recursive watch adds the new directory's watch after the fact

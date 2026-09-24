@@ -261,7 +261,12 @@ export const watchPath: RegisteredTool = buildTool({
     }
     if (outcome.staleNotifications > 0) {
       notes.push(
-        `${outcome.staleNotifications} notification(s) named a path that was unchanged (same modification time, inode-change time and size) and were not counted — macOS can deliver a write made just before the watch started`,
+        `${outcome.staleNotifications} notification(s) named a path whose modification time, inode-change time and size had not moved (and, for a file written moments before, whose content was the same) and were not counted — macOS can deliver a write made just before the watch started`,
+      );
+    }
+    if (outcome.unverifiedNotifications > 0) {
+      notes.push(
+        `${outcome.unverifiedNotifications} notification(s) named a recently written file whose timestamps and size had not moved but which was too large to compare, and were counted: on a filesystem with a coarse clock (Linux, HFS+, FAT) equal timestamps do not prove nothing changed`,
       );
     }
     if (outcome.reconciledEvents > 0) {
