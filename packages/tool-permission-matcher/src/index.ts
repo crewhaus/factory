@@ -160,8 +160,15 @@ type GlobState =
  * of the value times the length of the glob, whatever the input looks like.
  * The language accepted is exactly the old regex's — the test suite checks
  * the two against each other.
+ *
+ * `work`, when passed, has the number of automaton states visited added to
+ * `work.steps`: a count of the work done that does not depend on how busy
+ * the machine is, so a test can check the cost grows linearly without
+ * racing a clock.
  */
-export type GlobMatcher = { readonly test: (value: string) => boolean };
+export type GlobMatcher = {
+  readonly test: (value: string, work?: { steps: number }) => boolean;
+};
 
 function compileGlob(glob: string): GlobMatcher {
   const tokens = tokenizeGlob(glob);
@@ -170,7 +177,12 @@ function compileGlob(glob: string): GlobMatcher {
   if (tokens.every((t) => t.k === "lit")) {
     let literal = "";
     for (const t of tokens) literal += String.fromCharCode((t as { c: number }).c);
-    return { test: (value: string) => value === literal };
+    return {
+      test: (value: string, work?: { steps: number }) => {
+        if (work !== undefined) work.steps += value.length;
+        return value === literal;
+      },
+    };
   }
 
   const states: GlobState[] = [{ t: "accept" }];
@@ -220,7 +232,7 @@ function compileGlob(glob: string): GlobMatcher {
   const count = states.length;
 
   return {
-    test(value: string): boolean {
+    test(value: string, work?: { steps: number }): boolean {
       // `seen[s] === step` ⇔ state s is already in the set for this step.
       const seen = new Int32Array(count).fill(-1);
       let current: number[] = [];
@@ -241,9 +253,15 @@ function compileGlob(glob: string): GlobMatcher {
         }
       };
       add(current, start, 0);
+      let steps = 0;
+      const done = (answer: boolean): boolean => {
+        if (work !== undefined) work.steps += steps;
+        return answer;
+      };
       for (let i = 0; i < value.length; i++) {
         const c = value.charCodeAt(i);
         following.length = 0;
+        steps += current.length;
         for (const s of current) {
           const st = states[s] as GlobState;
           if (
@@ -254,10 +272,10 @@ function compileGlob(glob: string): GlobMatcher {
             add(following, st.out, i + 1);
           }
         }
-        if (following.length === 0) return false;
+        if (following.length === 0) return done(false);
         [current, following] = [following, current];
       }
-      return current.includes(0);
+      return done(current.includes(0));
     },
   };
 }

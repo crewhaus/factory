@@ -135,38 +135,77 @@ describe("security-8#2 — a glob cannot stall the event loop", () => {
   // blocks the thread it runs on, so run in-process it would hang this test
   // instead of failing it — the event loop that would fire the timeout is the
   // thing that is stuck.
+  //
+  // Linear time is checked by COUNTING the work, not by timing it: each rule
+  // runs on an argument and on one sixteen times longer, and the matcher
+  // reports how many automaton states it visited. Linear means sixteen times
+  // the steps. A clock cannot say that reliably on a busy runner — in a full
+  // `bun run test` a wall-clock ratio of this same code measured 261.
   test("wildcard-heavy rules against long arguments finish in linear time", async () => {
     const script = `
         import { compilePattern, matchesPattern } from ${JSON.stringify(`${import.meta.dir}/index.ts`)};
         const cases = [
-          ["Bash(*git*push*--force*)", "git push --force origin main ; " + "git push ".repeat(16000)],
-          ["Bash(*a*b*c*d*)", "a".repeat(200000)],
-          ["Bash(**curl**|**sh**)", "curl ".repeat(40000)],
-          ["Bash(*a*a*a*a*a*a*a*a*b)", "a".repeat(100000) + "b"],
+          ["Bash(*git*push*--force*)", (k) => "git push --force origin main ; " + "git push ".repeat(k), 1000],
+          ["Bash(*a*b*c*d*)", (k) => "a".repeat(k), 12500],
+          ["Bash(**curl**|**sh**)", (k) => "curl ".repeat(k), 2500],
+          ["Bash(*a*a*a*a*a*a*a*a*b)", (k) => "a".repeat(k) + "b", 6250],
         ];
-        const t0 = performance.now();
-        const answers = cases.map(([p, c]) => matchesPattern(compilePattern(p), "Bash", { command: c }));
-        console.log(JSON.stringify({ answers, ms: performance.now() - t0 }));
+        const out = [];
+        for (const [pattern, make, k] of cases) {
+          const p = compilePattern(pattern);
+          const short = make(k);
+          const long = make(16 * k);
+          const small = { steps: 0 };
+          const large = { steps: 0 };
+          p._argRe.test(short, small);
+          p._argRe.test(long, large);
+          out.push({
+            pattern,
+            length: long.length,
+            answer: matchesPattern(p, "Bash", { command: long }),
+            small: small.steps,
+            large: large.steps,
+          });
+        }
+        console.log(JSON.stringify(out));
       `;
     const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
     let killed = false;
     const killer = setTimeout(() => {
       killed = true;
       child.kill("SIGKILL");
-    }, 15_000);
+    }, 45_000);
     const code = await child.exited;
     clearTimeout(killer);
     const stdout = await new Response(child.stdout).text();
     const stderr = await new Response(child.stderr).text();
-    // A kill here means the matcher did not get through ~600 KB of input in
-    // 15 s: it is backtracking again.
+    // A kill here means the matcher did not get through the inputs in 45 s:
+    // it is backtracking again (the old regex never finished the second one).
     expect({ killed, code, stderr }).toEqual({ killed: false, code: 0, stderr: "" });
-    const result = JSON.parse(stdout) as { answers: boolean[]; ms: number };
+    const rows = JSON.parse(stdout) as Array<{
+      pattern: string;
+      length: number;
+      answer: boolean;
+      small: number;
+      large: number;
+    }>;
     // The answers are what they always were; only the cost changed.
-    expect(result.answers).toEqual([true, false, false, true]);
-    // ~10 ms locally. The budget is two orders of magnitude above that.
-    expect(result.ms).toBeLessThan(2_000);
-  }, 30_000);
+    expect(rows.map((r) => r.answer)).toEqual([true, false, false, true]);
+    for (const r of rows) {
+      // The inputs really are the audit's sizes, 100–200 KB, and the work was
+      // counted (a matcher that reports nothing proves nothing)…
+      expect(r.length).toBeGreaterThanOrEqual(100_000);
+      expect(r.small).toBeGreaterThan(0);
+      // …sixteen times the input is at most sixteen times the work, give or
+      // take the fixed cost at either end (quadratic would be 256)…
+      expect({ pattern: r.pattern, growth: r.large / r.small < 17 }).toEqual({
+        pattern: r.pattern,
+        growth: true,
+      });
+      // …and no character costs more than a few states per glob token.
+      expect(r.large / r.length).toBeLessThan(r.pattern.length);
+    }
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
