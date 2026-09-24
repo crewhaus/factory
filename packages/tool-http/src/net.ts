@@ -938,6 +938,15 @@ export type OpenOptions = {
    * to any other origin carrying it is refused before the socket opens.
    */
   readonly credentialOrigins?: ReadonlySet<string> | undefined;
+  /**
+   * The canonical origin the call's credentials were set for. When given,
+   * a request to ANY other origin carries none of them, at every hop — not
+   * only where a redirect changes origin. A tool that makes several
+   * requests, some of them to URLs a server named (HttpPaginate's Link
+   * header), passes the origin of the URL the call named, so a server
+   * cannot steer the credential to another origin across requests.
+   */
+  readonly credentialOrigin?: string | undefined;
 };
 
 export type OpenResult = {
@@ -983,6 +992,16 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     assertNoUserinfo(current);
     assertOriginAllowed(current, o.cfg);
+    if (o.credentialOrigin !== undefined && currentOrigin !== o.credentialOrigin) {
+      // Not the origin the call's credentials were set for: whether a
+      // redirect or an earlier response pointed here, they are not sent.
+      for (const name of Object.keys(headers)) {
+        if (isCredential(name)) {
+          delete headers[name];
+          credentialsDropped = true;
+        }
+      }
+    }
     if (
       o.credentialOrigins !== undefined &&
       !o.credentialOrigins.has(currentOrigin) &&
@@ -1067,7 +1086,7 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
   }
 }
 
-function canonicalizeOriginOf(url: URL): string {
+export function canonicalizeOriginOf(url: URL): string {
   try {
     return canonicalizeOrigin(url.toString());
   } catch {

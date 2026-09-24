@@ -79,6 +79,7 @@ import {
   authHeaderName,
   bodyFailure,
   byString,
+  canonicalizeOriginOf,
   describeFailure,
   json,
   openRequest,
@@ -552,6 +553,11 @@ export const httpPaginate: RegisteredTool = buildTool({
     const deadline = startDeadline(input.timeoutMs, ctx?.signal);
     const maxTotalBytes = input.maxTotalBytes ?? MAX_MAX_BYTES;
     const items: unknown[] = [];
+    // The credential is for the origin the call named. A Link header is the
+    // server's choice of the next URL, so a page on any other origin is
+    // requested without it (C058), as a redirect to one is.
+    const credentialOrigin = canonicalizeOriginOf(first);
+    let credentialsDropped = false;
     let totalBytes = 0;
     let pages = 0;
     let stoppedBy = "end";
@@ -586,7 +592,9 @@ export const httpPaginate: RegisteredTool = buildTool({
           redirect: "follow",
           credentialHeaders: prepared.secretHeaders,
           credentialOrigins: prepared.credentialOrigins,
+          credentialOrigin,
         });
+        if (opened.credentialsDropped) credentialsDropped = true;
         const body = await readCapped(opened.res, maxBytes, deadline.signal);
         pages++;
         totalBytes += body.bytes;
@@ -597,6 +605,7 @@ export const httpPaginate: RegisteredTool = buildTool({
             stoppedBy: "status",
             lastUrl,
             status: opened.res.status,
+            credentialsDropped,
             items,
             note: `page ${pages} returned HTTP ${opened.res.status}; the walk stopped there`,
           });
@@ -607,6 +616,7 @@ export const httpPaginate: RegisteredTool = buildTool({
             itemCount: items.length,
             stoppedBy: "pageTooLarge",
             lastUrl,
+            credentialsDropped,
             items,
             note: `page ${pages} exceeded the ${maxBytes}-byte cap, so it could not be parsed; raise maxBytes or request a smaller page size`,
           });
@@ -622,6 +632,7 @@ export const httpPaginate: RegisteredTool = buildTool({
             itemCount: items.length,
             stoppedBy: "shape",
             lastUrl,
+            credentialsDropped,
             items,
             note:
               input.itemsPath === undefined
@@ -651,8 +662,10 @@ export const httpPaginate: RegisteredTool = buildTool({
 
         // Where the next page lives, per style.
         if (input.style === "link") {
+          // Relative to the page that carried the header: where the request
+          // ended up after any redirect, not where it started.
           const next = relTarget(opened.res.headers.get("link"), "next");
-          current = next === undefined ? null : (new URL(next, current) as URL);
+          current = next === undefined ? null : (new URL(next, opened.finalUrl) as URL);
         } else if (input.style === "cursor" && input.cursorPath !== undefined) {
           const cursor = readPath(parsed.value, input.cursorPath);
           if (cursor === undefined || cursor === null || cursor === "") {
@@ -675,7 +688,15 @@ export const httpPaginate: RegisteredTool = buildTool({
           current = null;
         }
       }
-      return json({ pages, itemCount: items.length, bytes: totalBytes, stoppedBy, lastUrl, items });
+      return json({
+        pages,
+        itemCount: items.length,
+        bytes: totalBytes,
+        stoppedBy,
+        lastUrl,
+        credentialsDropped,
+        items,
+      });
     } catch (err) {
       return describeFailure(err, deadline);
     } finally {

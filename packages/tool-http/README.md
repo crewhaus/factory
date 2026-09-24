@@ -71,7 +71,9 @@ second HTTP surface with a weaker gate would be the same hole twice.
 7. `Authorization`, `Proxy-Authorization`, `Cookie` **and whatever header the
    call's `auth` profile set** are **dropped the moment a redirect leaves the
    origin they were minted for**, and the result reports `credentialsDropped`.
-   A URL carrying `user:pass@` is refused outright — at the first hop and at
+   `HttpPaginate` holds the same line across pages: a `Link` header naming
+   another origin is followed without the credential, because the server
+   chose that URL, not the call. A URL carrying `user:pass@` is refused outright — at the first hop and at
    every redirect — because userinfo is a credential that would otherwise ride
    in `finalUrl` and `redirects` straight into a transcript.
 8. Every request has a deadline and every body a byte cap, on its decoded
