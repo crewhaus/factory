@@ -14,7 +14,12 @@
  *   1. `opts.subAgents.get(name)` — inline spec map (codegen-supplied).
  *   2. `<opts.subAgentDir or cwd/.crewhaus/sub-agents>/<name>.md` — frontmatter
  *      file on disk. Format mirrors SKILL.md: leading `---` YAML block, body
- *      becomes `instructions`.
+ *      becomes `instructions`. Any agent with a write tool can put a file
+ *      there, so a definition from disk can only NARROW: its permissions
+ *      meet the parent's, its pool candidates carry no tool_config, it runs
+ *      only on models the spec already names (a model id can carry an
+ *      endpoint), and the file is read without following a link or opening
+ *      a FIFO planted in its place.
  *   3. Built-in `general-purpose` fallback.
  *
  * Concurrency: a Task dispatch runs in parallel with its siblings ONLY
@@ -38,7 +43,6 @@
  * occurs when callers wire `Task` into a `runChatLoop` invocation that
  * doesn't pass `spawnSubAgent`.
  */
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type RuntimeBridge,
@@ -57,6 +61,7 @@ import {
 import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, toolListEntryNames } from "@crewhaus/tool-catalog";
 import { registeredToolName } from "@crewhaus/tool-categories";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -322,11 +327,31 @@ export function parseSubAgentFile(content: string, fallbackName?: string): SubAg
   return def;
 }
 
+/** A definition is a page of prose; anything past this is not one. */
+const SUB_AGENT_FILE_MAX_BYTES = 256 * 1024;
+
+/**
+ * The file is read contained to the directory, never through a symlink at
+ * the leaf, with a FIFO refused before it is opened and the size capped.
+ * The directory is one any agent with a write tool can populate: `<name>.md`
+ * linked to a file outside it used to be read and handed to a child as its
+ * instructions, and a FIFO there blocked the event loop for every session.
+ */
 function loadSubAgentFromDisk(name: string, dir: string): SubAgentDefinition | null {
-  const filePath = join(dir, `${name}.md`);
-  if (!existsSync(filePath)) return null;
-  const content = readFileSync(filePath, "utf-8");
-  return parseSubAgentFile(content, name);
+  const read = openForReadSync(dir, `${name}.md`, {
+    maxBytes: SUB_AGENT_FILE_MAX_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok) {
+    if (read.code === "not-found") return null;
+    throw new SubAgentResolutionError(`sub-agent "${name}" in ${dir} was not read: ${read.reason}`);
+  }
+  if (read.truncated) {
+    throw new SubAgentResolutionError(
+      `sub-agent "${name}" in ${dir} is larger than ${SUB_AGENT_FILE_MAX_BYTES} bytes, so it was not read`,
+    );
+  }
+  return parseSubAgentFile(read.text, name);
 }
 
 /**
@@ -503,6 +528,100 @@ function narrowDiskModelPool(def: SubAgentDefinition): {
 /** Definitions whose refused model_pool keys have already been reported. */
 const reportedRefusedPoolKeys = new Set<string>();
 
+/**
+ * Every model the operator's spec names for this Task tool: the parent's
+ * declared model and every model an inline (spec) definition can run on.
+ */
+function declaredModels(
+  parentModel: string,
+  subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined,
+): ReadonlySet<string> {
+  const out = new Set<string>([parentModel]);
+  for (const def of subAgents?.values() ?? []) {
+    if (def.model !== undefined) out.add(def.model);
+    for (const m of def.modelFallbacks ?? []) out.add(m);
+    if (def.modelTiers !== undefined) {
+      out.add(def.modelTiers.fast);
+      out.add(def.modelTiers.default);
+    }
+    for (const c of def.modelPool?.candidates ?? []) out.add(c.model);
+    for (const o of def.allowedProfiles ?? []) {
+      out.add(o.model);
+      for (const m of o.modelFallbacks ?? []) out.add(m);
+    }
+  }
+  return out;
+}
+
+/**
+ * security — a definition on disk may run only on models the spec already
+ * names ({@link declaredModels}). A model id can carry an endpoint
+ * (`local/<model>@<url>`), so a file the agent wrote could otherwise send the
+ * child's whole conversation — its prompt and every tool result it reads —
+ * to a host of its choosing, or pick a model the operator never agreed to pay
+ * for; 0.6.0 §7.7 already refuses the second for the Task `profile` argument.
+ * Anything else is dropped, and the child runs on the parent's model.
+ * Returns the fields it dropped, to report — never the model strings, which
+ * can carry a URL.
+ */
+function narrowDiskModels(
+  def: SubAgentDefinition,
+  declared: ReadonlySet<string>,
+): { readonly def: SubAgentDefinition; readonly refused: ReadonlyArray<string> } {
+  const refused: string[] = [];
+  const ok = (model: string): boolean => declared.has(model);
+  let next: SubAgentDefinition = def;
+  const drop = (field: keyof SubAgentDefinition, label: string): void => {
+    const { [field]: _dropped, ...rest } = next;
+    next = rest as SubAgentDefinition;
+    refused.push(label);
+  };
+  if (def.model !== undefined && !ok(def.model)) {
+    drop("model", "model");
+    if (next.modelProfile !== undefined) {
+      const { modelProfile: _p, ...rest } = next;
+      next = rest as SubAgentDefinition;
+    }
+  }
+  if (def.modelFallbacks !== undefined && !def.modelFallbacks.every(ok)) {
+    const kept = def.modelFallbacks.filter(ok);
+    if (kept.length > 0) {
+      next = { ...next, modelFallbacks: kept };
+      refused.push("model_fallbacks");
+    } else drop("modelFallbacks", "model_fallbacks");
+  }
+  if (def.modelTiers !== undefined && !(ok(def.modelTiers.fast) && ok(def.modelTiers.default))) {
+    drop("modelTiers", "model_tiers");
+  }
+  if (def.modelPool !== undefined && !def.modelPool.candidates.every((c) => ok(c.model))) {
+    const candidates = def.modelPool.candidates.filter((c) => ok(c.model));
+    if (candidates.length > 0) {
+      next = { ...next, modelPool: { ...def.modelPool, candidates } };
+      refused.push("model_pool");
+    } else drop("modelPool", "model_pool");
+  }
+  if (
+    def.allowedProfiles !== undefined &&
+    !def.allowedProfiles.every((o) => ok(o.model) && (o.modelFallbacks ?? []).every(ok))
+  ) {
+    const options = def.allowedProfiles
+      .filter((o) => ok(o.model))
+      .map((o) =>
+        o.modelFallbacks === undefined || o.modelFallbacks.every(ok)
+          ? o
+          : { ...o, modelFallbacks: o.modelFallbacks.filter(ok) },
+      );
+    if (options.length > 0) {
+      next = { ...next, allowedProfiles: options };
+      refused.push("allowed_profiles");
+    } else drop("allowedProfiles", "allowed_profiles");
+  }
+  return { def: next, refused };
+}
+
+/** Definitions whose refused models have already been reported. */
+const reportedRefusedModels = new Set<string>();
+
 export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool {
   const knownNames = opts.subAgents !== undefined ? [...opts.subAgents.keys()] : [];
   // 0.6.0 §7.7 — advertise the `profile` argument only when some definition
@@ -579,6 +698,19 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
         def = withRegisteredToolNames(def);
       } catch (err) {
         return `[Task error] ${(err as Error).message}`;
+      }
+
+      // A definition from disk runs only on models the spec names — before
+      // the `profile` check below reads its allowed_profiles.
+      if (fromDisk) {
+        const narrowedModels = narrowDiskModels(def, declaredModels(bridge.model, opts.subAgents));
+        def = narrowedModels.def;
+        if (narrowedModels.refused.length > 0 && !reportedRefusedModels.has(def.name)) {
+          reportedRefusedModels.add(def.name);
+          process.stderr.write(
+            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so it may run only on models the spec names — its ${narrowedModels.refused.join(", ")} named others and were ignored, so it runs on the parent's model. To run it on another model, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
+          );
+        }
       }
 
       // 0.6.0 §7.7 / §10.1 — the model-filled `profile` argument is checked
