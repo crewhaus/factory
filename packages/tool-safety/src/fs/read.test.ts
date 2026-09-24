@@ -1,8 +1,19 @@
-import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import {
+  closeSync,
+  mkdirSync,
+  readSync,
+  renameSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
-import { openForRead, openForReadSync } from "./read";
+import { _setDescriptorPathSupportForTest } from "./descriptor";
+import { _setOpenHooksForTest, openForRead, openForReadFd, openForReadSync } from "./read";
+import { joinRel } from "./resolve";
 import { fixture, mkfifo, posix } from "./test-helpers";
+import { writeFileSafe } from "./write";
 
 const f = fixture("read");
 afterAll(() => f.cleanup());
@@ -141,6 +152,140 @@ describe.if(posix)("openForRead contains the leaf, not just the directory", () =
       ok: false,
       code: "not-regular-file",
       kind: "character-device",
+    });
+  });
+});
+
+/**
+ * The review's race, made deterministic: `sub` is swapped for a link to
+ * outside after the path was resolved and before it is opened, so the open
+ * (and the pre-open lstat, and the fstat) all go through the swap. A second
+ * process renaming `sub` back and forth leaked the outside file in 262 of
+ * 52 230 reads before the descriptor was checked.
+ */
+describe.if(posix)("a directory swapped between the resolution and the open", () => {
+  const ws = join(f.base, "swap-ws");
+  const out = join(f.base, "swap-out");
+  mkdirSync(join(ws, "sub"), { recursive: true });
+  mkdirSync(out);
+  writeFileSync(join(ws, "sub", "t.txt"), "inside-ok");
+  writeFileSync(join(out, "t.txt"), "OUTSIDE-SECRET");
+  symlinkSync(out, join(ws, ".lnk"));
+  const swapIn = (): void => {
+    renameSync(join(ws, "sub"), join(ws, ".subtmp"));
+    renameSync(join(ws, ".lnk"), join(ws, "sub"));
+  };
+  const swapBack = (): void => {
+    renameSync(join(ws, "sub"), join(ws, ".lnk"));
+    renameSync(join(ws, ".subtmp"), join(ws, "sub"));
+  };
+  let swappedIn = false;
+  afterEach(() => {
+    _setOpenHooksForTest({});
+    _setDescriptorPathSupportForTest(undefined);
+    if (swappedIn) swapBack();
+    swappedIn = false;
+  });
+
+  const cases: Array<[string, boolean | undefined, boolean]> = [
+    // [label, descriptor path support, swap back before the check]
+    ["checked through the descriptor, swapped back before the check", undefined, true],
+    ["checked through the descriptor, still swapped", undefined, false],
+    ["without the descriptor: directory identities", false, false],
+    ["without the descriptor: the leaf's identity", false, true],
+  ];
+  for (const [label, support, back] of cases) {
+    for (const [name, read] of readers) {
+      test(`${name}, ${label}: refused, and nothing outside is read`, async () => {
+        _setDescriptorPathSupportForTest(support);
+        _setOpenHooksForTest({
+          beforeOpen: () => {
+            swapIn();
+            swappedIn = true;
+          },
+          afterOpen: () => {
+            if (!back) return;
+            swapBack();
+            swappedIn = false;
+          },
+        });
+        const r = await read(ws, "sub/t.txt", { maxBytes: 100 });
+        expect(r).toMatchObject({ ok: false, code: "changed", path: "sub/t.txt" });
+        expect(JSON.stringify(r)).not.toContain("OUTSIDE");
+        expect(JSON.stringify(r)).not.toContain(out);
+      });
+    }
+  }
+
+  test("with nothing swapped, the same read succeeds either way", async () => {
+    for (const support of [undefined, false]) {
+      _setDescriptorPathSupportForTest(support);
+      expect(openForReadSync(ws, "sub/t.txt", { maxBytes: 100 })).toMatchObject({
+        ok: true,
+        text: "inside-ok",
+      });
+    }
+  });
+});
+
+describe("openForReadFd and position", () => {
+  test("hands over the checked descriptor of a contained file", () => {
+    const opened = openForReadFd(f.ws, "note.txt");
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    try {
+      const buf = new Uint8Array(5);
+      expect(readSync(opened.fd, buf, 0, 5, 0)).toBe(5);
+      expect(new TextDecoder().decode(buf)).toBe("hello");
+      expect(opened.rel).toBe("note.txt");
+    } finally {
+      closeSync(opened.fd);
+    }
+    expect(openForReadFd(f.ws, "../outside/secret.txt")).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+    });
+  });
+
+  test("position reads from an offset", async () => {
+    for (const [, read] of readers) {
+      expect(await read(f.ws, "note.txt", { maxBytes: 3, position: 2 })).toMatchObject({
+        ok: true,
+        text: "llo",
+        truncated: false,
+      });
+    }
+  });
+});
+
+describe("a leaf joined onto a directory that is the root itself", () => {
+  test("joinRel works where a template string gave an absolute path", async () => {
+    // A resolver's `rel` is "" for the root: `${rel}/package.json` is "/package.json".
+    const dirRel = "";
+    expect(joinRel(dirRel, "note.txt")).toBe("note.txt");
+    expect(joinRel("a/b", "package.json")).toBe("a/b/package.json");
+    expect(await openForRead(f.ws, joinRel(dirRel, "note.txt"), { maxBytes: 10 })).toMatchObject({
+      ok: true,
+      text: "hello",
+    });
+    expect(
+      writeFileSafe(f.ws, joinRel(dirRel, "baselines.json"), "{}", { overwrite: true }),
+    ).toMatchObject({
+      ok: true,
+      rel: "baselines.json",
+    });
+  });
+
+  test("the absolute path the template made is refused, and the reason says why", () => {
+    const r = openForReadSync(f.ws, `${""}/note.txt`, { maxBytes: 10 });
+    expect(r).toMatchObject({ ok: false, code: "escapes-root", path: "/note.txt" });
+    if (!r.ok) {
+      expect(r.reason).toContain("absolute path");
+      expect(r.reason).toContain("escapes the workspace");
+    }
+    expect(writeFileSafe(f.ws, "/baselines.json", "{}", { overwrite: true })).toMatchObject({
+      ok: false,
+      code: "escapes-root",
     });
   });
 });

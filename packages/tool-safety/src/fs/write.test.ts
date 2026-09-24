@@ -16,10 +16,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { _setDescriptorPathSupportForTest } from "./descriptor";
 import { caseInsensitive, fixture, mkfifo, posix } from "./test-helpers";
 import {
+  _setCreateHooksForTest,
   _setLinkForTest,
   _setTempSuffixForTest,
+  appendContained,
   beginAtomicWrite,
   createExclusive,
   ensureDirContained,
@@ -31,6 +34,8 @@ afterAll(() => f.cleanup());
 afterEach(() => {
   _setTempSuffixForTest(undefined);
   _setLinkForTest(undefined);
+  _setCreateHooksForTest({});
+  _setDescriptorPathSupportForTest(undefined);
 });
 
 const mode = (p: string): number => statSync(p).mode & 0o7777;
@@ -243,13 +248,19 @@ describe.if(posix)("writeFileSafe never writes through a planted link", () => {
     for (let i = 0; i < 3; i++) {
       const begun = beginAtomicWrite(f.ws, "probe.txt", { overwrite: true });
       if (!begun.ok) throw new Error(begun.reason);
-      const temps = readdirSync(f.ws).filter((n) => n.startsWith(".probe.txt."));
-      expect(temps).toHaveLength(1);
-      const temp = temps[0] as string;
-      expect(temp).toMatch(/^\.probe\.txt\.[0-9a-f]{16}\.tmp$/);
-      expect(temp).not.toContain(String(process.pid));
-      seen.add(temp);
-      begun.writer.abort();
+      try {
+        const temps = readdirSync(f.ws).filter((n) => n.startsWith(".probe.txt."));
+        expect(temps).toHaveLength(1);
+        const temp = temps[0] as string;
+        // Sixteen random hex digits, never a pid. (A short pid, as in a
+        // container, turns up inside random hex by chance, so the format is
+        // what is checked, not the absence of its digits.)
+        expect(temp).toMatch(/^\.probe\.txt\.[0-9a-f]{16}\.tmp$/);
+        expect(temp).not.toContain(`.${process.pid}.`);
+        seen.add(temp);
+      } finally {
+        begun.writer.abort();
+      }
     }
     expect(seen.size).toBe(3);
     expect(noTemps(f.ws)).toBe(true);
@@ -421,4 +432,184 @@ describe.if(posix)("ensureDirContained", () => {
 
 test.if(posix)("readlink of the planted links still shows the attacker's text (sanity)", () => {
   expect(readlinkSync(join(f.ws, "data.txt.part0001"))).toBe("../outside/created.txt");
+});
+
+/**
+ * A directory swapped for a link to outside exactly while a file is created
+ * in it, and swapped back at once: the create lands outside, and a check of
+ * the directory afterwards sees nothing wrong. The new file must be found
+ * where it really is and removed, before a byte is written into it.
+ */
+describe.if(posix)("a directory swapped around the create itself", () => {
+  const ws = join(f.base, "create-swap-ws");
+  const out = join(f.base, "create-swap-out");
+  mkdirSync(join(ws, "sub"), { recursive: true });
+  mkdirSync(out);
+  symlinkSync(out, join(ws, ".lnk"));
+  const swap = (): void => {
+    renameSync(join(ws, "sub"), join(ws, ".subtmp"));
+    renameSync(join(ws, ".lnk"), join(ws, "sub"));
+  };
+  const back = (): void => {
+    renameSync(join(ws, "sub"), join(ws, ".lnk"));
+    renameSync(join(ws, ".subtmp"), join(ws, "sub"));
+  };
+  const swapAroundCreate = (): void =>
+    _setCreateHooksForTest({ beforeCreate: swap, afterCreate: back });
+
+  test("writeFileSafe leaves nothing outside, and says the directory changed", () => {
+    swapAroundCreate();
+    const r = writeFileSafe(ws, "sub/data.json", "ATTACKER-CHOSEN", { overwrite: true });
+    expect(r).toMatchObject({ ok: false, code: "changed", path: "sub/data.json" });
+    expect(readdirSync(out)).toEqual([]);
+    expect(readdirSync(join(ws, "sub"))).toEqual([]);
+  });
+
+  test("createExclusive leaves nothing outside either", () => {
+    swapAroundCreate();
+    const r = createExclusive(ws, "sub/part.0001");
+    expect(r).toMatchObject({ ok: false, code: "changed" });
+    if (r.ok) closeSync(r.fd);
+    expect(readdirSync(out)).toEqual([]);
+  });
+
+  test("with nothing swapped, both write normally", () => {
+    expect(writeFileSafe(ws, "sub/ok.json", "{}", { overwrite: false })).toMatchObject({
+      ok: true,
+    });
+    const made = createExclusive(ws, "sub/ok.part");
+    expect(made.ok).toBe(true);
+    if (made.ok) closeSync(made.fd);
+    expect(readdirSync(out)).toEqual([]);
+  });
+});
+
+describe.if(posix)("appendContained", () => {
+  test("creates the file, then appends to it in place", () => {
+    expect(
+      appendContained(f.ws, "logs/index.jsonl", '{"run":1}\n', { createParents: true }),
+    ).toMatchObject({
+      ok: true,
+      created: true,
+      bytes: 10,
+      size: 10,
+      rel: "logs/index.jsonl",
+    });
+    expect(appendContained(f.ws, "logs/index.jsonl", '{"run":2}\n')).toMatchObject({
+      ok: true,
+      created: false,
+      size: 20,
+    });
+    expect(readFileSync(join(f.ws, "logs", "index.jsonl"), "utf8")).toBe('{"run":1}\n{"run":2}\n');
+    expect(appendContained(f.ws, "logs/missing.jsonl", "x", { create: false })).toMatchObject({
+      ok: false,
+      code: "not-found",
+    });
+  });
+
+  test("a link at the leaf is refused, and what it points at is untouched (flag-truth-4#3)", () => {
+    writeFileSync(join(f.outside, "victim.log"), "victim");
+    symlinkSync(join(f.outside, "victim.log"), join(f.ws, "linked.log"));
+    expect(appendContained(f.ws, "linked.log", "INJECTED")).toMatchObject({
+      ok: false,
+      code: "is-symlink",
+    });
+    expect(appendContained(f.ws, "../outside/victim.log", "INJECTED")).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+    });
+    expect(readFileSync(join(f.outside, "victim.log"), "utf8")).toBe("victim");
+  });
+
+  test("a FIFO is refused, not blocked on", () => {
+    mkfifo(join(f.ws, "append.fifo"));
+    expect(appendContained(f.ws, "append.fifo", "x")).toMatchObject({
+      ok: false,
+      code: "not-regular-file",
+      kind: "fifo",
+    });
+  });
+
+  test("appends where writeFileSafe cannot: a writable file in a read-only directory", () => {
+    mkdirSync(join(f.ws, "ro"));
+    writeFileSync(join(f.ws, "ro", "state.txt"), "a");
+    chmodSync(join(f.ws, "ro"), 0o555);
+    try {
+      // The atomic replace needs a temp beside the file, so it is refused:
+      // by design, as a write that cannot be atomic is not attempted.
+      expect(writeFileSafe(f.ws, "ro/state.txt", "b", { overwrite: true })).toMatchObject({
+        ok: false,
+        code: "permission-denied",
+      });
+      expect(appendContained(f.ws, "ro/state.txt", "b")).toMatchObject({ ok: true, size: 2 });
+      expect(readFileSync(join(f.ws, "ro", "state.txt"), "utf8")).toBe("ab");
+    } finally {
+      chmodSync(join(f.ws, "ro"), 0o755);
+    }
+  });
+
+  describe("with a directory swapped around the open", () => {
+    const ws = join(f.base, "append-swap-ws");
+    const out = join(f.base, "append-swap-out");
+    mkdirSync(join(ws, "sub"), { recursive: true });
+    mkdirSync(out);
+    symlinkSync(out, join(ws, ".lnk"));
+    const swap = (): void => {
+      renameSync(join(ws, "sub"), join(ws, ".subtmp"));
+      renameSync(join(ws, ".lnk"), join(ws, "sub"));
+    };
+    const back = (): void => {
+      renameSync(join(ws, "sub"), join(ws, ".lnk"));
+      renameSync(join(ws, ".subtmp"), join(ws, "sub"));
+    };
+
+    test("a new file made outside is removed, and nothing is appended", () => {
+      _setCreateHooksForTest({ beforeCreate: swap, afterCreate: back });
+      expect(appendContained(ws, "sub/new.log", "INJECTED")).toMatchObject({
+        ok: false,
+        code: "changed",
+      });
+      expect(readdirSync(out)).toEqual([]);
+      expect(readdirSync(join(ws, "sub"))).toEqual([]);
+    });
+
+    test("a different file renamed over the leaf after it was checked is not appended to", () => {
+      writeFileSync(join(ws, "sub", "swapped.log"), "checked");
+      writeFileSync(join(ws, "sub", "other.log"), "other");
+      _setCreateHooksForTest({
+        beforeCreate: () =>
+          renameSync(join(ws, "sub", "other.log"), join(ws, "sub", "swapped.log")),
+      });
+      expect(appendContained(ws, "sub/swapped.log", "INJECTED")).toMatchObject({
+        ok: false,
+        code: "changed",
+      });
+      expect(readFileSync(join(ws, "sub", "swapped.log"), "utf8")).toBe("other");
+    });
+
+    test("a swap between the directory's resolution and the leaf's check is caught at the descriptor", () => {
+      // The leaf is examined, and opened, through the swap: both see the
+      // outside file, so only where the descriptor really is gives it away.
+      writeFileSync(join(ws, "sub", "early.log"), "inside");
+      writeFileSync(join(out, "early.log"), "OUTSIDE-FILE");
+      _setCreateHooksForTest({ afterResolve: swap, afterCreate: back });
+      expect(appendContained(ws, "sub/early.log", "INJECTED")).toMatchObject({
+        ok: false,
+        code: "changed",
+      });
+      expect(readFileSync(join(out, "early.log"), "utf8")).toBe("OUTSIDE-FILE");
+    });
+
+    test("an existing outside file reached through the swap is neither appended to nor removed", () => {
+      writeFileSync(join(ws, "sub", "app.log"), "inside");
+      writeFileSync(join(out, "app.log"), "OUTSIDE-FILE");
+      _setCreateHooksForTest({ beforeCreate: swap, afterCreate: back });
+      expect(appendContained(ws, "sub/app.log", "INJECTED")).toMatchObject({
+        ok: false,
+        code: "changed",
+      });
+      expect(readFileSync(join(out, "app.log"), "utf8")).toBe("OUTSIDE-FILE");
+      expect(readFileSync(join(ws, "sub", "app.log"), "utf8")).toBe("inside");
+    });
+  });
 });

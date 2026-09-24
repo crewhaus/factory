@@ -91,6 +91,34 @@ describe("copyTreeSafe", () => {
     expect(existsSync(join(f.ws, "over-b"))).toBe(false);
   });
 
+  test("a file larger than one copy chunk arrives byte for byte, with the mode it was given", () => {
+    // Several MiB of a pattern that differs chunk to chunk, so a copy that
+    // repeated, dropped or reordered a chunk would show.
+    const size = 3 * 1024 * 1024 + 17;
+    const data = new Uint8Array(size);
+    for (let i = 0; i < size; i++) data[i] = (i * 31 + (i >> 20)) & 0xff;
+    mkdirSync(join(f.ws, "bigsrc"));
+    writeFileSync(join(f.ws, "bigsrc", "blob.bin"), data);
+    chmodSync(join(f.ws, "bigsrc", "blob.bin"), 0o666);
+    const r = copyTreeSafe(f.ws, "bigsrc", f.ws, "bigdst", opts);
+    expect(r).toMatchObject({ ok: true, files: 1, bytes: size });
+    const copied = readFileSync(join(f.ws, "bigdst", "blob.bin"));
+    expect(copied.length).toBe(size);
+    expect(Buffer.compare(copied, Buffer.from(data))).toBe(0);
+    // A new file gets the source's bits less the umask, as a plain create does.
+    expect(mode(join(f.ws, "bigdst", "blob.bin"))).toBe(0o666 & ~process.umask());
+    // An overwrite keeps the replaced file's bits, as `cp` does.
+    chmodSync(join(f.ws, "bigdst", "blob.bin"), 0o600);
+    writeFileSync(join(f.ws, "bigsrc", "blob.bin"), data.subarray(0, 1000));
+    expect(
+      copyTreeSafe(f.ws, "bigsrc", f.ws, "bigdst", { ...opts, overwrite: true }),
+    ).toMatchObject({
+      ok: true,
+    });
+    expect(readFileSync(join(f.ws, "bigdst", "blob.bin")).length).toBe(1000);
+    expect(mode(join(f.ws, "bigdst", "blob.bin"))).toBe(0o600);
+  });
+
   test("a tree cannot be copied into itself", () => {
     expect(copyTreeSafe(f.ws, "src", f.ws, "src/inner", opts)).toMatchObject({
       ok: false,

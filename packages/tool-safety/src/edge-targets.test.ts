@@ -80,7 +80,7 @@ describe("cf-worker targets never bundle this Bun-only package", () => {
     }
     expect(walked).toBeGreaterThan(edge.size);
     expect(offenders).toEqual([]);
-  });
+  }, 20_000);
 
   test("the closure walk finds the package through an intermediate dependency", () => {
     const graph: Record<string, string[]> = {

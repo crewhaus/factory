@@ -68,6 +68,24 @@ export function escapes(given: string, what = "it"): SafeFsFailure {
   );
 }
 
+/**
+ * A path that is outside the root as written, before any link: with the
+ * reason an absolute path needs, since joining a relative directory that is
+ * "" (the root itself) onto `/package.json` is the usual way to get one.
+ */
+export function escapesAsWritten(given: string): SafeFsFailure {
+  if (!isAbsolutePath(given)) return escapes(given);
+  return fail(
+    "escapes-root",
+    given,
+    `${quote(given)} escapes the workspace: it is an absolute path outside the workspace root; name it relative to the root`,
+  );
+}
+
+function isAbsolutePath(given: string): boolean {
+  return given.startsWith("/") || given.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(given);
+}
+
 export function notRegular(given: string, kind: FileKind): SafeFsFailure {
   return fail(
     "not-regular-file",

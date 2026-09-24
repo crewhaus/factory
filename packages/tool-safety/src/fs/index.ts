@@ -8,6 +8,8 @@
  * - {@link openForRead}: at most N bytes of a contained regular file.
  * - {@link writeFileSafe} / {@link beginAtomicWrite}: temp + rename, never
  *   through a link, permission bits kept on overwrite.
+ * - {@link appendContained}: an in-place append that never follows a link
+ *   or opens a file outside the root.
  * - {@link createExclusive}: a new file at an exact name, refused if
  *   anything (a dangling link included) is already there.
  * - {@link ensureDirContained}: `mkdir -p` that does not follow a link out.
@@ -15,6 +17,8 @@
  *   never followed.
  * - {@link copyTreeSafe}: a planned copy with every destination path and
  *   every link's new target checked before a byte is written.
+ * - {@link checkRelocatedLinks}: before a rename, every link in the tree
+ *   judged from where the rename will put it; no content budget.
  * - {@link probeKind} / {@link assertRegularFile}: what a path is, without
  *   opening it.
  *
@@ -28,9 +32,18 @@ export {
 } from "./failure";
 export { type FileKind, fileKind } from "../streams/file";
 export { type KindProbe, assertRegularFile, probeKind } from "./kind";
-export { type Contained, type ResolveOptions, resolveContained } from "./resolve";
-export { type ContainedRead, type OpenForReadOptions, openForRead, openForReadSync } from "./read";
+export { type Contained, type ResolveOptions, joinRel, resolveContained } from "./resolve";
 export {
+  type ContainedFd,
+  type ContainedRead,
+  type OpenForReadOptions,
+  openForRead,
+  openForReadFd,
+  openForReadSync,
+} from "./read";
+export {
+  type AppendOptions,
+  type AppendResult,
   type AtomicWriter,
   type CreateExclusiveOptions,
   type CreatedExclusive,
@@ -40,6 +53,7 @@ export {
   type LeafSymlinkPolicy,
   type WriteOptions,
   type WriteResult,
+  appendContained,
   beginAtomicWrite,
   createExclusive,
   ensureDirContained,
@@ -54,6 +68,12 @@ export {
   type WalkTruncation,
   walkContained,
 } from "./walk";
+export {
+  RELOCATE_DEFAULTS,
+  type RelocateOptions,
+  type RelocateResult,
+  checkRelocatedLinks,
+} from "./relocate";
 export {
   type CopyEntry,
   type CopyOptions,

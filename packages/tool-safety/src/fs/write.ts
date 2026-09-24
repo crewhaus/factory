@@ -16,10 +16,12 @@ import {
 } from "node:fs";
 import * as path from "node:path";
 import { fileKind } from "../streams/file";
+import { descriptorPath, descriptorPathSupported } from "./descriptor";
 import {
   SafeFsError,
   type SafeFsFailure,
   escapes,
+  escapesAsWritten,
   fail,
   fromErrno,
   invalidPath,
@@ -58,7 +60,13 @@ import { type Root, isWithin, physicalPath, prepareRoot, toPosix } from "./resol
  */
 
 const O_NOFOLLOW = (constants as Record<string, number | undefined>)["O_NOFOLLOW"] ?? 0;
-export const EXCLUSIVE = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
+/**
+ * Read-write, not write-only: macOS resolves `/dev/fd/<fd>` only for a
+ * descriptor it could reopen for reading, and the check that a new file
+ * landed where it was meant to (`createdInDir`) asks exactly that. A new
+ * file is opened with the access asked for, whatever its mode bits.
+ */
+export const EXCLUSIVE = constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW;
 
 /**
  * Permission bits an overwrite carries over: the rwx bits. setuid and setgid
@@ -80,7 +88,7 @@ export function lexicalIn(root: Root, given: string): LexicalTarget | SafeFsFail
   if (isWithin(root.physical, abs)) {
     return { abs, base: root.physical, known: { lexical: root.physical, physical: root.physical } };
   }
-  return escapes(given);
+  return escapesAsWritten(given);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +314,7 @@ function locateLeaf(
   if (dir === undefined) {
     return fail("changed", given, `the directory of ${quote(given)} changed while it was checked`);
   }
+  createHooks.afterResolve?.(dirReal);
   return examineLeaf(root, given, rel, dir, path.basename(target.abs), options, 0);
 }
 
@@ -365,6 +374,56 @@ export function dirUnchanged(dir: CheckedDir): boolean {
   } catch {
     return false;
   }
+}
+
+type CreateHooks = {
+  /** After the directory is resolved, before the leaf is examined. */
+  afterResolve?: (dirReal: string) => void;
+  beforeCreate?: (real: string) => void;
+  afterCreate?: (real: string) => void;
+};
+let createHooks: CreateHooks = {};
+
+/**
+ * Test seam: run code just before and just after a file is created
+ * exclusively, to swap a directory exactly there. Pass `{}` to restore.
+ */
+export function _setCreateHooksForTest(next: CreateHooks): void {
+  createHooks = next;
+}
+
+/**
+ * The file just created on `fd` is in the directory that was checked. Asked
+ * of the descriptor where the kernel can say where it is (see
+ * `descriptor.ts`): then a file that a swapped directory put somewhere else
+ * is found where it really is and removed there, before a byte is written.
+ * Elsewhere, the directory's identity is compared, as before.
+ */
+export function createdInDir(fd: number, dir: CheckedDir, rootPhysical: string): boolean {
+  if (!descriptorPathSupported(rootPhysical)) return dirUnchanged(dir);
+  const held = descriptorPath(fd);
+  if (held === undefined) return dirUnchanged(dir);
+  const parent = checkDir(path.dirname(held));
+  if (parent !== undefined && parent.dev === dir.dev && parent.ino === dir.ino) return true;
+  try {
+    unlinkIfSame(held, fstatSync(fd));
+  } catch {
+    // Could not tell it is ours: leave it.
+  }
+  return false;
+}
+
+/**
+ * The file open on `fd`, which this call did NOT create, is in the checked
+ * directory. Like {@link createdInDir}, but it never removes anything: the
+ * file may be someone else's.
+ */
+function openedInDir(fd: number, dir: CheckedDir, rootPhysical: string): boolean {
+  if (!descriptorPathSupported(rootPhysical)) return dirUnchanged(dir);
+  const held = descriptorPath(fd);
+  if (held === undefined) return dirUnchanged(dir);
+  const parent = checkDir(path.dirname(held));
+  return parent !== undefined && parent.dev === dir.dev && parent.ino === dir.ino;
 }
 
 export function tryUnlink(p: string): void {
@@ -435,7 +494,9 @@ export function createExclusive(
   }
   let fd: number;
   try {
+    createHooks.beforeCreate?.(found.leafReal);
     fd = openSync(found.leafReal, EXCLUSIVE, options.mode ?? 0o666);
+    createHooks.afterCreate?.(found.leafReal);
   } catch (err) {
     const code = (err as { code?: unknown }).code;
     if (code === "EEXIST" || code === "ELOOP") {
@@ -447,8 +508,9 @@ export function createExclusive(
     }
     return fromErrno(given, err, "created");
   }
-  if (!dirUnchanged(found.dir)) {
+  if (!createdInDir(fd, found.dir, found.root.physical)) {
     try {
+      // Without the descriptor's path, the name is all there is to go by.
       unlinkIfSame(found.leafReal, fstatSync(fd));
     } finally {
       closeSync(fd);
@@ -460,6 +522,125 @@ export function createExclusive(
     );
   }
   return { ok: true, fd, real: found.leafReal, rel: found.rel };
+}
+
+// ---------------------------------------------------------------------------
+// appendContained
+// ---------------------------------------------------------------------------
+
+const O_NONBLOCK = (constants as Record<string, number | undefined>)["O_NONBLOCK"] ?? 0;
+/** An existing file: never created, never followed. Read-write for the same reason as {@link EXCLUSIVE}. */
+const APPEND_EXISTING = constants.O_RDWR | constants.O_APPEND | O_NOFOLLOW | O_NONBLOCK;
+/** A new file: created exclusively, so a file found in the wrong place is ours to remove. */
+const APPEND_NEW = EXCLUSIVE | constants.O_APPEND;
+
+export type AppendOptions = {
+  /** Create missing parent directories, each one contained. Default false. */
+  readonly createParents?: boolean;
+  /** Create the file when it does not exist (default true). False refuses a missing file. */
+  readonly create?: boolean;
+  /** Mode for a file this call creates (umask applies). Default 0o666. */
+  readonly mode?: number;
+};
+
+export type AppendResult =
+  | {
+      readonly ok: true;
+      readonly real: string;
+      readonly rel: string;
+      /** The file did not exist before this call. */
+      readonly created: boolean;
+      /** Bytes appended. */
+      readonly bytes: number;
+      /** The file's size after the append. */
+      readonly size: number;
+    }
+  | SafeFsFailure;
+
+/**
+ * Append `data` to `given` inside `root`, in place: for a log or a JSONL
+ * index that many runs add to (eval-report's `index.jsonl`), and for
+ * touching a file, where rewriting it through a temp would cost O(n) and
+ * race other appenders.
+ *
+ * The directory is contained as for {@link writeFileSafe}, and a link or a
+ * special file at the leaf is refused. An existing file is opened without
+ * `O_CREAT`, with `O_NOFOLLOW|O_NONBLOCK`, and must be the very file that
+ * was checked, in the directory that was checked (asked of the descriptor
+ * where the kernel can say). A missing one is created with `O_EXCL`, and if
+ * it turns out to be in the wrong place it is removed there. Either way,
+ * nothing is written until the checks pass.
+ *
+ * Each call's bytes land at the end of the file. One `write` is atomic
+ * against other appenders; a large `data` may take several, so keep records
+ * small enough to append in one (a JSONL line).
+ */
+export function appendContained(
+  root: string,
+  given: string,
+  data: string | Uint8Array,
+  options: AppendOptions = {},
+): AppendResult {
+  for (let attempt = 0; ; attempt++) {
+    const found = locateLeaf(root, given, { createParents: options.createParents === true });
+    if (!found.ok) return found;
+    const existing = found.existing;
+    if (existing === undefined && options.create === false) {
+      return fail("not-found", given, `${quote(given)} does not exist, and create is false`);
+    }
+    let fd: number;
+    try {
+      createHooks.beforeCreate?.(found.leafReal);
+      fd = openSync(
+        found.leafReal,
+        existing === undefined ? APPEND_NEW : APPEND_EXISTING,
+        options.mode ?? 0o666,
+      );
+      createHooks.afterCreate?.(found.leafReal);
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      // Another appender created it first: append to theirs.
+      if (code === "EEXIST" && attempt === 0) continue;
+      if (code === "ENXIO") return notRegular(given, "fifo");
+      return fromErrno(given, err, "appended to");
+    }
+    try {
+      const opened = fstatSync(fd);
+      if (existing === undefined) {
+        if (!createdInDir(fd, found.dir, found.root.physical)) {
+          return fail(
+            "changed",
+            given,
+            `the directory of ${quote(given)} changed while it was being created; nothing was appended`,
+          );
+        }
+      } else if (
+        !opened.isFile() ||
+        opened.dev !== existing.dev ||
+        opened.ino !== existing.ino ||
+        !openedInDir(fd, found.dir, found.root.physical)
+      ) {
+        return fail(
+          "changed",
+          given,
+          `${quote(given)} changed while it was being opened; nothing was appended`,
+        );
+      }
+      const bytes = writeAll(fd, data);
+      return {
+        ok: true,
+        real: found.leafReal,
+        rel: found.rel,
+        created: existing === undefined,
+        bytes,
+        size: fstatSync(fd).size,
+      };
+    } catch (err) {
+      return fromErrno(given, err, "appended to");
+    } finally {
+      closeSync(fd);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +759,9 @@ export function beginAtomicWrite(
   try {
     // A temp that replaces a file starts private and gets the old bits on
     // commit; a new file is created with its final mode straight away.
+    createHooks.beforeCreate?.(temp);
     fd = openSync(temp, EXCLUSIVE, preserved === undefined ? (options.mode ?? 0o666) : 0o600);
+    createHooks.afterCreate?.(temp);
   } catch (err) {
     const code = (err as { code?: unknown }).code;
     if (code === "EEXIST" || code === "ELOOP") {
@@ -599,6 +782,15 @@ export function beginAtomicWrite(
     closeSync(fd);
     tryUnlink(temp);
     return fromErrno(given, err, "written");
+  }
+  if (!createdInDir(fd, leaf.dir, leaf.root.physical)) {
+    closeSync(fd);
+    unlinkIfSame(temp, made);
+    return fail(
+      "changed",
+      given,
+      `the directory of ${quote(given)} changed while the write was starting; nothing was written`,
+    );
   }
   let open = true;
   let bytes = 0;

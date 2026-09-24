@@ -7,7 +7,7 @@ Zero runtime dependencies: Bun and `node:*` only. **Bun only.** It uses Bun Work
 ```ts
 import { runRegex, screenUserRegex } from "@crewhaus/tool-safety/regex";
 import { spawnBounded, readResponseBounded, decodeBody, fetchRaw, readFileBounded, openRegularFile } from "@crewhaus/tool-safety/streams";
-import { openForRead, writeFileSafe, createExclusive, walkContained, copyTreeSafe } from "@crewhaus/tool-safety/fs";
+import { openForRead, joinRel, writeFileSafe, appendContained, walkContained, copyTreeSafe, checkRelocatedLinks } from "@crewhaus/tool-safety/fs";
 import { resolveCredentialEnv, checkEnvReveal, redactKnownSecrets, redactUrlCredentials } from "@crewhaus/tool-safety/env";
 ```
 
@@ -172,9 +172,15 @@ Every refusal is a `SafeFsFailure`: `{ ok: false, code, reason, path }`. The `re
 
 The path is resolved one component at a time. After a link, `..` climbs from the link's TARGET: `a/b/y/..` with `y -> ../..` lands two levels above `a/b`, not at `a/b`, which is where folding the text would put it (security-11#5). A dangling link is followed too, because `open(O_CREAT)` through it creates its target. A missing tail is allowed, so a destination can be checked before it exists. Do I/O on the returned `real`.
 
-### Reading: `openForRead(root, path, { maxBytes, followLeafSymlink? })` and `openForReadSync`
+### Reading: `openForRead(root, path, { maxBytes, position?, followLeafSymlink? })`, `openForReadSync` and `openForReadFd`
 
-This returns at most `maxBytes` of a regular file whose physical location is inside the root. A leaf linked out of the root is refused, whatever directory it was joined onto (security-9#2, security-7#1, security-7#12, security-5#2, flag-truth-3#6). The read itself is `readFileBounded`, so a FIFO or device is refused before it is opened. An in-root link at the leaf is followed unless `followLeafSymlink: false`.
+This returns at most `maxBytes` of a regular file whose physical location is inside the root. A leaf linked out of the root is refused, whatever directory it was joined onto (security-9#2, security-7#1, security-7#12, security-5#2, flag-truth-3#6). The open refuses a FIFO or device before opening it, as `readFileBounded` does. An in-root link at the leaf is followed unless `followLeafSymlink: false`.
+
+A leaf joined onto a contained directory is spelled with `joinRel(dir.rel, "package.json")`. A template string gives `/package.json` when the directory is the root itself (`rel` is ""), and that absolute path is refused as outside the workspace, with a reason that says so.
+
+**A directory swapped mid-read.** Node has no `openat`, so the open walks the path again, and a directory on it swapped for a link between the check and the open used to be followed. The review's two-process race read the outside file in 262 of 52 230 reads. Now the open descriptor is asked where it really is: `realpath` of `/dev/fd/<fd>` names the open file on macOS and, through `/proc/self/fd`, on Linux. Unless that is inside the root, nothing is read. The same race then leaked nothing in 142 503 reads on macOS and 171 775 on Linux. Where the descriptor cannot be asked (Windows, a Linux without `/proc`), the identity of every directory on the path and of the leaf is compared after the open instead. That narrows the window without closing it.
+
+`openForReadFd(root, path)` makes every one of these checks and hands over the descriptor, for a reader that streams (`ReadLines`, `TailFile`). The caller closes it.
 
 ### Writing: `writeFileSafe(root, path, data, { overwrite, createParents?, mode?, leafSymlink? })`
 
@@ -185,9 +191,15 @@ This returns at most `maxBytes` of a regular file whose physical location is ins
 
 `beginAtomicWrite` is the same with the bytes streamed in: `writer.write(chunk)` any number of times, then `commit()` or `abort()`. Use it for a download.
 
+The temp needs a place beside the destination, so `writeFileSafe` refuses a file in a directory it cannot write, with `permission-denied`, even when the file itself is writable. This is by design: that write could only be done in place, which is neither atomic nor safe from a link swapped in at the leaf.
+
+### Appending: `appendContained(root, path, data, { createParents?, create?, mode? })`
+
+This appends in place: to a JSONL index that every run adds to, or to touch a file. A rewrite through a temp would cost O(n) and race other appenders. A link or special file at the leaf is refused. An existing file is opened without `O_CREAT`, with `O_NOFOLLOW|O_NONBLOCK`, and must be the very file that was checked, in the directory that was checked. A missing one is created with `O_EXCL`. Nothing is written until those checks pass; a file created in the wrong place is removed there, and one that already existed is left alone. One `write` is atomic against other appenders, so keep a record to one append.
+
 ### New files at exact names: `createExclusive(root, path, { mode?, createParents? })`
 
-This creates a new file and returns its open descriptor. Anything already at the name is refused, including a dangling link. Use it for part files, partials and temps (flag-truth-6#1, security-11#1). `ensureDirContained(root, path, { symlinks? })` creates a directory the same way; `symlinks: "refuse"` refuses any link on the way, for a layout whose directories must be real, such as a trash can (security-10#2).
+This creates a new file and returns its open descriptor. Anything already at the name is refused, including a dangling link. As with every file this module creates, where the new file really landed is asked of its descriptor. If a directory was swapped to put it elsewhere, it is removed there, before a byte is written. Use it for part files, partials and temps (flag-truth-6#1, security-11#1). `ensureDirContained(root, path, { symlinks? })` creates a directory the same way; `symlinks: "refuse"` refuses any link on the way, for a layout whose directories must be real, such as a trash can (security-10#2).
 
 ### Walking: `walkContained(root, start, { maxEntries, maxDepth, maxVisited?, filter? })`
 
@@ -199,13 +211,24 @@ The whole copy is planned before a byte is written. Every source entry is `lstat
 
 During the write, each entry is checked against the directory that was planned. If a directory is swapped for a link mid-copy, the copy stops, removes the entry it had just made through the swap, and reports how many entries were already copied.
 
+On Linux each file's bytes are copied by the kernel, between the two verified descriptors (`/proc/self/fd/<n>`): a clone on btrfs and XFS, `copy_file_range` on ext4. On macOS they are copied in 1 MiB chunks. There, copying between `/dev/fd` paths failed on 64 MiB and changed modes (measured on Bun 1.3.14), and a clone by path would re-walk the path the plan checked. A multi-gigabyte copy therefore blocks for as long as the disk takes, and it is synchronous.
+
+### Moving: `checkRelocatedLinks(srcRoot, src, dstRoot, dst, { maxLinks?, maxVisited? })`
+
+A rename moves links to a new depth, where a relative target means something else. This check judges every link in the tree from where the rename will put it, before the rename. It reads nothing but link text and applies no content budget. On a 60 601-entry tree it took 66 ms, where `copyTreeSafe(…, { dryRun: true })` took 381 ms and refused at MovePath's default of 50 000 entries. A destination the rename would replace is consulted only for paths the moved tree lacks, which can only refuse more.
+
 ### Kinds: `probeKind(absPath)`, `assertRegularFile(absPath)` and `fileKind(stats)`
 
 These tell what a path is without opening it: a `stat` never blocks on a FIFO, but an `open` does (flag-truth-6#3, security-11#7, security-6#12, security-7#8). `assertRegularFile` throws a `SafeFsError` for code that hands the path to something else. To read the file, use `openForRead`, which re-checks the open descriptor.
 
 ### What `./fs` cannot do
 
-Node has no `openat` or `mkdirat`. A directory swapped for a link between a check and the call that uses it is caught after the call, by comparing the directory's identity (`dev`/`ino`), not prevented. What the call created through the swap is then removed while the name still leads to it. Identity rather than spelling is compared because a case-insensitive volume makes `Docs` and `docs` one directory.
+Node has no `openat` or `mkdirat`. What this module does instead:
+
+- **Reads** are checked on the open descriptor, which closes the directory-swap race on macOS and Linux (see Reading).
+- **Files it creates** are found through their descriptor, and removed where they really are when a swap put them outside.
+- **The rename or link that puts a temp in place**, and `mkdir`, are still checked after the call by comparing the directory's identity (`dev`/`ino`). What they created through the swap is then removed while the name still leads to it; they are not prevented. Identity rather than spelling is compared because a case-insensitive volume makes `Docs` and `docs` one directory.
+- **A hard link** inside the root to a file outside it is that file under an inside name. No containment by path can tell it apart.
 
 ## `./env`: credentials and the environment
 
@@ -231,9 +254,11 @@ The result is `{ ok: true, name, value }`, or a refusal with a `code` and a `rea
 
 A package whose config has one `token_env` passes `[cfg.tokenEnv, ...cfg.tokenEnvs]` as `allowed`.
 
+**Adopt this only where tool_config arrives.** Today agent-level tool_config never reaches about 62 shipped tools (config-delivery#0, including tool-http, tool-codehost, tool-notify, tool-obs and tool-defi). In those packages `allowed` would always be empty, and every auth, token, webhook and signing call would be refused with `not-allowed`. Adoption there waits for that fix. There is deliberately no default allow-list: a list the operator did not write is the model choosing again. A package whose list is empty should warn at registration, naming the config key to set, so the refusal is not the first sign.
+
 ### `checkEnvReveal(name, { allowed, configKey })`
 
-Answers whether a tool that reports on variables (EnvInspect) may show a value. The name must be listed, and never credential-shaped, listed or not (flag-truth-4#1, security-8#3, docs-claims#6). Presence and length are all a model learns about a key.
+Answers whether a tool that reports on variables (EnvInspect) may show a value. The name must be listed, and never credential-shaped, listed or not (flag-truth-4#1, security-8#3, docs-claims#6). Presence and length are all a model learns about a key. `tool_config.proc.env_reveal` needs a config channel that tool-proc does not have yet (it registers no config), so EnvInspect adopts this together with one.
 
 ### `isCredentialShapedName(name)` and `credentialShapeOf(name)`
 
@@ -260,13 +285,13 @@ A secret in a URL's PATH, such as a Slack webhook's, is not recognisable by shap
 | security-5#7 (tool-notify) | `fetch(url)` + a capped reader | `fetchRaw(url, init)` (or `fetchRaw(request)` in `pinnedFetch`) + `readResponseBounded`, plus a local gzip-bomb test. `SseRead` and a large `DownloadFile` use `decodeBody`. |
 | security-9#4 (tool-fetch) | — | **Not adoptable here.** `tool-fetch` ships in the cf-worker targets, and `edge-targets.test.ts` refuses this package in its dependencies. Its fix must also work on workerd, which has no `decompress: false`. |
 | security-12#3, flag-truth-6#5 | `Buffer.allocUnsafe(size)` + read all | `readFileBounded` / `readFileBoundedSync`. |
-| security-11#8 | line reads with no byte budget | `openRegularFile` for the checked descriptor, then the tool's own streaming read with a per-line byte cap. |
+| security-11#8 | line reads with no byte budget | `openForReadFd` (or `openRegularFile` for a path already contained) for the checked descriptor, then the tool's own streaming read with a per-line byte cap. |
 | flag-truth-6#4, security-12#8 | a preview capped by lines only | The UTF-8-safe cut in `collectBounded` is the model; the preview fix itself lives in `tool-result-store`. |
 | flag-truth-6#3, security-11#7, security-6#12, security-7#8 | `statSync` / `openSync` + `readFileSync` of a caller-named path | `openForRead` (or `assertRegularFile` before handing the path on). |
-| security-9#2, security-7#1, security-7#12, security-5#2, flag-truth-3#6 | `readFileSync(join(dir.real, "package.json"))` after containing only `dir` | ``openForRead(root, `${dir.rel}/package.json`, { maxBytes })``. For a directory of leaves (AuditVerify), `walkContained` first, refusing any entry whose `kind` is not `file`. |
-| security-7#0, flag-truth-4#3, security-6#7, flag-truth-3#3, security-6#11 | `writeFileSync(join(dir.real, leaf))`, `mkdirSync({ recursive: true })`, `Bun.write(tmp)` + rename | `writeFileSafe(root, rel, data, { overwrite, createParents })`. |
+| security-9#2, security-7#1, security-7#12, security-5#2, flag-truth-3#6 | `readFileSync(join(dir.real, "package.json"))` after containing only `dir` | `openForRead(root, joinRel(dir.rel, "package.json"), { maxBytes })`, which also works when `dir` is the root. For a directory of leaves (AuditVerify), `walkContained` first, refusing any entry whose `kind` is not `file`. |
+| security-7#0, flag-truth-4#3, security-6#7, flag-truth-3#3, security-6#11 | `writeFileSync(join(dir.real, leaf))`, `mkdirSync({ recursive: true })`, `Bun.write(tmp)` + rename | `writeFileSafe(root, joinRel(dir.rel, leaf), data, { overwrite, createParents })`. An append-only file (eval-report's `index.jsonl`, TouchFile) uses `appendContained`. |
 | security-2#0, security-9#3, security-8#13, flag-truth-6#1, security-11#1 | a derived temp, partial or part name opened with `"w"` | `writeFileSafe` / `beginAtomicWrite` (random temp, `O_EXCL`), or `createExclusive` for a file that must be new. |
-| flag-truth-6#0, security-11#0, security-11#2 | `buildPlan` + `mkdirSync` + `copyFileSync` + `symlinkSync(readlinkSync(…))` | `copyTreeSafe(…, { symlinks: "copy-contained" })`. MovePath runs the same call with `dryRun: true` before its `renameSync`, since a rename moves links to a new depth too; its EXDEV fallback is the real copy, then a delete. |
+| flag-truth-6#0, security-11#0, security-11#2 | `buildPlan` + `mkdirSync` + `copyFileSync` + `symlinkSync(readlinkSync(…))` | `copyTreeSafe(…, { symlinks: "copy-contained" })`. MovePath runs `checkRelocatedLinks` before its `renameSync`, since a rename moves links to a new depth too; its EXDEV fallback is the real copy, then a delete. |
 | security-11#5 | a lexical `path.resolve(dir, linkTarget)` check of staged links | `walkContained(staging, ".")` and refuse any entry with `link.inside === false`. |
 | flag-truth-6#2, security-11#3 | `zip -r` without `-y` | Add `-y` to the argv. `walkContained` can refuse a source holding a link that leads out. |
 | security-10#2 | `mkdirSync(trash, { recursive: true })` | `ensureDirContained(root, trashRel, { symlinks: "refuse" })`. The owner check stays in the tool. |

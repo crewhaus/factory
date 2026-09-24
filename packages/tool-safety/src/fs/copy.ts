@@ -3,8 +3,10 @@ import {
   type Stats,
   chmodSync,
   closeSync,
+  copyFileSync,
   fchmodSync,
   fstatSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -40,6 +42,7 @@ import {
   EXCLUSIVE,
   PRESERVED_MODE_BITS,
   checkDir,
+  createdInDir,
   dirUnchanged,
   ensureDirIn,
   lexicalIn,
@@ -514,7 +517,7 @@ export function copyTreeSafe(
         : p.kind === "directory"
           ? makeDir(p, parent, dirs, madeDirs)
           : p.kind === "file"
-            ? copyFile(p, parent)
+            ? copyFile(p, parent, dRoot.physical)
             : makeLink(p, parent, links);
     if (failed !== undefined) return afterProgress(failed, i, planned.length);
   }
@@ -637,7 +640,39 @@ function makeLink(
   return undefined;
 }
 
-function copyFile(p: Planned, parent: CheckedDir): SafeFsFailure | undefined {
+/**
+ * Copy the whole of `srcFd` into the empty `destFd` in the kernel, where
+ * that can be done through the descriptors themselves: on Linux,
+ * `/proc/self/fd/<n>` reaches exactly the open file, whatever its path now
+ * leads to, so the copy clones (btrfs, XFS: `FICLONE`, no blocks
+ * duplicated) or uses `copy_file_range` (ext4) without re-walking a path
+ * the plan checked. Elsewhere there is no such path: macOS resolves
+ * `/dev/fd/<n>` for reads, but copying between two of them failed with
+ * EBADF on 64 MiB and rewrote the mode (measured on Bun 1.3.14), and a
+ * clone BY PATH would reopen the race the plan's identity check closes. So
+ * elsewhere, and on any error, the caller copies bytes itself.
+ *
+ * Returns the bytes now in `destFd`, or undefined when nothing was done.
+ */
+function kernelCopy(srcFd: number, destFd: number): number | undefined {
+  if (process.platform !== "linux") return undefined;
+  const mode = fstatSync(destFd).mode & 0o7777;
+  try {
+    copyFileSync(`/proc/self/fd/${srcFd}`, `/proc/self/fd/${destFd}`, constants.COPYFILE_FICLONE);
+  } catch {
+    try {
+      ftruncateSync(destFd, 0);
+    } catch {
+      // left for the caller to remove
+    }
+    return undefined;
+  }
+  // copyFile gives the destination the source's bits; the caller decides them.
+  fchmodSync(destFd, mode);
+  return fstatSync(destFd).size;
+}
+
+function copyFile(p: Planned, parent: CheckedDir, rootPhysical: string): SafeFsFailure | undefined {
   let srcFd: number;
   try {
     srcFd = openSync(p.srcReal, constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
@@ -681,23 +716,29 @@ function copyFile(p: Planned, parent: CheckedDir): SafeFsFailure | undefined {
       }
     }
     made = fstatSync(destFd);
-    if (!dirUnchanged(parent)) {
+    if (!createdInDir(destFd, parent, rootPhysical)) {
+      // Found where it really is and removed there; nothing to undo by name.
+      writing = undefined;
       return fail(
         "changed",
         p.destPath,
         `the directory of ${quote(p.destPath)} changed during the copy`,
       );
     }
-    const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(COPY_CHUNK, p.stats.size + 1)));
-    let total = 0;
-    for (;;) {
-      const n = readSync(srcFd, buffer, 0, buffer.length, null);
-      if (n === 0) break;
-      total += n;
-      if (total > p.stats.size) {
-        return fail("changed", p.srcPath, `${quote(p.srcPath)} grew during the copy`);
+    const copied = kernelCopy(srcFd, destFd);
+    let total = copied ?? 0;
+    if (copied === undefined) {
+      const buffer = Buffer.allocUnsafe(Math.max(1, Math.min(COPY_CHUNK, p.stats.size + 1)));
+      for (;;) {
+        const n = readSync(srcFd, buffer, 0, buffer.length, null);
+        if (n === 0) break;
+        total += n;
+        if (total > p.stats.size) break;
+        writeAll(destFd, buffer.subarray(0, n));
       }
-      writeAll(destFd, buffer.subarray(0, n));
+    }
+    if (total > p.stats.size) {
+      return fail("changed", p.srcPath, `${quote(p.srcPath)} grew during the copy`);
     }
     if (total !== p.stats.size) {
       return fail("changed", p.srcPath, `${quote(p.srcPath)} shrank during the copy`);

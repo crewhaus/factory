@@ -1,6 +1,14 @@
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import * as path from "node:path";
-import { type SafeFsFailure, escapes, fail, invalidPath, quote, unresolvable } from "./failure";
+import {
+  type SafeFsFailure,
+  escapes,
+  escapesAsWritten,
+  fail,
+  invalidPath,
+  quote,
+  unresolvable,
+} from "./failure";
 
 /**
  * Where a path PHYSICALLY lands, resolved the way the kernel resolves it.
@@ -172,6 +180,16 @@ export function prepareRoot(root: string, given: string): Root | SafeFsFailure {
   }
 }
 
+/**
+ * A leaf (or a relative path) under a directory's `rel`, for handing back to
+ * this module: `joinRel("", "package.json")` is `"package.json"`, where a
+ * template string would give `"/package.json"`, an absolute path outside
+ * the root. `rel` is "" for the root itself.
+ */
+export function joinRel(rel: string, leaf: string): string {
+  return path.posix.join(rel === "" ? "." : rel, leaf);
+}
+
 /** Slash-separated on every OS. */
 export function toPosix(p: string): string {
   return path.sep === "/" ? p : p.split(path.sep).join("/");
@@ -219,7 +237,7 @@ function lexicalAbs(
       known: { lexical: root.physical, physical: root.physical },
     };
   }
-  return escapes(given);
+  return escapesAsWritten(given);
 }
 
 /** {@link resolveContained} against a root already prepared. */
