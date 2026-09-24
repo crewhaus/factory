@@ -167,6 +167,13 @@ export function _resetDefiConfig(): void {
  * is looking at the spec, rather than three tool calls into a run.
  */
 function assertEndpoint(raw: string, chainId: string): string {
+  if (/^\$[A-Z_][A-Z0-9_]*$/.test(raw.trim())) {
+    // A bundle and `crewhaus run` read a `$VAR` value from the environment
+    // before this sees it; one arriving here was handed over unresolved.
+    throw new DefiError(
+      `rpc["${chainId}"] is ${raw.trim()}, an environment reference nothing resolved — a compiled bundle and crewhaus run read it from the environment at start; a direct registerDefiConfig caller passes the URL itself`,
+    );
+  }
   let url: URL;
   try {
     url = new URL(raw.trim());

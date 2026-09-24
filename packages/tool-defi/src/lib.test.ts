@@ -412,6 +412,31 @@ describe("configuration", () => {
     );
   });
 
+  test("an endpoint's refusal never repeats the value, which a $VAR may have supplied (C156)", () => {
+    // A bundle resolves `rpc: { "1": $ETH_RPC_URL }` before this sees it
+    // (tool-categories' applyToolConfig); what the environment held must not
+    // come back in a refusal.
+    for (const resolved of [
+      "eth.example/v2/KEY-FROM-ENV",
+      "ftp://eth.example/v2/KEY-FROM-ENV",
+      "https://user:KEY-FROM-ENV@eth.example/v2/x",
+    ]) {
+      expect(() => buildDefiConfig({ rpc: { "1": resolved } })).toThrow(DefiError);
+      try {
+        buildDefiConfig({ rpc: { "1": resolved } });
+      } catch (err) {
+        expect({ resolved, leaks: (err as Error).message.includes("KEY-FROM-ENV") }).toEqual({
+          resolved,
+          leaks: false,
+        });
+      }
+    }
+    // Handed over unresolved, the reference is named for what it is.
+    expect(() => buildDefiConfig({ rpc: { "1": "$ETH_RPC_URL" } })).toThrow(
+      'rpc["1"] is $ETH_RPC_URL, an environment reference nothing resolved',
+    );
+  });
+
   test("a Multicall3 deployment is held to the address check at config time (C127)", () => {
     // The aggregator answers every read in a batch; 0.7.0 lowercased whatever
     // was written, so a mistyped mixed-case address became every answer.
