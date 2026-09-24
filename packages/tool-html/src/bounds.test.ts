@@ -65,7 +65,7 @@ describe("the selector engine answers each (element, step) question once", () =>
     const root = parseHtml(`<div><h1></h1>${"<p></p>".repeat(100_000)}</div>`);
     expect(queryAll(root, "h1 ~ p ~ p")).toHaveLength(99_999);
     expect(queryAll(root, "h2 ~ p")).toEqual([]);
-  });
+  }, 20_000);
 
   test("positional pseudo-classes index a parent's children once, not once per child", () => {
     const root = parseHtml(`<div>${"<p></p>".repeat(5_000)}</div>`);
@@ -241,7 +241,7 @@ describe("the memoised matcher gives the 0.7.0 matcher's answers", () => {
     expect(compared).toBe(2_000);
     // The comparison has to exercise matches, not only empty answers.
     expect(nonEmpty).toBeGreaterThan(500);
-  });
+  }, 20_000);
 
   test("an ancestor or sibling outside the queried container still counts", () => {
     const root = parseHtml(

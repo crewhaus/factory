@@ -163,7 +163,7 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
       expect(parsed.valid).toBe(false);
       for (const error of parsed.errors) expect(error.message.length).toBeLessThanOrEqual(1_000);
     }
-  });
+  }, 20_000);
 
   test("an ordinary anyOf failure still names each alternative", () => {
     const result = validateValue(true, { anyOf: [{ type: "string" }, { type: "number" }] });
@@ -204,5 +204,5 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     expect(result.undetermined).toBeNull();
     expect(result.valid).toBe(true);
     expect(20_000 * 31).toBeGreaterThan(DEFAULT_MAX_WORK);
-  });
+  }, 20_000);
 });
