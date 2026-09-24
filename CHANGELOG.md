@@ -180,6 +180,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run — when the call also carried a `file_path: "src/ok.ts"` the tool never
   reads, when the path was `src/../.crewhaus/settings.json`, or when it went
   through a symlinked directory. None of these pass now.
+- **Every tool that sends to a place the model picks now gets the strict
+  egress check.** `Fetch` and `WebFetch` blocked a call carrying text from a
+  tool result, an MCP response or a sub-agent; `HttpRequest`, `HttpBatch`,
+  `GraphqlQuery`, `WebhookPost`, `EmailSend`, `SmsSend`, `ChatPost`, the
+  issue and pull-request writers, `DownloadFile`, `OpenExternal`,
+  `HttpPaginate`, the RPC readers and the other tools that take a URL or a
+  recipient from the model only logged it. They now block it too. Tools that
+  send to a place you configured (`SendMessage`, `WebSearch`,
+  `ImageGenerate`, a code host's reads) still only log. To relax one sink for
+  a deployment, pass `resolveSinkScope` to the runtime.
 - **A deny written the way the docs say now fires on MCP tools.**
   `alwaysDeny mcp__github__*` matched nothing, because the tools were
   registered under another name, so in auto mode the call simply ran.
