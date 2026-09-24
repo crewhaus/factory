@@ -251,8 +251,9 @@ import { type ServingModel, type ToolLimitVerdict, checkServingToolLimits } from
  * hit, a synthetic warning user message is appended (deduped per
  * signature) so the model can self-correct. Every tool result flows
  * through `@crewhaus/tool-result-store` — outputs over 10 KB are
- * persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` and the
- * model sees a preview pointing at the full file. Behind a
+ * persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` (or
+ * `<toolUseId>.<n>.txt` when an id-less provider's synthesised id repeats)
+ * and the model sees a preview pointing at the full file. Behind a
  * `streaming: true` option, the loop swaps to
  * `@crewhaus/streaming-tool-executor`, which dispatches tools mid-stream
  * via the SDK's `contentBlock` event.
