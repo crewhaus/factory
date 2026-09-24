@@ -26,6 +26,13 @@ import { preferIdentity, readBodyBounded, withRawBody } from "./body";
  *      cannot inflate past it in the runtime first.
  *   8. `Cookie` and `Authorization` headers are stripped from the
  *      response before returning to the model.
+ *   9. A redirect to another origin carries only the content-negotiation
+ *      headers the call set (Accept, Accept-Encoding, Accept-Language,
+ *      Content-Type, Content-Language, User-Agent): a header the call set
+ *      for the origin it named — Authorization, Cookie, an X-Api-Key — is
+ *      not sent to one it did not. A 303, or a 301/302 after a method
+ *      other than GET/HEAD, is followed as a GET without the body
+ *      (RFC 9110 §15.4), as tool-http's openRequest does.
  *
  * Layer R4. Pairs with the `target-cli` codegen contract — `BUILTIN_TOOL_MAP`
  * declares `fetch: { initSymbol: "registerFetchConfig" }` so the bundle
@@ -503,15 +510,41 @@ export function _setRawFetch(fn: RawFetch | undefined): void {
   rawFetch = fn ?? pinnedFetch;
 }
 
+/**
+ * The request headers a redirect to ANOTHER origin still carries. Fetch
+ * takes any header from the call, and it cannot tell which of them is a
+ * credential for the origin the call named (`Authorization` and `Cookie`
+ * are, and so is an `X-Api-Key`), so a cross-origin hop keeps only these,
+ * which describe the request rather than who makes it.
+ */
+const CROSS_ORIGIN_HEADERS = new Set([
+  "accept",
+  "accept-encoding",
+  "accept-language",
+  "content-language",
+  "content-type",
+  "user-agent",
+]);
+
+function originOf(url: URL): string {
+  try {
+    return canonicalizeOrigin(url.toString());
+  } catch {
+    return url.origin;
+  }
+}
+
 async function performFetch(
   initialUrl: URL,
-  method: string,
-  body: string | undefined,
+  initialMethod: string,
+  initialBody: string | undefined,
   callHeaders: Record<string, string> | undefined,
   signal: AbortSignal,
   cfg: FetchConfig,
 ): Promise<Response> {
   let currentUrl = initialUrl;
+  let method = initialMethod;
+  let body = initialBody;
   const headers = new Headers(callHeaders ?? {});
   preferIdentity(headers);
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
@@ -530,7 +563,7 @@ async function performFetch(
       method,
       redirect: "manual",
       signal,
-      ...(body !== undefined ? { body } : {}),
+      ...(body !== undefined && method !== "GET" && method !== "HEAD" ? { body } : {}),
       headers,
     };
     const res = await rawFetch(new Request(currentUrl.toString(), init), pinnedIp);
@@ -542,6 +575,26 @@ async function performFetch(
         next = new URL(loc, currentUrl);
       } catch {
         throw new FetchPermissionError(`invalid redirect target "${loc}"`);
+      }
+      if (originOf(next) !== originOf(currentUrl)) {
+        // Headers were set for the origin the call named; a redirect is the
+        // server's choice of destination, not the caller's.
+        for (const name of [...headers.keys()]) {
+          if (!CROSS_ORIGIN_HEADERS.has(name)) headers.delete(name);
+        }
+      }
+      // RFC 9110 §15.4.4 and §15.4.3: a 303 always becomes a GET, and 301/302
+      // after a non-GET have meant GET in every deployed client. Replaying
+      // the body would re-send the payload somewhere that did not ask for it.
+      if (
+        (res.status === 303 || res.status === 301 || res.status === 302) &&
+        method !== "GET" &&
+        method !== "HEAD"
+      ) {
+        method = "GET";
+        body = undefined;
+        headers.delete("content-type");
+        headers.delete("content-length");
       }
       currentUrl = next;
       // Drain and discard the redirect body so the connection can be
