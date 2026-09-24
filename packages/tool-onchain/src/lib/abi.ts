@@ -490,14 +490,11 @@ function wordAt(data: Uint8Array, offset: number, what: string, budget: DecodeBu
   return data.subarray(offset, offset + WORD);
 }
 
-function bigIntFromWord(word: Uint8Array, signed: boolean, bits: number): bigint {
+/** A word read as an unsigned 256-bit integer: an offset, a length, or a value to check. */
+function uintFromWord(word: Uint8Array): bigint {
   let value = 0n;
   for (const byte of word) value = (value << 8n) | BigInt(byte);
-  if (!signed) return value;
-  const limit = 1n << BigInt(bits);
-  const half = limit >> 1n;
-  const truncated = value & (limit - 1n);
-  return truncated >= half ? truncated - limit : truncated;
+  return value;
 }
 
 /** How many bytes one element of this type takes where its parent lays it out. */
@@ -542,7 +539,7 @@ function decodeValue(
   if (type.base === "array") {
     const child = type.child as AbiType;
     if (type.arrayLength === -1) {
-      const length = Number(bigIntFromWord(wordAt(data, offset, what, budget), false, 256));
+      const length = Number(uintFromWord(wordAt(data, offset, what, budget)));
       return decodeRepeated(length, child, data, offset + WORD, what, budget);
     }
     return decodeRepeated(type.arrayLength as number, child, data, offset, what, budget);
@@ -560,7 +557,7 @@ function decodeValue(
   }
 
   if (type.base === "string" || type.base === "bytes") {
-    const length = Number(bigIntFromWord(wordAt(data, offset, what, budget), false, 256));
+    const length = Number(uintFromWord(wordAt(data, offset, what, budget)));
     const start = offset + WORD;
     if (start + length > data.length) {
       throw new Error(`${what}: declares ${length} bytes, past the end of the data`);
@@ -570,16 +567,67 @@ function decodeValue(
     return type.base === "string" ? new TextDecoder().decode(bytes) : `0x${toHex(bytes)}`;
   }
 
-  const word = wordAt(data, offset, what, budget);
-  if (type.base === "address") return `0x${toHex(word.subarray(12))}`;
+  return decodeStaticWord(type, wordAt(data, offset, what, budget), what);
+}
+
+/** True when every byte in the slice is zero. */
+function allZero(bytes: Uint8Array): boolean {
+  return bytes.every((b) => b === 0);
+}
+
+/**
+ * One static word, read as its type — and refused unless it is the ONE word
+ * an encoder writes for a value of that type.
+ *
+ * A 32-byte word holds more than an address, a uint8 or a bytes4 can, and the
+ * ABI says what the rest must be: zero padding, or a sign extension. Solidity's
+ * decoder reverts on a word that breaks that; reading it anyway returns a value
+ * the named type cannot hold — a uint8 of 2^256−1, an "address" read from the
+ * low bytes of a balance — which is what naming the wrong types looks like,
+ * and a plausible answer to a question nobody asked. So it is an error, as a
+ * bool word of 2 always was.
+ */
+function decodeStaticWord(type: AbiType, word: Uint8Array, what: string): Decoded {
+  const value = uintFromWord(word);
+  if (type.base === "address") {
+    if (!allZero(word.subarray(0, 12))) {
+      throw new Error(
+        `${what}: an address word has non-zero upper bytes (0x${toHex(word.subarray(0, 12))}), so it is not an address — the data is mistyped or was not ABI-encoded`,
+      );
+    }
+    return `0x${toHex(word.subarray(12))}`;
+  }
   if (type.base === "bool") {
-    const value = bigIntFromWord(word, false, 256);
     if (value > 1n)
       throw new Error(`${what}: a bool word holds ${value}, which is neither true nor false`);
     return value === 1n;
   }
-  if (type.base === "bytesN") return `0x${toHex(word.subarray(0, type.bits / 8))}`;
-  return bigIntFromWord(word, type.base === "int", type.bits).toString();
+  if (type.base === "bytesN") {
+    const size = type.bits / 8;
+    if (!allZero(word.subarray(size))) {
+      throw new Error(
+        `${what}: a bytes${size} word has non-zero padding after its ${size} bytes — the data is mistyped or was not ABI-encoded`,
+      );
+    }
+    return `0x${toHex(word.subarray(0, size))}`;
+  }
+  if (type.base === "int") {
+    const signed = BigInt.asIntN(type.bits, value);
+    // A canonical intN word is the sign extension of its low N bits: every
+    // bit above them equals the sign bit.
+    if (BigInt.asUintN(256, signed) !== value) {
+      throw new Error(
+        `${what}: the word is not a sign-extended int${type.bits} — its upper bits are neither all zero nor all one — so the data is mistyped or was not ABI-encoded`,
+      );
+    }
+    return signed.toString();
+  }
+  if (value >> BigInt(type.bits) !== 0n) {
+    throw new Error(
+      `${what}: a uint${type.bits} word holds ${value}, which does not fit in ${type.bits} bits — the data is mistyped or was not ABI-encoded`,
+    );
+  }
+  return value.toString();
 }
 
 /** Head/tail decoding of `count` values laid out from `base`: a tuple, or an array's items. */
@@ -597,7 +645,7 @@ function decodeSequence(
     const type = typeAt(i);
     const label = `${what}[${i}]`;
     if (type.dynamic) {
-      const offset = Number(bigIntFromWord(wordAt(data, head, label, budget), false, 256));
+      const offset = Number(uintFromWord(wordAt(data, head, label, budget)));
       // An offset is relative to the start of the enclosing tuple. Treating
       // it as absolute reads the wrong bytes and usually still "works".
       out.push(decodeValue(type, data, base + offset, label, budget));

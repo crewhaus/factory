@@ -698,11 +698,10 @@ describe("the batch", () => {
  * to one.
  */
 describe("what a contract is allowed to say", () => {
-  test("an address word is the LOW 20 bytes, as tool-onchain's decoder reads it", async () => {
-    // The ABI says the top 12 bytes of an address word are zero and nothing on
-    // the receiving end enforces it. Formatting the whole word instead gives a
-    // 66-character string that is not an address, and every address check
-    // downstream then rejects a read that was perfectly good.
+  test("an address word is the LOW 20 bytes, and dirty padding is reported, not hidden", async () => {
+    // The ABI says the top 12 bytes of an address word are zero. Formatting
+    // the whole word instead gives a 66-character string that is not an
+    // address, and every address check downstream then rejects the read.
     const clean = BigInt(ADDR.usdc);
     const dirty = (BigInt(`0x${"ff".repeat(12)}`) << 160n) | clean;
 
@@ -711,12 +710,18 @@ describe("what a contract is allowed to say", () => {
     // Leading zero bytes in the address itself must still pad out to 40.
     expect(addressFromWord(0xabn).address).toBe(`0x${"0".repeat(38)}ab`);
 
-    // The oracle: tool-onchain's own decoder, on the same dirty word.
-    const encoded = `0x${dirty.toString(16).padStart(64, "0")}`;
+    // The oracle: tool-onchain's own decoder reads the clean word the same
+    // way. It REFUSES the dirty one (C209), as Solidity's decoder does; this
+    // package reads it and flags it instead, so one non-conforming contract
+    // costs a caveat on a row rather than the whole read.
+    const word = (value: bigint): string => `0x${value.toString(16).padStart(64, "0")}`;
     const out = JSON.parse(
-      (await abiDecode.execute({ data: encoded, types: ["address"] }, ctx)) as string,
+      (await abiDecode.execute({ data: word(clean), types: ["address"] }, ctx)) as string,
     ) as { values: string[] };
-    expect((out.values[0] as string).toLowerCase()).toBe(addressFromWord(dirty).address);
+    expect((out.values[0] as string).toLowerCase()).toBe(addressFromWord(clean).address);
+    await expect(abiDecode.execute({ data: word(dirty), types: ["address"] }, ctx)).rejects.toThrow(
+      /non-zero upper bytes/,
+    );
   });
 
   test("a contract-supplied label is capped and scrubbed, and says when it was", () => {

@@ -130,6 +130,17 @@ describe("AbiDecode", () => {
     await expect(raw(abiDecode, { data: "0x00", types: ["uint256"] })).rejects.toThrow(/truncated/);
   });
 
+  test("a word its type cannot hold is an error, not a plausible value (C209)", async () => {
+    // 0.7.0 answered "256" for a uint8 and the low 20 bytes of a balance for
+    // an address.
+    await expect(
+      raw(abiDecode, { data: `0x${"0".repeat(61)}100`, types: ["uint8"] }),
+    ).rejects.toThrow(/^value\[0\]: a uint8 word holds 256/);
+    await expect(
+      raw(abiDecode, { data: `0x${"ff".repeat(12)}${"11".repeat(20)}`, types: ["address"] }),
+    ).rejects.toThrow(/^value\[0\]: an address word has non-zero upper bytes/);
+  });
+
   test("offsets that share one tail are refused rather than decoded a million times (C085)", async () => {
     // uint256[][][][][] where each of five levels' 16 heads share one child:
     // 1,048,576 values from about 5 KB of hex on 0.7.0.

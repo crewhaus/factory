@@ -228,6 +228,97 @@ describe("ABI decoding", () => {
   });
 });
 
+describe("a word that is not the encoding of its type is refused (C209)", () => {
+  /** One word from hex digits, left-padded to 64. */
+  const w = (hex: string): string => `0x${hex.padStart(64, "0")}`;
+
+  test("a uint word must fit its width", () => {
+    expect(() => decodeData(["uint8"], w("100"))).toThrow(
+      "value[0]: a uint8 word holds 256, which does not fit in 8 bits",
+    );
+    // The common mistake the check exists for: a uint256 slot read as uint8.
+    expect(() => decodeData(["uint8"], w((10n ** 18n).toString(16)))).toThrow(/uint8/);
+    expect(decodeData(["uint8"], w("ff"))).toEqual(["255"]);
+    expect(decodeData(["uint64"], w("f".repeat(16)))).toEqual([(2n ** 64n - 1n).toString()]);
+    expect(() => decodeData(["uint64"], w(`1${"0".repeat(16)}`))).toThrow(/uint64/);
+  });
+
+  test("an int word must be the sign extension of its low bits", () => {
+    expect(() => decodeData(["int8"], w("80"))).toThrow(
+      "value[0]: the word is not a sign-extended int8",
+    );
+    expect(() => decodeData(["int8"], w("100"))).toThrow(/sign-extended int8/);
+    expect(() => decodeData(["int8"], `0x${"f".repeat(60)}0080`)).toThrow(/sign-extended/);
+    expect(decodeData(["int8"], `0x${"f".repeat(62)}80`)).toEqual(["-128"]);
+    expect(decodeData(["int8"], w("7f"))).toEqual(["127"]);
+    expect(decodeData(["int8"], `0x${"f".repeat(64)}`)).toEqual(["-1"]);
+  });
+
+  test("an address word must have zero upper bytes", () => {
+    expect(() => decodeData(["address"], `0x${"ff".repeat(12)}${"11".repeat(20)}`)).toThrow(
+      "value[0]: an address word has non-zero upper bytes (0xffffffffffffffffffffffff)",
+    );
+    expect(decodeData(["address"], `0x${"00".repeat(12)}${"11".repeat(20)}`)).toEqual([
+      `0x${"11".repeat(20)}`,
+    ]);
+  });
+
+  test("a bytesN word must have zero padding after its bytes", () => {
+    expect(() => decodeData(["bytes4"], `0xdeadbeef${"ab".repeat(28)}`)).toThrow(
+      "value[0]: a bytes4 word has non-zero padding after its 4 bytes",
+    );
+    expect(decodeData(["bytes4"], `0xdeadbeef${"00".repeat(28)}`)).toEqual(["0xdeadbeef"]);
+    expect(decodeData(["bytes32"], `0x${"ab".repeat(32)}`)).toEqual([`0x${"ab".repeat(32)}`]);
+  });
+
+  test("the check reaches inside arrays and tuples, and names the element", () => {
+    const pad = (hex: string): string => hex.padStart(64, "0");
+    expect(() => decodeData(["uint8[2]"], `0x${pad("1")}${pad("10000")}`)).toThrow(
+      /^value\[0\]\[1\]: a uint8 word/,
+    );
+    expect(() => decodeData(["(uint256,address)"], `0x${pad("1")}${"ff".repeat(32)}`)).toThrow(
+      /^value\[0\]\[1\]: an address word/,
+    );
+  });
+
+  test("the widest types take every word, at their extremes", () => {
+    const max = (2n ** 256n - 1n).toString(16);
+    expect(decodeData(["uint256"], w(max))).toEqual([(2n ** 256n - 1n).toString()]);
+    expect(decodeData(["int256"], w(`8${"0".repeat(63)}`))).toEqual([(-(2n ** 255n)).toString()]);
+    expect(decodeData(["int256"], w(`7${"f".repeat(63)}`))).toEqual([(2n ** 255n - 1n).toString()]);
+  });
+
+  test("whatever the encoder writes, the decoder reads back", () => {
+    const cases: Array<[string, unknown]> = [
+      ["uint8", 255n],
+      ["uint16", 65535n],
+      ["uint64", 2n ** 64n - 1n],
+      ["uint256", 2n ** 256n - 1n],
+      ["int8", -128n],
+      ["int8", 127n],
+      ["int64", -(2n ** 63n)],
+      ["int256", -1n],
+      ["int256", 2n ** 255n - 1n],
+      ["address", VITALIK],
+      ["bytes1", "0xab"],
+      ["bytes4", "0xdeadbeef"],
+      ["bytes32", `0x${"cd".repeat(32)}`],
+      ["bool", true],
+      ["bool", false],
+    ];
+    for (const [type, value] of cases) {
+      const data = `0x${encodeCall(`f(${type})`, [value as never]).slice(10)}`;
+      const expected =
+        typeof value === "bigint"
+          ? value.toString()
+          : typeof value === "string"
+            ? value.toLowerCase()
+            : value;
+      expect({ type, decoded: decodeData([type], data)[0] }).toEqual({ type, decoded: expected });
+    }
+  });
+});
+
 /** One ABI word holding `n`. */
 const word = (n: number | bigint): string => BigInt(n).toString(16).padStart(64, "0");
 

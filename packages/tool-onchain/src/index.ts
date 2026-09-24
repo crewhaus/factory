@@ -113,7 +113,7 @@ export const abiEncodeCall: RegisteredTool = buildTool({
 export const abiDecode: RegisteredTool = buildTool({
   name: "AbiDecode",
   description:
-    "Decode ABI-encoded hex — an eth_call result, a log's data, a transaction's arguments, revert data — into named, typed values. Use it to read a contract's answer without a model squinting at 32-byte words. Integers come back as decimal STRINGS so a uint256 survives JSON intact; addresses come back lowercase and hex-prefixed. Data that ends early is an error rather than a plausible short answer.",
+    "Decode ABI-encoded hex — an eth_call result, a log's data, a transaction's arguments, revert data — into named, typed values. Use it to read a contract's answer without a model squinting at 32-byte words. Integers come back as decimal STRINGS so a uint256 survives JSON intact; addresses come back lowercase and hex-prefixed. Data that ends early is an error rather than a plausible short answer, and so is a word that no encoder writes for its type — a uint8 holding 256, an address or bytes4 with non-zero padding, an int8 that is not sign-extended — because that is what naming the wrong types looks like.",
   inputSchema: z.object({
     data: z.string().max(LIMITS.hexChars).describe("0x hex, without a function selector"),
     types: z.array(z.string()).min(1).max(LIMITS.types).describe('e.g. ["uint256", "address"]'),

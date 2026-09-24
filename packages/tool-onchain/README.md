@@ -121,7 +121,11 @@ same as all of them, so every entry point takes it as an argument.
 - **It does not sign or hold keys.**
 - **It does not know what a contract does.** `AbiDecode` decodes the types
   you name; naming the wrong ones produces confident nonsense, which is why
-  data that ends early is an error rather than a short answer.
+  data that ends early is an error rather than a short answer. So is a word
+  that is not the encoding of its type — a `uint8` holding 256, an `address`
+  or `bytes4` with non-zero padding, an `int8` that is not sign-extended —
+  which is how Solidity's own decoder treats it, and what reading a
+  `uint256` slot as a `uint8` looks like.
 - **It does not fetch an ABI.** Signatures come from the caller.
 - **It does not price anything.** `DefiMath` computes against a reference you
   supply; where that reference came from is your problem.

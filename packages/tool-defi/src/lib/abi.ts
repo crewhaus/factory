@@ -180,13 +180,14 @@ export function asSigned(word: bigint, bits: number): bigint {
  * Read a 32-byte word as an `address`.
  *
  * The low 20 bytes are the address; the upper 12 are padding that the ABI says
- * is zero and that nothing on the receiving end enforces. `@crewhaus/tool-onchain`'s
- * decoder takes the low 20 bytes and ignores the rest, so this does too —
- * formatting the WHOLE word instead produces a 66-character string that is not
- * an address, which every downstream address check then rejects, so one
- * non-conforming contract takes out the read rather than the padding it
- * violated. The dirty padding is reported rather than swallowed: it is also
- * what calling the wrong function on the right contract looks like.
+ * is zero. `@crewhaus/tool-onchain`'s `AbiDecode` refuses a word whose padding
+ * is not, as Solidity's decoder does. This reads the low 20 bytes anyway and
+ * REPORTS the dirty padding, so one non-conforming contract costs a caveat on
+ * a row rather than the whole valuation — formatting the WHOLE word instead
+ * produces a 66-character string that is not an address, which every
+ * downstream address check then rejects. The flag is not a formality: dirty
+ * padding is also what calling the wrong function on the right contract looks
+ * like.
  */
 export function addressFromWord(word: bigint): { address: string; paddingDirty: boolean } {
   const low = word & ((1n << 160n) - 1n);
