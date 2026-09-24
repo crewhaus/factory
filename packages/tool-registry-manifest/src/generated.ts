@@ -1028,7 +1028,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "copyPath",
     name: "CopyPath",
     description:
-      "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists.",
+      "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when they still point inside the workspace from where the copy puts them; an existing symlink under the destination is never written through.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -5042,7 +5042,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "movePath",
     name: "MovePath",
     description:
-      "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone.",
+      "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move that would leave a relative symlink pointing outside the workspace from its new place is refused.",
     readOnly: false,
     destructive: true,
     scope: "internal",

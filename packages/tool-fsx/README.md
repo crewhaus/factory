@@ -46,6 +46,21 @@ re-check the *real* path so a symlink inside the workspace cannot point out of
 it. `index.test.ts` proves it for every path-taking tool, three ways — a `..`
 path, an absolute path, and an in-workspace symlink to somewhere else.
 
+The guard covers every path a tool writes, not just the one the caller
+named. `CopyPath` and `MovePath`'s cross-filesystem fallback copy with
+[`@crewhaus/tool-safety`](../tool-safety)'s `copyTreeSafe`: the whole copy is
+planned before a byte is written, an existing symlink anywhere under the
+destination is refused (even one that stays inside the workspace, as GNU
+`cp -R` refuses to merge a directory into a link), a file never replaces a
+directory, and FIFOs, sockets and devices in the source are refused. Links
+are copied as links, and only when they still lead inside the workspace from
+where the copy puts them. `MovePath` judges every link in the tree from its new
+place before it renames anything, so `a/b/up -> ../..` cannot be moved one
+level up to point out of the workspace. `SplitFile` and `ConcatFiles` write
+each file through a temp created with `O_EXCL|O_NOFOLLOW` and renamed into
+place, and refuse a part or destination name that is a symlink, with or
+without `overwrite`. `copy-containment.test.ts` holds these.
+
 Archives get a second gate. `ArchiveExtract` reads the member list from the
 archive's own structures **in this process** — tar's headers, zip's central
 directory — rather than from `tar -t` or `unzip -Z1` output, because a member

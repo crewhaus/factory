@@ -27,7 +27,6 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   type Dirent,
   closeSync,
-  copyFileSync,
   existsSync,
   constants as fsConstants,
   fstatSync,
@@ -40,7 +39,6 @@ import {
   realpathSync,
   renameSync,
   rmSync,
-  symlinkSync,
   unlinkSync,
   utimesSync,
   writeSync,
@@ -48,6 +46,14 @@ import {
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  type CopyResult,
+  type SafeFsFailure,
+  beginAtomicWrite,
+  checkRelocatedLinks,
+  copyTreeSafe,
+  ensureDirContained,
+} from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   type ArchiveEntry,
@@ -860,97 +866,18 @@ export const tempDir: RegisteredTool = buildTool({
 // moving bytes about
 // ---------------------------------------------------------------------------
 
-type PlanEntry = {
-  readonly rel: string;
-  readonly kind: WalkNode["kind"];
-  readonly size: number;
-  readonly sourceAbs: string;
-  readonly destAbs: string;
-};
-
-type CopyPlan = {
-  readonly entries: PlanEntry[];
-  readonly bytes: number;
-  readonly truncated: boolean;
-  /** Destination paths that already exist and would be replaced. */
-  readonly conflicts: string[];
-};
-
-/**
- * Enumerate exactly what a copy or move would touch, before touching any of
- * it. Having the plan first is what makes `dryRun` truthful and what lets an
- * overwrite conflict be refused before half the tree has been written.
- */
-function buildPlan(source: SafePath, destination: SafePath, maxEntries: number): CopyPlan | string {
-  const info = peek(source.abs);
-  if (info === undefined) return `no such path: ${source.rel}`;
-  const entries: PlanEntry[] = [];
-  let bytes = 0;
-  let truncated = false;
-
-  if (info.kind === "dir") {
-    const walked = walkTree(source.real, exhaustiveWalk(maxEntries));
-    truncated = walked.truncated;
-    entries.push({
-      rel: "",
-      kind: "dir",
-      size: 0,
-      sourceAbs: source.abs,
-      destAbs: destination.abs,
-    });
-    for (const node of walked.entries) {
-      const destAbs = path.join(destination.abs, ...node.rel.split("/"));
-      // Belt and braces: a walked relative path can never contain `..`, but
-      // the destination is caller-supplied, so re-assert containment.
-      if (!isInside(destination.abs, destAbs)) {
-        return `refusing to write outside the destination: ${node.rel}`;
-      }
-      entries.push({
-        rel: node.rel,
-        kind: node.kind,
-        size: node.size,
-        sourceAbs: node.abs,
-        destAbs,
-      });
-      bytes += node.kind === "file" ? node.size : 0;
-    }
-  } else {
-    entries.push({
-      rel: "",
-      kind: info.kind,
-      size: info.size,
-      sourceAbs: source.abs,
-      destAbs: destination.abs,
-    });
-    bytes = info.size;
-  }
-
-  const conflicts = entries
-    .filter((entry) => entry.kind !== "dir" && peek(entry.destAbs) !== undefined)
-    .map((entry) => path.relative(workspaceRoot(), entry.destAbs))
-    .sort(compareStrings);
-  return { entries, bytes, truncated, conflicts };
+/** A workspace-relative path as `@crewhaus/tool-safety/fs` takes it: "." for the root. */
+function relArg(target: SafePath): string {
+  return target.rel === "" ? "." : target.rel;
 }
 
-function applyPlan(plan: CopyPlan): void {
-  for (const entry of plan.entries) {
-    if (entry.kind === "dir") {
-      mkdirSync(entry.destAbs, { recursive: true });
-      continue;
-    }
-    mkdirSync(path.dirname(entry.destAbs), { recursive: true });
-    const existing = peek(entry.destAbs);
-    if (existing !== undefined) {
-      rmSync(entry.destAbs, { recursive: true, force: true });
-    }
-    if (entry.kind === "symlink") {
-      // Copy the LINK, not what it points at. Dereferencing here would let a
-      // link that points outside the workspace pull outside content in.
-      symlinkSync(readlinkSync(entry.sourceAbs), entry.destAbs);
-      continue;
-    }
-    copyFileSync(entry.sourceAbs, entry.destAbs);
-  }
+/**
+ * A refusal from `@crewhaus/tool-safety/fs`, answered as JSON. `reason`
+ * names the caller's path and why; it never names where an escaping path
+ * led.
+ */
+function refusal(flag: "copied" | "moved", failure: SafeFsFailure, note = ""): string {
+  return json({ [flag]: false, code: failure.code, reason: `${failure.reason}${note}` });
 }
 
 const copyMoveSchema = {
@@ -967,6 +894,34 @@ const copyMoveSchema = {
     .describe("cap on entries touched (default 50000)"),
 };
 
+/**
+ * The copy both tools share (CopyPath, and MovePath across a filesystem
+ * boundary): `copyTreeSafe`, which plans every entry before writing one.
+ * Every destination path is checked, not only the destination root: an
+ * existing symlink anywhere under it is refused, whatever it points at, so
+ * a planted `dst/sub -> ~/.ssh` is never written through. Links in the
+ * source are copied as links only when they still lead inside the
+ * workspace from their NEW place (`a/b/up -> ../..` copied one level up
+ * would lead out). Files are created with `O_EXCL|O_NOFOLLOW`, and a
+ * replaced file goes through a temp and a rename. FIFOs, sockets and
+ * devices are refused, since opening one to copy it can block for ever.
+ */
+function copyContained(
+  source: SafePath,
+  destination: SafePath,
+  options: { maxEntries: number; overwrite: boolean; dryRun: boolean },
+): CopyResult {
+  const root = workspaceRoot();
+  return copyTreeSafe(root, relArg(source), root, relArg(destination), {
+    symlinks: "copy-contained",
+    specials: "refuse",
+    maxEntries: options.maxEntries,
+    overwrite: options.overwrite,
+    createParents: true,
+    dryRun: options.dryRun,
+  });
+}
+
 export const copyPath: RegisteredTool = buildTool({
   name: "CopyPath",
   operativeArgs: [
@@ -974,7 +929,7 @@ export const copyPath: RegisteredTool = buildTool({
     { field: "destination", kind: "path" },
   ],
   description:
-    "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists.",
+    "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when they still point inside the workspace from where the copy puts them; an existing symlink under the destination is never written through.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
   execute: async (input) => {
@@ -984,42 +939,62 @@ export const copyPath: RegisteredTool = buildTool({
       return `refusing to copy ${source.rel} into itself (${destination.rel})`;
     }
     if (source.abs === destination.abs) return "source and destination are the same path";
-    const plan = buildPlan(source, destination, input.maxEntries ?? 50_000);
-    if (typeof plan === "string") return plan;
-    if (plan.truncated) {
-      return `${source.rel} has more entries than the cap allows — raise maxEntries or copy a subdirectory at a time`;
+    if (peek(source.abs) === undefined) return `no such path: ${source.rel}`;
+    const maxEntries = input.maxEntries ?? 50_000;
+    const result = copyContained(source, destination, {
+      maxEntries,
+      overwrite: input.overwrite === true,
+      dryRun: input.dryRun === true,
+    });
+    if (!result.ok) {
+      if (result.code === "exists" && result.conflicts !== undefined) {
+        const conflicts = [...result.conflicts].sort(compareStrings);
+        return json({
+          copied: false,
+          reason: "destination exists",
+          conflicts: conflicts.slice(0, 50),
+          conflictCount: conflicts.length,
+          hint: "pass overwrite: true to replace them",
+        });
+      }
+      if (result.code === "too-large") {
+        return `${source.rel} has more entries than the cap allows — raise maxEntries or copy a subdirectory at a time`;
+      }
+      return refusal("copied", result);
     }
-    if (plan.conflicts.length > 0 && input.overwrite !== true) {
-      return json({
-        copied: false,
-        reason: "destination exists",
-        conflicts: plan.conflicts.slice(0, 50),
-        conflictCount: plan.conflicts.length,
-        hint: "pass overwrite: true to replace them",
-      });
-    }
+    const replaced = [...result.replaced].sort(compareStrings);
     const summary = {
       source: source.rel,
       destination: destination.rel,
-      files: plan.entries.filter((e) => e.kind === "file").length,
-      directories: plan.entries.filter((e) => e.kind === "dir").length,
-      symlinks: plan.entries.filter((e) => e.kind === "symlink").length,
-      bytes: plan.bytes,
-      size: formatBytes(plan.bytes),
-      overwrites: plan.conflicts.length,
+      files: result.files,
+      directories: result.directories,
+      symlinks: result.symlinks,
+      bytes: result.bytes,
+      size: formatBytes(result.bytes),
+      overwrites: replaced.length,
     };
-    if (input.dryRun === true) {
+    if (result.dryRun) {
       return json({
         ...summary,
         dryRun: true,
         copied: false,
-        wouldOverwrite: plan.conflicts.slice(0, 50),
+        wouldOverwrite: replaced.slice(0, 50),
       });
     }
-    applyPlan(plan);
     return json({ ...summary, dryRun: false, copied: true });
   },
 });
+
+let renameForMove: (from: string, to: string) => void = renameSync;
+
+/**
+ * Test seam: the rename MovePath tries first, so a test can make it fail
+ * with `EXDEV` and exercise the copy-then-delete fallback without a second
+ * filesystem. Pass `undefined` to restore.
+ */
+export function _setMoveRenameForTest(fn: ((from: string, to: string) => void) | undefined): void {
+  renameForMove = fn ?? renameSync;
+}
 
 export const movePath: RegisteredTool = buildTool({
   name: "MovePath",
@@ -1028,7 +1003,7 @@ export const movePath: RegisteredTool = buildTool({
     { field: "destination", kind: "path" },
   ],
   description:
-    "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone.",
+    "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move that would leave a relative symlink pointing outside the workspace from its new place is refused.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
   execute: async (input) => {
@@ -1050,6 +1025,13 @@ export const movePath: RegisteredTool = buildTool({
         hint: "pass overwrite: true to replace it",
       });
     }
+    // A rename moves every link in the tree to a new depth, where a relative
+    // target means something else: `a/b/up -> ../..` is the workspace root
+    // where it is, and the workspace's parent once `a/b` moves one level up.
+    // Judged before anything moves, so dryRun gives the same verdict.
+    const root = workspaceRoot();
+    const relocated = checkRelocatedLinks(root, relArg(source), root, relArg(destination));
+    if (!relocated.ok) return refusal("moved", relocated, "; nothing was moved");
     if (input.dryRun === true) {
       return json({
         source: source.rel,
@@ -1059,10 +1041,11 @@ export const movePath: RegisteredTool = buildTool({
         wouldOverwrite: destExisting !== undefined,
       });
     }
-    mkdirSync(path.dirname(destination.abs), { recursive: true });
+    const parent = ensureDirContained(root, path.posix.dirname(relArg(destination)));
+    if (!parent.ok) return refusal("moved", parent, "; nothing was moved");
     if (destExisting !== undefined) rmSync(destination.abs, { recursive: true, force: true });
     try {
-      renameSync(source.abs, destination.abs);
+      renameForMove(source.abs, destination.abs);
     } catch (err) {
       // A workspace can straddle mount points (a bind-mounted cache, a
       // container volume), and rename(2) cannot cross one. Fall back to
@@ -1070,14 +1053,24 @@ export const movePath: RegisteredTool = buildTool({
       if ((err as NodeJS.ErrnoException).code !== "EXDEV") {
         return `could not move ${source.rel}: ${(err as Error).message}`;
       }
-      const plan = buildPlan(source, destination, input.maxEntries ?? 50_000);
-      if (typeof plan === "string") return plan;
-      if (plan.truncated) {
-        // The copy half of copy-then-delete would be partial, and the delete
-        // half would then destroy the only complete copy. Stop before either.
-        return `${source.rel} has more entries than the cap allows, and this move has to cross a filesystem boundary — raise maxEntries, or move subdirectories one at a time`;
+      const copied = copyContained(source, destination, {
+        maxEntries: input.maxEntries ?? 50_000,
+        overwrite: false,
+        dryRun: false,
+      });
+      if (!copied.ok) {
+        if (copied.code === "too-large") {
+          // The copy half of copy-then-delete would be partial, and the
+          // delete half would then destroy the only complete copy. Nothing
+          // was written, and the source is untouched.
+          return `${source.rel} has more entries than the cap allows, and this move has to cross a filesystem boundary — raise maxEntries, or move subdirectories one at a time`;
+        }
+        return refusal(
+          "moved",
+          copied,
+          `; the move had to cross a filesystem boundary, and ${source.rel} was left where it is`,
+        );
       }
-      applyPlan(plan);
       rmSync(source.abs, { recursive: true, force: true });
     }
     return json({
@@ -1271,6 +1264,16 @@ export const splitFile: RegisteredTool = buildTool({
       abs: path.join(outDir.abs, part.name),
       rel: path.posix.join(outDir.rel === "" ? "." : outDir.rel, part.name),
     }));
+    // A part name that is a symlink (dangling or not), a directory or a FIFO
+    // is refused whether or not `overwrite` is set, and named as what it is:
+    // listing it as an ordinary conflict would invite `overwrite: true`,
+    // which on 0.7.0 wrote the part THROUGH the link, outside the workspace.
+    for (const part of parts) {
+      const leaf = peek(part.abs);
+      if (leaf !== undefined && leaf.kind !== "file") {
+        return `${part.rel} is a ${leaf.kind}, not a regular file; no part was written`;
+      }
+    }
     const conflicts = parts.filter((part) => peek(part.abs) !== undefined).map((part) => part.rel);
     if (conflicts.length > 0 && input.overwrite !== true) {
       return json({
@@ -1291,26 +1294,42 @@ export const splitFile: RegisteredTool = buildTool({
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, split: false });
 
-    mkdirSync(outDir.abs, { recursive: true });
+    const root = workspaceRoot();
+    const dir = ensureDirContained(root, relArg(outDir));
+    if (!dir.ok) return json({ split: false, code: dir.code, reason: dir.reason });
+    // Each part goes through `beginAtomicWrite`: a temp made with
+    // O_CREAT|O_EXCL|O_NOFOLLOW beside the part, renamed into place. A link
+    // swapped in at a part name after the check above is replaced as a name,
+    // never written through, and a dangling one never creates its target.
+    const written: string[] = [];
     const source = openNoFollow("SplitFile", target.real);
     try {
       let position = 0;
       for (const part of parts) {
-        const out = openSync(part.abs, "w");
+        const begun = beginAtomicWrite(root, part.rel, { overwrite: input.overwrite === true });
+        if (!begun.ok) {
+          return json({ split: false, code: begun.code, reason: begun.reason, written });
+        }
+        const { writer } = begun;
         try {
           let remaining = part.bytes;
           const buffer = Buffer.allocUnsafe(Math.min(CHUNK_BYTES, Math.max(remaining, 1)));
           while (remaining > 0) {
             const read = readSync(source, buffer, 0, Math.min(buffer.length, remaining), position);
             if (read <= 0) break;
-            let written = 0;
-            while (written < read) written += writeSync(out, buffer, written, read - written);
+            writer.write(buffer.subarray(0, read));
             position += read;
             remaining -= read;
           }
-        } finally {
-          closeSync(out);
+        } catch (err) {
+          writer.abort();
+          throw err;
         }
+        const committed = writer.commit();
+        if (!committed.ok) {
+          return json({ split: false, code: committed.code, reason: committed.reason, written });
+        }
+        written.push(part.rel);
       }
     } finally {
       closeSync(source);
@@ -1376,29 +1395,35 @@ export const concatFiles: RegisteredTool = buildTool({
     };
     if (input.dryRun === true) return json({ ...summary, dryRun: true, concatenated: false });
 
-    mkdirSync(path.dirname(destination.abs), { recursive: true });
+    // Through a temp beside the destination, renamed into place: a link
+    // swapped in at the destination after the check above is replaced, never
+    // written through, and a half-written join never replaces a good file.
+    const begun = beginAtomicWrite(workspaceRoot(), relArg(destination), {
+      overwrite: input.overwrite === true,
+      createParents: true,
+    });
+    if (!begun.ok) return json({ concatenated: false, code: begun.code, reason: begun.reason });
+    const { writer } = begun;
     const separatorBytes = Buffer.from(separator, "utf8");
-    const out = openSync(destination.abs, "w");
     try {
       for (const [index, source] of sources.entries()) {
-        if (index > 0 && separatorBytes.length > 0) {
-          let written = 0;
-          while (written < separatorBytes.length) {
-            written += writeSync(out, separatorBytes, written, separatorBytes.length - written);
-          }
-        }
+        if (index > 0 && separatorBytes.length > 0) writer.write(separatorBytes);
         const fd = openNoFollow("ConcatFiles", source.real);
         try {
           streamFile(fd, (chunk, length) => {
-            let written = 0;
-            while (written < length) written += writeSync(out, chunk, written, length - written);
+            writer.write(chunk.subarray(0, length));
           });
         } finally {
           closeSync(fd);
         }
       }
-    } finally {
-      closeSync(out);
+    } catch (err) {
+      writer.abort();
+      throw err;
+    }
+    const committed = writer.commit();
+    if (!committed.ok) {
+      return json({ concatenated: false, code: committed.code, reason: committed.reason });
     }
     return json({ ...summary, dryRun: false, concatenated: true });
   },

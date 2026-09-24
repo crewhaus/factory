@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -870,6 +871,51 @@ describe("SplitFile and ConcatFiles", () => {
     expect(await run(concatFiles, { paths: ["a.txt"], destination: "a.txt" })).toContain(
       "also one of the sources",
     );
+  });
+
+  test("SplitFile never writes through a symlink at a part name, even with overwrite", async () => {
+    write("data.log", "l1\nl2\nl3\n");
+    const o = outside();
+    writeFileSync(path.join(o, "victim.txt"), "victim-original");
+    symlinkSync(path.join(o, "victim.txt"), path.join(tmp, "data.log.part0001"));
+    // Dangling: on 0.7.0 `open(…, "w")` through it CREATED the outside file.
+    symlinkSync(path.join(o, "created.txt"), path.join(tmp, "data.log.part0002"));
+    for (const overwrite of [false, true]) {
+      const refused = await run(splitFile, { path: "data.log", maxLines: 1, overwrite });
+      // Named as a link, not listed as a conflict that `overwrite` would fix.
+      expect(refused).toContain("data.log.part0001 is a symlink, not a regular file");
+      expect(readFileSync(path.join(o, "victim.txt"), "utf8")).toBe("victim-original");
+      expect(existsSync(path.join(o, "created.txt"))).toBe(false);
+    }
+    // Nothing else was written either: the refusal comes before the first part.
+    expect(existsSync(path.join(tmp, "data.log.part0003"))).toBe(false);
+  });
+
+  test("SplitFile with overwrite replaces an ordinary part's bytes", async () => {
+    write("data.log", "l1\nl2\n");
+    write("data.log.part0001", "stale contents\n");
+    const done = await run(splitFile, { path: "data.log", maxLines: 1, overwrite: true });
+    expect(done.split).toBe(true);
+    expect(readFileSync(path.join(tmp, "data.log.part0001"), "utf8")).toBe("l1\n");
+    expect(readFileSync(path.join(tmp, "data.log.part0002"), "utf8")).toBe("l2\n");
+    // No temp is left beside the parts.
+    expect(readdirSync(tmp).sort()).toEqual(["data.log", "data.log.part0001", "data.log.part0002"]);
+  });
+
+  test("ConcatFiles replaces an existing destination through a temp, keeping its mode", async () => {
+    write("a.txt", "A");
+    write("b.txt", "B");
+    const dest = write("joined.sh", "old");
+    chmodSync(dest, 0o750);
+    const done = await run(concatFiles, {
+      paths: ["a.txt", "b.txt"],
+      destination: "joined.sh",
+      overwrite: true,
+    });
+    expect(done.concatenated).toBe(true);
+    expect(readFileSync(dest, "utf8")).toBe("AB");
+    expect(lstatSync(dest).mode & 0o777).toBe(0o750);
+    expect(readdirSync(tmp).sort()).toEqual(["a.txt", "b.txt", "joined.sh"]);
   });
 });
 
