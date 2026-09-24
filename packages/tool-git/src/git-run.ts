@@ -26,7 +26,7 @@
  */
 import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
-import { withoutCredentials } from "@crewhaus/tool-safety/env";
+import { redactUrlCredentialsInText, withoutCredentials } from "@crewhaus/tool-safety/env";
 import {
   FILTER_PROBE_ARGS,
   FILTER_PROBE_ARGS_LEGACY,
@@ -593,10 +593,16 @@ export function firstLine(text: string): string {
  */
 export function failure(toolName: string, run: GitRun): string {
   if (run.timedOut) {
-    return `${toolName} timed out: \`git ${run.args.join(" ")}\` did not finish in time and was killed. Narrow the request or raise \`timeout\`.`;
+    return redactUrlCredentialsInText(
+      `${toolName} timed out: \`git ${run.args.join(" ")}\` did not finish in time and was killed. Narrow the request or raise \`timeout\`.`,
+    );
   }
   const detail = run.stderr.trim() === "" ? run.stdout.trim() : run.stderr.trim();
-  return `${toolName} failed (git exit ${run.code}): ${detail === "" ? "no output" : detail}`;
+  // git quotes a remote's URL in some errors, userinfo and all; a
+  // credential never reaches a result, even inside an error (C051).
+  return redactUrlCredentialsInText(
+    `${toolName} failed (git exit ${run.code}): ${detail === "" ? "no output" : detail}`,
+  );
 }
 
 /** Append a truncation note when a run's stdout hit the cap. */

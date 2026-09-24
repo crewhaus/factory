@@ -10,6 +10,7 @@
  * Everywhere there was a choice of output format we took git's most stable,
  * explicitly-for-scripts one, and each parser says which one and why.
  */
+import { looksLikePastedSecret, redactUrlCredentials } from "@crewhaus/tool-safety/env";
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -467,23 +468,94 @@ export type RemoteRecord = {
   readonly name: string;
   readonly fetch: string | null;
   readonly push: string | null;
+  /** Present, and true, only when a credential was masked in either URL. */
+  readonly credentialsRedacted?: true;
 };
 
-/** Parse `git remote -v`: "<name>\t<url> (fetch|push)", one line per direction. */
+/** What stands in for a masked credential. */
+export const REDACTED_CREDENTIAL = "***";
+
+/** Schemes whose user name is a login (`ssh://git@host`), not a token. */
+const SSH_SCHEMES: ReadonlySet<string> = new Set(["ssh", "git+ssh", "ssh+git", "git"]);
+
+/**
+ * A remote URL with its credentials masked (C051).
+ *
+ * `git remote -v` prints the URL exactly as configured — after any
+ * `url.<base>.insteadOf` rewrite, which is where a CI setup often plants a
+ * token — so `https://x-access-token:<PAT>@github.com/o/r.git` would reach
+ * the model, the transcript and the provider verbatim. For an http(s) (or
+ * any non-ssh) URL the whole userinfo is replaced, because GitHub and GitLab
+ * both accept a bare token AS the user name. An ssh URL keeps its login
+ * (`ssh://git@host`) and loses only a password or a token-shaped user.
+ * Credential-named query parameters (`?access_token=`) are masked on every
+ * scheme. scp-style `user@host:path`, local paths and `file://` carry no
+ * credential and are left alone. Text surgery only: the host and path are
+ * returned exactly as written.
+ */
+export function redactRemoteUrl(url: string): { readonly url: string; readonly redacted: boolean } {
+  const schemeEnd = url.indexOf("://");
+  if (schemeEnd <= 0 || !/^[A-Za-z][A-Za-z0-9+.-]*$/.test(url.slice(0, schemeEnd))) {
+    return { url, redacted: false };
+  }
+  const scheme = url.slice(0, schemeEnd).toLowerCase();
+  let masked: string;
+  if (SSH_SCHEMES.has(scheme)) {
+    const start = schemeEnd + 3;
+    let end = url.length;
+    for (let i = start; i < url.length; i++) {
+      const c = url[i];
+      if (c === "/" || c === "?" || c === "#") {
+        end = i;
+        break;
+      }
+    }
+    const authority = url.slice(start, end);
+    const at = authority.lastIndexOf("@");
+    const userinfo = at < 0 ? undefined : authority.slice(0, at);
+    let kept = "";
+    if (userinfo !== undefined) {
+      const colon = userinfo.indexOf(":");
+      const user = colon < 0 ? userinfo : userinfo.slice(0, colon);
+      const safeUser = looksLikePastedSecret(user) ? REDACTED_CREDENTIAL : user;
+      kept = colon < 0 ? `${safeUser}@` : `${safeUser}:${REDACTED_CREDENTIAL}@`;
+    }
+    // The rest (host, path, query) goes through the shared masker with no
+    // userinfo left for it to see.
+    const bare = `${url.slice(0, start)}${authority.slice(at + 1)}${url.slice(end)}`;
+    const rest = redactUrlCredentials(bare, REDACTED_CREDENTIAL);
+    masked = `${rest.slice(0, start)}${kept}${rest.slice(start)}`;
+  } else {
+    masked = redactUrlCredentials(url, REDACTED_CREDENTIAL);
+  }
+  return { url: masked, redacted: masked !== url };
+}
+
+/**
+ * Parse `git remote -v`: "<name>\t<url> (fetch|push)", one line per
+ * direction. Credentials in either URL are masked (see `redactRemoteUrl`).
+ */
 export function parseRemotes(stdout: string): RemoteRecord[] {
-  const byName = new Map<string, { fetch: string | null; push: string | null }>();
+  const byName = new Map<string, { fetch: string | null; push: string | null; masked: boolean }>();
   for (const line of splitLines(stdout)) {
     const m = line.match(/^(\S+)\t(.*) \((fetch|push)\)$/);
     if (m === null) continue;
     const name = m[1] as string;
-    const entry = byName.get(name) ?? { fetch: null, push: null };
-    if (m[3] === "fetch") entry.fetch = m[2] as string;
-    else entry.push = m[2] as string;
+    const entry = byName.get(name) ?? { fetch: null, push: null, masked: false };
+    const { url, redacted } = redactRemoteUrl(m[2] as string);
+    if (m[3] === "fetch") entry.fetch = url;
+    else entry.push = url;
+    entry.masked ||= redacted;
     byName.set(name, entry);
   }
   return [...byName.entries()]
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .map(([name, urls]) => ({ name, fetch: urls.fetch, push: urls.push }));
+    .map(([name, urls]) => ({
+      name,
+      fetch: urls.fetch,
+      push: urls.push,
+      ...(urls.masked ? { credentialsRedacted: true as const } : {}),
+    }));
 }
 
 // ---------------------------------------------------------------------------

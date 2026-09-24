@@ -26,7 +26,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { MAX_OUTPUT_CHARS, runGit } from "./git-run";
+import { MAX_OUTPUT_CHARS, failure, runGit } from "./git-run";
 import {
   GIT_TOOLS,
   gitAdd,
@@ -649,6 +649,45 @@ describe("GitBranchList, GitTagList, GitRemoteList", () => {
     git(["tag", "other"], repo);
     const out = await call(gitTagList, { pattern: "v*" });
     expect(out.tags.map((t: { name: string }) => t.name)).toEqual(["v1.0"]);
+  });
+
+  test("a token in a remote's URL, or in an insteadOf rewrite, is masked (C051)", async () => {
+    const tok = ["gh", "p_", "FAKE", "0123456789abcdefABCDEF0123456789ab"].join("");
+    git(["remote", "add", "origin", `https://x-access-token:${tok}@example.invalid/x.git`], repo);
+    // The CI pattern: a clean remote, and a repo-local rewrite that adds a token.
+    git(["remote", "add", "deps", "https://deps.invalid/y.git"], repo);
+    git(["config", `url.https://${tok}@deps.invalid/.insteadOf`, "https://deps.invalid/"], repo);
+    const text = await gitRemoteList.execute({ cwd: "repo" });
+    expect(String(text)).not.toContain(tok);
+    const out = JSON.parse(String(text)) as { remotes: Array<Record<string, unknown>> };
+    expect(out.remotes).toEqual([
+      {
+        name: "deps",
+        fetch: "https://***@deps.invalid/y.git",
+        push: "https://***@deps.invalid/y.git",
+        credentialsRedacted: true,
+      },
+      {
+        name: "origin",
+        fetch: "https://***@example.invalid/x.git",
+        push: "https://***@example.invalid/x.git",
+        credentialsRedacted: true,
+      },
+    ]);
+  });
+
+  test("an error that quotes a remote's URL does not quote its credential", () => {
+    const tok = ["gh", "p_", "FAKE", "0123456789abcdefABCDEF0123456789ab"].join("");
+    const message = failure("GitRemoteList", {
+      code: 128,
+      stdout: "",
+      stderr: `fatal: repository 'https://x-access-token:${tok}@example.invalid/x.git/' not found`,
+      timedOut: false,
+      truncated: false,
+      args: ["remote", "-v"],
+    });
+    expect(message).not.toContain(tok);
+    expect(message).toContain("example.invalid/x.git");
   });
 
   test("remotes are read from config, never contacted", async () => {

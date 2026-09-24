@@ -315,6 +315,67 @@ describe("parseRemotes", () => {
       },
     ]);
   });
+
+  // C051. Tokens are built from parts so no literal trips a secret scanner.
+  const tok = ["gh", "p_", "FAKE", "0123456789abcdefABCDEF0123456789ab"].join("");
+  const glpat = ["glp", "at-", "abcdefghij0123456789"].join("");
+
+  test("a credential in a remote URL never comes back, and the record says it was masked", () => {
+    const stdout = [
+      `origin\thttps://x-access-token:${tok}@github.com/acme/repo.git (fetch)`,
+      `origin\thttps://${tok}@github.com/acme/repo.git (push)`,
+      "scp\tgit@github.com:acme/scp.git (fetch)",
+      "scp\tgit@github.com:acme/scp.git (push)",
+    ].join("\n");
+    const out = parseRemotes(stdout);
+    expect(JSON.stringify(out)).not.toContain(tok);
+    expect(out).toEqual([
+      {
+        name: "origin",
+        fetch: "https://***@github.com/acme/repo.git",
+        push: "https://***@github.com/acme/repo.git",
+        credentialsRedacted: true,
+      },
+      // scp-style carries a login, not a credential: untouched, and unmarked.
+      { name: "scp", fetch: "git@github.com:acme/scp.git", push: "git@github.com:acme/scp.git" },
+    ]);
+  });
+
+  test("each URL shape is masked the way its scheme needs, and nothing else is touched", () => {
+    const cases: ReadonlyArray<[string, string]> = [
+      [
+        `https://gitlab-ci-token:${glpat}@gitlab.example/g/p.git`,
+        "https://***@gitlab.example/g/p.git",
+      ],
+      [`https://${tok}:x-oauth-basic@h.example/r.git`, "https://***@h.example/r.git"],
+      ["https://user:p%40ss@h.example/r.git", "https://***@h.example/r.git"],
+      [`https://h.example/q.git?access_token=${tok}`, "https://h.example/q.git?access_token=***"],
+      [
+        "https://h.example/q.git?private_token=abc&ref=main",
+        "https://h.example/q.git?private_token=***&ref=main",
+      ],
+      ["ssh://git@github.com/a/s.git", "ssh://git@github.com/a/s.git"],
+      ["ssh://u:pw@h.example/r.git", "ssh://u:***@h.example/r.git"],
+      [`ssh://${tok}@h.example/r.git`, "ssh://***@h.example/r.git"],
+      ["git://h.example/r.git", "git://h.example/r.git"],
+      ["git@github.com:a/b.git", "git@github.com:a/b.git"],
+      ["/srv/repo.git", "/srv/repo.git"],
+      ["file:///x/r.git", "file:///x/r.git"],
+      // An @ in the PATH is not userinfo.
+      ["https://registry.example/@scope/pkg.git", "https://registry.example/@scope/pkg.git"],
+    ];
+    let masked = 0;
+    for (const [input, want] of cases) {
+      const [record] = parseRemotes(`r\t${input} (fetch)`);
+      expect({ input, fetch: record?.fetch }).toEqual({ input, fetch: want });
+      expect({ input, flagged: record?.credentialsRedacted === true }).toEqual({
+        input,
+        flagged: want !== input,
+      });
+      if (want !== input) masked += 1;
+    }
+    expect(masked).toBe(7);
+  });
 });
 
 describe("parseWorktrees", () => {
