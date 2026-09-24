@@ -400,16 +400,41 @@ describe("every copy of the path resolver probes with lstat, not existsSync", ()
     expect(copies.length).toBeGreaterThanOrEqual(17);
     // The ones that do NOT use the conventional paths.ts filename are the
     // ones a filename-based sweep loses, so name them explicitly.
-    for (const pkg of [
-      "tool-fs",
-      "tool-image",
-      "tool-document-ingest",
-      "tool-proc",
-      "tool-git",
-      "crawler",
-    ]) {
+    for (const pkg of ["tool-proc", "tool-git", "crawler"]) {
       expect(pkgs).toContain(pkg);
     }
+  });
+
+  test("a package that retired its copy resolves through tool-safety instead", () => {
+    // 0.7.1: these five dropped their copy for tool-safety's resolveContained,
+    // which walks a dangling link's target one component at a time (the
+    // copies folded it as text: `evil -> a/y/../x` with `a/y -> ..` read as
+    // inside). A copy that leaves the sweep must have been REPLACED, not
+    // deleted, or the floor above is all that notices.
+    const repoRoot = join(import.meta.dir, "..", "..", "..");
+    const retired = [
+      ["tool-fs", "index.ts"],
+      ["tool-fsx", "paths.ts"],
+      ["tool-hostfs", "paths.ts"],
+      ["tool-image", "index.ts"],
+      ["tool-document-ingest", "index.ts"],
+    ] as const;
+    const copies = new Set(resolverFiles().map((c) => c.pkg));
+    let checked = 0;
+    for (const [pkg, file] of retired) {
+      const text = readFileSync(join(repoRoot, "packages", pkg, "src", file), "utf-8");
+      expect({ pkg, copy: copies.has(pkg) }).toEqual({ pkg, copy: false });
+      expect({ pkg, delegates: /resolveContained\(/.test(text) }).toEqual({
+        pkg,
+        delegates: true,
+      });
+      expect({ pkg, imports: text.includes('from "@crewhaus/tool-safety/fs"') }).toEqual({
+        pkg,
+        imports: true,
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(5);
   });
 });
 
