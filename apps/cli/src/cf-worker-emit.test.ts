@@ -121,6 +121,20 @@ describe("emitCfWorkerBundle", () => {
     expect((thrown as Error).message).toContain(CF_WORKER_EMIT_TARGETS.join("|"));
   });
 
+  test("an unsupported target is reported before its tools are checked", () => {
+    // The channel starter's tools (read, bash) are host tools the edge
+    // refuses; the operator must hear about the target first, since fixing
+    // the tools would only lead to this error.
+    const spec = CHANNEL_SPEC.replace(
+      "agent:\n",
+      "agent:\n  tools: [read, bash, mcp__evil__send]\n",
+    );
+    expect(spec).toContain("tools: [read, bash, mcp__evil__send]");
+    expect(() => emitCfWorkerBundle(ir(spec))).toThrow(
+      /^cf-worker emit supports target=cli\|workflow\|graph, got channel$/,
+    );
+  });
+
   test("CF_WORKER_EMIT_TARGETS is the cli/workflow/graph set", () => {
     expect([...CF_WORKER_EMIT_TARGETS]).toEqual(["cli", "workflow", "graph"]);
   });

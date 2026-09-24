@@ -55,6 +55,11 @@ export type CfWorkerEmitOptions = {
  * one-liner) on an unsupported target.
  */
 export function emitCfWorkerBundle(ir: IrNode, opts: CfWorkerEmitOptions = {}): CompileResult {
+  // The target first: a tool finding on a shape the edge cannot emit at all
+  // would send the operator to fix tools, only to meet this error next.
+  if (!(CF_WORKER_EMIT_TARGETS as ReadonlyArray<string>).includes(ir.target)) {
+    throw new CompilerError(unsupportedTargetMessage(ir.target));
+  }
   // FR-002 — Pillar 3 sink-side gate. This path drives lower()+emit directly
   // (bypassing compile()), so apply the SAME offline scope audit
   // compile({ strict: true }) runs over the lowered IR: an outward-reaching
@@ -83,8 +88,10 @@ function emitFor(ir: IrNode, opts: CfWorkerEmitOptions): Bundle {
     case "graph":
       return emitCfWorkerGraph(ir, emitOpts);
     default:
-      throw new CompilerError(
-        `cf-worker emit supports target=${CF_WORKER_EMIT_TARGETS.join("|")}, got ${ir.target}`,
-      );
+      throw new CompilerError(unsupportedTargetMessage(ir.target));
   }
+}
+
+function unsupportedTargetMessage(target: string): string {
+  return `cf-worker emit supports target=${CF_WORKER_EMIT_TARGETS.join("|")}, got ${target}`;
 }

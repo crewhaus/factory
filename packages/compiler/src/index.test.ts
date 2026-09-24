@@ -1538,6 +1538,44 @@ steps:
     expect(() => compile(spec, { strict: true })).toThrow(/mcp__slack__send/);
   });
 
+  // `crewhaus run --watch`, the compiler-worker's /compile and the cf-worker
+  // emit all call the gate. Lowering spells a sub-agent's list with
+  // registered names (`WebSearch`), and on 0.7.0 those lists held spec keys,
+  // which the gate never matched — so the trader and expert starters passed.
+  const SPEC_SUB_AGENT_WEB = `
+name: trader-like
+target: cli
+agent:
+  model: m
+  instructions: i
+  sub_agents:
+    researcher:
+      description: looks things up
+      instructions: search, then fetch
+      tools: [webSearch, webFetch, read, imageGenerate, fetch]
+tools: [read, webSearch, webFetch, imageGenerate, fetch]
+`;
+
+  test("a sub-agent listing builtin web tools passes, as it did on 0.7.0", () => {
+    const ir = lower(parseSpec(SPEC_SUB_AGENT_WEB));
+    // The property under test: the child list really is registered names.
+    const sub = JSON.stringify(ir);
+    expect(sub).toContain('"WebSearch"');
+    expect(sub).toContain('"ImageGenerate"');
+    expect(() => compile(SPEC_SUB_AGENT_WEB, { strict: true })).not.toThrow();
+  });
+
+  test("an mcp__ name in a sub-agent list is still gated", () => {
+    const spec = SPEC_SUB_AGENT_WEB.replace(
+      "tools: [webSearch, webFetch, read, imageGenerate, fetch]\n",
+      "tools: [webSearch, mcp__evil__exfiltrate]\n",
+    );
+    expect(spec).toContain("mcp__evil__exfiltrate");
+    expect(() => compile(spec, { strict: true })).toThrow(
+      /1 scope finding\(s\).*mcp__evil__exfiltrate/,
+    );
+  });
+
   test("DEFAULT (no strict) does NOT run the gate — backwards compatible", () => {
     // Without { strict: true } the outward-named spec is not gated by scope
     // (it would instead fall through to the emitter's own resolution); the

@@ -145,6 +145,21 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
     if (emitAs === "cf-worker") {
       const spec = parseSpec(body.yaml);
       const ir = lower(spec);
+      // The target first, as on 0.7.0: a tool finding on a shape the edge
+      // cannot emit would send the caller to fix tools, only to meet this.
+      if (ir.target !== "cli" && ir.target !== "workflow" && ir.target !== "graph") {
+        return jsonResponse(
+          {
+            error: {
+              code: "UNSUPPORTED_TARGET",
+              message: `cf-worker emit supports target=cli|workflow|graph, got ${ir.target}`,
+            },
+            issues: [],
+          },
+          400,
+          cors,
+        );
+      }
       // FR-002 — Pillar 3 sink-side gate. This branch drives lower()+emit
       // directly (bypassing compile()), so apply the SAME offline scope audit
       // compile({ strict: true }) runs over the lowered IR: an outward-reaching
@@ -173,18 +188,6 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
         case "graph":
           bundle = { ...emitCfWorkerGraph(ir, opts), warnings: edgeWarnings };
           break;
-        default:
-          return jsonResponse(
-            {
-              error: {
-                code: "UNSUPPORTED_TARGET",
-                message: `cf-worker emit supports target=cli|workflow|graph, got ${ir.target}`,
-              },
-              issues: [],
-            },
-            400,
-            cors,
-          );
       }
     } else {
       // FR-002 — Pillar 3 sink-side gate. The Worker compiles arbitrary

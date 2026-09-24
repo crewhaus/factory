@@ -689,7 +689,12 @@ function collectToolNames(ir: unknown): string[] {
 export function assertToolScopesStrict(ir: IrNode): void {
   const findings: ScopeFinding[] = [];
   for (const name of collectToolNames(ir)) {
-    if (isOutwardName(name)) {
+    // The gate keys on the spec key, as it did on 0.7.0. Lowering spells a
+    // sub-agent's list with registered names (`WebSearch`), which
+    // `isOutwardName` matches, so read a builtin's key back first: a builtin
+    // is vetted, and `apps/cli/src/tool-registry.test.ts` pins each one's
+    // scope to its io facts. An `mcp__*` name is no builtin and stays gated.
+    if (isOutwardName(builtinKeyForName(name) ?? name)) {
       findings.push({
         toolName: name,
         reason:
