@@ -183,7 +183,7 @@ test("--for-publish puts the root LICENSE and NOTICE and a README into the packe
     const readme = readFileSync(join(pkgDir, "README.md"), "utf8");
     expect(readme.split("\n")[0]).toBe("# @crewhaus/tool-data-pkg");
     expect(readme).toContain("Reads and writes data files.");
-    expect(readme).toContain("Bun](https://bun.sh) `>=1.2.0`");
+    expect(readme).toContain("Bun](https://bun.sh) `>=1.2.0`; plain Node is not supported.");
     expect(readme).toContain("TOOLS-REFERENCE.md");
     expect(readme).toContain("https://github.com/crewhaus/factory/tree/main/packages/data-pkg");
 

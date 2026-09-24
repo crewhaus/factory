@@ -416,7 +416,7 @@ function generatedReadme(pkg: Json, relDir: string): string {
     );
   }
   out.push(
-    `Requires [Bun](https://bun.sh) \`${ROOT_BUN_ENGINE}\`. It does not run on plain Node.`,
+    `Requires [Bun](https://bun.sh) \`${ROOT_BUN_ENGINE}\`; plain Node is not supported.`,
     "",
   );
   out.push(`[Source](${HOMEPAGE_BASE}/tree/main/${relDir})`, "");
