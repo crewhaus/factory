@@ -608,34 +608,43 @@ export const permissionAudit: RegisteredTool = buildTool({
   execute: async (input) => {
     const text = loadSpecText("PermissionAudit", input);
     if (!text.ok) return text.message;
-    const view = specView(text.value);
-    if (!view.ok) return view.message;
+    const parsed = parseOrExplain(text.value);
+    if (!parsed.ok) return parsed.message;
+    // `all-<category>` selectors are expanded the way the compiler expands
+    // them, as ToolInventory does: audited unexpanded, `tools: [all-http]`
+    // was one pseudo-tool named "all-http", and a live `alwaysDeny
+    // HttpRequest` was listed as a rule that matches nothing (C032).
+    let expanded: Spec = parsed.value;
+    let categoryError: string | undefined;
+    try {
+      expanded = expandSpecToolCategories(parsed.value);
+    } catch (err) {
+      categoryError = (err as Error).message;
+    }
+    const view = buildSpecView(expanded, collectSpecModels(expanded));
 
     // The one destructive signal a spec carries on its own: an MCP server's
     // narrowing `tool_flags`.
     const destructive = new Set(input.destructiveTools ?? []);
     const flaggedDefaults: string[] = [];
-    const parsed = parseOrExplain(text.value);
-    if (parsed.ok) {
-      const servers = asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {};
-      for (const [server, raw] of Object.entries(servers)) {
-        const flags = asRecord(asRecord(raw)?.["tool_flags"]);
-        if (flags === undefined) continue;
-        if (asRecord(flags["defaults"])?.["destructive"] === true) flaggedDefaults.push(server);
-        for (const [tool, entry] of Object.entries(asRecord(flags["per_tool"]) ?? {})) {
-          if (asRecord(entry)?.["destructive"] === true) destructive.add(`mcp__${server}__${tool}`);
-        }
+    const servers = asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {};
+    for (const [server, raw] of Object.entries(servers)) {
+      const flags = asRecord(asRecord(raw)?.["tool_flags"]);
+      if (flags === undefined) continue;
+      if (asRecord(flags["defaults"])?.["destructive"] === true) flaggedDefaults.push(server);
+      for (const [tool, entry] of Object.entries(asRecord(flags["per_tool"]) ?? {})) {
+        if (asRecord(entry)?.["destructive"] === true) destructive.add(`mcp__${server}__${tool}`);
       }
     }
 
-    const judge = parsed.ok
-      ? asRecord(asRecord(asRecord(parsed.value)?.["security"])?.["justification"])?.["judge"]
-      : undefined;
+    const judge = asRecord(asRecord(asRecord(parsed.value)?.["security"])?.["justification"])?.[
+      "judge"
+    ];
     const result = auditPermissions({
-      tools: view.value.tools,
-      mode: view.value.permissions.mode,
-      askMode: view.value.permissions.askMode,
-      rules: view.value.permissions.rules,
+      tools: view.tools,
+      mode: view.permissions.mode,
+      askMode: view.permissions.askMode,
+      rules: view.permissions.rules,
       destructiveTools: destructive,
       // permission-integration#9 / flag-truth-3#4 — a builtin's real flags,
       // from the manifest generated off the tools themselves, instead of
@@ -645,10 +654,11 @@ export const permissionAudit: RegisteredTool = buildTool({
       // The builtins, and the tools the runtime registers without a spec
       // listing them — `alwaysAllow Skill` names a real tool.
       knownTools: [...Object.values(TOOL_FLAGS), ...RUNTIME_TOOL_NAMES.map((name) => ({ name }))],
-      mcpServers: view.value.mcpServers.map((s) => s.name),
+      mcpServers: view.mcpServers.map((s) => s.name),
       ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });
     return json({
+      ...(categoryError !== undefined ? { categoryError } : {}),
       ...result,
       ...(flaggedDefaults.length > 0
         ? {

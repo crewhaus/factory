@@ -430,6 +430,62 @@ describe("ToolInventory", () => {
 });
 
 describe("PermissionAudit", () => {
+  // C032 / C146 residue: the builtins whose registered name is not the
+  // key with its first letter upper-cased, and `all-<category>` selectors.
+  test("rules name JavaScript and CodeGraph* as the engine does", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "tools: [javascript, codegraphCallers, codegraphSearch]",
+      "permissions:",
+      "  mode: default",
+      "  rules:",
+      "    - { type: alwaysDeny, pattern: JavaScript }",
+      "    - { type: alwaysAllow, pattern: CodeGraphCallers }",
+      "    - { type: alwaysAllow, pattern: CodeGraphSearch }",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string; rule?: { pattern: string } }>;
+      unusedRules: unknown[];
+      ruleProblems: unknown[];
+    }>(permissionAudit, { spec });
+    expect(result.unusedRules).toEqual([]);
+    expect(result.ruleProblems).toEqual([]);
+    expect(result.tools.map((t) => [t.tool, t.decision, t.rule?.pattern ?? null])).toEqual([
+      ["codegraphCallers", "allow", "CodeGraphCallers"],
+      ["codegraphSearch", "allow", "CodeGraphSearch"],
+      ["javascript", "deny", "JavaScript"],
+    ]);
+  });
+
+  test("an all-<category> selector is audited as the tools it expands to", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "tools: [all-http]",
+      "permissions:",
+      "  mode: auto",
+      "  rules:",
+      "    - { type: alwaysDeny, pattern: HttpRequest }",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string }>;
+      unusedRules: unknown[];
+      categoryError?: string;
+    }>(permissionAudit, { spec });
+    expect(result.categoryError).toBeUndefined();
+    expect(result.tools.some((t) => t.tool === "all-http")).toBe(false);
+    expect(result.tools.length).toBeGreaterThan(1);
+    expect(result.tools.find((t) => t.tool === "httpRequest")?.decision).toBe("deny");
+    expect(result.unusedRules).toEqual([]);
+  });
+
   test("an outward tool with no rule is a finding", async () => {
     const spec = CLI_SPEC.replace("[read, write, bash]", "[read, webFetch]");
     const result = await callJson<{ findings: Array<{ tool: string }>; fallback: string }>(

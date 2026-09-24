@@ -100,12 +100,14 @@ apply at run time. Where it *can* be exact it is: a pattern the runtime
 matcher would refuse to compile is listed under `malformedRules` and scored
 the way the engine scores it — a broken `alwaysDeny` or `alwaysAsk` fails
 closed and gates every call, a broken `alwaysAllow` is dropped — and under
-`mode: plan` the report says outright that no rule is consulted at all,
-because the engine decides on the tool's own `readOnly` flag and returns
-before the scan. `ToolInventory` can prove an MCP tool names an undeclared
-server, but a builtin key is only checked against a `knownTools` list you
-supply, because the builtin registry lives in the compiled bundle rather than
-in the spec. `BundleFreshness` uses preflight's mtime heuristic and says so —
+`mode: plan` the decisions follow plan mode: allow rules are ignored, a deny or
+ask rule denies, and anything else is allowed only if the tool is read-only.
+Builtins are reported with their own flags from the builtin manifest, rules
+are matched against the name the engine sees (`JavaScript`, not a guess from
+the key `javascript`), and an `all-<category>` selector is audited as the
+tools it expands to. `ToolInventory` can prove an MCP tool names an undeclared
+server, and checks builtin keys against this release's builtins unless you pass
+`knownTools` for a different runtime. `BundleFreshness` uses preflight's mtime heuristic and says so —
 `stale` means "recompile to be sure", not "proven different". `AuditVerify`
 returns `anchorChecked`, because a chain that verifies without an anchor has
 not ruled out a dropped tail. `EvalBaselineCompare` fails a comparison that never happened — two runs that share

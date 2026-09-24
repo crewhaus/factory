@@ -231,8 +231,13 @@ function decisionOf(ruleType: string): string {
 /**
  * A spec's `tools:` list may spell a builtin in either legal form — the
  * camelCase key (`webFetch`) or the registered PascalCase name (`WebFetch`).
- * Permission patterns are written against the registered name, so both forms
- * are checked wherever a name is compared to the registry.
+ * Permission patterns are written against the registered name.
+ *
+ * This is the NAME-ONLY guess, for a tool the manifest does not describe:
+ * upper-casing the first letter is wrong for the builtins whose names are
+ * not their keys (`javascript` is `JavaScript`, `codegraphSearch` is
+ * `CodeGraphSearch`), so a builtin's name always comes from its flags
+ * (`flagsOf(tool).name`) and never from here.
  */
 export function toRegisteredName(toolKey: string): string {
   if (toolKey.startsWith("mcp__")) return toolKey;
@@ -347,8 +352,11 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   );
 
   for (const tool of grantedTools) {
-    const registered = toRegisteredName(tool);
     const flags = flagsOf(tool);
+    // The name the engine matches rules against. A builtin's comes from its
+    // flags: `toRegisteredName` gets `javascript` → "Javascript" wrong, and a
+    // live `alwaysDeny JavaScript` was then reported as unused (C032).
+    const registered = flags?.name ?? toRegisteredName(tool);
     let matched: { rule: RuleLike; coverage: Coverage } | undefined;
     for (const rule of input.rules) {
       if (modeOverridesRules && rule.type === "alwaysAllow") continue;
@@ -364,10 +372,17 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
         }
         continue;
       }
+      // The engine only ever sees the registered name, so a builtin's rule is
+      // matched against that alone — a glob that matches the spec KEY
+      // (`web*` against `webFetch`) never fires at run time and must not be
+      // reported as the tool's decision. A tool the manifest does not
+      // describe keeps both spellings, since its registered name is a guess.
       const coverage =
-        patternCoverage(rule.pattern, tool) !== "none"
-          ? patternCoverage(rule.pattern, tool)
-          : patternCoverage(rule.pattern, registered);
+        flags !== undefined
+          ? patternCoverage(rule.pattern, registered)
+          : patternCoverage(rule.pattern, tool) !== "none"
+            ? patternCoverage(rule.pattern, tool)
+            : patternCoverage(rule.pattern, registered);
       if (coverage !== "none") {
         matched = { rule, coverage };
         usedRules.add(`${rule.type} ${rule.pattern}`);

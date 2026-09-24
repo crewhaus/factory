@@ -471,6 +471,29 @@ describe("permission patterns", () => {
 });
 
 describe("permission audit", () => {
+  test("a builtin's rule is matched against the name its flags give, not a guess (C032)", () => {
+    const flags = {
+      name: "JavaScript",
+      readOnly: false,
+      destructive: true,
+      scope: "internal",
+      requiresSandbox: false,
+      requireJustification: false,
+    };
+    // `toRegisteredName("javascript")` is "Javascript"; the engine sees
+    // "JavaScript", so the rule below is live and must be reported so.
+    const result = auditPermissions({
+      tools: ["javascript"],
+      mode: "default",
+      askMode: "pause",
+      rules: [{ type: "alwaysAllow", pattern: "JavaScript" }],
+      flagsOf: (tool) => (tool === "javascript" ? flags : undefined),
+    });
+    expect(result.tools[0]?.decision).toBe("allow");
+    expect(result.tools[0]?.rule?.pattern).toBe("JavaScript");
+    expect(result.unusedRules).toEqual([]);
+  });
+
   test("an outward tool with no rule is a finding", () => {
     const result = auditPermissions({
       tools: ["read", "webFetch"],
