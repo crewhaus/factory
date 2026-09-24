@@ -37,7 +37,9 @@ export function bindTokenChains(config: {
   readonly chains: ReadonlyArray<ChainAdapterConfig>;
 }): void {
   const adapters = createEvmAdapters(config.chains);
-  _setChainReader(chainReaderFromAdapters((chainId) => adapters.get(chainId)));
+  _setChainReader(
+    chainReaderFromAdapters((chainId) => adapters.get(chainId), [...adapters.keys()]),
+  );
 }
 
 /** The spec's `tool_config.token` block. */

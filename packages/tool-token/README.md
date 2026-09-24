@@ -164,6 +164,9 @@ tool_config:
 ```
 
 Without a `chains` block, a chain read refuses and names the block to write.
+These tools name a chain by its EIP-155 id, so declare it under that id in
+decimal (`id: "1"`, `id: "8453"`); a chain declared as `mainnet` is refused
+with the ids the spec does declare.
 Without `metadata_origins`, metadata is not fetched, and the answer says why.
 The metadata fetch goes through `@crewhaus/tool-http`'s gate: https only, the
 SSRF refusal, no redirects, a byte cap. The caller's own `allowedHosts` and

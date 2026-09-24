@@ -96,13 +96,21 @@ export function assertReadMethod(method: string): asserts method is ChainReadMet
  */
 export function chainReaderFromAdapters(
   resolve: (chainId: string) => ChainAdapter | undefined,
+  declared?: ReadonlyArray<string>,
 ): ChainReader {
   return async (read) => {
     assertReadMethod(read.method);
     const adapter = resolve(String(read.chainId));
     if (adapter === undefined) {
+      // These tools name a chain by its EIP-155 id, and look it up as that
+      // number written in decimal. A chain declared as "mainnet" is there,
+      // just not under the id asked for — so say which ids ARE declared.
+      const known =
+        declared === undefined || declared.length === 0
+          ? ""
+          : ` The spec declares ${declared.map((id) => `"${id}"`).join(", ")}; the token tools look a chain up by its EIP-155 chain id in decimal, so declare it as id: "${read.chainId}".`;
       throw new TokenError(
-        `no chain adapter is registered for chain ${read.chainId}; declare it in the spec's chains[] block`,
+        `no chain is declared with id "${read.chainId}", so chain ${read.chainId} cannot be read.${known === "" ? " Declare it in the spec's chains[] block." : known}`,
       );
     }
     return adapter.rpcRead(read.method, read.params);
