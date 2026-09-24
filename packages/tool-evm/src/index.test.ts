@@ -211,7 +211,7 @@ describe("requireAdapter — unbound resolver branch", () => {
     // returns undefined for an unknown chainId).
     setEvmAdapterResolver(undefined as unknown as (chainId: string) => undefined);
     await expect(EVM_TOOL_MAP.evmBlockNumber.execute({ chainId: "base-mainnet" })).rejects.toThrow(
-      /no EvmAdapterResolver bound/,
+      /EvmBlockNumber: no chain is configured\. Declare one in the spec — chains: \[/,
     );
   });
 });

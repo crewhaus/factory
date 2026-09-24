@@ -117,6 +117,7 @@ import {
 } from "./store";
 import {
   MAX_VECTOR_IDS,
+  VECTOR_DELETE_EXAMPLE,
   applyVectorDeletes,
   capList,
   checkCollection,
@@ -1959,7 +1960,7 @@ export const vectorDelete: RegisteredTool = stateTool({
   execute: async (input, ctx) => {
     const target = getVectorTarget();
     if (target === undefined) {
-      return "VectorDelete has no vector store registered, and will not invent one — the host registers the store it already built with registerVectorTarget({ store, collection }). Nothing was deleted.";
+      return `VectorDelete has no vector store registered, and will not invent one. Name the store in the spec — ${VECTOR_DELETE_EXAMPLE} — or have the host call registerVectorTarget({ store, collection }). Nothing was deleted.`;
     }
 
     const policy = readVectorToolConfig(ctx?.toolConfig);
@@ -2103,10 +2104,12 @@ export {
   countIsIndicative,
   getVectorTarget,
   parseChunkId,
+  registerVectorDeleteConfig,
   registerVectorTarget,
   selectVectorIds,
   type ChunkId,
   type VectorCountConsistency,
+  type VectorDeleteConfigInput,
   type VectorDeleteTarget,
   type VectorSelection,
   type VectorTargetRegistration,

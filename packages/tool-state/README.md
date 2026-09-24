@@ -167,9 +167,22 @@ pinecone or weaviate collection over HTTP, so this one is labelled
 `scope: "external"` with `ioCapability: "network"`, takes a justification, and
 is kept out of a list whose meaning it would quietly dilute.
 
-**It needs a store handed to it.** This package does not depend on
-`@crewhaus/vector-store` and cannot build a store from a backend name; the host
-registers the one it already built, the way `@crewhaus/tool-retrieve` is wired:
+**It needs a store.** Name it in the spec, and a compiled bundle, `crewhaus run`
+and `crewhaus eval` build it at boot:
+
+```yaml
+tool_config:
+  vectorDelete:
+    backend: qdrant                 # qdrant, pinecone, weaviate or lance
+    url: https://qdrant.example:6333
+    collection: chunks
+    api_key: $QDRANT_API_KEY        # read from the environment, never compiled in
+    protected_collections: [audit]
+```
+
+`in-memory` is refused: a store that starts empty in every process has nothing
+in it to erase. A host that already built its store registers it instead, the
+way `@crewhaus/tool-retrieve` is wired:
 
 ```ts
 import { registerVectorTarget } from "@crewhaus/tool-state";

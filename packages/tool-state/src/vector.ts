@@ -36,6 +36,7 @@
  * equal the one before it for deletes that did land.
  */
 import { CrewhausError } from "@crewhaus/errors";
+import { createVectorStore } from "@crewhaus/vector-store";
 import { compareStrings, validateKey } from "./lib/names";
 
 /** Most ids one call takes. Bounds the work, and the result, per call. */
@@ -159,6 +160,91 @@ export function registerVectorTarget(registration: VectorTargetRegistration): vo
     );
   }
   activeTarget = registration;
+}
+
+/** The spec's `tool_config.vectorDelete` block: which store to delete from. */
+export type VectorDeleteConfigInput = {
+  readonly backend?: unknown;
+  readonly url?: unknown;
+  readonly collection?: unknown;
+  readonly api_key?: unknown;
+  readonly apiKey?: unknown;
+  readonly protected_collections?: unknown;
+  readonly protectedCollections?: unknown;
+  readonly count_consistency?: unknown;
+  readonly countConsistency?: unknown;
+};
+
+/** Backends a delete can reach. An in-process store starts empty in every process. */
+const DELETE_BACKENDS = ["qdrant", "pinecone", "weaviate", "lance"] as const;
+
+/** What a spec writes to give VectorDelete a store — quoted by every refusal about it. */
+export const VECTOR_DELETE_EXAMPLE =
+  "tool_config.vectorDelete: { backend: qdrant, url: https://qdrant.example:6333, collection: chunks, api_key: $QDRANT_API_KEY }";
+
+function oneOf(block: Record<string, unknown>, snake: string, camel: string): unknown {
+  const a = Object.hasOwn(block, snake);
+  const b = Object.hasOwn(block, camel);
+  if (a && b) {
+    throw new VectorTargetError(
+      `tool_config.vectorDelete sets both ${snake} and ${camel}. Write it once, as ${snake}.`,
+    );
+  }
+  return a ? block[snake] : block[camel];
+}
+
+/**
+ * Deliver the spec's block at boot: build the named store and register it,
+ * with the block's protection list. The api key is read from the environment
+ * when written `$VAR`, like every tool_config credential.
+ *
+ * A block without `backend` registers nothing, so the tool keeps refusing and
+ * says what to write — the same as a spec with no block. `in-memory` is
+ * refused: a store that starts empty in this process holds nothing to erase,
+ * and a delete from it would report a clean success having deleted nothing.
+ */
+export function registerVectorDeleteConfig(input: VectorDeleteConfigInput): void {
+  const block = (input ?? {}) as Record<string, unknown>;
+  const backend = block["backend"];
+  if (backend === undefined) return;
+  if (
+    typeof backend !== "string" ||
+    !(DELETE_BACKENDS as ReadonlyArray<string>).includes(backend)
+  ) {
+    throw new VectorTargetError(
+      `tool_config.vectorDelete.backend must be one of ${DELETE_BACKENDS.join(", ")}, not ${describeStoreValue(backend)}${backend === "in-memory" ? " — an in-memory store starts empty in every process, so there is nothing in it to delete" : ""}. For example: ${VECTOR_DELETE_EXAMPLE}`,
+    );
+  }
+  const url = block["url"];
+  const collection = block["collection"];
+  const apiKey = oneOf(block, "api_key", "apiKey");
+  for (const [name, value] of [
+    ["url", url],
+    ["collection", collection],
+    ["api_key", apiKey],
+  ] as const) {
+    if (value !== undefined && typeof value !== "string") {
+      throw new VectorTargetError(`tool_config.vectorDelete.${name} must be a string.`);
+    }
+  }
+  const store = createVectorStore({
+    backend: backend as (typeof DELETE_BACKENDS)[number],
+    ...(url !== undefined ? { url: url as string } : {}),
+    ...(collection !== undefined ? { collection: collection as string } : {}),
+    ...(apiKey !== undefined ? { apiKey: apiKey as string } : {}),
+  });
+  const protectedCollections = oneOf(block, "protected_collections", "protectedCollections");
+  const countConsistency = oneOf(block, "count_consistency", "countConsistency");
+  registerVectorTarget({
+    store,
+    ...(collection !== undefined ? { collection: collection as string } : {}),
+    ...(protectedCollections !== undefined
+      ? { protectedCollections: protectedCollections as readonly string[] }
+      : {}),
+    ...(countConsistency !== undefined
+      ? { countConsistency: countConsistency as VectorCountConsistency }
+      : {}),
+  });
 }
 
 export function getVectorTarget(): VectorTargetRegistration | undefined {

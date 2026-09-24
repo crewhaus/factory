@@ -333,18 +333,27 @@ IPv4-mapped, IPv4-translated, NAT64's `64:ff9b::/96` (which is exactly what a DN
 resolver answers for an IPv4-only name), 6to4's `2002::/16`, the deprecated
 IPv4-compatible form — is resolved to the IPv4 it carries and judged on that.
 
-A local anvil or hardhat node is the obvious casualty, so an **operator** can permit it:
+With no configuration these tools may dial any public RPC origin. A spec narrows that
+to a list, and a compiled bundle, `crewhaus run` and `crewhaus eval` apply it at boot:
+
+```yaml
+tool_config:
+  chainread:
+    allowed_origins: [https://mainnet.base.org]   # the ONLY origins these tools dial
+```
+
+A spec cannot open loopback or the private ranges: `allow_private_hosts` in the block
+is refused, because a spec can come from a template or a pull request. A local anvil
+or hardhat node is the casualty; a host that runs one opens it in code:
 
 ```ts
 import { setRpcEndpointPolicy } from "@crewhaus/tool-chainread";
 
 setRpcEndpointPolicy({ allowPrivateHosts: true }); // a local devnet
-setRpcEndpointPolicy({ allowedOrigins: ["https://mainnet.base.org"] }); // stricter still
 ```
 
-Bound at boot by the runtime, exactly like `setEvmAdapterResolver` in `tool-evm`, and
-deliberately **not** a field in any tool's input schema: a gate a model can open for
-itself is not a gate. `EvmRpcHealth` reports the policy it is operating under.
+Neither is a field in any tool's input schema: a gate a model can open for itself is
+not a gate. `EvmRpcHealth` reports the policy it is operating under.
 
 This is a narrower guard than `@crewhaus/tool-fetch`'s `assertNotSsrf`, which is the
 repo's canonical one and is not a dependency of this package. It covers the same ground

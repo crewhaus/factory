@@ -97,11 +97,11 @@ describe("registration", () => {
     }
   });
 
-  test("with nothing wired, each tool says what the operator must bind", async () => {
+  test("with nothing wired, each tool says what the spec must declare", async () => {
     _setRpc(undefined);
     await expect(
       run(evmMulticall, { chainId: CHAIN, calls: [{ target: ADDR.token, data: "0x" }] }),
-    ).rejects.toThrow(/setChainRpcResolver/);
+    ).rejects.toThrow(/no chain is configured\. Declare one in the spec — chains: \[/);
   });
 });
 

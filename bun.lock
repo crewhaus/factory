@@ -2273,6 +2273,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/chain-adapter-evm": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -2650,6 +2651,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/chain-adapter-evm": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -3273,6 +3275,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/vector-store": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3360,9 +3363,11 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/chain-adapter-base": "workspace:*",
+        "@crewhaus/chain-adapter-evm": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-http": "workspace:*",
         "@crewhaus/tool-onchain": "workspace:*",
         "@crewhaus/tool-text": "workspace:*",
         "zod": "^3.23.8",

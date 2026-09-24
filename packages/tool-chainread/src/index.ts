@@ -81,10 +81,12 @@ export { _setFetch, type RpcFetch, type RpcOutcome, openRpc } from "./lib/rpc";
 export { _setClock, type Clock, virtualClock } from "./lib/clock";
 export {
   _setDnsLookup,
+  type ChainreadConfigInput,
   type DnsLookupFn,
   type RpcEndpointPolicy,
   RpcEndpointError,
   getRpcEndpointPolicy,
+  registerChainreadConfig,
   setRpcEndpointPolicy,
 } from "./lib/endpoint";
 export { ChainReadError } from "./lib/quantity";

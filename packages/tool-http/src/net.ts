@@ -988,6 +988,52 @@ export async function readBytesCapped(
   return { bytes: merged, truncated };
 }
 
+/**
+ * One GET through this package's gate, for another package that must fetch a
+ * URL it did not choose (a token's metadata document) and has no HTTP client
+ * of its own: the allow-list is the caller's operator list, the SSRF gate and
+ * userinfo refusal run as for every tool here, a redirect is refused rather
+ * than followed, and the body is capped. `truncated` says the cap was hit.
+ */
+export async function guardedGet(
+  url: string,
+  opts: {
+    readonly allowedOrigins: ReadonlyArray<string>;
+    readonly maxBytes: number;
+    readonly timeoutMs?: number;
+    readonly signal?: AbortSignal;
+  },
+): Promise<{
+  readonly status: number;
+  readonly contentType: string | null;
+  readonly bytes: Uint8Array;
+  readonly truncated: boolean;
+}> {
+  const parsed = parseUrl(url);
+  if (typeof parsed === "string") throw new HttpPermissionError(parsed);
+  const cfg = buildHttpConfig({ allowed_origins: opts.allowedOrigins });
+  const deadline = startDeadline(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, opts.signal);
+  try {
+    const { res } = await openRequest({
+      url: parsed,
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: deadline.signal,
+      cfg,
+      redirect: "error",
+    });
+    const body = await readBytesCapped(res, opts.maxBytes);
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      bytes: body.bytes,
+      truncated: body.truncated,
+    };
+  } finally {
+    deadline.cancel();
+  }
+}
+
 /** A URL the caller supplied, or a readable refusal. */
 export function parseUrl(raw: string): URL | string {
   try {

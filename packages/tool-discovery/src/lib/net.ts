@@ -79,9 +79,65 @@ export type PeerPolicy = {
 
 let policy: PeerPolicy = {};
 
-/** Bind the policy at boot. Generated daemons call this before registering tools. */
+/**
+ * Bind the policy. A compiled bundle, `crewhaus run` and `crewhaus eval` bind
+ * it at boot through {@link registerDiscoveryConfig}, from the spec's
+ * `tool_config.federationDiscover` block; a host may call it directly.
+ */
 export function setPeerPolicy(next: PeerPolicy): void {
   policy = next;
+}
+
+/** The spec's `tool_config.federationDiscover` block. */
+export type DiscoveryConfigInput = {
+  readonly allowed_origins?: ReadonlyArray<string>;
+  readonly allowedOrigins?: ReadonlyArray<string>;
+};
+
+/**
+ * Deliver the spec's block at boot: `allowed_origins` becomes the ONLY peer
+ * origins `FederationDiscover` may dial, and an empty list dials nothing. It
+ * can only narrow — a spec that tries to open loopback and the private ranges
+ * is refused, because a spec may come from a template or a pull request.
+ */
+export function registerDiscoveryConfig(input: DiscoveryConfigInput): void {
+  const block = (input ?? {}) as Record<string, unknown>;
+  for (const key of ["allow_private_hosts", "allowPrivateHosts"]) {
+    if (Object.hasOwn(block, key)) {
+      throw new PeerEndpointError(
+        `tool_config.federationDiscover.${key} is not accepted: a spec cannot open loopback or private addresses. Remove it, and list the peer origins under allowed_origins.`,
+      );
+    }
+  }
+  if (Object.hasOwn(block, "allowed_origins") && Object.hasOwn(block, "allowedOrigins")) {
+    throw new PeerEndpointError(
+      "tool_config.federationDiscover sets both allowed_origins and allowedOrigins. Write the list once, as allowed_origins.",
+    );
+  }
+  const raw = block["allowed_origins"] ?? block["allowedOrigins"];
+  if (raw === undefined) return;
+  if (!Array.isArray(raw) || raw.some((o) => typeof o !== "string")) {
+    throw new PeerEndpointError(
+      'tool_config.federationDiscover.allowed_origins must be a list of origins, for example ["https://peer.example"].',
+    );
+  }
+  const origins = (raw as string[]).map((o) => {
+    let url: URL;
+    try {
+      url = new URL(o);
+    } catch {
+      throw new PeerEndpointError(
+        `tool_config.federationDiscover.allowed_origins has "${o}", which is not an origin. Write it as https://host[:port].`,
+      );
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      throw new PeerEndpointError(
+        `tool_config.federationDiscover.allowed_origins has "${url.protocol}//${url.host}", which is not http(s). Write it as https://host[:port].`,
+      );
+    }
+    return url.origin;
+  });
+  setPeerPolicy({ ...policy, allowedOrigins: origins });
 }
 
 /** Read it back — `FederationDiscover` reports the posture it ran under. */

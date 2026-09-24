@@ -238,9 +238,21 @@ an integer nor the value that was computed.
 
 ## Wiring
 
-The transport is bound once at boot, per chain, from the spec's `chains[]`
-block — the same shape `@crewhaus/tool-evm` uses. No caller supplies a URL
+The transport is bound once at boot, per chain, from the spec's `chains`
+block — the same block `@crewhaus/tool-evm` reads. A compiled bundle,
+`crewhaus run` and `crewhaus eval` call `bindChainCallChains` with it; without
+one, every call refuses and names the block to write. No caller supplies a URL
 anywhere in this package, and there is no endpoint list inside it.
+
+```yaml
+chains:
+  - id: "8453"
+    kind: evm
+    rpcUrls: [$BASE_RPC_URL]     # read from the environment, never compiled in
+    finality: { kind: finalized }
+```
+
+A host that builds its own adapters binds them directly:
 
 ```ts
 import { setChainRpcResolver, chainRpcFromAdapter } from "@crewhaus/tool-chaincall";

@@ -25,6 +25,12 @@
     },
     {
       "path": "../tool-executor"
+    },
+    {
+      "path": "../chain-adapter-evm"
+    },
+    {
+      "path": "../tool-http"
     }
   ],
   "include": ["src/**/*"]

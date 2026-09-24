@@ -51,6 +51,13 @@ export type ChainFinality =
 
 export type RpcPolicy = "single" | "quorum" | "fallback";
 
+/**
+ * What a spec writes to give a chain-reading tool its chain. Every "no chain
+ * is configured" refusal quotes it, so the fix is in the message.
+ */
+export const CHAINS_BLOCK_EXAMPLE =
+  'chains: [{ id: "1", kind: evm, rpcUrls: [$ETH_RPC_URL], finality: { kind: finalized } }]';
+
 export type ChainAdapterConfig = {
   readonly chainId: string;
   readonly rpcUrls: readonly string[];

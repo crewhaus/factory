@@ -18,7 +18,12 @@
  * `chain-adapter-solana`). The bundle's `daemon.ts` wires the resolver
  * from the IR's `chains` block (see compiler / target emitters).
  */
-import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
+import {
+  CHAINS_BLOCK_EXAMPLE,
+  type ChainAdapter,
+  type ChainAdapterConfig,
+} from "@crewhaus/chain-adapter-base";
+import { createEvmAdapters } from "@crewhaus/chain-adapter-evm";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -36,11 +41,24 @@ export type EvmAdapterResolver = (chainId: string) => ChainAdapter | undefined;
 let resolver: EvmAdapterResolver | undefined;
 
 /**
- * Bind the adapter resolver at boot. Generated daemons call this
- * before registering the tools. Tests call it inline.
+ * Bind the adapter resolver. A compiled bundle binds it at boot through
+ * {@link bindEvmChains}, from the spec's `chains` block. Tests call it
+ * inline.
  */
 export function setEvmAdapterResolver(fn: EvmAdapterResolver): void {
   resolver = fn;
+}
+
+/**
+ * Bind the resolver from the spec's `chains` block — what every generated
+ * bundle, `crewhaus run` and `crewhaus eval` call at boot when a spec lists
+ * one of these tools. One adapter per declared chain.
+ */
+export function bindEvmChains(config: {
+  readonly chains: ReadonlyArray<ChainAdapterConfig>;
+}): void {
+  const adapters = createEvmAdapters(config.chains);
+  setEvmAdapterResolver((chainId) => adapters.get(chainId));
 }
 
 /**
@@ -50,7 +68,7 @@ export function setEvmAdapterResolver(fn: EvmAdapterResolver): void {
 function requireAdapter(chainId: string, toolName: string): ChainAdapter {
   if (resolver === undefined) {
     throw new Error(
-      `${toolName}: no EvmAdapterResolver bound. The runtime must call setEvmAdapterResolver() at boot.`,
+      `${toolName}: no chain is configured. Declare one in the spec — ${CHAINS_BLOCK_EXAMPLE}.`,
     );
   }
   const a = resolver(chainId);

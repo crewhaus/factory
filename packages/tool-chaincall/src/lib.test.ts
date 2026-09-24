@@ -426,9 +426,11 @@ describe("rpc — reading a node's refusal", () => {
     expect(dispatched).toBe(0);
   });
 
-  test("with nothing bound, a tool says what the operator has to wire", () => {
+  test("with nothing bound, a tool says what the spec has to declare", () => {
     _setRpc(undefined);
-    expect(() => resolveRpc("base-mainnet", "EvmMulticall")).toThrow(/setChainRpcResolver/);
+    expect(() => resolveRpc("base-mainnet", "EvmMulticall")).toThrow(
+      /EvmMulticall: no chain is configured\. Declare one in the spec — chains:/,
+    );
   });
 
   test("with a chain missing, it names the chain rather than the wiring", () => {

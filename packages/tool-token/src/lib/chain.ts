@@ -22,7 +22,7 @@
  * blocks. `getBlockNumber()` rides along in the same batch so the answer says
  * which block it is a snapshot of.
  */
-import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
+import { CHAINS_BLOCK_EXAMPLE, type ChainAdapter } from "@crewhaus/chain-adapter-base";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   MULTICALL3_ADDRESS,
@@ -60,7 +60,7 @@ export type ChainReader = (read: ChainRead) => Promise<unknown>;
 
 const unbound: ChainReader = async (read) => {
   throw new TokenError(
-    `no chain reader is bound, so chain ${read.chainId} cannot be read. This package contains no RPC client of its own: the runtime binds one with _setChainReader(), and chainReaderFromAdapters() wires it from the spec's chains[] block in one line.`,
+    `no chain is configured, so chain ${read.chainId} cannot be read. Declare it in the spec — ${CHAINS_BLOCK_EXAMPLE}.`,
   );
 };
 

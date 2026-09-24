@@ -94,6 +94,8 @@ import {
 import { CAPS, DATA_NOTICE, quoteFields, quoteList, quoteUntrusted } from "./lib/untrusted";
 
 export {
+  type DiscoveryConfigInput,
+  registerDiscoveryConfig,
   setPeerPolicy,
   getPeerPolicy,
   _resetPeerPolicy,

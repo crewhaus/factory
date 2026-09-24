@@ -41,7 +41,7 @@ export type MetadataFetch = (req: {
 
 const unbound: MetadataFetch = async (req) => {
   throw new Error(
-    `no metadata fetcher is bound, so ${req.url} was not read. This package contains no HTTP client of its own: the runtime binds one with _setMetadataFetch(), which is also where redirect, SSRF and timeout policy belongs.`,
+    `no metadata origin is allowed, so ${req.url} was not read. Allow the origin in the spec — tool_config.token: { metadata_origins: [https://ipfs.io] }.`,
   );
 };
 
