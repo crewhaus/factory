@@ -27,8 +27,8 @@ tools:
 | `ToolInventory` | The tools a spec grants, builtin vs MCP, with `all-<category>` selectors expanded |
 | `PermissionAudit` | Which rule covers each granted tool, and which outward tools no rule names |
 | `PreflightRun` | The full preflight against an explicitly supplied env: blocking items, warnings, remediation |
-| `HarnessInventory` | The harnesses under a root — name, shape, model, spec path, bundle state |
-| `BundleFreshness` | Which compiled bundles are older than their spec, or missing |
+| `HarnessInventory` | The harnesses under a root — name, shape, model, spec path, bundle state (`unreadable` with the reason when it cannot be determined) |
+| `BundleFreshness` | Which compiled bundles are older than their spec, missing, or `unreadable` (unknown, with the reason — never reported as missing) |
 | `AuditVerify` | Re-walk the audit log's hash chain and report the first break |
 | `EvalBaselineCompare` | The release gate: pass-rate delta, per-sample regressions, threshold verdict |
 | `SessionSummarize` | Event counts, tool tallies and errors from a harness's session logs |

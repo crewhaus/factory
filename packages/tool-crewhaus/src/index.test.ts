@@ -8,6 +8,7 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -669,6 +670,47 @@ describe("HarnessInventory", () => {
     });
     expect(freshness.bundles[0]?.state).toBe("missing-bundle");
   });
+});
+
+describe("a bundle that cannot be examined (flag-truth-3#10)", () => {
+  const canRevoke = process.platform !== "win32" && process.getuid?.() !== 0;
+
+  test.skipIf(!canRevoke)(
+    "is unreadable with the reason in BundleFreshness and HarnessInventory, never missing",
+    async () => {
+      write("h/crewhaus.yaml", CLI_SPEC);
+      write("h/dist/index.js", "// compiled");
+      const dist = path.join(tmp, "h", "dist");
+      chmodSync(dist, 0o000);
+      try {
+        const fresh = await callJson<{
+          counts: { missingBundle: number; unreadable: number };
+          bundles: Array<{ dir: string; state: string; detail?: string; remediation?: string }>;
+        }>(bundleFreshness, { dirs: ["h"] });
+        // On 0.7.0: state "missing-bundle" with "crewhaus compile" as the fix.
+        expect(fresh.bundles[0]?.state).toBe("unreadable");
+        expect(fresh.bundles[0]?.detail).toMatch(/^(EACCES|EPERM) listing dist\/$/);
+        expect(fresh.bundles[0]?.remediation).toBeUndefined();
+        expect(fresh.counts).toMatchObject({ missingBundle: 0, unreadable: 1 });
+        // The caller must act on it, so staleOnly keeps it.
+        const needsWork = await callJson<{ bundles: Array<{ dir: string }> }>(bundleFreshness, {
+          dirs: ["h"],
+          staleOnly: true,
+        });
+        expect(needsWork.bundles.map((b) => b.dir)).toEqual(["h"]);
+
+        const inventory = await callJson<{
+          counts: { missingBundles: number; unreadableBundles: number };
+          harnesses: Array<{ bundle: string; bundleDetail?: string }>;
+        }>(harnessInventory, {});
+        expect(inventory.harnesses[0]?.bundle).toBe("unreadable");
+        expect(inventory.harnesses[0]?.bundleDetail).toMatch(/^(EACCES|EPERM) listing dist\/$/);
+        expect(inventory.counts).toMatchObject({ missingBundles: 0, unreadableBundles: 1 });
+      } finally {
+        chmodSync(dist, 0o755);
+      }
+    },
+  );
 });
 
 describe("BundleFreshness", () => {

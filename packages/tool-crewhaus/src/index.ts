@@ -772,7 +772,7 @@ export const preflightRun: RegisteredTool = buildTool({
 export const harnessInventory: RegisteredTool = buildTool({
   name: "HarnessInventory",
   description:
-    "Enumerate the harnesses under a directory — name, shape, model, spec path, whether a bundle exists and whether it is older than the spec. Use to get the fleet table a supervisor starts from. A harness is any directory carrying a crewhaus.yaml, matching what `crewhaus fleet` discovers; the walk is depth-bounded, skips state and vendor directories, and never follows a directory symlink. A spec that does not parse is still listed, marked invalid, with its first issue.",
+    "Enumerate the harnesses under a directory — name, shape, model, spec path, whether a bundle exists and whether it is older than the spec (`unreadable`, with the reason, when that cannot be determined). Use to get the fleet table a supervisor starts from. A harness is any directory carrying a crewhaus.yaml, matching what `crewhaus fleet` discovers; the walk is depth-bounded, skips state and vendor directories, and never follows a directory symlink. A spec that does not parse is still listed, marked invalid, with its first issue.",
   inputSchema: z.object({
     root: z.string().optional().describe("where to look; defaults to the working directory"),
     maxDepth: z.number().int().min(0).max(12).optional().describe("walk depth cap (default 6)"),
@@ -811,6 +811,8 @@ export const harnessInventory: RegisteredTool = buildTool({
         specValid: identity.valid,
         ...(identity.firstIssue !== undefined ? { firstIssue: identity.firstIssue } : {}),
         bundle: freshness.state,
+        // `unreadable` is "could not determine", never "missing": say why.
+        ...(freshness.reason !== undefined ? { bundleDetail: freshness.reason } : {}),
       };
     });
 
@@ -822,6 +824,7 @@ export const harnessInventory: RegisteredTool = buildTool({
         invalidSpecs: harnesses.filter((h) => !h.specValid).length,
         staleBundles: harnesses.filter((h) => h.bundle === "stale").length,
         missingBundles: harnesses.filter((h) => h.bundle === "missing-bundle").length,
+        unreadableBundles: harnesses.filter((h) => h.bundle === "unreadable").length,
       },
       harnesses,
       ...(found.unreadable.length > 0 ? { unreadable: found.unreadable } : {}),
@@ -832,7 +835,7 @@ export const harnessInventory: RegisteredTool = buildTool({
 export const bundleFreshness: RegisteredTool = buildTool({
   name: "BundleFreshness",
   description:
-    'Compare each harness\'s compiled bundle against its spec and report which bundles are stale or missing, with the command that fixes them. Use to find the harnesses running yesterday\'s spec before you trust what they do. The comparison is the mtime heuristic preflight uses — mtimes lie across git checkouts, file copies and clock skew, so a `stale` verdict means "recompile to be sure", not "proven different".',
+    'Compare each harness\'s compiled bundle against its spec and report which bundles are stale or missing, with the command that fixes them. Use to find the harnesses running yesterday\'s spec before you trust what they do. The comparison is the mtime heuristic preflight uses — mtimes lie across git checkouts, file copies and clock skew, so a `stale` verdict means "recompile to be sure", not "proven different". A bundle or spec that exists but cannot be examined is `unreadable`, with the reason, never reported as missing.',
   inputSchema: z.object({
     dirs: z
       .array(z.string())
@@ -842,7 +845,12 @@ export const bundleFreshness: RegisteredTool = buildTool({
       .string()
       .optional()
       .describe("where to discover harnesses (default: working directory)"),
-    staleOnly: z.boolean().optional().describe("return only the bundles that need a recompile"),
+    staleOnly: z
+      .boolean()
+      .optional()
+      .describe(
+        "return only the bundles that need attention: stale or missing (recompile) and unreadable (the answer is unknown)",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -870,12 +878,20 @@ export const bundleFreshness: RegisteredTool = buildTool({
       rows.push({
         dir: dir.value.rel === "" ? "." : dir.value.rel,
         state: freshness.state,
+        // A recompile is the fix for a stale or absent bundle only. An
+        // unreadable one is UNKNOWN, and compiling over it fixes nothing.
         ...(freshness.state === "stale" || freshness.state === "missing-bundle"
           ? { remediation: "crewhaus compile crewhaus.yaml" }
           : {}),
+        ...(freshness.reason !== undefined ? { detail: freshness.reason } : {}),
       });
     }
-    const needsWork = rows.filter((r) => r["state"] === "stale" || r["state"] === "missing-bundle");
+    // Everything the caller must act on: a recompile, or a look at why the
+    // answer could not be determined.
+    const needsWork = rows.filter(
+      (r) =>
+        r["state"] === "stale" || r["state"] === "missing-bundle" || r["state"] === "unreadable",
+    );
     return json({
       checked: rows.length,
       counts: {
@@ -883,6 +899,7 @@ export const bundleFreshness: RegisteredTool = buildTool({
         stale: rows.filter((r) => r["state"] === "stale").length,
         missingBundle: rows.filter((r) => r["state"] === "missing-bundle").length,
         missingSpec: rows.filter((r) => r["state"] === "missing-spec").length,
+        unreadable: rows.filter((r) => r["state"] === "unreadable").length,
       },
       method: "mtime heuristic (approximate — mtimes lie across checkouts and copies)",
       bundles: input.staleOnly === true ? needsWork : rows,
