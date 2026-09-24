@@ -130,11 +130,58 @@ const DEFAULT_CPUS = "1.0";
  */
 const IMAGE_RE = /^[a-z0-9][a-z0-9._\-/]*(?::[a-zA-Z0-9._\-]+)?(?:@sha256:[a-f0-9]{64})?$/;
 
+/**
+ * What `CREWHAUS_SANDBOX` selects. `fromEnv` is false when the variable is
+ * unset or blank, which means docker. `ok: false` is a value that names no
+ * backend — the caller must not guess which one was meant.
+ */
+export type SandboxBackendResolution =
+  | { readonly ok: true; readonly backend: SandboxBackend; readonly fromEnv: boolean }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * THE one reading of `CREWHAUS_SANDBOX`: trimmed and lower-cased, then
+ * checked against the three backends. Everything that decides from the
+ * variable — `createSandbox`, the permission floor in `crewhaus run`, the
+ * floor a compiled bundle emits — reads it through here.
+ *
+ * It used to be read two ways: the floor compared the raw value with "noop"
+ * while `createSandbox` trimmed it, so `noop ` (or `noop\r` from a CRLF .env)
+ * told the floor a sandbox existed and then ran model code on the host with
+ * the noop backend (security-6#1).
+ */
+export function resolveSandboxBackend(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): SandboxBackendResolution {
+  const raw = env["CREWHAUS_SANDBOX"] ?? "";
+  const value = raw.trim().toLowerCase();
+  if (value === "") return { ok: true, backend: "docker", fromEnv: false };
+  if (value === "docker" || value === "podman" || value === "noop") {
+    return { ok: true, backend: value, fromEnv: true };
+  }
+  return {
+    ok: false,
+    reason: `CREWHAUS_SANDBOX=${JSON.stringify(raw)} is not a sandbox backend. Set it to docker or podman to run code in a container, or noop to turn code execution off.`,
+  };
+}
+
+/**
+ * Whether code-execution tools may treat the sandbox as real: only when
+ * `CREWHAUS_SANDBOX` selects docker or podman (unset means docker). `noop`
+ * and a value that names no backend are both "no sandbox", so the
+ * permission floor denies those tools rather than guessing.
+ */
+export function sandboxAvailableFromEnv(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  const resolved = resolveSandboxBackend(env);
+  return resolved.ok && resolved.backend !== "noop";
+}
+
 function readEnvBackend(): SandboxBackend | undefined {
-  const raw = (process.env["CREWHAUS_SANDBOX"] ?? "").trim().toLowerCase();
-  if (raw === "") return undefined;
-  if (raw === "docker" || raw === "podman" || raw === "noop") return raw;
-  throw new SandboxError(`CREWHAUS_SANDBOX=${raw} is not one of docker|podman|noop`);
+  const resolved = resolveSandboxBackend();
+  if (!resolved.ok) throw new SandboxError(resolved.reason);
+  return resolved.fromEnv ? resolved.backend : undefined;
 }
 
 function readEnvAllowedImages(): ReadonlyArray<string> {

@@ -1282,13 +1282,17 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   const bannerBoot = renderBannerBoot(ir.name, ir.cli?.banner);
   // Section 18 — only flip `sandboxAvailable` on at runtime when the
   // operator has wired a real backend. Default (unset) treats docker as
-  // available; `CREWHAUS_SANDBOX=noop` always denies the floor.
+  // available; `CREWHAUS_SANDBOX=noop` (however it is spaced or cased) and a
+  // value naming no backend deny the floor. The bundle reads the variable
+  // through the sandbox's own parser, so the floor and the backend can never
+  // disagree about what it says (security-6#1).
   const hasSandboxTools = ir.tools.some(
     (t) => t === "python" || t === "javascript" || t === "shell",
   );
-  const sandboxField = hasSandboxTools
-    ? '\n  sandboxAvailable: ((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop"),'
+  const sandboxImport = hasSandboxTools
+    ? `import { sandboxAvailableFromEnv } from "@crewhaus/tool-code-execution";\n`
     : "";
+  const sandboxField = hasSandboxTools ? "\n  sandboxAvailable: sandboxAvailableFromEnv()," : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";
   // Loop contract 0.4 (Batch A) — extended-thinking selector. The IR carries
@@ -1449,7 +1453,7 @@ ${catchBlock}${finallyBlock}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: cli, ir version: ${ir.version})
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
-${hybridImport}${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
+${hybridImport}${permImport}${importBlock}${sandboxImport}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
 ${watchmeEnvStamp}${registerBlock}
 ${pluginsActivateBoot}${extensionBoot}${pluginsRegisterBoot}${specHooks.bootBlock}
 

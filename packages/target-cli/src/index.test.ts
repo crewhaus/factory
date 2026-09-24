@@ -1656,3 +1656,21 @@ describe("emitCli — the pool's runtime closures reach the bundle (0.6.0 PR 9e)
     expect(c).not.toContain("@crewhaus/model-service");
   });
 });
+
+describe("the sandbox floor reads CREWHAUS_SANDBOX through the sandbox's own parser (security-6#1)", () => {
+  test("a bundle with a code-execution tool decides the floor with sandboxAvailableFromEnv", () => {
+    const content = emitCli(baseIr({ tools: ["python"] })).files[0]?.content ?? "";
+    expect(content).toContain(
+      'import { sandboxAvailableFromEnv } from "@crewhaus/tool-code-execution";',
+    );
+    expect(content).toContain("sandboxAvailable: sandboxAvailableFromEnv(),");
+    // The old inline reading compared the raw value, so `noop ` passed as a sandbox.
+    expect(content).not.toContain("process.env.CREWHAUS_SANDBOX");
+  });
+
+  test("a bundle without one is unchanged: no import, no field", () => {
+    const content = emitCli(baseIr({ tools: ["bash"] })).files[0]?.content ?? "";
+    expect(content).not.toContain("sandboxAvailableFromEnv");
+    expect(content).not.toContain("sandboxAvailable:");
+  });
+});

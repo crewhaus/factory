@@ -7,6 +7,13 @@ import {
 } from "@crewhaus/sandbox";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+
+/**
+ * Re-exported so a compiled bundle that grants python/javascript/shell can
+ * decide the sandbox floor with the SAME reading of `CREWHAUS_SANDBOX` the
+ * sandbox itself uses, from a package it already imports (security-6#1).
+ */
+export { sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import type { TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 

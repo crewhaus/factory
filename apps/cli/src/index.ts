@@ -430,6 +430,7 @@ import {
   resolveSessionRootDir,
   runChatLoop,
 } from "@crewhaus/runtime-core";
+import { resolveSandboxBackend, sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import {
   type PendingApproval,
   type PendingApprovalStore,
@@ -4431,14 +4432,16 @@ async function applyToolConfigs(
 
 /**
  * Section 18 — resolve `sandboxAvailable` for the `run` path from the
- * `CREWHAUS_SANDBOX` env var, using the SAME grammar the compiled bundle
- * emits (`packages/target-cli` renderRun): unset defaults to `"docker"`
- * (available); any value whose lowercase is `"noop"` disables the sandbox
- * floor (code-exec tools are then denied by permission-engine's
- * `requiresSandbox` floor). Pure — reads only the passed env snapshot.
+ * `CREWHAUS_SANDBOX` env var, through the sandbox's own parser — the one the
+ * compiled bundle also calls and `createSandbox` uses — so the floor and the
+ * backend always read the same thing (security-6#1). Unset means docker
+ * (available); `noop`, in any case or spacing, and a value that names no
+ * backend disable the floor (code-exec tools are then denied by
+ * permission-engine's `requiresSandbox` floor). Pure — reads only the passed
+ * env snapshot.
  */
 export function resolveSandboxAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
+  return sandboxAvailableFromEnv(env);
 }
 
 /**
@@ -5501,17 +5504,22 @@ async function runRunCli(
   );
   const sandboxAvailable = resolveSandboxAvailable();
   if (hasCodeExecTools) {
-    if (!sandboxAvailable) {
+    const sandbox = resolveSandboxBackend();
+    if (!sandbox.ok) {
+      process.stdout.write(
+        `[sandbox] ${sandbox.reason} Until then python/javascript/shell calls are denied.\n`,
+      );
+    } else if (!sandboxAvailable) {
       process.stdout.write(
         "[sandbox] disabled (CREWHAUS_SANDBOX=noop) — python/javascript/shell calls will be denied by the sandbox floor\n",
       );
-    } else if (process.env["CREWHAUS_SANDBOX"] === undefined) {
+    } else if (!sandbox.fromEnv) {
       process.stdout.write(
         "[sandbox] assuming docker — set CREWHAUS_SANDBOX (docker|podman) to select a backend, or CREWHAUS_SANDBOX=noop to disable code execution\n",
       );
     } else {
       process.stdout.write(
-        `[sandbox] backend "${process.env["CREWHAUS_SANDBOX"]}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
+        `[sandbox] backend "${sandbox.backend}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
       );
     }
   }
