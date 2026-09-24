@@ -1265,7 +1265,7 @@ async function callRemote(call: RemoteCall): Promise<RemoteResult> {
       cfg: call.cfg,
       credentialHeaders: secretHeaders,
     });
-    const body = await readCapped(opened.res, call.maxBytes);
+    const body = await readCapped(opened.res, call.maxBytes, deadline.signal);
     return {
       ok: true,
       status: opened.res.status,
@@ -1835,8 +1835,12 @@ export const healthProbe: RegisteredTool = buildTool({
           credentialHeaders: secretHeaders,
         });
         // Drain under the cap rather than leaving the stream open: a probe
-        // that never reads the body leaks a socket per endpoint.
-        await readCapped(opened.res, maxBytes);
+        // that never reads the body leaks a socket per endpoint. The probe
+        // judges the status, not the body, so a body the reader refuses to
+        // decode is released rather than reported as the endpoint failing.
+        await readCapped(opened.res, maxBytes, deadline.signal).catch((err: unknown) => {
+          if (err instanceof Error && err.name === "AbortError") throw err;
+        });
         const status = opened.res.status;
         results[index] = {
           url: redact(opened.finalUrl),

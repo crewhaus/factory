@@ -49,6 +49,7 @@ import { connect as tlsConnect } from "node:tls";
 import type { DetailedPeerCertificate } from "node:tls";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { decodeBody } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { formatDn, summarizeCert } from "./lib/cert";
 import { parseFeed } from "./lib/feed";
@@ -72,6 +73,7 @@ import {
   assertHostAllowed,
   assertNotSsrf,
   authHeaderName,
+  bodyFailure,
   byString,
   describeFailure,
   json,
@@ -288,7 +290,7 @@ async function fetchText(
     cfg,
     redirect: "follow",
   });
-  const body = await readCapped(opened.res, maxBytes);
+  const body = await readCapped(opened.res, maxBytes, deadline.signal);
   return {
     status: opened.res.status,
     text: body.text,
@@ -392,7 +394,7 @@ export const httpRequest: RegisteredTool = buildTool({
             continue;
           }
         }
-        const body = await readCapped(opened.res, maxBytes);
+        const body = await readCapped(opened.res, maxBytes, deadline.signal);
         const parsed = input.parseJson === true ? parseJsonBody(body.text) : undefined;
         if (parsed !== undefined && !parsed.ok) return parsed.message;
         return json({
@@ -542,7 +544,7 @@ export const httpPaginate: RegisteredTool = buildTool({
           redirect: "follow",
           credentialHeaders: prepared.secretHeaders,
         });
-        const body = await readCapped(opened.res, maxBytes);
+        const body = await readCapped(opened.res, maxBytes, deadline.signal);
         pages++;
         totalBytes += body.bytes;
         if (opened.res.status < 200 || opened.res.status >= 300) {
@@ -692,7 +694,11 @@ export const graphqlQuery: RegisteredTool = buildTool({
         redirect: "follow",
         credentialHeaders: prepared.secretHeaders,
       });
-      const body = await readCapped(opened.res, input.maxBytes ?? DEFAULT_MAX_BYTES);
+      const body = await readCapped(
+        opened.res,
+        input.maxBytes ?? DEFAULT_MAX_BYTES,
+        deadline.signal,
+      );
       if (body.truncated) {
         return `the GraphQL response exceeded the ${input.maxBytes ?? DEFAULT_MAX_BYTES}-byte cap and could not be parsed — narrow the selection set or raise maxBytes`;
       }
@@ -806,7 +812,7 @@ export const httpBatch: RegisteredTool = buildTool({
               redirect: "follow",
               credentialHeaders: prepared.secretHeaders,
             });
-            const body = await readCapped(opened.res, maxBytes);
+            const body = await readCapped(opened.res, maxBytes, deadline.signal);
             return {
               index,
               url: req.url,
@@ -934,7 +940,7 @@ export const downloadFile: RegisteredTool = buildTool({
         return `HTTP ${opened.res.status} ${opened.res.statusText} from ${safeUrlLabel(opened.finalUrl)} — nothing was written`;
       }
       // One extra byte past the cap is enough to know it was exceeded.
-      const raw = await readBytesCapped(opened.res, maxBytes + 1);
+      const raw = await readBytesCapped(opened.res, maxBytes + 1, deadline.signal);
       if (raw.truncated || raw.bytes.byteLength > maxBytes) {
         return `the response is larger than the ${maxBytes}-byte cap — nothing was written; raise maxBytes if the file really is that big`;
       }
@@ -1281,7 +1287,11 @@ export const httpWaitFor: RegisteredTool = buildTool({
           const statusOk = wantStatus.size === 0 || wantStatus.has(opened.res.status);
           let jsonOk = predicate === undefined;
           if (predicate !== undefined) {
-            const body = await readCapped(opened.res, input.maxBytes ?? DEFAULT_MAX_BYTES);
+            const body = await readCapped(
+              opened.res,
+              input.maxBytes ?? DEFAULT_MAX_BYTES,
+              deadline.signal,
+            );
             const parsed = parseJsonBody(body.text);
             if (parsed.ok) {
               jsonOk = matchesPredicateSafely(parsed.value, predicate);
@@ -1408,28 +1418,22 @@ export const sseRead: RegisteredTool = buildTool({
         return json({ status, count: 0, events: [], stoppedBy: "status", bytes: 0 });
       }
 
-      const reader = opened.res.body.getReader();
+      // The stream arrives raw and is decoded here, under the byte cap, so a
+      // compressed stream cannot inflate past it (see net.ts pinnedFetch).
+      const body = decodeBody(opened.res, { maxBytes, signal: deadline.signal });
       const decoder = new TextDecoder("utf-8", { fatal: false });
       const sse = new SseDecoder();
       try {
-        while (true) {
-          if (deadline.expired()) {
-            stoppedBy = "deadline";
-            break;
-          }
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value !== undefined) {
-            bytes += value.byteLength;
-            for (const event of sse.push(decoder.decode(value, { stream: true }))) {
-              collected.push(event);
-              if (input.terminatorEvent !== undefined && event.event === input.terminatorEvent) {
-                // The terminator ends the read. Events the server had already
-                // pushed into the same chunk are dropped rather than returned
-                // after the event that said the stream was finished.
-                stoppedBy = "terminator";
-                break;
-              }
+        for await (const value of body) {
+          bytes += value.byteLength;
+          for (const event of sse.push(decoder.decode(value, { stream: true }))) {
+            collected.push(event);
+            if (input.terminatorEvent !== undefined && event.event === input.terminatorEvent) {
+              // The terminator ends the read. Events the server had already
+              // pushed into the same chunk are dropped rather than returned
+              // after the event that said the stream was finished.
+              stoppedBy = "terminator";
+              break;
             }
           }
           if (stoppedBy === "terminator") break;
@@ -1442,19 +1446,23 @@ export const sseRead: RegisteredTool = buildTool({
             break;
           }
         }
-        if (stoppedBy === "streamEnded") {
-          for (const event of sse.flush()) collected.push(event);
+        const outcome = body.outcome;
+        if (stoppedBy === "streamEnded" && outcome !== undefined) {
+          if (!outcome.ok) {
+            if (outcome.code !== "aborted" && outcome.code !== "stalled") {
+              return describeFailure(bodyFailure(outcome), deadline);
+            }
+            stoppedBy = deadline.expired() ? "deadline" : "error";
+          } else if (outcome.truncated) {
+            stoppedBy = "byteCap";
+          } else {
+            for (const event of sse.flush()) collected.push(event);
+          }
         }
       } catch (err) {
         stoppedBy = deadline.expired() ? "deadline" : "error";
         if (stoppedBy === "error" && !(err instanceof Error && err.name === "AbortError")) {
           return describeFailure(err, deadline);
-        }
-      } finally {
-        try {
-          await reader.cancel();
-        } catch {
-          // already closed
         }
       }
 

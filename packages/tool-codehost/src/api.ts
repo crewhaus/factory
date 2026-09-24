@@ -160,7 +160,7 @@ export async function apiRequest(c: CallCtx, init: ApiRequestInit): Promise<ApiR
     signal: c.deadline.signal,
     cfg: c.cfg,
   });
-  const drained = await readCapped(opened.res, init.maxBytes ?? c.maxBytes);
+  const drained = await readCapped(opened.res, init.maxBytes ?? c.maxBytes, c.deadline.signal);
   const map = headerMap(opened.res);
   const contentType = map["content-type"] ?? "";
   let parsed: unknown;
