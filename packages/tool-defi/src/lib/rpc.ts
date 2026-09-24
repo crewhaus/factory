@@ -320,11 +320,51 @@ export type RpcOutcome<T> =
   | ({ readonly ok: false } & TransportFailure);
 
 export type RpcOptions = {
+  /**
+   * The WHOLE call's signal: a tool opens one deadline per call
+   * ({@link startDeadline}) and hands its signal down, so every request the
+   * call makes shares one budget of time. Once it has aborted, nothing more
+   * is dialled.
+   */
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
   /** Only for the refusal message when a method is off the allow-list. */
   readonly chainId?: string;
+  /** The call's price-provider budget and answers, for {@link getJson}. */
+  readonly providers?: ProviderLedger;
 };
+
+/**
+ * What one tool call may ask the public price providers, and what it already
+ * has.
+ *
+ * `PortfolioValuation` prices up to 256 holdings, and one quote can take up to
+ * fifteen requests (direct, inverted, then crossed through two intermediates).
+ * Unbounded, one call could send thousands of requests to somebody else's
+ * public endpoint — and the same leg (USD/JPY, for every holding crossed
+ * through USD) was fetched again for every holding. The ledger caps the
+ * requests and answers a URL already fetched in this call from its answer.
+ */
+export type ProviderLedger = {
+  readonly limit: number;
+  made: number;
+  readonly answers: Map<string, Promise<RpcOutcome<unknown>>>;
+};
+
+export function newProviderLedger(limit: number): ProviderLedger {
+  return { limit, made: 0, answers: new Map() };
+}
+
+/** Why nothing was dialled: the call's signal had already fired. */
+function notAsked(signal: AbortSignal, label: string, what: string): TransportFailure {
+  const cancelled = !(signal.reason instanceof DeadlineElapsed);
+  return {
+    kind: "transport",
+    message: `the deadline elapsed before ${label} was asked ${what}: ${
+      cancelled ? "the call was cancelled" : `the call's ${signal.reason.ms}ms were spent`
+    }`,
+  };
+}
 
 /**
  * Issue one JSON-RPC call.
@@ -351,6 +391,9 @@ export async function rpcCall<T = unknown>(
   }
 
   const label = endpointLabel(endpoint);
+  if (options.signal?.aborted === true) {
+    return { ok: false, ...notAsked(options.signal, label, method) };
+  }
   const deadline = startDeadline(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.signal);
   try {
     const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
@@ -487,6 +530,32 @@ export async function getJson(
   options: RpcOptions & { readonly accept?: string } = {},
 ): Promise<RpcOutcome<unknown>> {
   const label = endpointLabel(url);
+  if (options.signal?.aborted === true) {
+    return { ok: false, ...notAsked(options.signal, label, "for a price") };
+  }
+  const ledger = options.providers;
+  if (ledger === undefined) return dialJson(url, label, options);
+  const key = `${options.accept ?? "application/json"} ${url}`;
+  const known = ledger.answers.get(key);
+  if (known !== undefined) return known;
+  if (ledger.made >= ledger.limit) {
+    return {
+      ok: false,
+      kind: "refused",
+      message: `this call has already sent the ${ledger.limit} price-provider requests it may send, so ${label} was not asked — price fewer distinct assets per call`,
+    };
+  }
+  ledger.made++;
+  const answer = dialJson(url, label, options);
+  ledger.answers.set(key, answer);
+  return answer;
+}
+
+async function dialJson(
+  url: string,
+  label: string,
+  options: RpcOptions & { readonly accept?: string },
+): Promise<RpcOutcome<unknown>> {
   const deadline = startDeadline(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.signal);
   try {
     let res: Response;
@@ -678,7 +747,15 @@ async function readCapped(res: Response, maxBytes: number): Promise<string | nul
   return new TextDecoder("utf-8", { fatal: false }).decode(merged);
 }
 
-export type Deadline = { readonly signal: AbortSignal; cancel(): void };
+export type Deadline = { readonly signal: AbortSignal; readonly ms: number; cancel(): void };
+
+/** The abort reason of a deadline that ran out, as opposed to a cancellation. */
+export class DeadlineElapsed extends Error {
+  override readonly name = "DeadlineElapsed";
+  constructor(readonly ms: number) {
+    super(`deadline of ${ms}ms elapsed`);
+  }
+}
 
 /**
  * A deadline that also honours the runtime's own cancellation. Every call
@@ -687,7 +764,7 @@ export type Deadline = { readonly signal: AbortSignal; cancel(): void };
  */
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(() => controller.abort(new DeadlineElapsed(ms)), ms);
   const onOuter = (): void => controller.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) controller.abort(outer.reason);
@@ -695,6 +772,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   }
   return {
     signal: controller.signal,
+    ms,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);
