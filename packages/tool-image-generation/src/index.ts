@@ -35,7 +35,8 @@ export type ImageGenerationConfig = {
   /** Provider-specific model id. Defaults: openai → "dall-e-3", replicate → "stability-ai/sdxl". */
   readonly model?: string;
   /**
-   * Override the OpenAI base URL (for a proxy or Azure OpenAI). OPENAI_API_KEY
+   * Override the OpenAI base URL, for an OpenAI-compatible proxy (not Azure
+   * OpenAI, whose path, `api-version` query and `api-key` header differ). OPENAI_API_KEY
    * goes wherever this points, so anything but `https://api.openai.com` must
    * also be approved by the operator outside the spec — see
    * {@link resolveOpenAIBaseUrl}.
@@ -136,6 +137,14 @@ export function resolveOpenAIBaseUrl(
       `the OpenAI base URL for ${url.protocol}//${url.host} carries user:password@. Remove it; the key is sent from OPENAI_API_KEY.`,
     );
   }
+  // `${base}/images/generations` is appended as text, so a query or fragment
+  // in the base would swallow the path (and a query can carry a credential):
+  // refused, and not echoed.
+  if (url.search !== "" || url.hash !== "") {
+    throw new ImageGenerationError(
+      `the OpenAI base URL for ${url.protocol}//${url.host} has a query or fragment. Write it as https://host/v1, with nothing after the path.`,
+    );
+  }
   let approved = false;
   if (operator !== undefined && operator !== "") {
     try {
@@ -225,6 +234,14 @@ async function generateOpenAI(
   }
   const baseUrl = resolveOpenAIBaseUrl(cfg, processEnv());
   const model = cfg.model ?? "dall-e-3";
+  // A spec block can only carry a string here; a per-call (model-pool
+  // candidate) block used to reach `fetchFn(...)` and crash with "is not a
+  // function". Refused like the boot block's.
+  if (cfg.fetch !== undefined && typeof cfg.fetch !== "function") {
+    throw new ImageGenerationError(
+      "tool_config.imageGenerate.fetch is not a setting a spec can write. Remove it.",
+    );
+  }
   const fetchFn = cfg.fetch ?? globalThis.fetch;
   const body = JSON.stringify({
     model,

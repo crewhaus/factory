@@ -18,7 +18,9 @@ The key is read from `OPENAI_API_KEY`. It is never written in the spec.
 
 By default the key goes to `https://api.openai.com/v1` and nowhere else.
 
-`openaiBaseUrl` points the tool at a proxy or Azure OpenAI instead. Because
+`openaiBaseUrl` points the tool at an OpenAI-compatible proxy instead (not
+Azure OpenAI, whose paths and auth header differ). It is an origin and a path,
+with no query or fragment. Because
 the key goes wherever that URL points, a spec cannot set it alone — a spec can
 come from a template or a pull request. The operator approves the endpoint by
 setting `OPENAI_BASE_URL` to the same origin in the environment the harness

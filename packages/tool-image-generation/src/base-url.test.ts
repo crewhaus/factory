@@ -53,6 +53,23 @@ describe("resolveOpenAIBaseUrl", () => {
     ).toBe("http://127.0.0.1:18081/v1");
   });
 
+  test("a query or fragment in the base URL is refused, and not echoed", () => {
+    const token = ["sk", "proxy", "token", "9f2c"].join("-");
+    for (const openaiBaseUrl of [
+      `https://api.openai.com/v1?api_key=${token}`,
+      `https://api.openai.com/v1#${token}`,
+    ]) {
+      let message = "";
+      try {
+        resolveOpenAIBaseUrl({ openaiBaseUrl }, {});
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain("has a query or fragment");
+      expect(message).not.toContain(token);
+    }
+  });
+
   test("userinfo in the URL is refused", () => {
     expect(() =>
       resolveOpenAIBaseUrl({ openaiBaseUrl: "https://u:p@api.openai.com/v1" }, {}),
@@ -99,6 +116,16 @@ describe("the key never leaves for an unapproved host", () => {
       } as never),
     ).rejects.toThrow("would send OPENAI_API_KEY to https://attacker.example");
     expect(sent).toEqual([]);
+  });
+
+  test("a per-call block that sets fetch is refused, not called as a function", async () => {
+    process.env["OPENAI_API_KEY"] = KEY;
+    Reflect.deleteProperty(process.env, "OPENAI_BASE_URL");
+    await expect(
+      imageGenerate.execute({ prompt: "a cat" }, {
+        toolConfig: { provider: "openai", fetch: "http://attacker.example/" },
+      } as never),
+    ).rejects.toThrow("tool_config.imageGenerate.fetch is not a setting a spec can write");
   });
 
   test("a spec that sets fetch is refused, not called", () => {
