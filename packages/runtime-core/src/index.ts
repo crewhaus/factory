@@ -6707,10 +6707,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
 
   /**
-   * Run a list of tool calls honouring the orchestrator's partition:
-   * concurrent-safe batches via `Promise.all`, then serial calls one at
-   * a time. Results are returned in the original `toolUses` order so
-   * they line up with the assistant turn's tool_use blocks.
+   * Run a list of tool calls honouring the orchestrator's partition, group
+   * by group in the order the model issued them: a run of concurrency-safe
+   * calls in parallel (up to `maxConcurrentTools`), every other call alone.
+   * A read issued after a write therefore sees the write. Results are
+   * returned in the original `toolUses` order so they line up with the
+   * assistant turn's tool_use blocks.
    */
   async function runToolBatch(
     toolUses: ReadonlyArray<TsmToolUseBlock>,
@@ -6726,31 +6728,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     ]);
     const maxConcurrentTools = opts.maxConcurrentTools ?? DEFAULT_MAX_CONCURRENT_TOOLS;
     runContext.logger.debug("tool partition", {
-      concurrent: partition.concurrent.map((b) => b.length),
-      serial: partition.serial.length,
+      // In order: a number is a concurrent group of that many calls, "S" one
+      // serial call.
+      groups: partition.groups.map((g) => (g.kind === "serial" ? "S" : g.calls.length)),
       maxConcurrentTools,
     });
     // Map each tool_use's identity to its slot in the original order so
     // results can be placed back in order regardless of the
     // concurrent/serial execution shape. `partitionToolCalls` is total —
-    // every input block lands in exactly one partition bucket — and
+    // every input block lands in exactly one group — and
     // `executeOneToolUse` always resolves to a result, so every slot is
     // filled; there is no missing-result case to defend against.
     const indexByBlock = new Map<TsmToolUseBlock, number>();
     toolUses.forEach((tu, idx) => indexByBlock.set(tu, idx));
     const results = new Array<Anthropic.ToolResultBlockParam>(toolUses.length);
-    for (const batch of partition.concurrent) {
-      const settled = await mapWithConcurrency(batch, maxConcurrentTools, (tu) =>
+    for (const group of partition.groups) {
+      if (group.kind === "serial") {
+        // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
+        results[indexByBlock.get(group.call)!] = await executeOneToolUse(group.call);
+        continue;
+      }
+      const settled = await mapWithConcurrency(group.calls, maxConcurrentTools, (tu) =>
         executeOneToolUse(tu),
       );
-      batch.forEach((tu, i) => {
+      group.calls.forEach((tu, i) => {
         // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
         results[indexByBlock.get(tu)!] = settled[i] as Anthropic.ToolResultBlockParam;
       });
-    }
-    for (const tu of partition.serial) {
-      // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
-      results[indexByBlock.get(tu)!] = await executeOneToolUse(tu);
     }
     return results;
   }

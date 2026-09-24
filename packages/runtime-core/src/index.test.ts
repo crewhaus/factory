@@ -1126,6 +1126,74 @@ describe("runChatLoop — Section 8 orchestrator", () => {
     // execution already costs what serial would, so no wall-clock number can
     // separate the two. The start/finish ordering above can, on any machine.
   });
+
+  // C121 — the post-stream path ran every concurrency-safe batch before any
+  // serial call, so [Get, Set, Get] ran Get, Get, Set and the second Get
+  // returned the value from before the Set, while its tool_result sat after
+  // the Set in the transcript. Groups now run in the model's order, which is
+  // also what the streaming executor does: both paths must agree.
+  for (const streaming of [false, true]) {
+    test(`a read issued after a write in the same turn sees the write (streaming: ${streaming})`, async () => {
+      let value = "old";
+      const order: string[] = [];
+      const setTool = buildTool({
+        name: "Set",
+        description: "set the value",
+        inputSchema: z.object({}),
+        destructive: true,
+        execute: async () => {
+          order.push("Set");
+          value = "new";
+          return "set";
+        },
+      });
+      const getTool = buildTool({
+        name: "Get",
+        description: "get the value",
+        inputSchema: z.object({}),
+        readOnly: true,
+        concurrencySafe: true,
+        execute: async () => {
+          order.push("Get");
+          return value;
+        },
+      });
+      const use = (id: string, name: string): Anthropic.ToolUseBlock =>
+        ({ type: "tool_use", id, name, input: {} }) as Anthropic.ToolUseBlock;
+      const { adapter, capturedMessages } = makeScriptedClient([
+        [use("tu_g0", "Get"), use("tu_s", "Set"), use("tu_g2", "Get")],
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      const input = new PassThrough();
+      input.write("go\n");
+      input.end();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        _adapter: adapter,
+        input,
+        tools: [getTool, setTool],
+        permissionMode: "bypass",
+        streaming,
+      });
+
+      expect(order).toEqual(["Get", "Set", "Get"]);
+      const second = capturedMessages()[1] ?? [];
+      const last = second[second.length - 1];
+      const results = new Map<string, unknown>();
+      for (const block of (last?.content ?? []) as Anthropic.ToolResultBlockParam[]) {
+        if (block.type === "tool_result") results.set(block.tool_use_id, block.content);
+      }
+      const text = (id: string): string => {
+        const c = results.get(id);
+        if (typeof c === "string") return c;
+        return ((c ?? []) as Anthropic.TextBlockParam[]).map((b) => b.text).join("");
+      };
+      expect(text("tu_g0")).toBe("old");
+      expect(text("tu_s")).toBe("set");
+      expect(text("tu_g2")).toBe("new");
+    });
+  }
 });
 
 describe("runChatLoop — Section 8 loop detection", () => {
