@@ -322,6 +322,18 @@ describe("StatementParse", () => {
     expect(result.transactions[0]?.date).toBe("2026-04-03");
   });
 
+  test("the rejected list is capped like the transactions, and says how many there were (C092)", async () => {
+    writeFileSync(join(workspace, "s.ofx"), `<OFX>${"<STMTTRN>junk</STMTTRN>".repeat(1_000)}`);
+    const result = await call<{
+      rejected: unknown[];
+      rejectedCount: number;
+      rejectedTruncated: boolean;
+    }>(statementParse, { file: "s.ofx", limit: 10 });
+    expect(result.rejected.length).toBe(10);
+    expect(result.rejectedCount).toBe(1_000);
+    expect(result.rejectedTruncated).toBe(true);
+  });
+
   test("a path outside the workspace is refused", async () => {
     await expect(raw(statementParse, { file: "../outside.csv" })).rejects.toThrow(
       /escapes the workspace/,

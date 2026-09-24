@@ -444,7 +444,7 @@ export const statementParse: RegisteredTool = buildTool({
       .positive()
       .max(20_000)
       .optional()
-      .describe("cap the returned list; default 500"),
+      .describe("cap the returned transaction and rejected lists; default 500"),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -464,7 +464,11 @@ export const statementParse: RegisteredTool = buildTool({
       totalMinor: result.totalMinor,
       debitMinor: result.debitMinor,
       creditMinor: result.creditMinor,
-      rejected: result.rejected,
+      // Capped like the transactions: a file of nothing but unreadable rows
+      // would otherwise come back as one reason per row, whatever its size.
+      rejected: result.rejected.slice(0, limit),
+      rejectedCount: result.rejected.length,
+      rejectedTruncated: result.rejected.length > limit,
       transactions: result.transactions.slice(0, limit),
       truncated: result.count > limit,
     });

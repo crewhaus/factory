@@ -759,6 +759,59 @@ describe("statement parsing", () => {
     });
   });
 
+  test("unclosed <STMTTRN> blocks are each accounted for, in one pass (C092)", () => {
+    // A lazy block regex rescanned to the end of the file from every unclosed
+    // tag: 0.7.0 took about 37 s over this and returned no transactions and
+    // no rejections at all.
+    const result = parseStatement(`<OFX>\n${"<STMTTRN>\n".repeat(64_000)}`);
+    expect(result.count).toBe(0);
+    expect(result.rejected.length).toBe(64_000);
+    expect(result.rejected[63_999]).toEqual({
+      row: 64_000,
+      reason: "the transaction has no readable date or amount",
+    });
+  }, 20_000);
+
+  test("an unclosed block ends where the next begins, and does not swallow it (C092)", () => {
+    const result = parseStatement(
+      "<OFX>\n<STMTTRN><DTPOSTED>20240101<TRNAMT>-1.00<FITID>A\n<STMTTRN><DTPOSTED>20240102<TRNAMT>-2.00<FITID>B</STMTTRN>\n",
+    );
+    expect(result.transactions.map((t) => [t.id, t.amountMinor])).toEqual([
+      ["A", -100],
+      ["B", -200],
+    ]);
+    expect(result.rejected).toEqual([]);
+  });
+
+  test("SGML-style blocks with no end tags end at the transaction list's close (C092)", () => {
+    const sgml = [
+      "OFXHEADER:100",
+      "<OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><BANKTRANLIST>",
+      "<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20260110<TRNAMT>-1.00<FITID>1<NAME>One",
+      "<STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20260111<TRNAMT>-2.00<FITID>2<NAME>Two",
+      // No NAME: a block that ran on past the list would take the balance's.
+      "<STMTTRN><TRNTYPE>CREDIT<DTPOSTED>20260112<TRNAMT>3.00<FITID>3",
+      "</BANKTRANLIST><LEDGERBAL><BALAMT>100.00<DTASOF>20260131<NAME>not a transaction",
+      "</STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>",
+    ].join("\n");
+    const result = parseStatement(sgml);
+    expect(result.transactions.map((t) => [t.id, t.description, t.amountMinor])).toEqual([
+      ["1", "One", -100],
+      ["2", "Two", -200],
+      ["3", "", 300],
+    ]);
+  });
+
+  test("closed blocks read exactly as before, in any case, and a stray end tag is ignored", () => {
+    const closed = "<STMTTRN><DTPOSTED>20260101<TRNAMT>-1.00<FITID>x</STMTTRN>".repeat(20_000);
+    expect(parseStatement(`<OFX>${closed}</OFX>`).count).toBe(20_000);
+    const lower = parseStatement(
+      "<ofx></stmttrn><stmttrn><dtposted>20260102<trnamt>5.00<fitid>y</stmttrn></ofx>",
+    );
+    expect(lower.transactions.map((t) => t.id)).toEqual(["y"]);
+    expect(lower.rejected).toEqual([]);
+  });
+
   test("an unreadable row is reported with its reason, and the rest still parse", () => {
     const result = parseStatement(
       "Date,Description,Amount\n2026-01-01,ok,1.00\nnotadate,bad,2.00\n",

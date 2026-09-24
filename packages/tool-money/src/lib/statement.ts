@@ -202,6 +202,39 @@ function findColumn(headers: string[], role: string, override?: string): number 
   return headers.findIndex((h) => aliases.includes(h.trim().toLowerCase()));
 }
 
+/**
+ * The `<STMTTRN>` blocks of an OFX file, in one forward pass over its tags.
+ *
+ * OFX 1.x is SGML, where an end tag may be left out, so a block that is
+ * never closed ends where the next one starts, at the transaction list's
+ * own tags, or at the end of the file — and is read like any other rather
+ * than dropped. (A lazy `<STMTTRN>…</STMTTRN>` match instead rescanned to
+ * the end of the file from every unclosed tag, which was quadratic, and
+ * swallowed the next transaction into an unclosed one.) A stray end tag is
+ * ignored.
+ */
+export function* ofxTransactionBlocks(text: string): Generator<string> {
+  const tag = /<(\/?)(STMTTRN|BANKTRANLIST)>/gi;
+  let open = -1;
+  for (let m = tag.exec(text); m !== null; m = tag.exec(text)) {
+    const closing = m[1] === "/";
+    const isTransaction = (m[2] as string).toUpperCase() === "STMTTRN";
+    // Its own end tag closes a block; any other boundary ends it unclosed.
+    if (open !== -1) yield text.slice(open, m.index);
+    open = -1;
+    if (!closing && isTransaction) open = m.index;
+  }
+  if (open !== -1) yield text.slice(open);
+}
+
+/** One OFX element's value, e.g. `<TRNAMT>-12.50`. Built once per tag, not once per block. */
+const OFX_FIELDS: Readonly<Record<string, RegExp>> = Object.fromEntries(
+  ["DTPOSTED", "TRNAMT", "NAME", "MEMO", "FITID", "CHECKNUM", "REFNUM"].map((tag) => [
+    tag,
+    new RegExp(`<${tag}>([^<\\r\\n]*)`, "i"),
+  ]),
+);
+
 export function parseStatement(text: string, options: ParseOptions = {}): ParseResult {
   const format: StatementFormat = options.format ?? (/<OFX>|<STMTTRN>/i.test(text) ? "ofx" : "csv");
   const decimals = options.decimals ?? 2;
@@ -212,12 +245,11 @@ export function parseStatement(text: string, options: ParseOptions = {}): ParseR
   if (format === "ofx") {
     // OFX is SGML with optional closing tags; the transaction blocks are all
     // that matters here and they are regular enough to read directly.
-    const blocks = text.match(/<STMTTRN>[\s\S]*?<\/STMTTRN>/gi) ?? [];
-    const field = (block: string, tag: string): string => {
-      const m = new RegExp(`<${tag}>([^<\\r\\n]*)`, "i").exec(block);
-      return (m?.[1] ?? "").trim();
-    };
-    for (const [i, block] of blocks.entries()) {
+    const field = (block: string, tag: string): string =>
+      ((OFX_FIELDS[tag] as RegExp).exec(block)?.[1] ?? "").trim();
+    let i = -1;
+    for (const block of ofxTransactionBlocks(text)) {
+      i++;
       const date = parseDate(field(block, "DTPOSTED"), "iso");
       const amount = parseMoneyMinor(field(block, "TRNAMT"), decimals, false);
       if (date === null || amount === null) {
