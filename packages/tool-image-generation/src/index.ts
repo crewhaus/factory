@@ -17,6 +17,12 @@
  * include the URL in its reply; vision-capable models can see the
  * image inline on subsequent turns via WebFetch.
  *
+ * Bounds (0.7.1): the call ends when the turn's signal aborts (Ctrl-C,
+ * `turn_timeout_ms`, `deadline_ms`), when `tool_config.imageGenerate.timeoutMs`
+ * passes (default three minutes, request and body together), or when the
+ * body passes `maxResponseBytes` (default 32 MiB, refused rather than
+ * buffered); an error body is read only as far as its message shows.
+ *
  * Pillar 3: this tool is non-destructive (`destructive: false`) — it
  * doesn't write to the user's host filesystem; it issues a remote HTTP
  * request. Tool output is classified post-execution by runtime-core's
@@ -42,9 +48,48 @@ export type ImageGenerationConfig = {
    * {@link resolveOpenAIBaseUrl}.
    */
   readonly openaiBaseUrl?: string;
+  /**
+   * How long one generation may take, request and response together, in
+   * milliseconds. Default 180000 (three minutes): a high-quality image can
+   * take close to two. Past it the call fails with "timed out".
+   */
+  readonly timeoutMs?: number;
+  /**
+   * The most response body read, in bytes. Default 33554432 (32 MiB; a
+   * 1792x1024 PNG as base64 is a few MB). A larger body is refused, not
+   * buffered.
+   */
+  readonly maxResponseBytes?: number;
   /** Override fetch implementation for tests. */
   readonly fetch?: typeof globalThis.fetch;
 };
+
+const DEFAULT_TIMEOUT_MS = 180_000;
+const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+/** An error body is shown only up to 500 characters, so only this much is read. */
+const ERROR_BODY_BYTES = 4096;
+
+/**
+ * Read `timeoutMs` / `maxResponseBytes` from a config block: a positive whole
+ * number, else the default. Anything else is refused with the key named, so
+ * a typo never silently becomes "no limit".
+ */
+function positiveLimit(
+  cfg: ImageGenerationConfig,
+  key: "timeoutMs" | "maxResponseBytes",
+  fallback: number,
+): number {
+  const value: unknown = cfg[key];
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new ImageGenerationError(
+      `tool_config.imageGenerate.${key} must be a positive whole number${
+        key === "timeoutMs" ? " of milliseconds" : " of bytes"
+      }. Remove it for the default (${fallback}).`,
+    );
+  }
+  return value;
+}
 
 const inputSchema = z.object({
   prompt: z
@@ -89,6 +134,8 @@ export function registerImageGenerationConfig(config: ImageGenerationConfig): vo
   // somewhere the operator did not approve fails at boot, where someone is
   // looking, and not at the first image.
   if (config.openaiBaseUrl !== undefined) resolveOpenAIBaseUrl(config, processEnv());
+  positiveLimit(config, "timeoutMs", DEFAULT_TIMEOUT_MS);
+  positiveLimit(config, "maxResponseBytes", DEFAULT_MAX_RESPONSE_BYTES);
   registeredConfig = config;
 }
 
@@ -204,7 +251,7 @@ export const imageGenerate: RegisteredTool = buildTool({
     const provider = cfg.provider ?? defaultProvider(process.env);
     const responseFormat = input.responseFormat ?? "url";
     if (provider === "openai") {
-      return await generateOpenAI(input, cfg, responseFormat);
+      return await generateOpenAI(input, cfg, responseFormat, ctx?.signal);
     }
     if (provider === "mock") {
       return await generateMock(input);
@@ -221,10 +268,92 @@ function defaultProvider(env: NodeJS.ProcessEnv): ImageGenerationProvider {
   return "openai"; // surfaces a clear "missing OPENAI_API_KEY" error at call time
 }
 
+// ---------------------------------------------------------------------------
+// Bounded request. This package ships in the cf-worker bundles, which cannot
+// take @crewhaus/tool-safety (Bun-only), so the bound is written here with
+// what workerd has too: AbortController, setTimeout and a stream reader.
+// ---------------------------------------------------------------------------
+
+const pinnedSignals = new WeakSet<AbortSignal>();
+const noop = (): void => undefined;
+
+/**
+ * Call `fn` once when `signal` aborts; returns the unsubscribe. Never leaves
+ * the caller's signal without a listener: on Bun, removing the last listener
+ * from an `AbortSignal.timeout()` signal cancels its timer for good (the rule
+ * tool-safety's `onAbort` follows), which would disarm the caller's deadline.
+ */
+function onAbort(signal: AbortSignal | undefined, fn: () => void): () => void {
+  if (signal === undefined) return noop;
+  if (!pinnedSignals.has(signal)) {
+    pinnedSignals.add(signal);
+    signal.addEventListener("abort", noop, { once: true });
+  }
+  signal.addEventListener("abort", fn, { once: true });
+  return () => signal.removeEventListener("abort", fn);
+}
+
+/** A promise that rejects with `signal.reason` once `signal` aborts (our own
+ *  controller's signal, so its listener may come and go freely). */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  const aborted = new Promise<never>((_resolve, reject) => {
+    const fail = (): void => reject(signal.reason);
+    if (signal.aborted) fail();
+    else signal.addEventListener("abort", fail, { once: true });
+  });
+  aborted.catch(noop);
+  return aborted;
+}
+
+/**
+ * Read at most `maxBytes` of a body, racing every read against `signal`.
+ * Returns the text and whether more was there; the stream is cancelled at
+ * the cap, so the rest is never buffered. A response with no body stream
+ * reads as empty.
+ */
+async function readBodyCapped(
+  res: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<{ readonly text: string; readonly truncated: boolean }> {
+  const body = (res as { body?: ReadableStream<Uint8Array> | null }).body;
+  if (body === null || body === undefined) return { text: "", truncated: false };
+  const reader = body.getReader();
+  const aborted = rejectOnAbort(signal);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) break;
+      if (total + value.byteLength > maxBytes) {
+        chunks.push(value.subarray(0, maxBytes - total));
+        total = maxBytes;
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    // Stop the producer: past the cap, on an abort, or on a read error.
+    if (truncated || signal.aborted) await reader.cancel().catch(noop);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { text: new TextDecoder().decode(bytes), truncated };
+}
+
 async function generateOpenAI(
   input: z.infer<typeof inputSchema>,
   cfg: ImageGenerationConfig,
   responseFormat: "url" | "b64_json",
+  callerSignal?: AbortSignal,
 ): Promise<string> {
   const apiKey = process.env["OPENAI_API_KEY"];
   if (!apiKey) {
@@ -243,6 +372,8 @@ async function generateOpenAI(
     );
   }
   const fetchFn = cfg.fetch ?? globalThis.fetch;
+  const timeoutMs = positiveLimit(cfg, "timeoutMs", DEFAULT_TIMEOUT_MS);
+  const maxResponseBytes = positiveLimit(cfg, "maxResponseBytes", DEFAULT_MAX_RESPONSE_BYTES);
   const body = JSON.stringify({
     model,
     prompt: input.prompt,
@@ -251,23 +382,68 @@ async function generateOpenAI(
     response_format: responseFormat,
     ...(model === "dall-e-3" ? { style: input.style ?? "vivid" } : {}),
   });
-  const res = await fetchFn(`${baseUrl}/images/generations`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body,
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new ImageGenerationError(
-      `OpenAI image-generation request failed (${res.status} ${res.statusText}): ${text.slice(0, 500)}`,
-    );
+  // One deadline over the request and the body read, and the turn's own
+  // signal (Ctrl-C, turn_timeout_ms, deadline_ms) ends the call too.
+  const ctrl = new AbortController();
+  const timer = setTimeout(
+    () =>
+      ctrl.abort(
+        new ImageGenerationError(`OpenAI image-generation request timed out after ${timeoutMs} ms`),
+      ),
+    timeoutMs,
+  );
+  const cancel = (): void =>
+    ctrl.abort(new ImageGenerationError("OpenAI image-generation request was cancelled"));
+  if (callerSignal?.aborted === true) cancel();
+  const unsubscribe = onAbort(callerSignal, cancel);
+  let json: { data?: ReadonlyArray<{ url?: string; b64_json?: string }> };
+  try {
+    // Raced as well as signalled: a fetch that ignores its signal (or is
+    // handed one already aborted) still cannot hold the turn.
+    const res = await Promise.race([
+      fetchFn(`${baseUrl}/images/generations`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body,
+        signal: ctrl.signal,
+      }),
+      rejectOnAbort(ctrl.signal),
+    ]);
+    if (!res.ok) {
+      const { text } = await readBodyCapped(res, ERROR_BODY_BYTES, ctrl.signal).catch(() => ({
+        text: "",
+      }));
+      const shown = text.length > 500 ? `${text.slice(0, 500)}… (truncated)` : text;
+      throw new ImageGenerationError(
+        `OpenAI image-generation request failed (${res.status} ${res.statusText}): ${shown}`,
+      );
+    }
+    const read = await readBodyCapped(res, maxResponseBytes, ctrl.signal);
+    if (read.truncated) {
+      throw new ImageGenerationError(
+        `OpenAI image-generation response body exceeded ${maxResponseBytes} bytes (tool_config.imageGenerate.maxResponseBytes); nothing past the cap was read`,
+      );
+    }
+    try {
+      json = JSON.parse(read.text) as typeof json;
+    } catch {
+      throw new ImageGenerationError(
+        `OpenAI image-generation response was not JSON (${read.text.length} chars)`,
+      );
+    }
+  } catch (err) {
+    // An abort surfaces as whatever the runtime throws; say which one it was.
+    if (ctrl.signal.aborted && ctrl.signal.reason instanceof ImageGenerationError) {
+      throw ctrl.signal.reason;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    unsubscribe();
   }
-  const json = (await res.json()) as {
-    data?: ReadonlyArray<{ url?: string; b64_json?: string }>;
-  };
   const first = json.data?.[0];
   if (!first) {
     throw new ImageGenerationError("OpenAI response missing data[0] — unexpected format");
