@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
+import { auditToolScopes } from "@crewhaus/tool-builder";
 import { createVectorStore } from "@crewhaus/vector-store";
 import {
   DEFAULT_KNOWLEDGE_EMBEDDER_MODEL,
@@ -11,6 +12,7 @@ import {
   _resetRetrieveConfig,
   getRetrieveConfig,
   knowledgeRetrieve,
+  knowledgeSourceLabel,
   loadKnowledgeSources,
   registerRetrieveConfig,
   resolveKnowledgeEmbedder,
@@ -47,6 +49,17 @@ describe("Retrieve tool", () => {
     expect(retrieve.readOnly).toBe(true);
     expect(retrieve.concurrencySafe).toBe(true);
     expect(retrieve.destructive).toBe(false);
+  });
+
+  // 0.7.1 (C042): the query goes to the embedding provider (and to an HTTP
+  // vector store), so the egress classifier and the strict audit see it.
+  test("flags: the pipeline Retrieve is external with ioCapability network, whatever is registered later", () => {
+    expect([retrieve.scope, retrieve.ioCapability, retrieve.readOnly]).toEqual([
+      "external",
+      "network",
+      true,
+    ]);
+    expect(auditToolScopes([retrieve])).toEqual([]);
   });
 
   test("rejects calls before registerRetrieveConfig", async () => {
@@ -345,5 +358,160 @@ describe("knowledgeRetrieve builder", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// 0.7.1 (C042) — a knowledge Retrieve says where its query goes. Only the
+// in-process mock embedder over an in-memory or lance store stays local.
+describe("knowledgeRetrieve flags follow its backends", () => {
+  async function build(
+    embedder: Parameters<typeof knowledgeRetrieve>[0]["embedder"],
+    vectorStore: Parameters<typeof knowledgeRetrieve>[0]["vectorStore"],
+  ) {
+    return knowledgeRetrieve({
+      sources: [{ kind: "url", url: "https://docs.example.com/a.md" }],
+      embedder,
+      vectorStore,
+      fetch: async () => ({ ok: true, status: 200, text: async () => "refund policy body" }),
+    });
+  }
+  const mock = () => createEmbedder({ model: "mock/det" });
+  /** A provider outside the process, answering like the mock. */
+  const hosted = () => {
+    const inner = mock();
+    return Object.assign(Object.create(inner) as typeof inner, { provider: "openai" as const });
+  };
+
+  test("a hosted embedder: external + network, readOnly kept", async () => {
+    const tool = await build(hosted(), createVectorStore({ backend: "in-memory" }));
+    expect([tool.scope, tool.ioCapability, tool.readOnly]).toEqual(["external", "network", true]);
+    expect(auditToolScopes([tool])).toEqual([]);
+  });
+
+  test("an HTTP vector store: external + network even with the mock embedder", async () => {
+    const memory = createVectorStore({ backend: "in-memory" });
+    const remote = Object.assign(Object.create(memory) as typeof memory, {
+      backend: "qdrant" as const,
+    });
+    const tool = await build(mock(), remote);
+    expect([tool.scope, tool.ioCapability]).toEqual(["external", "network"]);
+  });
+
+  test("the mock embedder over an in-memory store stays internal", async () => {
+    const tool = await build(mock(), createVectorStore({ backend: "in-memory" }));
+    expect([tool.scope, tool.ioCapability]).toEqual(["internal", undefined]);
+  });
+});
+
+// 0.7.1 (C057) — a credential in a knowledge source URL is fetched with, and
+// never shown: not in a hit's id or doc, not in a boot error, not in its cause.
+describe("knowledge url sources never show a credential", () => {
+  // Built from parts at runtime, so the source holds no secret-shaped literal.
+  const USER_TOKEN = ["ghp", "CANARY0123456789abcdef"].join("_");
+  const QUERY_TOKEN = ["GHSAT0", "CANARYquerytoken"].join("");
+  const SLASH_SECRET = ["wJalrXUtnFEMI", "K7MDENGbPx", "RfiCYCANARYKEY"].join("/");
+  const CANARIES = [
+    USER_TOKEN,
+    QUERY_TOKEN,
+    "CANARYquerytoken",
+    "CANARY0123456789",
+    "RfiCYCANARYKEY",
+    "K7MDENGbPx",
+  ];
+  const leaked = (text: string): string[] => CANARIES.filter((c) => text.includes(c));
+
+  const DIRTY = `https://deploy:${USER_TOKEN}@docs.example.com/h.md?token=${QUERY_TOKEN}&ref=main`;
+
+  test("hits name the document by host and path, never its credential", async () => {
+    const seen: string[] = [];
+    const tool = await knowledgeRetrieve({
+      sources: [{ kind: "url", url: DIRTY }],
+      embedder: createEmbedder({ model: "mock/det" }),
+      vectorStore: createVectorStore({ backend: "in-memory" }),
+      fetch: async (url) => {
+        seen.push(url);
+        return { ok: true, status: 200, text: async () => "refunds are issued within 14 days" };
+      },
+    });
+    // The URL is still fetched exactly as written.
+    expect(seen).toEqual([DIRTY]);
+    const out = (await tool.execute({ query: "refunds" })) as string;
+    expect(leaked(out)).toEqual([]);
+    expect(out).toContain("docs.example.com/h.md");
+    expect(out).toContain("#src-");
+  });
+
+  test("labels: userinfo and credential params go, a clean URL and an npm @scope path stay as written", () => {
+    const clean = [
+      "https://example.com/doc",
+      "https://example.com/doc?ref=main&page=2",
+      "https://cdn.jsdelivr.net/npm/@scope/pkg/README.md",
+      "https://api.example.com/doc?author=me@example.com",
+    ];
+    for (const url of clean) expect(knowledgeSourceLabel(url)).toBe(url);
+
+    const dirty = [
+      DIRTY,
+      `https://docs.example.com/h.md?private_token=${QUERY_TOKEN}`,
+      `https://AKIDEXAMPLE:${SLASH_SECRET}@docs.example.com/h.md`,
+      // Digits then "/": parses as host AKIDEXAMPLE, port 1234, and a path
+      // that holds the rest of the secret.
+      `https://AKIDEXAMPLE:1234/${SLASH_SECRET}@docs.example.com/h.md`,
+      `https://AKIDEXAMPLE:${USER_TOKEN}#frag@docs.example.com/h.md`,
+      // Digits then "?": parses too, with the rest of the secret as a query.
+      `https://AKIDEXAMPLE:12?${USER_TOKEN}@docs.example.com/h.md`,
+      `not a url ${USER_TOKEN}@docs.example.com`,
+    ];
+    const labels = dirty.map((url) => ({
+      url: url.slice(0, 12),
+      label: knowledgeSourceLabel(url),
+    }));
+    expect(labels.filter((l) => leaked(l.label).length > 0)).toEqual([]);
+    expect(knowledgeSourceLabel(DIRTY)).toMatch(
+      /^https:\/\/<redacted>@docs\.example\.com\/h\.md\?token=REDACTED&ref=main#src-[0-9a-f]{12}$/,
+    );
+    expect(knowledgeSourceLabel(dirty[1] as string)).toMatch(
+      /^https:\/\/docs\.example\.com\/h\.md\?private_token=.*#src-[0-9a-f]{12}$/,
+    );
+  });
+
+  test("two sources differing only by a token stay distinct, and a label is the same on every boot", () => {
+    const a = knowledgeSourceLabel("https://x.example/a?token=T1abcdefgh");
+    const b = knowledgeSourceLabel("https://x.example/a?token=T2abcdefgh");
+    expect(a).not.toBe(b);
+    expect(knowledgeSourceLabel("https://x.example/a?token=T1abcdefgh")).toBe(a);
+  });
+
+  test("boot errors name the label, and the fetch's own error (which quotes the URL) is not carried", async () => {
+    const notFound = await loadKnowledgeSources([{ kind: "url", url: DIRTY }], {
+      fetch: async () => ({ ok: false, status: 404, text: async () => "" }),
+    }).catch((err: unknown) => err as Error);
+    expect(notFound).toBeInstanceOf(RetrieveConfigError);
+    expect((notFound as Error).message).toContain("404");
+    expect(leaked(Bun.inspect(notFound))).toEqual([]);
+
+    const thrown = await loadKnowledgeSources([{ kind: "url", url: DIRTY }], {
+      fetch: async (url) => {
+        const err = new Error(`Unable to connect. Is the computer able to access the url? ${url}`);
+        Object.assign(err, { code: "ConnectionRefused", path: url });
+        throw err;
+      },
+    }).catch((err: unknown) => err as Error);
+    expect(thrown).toBeInstanceOf(RetrieveConfigError);
+    expect((thrown as Error).message).toContain("ConnectionRefused");
+    expect(leaked(Bun.inspect(thrown))).toEqual([]);
+    expect(leaked(String((thrown as { cause?: unknown }).cause))).toEqual([]);
+  });
+
+  test("a store indexed before 0.7.1, holding raw-URL ids, is shown redacted", async () => {
+    const embedder = createEmbedder({ model: "mock/det" });
+    const vectorStore = createVectorStore({ backend: "in-memory" });
+    const oldDoc = `https://docs.example.com/h.md?token=${QUERY_TOKEN}`;
+    const [vec] = await embedder.embed(["refund window"]);
+    await vectorStore.upsert(`${oldDoc}:0:0`, vec ?? [], { docId: oldDoc, text: "refund window" });
+    registerRetrieveConfig({ embedder, vectorStore });
+    const out = (await retrieve.execute({ query: "refund window" })) as string;
+    expect(out).toContain("docs.example.com/h.md");
+    expect(leaked(out)).toEqual([]);
   });
 });
