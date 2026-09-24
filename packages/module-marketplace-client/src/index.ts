@@ -7,6 +7,7 @@ import {
   canonicalJson,
   crewhausEngineProblem,
   entrypointDigest,
+  entrypointImportProblem,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
 import { readFileBounded } from "@crewhaus/tool-safety/streams";
@@ -234,6 +235,13 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
     warnings: string[],
   ): Promise<boolean> {
     const who = `${manifest.name}@${manifest.version}`;
+    if (manifest.signature !== undefined && manifest.entrypointDigest === undefined) {
+      // The loader refuses this at boot whatever index.js holds.
+      warnings.push(
+        `${who} is signed, but its manifest has no entrypointDigest, so the signature covers none of its code, and a spec that names it will be refused at boot outside development mode. Ask the publisher to re-sign it with entrypointDigest set.`,
+      );
+      return false;
+    }
     const digestNote =
       manifest.entrypointDigest !== undefined
         ? " (its sha256 must equal the manifest's entrypointDigest)"
@@ -261,6 +269,16 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
         `${who}: the index.js at ${entryPath} does not match the manifest's entrypointDigest, so a spec that names the plugin will be refused at boot until it does.`,
       );
       return false;
+    }
+    if (manifest.signature !== undefined) {
+      // A signed plugin runs as exactly these bytes, so it must be one file.
+      const outside = entrypointImportProblem(bytes);
+      if (outside !== undefined) {
+        warnings.push(
+          `${who}: the index.js at ${entryPath} cannot run as signed code, so a spec that names the plugin will be refused at boot: ${outside}.`,
+        );
+        return false;
+      }
     }
     return true;
   }

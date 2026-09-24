@@ -17,8 +17,29 @@ or list `.pem` files (or directories of them) in `CREWHAUS_PLUGIN_TRUST_ANCHORS`
 separated the way `PATH` is. A listed path that cannot be read, or a file that
 is not an Ed25519 public key, stops the boot and names the file.
 
-When the manifest carries an `entrypointDigest`, the plugin's `index.js` must
-match it too, so a swapped entrypoint next to a signed manifest is refused.
+## What a signature covers
+
+A signed manifest must carry an `entrypointDigest`: the sha256 of the plugin's
+`index.js`. Without one the signature says nothing about the code, and the
+plugin is refused (it loads unverified only in development mode, below).
+
+A signed plugin runs as exactly the bytes that digest names. crewhaus reads
+`index.js` once, checks the digest, and imports a private copy of those bytes,
+so a file changed after the check never runs. That makes a signed plugin one
+file: an `index.js` that imports anything other than a `node:` or `bun:`
+builtin (`./lib.js`, `zod`) is refused, because the signature covers none of
+it. Bundle the plugin before you sign it:
+
+```sh
+bun build src/index.ts --target=bun --format=esm --outfile index.js
+```
+
+A signed manifest may also carry `notAfter`, an RFC 3339 date-time with `Z` or
+an offset (`"2027-01-01T00:00:00Z"`). It is signed with the rest of the
+manifest, and the plugin is refused after it. `signature.issuedAt` is not
+signed, so nothing reads it as a date.
+
+To stop trusting a publisher, remove their key from `~/.crewhaus/plugin-trust/`.
 
 ## Unsigned plugins, for development
 
@@ -28,7 +49,8 @@ CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1 bun agent.ts
 
 loads unsigned plugins. Every boot prints a warning, and so does every plugin
 loaded without a verified signature. A signed plugin whose signature does not
-verify against a trusted key is still refused.
+verify against a trusted key is still refused. An unsigned plugin may be
+several files, and is imported where it is.
 
 With no trusted key and no opt-in, a spec that names plugins does not start,
 and the message says where to put the key.

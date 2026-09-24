@@ -1,6 +1,16 @@
 import { createPublicKey, verify } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve as resolvePath, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type PluginRegistry, createPluginRegistry } from "@crewhaus/plugin-registry";
@@ -16,12 +26,19 @@ import {
   type ToolDefinition,
   crewhausEngineProblem,
   entrypointDigest,
+  entrypointImportProblem,
+  manifestExpiryProblem,
   manifestPayloadForSigning,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
 import { buildTool } from "@crewhaus/tool-builder";
 import { RUNTIME_TOOL_NAMES, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
-import { openForRead, probeKind, resolveContained } from "@crewhaus/tool-safety/fs";
+import {
+  createExclusive,
+  openForRead,
+  probeKind,
+  resolveContained,
+} from "@crewhaus/tool-safety/fs";
 import { readFileBounded } from "@crewhaus/tool-safety/streams";
 import type { ZodType as Zod4Type } from "zod/v4";
 import pkg from "../package.json" with { type: "json" };
@@ -59,7 +76,11 @@ export const MAX_PLUGIN_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
  *      verifies against a trust anchor (one or more allow-listed
  *      Ed25519 public keys). Unsigned plugins are rejected unless
  *      the loader is constructed with `allowUnsigned: true` (intended
- *      for development only — logged loudly).
+ *      for development only — logged loudly). A signed manifest must
+ *      carry an `entrypointDigest`, may carry a signed `notAfter`, and
+ *      its code is imported from a private copy of exactly the bytes
+ *      the digest was checked against — which is why a signed plugin
+ *      must be one file with no imports but runtime builtins.
  *
  *   3. **Capability gating.** The returned `LoadedPlugin` exposes the
  *      plugin's contributions and its declared `PluginPermissions`.
@@ -140,7 +161,11 @@ export type LoadedPlugin = {
   readonly entrypointPath: string;
   /** Declared capability allow-list — fail-closed if undefined. */
   readonly permissions: PluginPermissions;
-  /** `true` if the manifest carried a valid signature. */
+  /**
+   * `true` when the manifest's signature verified against a trust anchor, and
+   * the code that was imported is exactly the bytes its signed
+   * `entrypointDigest` names. `false` for a plugin loaded in development mode.
+   */
   readonly signed: boolean;
   /** The module's default export (typed loosely — callers narrow per contribution kind). */
   readonly module: { default?: unknown };
@@ -221,6 +246,41 @@ function resolveEntrypoint(pluginName: string, manifestDir: string): string {
     );
   }
   return contained.real;
+}
+
+/**
+ * Stage a signed plugin's verified bytes for import: a new private directory
+ * (mode 0700, random name) holding `index.js` (0600), created exclusively.
+ * Importing this copy instead of the file in `~/.crewhaus/plugins` means what
+ * runs is what was hashed — the plugin's file can change after the check and
+ * it does not matter — and a relative import has nothing beside it to find.
+ * `remove` deletes the directory once the module is loaded.
+ */
+function writeVerifiedCopy(
+  pluginName: string,
+  bytes: Uint8Array,
+): { readonly path: string; readonly remove: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), `crewhaus-plugin-${pluginName}-`));
+  const remove = (): void => rmSync(dir, { recursive: true, force: true });
+  try {
+    const made = createExclusive(dir, "index.js", { mode: 0o600 });
+    if (!made.ok) throw new Error(made.reason);
+    try {
+      let written = 0;
+      while (written < bytes.length) {
+        written += writeSync(made.fd, bytes, written, bytes.length - written);
+      }
+    } finally {
+      closeSync(made.fd);
+    }
+    return { path: made.real, remove };
+  } catch (err) {
+    remove();
+    throw new PluginLoaderError(
+      `plugin "${pluginName}": cannot stage its verified code for import: ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
+  }
 }
 
 export interface PluginLoader {
@@ -366,7 +426,11 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
       if (engineProblem !== undefined) {
         throw new PluginLoaderError(`${engineProblem} — refusing to load it`);
       }
-      const signed = verifySignature(manifest);
+      let signed = verifySignature(manifest);
+      const expired = manifestExpiryProblem(manifest, Date.now());
+      if (expired !== undefined) {
+        throw new PluginLoaderError(`${expired} — refusing to load it`);
+      }
 
       // The entrypoint is `<manifest-dir>/index.js`. `entrypointPath` is that
       // name (activatePlugins finds `<plugin>/skills` beside it);
@@ -377,11 +441,30 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
       const entrypointPath = join(manifestDir, "index.js");
       const realEntry = resolveEntrypoint(manifest.name, manifestDir);
 
+      // A signature that names no code attests to nothing that runs: without
+      // an entrypointDigest, index.js could be anything.
+      if (signed && manifest.entrypointDigest === undefined) {
+        if (!allowUnsigned) {
+          throw new PluginLoaderError(
+            `plugin "${manifest.name}" is signed, but its manifest has no entrypointDigest, so the signature covers none of its code — refusing to load it. The publisher must re-sign it with entrypointDigest set to the sha256 of its index.js.`,
+          );
+        }
+        warn(
+          `[plugins] "${manifest.name}" is signed, but has no entrypointDigest, so the signature covers none of its code; it loads unverified only because CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1 — development only`,
+        );
+        signed = false;
+      }
+
       // Code-integrity: the signature only attests to the MANIFEST. When the
       // manifest carries an entrypointDigest (which is covered by the
       // signature), recompute the hash of the actual index.js and refuse to
       // import if it differs — otherwise a swapped index.js next to a validly-
       // signed manifest would execute while the loader reported signed:true.
+      // For a VERIFIED plugin, the bytes that were hashed are the bytes that
+      // are imported (a private copy of them), and they may import nothing
+      // the digest does not cover.
+      let importPath = realEntry;
+      let verifiedCopy: { readonly path: string; readonly remove: () => void } | undefined;
       if (manifest.entrypointDigest !== undefined) {
         let bytes: Uint8Array;
         try {
@@ -400,11 +483,21 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
             `plugin "${manifest.name}": entrypoint digest mismatch — index.js does not match the signed entrypointDigest (signature attests to different code). Refusing to import.`,
           );
         }
+        if (signed) {
+          const outside = entrypointImportProblem(bytes);
+          if (outside !== undefined) {
+            throw new PluginLoaderError(
+              `plugin "${manifest.name}": ${entrypointPath} cannot run as signed code: ${outside}`,
+            );
+          }
+          verifiedCopy = writeVerifiedCopy(manifest.name, bytes);
+          importPath = verifiedCopy.path;
+        }
       }
 
       let module: { default?: unknown };
       try {
-        module = await importEntry(realEntry);
+        module = await importEntry(importPath);
       } catch (err) {
         throw entrypointError(
           manifest,
@@ -412,6 +505,8 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
           `failed to import plugin entrypoint at ${entrypointPath}`,
           err,
         );
+      } finally {
+        verifiedCopy?.remove();
       }
       return {
         manifest,

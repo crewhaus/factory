@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { builtinModules } from "node:module";
 import { CrewhausError } from "@crewhaus/errors";
 import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
 
@@ -144,7 +145,12 @@ export type PluginSignature = {
   readonly algorithm: PluginSignatureAlgorithm;
   readonly publicKeyB64: string;
   readonly sigB64: string;
-  /** Optional ISO-8601 timestamp; advisory only. */
+  /**
+   * Optional ISO-8601 timestamp, for people. It sits inside `signature`,
+   * which the signature does not cover, so anyone can change it: nothing
+   * reads it as a date. To give a signature an end, sign
+   * {@link PluginManifest.notAfter}.
+   */
   readonly issuedAt?: string;
 };
 
@@ -176,11 +182,29 @@ export type PluginManifest = {
   /**
    * Lowercase hex SHA-256 of the plugin's entrypoint (`index.js`). It is part
    * of the manifest, so `manifestPayloadForSigning` includes it and the
-   * signature therefore commits to the CODE, not just the metadata. The loader
-   * refuses to `import()` an entrypoint whose hash does not match. Optional for
-   * back-compat; signed plugins SHOULD set it (compute via `entrypointDigest`).
+   * signature therefore commits to the CODE, not just the metadata.
+   *
+   * REQUIRED on a signed manifest: without it a signature attests to no code,
+   * and the loader refuses the plugin (it loads unverified only under
+   * `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1`). Compute it with `entrypointDigest`.
+   *
+   * A signed plugin is ONE file. The digest covers `index.js` and nothing it
+   * imports, so the loader imports exactly the bytes it checked, from a
+   * private copy, and refuses an `index.js` that imports anything but a
+   * `node:` or `bun:` builtin ({@link entrypointImportProblem}). Bundle the
+   * plugin first: `bun build src/index.ts --target=bun --format=esm
+   * --outfile index.js`. An unsigned (development) plugin may still be
+   * several files; a digest on it is checked, and it is imported in place.
    */
   readonly entrypointDigest?: string;
+  /**
+   * The last moment this manifest's signature is good for, as an RFC 3339
+   * date-time with an explicit offset (`2027-01-01T00:00:00Z`). It is signed
+   * with the rest of the manifest, and the loader refuses the plugin after
+   * it. A date-time without `Z` or an offset is refused rather than read as
+   * the host's local time.
+   */
+  readonly notAfter?: string;
   readonly signature?: PluginSignature;
 };
 
@@ -251,6 +275,15 @@ export function validatePluginManifest(m: unknown): PluginManifest {
     if (!/^[a-f0-9]{64}$/.test(manifest["entrypointDigest"] as string)) {
       throw new PluginSdkError(
         "plugin manifest: `entrypointDigest` must be a lowercase hex SHA-256 (64 chars)",
+      );
+    }
+  }
+
+  if (manifest["notAfter"] !== undefined) {
+    const notAfter = manifest["notAfter"];
+    if (typeof notAfter !== "string" || parseOffsetDateTime(notAfter) === undefined) {
+      throw new PluginSdkError(
+        `plugin manifest: \`notAfter\` must be an RFC 3339 date-time with Z or an offset, such as "2027-01-01T00:00:00Z" (got ${JSON.stringify(notAfter)}); a date-time without one would be read as the host's local time`,
       );
     }
   }
@@ -420,4 +453,100 @@ export function manifestPayloadForSigning(manifest: PluginManifest): string {
  */
 export function entrypointDigest(code: string | Uint8Array): string {
   return createHash("sha256").update(code).digest("hex");
+}
+
+// ---------------------------------------------------------------------------
+// notAfter — when a signed manifest stops being good
+// ---------------------------------------------------------------------------
+
+const OFFSET_DATE_TIME =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:[Zz]|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Milliseconds since the epoch for an RFC 3339 date-time that carries `Z` or
+ * an offset, or undefined for anything else — including a date-time with no
+ * offset, which `Date.parse` would read as the host's local time, and a
+ * calendar date that does not exist (`2027-02-30`).
+ */
+function parseOffsetDateTime(text: string): number | undefined {
+  const m = OFFSET_DATE_TIME.exec(text);
+  if (m === null) return undefined;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  if (
+    year === undefined ||
+    month === undefined ||
+    day === undefined ||
+    hour === undefined ||
+    minute === undefined ||
+    second === undefined
+  ) {
+    return undefined;
+  }
+  // `Date` rolls 2027-02-30 over to March; a date that does not exist is refused.
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  if (calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return undefined;
+  if (hour > 23 || minute > 59 || second > 59) return undefined;
+  const ms = Date.parse(text);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * Why a manifest must not load at `nowMs`, or undefined when it may: its
+ * signed `notAfter` has passed. A manifest without one does not expire.
+ */
+export function manifestExpiryProblem(
+  manifest: Pick<PluginManifest, "name" | "version" | "notAfter">,
+  nowMs: number,
+): string | undefined {
+  if (manifest.notAfter === undefined) return undefined;
+  const until = parseOffsetDateTime(manifest.notAfter);
+  if (until === undefined) {
+    return `plugin "${manifest.name}" ${manifest.version} has a notAfter crewhaus cannot read (${JSON.stringify(manifest.notAfter)})`;
+  }
+  if (nowMs <= until) return undefined;
+  return `plugin "${manifest.name}" ${manifest.version} expired: its manifest is good until ${manifest.notAfter}, and it is now ${new Date(nowMs).toISOString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// What a signed entrypoint may import
+// ---------------------------------------------------------------------------
+
+const HOST_BUILTINS: ReadonlySet<string> = new Set(builtinModules);
+
+/** A module the runtime itself provides: `node:*`, `bun:*`, `bun`, or a bare Node builtin (`fs`). */
+function isRuntimeBuiltin(specifier: string): boolean {
+  return (
+    specifier.startsWith("node:") ||
+    specifier.startsWith("bun:") ||
+    specifier === "bun" ||
+    HOST_BUILTINS.has(specifier)
+  );
+}
+
+/**
+ * Why `code`, a signed plugin's `index.js`, cannot run as the code its
+ * `entrypointDigest` attests to, or undefined when it can. The digest covers
+ * this one file, so an import of anything the runtime does not provide
+ * itself — a sibling (`./lib.js`) or a package (`zod`, which Bun may even
+ * fetch from npm when no `node_modules` has it) — would run code the
+ * signature does not cover. Imports are read from the source with Bun's own
+ * scanner: static imports, re-exports, `require("…")` and `import("…")` with
+ * a literal specifier.
+ */
+export function entrypointImportProblem(code: string | Uint8Array): string | undefined {
+  const text = typeof code === "string" ? code : new TextDecoder().decode(code);
+  let imports: ReadonlyArray<{ readonly path: string }>;
+  try {
+    imports = new Bun.Transpiler({ loader: "js" }).scanImports(text);
+  } catch (err) {
+    return `it cannot be read as JavaScript (${err instanceof Error ? err.message : String(err)})`;
+  }
+  const outside = [...new Set(imports.map((i) => i.path).filter((p) => !isRuntimeBuiltin(p)))];
+  if (outside.length === 0) return undefined;
+  const listed = outside
+    .slice(0, 5)
+    .map((p) => JSON.stringify(p))
+    .join(", ");
+  const more = outside.length > 5 ? ` and ${outside.length - 5} more` : "";
+  return `it imports ${listed}${more}, which its entrypointDigest does not cover. A signed plugin must be one file: bundle it (bun build src/index.ts --target=bun --format=esm --outfile index.js) and sign that`;
 }

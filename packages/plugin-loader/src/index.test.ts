@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { join } from "node:path";
 import { createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
   type PluginManifest,
@@ -141,7 +141,11 @@ describe("plugin-loader.load — happy path", () => {
 
   test("loads a signed plugin against a configured trust anchor", async () => {
     const { publicKeyPem, privateKey } = makeKeypair();
-    const unsigned: PluginManifest = { name: "my-plugin", version: "1.0.0" };
+    const unsigned: PluginManifest = {
+      name: "my-plugin",
+      version: "1.0.0",
+      entrypointDigest: entrypointDigest(new Uint8Array(readFileSync(join(pluginDir, "index.js")))),
+    };
     const signed = signManifest(unsigned, privateKey);
     writeFileSync(join(pluginDir, "plugin.json"), JSON.stringify(signed));
     const loader = createPluginLoader({
@@ -327,7 +331,11 @@ describe("plugin-loader.load — security checks", () => {
 
   test("rejects non-ed25519 signature algorithm", async () => {
     const { publicKeyPem, privateKey } = makeKeypair();
-    const unsigned: PluginManifest = { name: "my-plugin", version: "1.0.0" };
+    const unsigned: PluginManifest = {
+      name: "my-plugin",
+      version: "1.0.0",
+      entrypointDigest: entrypointDigest(new Uint8Array(readFileSync(join(pluginDir, "index.js")))),
+    };
     const valid = signManifest(unsigned, privateKey);
     // Force the alg to something else
     const tampered = {
@@ -425,9 +433,11 @@ function pluginModule(name: string): { default: unknown } {
   };
 }
 
-/** Install a signed plugin: write its signed manifest under `pluginsRoot/<name>`
- *  and register it in `registry` (sourcePath → that manifest). No index.js is
- *  written — the loader's `importEntrypoint` seam returns the module instead. */
+/** Install a signed plugin: write an index.js that names it and a signed
+ *  manifest whose entrypointDigest covers that file under `pluginsRoot/<name>`,
+ *  and register it in `registry` (sourcePath → that manifest). The loader's
+ *  `importEntrypoint` seam returns the live module; {@link pluginNameIn} reads
+ *  which plugin the imported (verified) copy is. */
 function installSignedPlugin(args: {
   name: string;
   pluginsRoot: string;
@@ -436,10 +446,29 @@ function installSignedPlugin(args: {
 }): Promise<void> {
   const dir = join(args.pluginsRoot, args.name);
   mkdirSync(dir, { recursive: true });
-  const signed = signManifest({ name: args.name, version: "1.0.0" }, args.privateKey);
+  const code = `export default ${JSON.stringify(args.name)};\n`;
+  writeFileSync(join(dir, "index.js"), code);
+  const signed = signManifest(
+    {
+      name: args.name,
+      version: "1.0.0",
+      entrypointDigest: entrypointDigest(new TextEncoder().encode(code)),
+    },
+    args.privateKey,
+  );
   const sourcePath = join(dir, "plugin.json");
   writeFileSync(sourcePath, JSON.stringify(signed));
   return args.registry.register({ manifest: signed, sourcePath }).then(() => undefined);
+}
+
+/** Which plugin an imported index.js (the loader's verified copy) belongs to. */
+function pluginNameIn(absPath: string): string {
+  return JSON.parse(
+    readFileSync(absPath, "utf8")
+      .replace(/^export default /, "")
+      .trim()
+      .replace(/;$/, ""),
+  );
 }
 
 describe("defaultPluginPaths", () => {
@@ -502,8 +531,9 @@ describe("activatePlugins", () => {
       trustedRoots: [tmpRoot],
       trustAnchors: [{ name: "test", publicKeyPem }],
       importEntrypoint: async (absPath) => {
-        importedPaths.push(absPath);
-        return pluginModule(absPath.includes(`${sep}alpha${sep}`) ? "alpha" : "beta");
+        const which = pluginNameIn(absPath);
+        importedPaths.push(which);
+        return pluginModule(which);
       },
     });
 
@@ -512,8 +542,7 @@ describe("activatePlugins", () => {
 
     expect(activated.tools.map((t) => t.name)).toEqual(["alpha-tool"]);
     // "beta" was never loaded — the gate is the names list, not the registry.
-    expect(importedPaths.every((p) => p.includes(`${sep}alpha${sep}`))).toBe(true);
-    expect(importedPaths.some((p) => p.includes(`${sep}beta${sep}`))).toBe(false);
+    expect(importedPaths).toEqual(["alpha"]);
   });
 
   test("preserves load order and de-dupes repeated names", async () => {
@@ -527,8 +556,7 @@ describe("activatePlugins", () => {
     const loader = createPluginLoader({
       trustedRoots: [tmpRoot],
       trustAnchors: [{ name: "test", publicKeyPem }],
-      importEntrypoint: async (absPath) =>
-        pluginModule(absPath.includes(`${sep}two${sep}`) ? "two" : "one"),
+      importEntrypoint: async (absPath) => pluginModule(pluginNameIn(absPath)),
     });
 
     const activated = await activatePlugins({
@@ -554,8 +582,7 @@ describe("activatePlugins", () => {
     const loader = createPluginLoader({
       trustedRoots: [tmpRoot],
       trustAnchors: [{ name: "test", publicKeyPem }],
-      importEntrypoint: async (absPath) =>
-        pluginModule(absPath.includes(`${sep}skilled${sep}`) ? "skilled" : "plain"),
+      importEntrypoint: async (absPath) => pluginModule(pluginNameIn(absPath)),
     });
 
     const activated = await activatePlugins({

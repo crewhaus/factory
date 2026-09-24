@@ -178,3 +178,76 @@ describe("install installs what was asked for, or nothing (C015)", () => {
     expect((await registry.get("greeter"))?.manifest.version).toBe("1.0.0");
   });
 });
+
+describe("install says when signed code cannot run as signed (C108)", () => {
+  // The loader runs a signed plugin as exactly the bytes its entrypointDigest
+  // names, so install reports what boot would refuse.
+  const publisher = generateKeyPairSync("ed25519");
+  const pem = publisher.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const signWith = (m: PluginManifest): PluginManifest => ({
+    ...m,
+    signature: {
+      algorithm: "ed25519",
+      publicKeyB64: "unused",
+      sigB64: sign(
+        null,
+        Buffer.from(manifestPayloadForSigning(m), "utf8"),
+        publisher.privateKey,
+      ).toString("base64"),
+    },
+  });
+  const verifying = () =>
+    createPluginRegistry({
+      registryPath: join(dir, "registry.json"),
+      trustAnchors: [{ kind: "pem", name: "publisher", publicKeyPem: pem }],
+    });
+
+  test("a signed manifest with no entrypointDigest is not runnable, and says why", async () => {
+    placeCode("greeter");
+    const m = signWith({ name: "greeter", version: "1.0.0" });
+    const result = await client(m, { registry: verifying() }).client.install("greeter");
+    expect(result.runnable).toBe(false);
+    expect(result.warnings).toEqual([
+      "greeter@1.0.0 is signed, but its manifest has no entrypointDigest, so the signature covers none of its code, and a spec that names it will be refused at boot outside development mode. Ask the publisher to re-sign it with entrypointDigest set.",
+    ]);
+  });
+
+  test("signed code that imports a sibling is not runnable, and names the import", async () => {
+    const code = 'import { b } from "./lib.js";\nexport default { b };\n';
+    const path = placeCode("greeter", code);
+    const m = signWith({
+      name: "greeter",
+      version: "1.0.0",
+      entrypointDigest: entrypointDigest(code),
+    });
+    const result = await client(m, { registry: verifying() }).client.install("greeter");
+    expect(result.runnable).toBe(false);
+    expect(result.warnings).toEqual([
+      `greeter@1.0.0: the index.js at ${path} cannot run as signed code, so a spec that names the plugin will be refused at boot: it imports "./lib.js", which its entrypointDigest does not cover. A signed plugin must be one file: bundle it (bun build src/index.ts --target=bun --format=esm --outfile index.js) and sign that.`,
+    ]);
+  });
+
+  test("single-file signed code is runnable; an unsigned plugin may still import its siblings", async () => {
+    const one = "export default {};\n";
+    placeCode("greeter", one);
+    const signed = signWith({
+      name: "greeter",
+      version: "1.0.0",
+      entrypointDigest: entrypointDigest(one),
+    });
+    const a = await client(signed, { registry: verifying() }).client.install("greeter");
+    expect({ runnable: a.runnable, warnings: a.warnings }).toEqual({
+      runnable: true,
+      warnings: [],
+    });
+
+    const multi = 'import { b } from "./lib.js";\nexport default { b };\n';
+    placeCode("dev", multi);
+    const unsigned = { name: "dev", version: "1.0.0", entrypointDigest: entrypointDigest(multi) };
+    const b = await client(unsigned).client.install("dev");
+    expect({ runnable: b.runnable, warnings: b.warnings }).toEqual({
+      runnable: true,
+      warnings: [],
+    });
+  });
+});

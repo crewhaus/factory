@@ -113,8 +113,12 @@ describe("crewhaus plugins install verifies what it installs (C015)", () => {
 
   test("a manifest signed by a --trust-anchor key installs, verified, and says the code is missing", async () => {
     const publisher = keypair();
+    // A signed manifest names its code (0.7.1: the loader refuses one that does not).
     const { home, registry } = setup(
-      signed({ name: "greeter", version: "1.0.0" }, publisher.privateKey),
+      signed(
+        { name: "greeter", version: "1.0.0", entrypointDigest: "a".repeat(64) },
+        publisher.privateKey,
+      ),
     );
     const pem = join(home, "publisher.pem");
     writeFileSync(pem, publisher.pem);
@@ -123,7 +127,7 @@ describe("crewhaus plugins install verifies what it installs (C015)", () => {
     const manifestPath = join(home, ".crewhaus", "plugins", "greeter", "plugin.json");
     expect(run.stdout).toBe(`installed greeter@1.0.0 → ${manifestPath}\n`);
     expect(run.stderr).toBe(
-      `[plugins] greeter@1.0.0 is installed as a manifest only: the registry delivers no code. Put the plugin's index.js at ${join(home, ".crewhaus", "plugins", "greeter", "index.js")} before a spec names it in plugins:.\n`,
+      `[plugins] greeter@1.0.0 is installed as a manifest only: the registry delivers no code. Put the plugin's index.js at ${join(home, ".crewhaus", "plugins", "greeter", "index.js")} (its sha256 must equal the manifest's entrypointDigest) before a spec names it in plugins:.\n`,
     );
   }, 30_000);
 
