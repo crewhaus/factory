@@ -506,13 +506,42 @@ describe("0.7.1 — one spelling for MCP tool names (flag-truth-1#1, extension-p
     ]);
   });
 
-  test("an invalid name still fails the whole server, however long", async () => {
+  // extension-path#15 (C100): an invalid remote name used to throw part-way
+  // through the list, leaving the tools before it registered and the rest
+  // not — a required server failed its boot, and an optional one was left
+  // half-registered and re-throwing "already registered" on every retry. A
+  // name no provider accepts now drops that tool, as a too-long one does.
+  test("an invalid name drops that tool, however long, and the server's others register", async () => {
+    const bad = `bad.${"t".repeat(100)}`;
     const { host } = makeFakeHost({
       serverName: "srv",
-      tools: [{ name: `bad.${"t".repeat(70)}`, inputSchema: {} }],
+      tools: [
+        { name: "first", inputSchema: {} },
+        { name: bad, inputSchema: {} },
+        { name: "", inputSchema: {} },
+        { name: "last", inputSchema: {} },
+      ],
     });
-    await expect(registerMcpServer(host, "srv", new ToolCatalog())).rejects.toThrow(
-      /returned a tool with an invalid name/,
+    const catalog = new ToolCatalog();
+    const skipped: Array<{ remoteName: string; reason: string }> = [];
+    await registerMcpServer(host, "srv", catalog, {
+      onSkip: ({ remoteName, reason }) => skipped.push({ remoteName, reason }),
+    });
+    expect(catalog.list().map((t) => t.name)).toEqual(["mcp__srv__first", "mcp__srv__last"]);
+    expect(skipped.map((s) => s.remoteName)).toEqual([bad, ""]);
+    expect(skipped[0]?.reason).toMatch(/returned a tool with an invalid name "bad\.t+…"/);
+    expect(skipped[1]?.reason).toMatch(/empty\/missing name/);
+  });
+
+  test("an invalid SERVER name still fails the server, before any tool registers", async () => {
+    const { host } = makeFakeHost({
+      serverName: "my server",
+      tools: [{ name: "ok", inputSchema: {} }],
+    });
+    const catalog = new ToolCatalog();
+    await expect(registerMcpServer(host, "my server", catalog)).rejects.toThrow(
+      /MCP server name "my server" can only use/,
     );
+    expect(catalog.list()).toEqual([]);
   });
 });

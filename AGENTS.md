@@ -55,7 +55,7 @@ The fabric has **two symmetric halves**: a source side (classify content coming 
 
 | Source site | Origin | Where |
 |---|---|---|
-| MCP tool responses | `"mcp"` | [packages/tool-mcp](packages/tool-mcp) |
+| MCP tool responses, and tool definitions (name, description, every schema key and string) at registration | `"mcp"` | [packages/tool-mcp](packages/tool-mcp) |
 | Sub-agent `finalMessage` | `"subagent"` | [packages/sub-agent-spawner](packages/sub-agent-spawner) |
 | Inbound channel text | `"channel"` | [packages/channel-adapter-base](packages/channel-adapter-base) (via the generated channel-bot `runTurn`) |
 | Federation peer payloads | `"federation"` | [packages/federation-router](packages/federation-router) |

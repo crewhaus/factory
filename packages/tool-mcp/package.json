@@ -20,6 +20,9 @@
     "@crewhaus/tool-catalog": "workspace:*",
     "zod": "^3.23.8"
   },
+  "devDependencies": {
+    "@crewhaus/tool-registry-manifest": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

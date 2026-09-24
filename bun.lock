@@ -2926,6 +2926,9 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/tool-registry-manifest": "workspace:*",
+      },
     },
     "packages/tool-media": {
       "name": "@crewhaus/tool-media",
