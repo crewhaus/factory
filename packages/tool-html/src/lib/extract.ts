@@ -13,9 +13,26 @@ const cellText = (node: Element): string => normalizeText(textOf(node));
 export type Table = {
   readonly headers: ReadonlyArray<string>;
   readonly rows: ReadonlyArray<ReadonlyArray<string>>;
+  /** Body rows the table has, whether or not all of them were returned. */
   readonly rowCount: number;
+  /** The widest row returned (header included). */
   readonly columnCount: number;
   readonly caption: string;
+  /** True when `rows`/`headers` are not the whole table; `truncatedBy` says why. */
+  readonly truncated: boolean;
+  readonly truncatedBy: ReadonlyArray<"rows" | "columns" | "chars">;
+};
+
+/** A budget several tables can share, so many small ones cannot add up past it. */
+export type TableBudget = { chars: number };
+
+export type TableLimits = {
+  /** Body rows to build; the rest are counted, never expanded. */
+  readonly maxRows?: number;
+  /** Columns per row; cells past it are dropped from every row. */
+  readonly maxColumns?: number;
+  /** Characters of cell text (plus JSON overhead) to spend, shared across calls. */
+  readonly budget?: TableBudget;
 };
 
 /**
@@ -24,50 +41,24 @@ export type Table = {
  * `colspan` and `rowspan` are expanded, because a table that uses them reads
  * as ragged rows otherwise and every column after the span is off by one —
  * which is invisible in the output and wrong in every row after it.
+ *
+ * Expansion is where a table's size stops being its markup's size: one cell
+ * with `colspan=1000 rowspan=1000` is a million cells, and each copy carries
+ * the cell's whole text. So the grid is built under limits and stops at
+ * them, rather than being built whole and sliced: at most `maxRows` body
+ * rows, `maxColumns` per row, and a character `budget` spent per cell
+ * written, carried copies included. Hitting any of them sets `truncated`
+ * and names it in `truncatedBy`; a row cut by the budget is dropped whole
+ * rather than returned short.
  */
-export function extractTable(table: Element): Table {
+export function extractTable(table: Element, limits: TableLimits = {}): Table {
   const rows = queryAll(table, "tr");
-  const grid: string[][] = [];
-  // Cells a rowspan above is still occupying, by column index.
-  const carry = new Map<number, { text: string; remaining: number }>();
-
-  for (const [rowIndex, row] of rows.entries()) {
-    const out: string[] = [];
-    let column = 0;
-    const drainCarried = (): void => {
-      while (carry.has(column)) {
-        const held = carry.get(column) as { text: string; remaining: number };
-        out[column] = held.text;
-        if (held.remaining <= 1) carry.delete(column);
-        else carry.set(column, { text: held.text, remaining: held.remaining - 1 });
-        column++;
-      }
-    };
-
-    for (const cell of row.children) {
-      if (cell.type !== "element" || (cell.tag !== "td" && cell.tag !== "th")) continue;
-      const text = cellText(cell);
-      const colspan = Math.max(
-        1,
-        Math.min(1000, Number.parseInt(cell.attrs["colspan"] ?? "1", 10) || 1),
-      );
-      const rowspan = Math.max(
-        1,
-        Math.min(1000, Number.parseInt(cell.attrs["rowspan"] ?? "1", 10) || 1),
-      );
-      for (let c = 0; c < colspan; c++) {
-        drainCarried();
-        const at = column;
-        out[column] = text;
-        column++;
-        if (rowspan > 1) carry.set(at, { text, remaining: rowspan - 1 });
-      }
-    }
-    drainCarried();
-    grid[rowIndex] = out.map((v) => v ?? "");
-  }
+  const maxColumns = limits.maxColumns ?? Number.POSITIVE_INFINITY;
+  const budget = limits.budget ?? { chars: Number.POSITIVE_INFINITY };
 
   // A header row is one whose cells are all `th`, and only if it is first.
+  // It depends only on the first row's own children, so it is known before
+  // anything is expanded.
   const firstRow = rows[0];
   const cellsIn = (node: Element | undefined, tags: ReadonlyArray<string>): number =>
     node === undefined
@@ -75,16 +66,104 @@ export function extractTable(table: Element): Table {
       : node.children.filter((c) => c.type === "element" && tags.includes(c.tag)).length;
   const headerCount = cellsIn(firstRow, ["th"]);
   const hasHeader = headerCount > 0 && headerCount === cellsIn(firstRow, ["td", "th"]);
+  const bodyRows = rows.length - (hasHeader ? 1 : 0);
+  // Rowspans only ever carry downward, so stopping early loses nothing above.
+  const rowsToBuild = Math.min(
+    rows.length,
+    (hasHeader ? 1 : 0) + Math.min(bodyRows, limits.maxRows ?? bodyRows),
+  );
+
+  const grid: string[][] = [];
+  // Cells a rowspan above is still occupying, by column index.
+  const carry = new Map<number, { text: string; cost: number; remaining: number }>();
+  let columnsTruncated = false;
+  let charsTruncated = false;
+
+  for (let rowIndex = 0; rowIndex < rowsToBuild && !charsTruncated; rowIndex++) {
+    const row = rows[rowIndex] as Element;
+    const out: string[] = [];
+    let column = 0;
+    // Spend the budget for one written cell; false once it is gone.
+    const spend = (cost: number): boolean => {
+      budget.chars -= cost;
+      if (budget.chars >= 0) return true;
+      charsTruncated = true;
+      return false;
+    };
+    const drainCarried = (): boolean => {
+      while (carry.has(column)) {
+        const held = carry.get(column) as { text: string; cost: number; remaining: number };
+        if (!spend(held.cost)) return false;
+        out[column] = held.text;
+        if (held.remaining <= 1) carry.delete(column);
+        else carry.set(column, { ...held, remaining: held.remaining - 1 });
+        column++;
+      }
+      return true;
+    };
+
+    cells: for (const cell of row.children) {
+      if (cell.type !== "element" || (cell.tag !== "td" && cell.tag !== "th")) continue;
+      if (column >= maxColumns) {
+        columnsTruncated = true;
+        break;
+      }
+      const text = cellText(cell);
+      // What one copy of this cell costs in the result: its JSON string and
+      // a separator.
+      const cost = JSON.stringify(text).length + 1;
+      const colspan = Math.max(
+        1,
+        Math.min(1000, Number.parseInt(attrOf(cell, "colspan") ?? "1", 10) || 1),
+      );
+      // A span past the last row would only park entries nothing reads.
+      const rowspan = Math.max(
+        1,
+        Math.min(
+          1000,
+          rows.length - rowIndex,
+          Number.parseInt(attrOf(cell, "rowspan") ?? "1", 10) || 1,
+        ),
+      );
+      for (let c = 0; c < colspan; c++) {
+        if (!drainCarried()) break cells;
+        if (column >= maxColumns) {
+          columnsTruncated = true;
+          break cells;
+        }
+        if (!spend(cost)) break cells;
+        const at = column;
+        out[column] = text;
+        column++;
+        if (rowspan > 1) carry.set(at, { text, cost, remaining: rowspan - 1 });
+      }
+    }
+    if (charsTruncated || !drainCarried()) {
+      charsTruncated = true;
+      break;
+    }
+    const filled: string[] = [];
+    for (let i = 0; i < out.length; i++) filled.push(out[i] ?? "");
+    grid.push(filled);
+  }
 
   const headers = hasHeader ? (grid[0] ?? []) : [];
   const body = hasHeader ? grid.slice(1) : grid;
+  let columnCount = 0;
+  for (const r of grid) if (r.length > columnCount) columnCount = r.length;
+  const truncatedBy: Array<"rows" | "columns" | "chars"> = [];
+  if (body.length < bodyRows && !charsTruncated) truncatedBy.push("rows");
+  if (columnsTruncated) truncatedBy.push("columns");
+  if (charsTruncated) truncatedBy.push("chars");
   const captionNode = table.children.find((c) => c.type === "element" && c.tag === "caption");
   return {
     headers,
     rows: body,
-    rowCount: body.length,
-    columnCount: grid.length === 0 ? 0 : Math.max(...grid.map((r) => r.length)),
+    rowCount: bodyRows,
+    columnCount,
     caption: captionNode === undefined ? "" : cellText(captionNode as Element),
+    truncated: truncatedBy.length > 0,
+    truncatedBy,
   };
 }
 

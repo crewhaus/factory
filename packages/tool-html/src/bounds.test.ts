@@ -15,7 +15,9 @@
  * answers to the old algorithms, kept here as oracles.
  */
 import { describe, expect, test } from "bun:test";
-import { type Element, parseHtml, textOf, walk } from "./lib/parse";
+import { htmlTable } from "./index";
+import { extractTable } from "./lib/extract";
+import { type Element, normalizeText, parseHtml, textOf, walk } from "./lib/parse";
 import { MAX_SELECTOR_GROUP, MAX_SELECTOR_STEPS, parseSelectorGroup, queryAll } from "./lib/select";
 
 /** Give every element a counting `attrs`, and return the counter. */
@@ -447,5 +449,187 @@ describe("the counted stray-close check changes no tree", () => {
       if (source.includes("</")) differentFromNoClose++;
     }
     expect(differentFromNoClose).toBeGreaterThan(1_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HtmlTable's span expansion.
+
+/** The 0.7.0 expansion, kept as the oracle for tables no limit touches. */
+function expandTable070(table: Element): {
+  headers: string[];
+  rows: string[][];
+  rowCount: number;
+  columnCount: number;
+} {
+  const cellText = (node: Element): string => normalizeText(textOf(node));
+  const rows = queryAll(table, "tr");
+  const grid: string[][] = [];
+  const carry = new Map<number, { text: string; remaining: number }>();
+  for (const [rowIndex, row] of rows.entries()) {
+    const out: string[] = [];
+    let column = 0;
+    const drainCarried = (): void => {
+      while (carry.has(column)) {
+        const held = carry.get(column) as { text: string; remaining: number };
+        out[column] = held.text;
+        if (held.remaining <= 1) carry.delete(column);
+        else carry.set(column, { text: held.text, remaining: held.remaining - 1 });
+        column++;
+      }
+    };
+    for (const cell of row.children) {
+      if (cell.type !== "element" || (cell.tag !== "td" && cell.tag !== "th")) continue;
+      const text = cellText(cell);
+      const colspan = Math.max(
+        1,
+        Math.min(1000, Number.parseInt(cell.attrs["colspan"] ?? "1", 10) || 1),
+      );
+      const rowspan = Math.max(
+        1,
+        Math.min(1000, Number.parseInt(cell.attrs["rowspan"] ?? "1", 10) || 1),
+      );
+      for (let c = 0; c < colspan; c++) {
+        drainCarried();
+        const at = column;
+        out[column] = text;
+        column++;
+        if (rowspan > 1) carry.set(at, { text, remaining: rowspan - 1 });
+      }
+    }
+    drainCarried();
+    grid[rowIndex] = Array.from(out, (v) => v ?? "");
+  }
+  const firstRow = rows[0];
+  const cellsIn = (node: Element | undefined, tags: ReadonlyArray<string>): number =>
+    node === undefined
+      ? 0
+      : node.children.filter((c) => c.type === "element" && tags.includes(c.tag)).length;
+  const headerCount = cellsIn(firstRow, ["th"]);
+  const hasHeader = headerCount > 0 && headerCount === cellsIn(firstRow, ["td", "th"]);
+  const body = hasHeader ? grid.slice(1) : grid;
+  return {
+    headers: hasHeader ? (grid[0] ?? []) : [],
+    rows: body,
+    rowCount: body.length,
+    columnCount: grid.length === 0 ? 0 : Math.max(...grid.map((r) => r.length)),
+  };
+}
+
+function randomTable(rand: () => number): string {
+  const rowCount = 1 + Math.floor(rand() * 6);
+  let html = "<table>";
+  for (let r = 0; r < rowCount; r++) {
+    html += "<tr>";
+    const cells = Math.floor(rand() * 5);
+    for (let c = 0; c < cells; c++) {
+      const tag = r === 0 && rand() < 0.6 ? "th" : "td";
+      const colspan = rand() < 0.3 ? ` colspan=${1 + Math.floor(rand() * 4)}` : "";
+      const rowspan = rand() < 0.3 ? ` rowspan=${1 + Math.floor(rand() * 5)}` : "";
+      html += `<${tag}${colspan}${rowspan}>${String.fromCharCode(97 + Math.floor(rand() * 26))}${r}${c}`;
+    }
+  }
+  return `${html}</table>`;
+}
+
+describe("HtmlTable builds a bounded grid", () => {
+  const lift = (html: string, limits: Parameters<typeof extractTable>[1]) =>
+    extractTable(queryAll(parseHtml(html), "table")[0] as Element, limits);
+  const tool = async (input: Record<string, unknown>): Promise<string> =>
+    htmlTable.execute(htmlTable.inputSchema.parse(input), {} as never) as Promise<string>;
+
+  test("a rowspan bomb stops at maxRows and the column cap, and still reports the true row count", () => {
+    // Five cells of colspan=1000 rowspan=1000 over 1,000 rows: five million
+    // cells on 0.7.0, all built before maxRows sliced them.
+    const html = `<table><tr>${"<td colspan=1000 rowspan=1000>x</td>".repeat(5)}</tr>${"<tr>".repeat(999)}</table>`;
+    const lifted = lift(html, { maxRows: 1, maxColumns: 1000 });
+    expect({
+      rows: lifted.rows.length,
+      width: lifted.rows[0]?.length,
+      rowCount: lifted.rowCount,
+      truncatedBy: lifted.truncatedBy,
+    }).toEqual({ rows: 1, width: 1000, rowCount: 1000, truncatedBy: ["rows", "columns"] });
+  });
+
+  test("the same bomb at the default maxRows stays within the character budget", async () => {
+    const html = `<table><tr>${"<td colspan=1000 rowspan=1000>x</td>".repeat(5)}</tr>${"<tr>".repeat(999)}</table>`;
+    const raw = await tool({ html });
+    // 0.7.0 returned 10 MB here with truncated: true only for the row cut.
+    expect(raw.length).toBeLessThan(2_100_000);
+    const table = JSON.parse(raw).tables[0];
+    expect(table.truncated).toBe(true);
+    expect(table.rowCount).toBe(1000);
+    for (const row of table.rows as string[][]) expect(row.length).toBe(1000);
+  });
+
+  test("colspan fan-out is cut at the column cap and says so", async () => {
+    // 58 KB of markup; 0.7.0 answered 10,000,232 characters with truncated: false.
+    const html = `<table>${`<tr>${"<td colspan=1000>x</td>".repeat(50)}</tr>`.repeat(50)}</table>`;
+    const raw = await tool({ html });
+    expect(raw.length).toBeLessThan(250_000);
+    const table = JSON.parse(raw).tables[0];
+    expect({ rows: table.rows.length, truncatedBy: table.truncatedBy }).toEqual({
+      rows: 50,
+      truncatedBy: ["columns"],
+    });
+  });
+
+  test("one long cell spanned 1,000 times is stopped by the budget, not copied 1,000 times", async () => {
+    const html = `<table><tr><td colspan=1000>${"A".repeat(10_000)}</td></tr></table>`;
+    const raw = await tool({ html });
+    // 0.7.0: 10,003,132 characters, truncated: false. A row the budget cut is
+    // dropped whole rather than returned short.
+    expect(raw.length).toBeLessThan(2_100_000);
+    const table = JSON.parse(raw).tables[0];
+    expect({
+      rows: table.rows.length,
+      rowCount: table.rowCount,
+      truncatedBy: table.truncatedBy,
+    }).toEqual({
+      rows: 0,
+      rowCount: 1,
+      truncatedBy: ["chars"],
+    });
+  });
+
+  test("many tables share one budget, and the ones it could not reach are counted", async () => {
+    // Ten tables of 101 rows x 1,000 one-character cells: 404 K each, so the
+    // fifth runs out part-way.
+    const one = `<table>${"<tr><td colspan=1000>x</td></tr>".repeat(101)}</table>`;
+    const raw = await tool({ html: one.repeat(10) });
+    expect(raw.length).toBeLessThan(2_100_000);
+    const out = JSON.parse(raw);
+    expect(out.tableCount).toBe(10);
+    expect(out.tables.length + out.tablesOmitted).toBe(10);
+    expect({ returned: out.tables.length, omitted: out.tablesOmitted }).toEqual({
+      returned: 5,
+      omitted: 5,
+    });
+    expect(out.note).toContain("budget");
+    expect(out.tables[3].truncated).toBe(false);
+    expect(out.tables[4].truncatedBy).toEqual(["chars"]);
+  });
+
+  test("a table no limit touches is lifted exactly as 0.7.0 lifted it", () => {
+    let compared = 0;
+    let spanned = 0;
+    for (let seed = 1; seed <= 500; seed++) {
+      const html = randomTable(prng(seed));
+      const table = queryAll(parseHtml(html), "table")[0] as Element;
+      const want = expandTable070(table);
+      const got = extractTable(table, { maxRows: 100, maxColumns: 1000, budget: { chars: 1e6 } });
+      expect({
+        seed,
+        headers: got.headers,
+        rows: got.rows,
+        rowCount: got.rowCount,
+        columnCount: got.columnCount,
+        truncated: got.truncated,
+      }).toEqual({ seed, ...want, truncated: false });
+      compared += 1;
+      if (/span=/.test(html)) spanned += 1;
+    }
+    expect(compared).toBe(500);
+    expect(spanned).toBeGreaterThan(300);
   });
 });

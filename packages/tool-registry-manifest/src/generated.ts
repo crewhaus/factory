@@ -3832,7 +3832,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "htmlTable",
     name: "HtmlTable",
     description:
-      "Lift HTML tables into headers and rows, with colspan and rowspan expanded. Use it to read a pricing grid, an order history or a financial statement as data instead of as markup. Spans are expanded because a table that uses them reads as ragged rows otherwise, and every column after the span is off by one — which is invisible in the output and wrong in every row.",
+      "Lift HTML tables into headers and rows, with colspan and rowspan expanded. Use it to read a pricing grid, an order history or a financial statement as data instead of as markup. Spans are expanded because a table that uses them reads as ragged rows otherwise, and every column after the span is off by one — which is invisible in the output and wrong in every row. Expansion stops at maxRows rows, 1,000 columns and 2M characters per call, and a table cut short says so in truncatedBy.",
     readOnly: true,
     destructive: false,
     scope: "internal",

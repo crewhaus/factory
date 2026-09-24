@@ -36,6 +36,10 @@ const LIMITS = {
   fileBytes: 64 * 1024 * 1024,
   matches: 2_000,
   fields: 64,
+  /** Columns per table row; the HTML spec caps a single colspan at 1,000 too. */
+  tableColumns: 1_000,
+  /** Cell text HtmlTable returns per call, shared by every table in it. */
+  tableChars: 2_000_000,
 } as const;
 
 /**
@@ -127,7 +131,7 @@ export const htmlQuery: RegisteredTool = buildTool({
 export const htmlTable: RegisteredTool = buildTool({
   name: "HtmlTable",
   description:
-    "Lift HTML tables into headers and rows, with colspan and rowspan expanded. Use it to read a pricing grid, an order history or a financial statement as data instead of as markup. Spans are expanded because a table that uses them reads as ragged rows otherwise, and every column after the span is off by one — which is invisible in the output and wrong in every row.",
+    "Lift HTML tables into headers and rows, with colspan and rowspan expanded. Use it to read a pricing grid, an order history or a financial statement as data instead of as markup. Spans are expanded because a table that uses them reads as ragged rows otherwise, and every column after the span is off by one — which is invisible in the output and wrong in every row. Expansion stops at maxRows rows, 1,000 columns and 2M characters per call, and a table cut short says so in truncatedBy.",
   inputSchema: z
     .object({
       ...sourceFields,
@@ -152,20 +156,37 @@ export const htmlTable: RegisteredTool = buildTool({
       return `no table matched ${input.selector === undefined ? "<table>" : `"${input.selector}"`} in ${from}${all.length > 0 ? ` (the document has ${all.length}, so the index may be out of range)` : ""}`;
     }
     const maxRows = input.maxRows ?? 500;
+    // One budget for the whole call: spans multiply a cell's text, and many
+    // small tables must not add up past what one large one may return.
+    const budget = { chars: LIMITS.tableChars };
+    const tables: Array<Record<string, unknown>> = [];
+    let tablesOmitted = 0;
+    for (const table of chosen) {
+      if (budget.chars <= 0) {
+        tablesOmitted += 1;
+        continue;
+      }
+      const lifted = extractTable(table, { maxRows, maxColumns: LIMITS.tableColumns, budget });
+      tables.push({
+        caption: lifted.caption,
+        headers: lifted.headers,
+        rowCount: lifted.rowCount,
+        columnCount: lifted.columnCount,
+        rows: lifted.rows,
+        truncated: lifted.truncated,
+        ...(lifted.truncated ? { truncatedBy: lifted.truncatedBy } : {}),
+      });
+    }
     return json({
       from,
-      tables: chosen.map((table) => {
-        const lifted = extractTable(table);
-        return {
-          caption: lifted.caption,
-          headers: lifted.headers,
-          rowCount: lifted.rowCount,
-          columnCount: lifted.columnCount,
-          rows: lifted.rows.slice(0, maxRows),
-          truncated: lifted.rowCount > maxRows,
-        };
-      }),
+      tables,
       tableCount: all.length,
+      ...(tablesOmitted > 0
+        ? {
+            tablesOmitted,
+            note: `the ${LIMITS.tableChars}-character result budget ran out, so ${tablesOmitted} matched table(s) were not read; pass index or a narrower selector`,
+          }
+        : {}),
     });
   },
 });
