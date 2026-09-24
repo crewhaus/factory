@@ -104,10 +104,14 @@ reported in `backEdges`.
 
 **They will not re-encode a photograph.** `ExifStrip` rewrites the segment
 list and copies the entropy-coded scan data verbatim, so the picture is
-bit-for-bit what it was. It keeps the ICC colour profile by default,
-because a profile is not metadata about the photographer: it is what tells
-a display how to interpret the colours, and dropping it visibly shifts the
-image.
+bit-for-bit what it was. It walks the whole file: metadata segments between
+the scans of a progressive JPEG are dropped too, and so is everything after
+the end-of-image marker (an appended preview, second view, HDR gain map or
+motion-photo video, each of which can carry its own EXIF and location). The
+result says how many trailing bytes went and what they looked like. It keeps
+the ICC colour profile by default, because a profile is not metadata about
+the photographer: it is what tells a display how to interpret the colours,
+and dropping it visibly shifts the image.
 
 **They will not guess.** A 16-bit or interlaced PNG is refused by name
 rather than truncated or de-interlaced badly. A payload past a QR code's
@@ -154,3 +158,11 @@ A photograph taken on a phone usually records where it was taken.
 `ExifRead` reports that as `hasGps: true` with a `privacyWarning`, rather
 than burying the coordinates in a field list, because publishing the file
 publishes the location. `ExifStrip` is the tool that removes it.
+
+`ExifRead` reads the whole file (up to 64 MiB), not just its first
+megabyte, and counts GPS found anywhere: before the first scan, between
+scans, or in a JPEG appended after the main one. It reports `trailingBytes`,
+`interScanMetadataSegments` and every EXIF block when there is more than
+one. When it cannot tell (an EXIF block that does not parse, or more
+appended images than it walks) and found no GPS elsewhere, `hasGps` is
+`null` with the reason in `gpsUndetermined`, never `false`.

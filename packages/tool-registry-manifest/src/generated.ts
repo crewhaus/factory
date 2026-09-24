@@ -2554,7 +2554,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "exifRead",
     name: "ExifRead",
     description:
-      "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at.",
+      "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read, so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -2568,7 +2568,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "exifStrip",
     name: "ExifStrip",
     description:
-      "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality.",
+      "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality. Metadata between scans is removed too, and so is anything appended after the image (a preview, gain map or motion-photo video, each of which can carry its own location).",
     readOnly: false,
     destructive: true,
     scope: "internal",

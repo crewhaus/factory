@@ -116,6 +116,153 @@ export function readJpegSegments(bytes: Uint8Array): {
   throw new MediaFormatError("the file ends before the start-of-scan marker");
 }
 
+// --- The whole codestream --------------------------------------------------
+
+/** One piece of a JPEG, in file order: a marker segment, or a scan's entropy-coded bytes. */
+export type JpegPart =
+  | { readonly type: "segment"; readonly segment: JpegSegment }
+  | { readonly type: "scan"; readonly start: number; readonly end: number };
+
+export type JpegWalk = {
+  /** Every piece after SOI, in order, up to and including EOI. */
+  readonly parts: ReadonlyArray<JpegPart>;
+  /** The marker segments alone, in order. */
+  readonly segments: ReadonlyArray<JpegSegment>;
+  /** Offset just past EOI, or null when the file ends without one. */
+  readonly eoiEnd: number | null;
+  /** Bytes after EOI: where an appended image or video lives. 0 when EOI is missing. */
+  readonly trailing: number;
+};
+
+/** More marker segments than any real JPEG has; past it the file is refused. */
+const MAX_JPEG_SEGMENTS = 65_536;
+
+/**
+ * Walk the WHOLE codestream: every marker segment, including those between
+ * the scans of a progressive or multi-scan file, to EOI.
+ *
+ * `readJpegSegments` stops at the first start-of-scan, which is all a header
+ * reader needs, and 0.7.0's ExifStrip copied everything after that point
+ * verbatim. But an APPn or COM segment may sit between scans, and a camera
+ * appends whole images after EOI (MPF previews, HDR gain maps, stereo pairs)
+ * and phones append motion-photo video; each can carry its own EXIF and GPS.
+ *
+ * Inside a scan, `0xFF` followed by `0x00` (stuffing), `0xD0`–`0xD7` (restart
+ * markers) or another `0xFF` (fill) belongs to the scan; any other `0xFF xx`
+ * is the next marker. The walk is linear: the scan search is a native
+ * `indexOf` from where the last one stopped.
+ */
+export function walkJpeg(bytes: Uint8Array): JpegWalk {
+  if (!startsWith(bytes, [0xff, 0xd8])) {
+    throw new MediaFormatError("not a JPEG: the file does not start with FFD8 (SOI)");
+  }
+  const parts: JpegPart[] = [];
+  const segments: JpegSegment[] = [];
+  const push = (segment: JpegSegment): void => {
+    if (segments.length >= MAX_JPEG_SEGMENTS) {
+      throw new MediaFormatError(`the file has more than ${MAX_JPEG_SEGMENTS} marker segments`);
+    }
+    segments.push(segment);
+    parts.push({ type: "segment", segment });
+  };
+  let pos = 2;
+  while (pos < bytes.length) {
+    const start = pos;
+    if (bytes[pos] !== 0xff) {
+      throw new MediaFormatError(
+        `expected a marker at offset ${start}, found 0x${(bytes[pos] as number).toString(16)}`,
+      );
+    }
+    pos++;
+    while (pos < bytes.length && bytes[pos] === 0xff) pos++; // fill bytes
+    if (pos >= bytes.length) break; // a lone trailing 0xFF: nothing follows
+    const marker = bytes[pos] as number;
+    pos++;
+    if (marker === 0xd9) {
+      push({ marker, name: "EOI", offset: start, length: pos - start, payload: new Uint8Array(0) });
+      return { parts, segments, eoiEnd: pos, trailing: bytes.length - pos };
+    }
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      push({
+        marker,
+        name: markerName(marker),
+        offset: start,
+        length: pos - start,
+        payload: new Uint8Array(0),
+      });
+      continue;
+    }
+    if (marker === 0xd8) {
+      throw new MediaFormatError(`a second start-of-image marker at offset ${start}`);
+    }
+    if (pos + 2 > bytes.length) {
+      throw new MediaFormatError(`segment ${markerName(marker)} at ${start} is cut off`);
+    }
+    const length = ((bytes[pos] as number) << 8) | (bytes[pos + 1] as number);
+    if (length < 2) {
+      throw new MediaFormatError(`segment ${markerName(marker)} declares a length of ${length}`);
+    }
+    if (pos + length > bytes.length) {
+      throw new MediaFormatError(
+        `segment ${markerName(marker)} at ${start} runs ${pos + length - bytes.length} bytes past the end of the file`,
+      );
+    }
+    push({
+      marker,
+      name: markerName(marker),
+      offset: start,
+      length: pos + length - start,
+      payload: bytes.subarray(pos + 2, pos + length),
+    });
+    pos += length;
+    if (marker !== 0xda) continue;
+    // Entropy-coded data, up to the next real marker.
+    const dataStart = pos;
+    for (;;) {
+      const ff = bytes.indexOf(0xff, pos);
+      if (ff === -1 || ff + 1 >= bytes.length) {
+        pos = bytes.length;
+        break;
+      }
+      const next = bytes[ff + 1] as number;
+      if (next === 0x00 || (next >= 0xd0 && next <= 0xd7)) {
+        pos = ff + 2;
+        continue;
+      }
+      if (next === 0xff) {
+        pos = ff + 1;
+        continue;
+      }
+      pos = ff;
+      break;
+    }
+    parts.push({ type: "scan", start: dataStart, end: pos });
+  }
+  return { parts, segments, eoiEnd: null, trailing: 0 };
+}
+
+/** A hint at what the bytes after EOI are, for a person reading the result. */
+export function describeTrailer(trailer: Uint8Array): string {
+  if (trailer.length === 0) return "nothing";
+  for (
+    let i = trailer.indexOf(0xff);
+    i !== -1 && i + 2 < trailer.length;
+    i = trailer.indexOf(0xff, i + 1)
+  ) {
+    if (trailer[i + 1] === 0xd8 && trailer[i + 2] === 0xff) {
+      return "an appended JPEG (an MPF preview, a second view or an HDR gain map)";
+    }
+  }
+  for (
+    let i = trailer.indexOf(0x66);
+    i !== -1 && i + 3 < trailer.length;
+    i = trailer.indexOf(0x66, i + 1)
+  ) {
+    if (asciiAt(trailer, i, "ftyp")) return "an appended video (a motion photo)";
+  }
+  return "unrecognised data";
+}
+
 // --- EXIF ----------------------------------------------------------------
 
 const TYPE_SIZES: Record<number, number> = {
@@ -436,26 +583,43 @@ export type StripResult = {
   readonly bytes: Uint8Array;
   readonly removed: ReadonlyArray<{ name: string; bytes: number }>;
   readonly bytesRemoved: number;
+  /** Bytes after EOI that were dropped: an appended image or video, and its metadata. */
+  readonly trailingBytesRemoved: number;
+  /** What those bytes looked like, when there were any. */
+  readonly trailingKind?: string;
+  /** The file ends without EOI; everything up to its end was walked and kept. */
+  readonly eoiMissing: boolean;
 };
 
 /**
- * A JPEG with its metadata segments dropped. The scan data is copied
- * verbatim — nothing is re-encoded, so the image is bit-for-bit the same
- * picture, just without the record of who took it and where.
+ * A JPEG with its metadata dropped: every APPn and COM segment the options
+ * do not keep, wherever it sits (before the first scan or between scans),
+ * and everything after EOI. The scans' entropy-coded bytes are copied
+ * verbatim — nothing is re-encoded, so the primary image is bit-for-bit the
+ * same picture, without the record of who took it and where.
+ *
+ * Dropping the trailer loses an appended preview, gain map or motion-photo
+ * video, and the metadata inside each. Nothing in the stripped file points
+ * at them any more: the MPF index (APP2) and the XMP (APP1) that did are
+ * metadata segments and are removed.
  */
 export function stripJpegMetadata(bytes: Uint8Array, options: StripOptions = {}): StripResult {
-  const { segments, scanStart } = readJpegSegments(bytes);
+  const walk = walkJpeg(bytes);
   const kept: Uint8Array[] = [new Uint8Array([0xff, 0xd8])];
   const removed: Array<{ name: string; bytes: number }> = [];
-  for (const segment of segments) {
-    if (segment.marker === 0xd8) continue;
+  for (const part of walk.parts) {
+    if (part.type === "scan") {
+      kept.push(bytes.subarray(part.start, part.end));
+      continue;
+    }
+    const segment = part.segment;
     if (isMetadata(segment, options)) {
       removed.push({ name: segment.name, bytes: segment.length });
       continue;
     }
     kept.push(bytes.subarray(segment.offset, segment.offset + segment.length));
   }
-  kept.push(bytes.subarray(scanStart));
+  const trailerStart = walk.eoiEnd ?? bytes.length;
   let total = 0;
   for (const part of kept) total += part.length;
   const out = new Uint8Array(total);
@@ -464,5 +628,140 @@ export function stripJpegMetadata(bytes: Uint8Array, options: StripOptions = {})
     out.set(part, at);
     at += part.length;
   }
-  return { bytes: out, removed, bytesRemoved: bytes.length - out.length };
+  const trailing = bytes.length - trailerStart;
+  return {
+    bytes: out,
+    removed,
+    bytesRemoved: bytes.length - out.length,
+    trailingBytesRemoved: trailing,
+    ...(trailing > 0 ? { trailingKind: describeTrailer(bytes.subarray(trailerStart)) } : {}),
+    eoiMissing: walk.eoiEnd === null,
+  };
+}
+
+/** One EXIF block found anywhere in a file, with where it was. */
+export type ExifLocation = {
+  readonly where: "before the first scan" | "between scans" | "in an appended image";
+  readonly offset: number;
+  readonly exif: ExifData | null;
+  /** Why `exif` is null: the block is there but could not be parsed. */
+  readonly unreadable?: string;
+};
+
+export type JpegMetadataReport = {
+  /** Every EXIF block in the file, the primary one first. */
+  readonly exifBlocks: ReadonlyArray<ExifLocation>;
+  /** APPn and COM segments that sit between or after the scans of the main image. */
+  readonly interScanMetadataSegments: ReadonlyArray<string>;
+  /** APPn segments before the first scan, by name. */
+  readonly metadataSegments: ReadonlyArray<string>;
+  readonly trailingBytes: number;
+  readonly trailingKind?: string;
+  /** JPEGs found in the trailer and walked for EXIF. */
+  readonly embeddedImages: number;
+  /** JPEG starts in the trailer beyond the ones walked; their metadata is unknown. */
+  readonly embeddedImagesNotInspected: number;
+  readonly eoiMissing: boolean;
+};
+
+/** How many appended images one call walks. */
+const MAX_EMBEDDED_IMAGES = 16;
+
+function exifBlocksOf(
+  walk: JpegWalk,
+  base: number,
+  where: (sawScan: boolean) => ExifLocation["where"],
+): ExifLocation[] {
+  const out: ExifLocation[] = [];
+  let sawScan = false;
+  for (const part of walk.parts) {
+    if (part.type === "scan") {
+      sawScan = true;
+      continue;
+    }
+    const s = part.segment;
+    if (s.marker !== 0xe1 || !asciiAt(s.payload, 0, "Exif")) continue;
+    let exif: ExifData | null = null;
+    let unreadable: string | undefined;
+    try {
+      exif = parseExif(s.payload);
+    } catch (err) {
+      unreadable = (err as Error).message;
+    }
+    out.push({
+      where: where(sawScan),
+      offset: base + s.offset,
+      exif,
+      ...(unreadable === undefined ? {} : { unreadable }),
+    });
+  }
+  return out;
+}
+
+/**
+ * Every place in a JPEG that can carry metadata: EXIF before and between
+ * scans, other APPn/COM segments, and the JPEGs appended after EOI (walked
+ * once each, not their own trailers again). What this reports is what
+ * ExifRead answers from, so it cannot call a file clean on the strength of
+ * its first megabyte.
+ */
+export function inspectJpegMetadata(bytes: Uint8Array): JpegMetadataReport {
+  const walk = walkJpeg(bytes);
+  const exifBlocks = exifBlocksOf(walk, 0, (sawScan) =>
+    sawScan ? "between scans" : "before the first scan",
+  );
+  const interScan: string[] = [];
+  const before: string[] = [];
+  let sawScan = false;
+  for (const part of walk.parts) {
+    if (part.type === "scan") {
+      sawScan = true;
+      continue;
+    }
+    const m = part.segment.marker;
+    if ((m >= 0xe0 && m <= 0xef) || m === 0xfe) {
+      (sawScan ? interScan : before).push(part.segment.name);
+    }
+  }
+  let embeddedImages = 0;
+  let attempts = 0;
+  let notInspected = 0;
+  const trailerStart = walk.eoiEnd ?? bytes.length;
+  if (walk.trailing > 0) {
+    // Each appended JPEG is walked from its SOI; a candidate inside one
+    // already walked (its thumbnail, say) is skipped rather than walked
+    // again. Every attempt counts against the cap, a failed one too, so a
+    // trailer of false starts cannot make this quadratic.
+    let coveredTo = trailerStart;
+    for (
+      let i = bytes.indexOf(0xff, trailerStart);
+      i !== -1 && i + 2 < bytes.length;
+      i = bytes.indexOf(0xff, i + 1)
+    ) {
+      if (bytes[i + 1] !== 0xd8 || bytes[i + 2] !== 0xff || i < coveredTo) continue;
+      if (attempts >= MAX_EMBEDDED_IMAGES) {
+        notInspected++;
+        continue;
+      }
+      attempts++;
+      try {
+        const inner = walkJpeg(bytes.subarray(i));
+        embeddedImages++;
+        exifBlocks.push(...exifBlocksOf(inner, i, () => "in an appended image"));
+        coveredTo = inner.eoiEnd === null ? bytes.length : i + inner.eoiEnd;
+      } catch {
+        // Not a walkable JPEG after all (FF D8 FF inside other data).
+      }
+    }
+  }
+  return {
+    exifBlocks,
+    interScanMetadataSegments: interScan,
+    metadataSegments: before.filter((n) => n !== "COM").sort(),
+    trailingBytes: walk.trailing,
+    ...(walk.trailing > 0 ? { trailingKind: describeTrailer(bytes.subarray(trailerStart)) } : {}),
+    embeddedImages,
+    embeddedImagesNotInspected: notInspected,
+    eoiMissing: walk.eoiEnd === null,
+  };
 }

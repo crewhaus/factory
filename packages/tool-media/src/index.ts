@@ -55,7 +55,7 @@ import {
   imageStats,
   resizeImage,
 } from "./lib/imageops";
-import { findExifSegment, parseExif, readJpegSegments, stripJpegMetadata } from "./lib/jpeg";
+import { inspectJpegMetadata, stripJpegMetadata } from "./lib/jpeg";
 import {
   DEFAULT_DECODE_LIMITS,
   type PngColorType,
@@ -158,6 +158,8 @@ function readWhole(
   const path = resolveSafe(toolName, rel);
   const stats = statSync(path.real);
   if (stats.isDirectory()) throw new ToolInputError(`"${rel}" is a directory, not a file`);
+  // Opening a FIFO blocks until something writes to it; a device may never end.
+  if (!stats.isFile()) throw new ToolInputError(`"${rel}" is not a regular file`);
   if (stats.size > maxBytes) {
     throw new ToolInputError(
       `"${rel}" is ${stats.size} bytes, over the ${maxBytes}-byte limit for this tool`,
@@ -190,6 +192,7 @@ function readHead(
   const path = resolveSafe(toolName, rel);
   const stats = statSync(path.real);
   if (stats.isDirectory()) throw new ToolInputError(`"${rel}" is a directory, not a file`);
+  if (!stats.isFile()) throw new ToolInputError(`"${rel}" is not a regular file`);
   const want = Math.min(window, stats.size);
   const fd = openSync(path.real, "r");
   try {
@@ -405,44 +408,93 @@ export const pngRead: RegisteredTool = buildTool({
 export const exifRead: RegisteredTool = buildTool({
   name: "ExifRead",
   description:
-    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at.",
+    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read, so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too.",
   inputSchema: z.object({ path: pathField.describe("a JPEG inside the workspace") }),
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) =>
     attempt(() => {
-      const { path, bytes } = readHead("ExifRead", input.path);
+      // The whole file, not a head window: GPS can sit between scans or in
+      // an appended image, and "no GPS" must not be said about bytes that
+      // were never read.
+      const { path, bytes } = readWhole("ExifRead", input.path);
       const kind = detectKind(bytes);
       if (kind?.kind !== "jpeg") {
         throw new ToolInputError(
           `"${input.path}" is ${kind === undefined ? "not a recognised format" : kind.kind}; EXIF reading here covers JPEG only`,
         );
       }
-      const { segments } = readJpegSegments(bytes);
-      const segment = findExifSegment(segments);
-      if (segment === undefined) {
-        return json({
-          path: path.rel,
-          hasExif: false,
-          hasGps: false,
-          note: "no APP1 EXIF segment; the file carries no EXIF metadata this reader can see",
-          metadataSegments: segments
-            .filter((s) => s.marker >= 0xe0 && s.marker <= 0xef)
-            .map((s) => s.name)
-            .sort(),
-        });
-      }
-      const exif = parseExif(segment.payload);
-      return json({
-        path: path.rel,
-        hasExif: true,
-        ...exif,
-        ...(exif.hasGps
+      const report = inspectJpegMetadata(bytes);
+      const primary = report.exifBlocks.find((b) => b.where !== "in an appended image");
+      const withGps = report.exifBlocks.filter((b) => b.exif?.hasGps === true);
+      const unreadableBlocks = report.exifBlocks.filter((b) => b.exif === null);
+      // GPS found anywhere is a definite yes. No GPS is a definite no only
+      // when every EXIF block was parsed and every appended image walked.
+      const undetermined =
+        withGps.length === 0 &&
+        (report.embeddedImagesNotInspected > 0 || unreadableBlocks.length > 0);
+      const hasGps = withGps.length > 0 ? true : undetermined ? null : false;
+      const where = {
+        trailingBytes: report.trailingBytes,
+        ...(report.trailingKind === undefined ? {} : { trailingKind: report.trailingKind }),
+        embeddedImages: report.embeddedImages,
+        interScanMetadataSegments: report.interScanMetadataSegments,
+        ...(report.eoiMissing ? { eoiMissing: true } : {}),
+        ...(report.exifBlocks.length > 1
+          ? {
+              exifBlocks: report.exifBlocks.map((b) => ({
+                where: b.where,
+                offset: b.offset,
+                hasGps: b.exif?.hasGps ?? null,
+                ...(b.exif?.gps === undefined ? {} : { gps: b.exif.gps }),
+                ...(b.unreadable === undefined ? {} : { unreadable: b.unreadable }),
+              })),
+            }
+          : {}),
+        ...(undetermined
+          ? {
+              gpsUndetermined:
+                report.embeddedImagesNotInspected > 0
+                  ? `${report.embeddedImagesNotInspected} more appended images were not walked`
+                  : "an EXIF block in the file could not be parsed",
+            }
+          : {}),
+        ...(report.trailingKind?.startsWith("an appended video") === true
+          ? {
+              videoNote:
+                "the appended video is not read here and may carry its own location; ExifStrip removes it",
+            }
+          : {}),
+      };
+      const privacy =
+        hasGps === true
           ? {
               privacyWarning:
                 "this file records where it was taken; publishing it publishes that location. ExifStrip removes it.",
             }
-          : {}),
+          : {};
+      if (primary === undefined || primary.exif === null) {
+        return json({
+          path: path.rel,
+          hasExif: report.exifBlocks.length > 0,
+          hasGps,
+          ...(report.exifBlocks.length === 0
+            ? {
+                note: "no APP1 EXIF segment; the file carries no EXIF metadata this reader can see",
+              }
+            : {}),
+          metadataSegments: report.metadataSegments,
+          ...where,
+          ...privacy,
+        });
+      }
+      return json({
+        path: path.rel,
+        hasExif: true,
+        ...primary.exif,
+        hasGps,
+        ...where,
+        ...privacy,
       });
     }),
 });
@@ -659,7 +711,7 @@ export const exifStrip: RegisteredTool = buildTool({
     { field: "output", kind: "path" },
   ],
   description:
-    "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality.",
+    "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality. Metadata between scans is removed too, and so is anything appended after the image (a preview, gain map or motion-photo video, each of which can carry its own location).",
   inputSchema: z.object({
     path: pathField.describe("the source JPEG"),
     output: pathField.describe("where to write the stripped JPEG"),
@@ -692,7 +744,15 @@ export const exifStrip: RegisteredTool = buildTool({
         bytesAfter: result.bytes.length,
         bytesRemoved: result.bytesRemoved,
         removed: result.removed,
-        note: "the entropy-coded scan data was copied verbatim; the picture is unchanged",
+        trailingBytesRemoved: result.trailingBytesRemoved,
+        ...(result.trailingKind === undefined ? {} : { trailingKind: result.trailingKind }),
+        ...(result.eoiMissing ? { eoiMissing: true } : {}),
+        note:
+          result.trailingBytesRemoved > 0
+            ? `the main image's scan data was copied verbatim, so that picture is unchanged; the ${result.trailingBytesRemoved} bytes after its end-of-image marker were dropped with any metadata in them: ${result.trailingKind}`
+            : result.eoiMissing
+              ? "the scan data was copied verbatim; the file has no end-of-image marker, so it was walked to its end and kept as it was"
+              : "the entropy-coded scan data was copied verbatim; the picture is unchanged",
       });
     }),
 });
