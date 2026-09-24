@@ -55,7 +55,7 @@ import {
   resolveChildPermissionsNarrowOnly,
 } from "@crewhaus/sub-agent-permission-inheritance";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { type RegisteredTool, toolListEntryNames } from "@crewhaus/tool-catalog";
 import { registeredToolName } from "@crewhaus/tool-categories";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -401,7 +401,8 @@ function resolveSubAgent(
  * tool-name allowlist on the definition. Undefined `def.tools` (with
  * `permissions: "inherit"`) → the child inherits the parent's full
  * catalog. Undefined `def.tools` with any other permission mode → empty
- * child catalog (the user has implicitly opted out).
+ * child catalog (the user has implicitly opted out). An MCP tool may be
+ * listed by its pre-0.7.1 spelling (`<server>__<tool>`).
  */
 function buildChildCatalog(
   parentTools: ReadonlyArray<RegisteredTool>,
@@ -414,9 +415,11 @@ function buildChildCatalog(
   // A spec key (`read`) names the same tool as its registered name (`Read`);
   // the parent catalog carries registered names, so map keys first. Before
   // this, a definition written with spec keys — the documented spelling for
-  // every other tools: list — gave the child no tools at all.
-  const allowlist = new Set(allowed.map((n) => registeredToolName(n) ?? n));
-  return parentTools.filter((t) => allowlist.has(t.name));
+  // every other tools: list — gave the child no tools at all. An MCP entry may
+  // still use the pre-0.7.1 `<server>__<tool>` spelling (toolListEntryNames).
+  return parentTools.filter((t) =>
+    allowed.some((entry) => toolListEntryNames(registeredToolName(entry) ?? entry, t.name)),
+  );
 }
 
 /** The definition with its `tools` mapped to registered names (`read` → `Read`). */

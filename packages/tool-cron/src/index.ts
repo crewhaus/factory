@@ -647,6 +647,7 @@ const timeoutField = z
 
 export const cronList: RegisteredTool = buildTool({
   name: "CronList",
+  operativeArgs: [],
   description:
     "List what this host has scheduled: the user's crontab, launchd agents on macOS, systemd timers on Linux. Every entry says which scheduler it came from, keeps that scheduler's own identifier (line number, label, unit name) and states which schedule grammar it is written in, so a caller can tell a five-field cron expression from a launchd calendar dictionary or a systemd OnCalendar string. Next firings are computed only for real cron expressions, and systemd's own reported next elapse is passed through rather than recomputed.",
   inputSchema: z.object({
@@ -1062,6 +1063,11 @@ function sameJobs(a: ParsedCrontab, b: ParsedCrontab): boolean {
 
 export const cronDelete: RegisteredTool = buildTool({
   name: "CronDelete",
+  operativeArgs: [
+    { field: "id", kind: "id" },
+    { field: "match", kind: "text" },
+    { field: "fingerprint", kind: "id" },
+  ],
   description:
     "Remove one scheduled job from this host's scheduler: a line from the user's crontab, a launchd agent, or a systemd user timer. DESTRUCTIVE — run it with dryRun first, which reports the exact entries, commands and removed text through the same code path the real delete uses. It refuses when the selector matches more than one entry (unless allowMultiple is set), when the entry changed since it was listed, and when the crontab was edited between being read and being rewritten. The removed text comes back verbatim so it can be reinstalled.",
   inputSchema: z.object({

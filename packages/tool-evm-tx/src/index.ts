@@ -162,6 +162,11 @@ const sendTxSchema = z.object({
 
 export const evmSendTransaction: RegisteredTool = buildTool({
   name: "EvmSendTransaction",
+  // The address the transaction goes to is what a rule scopes:
+  // `EvmSendTransaction(0xabc…)` allows one counterparty. It is a
+  // `recipient`, a destination the model picks, as the egress fabric has
+  // always treated it.
+  operativeArgs: [{ field: "to", kind: "recipient" }],
   description:
     "Sign and broadcast an EVM transaction. Goes through the wallet-engine flow: simulate, enforce transaction_policy, prompt approval, sign via custody adapter, broadcast, fetch receipt. Returns the tx hash plus block + status when the receipt is available.",
   inputSchema: sendTxSchema,

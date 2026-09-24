@@ -24,8 +24,8 @@
  *
  *   1. THE TOOL NAME IS ALSO AN OBSERVED VALUE. `patternFor` embeds
  *      `agg.toolName` verbatim on both of its paths. Built-in names are fixed,
- *      but an MCP tool's registered name is `<server>__<tool>` composed from
- *      strings a REMOTE server declares (`namespacedToolName` does no
+ *      but an MCP tool's registered name is `mcp__<server>__<tool>` composed
+ *      from strings a REMOTE server declares (`namespacedToolName` does no
  *      sanitising), so a hostile or careless server can register `notes__read*`
  *      and have "always allow the tool you approved" compile to a rule covering
  *      every tool whose name starts `notes__read`.
@@ -56,6 +56,7 @@
 import { hasUnescapedWildcard } from "@crewhaus/harness-advice";
 import {
   OPERATIVE_ARG_FIELDS,
+  type OperativeValueKind,
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
@@ -110,8 +111,18 @@ export function argNearMisses(value: string): string[] {
  * `observedValue` is the operative-argument value the human approved, or
  * `undefined` for a bare tool grant (no argument constraint to check). The
  * verdict's `ok: false` reason is written for an operator, not a log.
+ *
+ * `observedKind` is the kind the tool declares for that value (`path`,
+ * `url`, …). With it, the rule is checked the way the runtime checks a
+ * declared tool — against the canonical value alone. Without it, the value
+ * is offered in the matcher's name-table field, as for an undeclared tool.
  */
-export function verifyRule(pattern: string, toolName: string, observedValue?: string): RuleVerdict {
+export function verifyRule(
+  pattern: string,
+  toolName: string,
+  observedValue?: string,
+  observedKind?: OperativeValueKind,
+): RuleVerdict {
   const checks: string[] = [];
 
   // (0) The engine must be able to compile it at all. An uncompilable rule is
@@ -196,9 +207,17 @@ export function verifyRule(pattern: string, toolName: string, observedValue?: st
   //     matches nothing is not "safe" — it is a proposal that will never fire,
   //     and the human who accepts it keeps being asked with no idea why.
   const field = OPERATIVE_ARG_FIELDS[toolName]?.[0];
-  const probe = (value: string): unknown => (field === undefined ? value : { [field]: value });
+  const matches = (name: string, value: string): boolean =>
+    observedKind !== undefined
+      ? matchesPattern(
+          compiled,
+          name,
+          {},
+          { operativeValues: [{ kind: observedKind, canonical: [value] }] },
+        )
+      : matchesPattern(compiled, name, field === undefined ? value : { [field]: value });
   if (observedValue !== undefined) {
-    if (!matchesPattern(compiled, toolName, probe(observedValue))) {
+    if (!matches(toolName, observedValue)) {
       return {
         ok: false,
         reason: "the rule does not match the very call it was derived from, so it would never fire",
@@ -209,7 +228,7 @@ export function verifyRule(pattern: string, toolName: string, observedValue?: st
 
   // (4) The tool half must not reach past the approved name.
   for (const other of [`${toolName}${CANARY}`, `${CANARY}${toolName}`]) {
-    if (matchesPattern(compiled, other, probe(observedValue ?? "x"))) {
+    if (matches(other, observedValue ?? "x")) {
       return {
         ok: false,
         reason: `the rule also matches a name neighbouring the approved tool ("${readable(other)}" with extra characters) — it is broader than the tool it names`,
@@ -224,7 +243,7 @@ export function verifyRule(pattern: string, toolName: string, observedValue?: st
   if (observedValue !== undefined && compiled.argGlob !== null) {
     const misses = argNearMisses(observedValue);
     for (const miss of misses) {
-      if (matchesPattern(compiled, toolName, probe(miss))) {
+      if (matches(toolName, miss)) {
         return {
           ok: false,
           reason: `the rule also matches an argument the human never approved (${JSON.stringify(readable(miss))}) — a character in the observed value is being read as a wildcard rather than as itself`,

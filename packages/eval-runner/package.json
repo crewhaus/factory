@@ -2,7 +2,7 @@
   "name": "@crewhaus/eval-runner",
   "version": "0.7.0",
   "type": "module",
-  "description": "Eval runner — per-sample isolation, concurrency, grading, persistence",
+  "description": "Eval runner \u2014 per-sample isolation, concurrency, grading, persistence",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -41,6 +41,7 @@
     "@crewhaus/routing-store": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/sandbox": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*",
     "@crewhaus/spec": "workspace:*",

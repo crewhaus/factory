@@ -41,11 +41,30 @@ export type IrPermissions = {
  * unresolved config verbatim and the emitted bundle resolves it at process
  * start via `resolveMcpServerConfig` from `@crewhaus/mcp-host`.
  */
+/**
+ * 0.7.1 — `mcp_servers.<n>.tool_flags`, lowered. Tighten-only: every flag is
+ * the literal `true`, and there is no `readOnly` (it is a grant). `perTool`
+ * is keyed by the server's own tool name. The emitted bundle hands it to
+ * `resolveMcpServerConfig` with the rest of the config, and `@crewhaus/tool-mcp`
+ * folds it in when it registers the server's tools. Mirrors
+ * `McpToolFlagsConfig` in `@crewhaus/mcp-host`.
+ */
+export type IrMcpToolTrustFlags = {
+  readonly destructive?: true;
+  readonly requireJustification?: true;
+};
+export type IrMcpToolFlags = {
+  readonly defaults?: IrMcpToolTrustFlags;
+  readonly perTool?: Readonly<Record<string, IrMcpToolTrustFlags>>;
+};
+
 export type IrMcpStdioConfig = {
   readonly transport: "stdio";
   readonly command: string;
   readonly args: readonly string[];
   readonly env?: Readonly<Record<string, IrSecretRef>>;
+  /** Present only when the spec sets `tool_flags`, so other configs lower byte-identically. */
+  readonly toolFlags?: IrMcpToolFlags;
   /** #406 — present (false) ONLY when the spec opted out of fail-fast
    *  (`required: false`): a failed boot connect degrades + retries instead
    *  of exiting. Absent = required, byte-identical to pre-#406. */
@@ -56,6 +75,8 @@ export type IrMcpSseConfig = {
   readonly transport: "sse";
   readonly url: string;
   readonly headers?: Readonly<Record<string, IrSecretRef>>;
+  /** See {@link IrMcpStdioConfig.toolFlags}. */
+  readonly toolFlags?: IrMcpToolFlags;
   /** #406 — see {@link IrMcpStdioConfig.required}. */
   readonly required?: false;
 };

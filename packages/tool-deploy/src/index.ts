@@ -375,6 +375,11 @@ function decidePin(current: CurrentPin, target: string, repin: boolean): PinDeci
 
 export const specPin: RegisteredTool = buildTool({
   name: "SpecPin",
+  operativeArgs: [
+    { field: "registryDir", kind: "path" },
+    { field: "specFile", kind: "path" },
+    { field: "env", kind: "id", within: "name" },
+  ],
   description:
     "Register a spec file's current content as a version in the local spec registry and pin that version to an environment (or to a tenant's overlay of one). Registration is @crewhaus/spec-changelog's autoRegisterSpecVersion: content-hashed, so re-registering unchanged content is a no-op that reports the version already holding it, and each new version appends a distilled entry to the per-spec CHANGELOG.md beside the manifest. Pinning is @crewhaus/spec-registry's own. It REFUSES to move a pin that already exists unless repin:true (the registry has no unpin and no pin history, so the previous binding would survive nowhere else) — but a tenant's FIRST overlay is not such a move: with no overlay file the version aliasForTenant returned is the global pin showing through its fallback, nothing of the tenant's is replaced, and the global pin is not touched, so it is written rather than refused. It refuses a spec name that maps onto the shared \"spec\" fallback directory, refuses when the manifest cannot be read or is a symlink (an unreadable manifest is never treated as 'no versions'), and refuses when any path the registry would open — the spec directory, its manifest, its changelog, a version file, a tenant overlay — resolves outside the workspace. NO AUDIT RECORD IS WRITTEN: @crewhaus/audit-log is not a dependency of this package, and the result says so next to the pin that did change. dryRun changes nothing and previews the same pin decision the real call makes.",
   inputSchema: z.object({
@@ -862,6 +867,10 @@ async function planRollback(
 
 export const deployRollback: RegisteredTool = buildTool({
   name: "DeployRollback",
+  operativeArgs: [
+    { field: "registryDir", kind: "path" },
+    { field: "env", kind: "id", within: "name" },
+  ],
   description:
     "Repoint an environment (or a tenant's overlay of one) at an earlier registered version of a spec, through @crewhaus/deployment-controller's rollback. DESTRUCTIVE: @crewhaus/spec-registry has no unpin and keeps no pin history, so the binding this replaces survives nowhere afterwards. dryRun defaults to TRUE and runs the same selection the real call runs. It REFUSES a relative version word such as \"previous\" (the registry keeps one version per environment with no history; the only record of what an environment used to point at is the @crewhaus/audit-log deployment_action chain, which this package does not depend on — use DeployInspect to pick a version by name), refuses a version this registry has never seen, refuses a version the manifest lists but whose file cannot be fetched (that pin would be written and the environment would resolve to nothing, reading as a successful deploy), refuses when the manifest cannot be read, and refuses when any path the registry would open resolves outside the workspace. NO AUDIT RECORD IS WRITTEN: @crewhaus/audit-log is not a dependency of this package, and the result says so next to the pin that did change.",
   inputSchema: z.object({

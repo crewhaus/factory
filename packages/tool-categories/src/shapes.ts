@@ -103,13 +103,17 @@ export const SHAPE_TOOL_PROFILES: Readonly<Record<ToolShape, ShapeToolProfile>> 
 });
 
 /**
- * The permission engine's sandbox floor reads this at runtime: unset means a
- * docker backend is available, and `CREWHAUS_SANDBOX=noop` denies every
- * code-execution call. The same expression `crewhaus run` evaluates, so a
- * compiled bundle and the interpreter agree.
+ * What a bundle's chat loop passes as `sandboxAvailable` when it registers a
+ * tool that runs model-written code. It calls the sandbox's own parser
+ * (`sandboxAvailableFromEnv`, re-exported by `@crewhaus/tool-code-execution`),
+ * so the permission floor and the backend read `CREWHAUS_SANDBOX` the same
+ * way — ` noop `, `NOOP` and a value naming no backend all deny (security-6#1).
+ * {@link resolveBuiltinTools} adds the import whenever it reports `sandbox`,
+ * so an emitter only has to splice the expression in.
  */
-export const SANDBOX_AVAILABLE_EXPR =
-  '((process.env.CREWHAUS_SANDBOX ?? "docker").toLowerCase() !== "noop")';
+export const SANDBOX_AVAILABLE_EXPR = "sandboxAvailableFromEnv()";
+/** The symbol {@link SANDBOX_AVAILABLE_EXPR} calls. */
+export const SANDBOX_AVAILABLE_SYMBOL = "sandboxAvailableFromEnv";
 
 /** Can `shape` compile `key`? The same rules `refusal` explains in words. */
 function carriedBy(key: string, entry: BuiltinToolEntry, shape: ToolShape): boolean {
@@ -266,16 +270,6 @@ export async function registerToolConfigs(
   return plan;
 }
 
-/**
- * `sandboxAvailable` from the environment — the runtime twin of
- * {@link SANDBOX_AVAILABLE_EXPR}: unset means docker, `noop` means none.
- */
-export function sandboxAvailableFromEnv(
-  env: Readonly<Record<string, string | undefined>>,
-): boolean {
-  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
-}
-
 export type ResolvedTools = {
   /** `import { a, b } from "@crewhaus/tool-x";`, one line per package, sorted. */
   readonly imports: ReadonlyArray<string>;
@@ -356,7 +350,12 @@ export function resolveBuiltinTools(
         ids.push(entry.export);
       }
       wiredKeys.push(key);
-      if (entry.sandbox === true) sandbox = true;
+      if (entry.sandbox === true) {
+        sandbox = true;
+        // The floor's parser ships with the code-execution package itself, so
+        // the import rides the group that already carries the tool.
+        if (!edge) group(entry.package).inits.add(SANDBOX_AVAILABLE_SYMBOL);
+      }
     }
     wiredSites.push(ids);
     wiredForInit.push({

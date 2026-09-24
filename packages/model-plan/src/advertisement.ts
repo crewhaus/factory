@@ -158,9 +158,32 @@ export function satisfiesFeatures(
  * so this cannot make one pattern match two tools.
  */
 export function matchesToolPattern(pattern: string, name: string): boolean {
+  if (matchesToolSpelling(pattern, name)) return true;
+  // 0.7.1 — an MCP tool is registered as `mcp__<server>__<tool>`; a pattern
+  // written against its pre-0.7.1 spelling `<server>__<tool>` still names it.
+  const legacy = legacyMcpName(name);
+  return legacy !== undefined && matchesToolSpelling(pattern, legacy);
+}
+
+function matchesToolSpelling(pattern: string, name: string): boolean {
   if (!pattern.includes("*"))
     return pattern === name || pattern.toLowerCase() === name.toLowerCase();
   return globToRegExp(pattern).test(name);
+}
+
+/**
+ * `<server>__<tool>` for an `mcp__<server>__<tool>` name, else undefined. The
+ * same rule as `legacyMcpToolName` in `@crewhaus/tool-catalog` and
+ * `@crewhaus/tool-permission-matcher`; this package keeps its own copy so it
+ * stays free of tool-package dependencies, and apps/cli's
+ * `mcp-names.test.ts` checks the copies agree.
+ */
+function legacyMcpName(name: string): string | undefined {
+  if (!name.startsWith("mcp__")) return undefined;
+  const rest = name.slice("mcp__".length);
+  const sep = rest.indexOf("__", 1);
+  if (sep < 1 || sep + 2 >= rest.length) return undefined;
+  return rest;
 }
 
 /**

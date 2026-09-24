@@ -10,7 +10,11 @@
 import { describe, expect, test } from "bun:test";
 import { ConfigError } from "@crewhaus/errors";
 import { buildStdioChildEnv } from "./client.js";
-import { resolveMcpServerConfig, resolveSecretRef } from "./resolve.js";
+import {
+  resolveMcpServerConfig,
+  resolveMcpServerConfigAsync,
+  resolveSecretRef,
+} from "./resolve.js";
 
 describe("resolveSecretRef", () => {
   test("literal ref returns the embedded value", () => {
@@ -152,6 +156,28 @@ describe("resolveMcpServerConfig", () => {
     ).toThrow(
       /environment variable THREDZ_API_KEY is not set \(required by mcp server "thredz" env THREDZ_API_KEY\)/,
     );
+  });
+});
+
+describe("resolveMcpServerConfig carries the spec's tool_flags (0.7.1)", () => {
+  const toolFlags = {
+    defaults: { destructive: true as const },
+    perTool: { publish: { requireJustification: true as const } },
+  };
+  test("sync and async, on both transports, untouched", async () => {
+    for (const cfg of [
+      { transport: "stdio" as const, command: "npx", toolFlags },
+      { transport: "sse" as const, url: "https://mcp.example", toolFlags },
+    ]) {
+      expect(resolveMcpServerConfig(cfg).toolFlags).toEqual(toolFlags);
+      expect((await resolveMcpServerConfigAsync(cfg)).toolFlags).toEqual(toolFlags);
+    }
+  });
+  test("absent stays absent", () => {
+    expect(Object.keys(resolveMcpServerConfig({ transport: "stdio", command: "npx" }))).toEqual([
+      "transport",
+      "command",
+    ]);
   });
 });
 

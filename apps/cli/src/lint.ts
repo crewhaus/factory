@@ -1,9 +1,19 @@
 import { type IrNode, checkShapeTools, lower } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
-import { type Spec, SpecParseError, parseSpec } from "@crewhaus/spec";
+import { type Spec, SpecParseError, mcpServerNameWarnings, parseSpec } from "@crewhaus/spec";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  type PermissionRuleProblem,
+  type RuleToolDescriptor,
+  permissionRuleProblems,
+} from "@crewhaus/tool-permission-matcher";
+import {
+  RUNTIME_TOOL_NAMES,
+  TOOL_FLAGS,
+  TOOL_FLAGS_BY_NAME,
+} from "@crewhaus/tool-registry-manifest/flags";
 import { auditModelPlan } from "./model-plan-lint";
 import { auditSpecToolNames, collectToolNames } from "./scope-audit";
 
@@ -152,6 +162,18 @@ export function runLint(
     });
   }
 
+  // Stage 5b — 0.7.1: an mcp_servers key with `__` in it, or `_` at either
+  // end, makes `mcp__<server>__<tool>` ambiguous. 0.7.0 ran such keys, so the
+  // spec still parses; `compile` prints the same warning.
+  for (const w of mcpServerNameWarnings(spec)) {
+    findings.push({
+      message: w.message,
+      path: w.path,
+      severity: "warning",
+      rule: "mcp-server-name",
+    });
+  }
+
   // Stage 6 — 0.6.0 (design §10.1): the model-plan checks shared with
   // `doctor --philosophy-alignment` — judge independence on pooled / strategy
   // blocks (warning), profile tools ⊆ the shape's resolved toolset (warning),
@@ -161,8 +183,69 @@ export function runLint(
     findings.push({ message: f.message, path: f.path, severity: f.severity, rule: f.rule });
   }
 
+  // Stage 7 — 0.7.1 (permission-integration#12): permission rules that can
+  // never do what they say — a spec key where the tool's name belongs, a
+  // near-miss tool name, an MCP server the spec does not declare, an
+  // argument pattern that cannot match the field the tool declares. Shared
+  // with `compile` (which fails on them under --strict) and PermissionAudit.
+  for (const p of permissionRuleProblemsOf(ir, resolveTool)) {
+    findings.push({
+      message: p.message,
+      path: `permissions.rules[${p.type} ${p.pattern}]`,
+      severity: "warning",
+      rule: `permission-rule:${p.code}`,
+    });
+  }
+
   // Warnings inform; only errors gate (`ok` drives the CLI exit code).
   return { ok: findings.every((f) => f.severity !== "error"), findings, spec, ir };
+}
+
+/**
+ * Every tool a rule can name, as the rule checker needs them: the builtins,
+ * with their flags, and the tools the runtime registers without a spec
+ * listing them (`Skill`, `ListTools`, the browser shape's `Type`, …), by name.
+ * Without the second half a real tool name reads as a typo of a builtin, and
+ * the "fix" for `alwaysAllow Skill` was `Shell`.
+ */
+export const KNOWN_TOOLS: ReadonlyArray<RuleToolDescriptor> = [
+  ...Object.values(TOOL_FLAGS),
+  ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
+];
+
+/**
+ * The permission rules of a lowered spec that can never do what they say
+ * (see `permissionRuleProblems`). A granted tool is described by the live
+ * tool `resolveTool` returns, falling back to the builtin manifest, so the
+ * check sees the same declarations the runtime will.
+ */
+export function permissionRuleProblemsOf(
+  ir: IrNode,
+  resolveTool: (name: string) => RegisteredTool | undefined,
+): PermissionRuleProblem[] {
+  const node = ir as {
+    readonly permissions?: { readonly rules?: ReadonlyArray<{ type: string; pattern: string }> };
+    readonly mcp_servers?: Readonly<Record<string, unknown>>;
+  };
+  const rules = node.permissions?.rules ?? [];
+  if (rules.length === 0) return [];
+  const granted: RuleToolDescriptor[] = [];
+  for (const name of collectToolNames(ir)) {
+    const live = resolveTool(name);
+    const described = live ?? TOOL_FLAGS[name] ?? TOOL_FLAGS_BY_NAME.get(name);
+    if (described === undefined) continue;
+    granted.push({
+      name: described.name,
+      key: name,
+      ...(described.operativeArgs !== undefined ? { operativeArgs: described.operativeArgs } : {}),
+    });
+  }
+  return permissionRuleProblems({
+    rules,
+    granted,
+    known: KNOWN_TOOLS,
+    mcpServers: Object.keys(node.mcp_servers ?? {}),
+  });
 }
 
 /** Re-exported for the CLI wrapper's philosophy-alignment parity note. */

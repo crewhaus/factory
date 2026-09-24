@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SPEC_HOOK_EVENTS, Spec, SpecParseError, parseSpec } from "./index";
+import { SPEC_HOOK_EVENTS, Spec, SpecParseError, mcpServerNameWarnings, parseSpec } from "./index";
 
 describe("parseSpec", () => {
   test("parses a minimal valid CLI spec", () => {
@@ -679,6 +679,75 @@ steps:
 `);
     if (spec.target !== "workflow") expect.unreachable();
     expect(spec.mcp_servers?.["fs"]).toBeDefined();
+  });
+
+  test("an mcp_servers key must fit inside mcp__<server>__<tool> (extension-path#15)", () => {
+    const withServer = (key: string) => `
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+  ${JSON.stringify(key)}:
+    transport: stdio
+    command: npx
+`;
+    expect(() => parseSpec(withServer("my server.v2"))).toThrow(
+      'mcp_servers key "my server.v2" can only use letters, digits, "-" and "_". Rename it, e.g. "my-server-v2", and rename the permission rules, hooks and rate_limits that name it to match.',
+    );
+    for (const bad of ["a.b", "a b", ""]) {
+      expect(() => parseSpec(withServer(bad))).toThrow(/mcp_servers key/);
+    }
+    for (const good of ["a", "github", "my_server", "my-server", "A1", "-a"]) {
+      const spec = parseSpec(withServer(good));
+      expect(mcpServerNameWarnings(spec)).toEqual([]);
+    }
+  });
+
+  test("an mcp_servers key 0.7.0 ran still parses, with a warning that says what to rename", () => {
+    const withServers = (...keys: string[]) => `
+name: hello
+target: cli
+agent:
+  model: m
+  instructions: i
+mcp_servers:
+${keys.map((k) => `  ${JSON.stringify(k)}:\n    transport: stdio\n    command: npx`).join("\n")}
+`;
+    const spec = parseSpec(withServers("gh__enterprise", "_internal", "trail_", "fine"));
+    const warnings = mcpServerNameWarnings(spec);
+    expect(warnings.map((w) => w.path)).toEqual([
+      "mcp_servers.gh__enterprise",
+      "mcp_servers._internal",
+      "mcp_servers.trail_",
+    ]);
+    expect(warnings[0]?.message).toBe(
+      'mcp_servers key "gh__enterprise" contains "__", which also separates the server from the tool in mcp__<server>__<tool>, so two servers\' tool names can collide. Rename it, e.g. "gh-enterprise", and rename the permission rules, hooks and rate_limits that name gh__enterprise__… or mcp__gh__enterprise__… to match.',
+    );
+    expect(warnings[1]?.message).toMatch(
+      /^mcp_servers key "_internal" starts or ends with "_", which blurs where mcp__<server>__<tool> splits.* Rename it, e\.g\. "internal"/,
+    );
+  });
+
+  test("a model profile may select the tools of a declared key that contains `__`", () => {
+    expect(() =>
+      parseSpec(`
+name: hello
+target: cli
+agent:
+  model: default
+  instructions: i
+models:
+  default:
+    model: claude-sonnet-5
+    tools: [mcp__gh__enterprise__*]
+mcp_servers:
+  gh__enterprise:
+    transport: stdio
+    command: npx
+`),
+    ).not.toThrow();
   });
 
   test("mcp_servers field is optional", () => {

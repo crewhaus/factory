@@ -267,6 +267,42 @@ describe("createTaskTool — execute round-trip", () => {
     }
   });
 
+  test("a def.tools entry in the pre-0.7.1 <server>__<tool> spelling still names the MCP tool", async () => {
+    const root = newTempDir();
+    try {
+      let captured: ReadonlyArray<RegisteredTool> | undefined;
+      const spawn: SpawnSubAgentFn = mock(async (_p, opts) => {
+        captured = opts.childTools;
+        return {
+          finalMessage: "ok",
+          transcript: [],
+          toolCalls: [],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        };
+      });
+      const mcpTool = buildTool({
+        name: "mcp__gh__create_issue",
+        description: "an MCP tool",
+        inputSchema: z.object({}),
+        execute: async () => "ok",
+      });
+      const { bridge, close } = await makeBridge(root, spawn, [makeReadTool(), mcpTool]);
+      const inline: SubAgentDefinition = {
+        name: "filer",
+        description: "files issues",
+        instructions: "x",
+        tools: ["gh__create_issue"],
+        permissions: "scoped",
+      };
+      const tool = createTaskTool({ subAgents: new Map([["filer", inline]]) });
+      await tool.execute({ description: "x", prompt: "y", subagent_type: "filer" }, { bridge });
+      expect(captured?.map((t) => t.name)).toEqual(["mcp__gh__create_issue"]);
+      await close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("returns clean error when bridge is missing", async () => {
     const tool = createTaskTool({});
     const result = await tool.execute({ description: "x", prompt: "y" }, { signal: undefined });

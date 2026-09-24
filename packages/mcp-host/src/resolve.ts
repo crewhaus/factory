@@ -27,7 +27,12 @@
  * backend semantics (missing OR empty ⇒ error).
  */
 import { ConfigError } from "@crewhaus/errors";
-import type { McpServerConfig, SseServerConfig, StdioServerConfig } from "./types.js";
+import type {
+  McpServerConfig,
+  McpToolFlagsConfig,
+  SseServerConfig,
+  StdioServerConfig,
+} from "./types.js";
 
 /** Structural mirror of `@crewhaus/ir`'s `IrSecretRef`. */
 export type McpSecretRef =
@@ -46,12 +51,14 @@ export type UnresolvedStdioServerConfig = {
   readonly command: string;
   readonly args?: ReadonlyArray<string>;
   readonly env?: Readonly<Record<string, McpSecretLike>>;
+  readonly toolFlags?: McpToolFlagsConfig;
 };
 
 export type UnresolvedSseServerConfig = {
   readonly transport: "sse";
   readonly url: string;
   readonly headers?: Readonly<Record<string, McpSecretLike>>;
+  readonly toolFlags?: McpToolFlagsConfig;
 };
 
 export type UnresolvedMcpServerConfig = UnresolvedStdioServerConfig | UnresolvedSseServerConfig;
@@ -208,6 +215,7 @@ export async function resolveMcpServerConfigAsync(
       ...(config.env !== undefined
         ? { env: await resolveSecretMapAsync(config.env, `${serverLabel} env`, passthrough) }
         : {}),
+      ...(config.toolFlags !== undefined ? { toolFlags: config.toolFlags } : {}),
     };
     return resolved;
   }
@@ -223,6 +231,7 @@ export async function resolveMcpServerConfigAsync(
           ),
         }
       : {}),
+    ...(config.toolFlags !== undefined ? { toolFlags: config.toolFlags } : {}),
   };
   return resolved;
 }
@@ -262,6 +271,9 @@ export function resolveMcpServerConfig(
       ...(config.env !== undefined
         ? { env: resolveSecretMap(config.env, `${serverLabel} env`, opts.env) }
         : {}),
+      // Carried, not resolved: the trust flags the spec set on this server's
+      // tools, which tool-mcp folds in when it registers them.
+      ...(config.toolFlags !== undefined ? { toolFlags: config.toolFlags } : {}),
     };
     return resolved;
   }
@@ -271,6 +283,7 @@ export function resolveMcpServerConfig(
     ...(config.headers !== undefined
       ? { headers: resolveSecretMap(config.headers, `${serverLabel} header`, opts.env) }
       : {}),
+    ...(config.toolFlags !== undefined ? { toolFlags: config.toolFlags } : {}),
   };
   return resolved;
 }

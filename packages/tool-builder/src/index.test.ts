@@ -296,3 +296,202 @@ describe("buildTool — execute delegation", () => {
     expect(tool.execute({ message: "x" })).rejects.toThrow("boom");
   });
 });
+
+describe("buildTool — operativeArgs (0.7.1)", () => {
+  const exec = async () => "ok";
+  const nested = z.object({
+    path: z.string().optional(),
+    content: z.string(),
+    argv: z.array(z.string()),
+    target: z.object({ url: z.string() }).strict(),
+    requests: z.array(z.object({ url: z.string(), method: z.enum(["GET", "POST"]) })),
+    issue: z.number().int(),
+    mode: z.union([z.literal("fast"), z.literal("slow")]),
+    refined: z.string().refine((s) => s.length > 0),
+  });
+
+  test("passes a valid declaration through, frozen", () => {
+    const tool = buildTool({
+      name: "Nested",
+      description: "d",
+      inputSchema: nested,
+      execute: exec,
+      operativeArgs: [
+        { field: "path", kind: "path", default: "." },
+        { field: "argv", kind: "command" },
+        { field: "target.url", kind: "url" },
+        { field: "requests.url", kind: "url" },
+        { field: "issue", kind: "id" },
+        { field: "mode", kind: "text" },
+        { field: "refined", kind: "text" },
+      ],
+    });
+    expect(tool.operativeArgs?.map((a) => a.field)).toEqual([
+      "path",
+      "argv",
+      "target.url",
+      "requests.url",
+      "issue",
+      "mode",
+      "refined",
+    ]);
+    expect(tool.operativeArgs?.[0]).toEqual({ field: "path", kind: "path", default: "." });
+    expect(Object.isFrozen(tool.operativeArgs)).toBe(true);
+  });
+
+  test("omitted on the definition ⇒ omitted on the tool", () => {
+    expect("operativeArgs" in buildTool(echoDef)).toBe(false);
+  });
+
+  test("a field the schema does not have throws at build time, naming what is there", () => {
+    expect(() =>
+      buildTool({ ...echoDef, operativeArgs: [{ field: "file_path", kind: "path" }] }),
+    ).toThrow(
+      /tool "Echo": operativeArgs \[0\]: the input schema has no field "file_path" \(it has: message\)/,
+    );
+  });
+
+  test("an unknown nested field throws too", () => {
+    expect(() =>
+      buildTool({
+        name: "Nested",
+        description: "d",
+        inputSchema: nested,
+        execute: exec,
+        operativeArgs: [{ field: "target.host", kind: "url" }],
+      }),
+    ).toThrow(/has no field "target.host"/);
+  });
+
+  test("descending into a string throws", () => {
+    expect(() =>
+      buildTool({ ...echoDef, operativeArgs: [{ field: "message.inner", kind: "text" }] }),
+    ).toThrow(/"message" is not an object/);
+  });
+
+  test("a non-string field is refused unless the kind is id", () => {
+    const def = {
+      name: "Nested",
+      description: "d",
+      inputSchema: nested,
+      execute: exec,
+    };
+    expect(() => buildTool({ ...def, operativeArgs: [{ field: "issue", kind: "text" }] })).toThrow(
+      /"issue" is a number; only kind "id"/,
+    );
+    expect(() =>
+      buildTool({
+        name: "Obj",
+        description: "d",
+        inputSchema: z.object({ target: z.object({ url: z.string() }) }),
+        execute: exec,
+        operativeArgs: [{ field: "target", kind: "url" }],
+      }),
+    ).toThrow(/is a object, not a string/);
+  });
+
+  test("an unknown kind, an empty segment and a duplicate field are refused", () => {
+    expect(() =>
+      buildTool({
+        ...echoDef,
+        operativeArgs: [{ field: "message", kind: "glob" as unknown as "text" }],
+      }),
+    ).toThrow(/kind "glob" is not one of path, url, command, recipient, text, id/);
+    expect(() =>
+      buildTool({ ...echoDef, operativeArgs: [{ field: "message.", kind: "text" }] }),
+    ).toThrow(/empty segment/);
+    expect(() =>
+      buildTool({
+        ...echoDef,
+        operativeArgs: [
+          { field: "message", kind: "text" },
+          { field: "message", kind: "text" },
+        ],
+      }),
+    ).toThrow(/names "message" twice/);
+  });
+
+  test("an empty declaration is kept: the tool says no argument scopes it", () => {
+    const tool = buildTool({ ...echoDef, operativeArgs: [] });
+    expect(tool.operativeArgs).toEqual([]);
+  });
+
+  describe("within — one field qualified by another", () => {
+    const repoSchema = z.object({
+      owner: z.string(),
+      repo: z.string(),
+      chainId: z.number().int(),
+      tags: z.array(z.string()),
+      path: z.string(),
+      nested: z.object({ org: z.string() }),
+    });
+    const def = { name: "Repo", description: "d", inputSchema: repoSchema, execute: exec };
+
+    test("a recipient, text or id field can name a top-level string or number", () => {
+      const tool = buildTool({
+        ...def,
+        operativeArgs: [
+          { field: "repo", kind: "recipient", within: "owner" },
+          { field: "owner", kind: "id", within: "chainId" },
+        ],
+      });
+      expect(tool.operativeArgs?.[0]).toEqual({
+        field: "repo",
+        kind: "recipient",
+        within: "owner",
+      });
+    });
+
+    test("each way a qualifier can be wrong is refused, saying why", () => {
+      const bad =
+        (within: string, kind: "recipient" | "path" = "recipient") =>
+        () =>
+          buildTool({
+            ...def,
+            operativeArgs: [{ field: kind === "path" ? "path" : "repo", kind, within }],
+          });
+      expect(() =>
+        buildTool({ ...def, operativeArgs: [{ field: "owner", kind: "url", within: "repo" }] }),
+      ).toThrow(/a "url" value cannot be qualified/);
+      expect(bad("owner", "path")).not.toThrow();
+      expect(bad("missing")).toThrow(/has no top-level field "missing"/);
+      expect(bad("tags")).toThrow(/field "tags" is a list/);
+      expect(bad("nested")).toThrow(/field "nested" is not a string or a number/);
+      expect(bad("nested.org")).toThrow(/must name one top-level input field/);
+      expect(bad("repo")).toThrow(/names "repo" itself/);
+    });
+  });
+
+  test("an opaque schema (an MCP tool's z.unknown()) accepts any field", () => {
+    const tool = buildTool({
+      name: "Opaque",
+      description: "d",
+      inputSchema: z.unknown(),
+      execute: exec,
+      operativeArgs: [{ field: "anything.at.all", kind: "text" }],
+    });
+    expect(tool.operativeArgs).toHaveLength(1);
+  });
+});
+
+describe("buildTool — the documented defaults (security-7#11)", () => {
+  test("an unannotated tool is neither read-only nor destructive, which auto mode allows", () => {
+    // The docstring says so; this pins the facts it describes.
+    const tool = buildTool(echoDef);
+    expect({
+      readOnly: tool.readOnly,
+      destructive: tool.destructive,
+      requiresSandbox: tool.requiresSandbox,
+      requireJustification: tool.requireJustification,
+      scope: tool.scope,
+      classifyOutput: tool.classifyOutput,
+    }).toEqual({
+      readOnly: false,
+      destructive: false,
+      requiresSandbox: false,
+      requireJustification: false,
+      scope: "internal",
+      classifyOutput: true,
+    });
+  });
+});

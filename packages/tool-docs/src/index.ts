@@ -431,6 +431,7 @@ const docxBlockSchema = z.discriminatedUnion("type", [
 
 export const docxWrite: RegisteredTool = buildTool({
   name: "DocxWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write a .docx from structured content: headings, paragraphs, bullet or numbered lists, and tables. Use to hand somebody a real Word file; it produces a MINIMAL valid document with plain styling, not a re-render of an existing one.",
   inputSchema: z.object({
@@ -510,6 +511,7 @@ const cellSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
 export const xlsxWrite: RegisteredTool = buildTool({
   name: "XlsxWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write a .xlsx from rows, with numbers, booleans and strings kept as their own cell types and an optional bold header row. Use to produce a spreadsheet somebody can open; ISO-8601 strings become real date cells only for the columns you name, never by guessing.",
   inputSchema: z.object({
@@ -732,6 +734,10 @@ export const pdfText: RegisteredTool = buildTool({
 
 export const pdfSplit: RegisteredTool = buildTool({
   name: "PdfSplit",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Write a new PDF containing only the pages you select from an existing one. Use to pull a chapter or an exhibit out of a large PDF; the page tree is rebuilt from scratch, so the output is well-formed even when the input's cross-reference table was not.",
   inputSchema: z.object({
@@ -769,6 +775,10 @@ export const pdfSplit: RegisteredTool = buildTool({
 
 export const pdfMerge: RegisteredTool = buildTool({
   name: "PdfMerge",
+  operativeArgs: [
+    { field: "inputs.path", kind: "path" },
+    { field: "output", kind: "path" },
+  ],
   description:
     "Concatenate several PDFs, or selected pages of them, into one new file. Use to assemble an exhibit set or a combined report; each source's page objects are copied into a freshly built page tree, and annotations and bookmarks are dropped rather than left pointing at pages that are no longer there.",
   inputSchema: z.object({
@@ -990,6 +1000,7 @@ export const icsParse: RegisteredTool = buildTool({
 
 export const icsWrite: RegisteredTool = buildTool({
   name: "IcsWrite",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Write an RFC 5545 calendar file from a list of events, with correct 75-octet line folding and text escaping. Use to produce an invitation or a feed another calendar application can import; the DTSTAMP is an input, so the same events always write the same bytes.",
   inputSchema: z.object({

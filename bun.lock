@@ -177,6 +177,7 @@
         "@crewhaus/tool-pkgmgr": "workspace:*",
         "@crewhaus/tool-proc": "workspace:*",
         "@crewhaus/tool-registry": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
         "@crewhaus/tool-retrieve": "workspace:*",
         "@crewhaus/tool-routing": "workspace:*",
         "@crewhaus/tool-schema": "workspace:*",
@@ -200,9 +201,6 @@
         "@crewhaus/watchme-store": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
         "yaml": "^2.6.0",
-      },
-      "devDependencies": {
-        "@crewhaus/tool-registry-manifest": "workspace:*",
         "zod": "^3.23.8",
       },
       "optionalDependencies": {
@@ -807,6 +805,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
@@ -904,6 +903,7 @@
         "@crewhaus/routing-store": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
         "@crewhaus/skills-registry": "workspace:*",
         "@crewhaus/slash-commands": "workspace:*",
         "@crewhaus/spec": "workspace:*",
@@ -1032,6 +1032,7 @@
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/eval-grader": "workspace:*",
         "@crewhaus/grader-registry": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
       },
     },
     "packages/grader-continuity": {
@@ -1144,6 +1145,7 @@
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
       },
       "devDependencies": {
@@ -2196,11 +2198,10 @@
         "@crewhaus/harness-advice": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
-        "@crewhaus/tool-permission-matcher": "workspace:*",
-        "zod": "^3.23.8",
-      },
-      "devDependencies": {
         "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
+        "zod": "^3.23.8",
       },
     },
     "packages/tool-bash": {
@@ -2428,6 +2429,8 @@
         "@crewhaus/target-cli": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {

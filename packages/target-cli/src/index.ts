@@ -697,8 +697,11 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   const bannerBoot = renderBannerBoot(ir.name, ir.cli?.banner);
   // Section 18 — only flip `sandboxAvailable` on at runtime when the
   // operator has wired a real backend. Default (unset) treats docker as
-  // available; `CREWHAUS_SANDBOX=noop` always denies the floor.
-  // The resolver reports whether any registered tool runs model-written code.
+  // available; `CREWHAUS_SANDBOX=noop` (however it is spaced or cased) and a
+  // value naming no backend deny the floor. The bundle reads the variable
+  // through the sandbox's own parser, so the floor and the backend can never
+  // disagree about what it says (security-6#1). The resolver reports whether a
+  // registered tool runs model-written code, and imports that parser with it.
   const sandboxField = hasSandboxTools ? `\n  sandboxAvailable: ${SANDBOX_AVAILABLE_EXPR},` : "";
   const maxTokensField =
     ir.agent.maxTokens !== undefined ? `\n  maxTokens: ${ir.agent.maxTokens},` : "";

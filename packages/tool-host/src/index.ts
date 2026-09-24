@@ -578,6 +578,7 @@ function collectDisk(path: string, unknown: Unknowns): Record<string, unknown> |
 
 export const systemInfo: RegisteredTool = buildTool({
   name: "SystemInfo",
+  operativeArgs: [],
   description:
     "Report what this machine is — os and kernel, cpu count and model, memory, uptime, runtime version, and on request battery and free disk space. Use it to gate a heavy step on real capacity instead of guessing. Anything a probe could not establish comes back as null with the probe and the reason in `unknown`; a missing battery is never 0% and an unreadable cpu list is never 0 cores.",
   inputSchema: z.object({
@@ -852,6 +853,7 @@ function readDns(facts: HostFacts, unknown: Unknowns): Record<string, unknown> {
 
 export const networkInfo: RegisteredTool = buildTool({
   name: "NetworkInfo",
+  operativeArgs: [],
   description:
     "Report how this machine is attached to the network: its interfaces with addresses, MTU and carrier state, the DNS resolvers and search domains in effect, and the proxy environment with any credentials redacted. Use it to explain a connectivity problem from the host's own configuration. It opens no connection and resolves no name; anything a probe could not establish is null with a reason, never an empty interface list.",
   inputSchema: z.object({
@@ -1273,6 +1275,7 @@ async function readSockets(
 
 export const portInspect: RegisteredTool = buildTool({
   name: "PortInspect",
+  operativeArgs: [],
   description:
     "List the TCP ports this machine is listening on, with the owning process where it can be read, and answer whether specific ports are in use. Use it before binding a port, or to find what is already holding one. A socket whose owner cannot be read is reported WITH an unknown owner rather than dropped, and `listening` is null — never false — when the probe that ran could not see every user's sockets.",
   inputSchema: z.object({

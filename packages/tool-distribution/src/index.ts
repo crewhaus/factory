@@ -387,6 +387,7 @@ type AssetRow = {
 
 export const packageManifestVerify: RegisteredTool = buildTool({
   name: "PackageManifestVerify",
+  operativeArgs: [{ field: "paths", kind: "path" }],
   description:
     "Check that a published package manifest is telling the truth: fetch every URL it points at, hash the bytes, and compare them to the sha256 the manifest claims. Also checks that the version in the file matches the version in its download URLs, that a Debian paragraph's continuation lines are intact, and that a winget InstallerSha256 is uppercase. Takes one manifest or all four, as text or as workspace-relative paths, and recognises the format on its own. Every download is streamed and hashed as it arrives, never held in memory, and capped. The result distinguishes three outcomes and never collapses them: the asset is MISSING (a definite 404), the hash DISAGREES (a definite mismatch), or the check COULD NOT BE MADE (DNS failed, the deadline elapsed, the body stopped short, the cap was hit, the SSRF guard refused the hop) — with the reason named, because 'could not reach it' is neither a pass nor a failure.",
   inputSchema: z.object({

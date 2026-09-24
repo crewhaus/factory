@@ -337,7 +337,9 @@ describe("package contract", () => {
     "UrlReachable",
   ]);
   const mutating = new Set(["DownloadFile", "GraphqlQuery", "HttpBatch", "HttpRequest"]);
-  const justified = new Set(["GraphqlQuery", "HttpBatch", "HttpRequest"]);
+  // DownloadFile since 0.7.1: every destructive tool that goes to a place the
+  // model chose is justification-gated (apps/cli/src/flag-rules.test.ts).
+  const justified = new Set(["DownloadFile", "GraphqlQuery", "HttpBatch", "HttpRequest"]);
 
   test("every tool is exported in HTTP_TOOLS, with unique PascalCase names", () => {
     expect(HTTP_TOOLS.length).toBe(17);

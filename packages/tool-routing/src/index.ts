@@ -253,6 +253,7 @@ const ROUTE_ACTIONS = ["status", "freeze", "unfreeze", "promote", "compact"] as 
 
 export const routeControl: RegisteredTool = buildTool({
   name: "RouteControl",
+  operativeArgs: [{ field: "dir", kind: "path", default: "." }],
   description:
     "Inspect and steer a harness's learned model routing: the per-(routeKey, arm) reward scoreboard, the `route freeze` kill switch, and the promotion of observe-only `q:` / `shadow:` lane evidence into the live arms. Every rate it reports carries a Wilson interval and every mean carries its n, because an arm with three observations is not a better arm than one with three hundred. It REFUSES to promote or compact when the freeze marker exists (the pin is the kill switch) AND when the marker exists but cannot be parsed — a corrupt kill switch is not an absent one, and `promoteLanes`'s own freeze check reads it as absent. A real promotion additionally needs acceptUngated:true, because this tool does not resolve the eval gate `crewhaus route promote` requires. Resetting the scoreboard is deliberately not offered; use `crewhaus route reset`. dryRun defaults to true and changes nothing; the promotion preview is promoteLanes' own dryRun, running the same fold.",
   inputSchema: z.object({
@@ -670,6 +671,11 @@ const LEDGER_ACTIONS = ["list", "tally", "assign", "record"] as const;
 
 export const experimentLedger: RegisteredTool = buildTool({
   name: "ExperimentLedger",
+  operativeArgs: [
+    { field: "dir", kind: "path" },
+    { field: "experimentsDir", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Assign a stable request key to a spec-version variant, record outcomes, and fold the ledger into per-version tallies with an explicit winner or an explicit 'undecided'. The assignment hash is @crewhaus/canary-controller's own, so a two-version canary and an N-variant experiment can never disagree about which side of the split a key is on. Repeat eval measurements of the same (version, sample) are collapsed BEFORE the tally, because re-running an eval otherwise inflates n and narrows the interval enough to name a winner that does not exist. Every success rate carries a Wilson interval; the comparison between versions is a Mann-Whitney rank test over the per-observation scores, Bonferroni-corrected for the number of pairs, never a difference of means. Nothing here intercepts a live request: selection is a decision function and this is accounting. `record` writes; dryRun defaults to true.",
   inputSchema: z.object({

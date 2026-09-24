@@ -14,7 +14,7 @@
  * call, and nothing adjacent to it.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -91,7 +91,7 @@ describe("a rule built from a value full of glob metacharacters", () => {
   async function ruleForHostilePath(): Promise<string> {
     askSession(tmp, "sess_1", {
       toolName: "Read",
-      input: { file_path: HOSTILE_PATH },
+      input: { path: HOSTILE_PATH },
       approved: 3,
     });
     const out = await suggest();
@@ -171,7 +171,7 @@ describe("a rule built from a value full of glob metacharacters", () => {
 
   test("ApprovalStatus shows the same value back without mangling it", async () => {
     writeApprovals(tmp, [
-      approval({ id: approvalId(1), toolName: "Read", input: { file_path: HOSTILE_PATH } }),
+      approval({ id: approvalId(1), toolName: "Read", input: { path: HOSTILE_PATH } }),
     ]);
     const out = JSON.parse(await approvalStatus.execute({ approvalId: approvalId(1) })) as {
       approval: { operativeValue: string };
@@ -271,7 +271,7 @@ describe("a proposal that covers more than the approved call says so", () => {
   test("a value containing a parenthesis silently drops the argument constraint — and is labelled", async () => {
     askSession(tmp, "sess_1", {
       toolName: "Read",
-      input: { file_path: "docs/(draft).md" },
+      input: { path: "docs/(draft).md" },
       approved: 3,
     });
     const out = await suggest();
@@ -286,45 +286,32 @@ describe("a proposal that covers more than the approved call says so", () => {
     expect(ruleCovers(suggestion.pattern, "Read", "/etc/shadow")).toBe(true);
   });
 
-  test("an argument-constrained rule for a tool with FIELD ALIASES says it is still wider — and it is", async () => {
+  test("an argument-constrained rule covers only the approved call, whatever else the call carries (0.7.1)", async () => {
     askSession(tmp, "sess_1", {
       toolName: "Read",
-      input: { file_path: "notes/a.md" },
+      input: { path: "notes/a.md" },
       approved: 3,
     });
     const out = await suggest();
     const suggestion = out.suggestions[0] as SuggestResult["suggestions"][number];
     expect(suggestion.pattern).toBe("Read(notes/a.md)");
     expect(suggestion.argConstrained).toBe(true);
-    expect(suggestion.evidence.some((l) => l.startsWith("WIDER THAN THE APPROVED CALL"))).toBe(
-      true,
-    );
-    // Demonstrated, not asserted: `matchesPattern` takes the value from ANY of
-    // the tool's operative fields, so the approved value in one alias carries a
-    // never-approved value in the other past the rule.
+    // Demonstrated, not asserted: an allow rule needs EVERY operative value of
+    // the call to match, so the approved value in one alias no longer carries
+    // a never-approved value in the other past the rule…
     const compiled = compilePattern(suggestion.pattern);
     expect(matchesPattern(compiled, "Read", { file_path: "notes/a.md" })).toBe(true);
     expect(matchesPattern(compiled, "Read", { file_path: "notes/a.md", path: "/etc/shadow" })).toBe(
-      true,
+      false,
     );
-    // A tool with a SINGLE operative field gets no such line, because it has no
-    // such alias — the note must not be boilerplate on every suggestion.
-    expect(
-      (
-        await (async () => {
-          rmSync(path.join(tmp, ".crewhaus"), { recursive: true, force: true });
-          askSession(tmp, "sess_2", {
-            toolName: "Bash",
-            input: { command: "git status" },
-            approved: 3,
-          });
-          return await suggest();
-        })()
-      ).suggestions[0]?.evidence.some((l) => l.startsWith("WIDER THAN THE APPROVED CALL")),
-    ).toBe(false);
+    // …so there is no widening left to disclose.
+    expect(suggestion.evidence.some((l) => l.startsWith("WIDER THAN THE APPROVED CALL"))).toBe(
+      false,
+    );
+    expect(suggestion.evidence.some((l) => l.startsWith("BLANKET GRANT"))).toBe(false);
   });
 
-  test("a tool with no operative-argument field can only ever get a blanket grant — and is labelled", async () => {
+  test("a tool that declares no scoping argument can only ever get a blanket grant — and is labelled", async () => {
     writeSession(tmp, "sess_1", [
       toolUse("notes__read", { query: "anything" }),
       permissionAsk("notes__read", "approved"),
@@ -335,13 +322,17 @@ describe("a proposal that covers more than the approved call says so", () => {
     const suggestion = out.suggestions[0] as SuggestResult["suggestions"][number];
     expect(suggestion.pattern).toBe("notes__read");
     expect(suggestion.argConstrained).toBe(false);
-    expect(suggestion.evidence.join(" ")).toContain("no operative-argument field");
+    const note = suggestion.evidence.find((l) => l.startsWith("BLANKET GRANT")) ?? "";
+    expect(note).toContain("does not declare which argument decides where it acts");
+    // The note no longer claims a rule could not be scoped at all: the matcher
+    // does check an argument pattern on an undeclared tool, against its text.
+    expect(note).not.toContain("no rule can constrain");
   });
 
-  test("several distinct approved inputs also yield a bare grant, as harness-advice already explains", async () => {
+  test("several distinct approved inputs also yield a bare grant, and say so", async () => {
     writeSession(tmp, "sess_1", [
-      toolUse("Read", { file_path: "a.md" }),
-      toolUse("Read", { file_path: "b.md" }),
+      toolUse("Read", { path: "a.md" }),
+      toolUse("Read", { path: "b.md" }),
       permissionAsk("Read", "approved"),
       permissionAsk("Read", "approved"),
       permissionAsk("Read", "approved"),
@@ -350,7 +341,84 @@ describe("a proposal that covers more than the approved call says so", () => {
     const suggestion = out.suggestions[0] as SuggestResult["suggestions"][number];
     expect(suggestion.pattern).toBe("Read");
     expect(suggestion.argConstrained).toBe(false);
-    expect(suggestion.evidence.join(" ")).toContain("inputs varied");
+    const note = suggestion.evidence.find((l) => l.startsWith("BLANKET GRANT")) ?? "";
+    expect(note).toContain("2 different places");
+    expect(note).toContain("Read(a.md)");
+  });
+
+  test("a 0.7.0 builtin is scoped on the argument it declares, and verified on it", async () => {
+    // The finding (permission-integration#8): three approvals of `rm build/cache`
+    // became "delete anything", three `git status` became "run any command".
+    writeSession(tmp, "sess_1", [
+      toolUse("RemovePath", { path: "build/cache", recursive: true }),
+      toolUse("RunCommand", { argv: ["git", "status"] }),
+      toolUse("HttpRequest", { url: "https://API.example.com/v1/items", method: "GET" }),
+      ...Array.from({ length: 3 }, () => permissionAsk("RemovePath", "approved")),
+      ...Array.from({ length: 3 }, () => permissionAsk("RunCommand", "approved")),
+      ...Array.from({ length: 3 }, () => permissionAsk("HttpRequest", "approved")),
+    ]);
+    const out = await suggest();
+    expect(out.rejected).toEqual([]);
+    const byTool = new Map(out.suggestions.map((s) => [s.toolName, s]));
+    expect(byTool.get("RemovePath")?.pattern).toBe("RemovePath(build/cache)");
+    expect(byTool.get("RunCommand")?.pattern).toBe("RunCommand(git status)");
+    // The URL in the parsed form the matcher compares.
+    expect(byTool.get("HttpRequest")?.pattern).toBe(
+      "HttpRequest(https://api.example.com/v1/items)",
+    );
+    for (const s of out.suggestions) {
+      expect(s.argConstrained).toBe(true);
+      expect(s.verified).toContain("matches the approved call");
+      expect(s.evidence.some((l) => l.startsWith("BLANKET GRANT"))).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a planted session log is not a way out of the workspace (security-2#2)
+// ---------------------------------------------------------------------------
+
+describe("a session log that links outside the workspace", () => {
+  test("is not mined, and nothing it holds reaches the answer", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-tool-approvals-outside-"));
+    try {
+      // Another project's transcript, holding a secret inside a tool input and
+      // three approved asks — enough to become a suggestion if it were read.
+      const secretCommand =
+        "curl -H 'Authorization: Bearer sk-OUTSIDE-SECRET' https://internal.example";
+      const foreign = path.join(outside, "other-project-session.jsonl");
+      writeFileSync(
+        foreign,
+        `${[
+          toolUse("Bash", { command: secretCommand }),
+          permissionAsk("Bash", "approved"),
+          permissionAsk("Bash", "approved"),
+          permissionAsk("Bash", "approved"),
+        ].join("\n")}\n`,
+      );
+      const sessions = path.join(tmp, "h", ".crewhaus", "sessions");
+      mkdirSync(sessions, { recursive: true });
+      symlinkSync(foreign, path.join(sessions, "sess_planted.jsonl"));
+
+      const raw = await permissionsSuggest.execute({ dir: "h" });
+      const out = JSON.parse(raw) as {
+        mined: { mined: string[]; unreadable: Array<{ file: string; reason: string }> };
+        suggestions: unknown[];
+        unknown: Array<{ field: string }>;
+      };
+      expect(out.mined.mined).toEqual([]);
+      expect(out.suggestions).toEqual([]);
+      expect(out.mined.unreadable).toEqual([
+        {
+          file: "sess_planted.jsonl",
+          reason: "is a symbolic link that leads outside the workspace, so it was not read",
+        },
+      ]);
+      expect(out.unknown.map((u) => u.field)).toContain("mined.unreadable");
+      expect(raw).not.toContain("sk-OUTSIDE-SECRET");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });
 

@@ -14,9 +14,11 @@ import {
 import { z } from "zod";
 import { type SessionEvents, parseJsonlObjects } from "./advise-rules";
 import {
+  type AskAggregate,
   OPERATIVE_ARG_FIELDS,
   aggregateAsks,
   applyToSettingsRoot,
+  blanketGrantNote,
   diffPermissions,
   existingSettingsRules,
   formatSettingsDiff,
@@ -24,6 +26,7 @@ import {
   patternFor,
   rankSuggestions,
   readOnlyByName,
+  suggestLookupFromTools,
 } from "./permissions-suggest";
 
 function tool(name: string, readOnly: boolean): RegisteredTool {
@@ -112,6 +115,113 @@ describe("aggregateAsks", () => {
   it("tolerates old-vintage logs with no permission lines", () => {
     const s = session("sess_00000000000000dd", [line("assistant_message", { text: "hi" })]);
     expect(aggregateAsks([s]).size).toBe(0);
+  });
+});
+
+// -------- 0.7.1: reading a call the way the matcher reads it --------
+
+describe("aggregateAsks with the tools' own declarations (permission-integration#8)", () => {
+  function declared(
+    name: string,
+    operativeArgs: RegisteredTool["operativeArgs"],
+    shape: z.ZodRawShape,
+    extra: Partial<RegisteredTool> = {},
+  ): RegisteredTool {
+    return {
+      ...tool(name, false),
+      inputSchema: z.object(shape) as never,
+      ...(operativeArgs !== undefined ? { operativeArgs } : {}),
+      ...extra,
+    };
+  }
+  const TOOLS = {
+    removePath: declared("RemovePath", [{ field: "path", kind: "path" }], {
+      path: z.string(),
+      recursive: z.boolean().optional(),
+    }),
+    httpRequest: declared("HttpRequest", [{ field: "url", kind: "url" }], {
+      url: z.string(),
+      method: z.string().optional(),
+    }),
+    copyPath: declared(
+      "CopyPath",
+      [
+        { field: "source", kind: "path" },
+        { field: "destination", kind: "path" },
+      ],
+      { source: z.string(), destination: z.string() },
+    ),
+    clipboardWrite: declared("ClipboardWrite", [], { text: z.string() }),
+    emailSend: declared(
+      "EmailSend",
+      [{ field: "to", kind: "recipient" }],
+      { to: z.string(), body: z.string() },
+      { requireJustification: true },
+    ),
+  };
+  const lookup = suggestLookupFromTools(TOOLS);
+  const asked = (name: string, ...inputs: unknown[]) =>
+    session("sess_00000000000000ee", [
+      ...inputs.map((i) => toolUse(name, i)),
+      ask(name, "approved"),
+      ask(name, "approved"),
+      ask(name, "approved"),
+    ]);
+  const aggFor = (name: string, ...inputs: unknown[]) =>
+    aggregateAsks([asked(name, ...inputs)], lookup).get(name) as AskAggregate;
+
+  it("scopes on the declared field, in the canonical form the matcher compares", () => {
+    const rm = aggFor("RemovePath", { path: "./build/../build/cache", recursive: true });
+    expect(patternFor(rm)).toBe("RemovePath(build/cache)");
+    expect(blanketGrantNote(rm)).toBeUndefined();
+    const http = aggFor("HttpRequest", { url: "HTTPS://API.example.com", method: "DELETE" });
+    expect(patternFor(http)).toBe("HttpRequest(https://api.example.com/)");
+  });
+
+  it("strips the justification the runtime strips before parsing", () => {
+    const mail = aggFor("EmailSend", {
+      to: "ops@example.com",
+      body: "hi",
+      justification: "the weekly report the operator asked for",
+    });
+    expect(patternFor(mail)).toBe("EmailSend(ops@example.com)");
+  });
+
+  it("gives every reason a proposal cannot be scoped, as a BLANKET GRANT line", () => {
+    const cases: Array<[AskAggregate, string]> = [
+      [aggFor("RemovePath", { path: "a" }, { path: "b" }), "2 different places"],
+      [aggFor("RemovePath", { path: "../outside" }), "cannot name (outside the workspace"],
+      [aggFor("RemovePath", { nope: 1 }), "no longer fits the tool's input"],
+      [aggFor("CopyPath", { source: "a", destination: "b" }), "more than one place"],
+      [aggFor("ClipboardWrite", { text: "x" }), "has no argument that decides where it acts"],
+      [aggFor("mcp__srv__delete", { id: "1" }), "does not declare which argument"],
+      [aggFor("HttpRequest", { url: "not a url" }), "cannot name"],
+    ];
+    for (const [agg, reason] of cases) {
+      expect({ tool: agg.toolName, pattern: patternFor(agg) }).toEqual({
+        tool: agg.toolName,
+        pattern: agg.toolName,
+      });
+      expect(blanketGrantNote(agg)).toContain(
+        `BLANKET GRANT: this allows every ${agg.toolName} call`,
+      );
+      expect(blanketGrantNote(agg)).toContain(reason);
+    }
+  });
+
+  it("rankSuggestions carries the BLANKET GRANT line into a bare allow's evidence", () => {
+    const aggs = aggregateAsks([asked("ClipboardWrite", { text: "x" })], lookup);
+    const [grant] = rankSuggestions(aggs, new Map());
+    expect(grant?.rule.pattern).toBe("ClipboardWrite");
+    expect(grant?.evidence.some((l) => l.startsWith("BLANKET GRANT"))).toBe(true);
+  });
+
+  it("without a lookup, only the matcher's legacy name table is known", () => {
+    const bash = aggregateAsks([asked("Bash", { command: "git status" })]).get("Bash");
+    expect(patternFor(bash as AskAggregate)).toBe("Bash(git status)");
+    const rm = aggregateAsks([asked("RemovePath", { path: "build" })]).get("RemovePath");
+    expect(patternFor(rm as AskAggregate)).toBe("RemovePath");
+    expect(blanketGrantNote(rm as AskAggregate)).toContain("does not declare");
   });
 });
 
@@ -302,6 +412,28 @@ describe("diffPermissions", () => {
     const blob = formatSettingsDiff(diff).join("\n");
     expect(blob).toContain('  + { type: alwaysAllow, pattern: "Read" }');
     expect(blob).toContain('    { type: alwaysDeny, pattern: "Bash(rm**)" }');
+  });
+
+  it("flags a new bare allow as a blanket grant, and nothing else", () => {
+    const diff = diffPermissions(
+      [{ type: "alwaysAllow", pattern: "Glob" }],
+      [
+        ...suggestions,
+        {
+          rule: { type: "alwaysAllow", pattern: "Write(out/report.md)", source: "settings" },
+          reason: "recurring-approved",
+          toolName: "Write",
+          readOnly: false,
+          evidence: [],
+          weight: 3,
+        },
+      ],
+    );
+    const lines = formatSettingsDiff(diff);
+    const flagged = lines.filter((l) => l.includes("BLANKET GRANT"));
+    expect(flagged).toEqual([
+      '  + { type: alwaysAllow, pattern: "Read" } (⚠ BLANKET GRANT — every call of the tool)',
+    ]);
   });
 
   it("annotates a still-wildcarded pattern (F2)", () => {

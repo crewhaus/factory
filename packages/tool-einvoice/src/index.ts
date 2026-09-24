@@ -362,6 +362,7 @@ async function identifierProblem(
 
 export const eInvoiceBuild: RegisteredTool = buildTool({
   name: "EInvoiceBuild",
+  operativeArgs: [{ field: "outFile", kind: "path" }],
   description:
     'Write an EN 16931 e-invoice as UBL or CII (the syntaxes Peppol BIS 3, XRechnung, Factur-X and ZUGFeRD use) from an invoice record, and report which of the standard\'s rules were checked. Use it instead of a model composing the XML: every total, the VAT breakdown and every line net amount are computed from the rows, so there is no way to state a total that disagrees with them. The rule check is NARROW and names the rule identifiers it covers and the families it does not — it is not a Schematron run, and it never reports "valid". The bytes come back or go to a path you name; nothing is submitted anywhere.',
   inputSchema: z.object({
@@ -679,6 +680,7 @@ const paymentSchema = z.object({
 
 export const paymentFileBuild: RegisteredTool = buildTool({
   name: "PaymentFileBuild",
+  operativeArgs: [{ field: "outFile", kind: "path" }],
   description:
     "Assemble a bank-ready NACHA ACH batch or a SEPA pain.001 credit transfer from approved payment rows, with every control figure computed from the rows. Use it because this is arithmetic a model cannot be allowed to approximate: NACHA is 94-byte fixed-width records whose entry hash, debit and credit totals, entry count and block padding must agree exactly or the ODFI rejects the whole file with no line number, and pain.001's NbOfTxs and CtrlSum are no more forgiving. Duplicate references are refused before anything is written, names are truncated to the field and reported while references and amounts are refused rather than shortened, and a settlement date the calendar does not settle on is refused unless you ask for it to be moved. IT BUILDS THE FILE AND DOES NOT SEND IT: there is no transport here and no schema accepts a credential.",
   inputSchema: z.object({

@@ -1429,13 +1429,13 @@ describe("mcp_servers.<n>.tool_flags is narrowing-only (0.6.0 §5.5)", () => {
   test("accepts defaults + per_tool in the tightening direction on both transports", () => {
     const spec = parseSpec(
       server(
-        "{ defaults: { readOnly: true }, per_tool: { create_issue: { destructive: true, requireJustification: true } } }",
+        "{ defaults: { requireJustification: true }, per_tool: { create_issue: { destructive: true, requireJustification: true } } }",
       ),
     );
     if (spec.target !== "cli") expect.unreachable();
     const flags: SpecMcpToolFlags = spec.mcp_servers?.["github"]?.tool_flags;
     expect(flags).toEqual({
-      defaults: { readOnly: true },
+      defaults: { requireJustification: true },
       per_tool: { create_issue: { destructive: true, requireJustification: true } },
     });
     const sse = parseSpec(
@@ -1444,14 +1444,29 @@ describe("mcp_servers.<n>.tool_flags is narrowing-only (0.6.0 §5.5)", () => {
         "  remote:",
         "    transport: sse",
         "    url: https://mcp.example",
-        "    tool_flags: { defaults: { readOnly: true } }",
+        "    tool_flags: { defaults: { destructive: true } }",
       ),
     );
     if (sse.target !== "cli") expect.unreachable();
-    expect(sse.mcp_servers?.["remote"]?.tool_flags?.defaults?.readOnly).toBe(true);
+    expect(sse.mcp_servers?.["remote"]?.tool_flags?.defaults?.destructive).toBe(true);
+  });
+
+  test("REJECTS readOnly: true — it is a grant, not a restriction — and says what to write", () => {
+    // Plan and auto mode run a read-only tool without asking, so marking a
+    // remote tool read-only would widen what it may do.
+    let message = "";
+    try {
+      parseSpec(server("{ per_tool: { list_repos: { readOnly: true } } }"));
+    } catch (err) {
+      expect(err).toBeInstanceOf(SpecParseError);
+      message = (err as Error).message;
+    }
+    expect(message).toContain("read-only is a grant, not a restriction");
+    expect(message).toContain("destructive: true or requireJustification: true");
   });
 
   test.each([
+    ["readOnly: true", "{ defaults: { readOnly: true } }"],
     ["readOnly: false", "{ defaults: { readOnly: false } }"],
     ["requireJustification: false", "{ per_tool: { x: { requireJustification: false } } }"],
     ["destructive: false", "{ defaults: { destructive: false } }"],

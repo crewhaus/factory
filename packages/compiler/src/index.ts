@@ -48,6 +48,8 @@ import type {
   IrManagedV0,
   IrMcpServerConfig,
   IrMcpServers,
+  IrMcpToolFlags,
+  IrMcpToolTrustFlags,
   IrMemory,
   IrModelCapabilities,
   IrModelParams,
@@ -101,6 +103,7 @@ import {
   type SpecDiscordChannel,
   type SpecIMessageChannel,
   type SpecMcpServerConfig,
+  type SpecMcpToolFlags,
   type SpecModelPoolBlock,
   type SpecModelProfile,
   type SpecModelsBlock,
@@ -110,6 +113,7 @@ import {
   type SpecTelegramChannel,
   type SpecWatchmeBlock,
   type SpecWhatsAppChannel,
+  mcpServerNameWarnings,
   parseSpec,
 } from "@crewhaus/spec";
 import { emitBatchWorker } from "@crewhaus/target-batch-worker";
@@ -231,8 +235,8 @@ export type LowerOptions = {
    * a NARROWING profile (`tools` / `tool_config` / `permissions` /
    * `rate_limits` / `cost`) referenced from a SINGLE-MODEL serving slot,
    * which is a `model_pool` CANDIDATE setting by design (§4.2) and is
-   * reported `model-plan-candidate-only` here rather than refused, and
-   * `mcp_servers.<n>.tool_flags`, which 0.6.0 does not lower at all. The name
+   * reported `model-plan-candidate-only` here rather than refused. (0.6.0
+   * also refused `mcp_servers.<n>.tool_flags`; 0.7.1 lowers it.) The name
    * is historical — it dates from the PR train, when both classes were
    * waiting on a runtime consumer. `compile()` and the `crewhaus run`
    * interpreter never set this; tests and IR-level tooling set it to inspect
@@ -626,6 +630,10 @@ function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
       ].join(" "),
     });
   }
+  // 0.7.1 — an `mcp_servers` key with `__` in it, or `_` at either end,
+  // makes `mcp__<server>__<tool>` ambiguous. 0.7.0 ran such keys, so it is a
+  // warning here rather than a parse error.
+  for (const w of mcpServerNameWarnings(spec)) out.push({ code: "mcp-server-name", ...w });
   return out;
 }
 
@@ -1140,6 +1148,29 @@ function lowerMcpSecretMap(
   return out;
 }
 
+/**
+ * 0.7.1 — lower `tool_flags` (tighten-only, validated by the spec schema) to
+ * the IR's camelCase shape. Only `true` flags are carried, so the emitted
+ * config says exactly what tightens.
+ */
+function lowerMcpToolFlags(flags: SpecMcpToolFlags): IrMcpToolFlags | undefined {
+  if (flags === undefined) return undefined;
+  const entry = (
+    e: NonNullable<NonNullable<SpecMcpToolFlags>["defaults"]>,
+  ): IrMcpToolTrustFlags => ({
+    ...(e.destructive === true ? { destructive: true } : {}),
+    ...(e.requireJustification === true ? { requireJustification: true } : {}),
+  });
+  const perTool =
+    flags.per_tool !== undefined
+      ? Object.fromEntries(Object.entries(flags.per_tool).map(([k, v]) => [k, entry(v)]))
+      : undefined;
+  return {
+    ...(flags.defaults !== undefined ? { defaults: entry(flags.defaults) } : {}),
+    ...(perTool !== undefined ? { perTool } : {}),
+  };
+}
+
 function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefined): IrMcpServers {
   if (specMcp === undefined) return Object.freeze({}) as IrMcpServers;
   const out: Record<string, IrMcpServerConfig> = {};
@@ -1147,6 +1178,9 @@ function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefine
     // #406 — carried ONLY when the spec opted out of fail-fast, so a spec
     // without the key lowers byte-identically.
     const optional = cfg.required === false ? ({ required: false } as const) : {};
+    // 0.7.1 — likewise carried only when the spec sets it.
+    const toolFlags = lowerMcpToolFlags(cfg.tool_flags);
+    const flagged = toolFlags !== undefined ? { toolFlags } : {};
     if (cfg.transport === "stdio") {
       out[name] = {
         transport: "stdio",
@@ -1155,6 +1189,7 @@ function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefine
         ...(cfg.env !== undefined
           ? { env: lowerMcpSecretMap(cfg.env, `mcp_servers.${name}`, "env") }
           : {}),
+        ...flagged,
         ...optional,
       };
     } else {
@@ -1164,6 +1199,7 @@ function lowerMcpServers(specMcp: Record<string, SpecMcpServerConfig> | undefine
         ...(cfg.headers !== undefined
           ? { headers: lowerMcpSecretMap(cfg.headers, `mcp_servers.${name}`, "headers") }
           : {}),
+        ...flagged,
         ...optional,
       };
     }
@@ -1554,8 +1590,8 @@ function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompac
 // is the supported route, and the refusal names it.
 // `LowerOptions.allowRuntimePendingKeys` downgrades the refusal to the
 // `model-plan-candidate-only` warning (tests, IR tooling); `compile()` never
-// sets it. `mcp_servers.<n>.tool_flags` is the one genuinely unlowered key:
-// 0.6.0 ships no IR + emit wiring for it, so it stays refused too.
+// sets it. (`mcp_servers.<n>.tool_flags`, refused through 0.7.0, is lowered
+// since 0.7.1 — see lowerMcpServers.)
 // ---------------------------------------------------------------------------
 
 type LooseBlock = Readonly<Record<string, unknown>>;
@@ -1677,18 +1713,9 @@ function candidateOnlyRefusal(path: string, why: string): CompilerError {
  * lower; return silently otherwise. Runs once from `lower()` unless
  * `allowRuntimePendingKeys` is set.
  */
-function assertNoRuntimePendingKeys(spec: Spec): void {
-  const s = spec as unknown as LooseBlock;
-  const mcpServers = asLooseBlock(s["mcp_servers"]);
-  if (mcpServers !== undefined) {
-    for (const [name, raw] of Object.entries(mcpServers)) {
-      if (asLooseBlock(raw)?.["tool_flags"] !== undefined) {
-        throw new CompilerError(
-          `mcp_servers.${name}.tool_flags is accepted by the spec but not lowered by this compiler — 0.6.0 ships no IR + emit wiring for it (registerMcpServer flags); remove it from the spec for now`,
-        );
-      }
-    }
-  }
+function assertNoRuntimePendingKeys(_spec: Spec): void {
+  // 0.7.1 — `mcp_servers.<n>.tool_flags` is lowered (lowerMcpServers) and
+  // enforced by @crewhaus/tool-mcp, so nothing is refused here any more.
   // 0.6.0 PR 9c — `evaluation.on_fail: escalate` and `judge.escalate_to`
   // compile through: the cascade re-run consumes both (runtime-core's
   // `runEvaluatedTurn`, the workflow / graph retry closures).
@@ -4099,7 +4126,7 @@ function lowerThredzWiredNoMcp(
  *
  * Hyphen, never ":" — a role name may legally contain spaces, dots and colons
  * (`safeName` is permissive), and if the server name ever falls through to
- * `namespacedToolName` it builds `<server>__<tool>`, which must satisfy the
+ * `namespacedToolName` it builds `mcp__<server>__<tool>`, which must satisfy the
  * providers' `^[a-zA-Z0-9_-]{1,64}$`. The spec layer already rejects two roles
  * whose names collapse to the same slug, so this cannot silently collide.
  */

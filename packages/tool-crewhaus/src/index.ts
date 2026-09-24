@@ -50,6 +50,11 @@ import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  RUNTIME_TOOL_NAMES,
+  TOOL_FLAGS,
+  TOOL_FLAGS_BY_NAME,
+} from "@crewhaus/tool-registry-manifest/flags";
 import { z } from "zod";
 import { HARNESS_SPEC_FILENAME, discoverHarnesses } from "./discover";
 import {
@@ -517,13 +522,13 @@ export const toolInventory: RegisteredTool = buildTool({
     // checked against a runtime that is not this one — a bundle compiled from
     // another release has a different builtin set.
     //
-    // The set comes from `BUILTIN_TOOL_MAP` and NOT from
-    // `@crewhaus/tool-registry-manifest`, although the manifest has the same
-    // keys. This tool needs the key SET; the manifest is 455 KB of key set
-    // plus description prose, and `collectCrewhausDeps` pins whole packages,
-    // so importing it here would put that prose into every bundle granting
-    // any tool-crewhaus tool — and `crewhaus` sits inside the `all-operations`
-    // roll-up, so a plain `all-operations` grant would pay it too. `target-cli`
+    // The set comes from `BUILTIN_TOOL_MAP` and NOT from the manifest's main
+    // entry, although the manifest has the same keys. This tool needs the key
+    // SET; the main entry is 455 KB of key set plus description prose, which
+    // every bundle granting any tool-crewhaus tool would then load — and
+    // `crewhaus` sits inside the `all-operations` roll-up. (PermissionAudit,
+    // in this package, reads the manifest's `/flags` table, which carries no
+    // prose; `apps/cli/src/tool-registry.test.ts` holds that line.) `target-cli`
     // is already in this package's dependency closure via `@crewhaus/compiler`,
     // so this costs nothing. That the two key sets are identical is not an
     // assumption: `apps/cli/src/tool-registry.test.ts` asserts it in both
@@ -538,7 +543,7 @@ export const toolInventory: RegisteredTool = buildTool({
     const unknown: string[] = [];
     for (const tool of resolved.tools) {
       if (tool.startsWith("mcp__")) {
-        const server = tool.slice("mcp__".length).split("__")[0] ?? "";
+        const server = mcpServerOf(tool, servers);
         mcp.push({ tool, server, declared: servers.has(server) });
         continue;
       }
@@ -563,17 +568,34 @@ export const toolInventory: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * The server an `mcp__<server>__<tool>` name belongs to: the longest declared
+ * `mcp_servers` key it starts with, because a key may itself contain `__`
+ * (0.7.0 ran such keys). With no declared key, the text up to the first
+ * `__` after the prefix.
+ */
+function mcpServerOf(tool: string, servers: ReadonlySet<string>): string {
+  const rest = tool.slice("mcp__".length);
+  let best: string | undefined;
+  for (const server of servers) {
+    if (rest.startsWith(`${server}__`) && (best === undefined || server.length > best.length)) {
+      best = server;
+    }
+  }
+  return best ?? rest.split("__")[0] ?? "";
+}
+
 export const permissionAudit: RegisteredTool = buildTool({
   name: "PermissionAudit",
   description:
-    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use as the \"what can this harness really do\" review before deploying it. It sees the spec's own rules only — CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time — and it matches the tool-name half of a pattern, reporting an argument-scoped rule like `Bash(git *)` as conditional cover rather than pretending to evaluate future arguments. A rule the matcher cannot compile is listed under `malformedRules` and treated the way the engine treats it (a broken deny or ask gates everything; a broken allow is dropped), and under `mode: plan` it says so, because there the engine decides on the tool's readOnly flag and reads no rule at all.",
+    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use as the \"what can this harness really do\" review before deploying it. It sees the spec's own rules only — CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time — and it matches the tool-name half of a pattern, reporting an argument-scoped rule like `Bash(git *)` as conditional cover rather than pretending to evaluate future arguments. A rule the matcher cannot compile is listed under `malformedRules` and treated the way the engine treats it (a broken deny or ask gates everything; a broken allow is dropped); a rule that can never fire as written (a spec key where the tool name belongs, an argument pattern the tool's field cannot match) is listed under `ruleProblems` with its fix and covers nothing. Builtins are reported with their own flags, so an unruled call's decision is the one the engine would make for that tool. Under `mode: plan` the decisions follow plan mode: allow rules are ignored, a deny or ask rule denies, and anything else is allowed only if the tool is read-only.",
   inputSchema: z.object({
     ...specSourceFields,
     destructiveTools: z
       .array(z.string())
       .optional()
       .describe(
-        "tools the target runtime marks destructive; the spec cannot know this for builtins, so pass it to get them flagged",
+        "extra tools to treat as destructive, e.g. a custom tool; builtins are already read from their own flags",
       ),
   }),
   readOnly: true,
@@ -601,12 +623,25 @@ export const permissionAudit: RegisteredTool = buildTool({
       }
     }
 
+    const judge = parsed.ok
+      ? asRecord(asRecord(asRecord(parsed.value)?.["security"])?.["justification"])?.["judge"]
+      : undefined;
     const result = auditPermissions({
       tools: view.value.tools,
       mode: view.value.permissions.mode,
       askMode: view.value.permissions.askMode,
       rules: view.value.permissions.rules,
       destructiveTools: destructive,
+      // permission-integration#9 / flag-truth-3#4 — a builtin's real flags,
+      // from the manifest generated off the tools themselves, instead of
+      // "external" read off six legacy names and "destructive" read off
+      // nothing.
+      flagsOf: (tool) => TOOL_FLAGS[tool] ?? TOOL_FLAGS_BY_NAME.get(tool),
+      // The builtins, and the tools the runtime registers without a spec
+      // listing them — `alwaysAllow Skill` names a real tool.
+      knownTools: [...Object.values(TOOL_FLAGS), ...RUNTIME_TOOL_NAMES.map((name) => ({ name }))],
+      mcpServers: view.value.mcpServers.map((s) => s.name),
+      ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });
     return json({
       ...result,
@@ -626,6 +661,7 @@ export const permissionAudit: RegisteredTool = buildTool({
 
 export const preflightRun: RegisteredTool = buildTool({
   name: "PreflightRun",
+  operativeArgs: [{ field: "harnessDir", kind: "path", default: "." }],
   description:
     "Run the full preflight over a harness directory against an EXPLICITLY supplied environment, returning the blocking items, the warnings and the remediation for each. Use before spawning a harness, to turn the stack trace the spawn would die with into a list of things to fix. The environment is an input and is never read from this process, so pass the merged env the spawn would actually receive. It binds each declared port briefly to see whether it is free, and it reaches no network beyond that.",
   inputSchema: z.object({

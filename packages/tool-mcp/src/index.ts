@@ -1,21 +1,38 @@
 import { createHash } from "node:crypto";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
 import { McpError } from "@crewhaus/errors";
-import type { McpClient, McpHost, McpServerConfig, McpToolDefinition } from "@crewhaus/mcp-host";
+import type {
+  McpClient,
+  McpHost,
+  McpServerConfig,
+  McpToolDefinition,
+  McpToolFlagsConfig,
+} from "@crewhaus/mcp-host";
 import { nextBackoffMs } from "@crewhaus/mcp-host";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool, ToolCatalog, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import {
+  type RegisteredTool,
+  type ToolCatalog,
+  type ToolExecuteContext,
+  mcpToolName,
+  toolListEntryNames,
+} from "@crewhaus/tool-catalog";
 import { z } from "zod";
 
 /**
  * Wrap an MCP server's remote tools as `RegisteredTool` entries on the
  * shared catalog. Catalog R4 (`tool-mcp`).
  *
- * Naming: each remote tool is registered as `<serverName>__<toolName>` so
- * tools from different servers can never collide. Server names are user-
- * controlled YAML keys (already deduped at the spec layer); remote tool
- * names are server-controlled and validated here.
+ * Naming: each remote tool is registered as `mcp__<serverName>__<toolName>`
+ * (0.7.1; before that `<serverName>__<toolName>`), so tools from different
+ * servers can never collide and every MCP tool is recognisable by name. That
+ * is the spelling the docs, the spec's model-profile selectors, the egress
+ * fabric and the scope audit all key on. Permission rules, skill and
+ * sub-agent tool lists, hook matchers and rate limits written against the old
+ * spelling keep matching. Server names are user-controlled YAML keys
+ * (validated at the spec layer and again here); remote tool names are
+ * server-controlled and validated here.
  *
  * Schema: MCP tools' authoritative schema is JSON Schema. We keep that
  * verbatim on `RegisteredTool.jsonSchema` (forwarded to the model by
@@ -25,6 +42,37 @@ import { z } from "zod";
  */
 
 const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * An MCP server name: the characters a tool name can carry — letters,
+ * digits, `-` and `_` — because it becomes part of every tool the server
+ * contributes (`mcp__<server>__<tool>`).
+ *
+ * A name that also contains `__`, or starts or ends with `_` or `-`, still
+ * registers: crewhaus 0.7.0 ran such servers and a patch release keeps them
+ * running. The spec warns about them (see `mcpServerNameWarning` in
+ * `@crewhaus/spec`), because `__` is also the separator — server `a` + tool
+ * `b__c` and server `a__b` + tool `c` register the same name.
+ */
+export const MCP_SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/** Model providers accept tool names up to this long. */
+export const MAX_TOOL_NAME_LENGTH = 64;
+
+/**
+ * Why `name` cannot be an MCP server name, or undefined when it can. The
+ * message says what to write instead, so the spec layer and the runtime give
+ * the same answer.
+ */
+export function mcpServerNameProblem(name: string): string | undefined {
+  if (MCP_SERVER_NAME_PATTERN.test(name)) return undefined;
+  const suggestion =
+    name
+      .replace(/[^A-Za-z0-9_-]+/g, "-")
+      .replace(/_{2,}/g, "-")
+      .replace(/^[-_]+|[-_]+$/g, "") || "my-server";
+  return `MCP server name "${name}" can only use letters, digits, "-" and "_", e.g. "${suggestion}".`;
+}
 
 export type McpToolFlags = {
   readonly concurrencySafe?: boolean;
@@ -36,20 +84,107 @@ export type McpToolFlags = {
   readonly requireJustification?: boolean;
 };
 
+/**
+ * How a remote tool's trust flags are decided, most permissive first:
+ *
+ * 1. the caller's `defaults` / `perTool` (a runtime that knows the server,
+ *    such as the Thredz backend's justification-gated tools);
+ * 2. the spec's `mcp_servers.<n>.tool_flags`, carried on the server's config
+ *    (`McpServerConfig.toolFlags`) — `destructive` and `requireJustification`
+ *    can only be turned ON;
+ * 3. the server's own `ToolAnnotations`: `destructiveHint: true` makes the
+ *    tool destructive and `readOnlyHint: false` makes it not read-only; the
+ *    opposite hints are ignored, because a remote server's claim may tighten
+ *    a tool but never loosen it.
+ *
+ * A destructive tool is never read-only: read-only is a grant (plan and auto
+ * mode run such a tool without asking), so it cannot survive a tightening.
+ */
 export type RegisterMcpServerOptions = {
   /** Default flags applied to every tool from this server. */
   readonly defaults?: McpToolFlags;
   /**
    * Per-tool flag overrides keyed by remote tool name (NOT the namespaced
-   * `<server>__<tool>` form). Wins over `defaults`.
+   * `mcp__<server>__<tool>` form). Wins over `defaults`.
    */
   readonly perTool?: Readonly<Record<string, McpToolFlags>>;
   /** Logger callback fired once per registered tool. Useful for boot banners. */
   readonly onRegister?: (info: { fullName: string; remoteName: string }) => void;
+  /**
+   * Fired for a remote tool that is left out because its registered name
+   * would be longer than model providers accept (see
+   * {@link mcpToolNameLengthProblem}). The server's other tools are
+   * registered either way. Default: `console.warn(reason)`.
+   */
+  readonly onSkip?: (info: { fullName: string; remoteName: string; reason: string }) => void;
 };
 
+/**
+ * Why the remote tool `remoteName` on `serverName` cannot be registered under
+ * `mcp__<server>__<tool>`, or undefined when it can: the name would be longer
+ * than the {@link MAX_TOOL_NAME_LENGTH} characters model providers accept.
+ */
+export function mcpToolNameLengthProblem(
+  serverName: string,
+  remoteName: string,
+): string | undefined {
+  const fullName = namespacedToolName(serverName, remoteName);
+  if (fullName.length <= MAX_TOOL_NAME_LENGTH) return undefined;
+  const room = MAX_TOOL_NAME_LENGTH - (fullName.length - serverName.length);
+  return `mcp server "${serverName}" tool "${remoteName}" would be registered as "${fullName}", ${fullName.length} characters; model providers accept at most ${MAX_TOOL_NAME_LENGTH}. ${
+    room >= 1
+      ? `Give the server a name of at most ${room} characters in mcp_servers.`
+      : "The tool's own name is too long for any server name, so it cannot be offered to a model."
+  }`;
+}
+
+/**
+ * Register one remote tool, or — when its name cannot fit — report it through
+ * `onSkip` and register nothing. A too-long name only drops that tool: the
+ * 0.7.1 `mcp__` prefix made a few names that fitted before too long, and one
+ * of them must not take the server's other tools down with it.
+ */
+function registerOne(
+  host: McpHost,
+  serverName: string,
+  catalog: ToolCatalog,
+  remote: McpToolDefinition,
+  opts: RegisterMcpServerOptions,
+): void {
+  // Only a name that is otherwise valid is skipped for its length; anything
+  // else wrong with it still fails the server, as it always has.
+  const reason =
+    typeof remote.name === "string" &&
+    TOOL_NAME_PATTERN.test(remote.name) &&
+    mcpServerNameProblem(serverName) === undefined
+      ? mcpToolNameLengthProblem(serverName, remote.name)
+      : undefined;
+  if (reason !== undefined) {
+    const info = {
+      fullName: namespacedToolName(serverName, remote.name),
+      remoteName: remote.name,
+      reason,
+    };
+    if (opts.onSkip !== undefined) opts.onSkip(info);
+    else console.warn(`[mcp] ${reason} The server's other tools are registered.`);
+    return;
+  }
+  const tool = buildMcpRegisteredTool(
+    host,
+    serverName,
+    remote,
+    resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
+  );
+  catalog.register(tool);
+  opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
+}
+
+/**
+ * The registered name of the remote tool `toolName` on `serverName`:
+ * `mcp__<server>__<tool>`.
+ */
 export function namespacedToolName(serverName: string, toolName: string): string {
-  return `${serverName}__${toolName}`;
+  return mcpToolName(serverName, toolName);
 }
 
 /**
@@ -57,7 +192,7 @@ export function namespacedToolName(serverName: string, toolName: string): string
  * tests (and any future custom-naming caller) can reuse the wiring without
  * going through `registerMcpServer`.
  *
- * `opts.registeredName` overrides the default `<server>__<tool>` catalog
+ * `opts.registeredName` overrides the default `mcp__<server>__<tool>` catalog
  * name — the bare-name alias path (`registerMcpToolAliases`) uses it so a
  * backend flip (design §4.3) keeps one tool vocabulary. Everything else —
  * `scope: "external"`, `ioCapability: "network"`, the boundary
@@ -84,7 +219,16 @@ export function buildMcpRegisteredTool(
       `mcp server "${serverName}" returned a tool with an invalid name "${remote.name}" (must match ${TOOL_NAME_PATTERN.source})`,
     );
   }
+  const serverProblem = mcpServerNameProblem(serverName);
+  if (serverProblem !== undefined) throw new McpError(serverProblem);
   const fullName = opts.registeredName ?? namespacedToolName(serverName, remote.name);
+  const lengthProblem =
+    opts.registeredName === undefined
+      ? mcpToolNameLengthProblem(serverName, remote.name)
+      : fullName.length > MAX_TOOL_NAME_LENGTH
+        ? `mcp server "${serverName}" tool "${remote.name}" cannot be registered as "${fullName}": ${fullName.length} characters, and model providers accept at most ${MAX_TOOL_NAME_LENGTH}.`
+        : undefined;
+  if (lengthProblem !== undefined) throw new McpError(lengthProblem);
   const description = sanitizeDescription(remote.description) ?? `MCP tool ${fullName}`;
   return buildTool({
     name: fullName,
@@ -178,9 +322,7 @@ export async function registerMcpServer(
   await client.connect();
   const remoteTools = await client.listTools();
   for (const remote of remoteTools) {
-    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name));
-    catalog.register(tool);
-    opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
+    registerOne(host, serverName, catalog, remote, opts);
   }
 }
 
@@ -206,8 +348,8 @@ export type McpToolSnapshot = ReadonlyMap<string, string>;
 
 /**
  * The delta between two {@link McpToolSnapshot}s. `added`/`removed`/
- * `schemaChanged` hold REMOTE tool names (not the `<server>__` namespaced
- * form); `driftIsEmpty` is the fast steady-state check.
+ * `schemaChanged` hold REMOTE tool names (not the `mcp__<server>__`
+ * namespaced form); `driftIsEmpty` is the fast steady-state check.
  */
 export type McpToolDrift = {
   readonly added: readonly string[];
@@ -239,10 +381,24 @@ export function hashToolSchema(schema: unknown): string {
   return createHash("sha256").update(canonicalJson(schema)).digest("hex").slice(0, 16);
 }
 
-/** Build a drift snapshot (remote name → schema hash) from a live tool list. */
+/**
+ * Build a drift snapshot (remote name → schema hash) from a live tool list.
+ * A tool that carries trust hints hashes them with its schema, so a server
+ * that starts calling a tool destructive mid-run has it re-registered with
+ * the tighter flags. A tool without hints hashes exactly as before.
+ */
 export function snapshotTools(tools: ReadonlyArray<McpToolDefinition>): McpToolSnapshot {
   const map = new Map<string, string>();
-  for (const t of tools) map.set(t.name, hashToolSchema(t.inputSchema));
+  for (const t of tools) {
+    map.set(
+      t.name,
+      hashToolSchema(
+        t.annotations === undefined
+          ? t.inputSchema
+          : { inputSchema: t.inputSchema, annotations: t.annotations },
+      ),
+    );
+  }
   return map;
 }
 
@@ -311,9 +467,7 @@ export async function reconcileMcpServer(
   for (const remoteName of [...drift.added, ...drift.schemaChanged]) {
     const remote = byName.get(remoteName);
     if (remote === undefined) continue;
-    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remoteName));
-    catalog.register(tool);
-    opts.onRegister?.({ fullName: tool.name, remoteName });
+    registerOne(host, serverName, catalog, remote, opts);
   }
   return { drift, snapshot };
 }
@@ -639,8 +793,9 @@ function firstLineOf(err: unknown): string {
 // should see ONLY those tools. This is a pure catalog-narrowing primitive the
 // runtime consumes at turn-composition time; keeping it here (next to the MCP
 // registration surface) means the same narrowing covers built-ins and remote
-// MCP tools alike — the model-facing name (`<server>__<tool>` for MCP) is what
-// the allow-list matches.
+// MCP tools alike — the model-facing name (`mcp__<server>__<tool>` for MCP,
+// or its pre-0.7.1 spelling `<server>__<tool>`) is what the allow-list
+// matches.
 // ---------------------------------------------------------------------------
 
 /**
@@ -648,7 +803,8 @@ function firstLineOf(err: unknown): string {
  * `undefined` the skill imposes NO restriction and the list passes through
  * unchanged (an empty array, by contrast, means "no tools"). Matching is by
  * the model-facing `RegisteredTool.name`, so an MCP tool is referenced by its
- * namespaced `<server>__<tool>` name. Pure and allocation-cheap — safe to call
+ * namespaced `mcp__<server>__<tool>` name — or by the `<server>__<tool>`
+ * spelling a pre-0.7.1 skill used. Pure and allocation-cheap — safe to call
  * per turn.
  */
 export function narrowToolsForActiveSkill(
@@ -656,27 +812,56 @@ export function narrowToolsForActiveSkill(
   allow: ReadonlyArray<string> | undefined,
 ): ReadonlyArray<RegisteredTool> {
   if (allow === undefined) return tools;
-  const allowed = new Set(allow);
-  return tools.filter((t) => allowed.has(t.name));
+  return tools.filter((t) => allow.some((entry) => toolListEntryNames(entry, t.name)));
 }
 
-/** Fold `defaults` + `perTool` overrides into one resolved flag set. */
-function resolveFlags(
+/** The spec's `tool_flags` for a server, off the config it was added with. */
+function configuredFlags(host: McpHost, serverName: string): McpToolFlagsConfig | undefined {
+  return host.has(serverName) ? host.getClient(serverName).toolFlags : undefined;
+}
+
+/**
+ * Fold the caller's `defaults` + `perTool`, the spec's `tool_flags` and the
+ * server's annotations into one flag set — see {@link RegisterMcpServerOptions}
+ * for the order. The spec and the server can only tighten.
+ */
+export function resolveMcpToolFlags(
   opts: RegisterMcpServerOptions,
-  remoteName: string,
+  serverName: string,
+  remote: Pick<McpToolDefinition, "name" | "annotations">,
+  configured: McpToolFlagsConfig | undefined,
 ): {
   concurrencySafe: boolean;
   readOnly: boolean;
   destructive: boolean;
   requireJustification: boolean;
 } {
-  const override = opts.perTool?.[remoteName] ?? {};
+  const override = opts.perTool?.[remote.name] ?? {};
+  // A spec's per_tool key is the server's own tool name; the registered
+  // `mcp__<server>__<tool>` spelling is accepted too, since tightening by
+  // either name is safe.
+  const specPerTool =
+    configured?.perTool?.[remote.name] ??
+    configured?.perTool?.[namespacedToolName(serverName, remote.name)];
+  const hints = remote.annotations;
+  const destructive =
+    (override.destructive ?? opts.defaults?.destructive ?? false) ||
+    configured?.defaults?.destructive === true ||
+    specPerTool?.destructive === true ||
+    hints?.destructiveHint === true;
+  const requireJustification =
+    (override.requireJustification ?? opts.defaults?.requireJustification ?? false) ||
+    configured?.defaults?.requireJustification === true ||
+    specPerTool?.requireJustification === true;
+  const readOnly =
+    (override.readOnly ?? opts.defaults?.readOnly ?? false) &&
+    !destructive &&
+    hints?.readOnlyHint !== false;
   return {
     concurrencySafe: override.concurrencySafe ?? opts.defaults?.concurrencySafe ?? false,
-    readOnly: override.readOnly ?? opts.defaults?.readOnly ?? false,
-    destructive: override.destructive ?? opts.defaults?.destructive ?? false,
-    requireJustification:
-      override.requireJustification ?? opts.defaults?.requireJustification ?? false,
+    readOnly,
+    destructive,
+    requireJustification,
   };
 }
 
@@ -690,7 +875,7 @@ export type McpAliasRegistration = {
 
 /**
  * v0.3.0 Goal 3 (design §4.3) — register a SELECTED set of a server's remote
- * tools under their BARE names (no `<server>__` prefix), so a backend flip
+ * tools under their BARE names (no `mcp__<server>__` prefix), so a backend flip
  * keeps the exact tool vocabulary the model already knows (`wiki_recall`,
  * `goal_write`, …) while routing through the MCP client.
  *
@@ -722,9 +907,13 @@ export async function registerMcpToolAliases(
         `mcp server "${serverName}" tool "${remote.name}" cannot be aliased onto its bare name — a tool named "${remote.name}" is already registered on the catalog (the local twin must not be registered when the ${serverName} backend owns the vocabulary)`,
       );
     }
-    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name), {
-      registeredName: remote.name,
-    });
+    const tool = buildMcpRegisteredTool(
+      host,
+      serverName,
+      remote,
+      resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
+      { registeredName: remote.name },
+    );
     catalog.register(tool);
     registered.push(remote.name);
     opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });

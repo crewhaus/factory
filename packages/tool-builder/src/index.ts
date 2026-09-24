@@ -1,8 +1,11 @@
-import type {
-  RegisteredTool,
-  ToolDefinition,
-  ToolExecuteContext,
-  ToolExecuteResult,
+import {
+  type OperativeArg,
+  type OperativeArgKind,
+  type RegisteredTool,
+  ToolCatalogError,
+  type ToolDefinition,
+  type ToolExecuteContext,
+  type ToolExecuteResult,
 } from "@crewhaus/tool-catalog";
 import type { ZodType } from "zod";
 
@@ -87,12 +90,279 @@ export function auditToolScopes(tools: ReadonlyArray<RegisteredTool>): ScopeFind
   return findings;
 }
 
+const OPERATIVE_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set([
+  "path",
+  "url",
+  "command",
+  "recipient",
+  "text",
+  "id",
+]);
+
+/** The kinds whose value can be qualified by another field (`within`). */
+const QUALIFIABLE_KINDS: ReadonlySet<OperativeArgKind> = new Set([
+  "path",
+  "recipient",
+  "text",
+  "id",
+]);
+
+/** What a dotted field path resolves to inside a zod schema. */
+type FieldShape = "string" | "number" | "opaque" | { readonly missing: string };
+
+/** The zod type name, read structurally so two copies of zod agree. */
+function zodTypeName(schema: unknown): string | undefined {
+  const def = (schema as { _def?: { typeName?: unknown } } | undefined)?._def;
+  return typeof def?.typeName === "string" ? def.typeName : undefined;
+}
+
+function zodDef(schema: unknown): Record<string, unknown> {
+  return ((schema as { _def?: Record<string, unknown> })._def ?? {}) as Record<string, unknown>;
+}
+
 /**
- * Converts a ToolDefinition into a RegisteredTool by applying fail-closed
- * safety defaults. Any flag not explicitly set in the definition defaults to
- * false (the least-privileged stance).
+ * Strip the wrappers that do not change which fields exist: optional,
+ * nullable, default, refinements and transforms, brands, catch, readonly,
+ * lazy, and the input side of a pipeline.
+ */
+function unwrapZod(schema: unknown, depth = 0): unknown {
+  if (depth > 64) return schema;
+  const def = zodDef(schema);
+  switch (zodTypeName(schema)) {
+    case "ZodOptional":
+    case "ZodNullable":
+    case "ZodDefault":
+    case "ZodCatch":
+    case "ZodReadonly":
+      return unwrapZod(def["innerType"], depth + 1);
+    case "ZodEffects":
+      return unwrapZod(def["schema"], depth + 1);
+    case "ZodBranded":
+      return unwrapZod(def["type"], depth + 1);
+    case "ZodPipeline":
+      return unwrapZod(def["in"], depth + 1);
+    case "ZodLazy":
+      return unwrapZod((def["getter"] as () => unknown)(), depth + 1);
+    default:
+      return schema;
+  }
+}
+
+function leafShape(schema: unknown): FieldShape {
+  const s = unwrapZod(schema);
+  switch (zodTypeName(s)) {
+    case "ZodString":
+    case "ZodEnum":
+    case "ZodNativeEnum":
+      return "string";
+    case "ZodNumber":
+    case "ZodBigInt":
+      return "number";
+    case "ZodLiteral": {
+      const value = zodDef(s)["value"];
+      return typeof value === "string"
+        ? "string"
+        : typeof value === "number"
+          ? "number"
+          : { missing: "is a literal that is not a string" };
+    }
+    case "ZodAny":
+    case "ZodUnknown":
+      return "opaque";
+    case "ZodArray":
+      return leafShape(zodDef(s)["type"]);
+    case "ZodUnion":
+    case "ZodDiscriminatedUnion": {
+      const options = zodDef(s)["options"];
+      const list = Array.isArray(options)
+        ? options
+        : [...((options as Map<unknown, unknown>)?.values?.() ?? [])];
+      const shapes = list.map(leafShape);
+      if (shapes.includes("string")) return "string";
+      if (shapes.includes("opaque")) return "opaque";
+      if (shapes.includes("number")) return "number";
+      return { missing: "is not a string in any variant" };
+    }
+    default:
+      return {
+        missing: `is a ${(zodTypeName(s) ?? "non-zod value").replace(/^Zod/, "").toLowerCase()}, not a string`,
+      };
+  }
+}
+
+/** Walk `segments` into `schema`; arrays are transparent at every step. */
+function resolveFieldShape(schema: unknown, segments: readonly string[], i: number): FieldShape {
+  const s = unwrapZod(schema);
+  const typeName = zodTypeName(s);
+  if (typeName === "ZodArray") return resolveFieldShape(zodDef(s)["type"], segments, i);
+  if (i === segments.length) return leafShape(s);
+  const segment = segments[i] as string;
+  switch (typeName) {
+    case "ZodObject": {
+      const shape = (zodDef(s)["shape"] as () => Record<string, unknown>)();
+      if (!Object.hasOwn(shape, segment)) {
+        const known = Object.keys(shape);
+        return {
+          missing: `has no field "${segments.slice(0, i + 1).join(".")}"${known.length > 0 ? ` (it has: ${known.join(", ")})` : ""}`,
+        };
+      }
+      return resolveFieldShape(shape[segment], segments, i + 1);
+    }
+    case "ZodRecord":
+      return resolveFieldShape(zodDef(s)["valueType"], segments, i + 1);
+    case "ZodIntersection": {
+      const left = resolveFieldShape(zodDef(s)["left"], segments, i);
+      return typeof left === "string" ? left : resolveFieldShape(zodDef(s)["right"], segments, i);
+    }
+    case "ZodUnion":
+    case "ZodDiscriminatedUnion": {
+      const options = zodDef(s)["options"];
+      const list = Array.isArray(options)
+        ? options
+        : [...((options as Map<unknown, unknown>)?.values?.() ?? [])];
+      let first: FieldShape | undefined;
+      for (const option of list) {
+        const shape = resolveFieldShape(option, segments, i);
+        if (typeof shape === "string") return shape;
+        first ??= shape;
+      }
+      return first ?? { missing: `has no field "${segments.slice(0, i + 1).join(".")}"` };
+    }
+    case "ZodAny":
+    case "ZodUnknown":
+      // An opaque schema (an MCP tool's `z.unknown()`) cannot be checked.
+      return "opaque";
+    default:
+      return {
+        missing: `cannot reach "${segments.slice(0, i + 1).join(".")}": "${segments.slice(0, i).join(".") || "the input"}" is not an object`,
+      };
+  }
+}
+
+/**
+ * Why `name` cannot qualify another operative field, or `undefined` when it
+ * can: it must be a top-level field holding one string or number, not a
+ * list, since the qualified value is `<qualifier>/<value>`.
+ */
+function scalarFieldShape(inputSchema: unknown, name: string): string | undefined {
+  const s = unwrapZod(inputSchema);
+  if (zodTypeName(s) !== "ZodObject") return "is not an object";
+  const shape = (zodDef(s)["shape"] as () => Record<string, unknown>)();
+  if (!Object.hasOwn(shape, name)) return `has no top-level field "${name}"`;
+  if (zodTypeName(unwrapZod(shape[name])) === "ZodArray") {
+    return `field "${name}" is a list; a qualifier must hold one value`;
+  }
+  const leaf = leafShape(shape[name]);
+  return leaf === "string" || leaf === "number"
+    ? undefined
+    : `field "${name}" is not a string or a number`;
+}
+
+/**
+ * Check a tool's `operativeArgs` against its input schema. A declaration that
+ * names a field the schema does not have would make every scoped rule for the
+ * tool silently miss, so it is refused when the tool is built, not discovered
+ * at the first call.
+ */
+function checkOperativeArgs(
+  name: string,
+  inputSchema: unknown,
+  operativeArgs: ReadonlyArray<OperativeArg>,
+): ReadonlyArray<OperativeArg> {
+  const fail = (what: string): never => {
+    throw new ToolCatalogError(`tool "${name}": operativeArgs ${what}`);
+  };
+  if (!Array.isArray(operativeArgs)) fail("must be an array of { field, kind }");
+  const seen = new Set<string>();
+  const out: OperativeArg[] = [];
+  for (const [i, arg] of operativeArgs.entries()) {
+    const at = `[${i}]`;
+    if (arg === null || typeof arg !== "object")
+      fail(`${at} must be an object like { field: "path", kind: "path" }`);
+    const { field, kind } = arg;
+    if (typeof field !== "string" || field === "")
+      fail(`${at}.field must name an input field, e.g. "path"`);
+    const segments = field.split(".");
+    if (segments.some((segment) => segment === "")) {
+      fail(`${at}.field "${field}" has an empty segment; write nested fields as "a.b"`);
+    }
+    if (!OPERATIVE_ARG_KINDS.has(kind)) {
+      fail(`${at}.kind "${String(kind)}" is not one of ${[...OPERATIVE_ARG_KINDS].join(", ")}`);
+    }
+    if (arg.default !== undefined && typeof arg.default !== "string") {
+      fail(`${at}.default must be a string (the value the tool uses when "${field}" is omitted)`);
+    }
+    if (seen.has(field)) fail(`names "${field}" twice; list each field once`);
+    seen.add(field);
+    const shape = resolveFieldShape(inputSchema, segments, 0);
+    if (typeof shape === "object") {
+      fail(`${at}: the input schema ${shape.missing}. Name a field the tool actually reads.`);
+    }
+    if (shape === "number" && kind !== "id") {
+      fail(`${at}: "${field}" is a number; only kind "id" can hold a number`);
+    }
+    const { within } = arg;
+    if (within !== undefined) {
+      if (!QUALIFIABLE_KINDS.has(kind)) {
+        fail(
+          `${at}.within: a "${kind}" value cannot be qualified; only ${[...QUALIFIABLE_KINDS].join(", ")} can`,
+        );
+      }
+      if (typeof within !== "string" || !/^[A-Za-z_$][\w$]*$/.test(within)) {
+        fail(`${at}.within must name one top-level input field, e.g. "owner"`);
+      }
+      if (within === field) fail(`${at}.within names "${field}" itself`);
+      const qualifier = scalarFieldShape(inputSchema, within);
+      if (qualifier !== undefined) fail(`${at}.within: the input schema ${qualifier}`);
+    }
+    out.push(
+      Object.freeze({
+        field,
+        kind,
+        ...(arg.default !== undefined ? { default: arg.default } : {}),
+        ...(within !== undefined ? { within } : {}),
+      }),
+    );
+  }
+  return Object.freeze(out);
+}
+
+/**
+ * Converts a ToolDefinition into a RegisteredTool, filling in every flag the
+ * definition leaves out.
+ *
+ * The defaults are NOT all fail-closed, and auto mode is where that shows:
+ *
+ * - `readOnly: false` is the cautious value — plan mode denies the tool.
+ *   `readOnly: true` is a grant (plan and auto mode run the tool without
+ *   asking), so a tool that spawns a program the WORKSPACE supplies — a
+ *   project's linter, a binary in node_modules/.bin — is never read-only,
+ *   however read-only the program's job is.
+ * - `destructive: false` is the PERMISSIVE value. In auto mode a tool that is
+ *   neither read-only nor destructive is allowed with no prompt, so a tool
+ *   that deletes, overwrites or spends must say `destructive: true` to be
+ *   asked about.
+ * - `requiresSandbox: false` and `requireJustification: false` are
+ *   permissive too: the sandbox floor and the intent gate apply only to a
+ *   tool that opts in. A destructive tool that goes to a place the model
+ *   chose (`scope: "external"` with a `url` or `recipient` operative
+ *   argument) MUST opt in to `requireJustification`.
+ *
+ * apps/cli/src/flag-rules.test.ts holds these rules over every builtin.
+ * - `scope` defaults to `"internal"`, except for a definitionally outward name
+ *   (see {@link isOutwardName}), which defaults to `"external"`.
+ * - `classifyOutput: true` — the post-tool injection classifier runs unless
+ *   the tool opts out.
+ *
+ * `operativeArgs`, when given, is checked against `inputSchema` here: a
+ * field the schema does not have throws, so a typo cannot quietly turn every
+ * scoped permission rule for the tool into a miss.
  */
 export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
+  const operativeArgs =
+    def.operativeArgs !== undefined
+      ? checkOperativeArgs(def.name, def.inputSchema, def.operativeArgs)
+      : undefined;
   return {
     name: def.name,
     description: def.description,
@@ -145,5 +415,9 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     ...(def.concurrencyClassifier !== undefined
       ? { concurrencyClassifier: def.concurrencyClassifier }
       : {}),
+    // 0.7.1 — the field(s) a permission rule's argument glob constrains,
+    // checked against the schema above. Omitted ⇒ omitted, and rules fall
+    // back to the tool's string values.
+    ...(operativeArgs !== undefined ? { operativeArgs } : {}),
   };
 }

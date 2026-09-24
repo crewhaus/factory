@@ -29,6 +29,7 @@ import {
   parsePermissionsConfig,
   tagRules,
 } from "@crewhaus/permission-engine";
+import { sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import { type SkillRef, createSkillTool, discoverSkills } from "@crewhaus/skills-registry";
 import { type SlashCommand, loadCommands } from "@crewhaus/slash-commands";
 import { spawnSubAgent } from "@crewhaus/sub-agent-spawner";
@@ -39,7 +40,6 @@ import {
   type ToolPackageImporter,
   checkBuiltinTool,
   registerToolConfigs,
-  sandboxAvailableFromEnv,
 } from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
 import { createTaskTool } from "@crewhaus/tool-task";

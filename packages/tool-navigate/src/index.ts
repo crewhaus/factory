@@ -319,6 +319,7 @@ export function createNavigateTool(opts: CreateNavigateToolOptions): RegisteredT
     concurrencySafe: false,
     classifyOutput: false,
     scope: "external",
+    operativeArgs: [{ field: "url", kind: "url" }],
     execute: async (input): Promise<ToolResultContent> => {
       // SSRF guard runs BEFORE the browser touches the URL. Throws
       // NavigateError directly so the block reason surfaces unwrapped.

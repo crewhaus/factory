@@ -158,9 +158,14 @@ import { narrowRuleSet } from "@crewhaus/sub-agent-permission-inheritance";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import { TokenBudget, estimateTokens } from "@crewhaus/token-budget";
 import type { RegisteredTool, ToolExecuteModel } from "@crewhaus/tool-catalog";
-import { stripJustificationField, withJustificationField } from "@crewhaus/tool-catalog";
+import {
+  hasModelChosenDestination,
+  legacyMcpToolName,
+  stripJustificationField,
+  withJustificationField,
+} from "@crewhaus/tool-catalog";
 import { resolveToolConfigEnv } from "@crewhaus/tool-categories";
-import { executeTool } from "@crewhaus/tool-executor";
+import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
 import { storeAndPreview } from "@crewhaus/tool-result-store";
@@ -200,6 +205,7 @@ import {
   attachRoutingPersistence,
   attachWatchmeCapture,
 } from "./observability";
+import { workspacePathCanonicalizer } from "./path-canonical";
 import {
   type PreRouteArm,
   type PreRouteClassifierVerdict,
@@ -817,8 +823,11 @@ export async function findReplayableGrant(
   }
   const now = where.now ?? Date.now();
   const maxAgeMs = where.maxAgeMs ?? REPLAYABLE_GRANT_MAX_AGE_MS;
+  // 0.7.1 — a grant made before MCP tools were renamed names the tool by its
+  // old `<server>__<tool>` spelling; it is the same tool.
+  const legacyToolName = legacyMcpToolName(where.toolName);
   const matches = all.filter((a) => {
-    if (a.toolName !== where.toolName) return false;
+    if (a.toolName !== where.toolName && a.toolName !== legacyToolName) return false;
     if (a.sessionId !== where.sessionId) return false;
     if (a.decision !== "grant") return false;
     if (a.consumedAt !== undefined) return false;
@@ -2054,11 +2063,13 @@ export type RunChatLoopOptions = {
   /**
    * Pillar 3 sink-side — classify a tool sink as `"external-configured"` (a
    * spec-declared sink → warn on non-user content) or `"external-dynamic"` (a
-   * runtime-joined sink → block on non-user content). Defaults to treating
-   * `mcp__*` sinks as dynamic and everything else as configured (#144); wire
-   * this to mark federation-joined or other runtime-discovered sinks dynamic.
+   * runtime-joined sink → block on non-user content). Defaults to
+   * {@link defaultSinkScope}: `mcp__*` sinks and tools that send to a
+   * destination the model chooses are dynamic, everything else configured
+   * (#144); wire this to mark federation-joined or other runtime-discovered
+   * sinks dynamic. It receives the tool as well as its name.
    */
-  resolveSinkScope?: (toolName: string) => SinkScope;
+  resolveSinkScope?: (toolName: string, tool?: RegisteredTool) => SinkScope;
   /**
    * Hard cap on the number of model→tool cycles in a single turn. The loop
    * detector is advisory (it only injects a one-time warning and is defeated
@@ -2763,16 +2774,10 @@ export function resolveToolResultRoot(): string | undefined {
 }
 
 /**
- * Sinks whose DESTINATION is chosen at runtime by the (prompt-injectable)
- * model — a fetched/navigated URL, an on-chain recipient — are effectively
- * dynamic even though they are spec-declared built-in tools: an attacker who
- * steers the model picks where the data goes. So non-user cross-origin content
- * reaching them must reach the egress BLOCK tier, not merely warn. Fixed-
- * destination sinks are intentionally NOT here: `SendMessage` replies to the
- * operator-configured channel, `WebSearch`/`ImageGenerate` hit a fixed provider
- * API — classifying those dynamic would block legitimate replies, so they stay
- * `"external-configured"` (warn) and can be tightened per-deployment via the
- * `resolveSinkScope` override or the spec's egress policy.
+ * The names that were model-destination sinks before tools could say so
+ * themselves. They stay dynamic whatever a tool of that name declares, so
+ * the declaration can only add sinks to the block tier, never take one out
+ * (see {@link defaultSinkScope}).
  */
 const MODEL_DESTINATION_SINKS: ReadonlySet<string> = new Set([
   "Fetch",
@@ -2782,17 +2787,78 @@ const MODEL_DESTINATION_SINKS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Default egress sink-scope. Runtime-joined MCP sinks (`mcp__*`) are the
- * canonical dynamically-discovered external sink, and the model-destination
- * built-ins above are dynamic by virtue of their model-chosen target — both
- * classify as `"external-dynamic"` so the egress block tier is reachable for
- * non-user-origin payloads (#144). Other spec-declared built-in sinks stay
- * `"external-configured"` (warn). Override via `runChatLoop({ resolveSinkScope })`
- * to mark federation-joined or other runtime sinks dynamic too.
+ * 0.7.1 — the tool-name fields of a `pre-tool` / `post-tool` hook payload.
+ * `name` is the registered name; an MCP tool also carries `legacyName`, the
+ * `<server>__<tool>` spelling it had before 0.7.1. A hook matcher accepts
+ * either spelling, but a script that reads `name` from its stdin and compares
+ * it cannot know about the rename, and a guard that stops matching is a
+ * guard that silently stops guarding — so it gets a stable field to compare.
  */
-export function defaultSinkScope(toolName: string): SinkScope {
+function hookToolName(name: string): { name: string; legacyName?: string } {
+  const legacyName = legacyMcpToolName(name);
+  return legacyName !== undefined ? { name, legacyName } : { name };
+}
+
+/**
+ * 0.7.1 — re-key a tool-name map (rate limits) written with the pre-0.7.1
+ * MCP spelling `<server>__<tool>` onto the registered `mcp__<server>__<tool>`
+ * name. A key that already names a tool, `"*"`, or an old spelling whose new
+ * name the map also carries is left alone. Returns the input by reference
+ * when nothing moved.
+ */
+export function rekeyLegacyMcpToolKeys<V>(
+  map: Readonly<Record<string, V>> | undefined,
+  toolNames: ReadonlySet<string>,
+): Readonly<Record<string, V>> | undefined {
+  if (map === undefined) return undefined;
+  const byLegacy = new Map<string, string>();
+  for (const name of toolNames) {
+    const legacy = legacyMcpToolName(name);
+    if (legacy !== undefined) byLegacy.set(legacy, name);
+  }
+  if (byLegacy.size === 0) return map;
+  let moved = false;
+  const out: Record<string, V> = {};
+  for (const [key, value] of Object.entries(map)) {
+    const registered = key === "*" || toolNames.has(key) ? undefined : byLegacy.get(key);
+    if (registered !== undefined && !Object.hasOwn(map, registered)) {
+      out[registered] = value;
+      moved = true;
+    } else {
+      out[key] = value;
+    }
+  }
+  return moved ? out : map;
+}
+
+/**
+ * Default egress sink-scope.
+ *
+ * A sink whose DESTINATION the (prompt-injectable) model chooses is dynamic
+ * even when the spec declares the tool: an attacker who steers the model
+ * picks where the data goes, so content from a non-user origin reaching it
+ * must reach the egress BLOCK tier, not merely warn (#144). Which tools those
+ * are is read from the tool itself: an external tool whose `operativeArgs`
+ * include a `url` or a `recipient` (`hasModelChosenDestination`) — Fetch,
+ * HttpRequest, HttpBatch, WebhookPost, EmailSend, OpenExternal, the RPC
+ * readers, … (permission-integration#5). Runtime-joined MCP sinks (`mcp__*`)
+ * are dynamic too.
+ *
+ * A fixed-destination sink stays `"external-configured"` (warn): `SendMessage`
+ * replies to the operator's channel, `WebSearch` and `ImageGenerate` call a
+ * fixed provider, a code host is reached at its configured origin. The
+ * names that were dynamic before tools declared their destinations (Fetch,
+ * WebFetch, Navigate, EvmSendTransaction) stay dynamic, so a caller that
+ * passes only a name gets the 0.7.0 answer. Override per deployment with
+ * `runChatLoop({ resolveSinkScope })`.
+ */
+export function defaultSinkScope(
+  toolName: string,
+  tool?: Pick<RegisteredTool, "scope" | "operativeArgs">,
+): SinkScope {
   if (toolName.startsWith("mcp__")) return "external-dynamic";
   if (MODEL_DESTINATION_SINKS.has(toolName)) return "external-dynamic";
+  if (tool !== undefined && hasModelChosenDestination(tool)) return "external-dynamic";
   return "external-configured";
 }
 
@@ -5034,7 +5100,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // gates the acquire call site: tools outside the map (no named entry, no
   // `"*"`) are not rate-gated at all — the limiter itself is fail-closed on
   // unknown keys, so the guard is what keeps unlisted tools ungated.
-  const rateLimitEntries = Object.entries(opts.rateLimits ?? {});
+  // 0.7.1 — MCP tools are registered as `mcp__<server>__<tool>`; a limit a
+  // spec wrote against the old `<server>__<tool>` spelling is re-keyed onto
+  // the registered name so it keeps applying.
+  const toolNamesAtStart: ReadonlySet<string> = new Set(tools.map((t) => t.name));
+  const runRateLimits = rekeyLegacyMcpToolKeys(opts.rateLimits, toolNamesAtStart);
+  const rateLimitEntries = Object.entries(runRateLimits ?? {});
   let toolRateLimiter: RateLimiter | undefined;
   if (rateLimitEntries.length > 0) {
     const buckets = new Map<string, BucketConfig>();
@@ -5048,8 +5119,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     toolRateLimiter = createRateLimiter({ buckets });
   }
   const hasToolRateBucket = (toolName: string): boolean =>
-    opts.rateLimits !== undefined &&
-    (opts.rateLimits[toolName] !== undefined || opts.rateLimits["*"] !== undefined);
+    runRateLimits !== undefined &&
+    (runRateLimits[toolName] !== undefined || runRateLimits["*"] !== undefined);
 
   // -------------------------------------------------------------------------
   // 0.6.0 §4.4 — the per-candidate plan table. One plan per enabled pool
@@ -5107,7 +5178,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         };
     const deny = cfg?.permissions?.deny ?? [];
     const ask = cfg?.permissions?.ask ?? [];
-    const rateEntries = Object.entries(cfg?.rateLimits ?? {}) as ReadonlyArray<
+    const planRateLimits = rekeyLegacyMcpToolKeys(cfg?.rateLimits, toolNamesAtStart);
+    const rateEntries = Object.entries(planRateLimits ?? {}) as ReadonlyArray<
       readonly [string, { readonly rpm: number; readonly burst?: number }]
     >;
     const armId = fromPool ? (cfg.profile ?? cfg.model) : (candidate?.modelString ?? opts.model);
@@ -5126,7 +5198,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       }
       planLimiter = createRateLimiter({ buckets });
     }
-    const planRateLimits = cfg?.rateLimits;
     const names = new Set(planAdvertised.map(({ tool }) => tool.name));
     return {
       armId,
@@ -5658,7 +5729,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // the prior turn in some streaming scenarios).
       const post = await fireHook("post-tool", {
         id: tu.id,
-        name: tu.name,
+        ...hookToolName(tu.name),
         isError: result.is_error === true,
       });
       if (!post.allowed) {
@@ -5699,7 +5770,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
     // Section 11 — pre-tool hook: short-circuit with the hook's reason
     // when any matching hook returns deny/block.
-    const preHook = await fireHook("pre-tool", { id: tu.id, name: tu.name, input: tu.input });
+    const preHook = await fireHook("pre-tool", {
+      id: tu.id,
+      ...hookToolName(tu.name),
+      input: tu.input,
+    });
     if (!preHook.allowed) {
       return finish({
         type: "tool_result",
@@ -5717,6 +5792,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // `justificationInjectedTools` comment at loop start for the full split.
     let operativeInput = operativeToolInput(tu.name, tu.input);
 
+    // 0.7.1 — rules are checked against the call the tool will RUN: the
+    // input parsed by the tool's own schema (unknown keys stripped, defaults
+    // filled in) and the tool's declared operative values canonicalised
+    // (paths resolved against the workspace, URLs parsed). Matching the raw
+    // input let a decoy key, an extra argument, an omitted default, a `..` or
+    // a symlinked directory walk past a rule. An input the schema rejects
+    // could not run anyway, so it is denied here with the schema's message,
+    // before any approval is asked for. Paths are resolved against the
+    // current working directory, the root every workspace tool resolves
+    // against when it runs.
+    const subject = preparePermissionSubject(tool, operativeInput, {
+      canonicalizePath: workspacePathCanonicalizer(),
+    });
+    if (!subject.ok) {
+      // Not a permission decision: no rule was consulted, and the call fails
+      // the way a malformed call always has — an `is_error` tool result, with
+      // `tool_call_end` recording it. Publishing it as a `permission_decision`
+      // deny would count every malformed call as a policy denial (eval
+      // safety_violations, the deny alerts and SLOs).
+      return finish({
+        type: "tool_result",
+        tool_use_id: tu.id,
+        content: subject.reason,
+        is_error: true,
+      });
+    }
+
     // 0.6.0 §4.4 — the SERVING candidate's rule set: the run's rules narrowed
     // by the profile's `permissions.deny` / `.ask` through `narrowRuleSet`
     // (a decision-level meet — a profile can only tighten). The primary plan
@@ -5724,7 +5826,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const decisionDetails = evaluateWithReason(
       {
         toolName: tu.name,
-        input: operativeInput,
+        input: subject.input,
+        ...(subject.operativeValues !== undefined
+          ? { operativeValues: subject.operativeValues }
+          : {}),
         readOnly: tool.readOnly,
         destructive: tool.destructive,
         requiresSandbox: tool.requiresSandbox,
@@ -5762,6 +5867,17 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         // below so the approving operator SEES the justification.
         const inputHash = hashApprovalInput(tu.name, operativeInput);
         let existing = await approvals.store.get(tu.name, inputHash);
+        // 0.7.1 — an approval parked before MCP tools were renamed is keyed on
+        // the old `<server>__<tool>` spelling, and the operator may already
+        // have granted it. Honour it (or re-use it while still pending)
+        // rather than parking the same call again under a new id.
+        const legacyToolName = legacyMcpToolName(tu.name);
+        if (existing === null && legacyToolName !== undefined) {
+          existing = await approvals.store.get(
+            legacyToolName,
+            hashApprovalInput(legacyToolName, operativeInput),
+          );
+        }
         // #400 — THE RESUMED CALL IS NOT THE PARKED CALL.
         //
         // A grant is keyed on whole-input equality, which silently assumes the
@@ -5827,18 +5943,29 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // §10.1 — approval replay across candidates uses the SERVING
             // candidate's rule set: a grant parked while the strong arm
             // served does not run under a narrower arm's denies.
-            const recheck = evaluateWithReason(
-              {
-                toolName: tu.name,
-                input: approvedOperative,
-                readOnly: tool.readOnly,
-                destructive: tool.destructive,
-                requiresSandbox: tool.requiresSandbox,
-              },
-              permissionMode,
-              servingPlan.permissionRules,
-              { sandboxAvailable: opts.sandboxAvailable === true },
-            );
+            // 0.7.1 — the recheck, like the first check, reads the PARSED
+            // approved input and its canonical operative values; an approved
+            // input that no longer parses is a denial, never a run.
+            const approvedSubject = preparePermissionSubject(tool, approvedOperative, {
+              canonicalizePath: workspacePathCanonicalizer(),
+            });
+            const recheck = approvedSubject.ok
+              ? evaluateWithReason(
+                  {
+                    toolName: tu.name,
+                    input: approvedSubject.input,
+                    ...(approvedSubject.operativeValues !== undefined
+                      ? { operativeValues: approvedSubject.operativeValues }
+                      : {}),
+                    readOnly: tool.readOnly,
+                    destructive: tool.destructive,
+                    requiresSandbox: tool.requiresSandbox,
+                  },
+                  permissionMode,
+                  servingPlan.permissionRules,
+                  { sandboxAvailable: opts.sandboxAvailable === true },
+                )
+              : { decision: "deny" as const, reason: approvedSubject.reason };
             if (recheck.decision === "deny") {
               approved = false;
               denialMessage =
@@ -5855,7 +5982,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               // actually RUN, so re-fire it against the substituted input.
               const replayHook = await fireHook("pre-tool", {
                 id: tu.id,
-                name: tu.name,
+                ...hookToolName(tu.name),
                 input: tu.input,
               });
               if (!replayHook.allowed) {
@@ -6084,15 +6211,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // we deny the call before it fires. `warn` logs but proceeds.
     //
     // Resolve the sink-scope so the egress block tier is actually reachable
-    // (#144): runtime-joined MCP sinks default to `"external-dynamic"` (block
-    // non-user-origin content), while spec-declared sinks stay
-    // `"external-configured"` (warn). Callers can override via
-    // `opts.resolveSinkScope` to mark federation-joined or other dynamic sinks.
+    // (#144): runtime-joined MCP sinks and tools that send to a destination
+    // the model chose default to `"external-dynamic"` (block non-user-origin
+    // content); other spec-declared sinks stay `"external-configured"`
+    // (warn). Callers can override via `opts.resolveSinkScope`.
     if (tool.scope === "external") {
       // (#386) — scan the OPERATIVE payload: for injected-justification
       // tools this is what `executeTool` actually transmits to the sink.
       const payload = JSON.stringify(operativeInput ?? null);
-      const sinkScope = (opts.resolveSinkScope ?? defaultSinkScope)(tu.name);
+      const sinkScope = (opts.resolveSinkScope ?? defaultSinkScope)(tu.name, tool);
       const egress = await classifyEgress(payload, runContext, {
         sinkId: tu.name,
         sinkScope,

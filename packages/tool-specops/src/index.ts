@@ -265,6 +265,7 @@ type PreparedPatch = {
 
 export const specPatchApply: RegisteredTool = buildTool({
   name: "SpecPatchApply",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Apply structured patches to a CrewHaus spec as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path. Use to change a tunable field - a token cap, a threshold, a pool policy - in a spec a human maintains, without reformatting their file. Defaults to a DRY RUN: it returns the patched YAML and the field-level diff and writes nothing until you pass dryRun: false with a path. The batch is applied in memory and re-validated after every patch, so a batch that breaks the schema never reaches the file. It refuses the identity, security and roster fields by design - model rosters, permissions, credentials and prompts are human-owned, and the refusal says which rule owns them.",
   inputSchema: z.object({
@@ -816,6 +817,11 @@ const SPEC_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export const doctorFix: RegisteredTool = buildTool({
   name: "DoctorFix",
+  operativeArgs: [
+    { field: "specPath", kind: "path", default: DEFAULT_SPEC_FILE },
+    { field: "crewhausDir", kind: "path", default: DEFAULT_CREWHAUS_DIR },
+    { field: "envPath", kind: "path", default: DEFAULT_ENV_FILE },
+  ],
   description:
     "Apply the mechanical repairs `crewhaus doctor` only prints: scaffold a missing spec, create the state directory, mark an outward-reaching tool `scope: external` in the spec, and append COMMENTED env stubs for missing provider credentials. Use when doctor reported a finding that has a deterministic fix and you want it made rather than described. Defaults to a DRY RUN that reports the exact bytes each change would write, produced by running the real fixer against an in-memory overlay - the preview is the write, not a rendering of it. It never writes a credential VALUE (stubs are commented out and there is no field to pass one), never touches a tool it cannot name safely, and applies nothing at all if any selected fix fails.",
   inputSchema: z.object({

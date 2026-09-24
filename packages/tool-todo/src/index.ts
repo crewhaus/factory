@@ -54,6 +54,7 @@ function renderMarkdown(todos: ReadonlyArray<Todo>): string {
 
 export const todoWrite: RegisteredTool = buildTool({
   name: "TodoWrite",
+  operativeArgs: [],
   description:
     "Replace the per-session todo list with the supplied items and return the list as a markdown checklist.",
   inputSchema: todoWriteSchema,

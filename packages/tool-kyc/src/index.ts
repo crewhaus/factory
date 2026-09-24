@@ -127,6 +127,7 @@ function retryable(kind: FetchFailureKind): boolean {
 
 export const vatIdValidate: RegisteredTool = buildTool({
   name: "VatIdValidate",
+  operativeArgs: [],
   description:
     "Check an EU, Northern Irish or UK VAT number: its country's own format first, then VIES or HMRC for whether it is actually registered, with the consultation number when a requester id is supplied. Use it before zero-rating an intra-community supply or paying an invoice that claims a VAT number. It reports THREE outcomes — registered, not registered, and could-not-check with the reason — because VIES is a proxy to member states' systems that are routinely down, and reading an outage as 'not valid' gets the invoice wrong. A registered number means the number exists, not that it belongs to whoever sent you the invoice.",
   inputSchema: z
@@ -353,6 +354,7 @@ const REGISTRIES = ["gleif", "sec-edgar"] as const;
 
 export const entityRegistryLookup: RegisteredTool = buildTool({
   name: "EntityRegistryLookup",
+  operativeArgs: [],
   description:
     "Look one company up in GLEIF and SEC EDGAR by LEI, CIK, ticker or name, and return one row per register with its own source URL and retrieval time. Use it to check a counterparty exists and is who the invoice says. The rows are NOT merged into one confident record: the registers disagree about legal names, and GLEIF's two statuses answer different questions — a LAPSED LEI usually means an unpaid renewal, not a dissolved company. The result shows the differences and lets the caller judge them, and a register that could not be read is reported as could-not-check, never as 'no such company'.",
   inputSchema: z

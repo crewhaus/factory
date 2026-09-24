@@ -215,9 +215,12 @@ test("every mutating tool is destructive, takes a dryRun, and says the default",
     expect(tool.description).toContain("dryRun defaults to true");
   }
   for (const tool of READERS) {
+    // CliVersionPin is not read-only (0.7.1): with `probe` it runs a harness's
+    // own CLI binary, and plan mode runs every read-only tool without asking.
+    // Neither reader is destructive: both only report.
     expect({ name: tool.name, readOnly: tool.readOnly, destructive: tool.destructive }).toEqual({
       name: tool.name,
-      readOnly: true,
+      readOnly: tool !== cliVersionPin,
       destructive: false,
     });
   }

@@ -114,6 +114,7 @@ const MAX_CONFLICT_FILE_BYTES = 2_000_000;
 
 export const gitStatus: RegisteredTool = buildTool({
   name: "GitStatus",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Report the working tree's state as structured JSON: branch, upstream, ahead/behind counts, and the staged, unstaged, untracked and conflicted paths. Use it instead of reading `git status` prose, and instead of guessing whether there is anything to commit.",
   inputSchema: z.object({
@@ -147,6 +148,7 @@ export const gitStatus: RegisteredTool = buildTool({
 
 export const gitDiff: RegisteredTool = buildTool({
   name: "GitDiff",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
     "Diff the working tree, the index, a ref or a commit range, as a summary, per-file line counts, a name list or a full patch. Use it to see exactly what a change touched before staging, committing or reviewing it.",
   inputSchema: z.object({
@@ -218,6 +220,7 @@ export const gitDiff: RegisteredTool = buildTool({
 
 export const gitLog: RegisteredTool = buildTool({
   name: "GitLog",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
     "List commits as structured records — sha, author, ISO dates, subject and body — filtered by range, path, author or count. Use it to answer what changed and when without parsing `git log`'s free-form text.",
   inputSchema: z.object({
@@ -265,6 +268,7 @@ export const gitLog: RegisteredTool = buildTool({
 
 export const gitShow: RegisteredTool = buildTool({
   name: "GitShow",
+  operativeArgs: [{ field: "path", kind: "path", within: "cwd", default: "." }],
   description:
     "Return one file's contents at a ref, or one commit's metadata and patch. Use it to read a file as it was on another branch without checking that branch out.",
   inputSchema: z.object({
@@ -325,6 +329,7 @@ export const gitShow: RegisteredTool = buildTool({
 
 export const gitBlame: RegisteredTool = buildTool({
   name: "GitBlame",
+  operativeArgs: [{ field: "path", kind: "path", within: "cwd" }],
   description:
     "Attribute each line of a file to the commit that last touched it, as structured records rather than blame's column-aligned text. Use it to find who and what introduced a specific line before changing or reverting it.",
   inputSchema: z.object({
@@ -382,6 +387,7 @@ export const gitBlame: RegisteredTool = buildTool({
 
 export const gitBranchList: RegisteredTool = buildTool({
   name: "GitBranchList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List branches with their tip sha, upstream, last-commit date and subject, sorted by refname. Use it to find the right branch name before switching, diffing or deleting.",
   inputSchema: z.object({
@@ -426,6 +432,7 @@ export const gitBranchList: RegisteredTool = buildTool({
 
 export const gitTagList: RegisteredTool = buildTool({
   name: "GitTagList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List tags with the commit each points at, whether it is annotated, its date and its message subject. Use it to find the previous release tag before generating notes or diffing two versions.",
   inputSchema: z.object({
@@ -462,6 +469,7 @@ export const gitTagList: RegisteredTool = buildTool({
 
 export const gitRemoteList: RegisteredTool = buildTool({
   name: "GitRemoteList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote.",
   inputSchema: z.object({ cwd: cwdField, timeout: timeoutField }),
@@ -478,6 +486,7 @@ export const gitRemoteList: RegisteredTool = buildTool({
 
 export const gitMergeBase: RegisteredTool = buildTool({
   name: "GitMergeBase",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Find the best common ancestor of two refs, or the fork point of a branch from its upstream. Use it to scope a review or a diff to only the commits a branch actually added.",
   inputSchema: z.object({
@@ -522,6 +531,7 @@ export const gitMergeBase: RegisteredTool = buildTool({
 
 export const gitRevParse: RegisteredTool = buildTool({
   name: "GitRevParse",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Resolve refs to object shas and types, and report the repository's root, git directory and current HEAD. Use it to turn a name like 'HEAD~3' or 'v1.2' into a stable sha before passing it to another tool.",
   inputSchema: z.object({
@@ -569,6 +579,7 @@ export const gitRevParse: RegisteredTool = buildTool({
 
 export const gitFileHistory: RegisteredTool = buildTool({
   name: "GitFileHistory",
+  operativeArgs: [{ field: "path", kind: "path", within: "cwd" }],
   description:
     "List the commits that touched one path, following it across renames, with the per-commit change status. Use it to trace how a single file reached its current shape, including what it used to be called.",
   inputSchema: z.object({
@@ -617,6 +628,7 @@ export const gitFileHistory: RegisteredTool = buildTool({
 
 export const gitStashList: RegisteredTool = buildTool({
   name: "GitStashList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the stash entries with their ref, sha, message and date. Use it to see what is parked before popping anything, since a stash stack is shared across every worktree of a repository.",
   inputSchema: z.object({
@@ -640,6 +652,7 @@ export const gitStashList: RegisteredTool = buildTool({
 
 export const gitConflicts: RegisteredTool = buildTool({
   name: "GitConflicts",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the currently conflicted paths and locate the conflict markers inside each one, by line number. Use it after a merge, rebase or cherry-pick stops, to go straight to the regions that need a decision.",
   inputSchema: z.object({
@@ -693,6 +706,7 @@ export const gitConflicts: RegisteredTool = buildTool({
 
 export const gitWorktreeList: RegisteredTool = buildTool({
   name: "GitWorktreeList",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "List the repository's worktrees with their path, HEAD, branch and locked or prunable state, sorted by path. Use it before adding or removing one, since git refuses to check the same branch out twice.",
   inputSchema: z.object({ cwd: cwdField, timeout: timeoutField }),
@@ -712,6 +726,7 @@ export const gitWorktreeList: RegisteredTool = buildTool({
 
 export const gitAdd: RegisteredTool = buildTool({
   name: "GitAdd",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
     "Stage the named paths. Use it to build a commit deliberately, one path at a time; there is no way to stage the whole tree blindly, which is the point.",
   inputSchema: z.object({
@@ -748,6 +763,7 @@ export const gitAdd: RegisteredTool = buildTool({
 
 export const gitCommit: RegisteredTool = buildTool({
   name: "GitCommit",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
     "Commit what is staged, or only the named paths, with a message and an optional author and date. Use it to record a change; it never amends unless `amend` is set explicitly, so an existing commit is never rewritten by accident.",
   inputSchema: z.object({
@@ -809,6 +825,10 @@ export const gitCommit: RegisteredTool = buildTool({
 
 export const gitSwitch: RegisteredTool = buildTool({
   name: "GitSwitch",
+  operativeArgs: [
+    { field: "cwd", kind: "path" },
+    { field: "branch", kind: "id" },
+  ],
   description:
     "Switch the worktree to another branch, optionally creating it or detaching HEAD at a ref. Use it to move between branches; git refuses and changes nothing when the switch would discard uncommitted work.",
   inputSchema: z.object({
@@ -851,6 +871,10 @@ export const gitSwitch: RegisteredTool = buildTool({
 
 export const gitBranchCreate: RegisteredTool = buildTool({
   name: "GitBranchCreate",
+  operativeArgs: [
+    { field: "cwd", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Create a branch at HEAD or at a given start point, without switching to it. Use it to mark a base or open a line of work while staying where you are.",
   inputSchema: z.object({
@@ -885,6 +909,10 @@ export const gitBranchCreate: RegisteredTool = buildTool({
 
 export const gitBranchDelete: RegisteredTool = buildTool({
   name: "GitBranchDelete",
+  operativeArgs: [
+    { field: "cwd", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Delete a local branch, refusing by default if it holds commits that are not merged anywhere. Use `force` only when you mean to discard those commits, since nothing but the reflog will remember them.",
   inputSchema: z.object({
@@ -920,6 +948,7 @@ export const gitBranchDelete: RegisteredTool = buildTool({
 
 export const gitStashPush: RegisteredTool = buildTool({
   name: "GitStashPush",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
     "Park the current changes on the stash stack with a message. Use a message always: the stack is shared by every worktree of the repository, so an unlabelled entry is hard to claim later.",
   inputSchema: z.object({
@@ -960,6 +989,7 @@ export const gitStashPush: RegisteredTool = buildTool({
 
 export const gitStashPop: RegisteredTool = buildTool({
   name: "GitStashPop",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Restore a stash entry onto the working tree, dropping it unless `apply` is set. Use an explicit `stash` ref whenever other worktrees share this repository, so you never take an entry that is not yours.",
   inputSchema: z.object({
@@ -998,6 +1028,10 @@ export const gitStashPop: RegisteredTool = buildTool({
 
 export const gitTagCreate: RegisteredTool = buildTool({
   name: "GitTagCreate",
+  operativeArgs: [
+    { field: "cwd", kind: "path" },
+    { field: "name", kind: "id" },
+  ],
   description:
     "Create a lightweight or annotated tag at HEAD or a given ref. Use an annotated tag (pass `message`) for anything a release refers to, since only those carry a date and an author.",
   inputSchema: z.object({
@@ -1034,6 +1068,7 @@ export const gitTagCreate: RegisteredTool = buildTool({
 
 export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything.",
   inputSchema: z.object({
@@ -1085,6 +1120,7 @@ export const gitApplyPatch: RegisteredTool = buildTool({
 
 export const gitCherryPick: RegisteredTool = buildTool({
   name: "GitCherryPick",
+  operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
     "Replay one or more commits onto the current branch. Use `noCommit` to stage the change without committing, and GitConflicts when the pick stops partway.",
   inputSchema: z.object({
@@ -1135,6 +1171,7 @@ export const gitCherryPick: RegisteredTool = buildTool({
 
 export const gitResetPaths: RegisteredTool = buildTool({
   name: "GitResetPaths",
+  operativeArgs: [{ field: "paths", kind: "path", within: "cwd" }],
   description:
     "Unstage the named paths, restoring their index entries from a ref without touching the files on disk. Use it to undo a GitAdd; this package has no whole-tree reset, so no call here can discard your edits.",
   inputSchema: z.object({
@@ -1168,6 +1205,7 @@ export const gitResetPaths: RegisteredTool = buildTool({
 
 export const gitWorktreeAdd: RegisteredTool = buildTool({
   name: "GitWorktreeAdd",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Create an additional worktree inside the workspace, checked out at a ref or on a new branch. Use it to work on two branches at once without stashing; the path must be inside the working directory.",
   inputSchema: z.object({
@@ -1209,6 +1247,7 @@ export const gitWorktreeAdd: RegisteredTool = buildTool({
 
 export const gitWorktreeRemove: RegisteredTool = buildTool({
   name: "GitWorktreeRemove",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     "Remove a worktree and its administrative entry. Use `force` only when you accept losing whatever is uncommitted there, because git otherwise refuses a dirty worktree for exactly that reason.",
   inputSchema: z.object({

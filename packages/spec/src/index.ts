@@ -136,29 +136,44 @@ const permissionsBlock = z
 const mcpRequiredField = z.boolean().optional();
 
 /**
- * 0.6.0 §5.5 — MCP tool trust flags, NARROWING-ONLY. Every MCP tool is
- * `readOnly: false` today and therefore asks in default mode; `tool_flags`
- * lets a spec tighten what the runtime knows about a server's tools
- * (`defaults` for every tool on the server, `per_tool` for named ones).
+ * 0.6.0 §5.5 — MCP tool trust flags, NARROWING-ONLY. `tool_flags` lets a spec
+ * tighten what the runtime knows about a server's tools (`defaults` for every
+ * tool on the server, `per_tool` keyed by the server's own tool name). Since
+ * 0.7.1 it is lowered and enforced: `destructive: true` makes auto mode ask,
+ * `requireJustification: true` puts the tool behind the intent gate. The
+ * server's own `destructiveHint: true` / `readOnlyHint: false` annotations
+ * tighten the same way; the loosening hints are ignored.
  *
- * SECURITY: the enumerated key set is `{readOnly: true, destructive: true,
+ * SECURITY: the enumerated key set is `{destructive: true,
  * requireJustification: true}` and each value is the literal `true` — a spec
  * may never clear `requireJustification`, never set `scope: internal` on an
  * `mcp__*` tool and never touch `ioCapability`. Loosening any of those would
  * punch straight through the egress chokepoint, which keys on
  * `scope === "external"`, so the schema rejects the loosening direction at
  * parse time (defense in depth, mirroring `permissions.mode: bypass`).
+ *
+ * `readOnly` is NOT a tightening, and is refused: a read-only tool is one
+ * plan mode and auto mode run WITHOUT asking, so marking a remote tool
+ * read-only grants it. 0.6.0 accepted the key (and refused to compile any
+ * `tool_flags` at all), so no spec that compiled relied on it.
  */
 const MCP_TOOL_FLAG_FORBIDDEN_KEYS = ["scope", "ioCapability", "classifyOutput"] as const;
 
 const mcpToolFlagsEntrySchema = z
   .object({
-    readOnly: z.literal(true).optional(),
+    readOnly: z
+      .never({
+        errorMap: () => ({
+          message:
+            "mcp_servers.<name>.tool_flags cannot set readOnly: read-only is a grant, not a restriction — plan and auto mode run a read-only tool without asking. Remove it; to tighten a tool, set destructive: true or requireJustification: true",
+        }),
+      })
+      .optional(),
     destructive: z.literal(true).optional(),
     requireJustification: z.literal(true).optional(),
   })
   .strict(
-    `mcp_servers.<name>.tool_flags may only TIGHTEN a tool's trust flags (readOnly: true, destructive: true, requireJustification: true); ${MCP_TOOL_FLAG_FORBIDDEN_KEYS.join(", ")} and every other RegisteredTool property are tool-author facts a spec cannot override`,
+    `mcp_servers.<name>.tool_flags may only TIGHTEN a tool's trust flags (destructive: true, requireJustification: true); ${MCP_TOOL_FLAG_FORBIDDEN_KEYS.join(", ")} and every other RegisteredTool property are tool-author facts a spec cannot override`,
   );
 
 const mcpToolFlagsBlock = z
@@ -192,7 +207,86 @@ const sseMcpConfig = z
 
 const mcpServerConfigSchema = z.discriminatedUnion("transport", [stdioMcpConfig, sseMcpConfig]);
 
-const mcpServersBlock = z.record(z.string().min(1), mcpServerConfigSchema).optional();
+/**
+ * An `mcp_servers` key becomes part of every tool name the server contributes
+ * (`mcp__<server>__<tool>`), and model providers accept only letters, digits,
+ * `_` and `-` there, so any other character fails the spec. Mirrors
+ * `MCP_SERVER_NAME_PATTERN` in `@crewhaus/tool-mcp`, which refuses the same
+ * names at registration; apps/cli checks the two agree.
+ */
+const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * The names {@link mcpServerNameWarning} is quiet about: no `__`, and no `_`
+ * at either end.
+ */
+const CLEAR_MCP_SERVER_NAME_RE = /^(?!_)(?:[A-Za-z0-9-]|_(?!_))+(?<!_)$/;
+
+function mcpServerNameSuggestion(name: string): string {
+  const cleaned = name
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/_{2,}/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  return cleaned === "" ? "my-server" : cleaned;
+}
+
+/**
+ * Why an `mcp_servers` key that works should still be renamed, or undefined
+ * when there is nothing to say. `__` is the separator in
+ * `mcp__<server>__<tool>`, and a key containing it, or starting or ending
+ * with `_`, makes that split ambiguous: server `a` + tool `b__c` and
+ * server `a__b` + tool `c` are the same tool name.
+ */
+function mcpServerNameWarning(name: string): string | undefined {
+  if (!MCP_SERVER_NAME_RE.test(name) || CLEAR_MCP_SERVER_NAME_RE.test(name)) return undefined;
+  const suggestion = mcpServerNameSuggestion(name);
+  const why = name.includes("__")
+    ? 'contains "__", which also separates the server from the tool in mcp__<server>__<tool>'
+    : 'starts or ends with "_", which blurs where mcp__<server>__<tool> splits';
+  return `mcp_servers key "${name}" ${why}, so two servers' tool names can collide. Rename it, e.g. "${suggestion}", and rename the permission rules, hooks and rate_limits that name ${name}__… or mcp__${name}__… to match.`;
+}
+
+/**
+ * The `mcp_servers` keys in a parsed spec that work but should be renamed
+ * (see {@link mcpServerNameWarning}), wherever the shape nests the block.
+ * crewhaus 0.7.0 ran such keys, so `compile` and `lint` warn about them
+ * rather than fail.
+ */
+export function mcpServerNameWarnings(
+  spec: unknown,
+): Array<{ readonly path: string; readonly message: string }> {
+  const out: Array<{ path: string; message: string }> = [];
+  const visit = (node: unknown, at: string): void => {
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => visit(item, `${at}[${i}]`));
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      const path = at === "" ? key : `${at}.${key}`;
+      if (key !== "mcp_servers" || value === null || typeof value !== "object") {
+        visit(value, path);
+        continue;
+      }
+      for (const name of Object.keys(value)) {
+        const message = mcpServerNameWarning(name);
+        if (message !== undefined) out.push({ path: `${path}.${name}`, message });
+      }
+    }
+  };
+  visit(spec, "");
+  return out;
+}
+
+const mcpServerNameKey = z.string().superRefine((name, ctx) => {
+  if (MCP_SERVER_NAME_RE.test(name)) return;
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    message: `mcp_servers key "${name}" can only use letters, digits, "-" and "_". Rename it, e.g. "${mcpServerNameSuggestion(name)}", and rename the permission rules, hooks and rate_limits that name it to match.`,
+  });
+});
+
+const mcpServersBlock = z.record(mcpServerNameKey, mcpServerConfigSchema).optional();
 
 // Section 13 — sub-agent definitions (`subAgentDefinitionSchema` /
 // `subAgentsBlock`) are declared below the model-profile section: from
@@ -4066,6 +4160,15 @@ type SpecModelCheckContext = {
 const MODEL_DIRECTED_TOOLS = new Set(["Consult", "Escalate"]);
 const MCP_TOOL_SELECTOR_RE = /^mcp__([^_].*?)__(.+)$/;
 
+/** Does `selector` (`mcp__<server>__<tool or glob>`) start with a declared server? */
+function namesDeclaredMcpServer(selector: string, servers: ReadonlySet<string>): boolean {
+  for (const server of servers) {
+    const prefix = `mcp__${server}__`;
+    if (selector.startsWith(prefix) && selector.length > prefix.length) return true;
+  }
+  return false;
+}
+
 /** Levenshtein distance — the did-you-mean helper for unknown `$refs` / tags. */
 function editDistance(a: string, b: string): number {
   if (a === b) return 0;
@@ -4218,6 +4321,8 @@ function checkProfileTools(
   }
   for (const [i, tool] of tools.entries()) {
     if (tool.startsWith("mcp__")) {
+      // A declared key may itself contain `__`, so match the keys first.
+      if (namesDeclaredMcpServer(tool, ctx.mcpServers)) continue;
       const server = tool.match(MCP_TOOL_SELECTOR_RE)?.[1];
       if (server === undefined) {
         ctx.custom(

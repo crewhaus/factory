@@ -274,6 +274,10 @@ function bandOf(rating: CvssRating | undefined, label: string | undefined): Band
 
 export const dependencyAudit: RegisteredTool = buildTool({
   name: "DependencyAudit",
+  operativeArgs: [
+    { field: "cwd", kind: "path", default: "." },
+    { field: "endpoint", kind: "url" },
+  ],
   description:
     "Read a project's lockfile and ask the public OSV database whether any locked version falls inside a range a published advisory declares affected, returning the severity, the affected range and the fixed version where OSV records one. Use it before trusting a dependency tree you did not install yourself. Read the limit in the result and do not round it up: a match means this VERSION IS IN AN AFFECTED RANGE, not that the vulnerable code is reachable from this project — nothing here analyses call paths, and `reachabilityAnalyzed` is always false. It reads bun.lock, package-lock.json, npm-shrinkwrap.json, yarn.lock and Cargo.lock; a pnpm, Python or Go lockfile beside them is reported as NOT audited rather than passed over in silence. Queries are batched, and a database that cannot be reached is an error rather than an empty, reassuring answer.",
   inputSchema: z.object({

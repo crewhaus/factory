@@ -156,6 +156,108 @@ export type ModelFeatureRequirement = {
   readonly web_search?: boolean;
 };
 
+/**
+ * The version of the tool contract this package defines: the
+ * `ToolDefinition` an author writes, and the `RegisteredTool` the runtime
+ * holds. A tool package published outside this repo can compare it against
+ * the version it was written for before it relies on a field.
+ *
+ * Semver: a new OPTIONAL field is a minor bump, a field that changes meaning
+ * or becomes required is a major one.
+ *
+ * - `1.0.0` — the contract as released in crewhaus 0.7.0.
+ * - `1.1.0` — adds `operativeArgs` (crewhaus 0.7.1).
+ */
+export const TOOL_CONTRACT_VERSION = "1.1.0";
+
+/**
+ * What an operative argument holds, which decides how a permission rule's
+ * argument glob is compared with it:
+ *
+ * - `"path"` — a filesystem path. It is resolved against the workspace root
+ *   before matching: `..` collapsed and symlinked directories followed, so a
+ *   rule is checked against the file the tool will actually touch. A path
+ *   that lands outside the workspace never satisfies an allow rule and always
+ *   satisfies a deny or ask rule. (The edge worker has no filesystem to ask:
+ *   there `..` is collapsed as text and a path that climbs above its start
+ *   counts as outside.)
+ * - `"url"` — a URL, compared in its parsed (WHATWG `href`) form, so
+ *   `HTTP://Example.COM` and `http://example.com/` are one value.
+ * - `"command"` — a command line. An array (an argv) is joined with single
+ *   spaces, so `Tool(git status)` matches `["git", "status"]`.
+ *   An allow rule must match the whole command; a deny or ask rule also fires
+ *   on any single word of an argv, so `RunCommand(rm)` catches
+ *   `["rm", "-rf", "src"]`.
+ * - `"recipient"` — who or where the tool delivers to, when that is not
+ *   written as a URL: an email address, a phone number, a host name, a
+ *   repository. Compared as written.
+ * - `"text"` and `"id"` — compared as written. An `"id"` field may also hold a
+ *   number, which is compared as its decimal string.
+ *
+ * `"url"` and `"recipient"` are the destination kinds: an external tool that
+ * declares one sends to a place the model chooses (see
+ * {@link hasModelChosenDestination}).
+ */
+export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text" | "id";
+
+/**
+ * One input field a permission rule's argument glob constrains — the rule
+ * `Write(src/**)` is about Write's `path`, not its `content`.
+ *
+ * `field` names the field in the tool's input schema. Use dots for a nested
+ * field (`target.path`). An array anywhere on the way is walked element by
+ * element, so `requests.url` covers the `url` of every request.
+ *
+ * `default` is the value the tool uses when the field is omitted, for a tool
+ * that fills the default in `execute` rather than in its schema. Without it,
+ * a call that leaves the field out would carry no value for a deny rule to
+ * catch, while the tool still acts on the default.
+ *
+ * `within` names a second, top-level field that qualifies this one. Its value
+ * is written in front, with a `/` between: `{ field: "repo", kind:
+ * "recipient", within: "owner" }` is matched as `crewhaus/factory`, so one rule
+ * can say `IssueCreate(crewhaus/*)`. For a `path`, `within` names the
+ * directory the path is relative to (`{ field: "paths", kind: "path", within:
+ * "cwd" }`), and the joined path is what gets resolved; an absolute path is
+ * left as it is. When the call leaves the qualifying field out, the value is
+ * matched on its own. A `url` or `command` cannot be qualified.
+ *
+ * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
+ * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
+ * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
+ * whose dangerous mode hangs on a flag should gate that mode itself — for
+ * example with `requireJustification` — rather than rely on a scoped rule.
+ */
+export type OperativeArg = {
+  readonly field: string;
+  readonly kind: OperativeArgKind;
+  readonly default?: string;
+  readonly within?: string;
+};
+
+/** The kinds that name where a tool sends: see {@link OperativeArgKind}. */
+export const DESTINATION_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set(["url", "recipient"]);
+
+/**
+ * True when the tool sends to a destination the model picks: it is
+ * `scope: "external"` and one of its `operativeArgs` is a URL or a
+ * recipient. Such a tool can carry whatever the model puts in the call to
+ * wherever the model points it, so the egress fabric treats it as a dynamic
+ * sink.
+ *
+ * Taken structurally, so a data-only description of a tool (the builtin
+ * manifest) answers the same way as the live one.
+ */
+export function hasModelChosenDestination(tool: {
+  readonly scope: string;
+  readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+}): boolean {
+  return (
+    tool.scope === "external" &&
+    (tool.operativeArgs ?? []).some((a) => DESTINATION_ARG_KINDS.has(a.kind as OperativeArgKind))
+  );
+}
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
@@ -218,12 +320,20 @@ export interface ToolDefinition<TInput = unknown> {
    * never see a field their own schema doesn't allow. A tool that declares
    * the field itself keeps receiving it verbatim.
    *
-   * Default at normalization is `false`. Recommended `true` for any tool
-   * with destructive or external side effects (evm-tx, message-channel,
-   * federation outbound). Independent of `scope` — a tool can be
-   * `internal` and still require justification (e.g. a destructive fs
-   * delete), and a tool can be `external` without requiring justification
-   * (e.g. a read-only public-data fetch).
+   * Default at normalization is `false`.
+   *
+   * THE RULE (0.7.1): a `destructive` tool that goes to a place the model
+   * chose — `scope: "external"` with a `url` or `recipient` operative
+   * argument ({@link hasModelChosenDestination}) — MUST set this: it changes
+   * or delivers something where the model pointed it (a message, a post, an
+   * HTTP call, a download). Other tools MAY set it when their effect deserves
+   * an intent check (a fleet mutation, a secret rotation). A destructive tool
+   * that acts only inside the workspace (Write, RemovePath, Bash) is not
+   * required to: the permission gate already asks, and without an LLM judge
+   * a justification fails closed in production, so gating every write would
+   * stop every write. apps/cli/src/flag-rules.test.ts holds the rule over
+   * every builtin and lists the gated set, so a change either way is
+   * deliberate.
    */
   requireJustification?: boolean;
   /**
@@ -264,6 +374,38 @@ export interface ToolDefinition<TInput = unknown> {
    * or returning `false` routes the call serial.
    */
   concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
+  /**
+   * The input field(s) a permission rule's argument glob is checked against —
+   * see {@link OperativeArg}. `buildTool` refuses a declaration that names a
+   * field the input schema does not have.
+   *
+   * How a rule reads them:
+   *
+   * - an `alwaysAllow` rule matches only when EVERY operative value in the
+   *   call matches its glob, so one in-scope value cannot carry an
+   *   out-of-scope one;
+   * - an `alwaysDeny` or `alwaysAsk` rule matches when ANY operative value
+   *   does.
+   *
+   * Values are read from the input AFTER the tool's schema has parsed it: the
+   * same object `execute` receives, with unknown keys stripped.
+   *
+   * Omitted ⇒ the rule falls back to the tool's string values: an allow needs
+   * every one of them to match, a deny or ask fires on any. That is safe but
+   * blunt: a tool with a message or a note field can rarely be given a scoped
+   * allow. Declaring the operative field is what makes a scoped allow usable.
+   *
+   * `[]` says, deliberately, that no argument decides where the tool acts —
+   * it writes to the clipboard, or stops a process by a handle only this
+   * session has. A rule with an argument pattern is then matched against the
+   * call's string values, exactly as for a tool that declares nothing, and
+   * `crewhaus lint` points out that such a rule scopes nothing.
+   *
+   * Every builtin that is not read-only, or is `scope: "external"`, declares
+   * this (an empty array included); `apps/cli/src/operative-args.test.ts`
+   * holds that.
+   */
+  operativeArgs?: ReadonlyArray<OperativeArg>;
 }
 
 /** Normalized form stored in the catalog. All flags are required booleans and
@@ -309,6 +451,9 @@ export interface RegisteredTool {
   /** See ToolDefinition.concurrencyClassifier. Optional; when absent the
    *  orchestrator partitions on the static concurrency flags alone. */
   concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
+  /** See ToolDefinition.operativeArgs. Optional and passed through verbatim
+   *  by `buildTool` after it has checked every field against the schema. */
+  operativeArgs?: ReadonlyArray<OperativeArg>;
 }
 
 export class ToolCatalogError extends CrewhausError {
@@ -398,7 +543,7 @@ export class ToolCatalog {
    * `crewhaus run` quarantine path (apps/cli `runRunCli`) does NOT use it. It
    * reads the failing-server set from `.crewhaus/mcp/quarantine.json` (written
    * by `crewhaus mcp doctor`), filters the plain tools array by the
-   * `<server>__` name prefix, and appends a notice built by `mcp-doctor.ts`'s
+   * `mcp__<server>__` name prefix, and appends a notice built by `mcp-doctor.ts`'s
    * `quarantineNotice()` to the agent instructions. This method + `restore()`
    * + `quarantinedNames()` are a catalog-level API awaiting a caller.
    */
@@ -546,6 +691,48 @@ export function stripJustificationField(input: unknown): unknown {
   if (!isPlainObject(input) || !(JUSTIFICATION_INPUT_FIELD in input)) return input;
   const { [JUSTIFICATION_INPUT_FIELD]: _stripped, ...rest } = input;
   return rest;
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool names
+// ---------------------------------------------------------------------------
+
+/**
+ * The prefix every tool from an MCP server carries: a remote tool `echo` on
+ * the server `everything` is registered as `mcp__everything__echo`. This is
+ * the spelling the docs, the spec's model-profile `tools:` selectors, the
+ * egress fabric and the scope audit all key on.
+ */
+export const MCP_TOOL_NAME_PREFIX = "mcp__";
+
+/** The registered name of the remote tool `tool` on the MCP server `server`. */
+export function mcpToolName(server: string, tool: string): string {
+  return `${MCP_TOOL_NAME_PREFIX}${server}__${tool}`;
+}
+
+/**
+ * The spelling an MCP tool name had before crewhaus 0.7.1, `<server>__<tool>`,
+ * or `undefined` when `name` is not an MCP tool name. Rules, allow-lists and
+ * rate limits written against the old spelling keep matching through it.
+ */
+export function legacyMcpToolName(name: string): string | undefined {
+  if (!name.startsWith(MCP_TOOL_NAME_PREFIX)) return undefined;
+  const rest = name.slice(MCP_TOOL_NAME_PREFIX.length);
+  // The separator after a server of at least one character. An
+  // `mcp_servers` key may itself contain `__` or start with `_` (0.7.0 ran
+  // such keys), and the old spelling is still everything after `mcp__`.
+  const sep = rest.indexOf("__", 1);
+  if (sep < 1 || sep + 2 >= rest.length) return undefined;
+  return rest;
+}
+
+/**
+ * Does a name written in a tool list (a skill's or sub-agent's `tools`, a
+ * rate-limit key) refer to the registered tool `name`? Exact match, or the
+ * pre-0.7.1 spelling of an MCP tool name.
+ */
+export function toolListEntryNames(entry: string, name: string): boolean {
+  return entry === name || (entry.length > 0 && legacyMcpToolName(name) === entry);
 }
 
 export const defaultCatalog = new ToolCatalog();

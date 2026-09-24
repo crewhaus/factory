@@ -244,6 +244,7 @@ export const goldenCompare: RegisteredTool = buildTool({
 
 export const goldenUpdate: RegisteredTool = buildTool({
   name: "GoldenUpdate",
+  operativeArgs: [{ field: "golden", kind: "path" }],
   description:
     "Write the current output to a golden file, atomically. Use it to accept a change you have reviewed and intend. It writes through a temporary file and a rename, so an interrupted run leaves the old golden intact rather than a half-written one — a truncated golden passes nothing and is easy to mistake for a real diff. This overwrites a reviewed baseline, so it is destructive and asks for a justification.",
   inputSchema: z

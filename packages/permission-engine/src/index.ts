@@ -3,7 +3,9 @@
  *
  * Modes
  *   default — ask on first encounter; rules can pre-decide
- *   plan    — read-only; non-readOnly tools always denied (no rules consulted)
+ *   plan    — read-only; non-readOnly tools always denied. Only deny and ask
+ *             rules are consulted (both deny); allow rules are ignored, so
+ *             plan mode can never be widened
  *   auto    — read-only auto-allow; destructive auto-ask; rules can override
  *   bypass  — allow everything (CLI flag only — see security note)
  *
@@ -13,6 +15,11 @@
  * cannot override an earlier source's decision.
  *
  * Rule types: alwaysAllow / alwaysDeny / alwaysAsk
+ *
+ * An argument-scoped rule (`Tool(glob)`) is matched differently by type
+ * (0.7.1): an allow needs EVERY operative value of the call to match its
+ * glob, a deny or ask fires when ANY does. See `matchesPattern` in
+ * `@crewhaus/tool-permission-matcher`.
  *
  * SECURITY: `mode: bypass` must NEVER come from a config file. Both
  * `parsePermissionsConfig()` (yaml/settings) and the Zod schema reject it
@@ -27,6 +34,8 @@ import { dirname, join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   type CompiledPattern,
+  type OperativeValue,
+  type RulePolarity,
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
@@ -52,7 +61,19 @@ export type RuleSet = {
 
 export type ToolCallContext = {
   readonly toolName: string;
+  /**
+   * The call's input. Pass it AFTER the tool's schema has parsed it (unknown
+   * keys stripped, defaults filled in): that is what the tool acts on, so it
+   * is what a rule must be checked against.
+   */
   readonly input: unknown;
+  /**
+   * The values of the tool's declared `operativeArgs`, canonicalised (paths
+   * resolved against the workspace, URLs parsed). When present, argument
+   * globs are matched against these instead of `input`. Absent ⇒ the tool
+   * declares none, and the matcher falls back to `input`'s string values.
+   */
+  readonly operativeValues?: ReadonlyArray<OperativeValue>;
   readonly readOnly: boolean;
   readonly destructive: boolean;
   /**
@@ -157,6 +178,10 @@ export const BUILTIN_DEFAULT_RULES: ReadonlyArray<PermissionRule> = [
   ...BUILTIN_BOOKKEEPING_RULES,
 ];
 
+function rulePolarity(t: RuleType): RulePolarity {
+  return t === "alwaysAllow" ? "allow" : "restrict";
+}
+
 function ruleTypeToDecision(t: RuleType): Decision {
   switch (t) {
     case "alwaysAllow":
@@ -175,6 +200,40 @@ function compile(rule: PermissionRule): CompiledPattern {
   const compiled = compilePattern(rule.pattern);
   compileCache.set(rule, compiled);
   return compiled;
+}
+
+/**
+ * The first rule, in source-priority order, that matches `call` among the
+ * rules `consider` admits. Each rule is matched with its own polarity: an
+ * allow needs every operative value to match, a deny or ask any one.
+ *
+ * A malformed rule pattern fails CLOSED for safety rules: an uncompilable
+ * `alwaysDeny`/`alwaysAsk` still gates (it counts as a match), so an
+ * attacker-influenced broken guard — e.g. a deny pattern in an untrusted
+ * sub-agent definition — can't be silently dropped to fail open. A malformed
+ * `alwaysAllow` is skipped: a broken grant simply isn't honored.
+ */
+function firstMatchingRule(
+  call: ToolCallContext,
+  rules: RuleSet,
+  consider: (type: RuleType) => boolean,
+): PermissionRule | undefined {
+  for (const sourceKey of SOURCE_PRIORITY) {
+    for (const rule of rules[sourceKey]) {
+      if (!consider(rule.type)) continue;
+      try {
+        const compiled = compile(rule);
+        const matched = matchesPattern(compiled, call.toolName, call.input, {
+          polarity: rulePolarity(rule.type),
+          ...(call.operativeValues !== undefined ? { operativeValues: call.operativeValues } : {}),
+        });
+        if (matched) return rule;
+      } catch {
+        if (rule.type === "alwaysDeny" || rule.type === "alwaysAsk") return rule;
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -200,36 +259,32 @@ export function evaluateWithReason(
   opts: EvaluateOptions = {},
 ): DecisionDetails {
   if (mode === "bypass") return { decision: "allow" };
-  if (mode === "plan") return { decision: call.readOnly ? "allow" : "deny" };
+  if (mode === "plan") {
+    // permission-integration#6 — plan mode used to consult no rule at all,
+    // so an operator's explicit deny on a read-only egress tool (HttpPaginate,
+    // SseRead, …) did nothing there. Deny and ask rules are read first, and
+    // both deny (plan mode has no one to ask). Allow rules are still ignored:
+    // plan mode can never be widened, only narrowed.
+    const guard = firstMatchingRule(call, rules, (type) => type !== "alwaysAllow");
+    if (guard !== undefined) {
+      return {
+        decision: "deny",
+        reason:
+          guard.type === "alwaysDeny"
+            ? `plan mode: the rule alwaysDeny ${guard.pattern} (${guard.source}) denies \`${call.toolName}\``
+            : `plan mode: the rule alwaysAsk ${guard.pattern} (${guard.source}) needs a person to approve \`${call.toolName}\`, and plan mode cannot ask, so it is denied`,
+      };
+    }
+    return { decision: call.readOnly ? "allow" : "deny" };
+  }
 
   // Section 18 production safety floor: a tool that declared
   // `requiresSandbox` cannot be allowed unless (a) a rule explicitly
   // matched AND (b) a non-noop sandbox is available. We compute the
   // base decision first so ruleHit is already known.
-  let baseDecision: Decision | undefined;
-  for (const sourceKey of SOURCE_PRIORITY) {
-    for (const rule of rules[sourceKey]) {
-      try {
-        const compiled = compile(rule);
-        if (matchesPattern(compiled, call.toolName, call.input)) {
-          baseDecision = ruleTypeToDecision(rule.type);
-          break;
-        }
-      } catch {
-        // A malformed rule pattern fails CLOSED for safety rules: an
-        // uncompilable `alwaysDeny`/`alwaysAsk` still gates (treated as a
-        // match for its own decision), so an attacker-influenced broken guard
-        // — e.g. a deny pattern in an untrusted sub-agent definition — can't
-        // be silently dropped to fail open. A malformed `alwaysAllow` is still
-        // skipped: a broken grant simply isn't honored (no widening).
-        if (rule.type === "alwaysDeny" || rule.type === "alwaysAsk") {
-          baseDecision = ruleTypeToDecision(rule.type);
-          break;
-        }
-      }
-    }
-    if (baseDecision !== undefined) break;
-  }
+  const hit = firstMatchingRule(call, rules, () => true);
+  let baseDecision: Decision | undefined =
+    hit !== undefined ? ruleTypeToDecision(hit.type) : undefined;
 
   if (baseDecision === undefined) {
     // No rule matched: mode-specific fallback.

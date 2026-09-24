@@ -127,8 +127,8 @@ describe("reconcileMcpServer (G74)", () => {
     const catalog = new ToolCatalog();
     const { drift, snapshot } = await reconcileMcpServer(host, "srv", catalog, undefined);
     expect(drift.added.sort()).toEqual(["alpha", "beta"]);
-    expect(catalog.has("srv__alpha")).toBe(true);
-    expect(catalog.has("srv__beta")).toBe(true);
+    expect(catalog.has("mcp__srv__alpha")).toBe(true);
+    expect(catalog.has("mcp__srv__beta")).toBe(true);
     expect(snapshot.size).toBe(2);
   });
 
@@ -141,8 +141,8 @@ describe("reconcileMcpServer (G74)", () => {
     const { drift } = await reconcileMcpServer(fx.host, "srv", catalog, first.snapshot);
     expect(drift.added).toEqual(["beta"]);
     expect(drift.removed).toEqual(["alpha"]);
-    expect(catalog.has("srv__alpha")).toBe(false);
-    expect(catalog.has("srv__beta")).toBe(true);
+    expect(catalog.has("mcp__srv__alpha")).toBe(false);
+    expect(catalog.has("mcp__srv__beta")).toBe(true);
   });
 
   test("a schema-changed tool is re-registered under the same name", async () => {
@@ -151,12 +151,12 @@ describe("reconcileMcpServer (G74)", () => {
     ]);
     const catalog = new ToolCatalog();
     const first = await reconcileMcpServer(fx.host, "srv", catalog, undefined);
-    const before = catalog.list().find((t) => t.name === "srv__alpha");
+    const before = catalog.list().find((t) => t.name === "mcp__srv__alpha");
 
     fx.setTools([{ name: "alpha", inputSchema: { type: "object", properties: { a: {}, b: {} } } }]);
     const { drift } = await reconcileMcpServer(fx.host, "srv", catalog, first.snapshot);
     expect(drift.schemaChanged).toEqual(["alpha"]);
-    const after = catalog.list().find((t) => t.name === "srv__alpha");
+    const after = catalog.list().find((t) => t.name === "mcp__srv__alpha");
     expect(after).toBeDefined();
     // The JSON-schema bytes on the catalog reflect the new advertisement.
     expect(after?.jsonSchema).not.toEqual(before?.jsonSchema);
@@ -180,7 +180,7 @@ describe("watchMcpServer (G74)", () => {
     const watch = await watchMcpServer(fx.host, "srv", catalog, {
       onDrift: ({ drift }) => drifts.push({ added: drift.added, removed: drift.removed }),
     });
-    expect(catalog.has("srv__alpha")).toBe(true);
+    expect(catalog.has("mcp__srv__alpha")).toBe(true);
 
     fx.setTools([
       { name: "alpha", inputSchema: OBJ },
@@ -189,7 +189,7 @@ describe("watchMcpServer (G74)", () => {
     fx.fireChanged();
     // The reconcile is serialised on an internal promise chain; let it settle.
     await new Promise((r) => setTimeout(r, 0));
-    expect(catalog.has("srv__beta")).toBe(true);
+    expect(catalog.has("mcp__srv__beta")).toBe(true);
     expect(drifts.at(-1)?.added).toEqual(["beta"]);
 
     watch.stop();
@@ -197,22 +197,29 @@ describe("watchMcpServer (G74)", () => {
     fx.fireChanged();
     await new Promise((r) => setTimeout(r, 0));
     // Stopped — the removal is not applied.
-    expect(catalog.has("srv__beta")).toBe(true);
+    expect(catalog.has("mcp__srv__beta")).toBe(true);
   });
 });
 
 describe("narrowToolsForActiveSkill (G74)", () => {
   const tool = (name: string) =>
     buildTool({ name, description: name, inputSchema: undefined, execute: async () => "ok" });
-  const tools = [tool("read"), tool("write"), tool("srv__remote")];
+  const tools = [tool("read"), tool("write"), tool("mcp__srv__remote")];
 
   test("undefined allow-list imposes no restriction", () => {
     expect(narrowToolsForActiveSkill(tools, undefined)).toEqual(tools);
   });
 
   test("narrows to the allow-list by model-facing name (incl. namespaced MCP)", () => {
+    const narrowed = narrowToolsForActiveSkill(tools, ["read", "mcp__srv__remote"]);
+    expect(narrowed.map((t) => t.name)).toEqual(["read", "mcp__srv__remote"]);
+  });
+
+  test("a pre-0.7.1 skill that lists <server>__<tool> still gets the tool", () => {
     const narrowed = narrowToolsForActiveSkill(tools, ["read", "srv__remote"]);
-    expect(narrowed.map((t) => t.name)).toEqual(["read", "srv__remote"]);
+    expect(narrowed.map((t) => t.name)).toEqual(["read", "mcp__srv__remote"]);
+    // …and the alias never reaches a tool it does not name.
+    expect(narrowToolsForActiveSkill(tools, ["srv__other"])).toHaveLength(0);
   });
 
   test("an empty allow-list means no tools", () => {

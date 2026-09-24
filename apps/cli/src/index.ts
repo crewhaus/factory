@@ -310,8 +310,10 @@ import {
   existingSettingsRules,
   formatSettingsDiff,
   formatSuggestionLines,
+  isArgScoped,
   rankSuggestions,
   readOnlyByName,
+  suggestLookupFromTools,
 } from "@crewhaus/harness-advice/permissions-suggest";
 // 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
 // the primary's routeKey; these read the candidate side apart from the
@@ -437,6 +439,7 @@ import {
   resolveSessionRootDir,
   runChatLoop,
 } from "@crewhaus/runtime-core";
+import { resolveSandboxBackend, sandboxAvailableFromEnv } from "@crewhaus/sandbox";
 import {
   type PendingApproval,
   type PendingApprovalStore,
@@ -470,7 +473,7 @@ import { renderBanner, shouldPrintBanner } from "@crewhaus/target-cli";
 // `crewhaus templates list/search` fall back to when no --registry / env is set.
 import { DEFAULT_TEMPLATE_REGISTRY_URL } from "@crewhaus/template-marketplace-client";
 import { buildTool } from "@crewhaus/tool-builder";
-import { type RegisteredTool, ToolCatalog } from "@crewhaus/tool-catalog";
+import { type RegisteredTool, ToolCatalog, mcpToolName } from "@crewhaus/tool-catalog";
 import {
   BUILTIN_TOOLS,
   CATEGORIES,
@@ -1078,6 +1081,7 @@ import {
   formatLintJson,
   formatLintText,
   nearestToolName,
+  permissionRuleProblemsOf,
   runLint,
   suggestSafeName,
   suggestSecretFix,
@@ -2129,7 +2133,11 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // `wrote …` stream). With --strict any REMEDIABLE warning fails the
   // compile HERE — before any file is written, so a strict-failed build
   // emits nothing.
-  for (const warning of bundle.warnings) {
+  // 0.7.1 (permission-integration#12) — permission rules that can never do
+  // what they say, the same check `crewhaus lint` runs. Remediable, so
+  // --strict fails on them like any other compile warning.
+  const warnings = [...bundle.warnings, ...(await permissionRuleWarnings(yamlText))];
+  for (const warning of warnings) {
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
   // channel-plugins-at-start is informational too: it describes how a
@@ -2158,16 +2166,21 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // not a defect; and model-sunset is a wall-clock notice that would make a
   // 0.5.x pool that compiled under --strict yesterday fail today (past
   // `retiresOn` a `models:` profile is already a hard error at lower time).
+  //
+  // 0.7.1 — mcp-server-name is informational for the same reason as
+  // model-sunset: the key ran on 0.7.0, and a spec that compiled under
+  // --strict before the upgrade must still compile after it.
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
     "channel-plugins-at-start",
     "cli-autodistill-toolchain",
+    "mcp-server-name",
     "model-plan-candidate-only",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",
     "model-sunset",
   ]);
-  const escalatedWarnings = bundle.warnings.filter((w) => !INFORMATIONAL_WARNING_CODES.has(w.code));
+  const escalatedWarnings = warnings.filter((w) => !INFORMATIONAL_WARNING_CODES.has(w.code));
   if (strictWarnings && escalatedWarnings.length > 0) {
     die(
       `--strict: ${escalatedWarnings.length} compile warning(s) escalated to errors (see lines above)`,
@@ -2685,6 +2698,30 @@ async function autoRegisterSpec(
   } catch (err) {
     process.stderr.write(`[register] skipped: ${(err as Error).message}\n`);
   }
+}
+
+/**
+ * The permission rules in a spec that can never do what they say, as compile
+ * warnings (code `permission-rule`). A spec that does not parse or lower has
+ * none here — the compile itself reports why.
+ */
+async function permissionRuleWarnings(
+  yamlText: string,
+): Promise<Array<{ code: string; path: string; message: string }>> {
+  let ir: ReturnType<typeof lower>;
+  try {
+    ir = lower(parseSpec(yamlText));
+  } catch {
+    return [];
+  }
+  const rules = (ir as { permissions?: { rules?: readonly unknown[] } }).permissions?.rules;
+  if (rules === undefined || rules.length === 0) return [];
+  const toolMap = await loadToolMap();
+  const byRegisteredName: Record<string, RegisteredTool> = {};
+  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  return permissionRuleProblemsOf(ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
+    (p) => ({ code: "permission-rule", path: "permissions.rules", message: p.message }),
+  );
 }
 
 /**
@@ -3776,14 +3813,16 @@ async function applyToolConfigs(
 
 /**
  * Section 18 — resolve `sandboxAvailable` for the `run` path from the
- * `CREWHAUS_SANDBOX` env var, using the SAME grammar the compiled bundle
- * emits (`packages/target-cli` renderRun): unset defaults to `"docker"`
- * (available); any value whose lowercase is `"noop"` disables the sandbox
- * floor (code-exec tools are then denied by permission-engine's
- * `requiresSandbox` floor). Pure — reads only the passed env snapshot.
+ * `CREWHAUS_SANDBOX` env var, through the sandbox's own parser — the one the
+ * compiled bundle also calls and `createSandbox` uses — so the floor and the
+ * backend always read the same thing (security-6#1). Unset means docker
+ * (available); `noop`, in any case or spacing, and a value that names no
+ * backend disable the floor (code-exec tools are then denied by
+ * permission-engine's `requiresSandbox` floor). Pure — reads only the passed
+ * env snapshot.
  */
 export function resolveSandboxAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
+  return sandboxAvailableFromEnv(env);
 }
 
 /**
@@ -4361,7 +4400,7 @@ async function runRunCli(
 
     // Item 38 — runtime auto-quarantine. `crewhaus mcp doctor` persists the set
     // of chronically-failing servers to `.crewhaus/mcp/quarantine.json`; here we
-    // withdraw those servers' namespaced (`<server>__<tool>`) tools from the
+    // withdraw those servers' namespaced (`mcp__<server>__<tool>`) tools from the
     // catalog so the model can't call them, and append a synthetic notice to the
     // instructions (mirroring loop-detection's warning injection) so the model
     // routes around them. Opt out with --no-mcp-quarantine. Auto-restore is
@@ -4383,7 +4422,7 @@ async function runRunCli(
         }
       }
       if (quarantinedServers.length > 0) {
-        const prefixes = quarantinedServers.map((s) => `${s}__`);
+        const prefixes = quarantinedServers.map((s) => mcpToolName(s, ""));
         tools = tools.filter((t) => !prefixes.some((p) => t.name.startsWith(p)));
         mcpQuarantineNotice = quarantinedServers
           .map((s) => quarantineNotice(s, "flagged chronically failing by `crewhaus mcp doctor`"))
@@ -4853,17 +4892,22 @@ async function runRunCli(
   );
   const sandboxAvailable = resolveSandboxAvailable();
   if (hasCodeExecTools) {
-    if (!sandboxAvailable) {
+    const sandbox = resolveSandboxBackend();
+    if (!sandbox.ok) {
+      process.stdout.write(
+        `[sandbox] ${sandbox.reason} Until then python/javascript/shell calls are denied.\n`,
+      );
+    } else if (!sandboxAvailable) {
       process.stdout.write(
         "[sandbox] disabled (CREWHAUS_SANDBOX=noop) — python/javascript/shell calls will be denied by the sandbox floor\n",
       );
-    } else if (process.env["CREWHAUS_SANDBOX"] === undefined) {
+    } else if (!sandbox.fromEnv) {
       process.stdout.write(
         "[sandbox] assuming docker — set CREWHAUS_SANDBOX (docker|podman) to select a backend, or CREWHAUS_SANDBOX=noop to disable code execution\n",
       );
     } else {
       process.stdout.write(
-        `[sandbox] backend "${process.env["CREWHAUS_SANDBOX"]}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
+        `[sandbox] backend "${sandbox.backend}" — python/javascript/shell enabled (still require an alwaysAllow rule)\n`,
       );
     }
   }
@@ -14760,12 +14804,30 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
     );
   }
 
-  // Read-only-ness comes from the resolvable tool map (keyed by RegisteredTool
-  // `.name`, which is what the ask aggregate is keyed by).
+  // Read-only-ness and which argument decides where each tool acts come from
+  // the resolvable tool map (keyed by RegisteredTool `.name`, which is what
+  // the ask aggregate is keyed by). A recorded call is parsed with the tool's
+  // schema before its operative values are read, as the runtime does.
   const toolMap = await loadToolMap();
   const readOnly = readOnlyByName(toolMap);
-  const aggregates = aggregateAsks(sessions);
-  const suggestions: PermissionSuggestion[] = rankSuggestions(aggregates, readOnly);
+  const aggregates = aggregateAsks(sessions, suggestLookupFromTools(toolMap));
+  // Every proposal is checked against the real permission matcher before it
+  // is shown: a rule that would also cover a call nobody approved is refused.
+  const { verifyRule } = await import("@crewhaus/tool-approvals");
+  const suggestions: PermissionSuggestion[] = [];
+  const rejected: Array<{ pattern: string; reason: string }> = [];
+  for (const suggestion of rankSuggestions(aggregates, readOnly)) {
+    const agg = aggregates.get(suggestion.toolName);
+    const scoped = agg !== undefined && isArgScoped(agg);
+    const verdict = verifyRule(
+      suggestion.rule.pattern,
+      suggestion.toolName,
+      scoped ? agg.argSamples[0] : undefined,
+      scoped ? agg.argKind : undefined,
+    );
+    if (verdict.ok) suggestions.push(suggestion);
+    else rejected.push({ pattern: suggestion.rule.pattern, reason: verdict.reason });
+  }
 
   // Existing settings rules (the exact shape buildRuleSet consumes).
   const settingsPath = join(process.cwd(), ".crewhaus", "settings.json");
@@ -14782,7 +14844,7 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
 
   if (args.flags["json"] === true) {
     process.stdout.write(
-      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, diff }, null, 2)}\n`,
+      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, rejected, diff }, null, 2)}\n`,
     );
     if (args.flags["apply"] !== true) return;
   } else {
@@ -14793,6 +14855,9 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
       process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
     }
     for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
+    for (const r of rejected) {
+      process.stdout.write(`[refused] ${r.pattern}\n  · ${r.reason}\n`);
+    }
     process.stdout.write("\n");
     for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
   }

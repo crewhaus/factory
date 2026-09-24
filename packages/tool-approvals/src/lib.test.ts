@@ -59,6 +59,18 @@ describe("readTailCapped / readJsonlCapped", () => {
     expect(readJsonlCapped(at("dir.jsonl")).bytes).toBeNull();
   });
 
+  test("a link at the leaf is not followed: every caller resolved and checked its path already", () => {
+    writeFileSync(at("real.jsonl"), '{"id":1}\n');
+    symlinkSync(at("real.jsonl"), at("link.jsonl"));
+    const read = readTailCapped(at("link.jsonl"), 1024);
+    expect(read.state).toEqual({
+      kind: "unreadable",
+      reason: "the path is a symbolic link, which is not followed here",
+    });
+    expect(read.text).toBe("");
+    expect(readTailCapped(at("real.jsonl"), 1024).state.kind).toBe("read");
+  });
+
   test("a directory in the file's place reads as UNREADABLE with a reason — never as empty", () => {
     mkdirSync(at("approvals.jsonl"));
     const read = readJsonlCapped(at("approvals.jsonl"));
@@ -365,12 +377,28 @@ describe("orderApprovals", () => {
 // ---------------------------------------------------------------------------
 
 describe("toRow", () => {
-  test("the operative field comes from the matcher's own table", () => {
-    expect(operativeOf("Read", { file_path: "/etc/hosts", content: "x" })).toEqual({
-      field: "file_path",
+  test("the operative field is the one the tool declares", () => {
+    expect(operativeOf("Read", { path: "/etc/hosts", content: "x" })).toEqual({
+      field: "path",
       value: "/etc/hosts",
     });
     expect(operativeOf("Bash", { command: "ls" })).toEqual({ field: "command", value: "ls" });
+    // 0.7.1 builtins beyond the legacy name table: the URL, not the method…
+    expect(operativeOf("HttpRequest", { method: "DELETE", url: "https://x.test/a" })).toEqual({
+      field: "url",
+      value: "https://x.test/a",
+    });
+    // …a repository read in the light of its owner…
+    expect(operativeOf("IssueCreate", { owner: "crewhaus", repo: "factory", title: "t" })).toEqual({
+      field: "repo",
+      value: "crewhaus/factory",
+    });
+    // …and the default a tool acts on when the call leaves the field out.
+    expect(operativeOf("EnvFileUpsert", { entries: {} })).toEqual({ field: "path", value: ".env" });
+  });
+
+  test("a builtin with no scoping argument shows none, even when a table name would match", () => {
+    expect(operativeOf("ClipboardWrite", { text: "x" })).toEqual({ field: null, value: null });
   });
 
   test("a tool with no entry in that table gets NO operative value — there is no field a rule could constrain", () => {
@@ -381,14 +409,14 @@ describe("toRow", () => {
     const row = toRow(
       approval({
         toolName: "Write",
-        input: { file_path: "notes.md", content: "sk-live-abcdefghijklmnop" },
+        input: { path: "notes.md", content: "sk-live-abcdefghijklmnop" },
       }) as never,
     );
-    expect(row.operativeField).toBe("file_path");
+    expect(row.operativeField).toBe("path");
     expect(row.operativeValue).toBe("notes.md");
     expect(row.inputFields).toEqual([
       { key: "content", type: "string", chars: 24 },
-      { key: "file_path", type: "string", chars: 8 },
+      { key: "path", type: "string", chars: 8 },
     ]);
     // The whole row, serialized, must not carry the secret's TEXT anywhere.
     expect(JSON.stringify(row)).not.toContain("sk-live-abcdefghijklmnop");
@@ -597,6 +625,33 @@ describe("readRecentSessions", () => {
     expect(read.tornLines).toBe(1);
     expect(read.sessions[0]?.objects).toHaveLength(2);
   });
+
+  test("a log that is a link OUT of the workspace is refused and never opened (security-2#2)", () => {
+    // The workspace is tmp/ws; the planted link points at tmp/outside.
+    const ws = path.join(tmp, "ws");
+    const dir = path.join(ws, ".crewhaus", "sessions");
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(path.join(tmp, "outside"));
+    const secret = path.join(tmp, "outside", "other-project.jsonl");
+    writeFileSync(secret, '{"kind":"tool_use","payload":{"input":{"command":"sk-OUTSIDE"}}}\n');
+    symlinkSync(secret, path.join(dir, "sess_planted.jsonl"));
+    writeFileSync(path.join(dir, "sess_own.jsonl"), '{"kind":"x"}\n');
+    // A link that stays inside the workspace is followed.
+    writeFileSync(path.join(ws, "shared.jsonl"), '{"kind":"y"}\n');
+    symlinkSync(path.join(ws, "shared.jsonl"), path.join(dir, "sess_shared.jsonl"));
+
+    const read = readRecentSessions(dir, "all", ws);
+    expect(read.sessions.map((s) => s.sessionId).sort()).toEqual(["sess_own", "sess_shared"]);
+    expect(read.failures).toEqual([
+      {
+        file: "sess_planted.jsonl",
+        reason: "is a symbolic link that leads outside the workspace, so it was not read",
+      },
+    ]);
+    expect(JSON.stringify(read)).not.toContain("sk-OUTSIDE");
+    // Counted as seen, so the caller can say a log went unread.
+    expect(read.available).toBe(3);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -671,5 +726,25 @@ describe("sessionRootRelocation", () => {
     expect(sessionRootRelocation(path.join(tmp, "other"), { CREWHAUS_SESSION_DIR: "  " })).toBe(
       undefined,
     );
+  });
+
+  test("an env file linked from OUTSIDE the workspace is not read, and the answer says unknown", () => {
+    const ws = path.join(tmp, "ws");
+    const dir = path.join(ws, "h");
+    mkdirSync(dir, { recursive: true });
+    mkdirSync(path.join(tmp, "outside"));
+    // The outside file does NOT assign the variable: if it were read, the
+    // probe would answer "no evidence" — the one-bit leak the audit found.
+    writeFileSync(path.join(tmp, "outside", ".env"), "UNRELATED=1\n");
+    symlinkSync(path.join(tmp, "outside", ".env"), path.join(dir, ".env"));
+    const said = sessionRootRelocation(dir, {}, ws);
+    expect(said).toContain("outside the workspace, which is not read here");
+    expect(said).toContain("unknown");
+
+    // A link that stays inside the workspace is followed.
+    rmSync(path.join(dir, ".env"));
+    writeFileSync(path.join(ws, "shared.env"), "CREWHAUS_SESSION_DIR=/var/x\n");
+    symlinkSync(path.join(ws, "shared.env"), path.join(dir, ".env"));
+    expect(sessionRootRelocation(dir, {}, ws)).toContain("assigns CREWHAUS_SESSION_DIR");
   });
 });

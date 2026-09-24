@@ -303,6 +303,7 @@ async function fetchText(
 
 export const httpRequest: RegisteredTool = buildTool({
   name: "HttpRequest",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Issue one HTTP request to an allow-listed origin, with an env-resolved auth profile, a redirect policy, a retry-on-status rule and a deadline, returning status, headers, body and timing. Use it when Fetch is not enough because the call needs authentication, a non-default redirect policy, or an automatic retry on 429/503 that would otherwise cost a model turn per attempt. It does not stream, does not keep cookies between calls, and its elapsedMs field is wall-clock, so it differs run to run. A 301, 302 or 303 answer to a non-GET is followed as a GET with the body dropped, as HTTP requires, so a POST is never replayed at a hop the caller did not ask for.",
   inputSchema: z.object({
@@ -424,6 +425,7 @@ export const httpRequest: RegisteredTool = buildTool({
 
 export const httpPaginate: RegisteredTool = buildTool({
   name: "HttpPaginate",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Walk a paginated API to the end or to a page cap and return the concatenated items, following RFC 5988 Link headers, a cursor field you name, or a page-number parameter. Use it instead of calling Fetch once per page: a seven-page listing becomes one tool call rather than seven model turns. It issues GET only, holds every item in memory, and stops at whichever comes first of the page cap, the item cap, the total-byte budget, an empty page or the deadline — the result says which.",
   inputSchema: z.object({
@@ -643,6 +645,7 @@ export const httpPaginate: RegisteredTool = buildTool({
 
 export const graphqlQuery: RegisteredTool = buildTool({
   name: "GraphqlQuery",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "POST a GraphQL query or mutation with variables to an allow-listed endpoint and return data and errors as separate fields. Use it so a partial GraphQL response — which arrives as HTTP 200 with a populated errors array — is visible as an error instead of being mistaken for success. It does not validate the query against a schema, does not batch operations, and does not follow @defer or subscription streams.",
   inputSchema: z.object({
@@ -720,6 +723,7 @@ export const graphqlQuery: RegisteredTool = buildTool({
 
 export const httpBatch: RegisteredTool = buildTool({
   name: "HttpBatch",
+  operativeArgs: [{ field: "requests.url", kind: "url" }],
   description:
     "Issue several independent requests with a concurrency cap and return every result in request order, whether it succeeded or failed. Use it when a step needs a handful of unrelated endpoints — one per resource id, say — and calling them one at a time would spend a model turn each. Requests cannot depend on one another, a failure never cancels the rest, and each response is capped independently. The batch has its own deadline as well as a per-request one, so requests still queued when it elapses come back as skipped rather than running the batch out to the sum of its parts.",
   inputSchema: z.object({
@@ -841,6 +845,10 @@ let partCounter = 0;
 
 export const downloadFile: RegisteredTool = buildTool({
   name: "DownloadFile",
+  operativeArgs: [
+    { field: "url", kind: "url" },
+    { field: "path", kind: "path" },
+  ],
   description:
     "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination.",
   inputSchema: z.object({
@@ -871,6 +879,13 @@ export const downloadFile: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   destructive: true,
+  // 0.7.1 (permission-integration#11) — the rule every builtin now follows:
+  // a destructive tool that goes to a place the model chose (a url or
+  // recipient operative argument) is justification-gated. The request goes to
+  // a URL the model picked, carrying whatever it put in it, and what comes
+  // back is written into the workspace — as for HttpRequest, which has
+  // always been gated.
+  requireJustification: true,
   execute: async (input, ctx) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
@@ -955,6 +970,7 @@ export const downloadFile: RegisteredTool = buildTool({
 
 export const headRequest: RegisteredTool = buildTool({
   name: "HeadRequest",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Ask for a URL's metadata without its body: status, size, content type, ETag, last-modified and caching headers. Use it to check whether a resource exists, how big it is, or whether a cached copy is still current, without spending the bytes on a download. Some servers refuse HEAD with 405 or 501, so this falls back to a single-byte ranged GET and says so in usedRangedGet.",
   inputSchema: z.object({
@@ -1047,6 +1063,7 @@ export const headRequest: RegisteredTool = buildTool({
 
 export const urlReachable: RegisteredTool = buildTool({
   name: "UrlReachable",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one.",
   inputSchema: z.object({
@@ -1101,6 +1118,7 @@ export const urlReachable: RegisteredTool = buildTool({
 
 export const linkCheck: RegisteredTool = buildTool({
   name: "LinkCheck",
+  operativeArgs: [{ field: "urls", kind: "url" }],
   description:
     "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable.",
   inputSchema: z.object({
@@ -1177,6 +1195,7 @@ export const linkCheck: RegisteredTool = buildTool({
 
 export const httpWaitFor: RegisteredTool = buildTool({
   name: "HttpWaitFor",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Poll a URL until it answers with an expected status or a named JSON field satisfies a predicate, within a required deadline. Use it to wait for a deploy, a migration or an async job to reach a stated condition instead of guessing with a sleep and burning a model turn per check. The deadline is mandatory and the poll never runs past it; the result says whether the condition was met, how many attempts it took and what the last answer was.",
   inputSchema: z.object({
@@ -1329,6 +1348,7 @@ function matchesPredicateSafely(body: unknown, predicate: FieldPredicate): boole
 
 export const sseRead: RegisteredTool = buildTool({
   name: "SseRead",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Open a server-sent-events endpoint and collect events until a count, a terminator event name, or a required deadline — whichever comes first. Use it to capture a bounded slice of a streaming endpoint, such as a job's progress feed, in one call. It does not reconnect on Last-Event-ID, does not interpret the data payloads, and always closes the connection before returning. The terminator ends the read where it arrives, so events the server had already queued behind it are not returned.",
   inputSchema: z.object({
@@ -1581,6 +1601,7 @@ const RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS"] as const;
 
 export const dnsLookup: RegisteredTool = buildTool({
   name: "DnsLookup",
+  operativeArgs: [{ field: "name", kind: "recipient" }],
   description:
     "Resolve A, AAAA, CNAME, MX, TXT and NS records for a hostname, reporting each type's answer or the error the resolver gave. Use it to confirm a domain's records line up with what a deployment expects — that a CNAME points where it should, that MX or TXT verification records landed — without a shell. Records are sorted for a stable result, TTLs are not reported, and the host must be named by an allow-listed origin. The timeout is one budget for the whole lookup, not one per record type, so a type that is never reached says so.",
   inputSchema: z.object({
@@ -1683,6 +1704,10 @@ async function resolveOne(type: string, host: string): Promise<unknown> {
 
 export const tlsInspect: RegisteredTool = buildTool({
   name: "TlsInspect",
+  operativeArgs: [
+    { field: "host", kind: "recipient" },
+    { field: "servername", kind: "recipient" },
+  ],
   description:
     "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock.",
   inputSchema: z.object({
@@ -1800,6 +1825,7 @@ function inspectCertificate(
 
 export const robotsCheck: RegisteredTool = buildTool({
   name: "RobotsCheck",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Fetch an origin's robots.txt and decide whether a given user-agent may fetch a given path, reporting the rule that decided it. Use it before crawling anything, so a harness does not learn about a site's rules by being blocked. It applies the RFC 9309 matching rules — longest match wins, Allow breaks a tie, and a 5xx on robots.txt means treat the whole site as disallowed — and it reports Crawl-delay without enforcing it, because pacing is the caller's decision.",
   inputSchema: z.object({
@@ -1933,6 +1959,7 @@ async function documentBody(
 
 export const sitemapParse: RegisteredTool = buildTool({
   name: "SitemapParse",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Parse a sitemap into structured entries, either from text you already have or from an allow-listed URL, saying whether it was a urlset or a sitemapindex. Use it to turn a site's own index of itself into a work list without a model reading XML. It reads exactly one document — an index's children are not followed — and refuses a document with entity declarations or an internal DTD subset rather than expanding them.",
   inputSchema: z.object(documentSourceSchema),
@@ -1961,6 +1988,7 @@ export const sitemapParse: RegisteredTool = buildTool({
 
 export const feedParse: RegisteredTool = buildTool({
   name: "FeedParse",
+  operativeArgs: [{ field: "url", kind: "url" }],
   description:
     "Parse an RSS, RDF or Atom feed into a common entry shape, either from text you already have or from an allow-listed URL. Use it to read a changelog, release feed or blog without a model parsing XML by hand. Entries keep the feed's own order because that order is the signal, dates are returned exactly as the feed wrote them rather than normalised, and HTML inside a summary is left as-is.",
   inputSchema: z.object(documentSourceSchema),

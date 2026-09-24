@@ -523,6 +523,7 @@ export const webFetch: RegisteredTool = buildTool({
   inputSchema: webFetchSchema,
   readOnly: true,
   concurrencySafe: true,
+  operativeArgs: [{ field: "url", kind: "url" }],
   // Pillar 3 sink-side: URL parameters can encode exfiltrated data ("Safe URL"
   // pattern from OpenAI's 2026-05 prompt-injection paper).
   scope: "external",
@@ -718,6 +719,7 @@ export const webSearch: RegisteredTool = buildTool({
   inputSchema: webSearchSchema,
   readOnly: true,
   concurrencySafe: true,
+  operativeArgs: [{ field: "query", kind: "text" }],
   // Pillar 3 sink-side: search-query parameter is an exfiltration vector.
   scope: "external",
   // FR-002 — declare the io-capability fact (remote search API) for the audit.

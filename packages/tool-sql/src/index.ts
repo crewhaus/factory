@@ -380,6 +380,7 @@ export const sqlQuery: RegisteredTool = buildTool({
 
 export const sqlExec: RegisteredTool = buildTool({
   name: "SqlExec",
+  operativeArgs: [{ field: "database", kind: "path" }],
   description:
     "Run one writing statement — INSERT, UPDATE, DELETE or DDL — against a SQLite database, with values supplied as bound parameters. Use when the point of the call is to change the database rather than to read it; it reports rows changed and the last inserted rowid. It applies exactly one statement and will not create the database file unless create is set.",
   inputSchema: z.object({
@@ -447,6 +448,7 @@ export const sqlExec: RegisteredTool = buildTool({
 
 export const sqlTransaction: RegisteredTool = buildTool({
   name: "SqlTransaction",
+  operativeArgs: [{ field: "database", kind: "path" }],
   description:
     "Apply several writing statements to a SQLite database as one unit, rolling every one of them back if any fails. Use when a change spans more than one statement and a half-applied version would be worse than no change at all; each statement carries its own bound parameters and the failing index is named on rollback. Statements run in the order given, on one connection, and may not contain their own BEGIN or COMMIT.",
   inputSchema: z.object({
@@ -1055,6 +1057,10 @@ function importResult(
 
 export const importCsv: RegisteredTool = buildTool({
   name: "ImportCsv",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "file", kind: "path" },
+  ],
   description:
     "Load a CSV file into a SQLite table in one transaction, creating the table from inferred column types if asked. Use to get a delimited export into a database without hand-writing thousands of INSERTs; it reports rows inserted and every rejected row with the reason it was rejected. A cell whose text does not fit its column's declared type is a rejection rather than a value silently stored as text, which is what SQLite would otherwise do.",
   inputSchema: z.object({
@@ -1198,6 +1204,10 @@ export const importCsv: RegisteredTool = buildTool({
 
 export const importJson: RegisteredTool = buildTool({
   name: "ImportJson",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "file", kind: "path" },
+  ],
   description:
     "Load JSON records into a SQLite table in one transaction, from a file or from records passed inline. Use for an API dump or a computed result set that needs to become queryable; it accepts a JSON array or newline-delimited JSON, creates the table from inferred types if asked, and reports every rejected record with its reason. Booleans become 1 and 0 and nested objects become JSON text, because SQLite has neither type.",
   inputSchema: z.object({
@@ -1466,6 +1476,10 @@ const exportFields = {
 
 export const exportCsv: RegisteredTool = buildTool({
   name: "ExportCsv",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "out", kind: "path" },
+  ],
   description:
     "Write a query's rows to a CSV file inside the workspace, streaming them rather than holding them in memory. Use to hand a result set to a spreadsheet or another tool without paying for the rows in context. NULL is written as an empty field, which CSV cannot tell from an empty string on the way back, and a BLOB is written as base64 with a marker; the query runs on a read-only connection.",
   inputSchema: z.object({
@@ -1530,6 +1544,10 @@ export const exportCsv: RegisteredTool = buildTool({
 
 export const exportJson: RegisteredTool = buildTool({
   name: "ExportJson",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "out", kind: "path" },
+  ],
   description:
     "Write a query's rows to a JSON or newline-delimited JSON file inside the workspace, streaming them rather than holding them in memory. Use when the consumer wants typed values rather than CSV's strings: NULL stays null, and a BLOB becomes an object carrying its base64 and byte length. An integer past 2^53 is written as a decimal string so its digits survive; the query runs on a read-only connection.",
   inputSchema: z.object({
@@ -1596,6 +1614,10 @@ export const exportJson: RegisteredTool = buildTool({
 
 export const databaseBackup: RegisteredTool = buildTool({
   name: "DatabaseBackup",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "out", kind: "path" },
+  ],
   description:
     "Copy a SQLite database to another path inside the workspace using SQLite's own VACUUM INTO, which takes a consistent snapshot while other connections are writing. Use instead of copying the file: a byte copy taken under a live writer can capture a half-written page or miss a write-ahead log entirely, and the result is a file that opens and is wrong. The copy is compacted, so it is usually smaller than the original and is not a byte-for-byte image.",
   inputSchema: z.object({
@@ -1814,6 +1836,10 @@ export const migrationStatus: RegisteredTool = buildTool({
 
 export const migrationApply: RegisteredTool = buildTool({
   name: "MigrationApply",
+  operativeArgs: [
+    { field: "database", kind: "path" },
+    { field: "directory", kind: "path" },
+  ],
   description:
     "Apply the pending .sql migrations from a directory in filename order, recording each one and stopping at the first failure. Use to bring a database up to date: a migration already recorded is skipped, each one runs inside its own transaction so a failure leaves that file unapplied, and migrations applied before the failure stay applied. It refuses to start when an applied file has since been edited or when a pending file sorts before an applied one, and a file containing its own BEGIN or COMMIT is refused because it would fight the wrapping transaction.",
   inputSchema: z.object({

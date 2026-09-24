@@ -195,6 +195,7 @@ const MAX_CLIPBOARD_MAX_CHARS = 1_000_000;
 
 export const clipboardRead: RegisteredTool = buildTool({
   name: "ClipboardRead",
+  operativeArgs: [],
   description:
     'Read the operator\'s system clipboard as text. WHAT THE CALLER TAKES ON: the clipboard is where people put a password, a recovery code or an API key for the seconds between copying and pasting it, and whatever is on it when this runs is returned verbatim into the model\'s context, from there into the conversation transcript, and from there into any log or trace the harness keeps. This tool does NOT scan for or redact secrets: a heuristic that catches some patterns and misses others earns trust it cannot honour, and the caller who relied on it pastes the one it missed into a ticket. Ask only when the operator has been told to copy something for you, and treat the result as sensitive for the rest of the run. Four distinct outcomes, never conflated: "read" with the text, "empty" (the clipboard was reachable and holds nothing), "noTextFlavour" (it holds something — an image, a file — that has no text form), and "unavailable" with a reason when there was no clipboard to ask (no desktop session, no backend program, an unsupported platform). An empty clipboard and an unreadable one are never reported as the same thing.',
   inputSchema: z.object({
@@ -305,6 +306,7 @@ export const clipboardRead: RegisteredTool = buildTool({
 
 export const clipboardWrite: RegisteredTool = buildTool({
   name: "ClipboardWrite",
+  operativeArgs: [],
   description:
     "Put text on the operator's system clipboard, replacing whatever was there. Declared destructive because that replacement cannot be undone: the thing the operator had copied a moment ago is gone, and there is no clipboard history to restore it from. The payload is piped to the backend on STDIN and never appears as a command argument, because argv is world-readable through a process listing on every platform here. Use dryRun to see which backend and argument list would be used without writing anything. On X11 the writing process owns the selection and must outlive this call, which xclip handles by forking its own resident holder — so on Linux the content survives this tool returning, but not the X session ending.",
   inputSchema: z.object({
@@ -392,6 +394,7 @@ const MAX_NOTIFY_FIELD = 2_000;
 
 export const desktopNotify: RegisteredTool = buildTool({
   name: "DesktopNotify",
+  operativeArgs: [],
   description:
     'Show a notification on the operator\'s desktop — a macOS notification, a FreeDesktop notification on Linux, a toast on Windows. The title, body and subtitle may contain anything at all: on macOS they travel as argv items that the AppleScript reads with `item N of argv`, so a body containing quotes or semicolons is displayed rather than executed, and on Windows they are XML-escaped into a document that crosses to PowerShell through the environment rather than as source. The result says "dispatched", not "shown": every one of these APIs accepts a notification and returns, and whether a human saw it depends on Do Not Disturb, a Focus mode and whether the screen is on — none of which is observable from here. A host with no notification daemon, no display session or no notifier installed is reported as unavailable with the reason.',
   inputSchema: z.object({
@@ -477,6 +480,7 @@ export const desktopNotify: RegisteredTool = buildTool({
 
 export const openExternal: RegisteredTool = buildTool({
   name: "OpenExternal",
+  operativeArgs: [{ field: "target", kind: "url" }],
   description: `Hand a URL or a local path to the operating system to open with whatever is registered for it. The scheme set is an ALLOW-LIST and it is short: ${OPENABLE_SCHEMES.join(", ")}. Everything else is refused by name — file: (it would bypass this tool's path containment), smb: and nfs: (they mount a remote share and can leak an authentication handshake to the host named in the URL), javascript:, data:, and the Windows ms-* shell handlers. The allowSchemes input can only NARROW that set, never widen it. What is checked is what is opened: an http(s) URL is handed to the desktop in its normalised form rather than as you typed it, a URL containing a backslash is refused (parsers disagree about whether that is a path separator, so the host checked here would not be the host opened there), a URL carrying credentials before the "@" is refused (they would sit in a process listing and in this transcript, and "google.com@evil.example" reads as the host it is not), and a mailto: may carry only the headers RFC 6068 calls safe — attach= is refused by name, because a mail client that honours it reads a local file into the message. A target with no scheme is treated as a filesystem path, resolved inside the workspace root with symlinks followed, and refused if it lands outside; an EXECUTABLE file is refused even inside the workspace, because "open this" and "run this" are the same gesture to a desktop. The result says "handedOff", not "opened": every opener returns as soon as the handler has been asked and none of them report what it then did.`,
   inputSchema: z.object({
     target: z
@@ -591,6 +595,7 @@ export const openExternal: RegisteredTool = buildTool({
 
 export const printDocument: RegisteredTool = buildTool({
   name: "PrintDocument",
+  operativeArgs: [{ field: "path", kind: "path" }],
   description:
     'Send a local file to a printer through CUPS (macOS and Linux) or to a Windows queue. The queue is probed with lpstat FIRST, on both the dry run and the real print, so the two resolve through the same code and a dry run is a prefix of the real thing rather than a separate prediction. That probe is also what keeps the answers apart: a host whose scheduler is not running prints nothing and lists nothing, which looks exactly like a host with no printers, and the two are reported differently. Declared destructive because paper and toner do not come back. On Windows the honest scope is narrow and stated rather than papered over: Out-Printer sends TEXT to a queue and cannot rasterise a PDF or an image, and it has no copies, duplex or page-range option — asking for one there is refused by name instead of silently dropped. Printer names and page ranges are matched against closed patterns and refused if they do not fit, because lp documents no "--" and a destination beginning with "-" would become an option.',
   inputSchema: z.object({
@@ -736,6 +741,7 @@ export const printDocument: RegisteredTool = buildTool({
 
 export const windowList: RegisteredTool = buildTool({
   name: "WindowList",
+  operativeArgs: [],
   description:
     "List the windows open on the operator's desktop, with the app, title and — where the backend can supply them — position and size. It never answers an empty list for a failure: a macOS host that has not granted Accessibility comes back as unavailable naming that grant in System Settings, a Wayland session comes back as unavailable explaining that Wayland provides no protocol for one client to enumerate another's windows (there is nothing to install that would fix it), a missing wmctrl comes back as unavailable naming the package, and a stream cut at the output cap is reported as truncated so the list is read as a prefix rather than as the whole desktop. Fields a backend cannot supply are null rather than zero or false — wmctrl reports no focus state, so every window's focused is null rather than a claim that nothing has focus.",
   inputSchema: z.object({ timeoutMs: timeoutSchema }),
@@ -788,6 +794,7 @@ const DEFAULT_IDLE_THRESHOLD_SECONDS = 300;
 
 export const userPresence: RegisteredTool = buildTool({
   name: "UserPresence",
+  operativeArgs: [],
   description:
     "Report whether a human is likely at this machine: seconds since the last input, whether the screen is locked, and what kind of session this is (console, ssh or headless). Every field is separately nullable and a null always carries an entry in `unknown` naming the probe that failed, because the tempting fallbacks here invert the tool's purpose — reporting idle:false when nothing could be asked tells a workflow the operator is at the keyboard, and reporting idle:true tells it the opposite and sends it off to act unattended. macOS reads idle time out of the IOKit registry, in nanoseconds, and lock state from the same dump; Linux needs xprintidle (usually not installed, and unavailable under Wayland, which exposes no idle query at all) and reads logind's LockedHint, which is a HINT a screen locker has to set and some do not; Windows uses GetLastInputInfo and the presence of LogonUI. An ssh session reports sessionKind \"ssh\" and does not pretend the far end's idle time says anything about the person typing.",
   inputSchema: z.object({
@@ -952,6 +959,7 @@ function readState(): StateRead {
 
 export const powerAssertion: RegisteredTool = buildTool({
   name: "PowerAssertion",
+  operativeArgs: [],
   description: `Hold a BOUNDED sleep inhibitor around a long step, release it, or report on one. The deadline is mandatory and is not enforced by this process: caffeinate exits at its own -t, systemd-inhibit releases when its sleep returns, and the Windows holder parks for a fixed Start-Sleep — so killing the whole harness still ends the assertion on time, which an in-process reaper could not promise. Every result says when the assertion expires. The maximum is ${MAX_HOLD_MINUTES} minutes and the default is ${DEFAULT_HOLD_MINUTES}. A held assertion is remembered in a state file, and release verifies that the recorded pid is still running THIS package's holder before signalling anything: pids are reused, and a stale file must never become a SIGTERM to whatever now owns that number. A probe that could not run at all leaves the state alone and reports "unknown" rather than assuming the holder is gone.`,
   inputSchema: z.object({
     action: z

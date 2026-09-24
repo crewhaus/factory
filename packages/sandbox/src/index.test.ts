@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { SANDBOX_DEFAULT_ALLOWED_IMAGES, SandboxError, createSandbox } from "./index";
+import {
+  SANDBOX_DEFAULT_ALLOWED_IMAGES,
+  SandboxError,
+  createSandbox,
+  resolveSandboxBackend,
+  sandboxAvailableFromEnv,
+} from "./index";
 
 const ORIGINAL_ENV = { ...process.env };
 function resetEnv(): void {
@@ -549,5 +555,75 @@ describe("docker backend run path (Bun.spawn mocked — no daemon, no real I/O)"
     });
     expect(result.stdout).toBe("A€");
     expect(chunks.join("")).toBe("A€");
+  });
+});
+
+describe("one reading of CREWHAUS_SANDBOX (security-6#1)", () => {
+  beforeEach(() => {
+    resetEnv();
+  });
+  afterEach(() => {
+    resetEnv();
+  });
+
+  // The floor and the backend used to read the variable two ways: the floor
+  // compared it untrimmed, createSandbox trimmed it. `noop ` or a CRLF `.env`'s
+  // `noop\r` then told the floor a sandbox existed while the noop backend ran
+  // the code on the host.
+  const values = [
+    "noop",
+    " noop",
+    "noop ",
+    "noop\r",
+    "NOOP",
+    "\tNoOp\n",
+    "docker",
+    " Docker ",
+    "podman\r",
+    "",
+    "   ",
+    "vagrant",
+    "no op",
+  ];
+
+  test("the floor says 'sandboxed' exactly when createSandbox would build a real container backend", () => {
+    let real = 0;
+    let refused = 0;
+    for (const value of values) {
+      process.env["CREWHAUS_SANDBOX"] = value;
+      const floor = sandboxAvailableFromEnv();
+      let backend: string;
+      try {
+        backend = createSandbox().backend;
+      } catch (err) {
+        // A value naming no backend: createSandbox refuses, and the floor
+        // must not call that a sandbox either.
+        expect(err).toBeInstanceOf(SandboxError);
+        backend = "refused";
+        refused++;
+      }
+      expect({ value, floor }).toEqual({
+        value,
+        floor: backend === "docker" || backend === "podman",
+      });
+      if (floor) real++;
+    }
+    // Both answers occur, so the agreement is not vacuous.
+    expect(real).toBe(5);
+    expect(refused).toBe(2);
+  });
+
+  test("resolveSandboxBackend trims, lower-cases, and says when a value names nothing", () => {
+    expect(resolveSandboxBackend({ CREWHAUS_SANDBOX: "noop\r" })).toEqual({
+      ok: true,
+      backend: "noop",
+      fromEnv: true,
+    });
+    expect(resolveSandboxBackend({})).toEqual({ ok: true, backend: "docker", fromEnv: false });
+    expect(resolveSandboxBackend({ CREWHAUS_SANDBOX: "vagrant" })).toEqual({
+      ok: false,
+      reason:
+        'CREWHAUS_SANDBOX="vagrant" is not a sandbox backend. Set it to docker or podman to run code in a container, or noop to turn code execution off.',
+    });
   });
 });

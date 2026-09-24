@@ -37,7 +37,11 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
-import type { RegisteredTool, ToolExecuteResult } from "@crewhaus/tool-catalog";
+import {
+  type RegisteredTool,
+  type ToolExecuteResult,
+  legacyMcpToolName,
+} from "@crewhaus/tool-catalog";
 import { RunnerError } from "./errors";
 
 /** The single JSONL file a recording directory holds. */
@@ -252,9 +256,18 @@ export class ToolReplayer {
     return this.reused;
   }
 
-  /** The next recorded entry for the key, or undefined on a MISS. */
+  /**
+   * The next recorded entry for the key, or undefined on a MISS. An MCP tool
+   * recorded before 0.7.1 is filed under its old name `<server>__<tool>`; a
+   * call to `mcp__<server>__<tool>` that has no entry of its own finds it
+   * there, so a cassette recorded on 0.7.0 still replays.
+   */
   take(sampleId: string, toolName: string, argsHash: string): ToolRecord | undefined {
-    const key = toolRecordKey(sampleId, toolName, argsHash);
+    let key = toolRecordKey(sampleId, toolName, argsHash);
+    const legacy = legacyMcpToolName(toolName);
+    if (!this.byKey.has(key) && legacy !== undefined) {
+      key = toolRecordKey(sampleId, legacy, argsHash);
+    }
     const list = this.byKey.get(key);
     if (list === undefined || list.length === 0) return undefined;
     const at = this.cursor.get(key) ?? 0;

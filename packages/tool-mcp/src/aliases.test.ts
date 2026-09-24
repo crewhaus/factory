@@ -75,6 +75,7 @@ describe("registerMcpToolAliases — bare-name routing (§4.3)", () => {
     // message_send was advertised but NOT requested — never registered.
     expect(catalog.has("message_send")).toBe(false);
     expect(catalog.has("thredz__message_send")).toBe(false);
+    expect(catalog.has("mcp__thredz__message_send")).toBe(false);
 
     // The bare name routes to the remote tool of the same name.
     const recall = catalog.get("wiki_recall");
