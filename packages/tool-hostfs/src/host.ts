@@ -166,6 +166,13 @@ export type PathFacts = {
    */
   readonly changeStamp: string;
   readonly sizeBytes: number;
+  /**
+   * The owner's uid. A trash directory must belong to the user trashing
+   * into it (the FreeDesktop spec's check, and GLib's): a component owned by
+   * someone else, or planted by a checked-out repository as a link, is not
+   * this user's trash.
+   */
+  readonly uid: number;
 };
 
 export type PathProbe = (absolutePath: string) => PathFacts | undefined;
@@ -204,6 +211,7 @@ export function probePath(absolutePath: string): PathFacts | undefined {
     mtimeMs: Number(stats.mtimeMs),
     changeStamp: `${stats.mtimeNs}:${stats.ctimeNs}`,
     sizeBytes: Number(stats.size),
+    uid: Number(stats.uid),
   };
 }
 

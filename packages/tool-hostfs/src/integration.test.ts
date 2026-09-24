@@ -30,6 +30,12 @@ import {
   _setWatchFactory,
 } from "./index";
 
+/**
+ * The uid the tests run as. The trash checks that every directory it writes
+ * through belongs to the user, so the identity is the real owner of the
+ * files these tests create, not an invented one.
+ */
+const UID = typeof process.getuid === "function" ? process.getuid() : 1000;
 const originalCwd = process.cwd();
 let catalog: ToolCatalog;
 let workspace: string;
@@ -93,7 +99,7 @@ describe("dispatch through executeTool", () => {
   test("a refusal is a readable string, not a thrown stack", async () => {
     _setPlatform("linux");
     _setClock(() => FIXED_NOW);
-    _setIdentity({ home: join(workspace, "home"), xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home: join(workspace, "home"), xdgDataHome: undefined, uid: UID });
     const result = await dispatch("TrashPath", { paths: ["../escape.txt"] });
     expect(result.text).toContain("outside the workspace root");
   });
@@ -101,7 +107,7 @@ describe("dispatch through executeTool", () => {
   test("every tool can be dispatched with a minimal valid input", async () => {
     _setPlatform("linux");
     _setClock(() => FIXED_NOW);
-    _setIdentity({ home: join(workspace, "home"), xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home: join(workspace, "home"), xdgDataHome: undefined, uid: UID });
     _setWatchFactory(() => ({ close: () => undefined }));
     _setRunner(async () => ({
       code: 1,
@@ -128,7 +134,7 @@ describe("the loop the package closes", () => {
     _setClock(() => FIXED_NOW);
     const home = join(workspace, "home");
     mkdirSync(home, { recursive: true });
-    _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home, xdgDataHome: undefined, uid: UID });
 
     mkdirSync(join(workspace, "work"), { recursive: true });
     writeFileSync(join(workspace, "work/draft.md"), "a draft\n");
@@ -166,7 +172,7 @@ describe("the loop the package closes", () => {
     _setClock(() => FIXED_NOW);
     const home = join(workspace, "home");
     mkdirSync(home, { recursive: true });
-    _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home, xdgDataHome: undefined, uid: UID });
     writeFileSync(join(workspace, "a.txt"), "x");
     writeFileSync(join(workspace, "b.txt"), "x");
 

@@ -66,6 +66,12 @@ import {
 import { removeClaimedInfoFile } from "./lib/trash-engine";
 import type { RunRequest, RunResult } from "./run";
 
+/**
+ * The uid the tests run as. The trash checks that every directory it writes
+ * through belongs to the user, so the identity is the real owner of the
+ * files these tests create, not an invented one.
+ */
+const UID = typeof process.getuid === "function" ? process.getuid() : 1000;
 const originalCwd = process.cwd();
 let workspace: string;
 /** Every command a test's tool call tried to run, in order. */
@@ -718,7 +724,7 @@ function linuxHost(home = join(workspace, "home")): string {
   // The trash writes a DeletionDate into a file whose bytes a test asserts.
   _setClock(() => FIXED_NOW);
   mkdirSync(home, { recursive: true });
-  _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+  _setIdentity({ home, xdgDataHome: undefined, uid: UID });
   return join(home, ".local/share/Trash");
 }
 
@@ -740,6 +746,7 @@ function facts(path: string, device: number): PathFacts | undefined {
       mtimeMs: Number(stats.mtimeMs),
       changeStamp: `${stats.mtimeNs}:${stats.ctimeNs}`,
       sizeBytes: Number(stats.size),
+      uid: Number(stats.uid),
     };
   } catch {
     return undefined;
@@ -860,7 +867,7 @@ describe("TrashPath: the FreeDesktop move", () => {
     _setClock(() => FIXED_NOW);
     const data = join(workspace, "xdg");
     mkdirSync(data, { recursive: true });
-    _setIdentity({ home: join(workspace, "home"), xdgDataHome: data, uid: 1000 });
+    _setIdentity({ home: join(workspace, "home"), xdgDataHome: data, uid: UID });
     writeFileSync(join(workspace, "a.txt"), "x");
     await call(trashPath, { paths: ["a.txt"] });
     expect(existsSync(join(data, "Trash/files/a.txt"))).toBe(true);
@@ -869,7 +876,7 @@ describe("TrashPath: the FreeDesktop move", () => {
   test("with no home at all the call is refused, not redirected somewhere", async () => {
     _setPlatform("linux");
     _setClock(() => FIXED_NOW);
-    _setIdentity({ home: undefined, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home: undefined, xdgDataHome: undefined, uid: UID });
     writeFileSync(join(workspace, "a.txt"), "x");
     const result = await callJson(trashPath, { paths: ["a.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
@@ -967,7 +974,7 @@ describe("TrashPath: what it refuses to guess", () => {
     _setClock(() => FIXED_NOW);
     const home = join(workspace, "home");
     mkdirSync(home, { recursive: true });
-    _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home, xdgDataHome: undefined, uid: UID });
     const result = await callJson(trashPath, { paths: ["home"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
     expect(String(entries[0]?.["reason"])).toContain("into itself");
@@ -981,7 +988,7 @@ describe("TrashPath: what it refuses to guess", () => {
     _setClock(() => FIXED_NOW);
     const home = join(workspace, "home");
     mkdirSync(join(home, ".local/share/Trash/files"), { recursive: true });
-    _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home, xdgDataHome: undefined, uid: UID });
     writeFileSync(join(home, ".local/share/Trash/files/old.txt"), "x");
     const result = await callJson(trashPath, {
       paths: ["home/.local/share/Trash/files/old.txt"],
@@ -1024,8 +1031,8 @@ describe("TrashPath: the same-filesystem rule", () => {
     const entries = result["entries"] as Array<Record<string, unknown>>;
     // The spec's answer to a cross-device delete is a trash directory at the
     // top of the other filesystem, NOT a copy into the home trash.
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash-1000"));
-    expect(readFileSync(join(volume, ".Trash-1000/files/onvol.txt"), "utf8")).toBe("precious\n");
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
+    expect(readFileSync(join(volume, `.Trash-${UID}/files/onvol.txt`), "utf8")).toBe("precious\n");
     expect(existsSync(join(volume, "onvol.txt"))).toBe(false);
   });
 
@@ -1036,7 +1043,7 @@ describe("TrashPath: the same-filesystem rule", () => {
     writeFileSync(join(volume, "onvol.txt"), "x\n");
     pretendSeparateFilesystem(volume);
     await call(trashPath, { paths: ["volume/onvol.txt"] });
-    const record = readFileSync(join(volume, ".Trash-1000/info/onvol.txt.trashinfo"), "utf8");
+    const record = readFileSync(join(volume, `.Trash-${UID}/info/onvol.txt.trashinfo`), "utf8");
     // So the entry still means something when the volume is mounted
     // somewhere else, which a removable disk does every time.
     expect(record).toContain("Path=onvol.txt\n");
@@ -1051,8 +1058,8 @@ describe("TrashPath: the same-filesystem rule", () => {
 
     const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash/1000"));
-    expect(existsSync(join(volume, ".Trash/1000/files/onvol.txt"))).toBe(true);
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash/${UID}`));
+    expect(existsSync(join(volume, `.Trash/${UID}/files/onvol.txt`))).toBe(true);
   });
 
   test("a $topdir/.Trash WITHOUT the sticky bit is not used", async () => {
@@ -1066,7 +1073,7 @@ describe("TrashPath: the same-filesystem rule", () => {
 
     const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash-1000"));
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
     expect(readdirSync(join(volume, ".Trash"))).toEqual([]);
   });
 
@@ -1081,7 +1088,7 @@ describe("TrashPath: the same-filesystem rule", () => {
 
     const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash-1000"));
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
     // Nothing was written through the link.
     expect(readdirSync(join(workspace, "attacker"))).toEqual([]);
   });
@@ -1132,6 +1139,133 @@ describe("TrashPath: the same-filesystem rule", () => {
       expect(entries[0]?.["record"]).toBeUndefined();
     } finally {
       _setRenamer(undefined);
+    }
+  });
+
+  test("a volume trash whose files/ or info/ is a link out is refused, dryRun included", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    const attacker = join(workspace, "attacker");
+    mkdirSync(join(volume, `.Trash-${UID}`), { recursive: true });
+    mkdirSync(join(attacker, "files"), { recursive: true });
+    mkdirSync(join(attacker, "info"), { recursive: true });
+    // What a cloned repository can carry: git checks out symlinks.
+    writeFileSync(join(attacker, "files/.bashrc"), "the user's own\n");
+    symlinkSync(join(attacker, "files"), join(volume, `.Trash-${UID}/files`));
+    symlinkSync(join(attacker, "info"), join(volume, `.Trash-${UID}/info`));
+    writeFileSync(join(volume, ".bashrc"), "from the workspace\n");
+    pretendSeparateFilesystem(volume);
+
+    for (const dryRun of [true, false]) {
+      const result = await callJson(trashPath, { paths: ["volume/.bashrc"], dryRun });
+      const entries = result["entries"] as Array<Record<string, unknown>>;
+      expect(entries[0]?.["status"]).toBe("refused");
+      expect(String(entries[0]?.["reason"])).toContain("is a symbolic link");
+    }
+    // On 0.7.0 the move went through the link and REPLACED this file.
+    expect(readFileSync(join(attacker, "files/.bashrc"), "utf8")).toBe("the user's own\n");
+    expect(readdirSync(join(attacker, "info"))).toEqual([]);
+    expect(readFileSync(join(volume, ".bashrc"), "utf8")).toBe("from the workspace\n");
+  });
+
+  test("an info/ link alone is refused too, and nothing is written through it", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    const attacker = join(workspace, "attacker");
+    mkdirSync(join(volume, `.Trash-${UID}/files`), { recursive: true });
+    mkdirSync(attacker, { recursive: true });
+    symlinkSync(attacker, join(volume, `.Trash-${UID}/info`));
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    pretendSeparateFilesystem(volume);
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(String(entries[0]?.["reason"])).toContain(`.Trash-${UID}/info is a symbolic link`);
+    expect(readdirSync(attacker)).toEqual([]);
+    expect(existsSync(join(volume, "onvol.txt"))).toBe(true);
+  });
+
+  test("a linked $topdir/.Trash/$uid is not used: the call falls back to .Trash-$uid", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    const attacker = join(workspace, "attacker/t2");
+    mkdirSync(join(volume, ".Trash"), { recursive: true });
+    mkdirSync(attacker, { recursive: true });
+    symlinkSync(attacker, join(volume, `.Trash/${UID}`));
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    pretendSeparateFilesystem(volume, true);
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
+    expect(entries[0]?.["status"]).toBe("trashed");
+    expect(readdirSync(attacker)).toEqual([]);
+  });
+
+  test("a trash directory owned by another user is refused", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    mkdirSync(join(volume, `.Trash-${UID}`), { recursive: true });
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    // Ownership cannot be changed without root, so the probe reports it.
+    _setPathProbe((path) => {
+      const found = facts(path, path.startsWith(volume) ? 99 : 1);
+      if (found !== undefined && path === join(volume, `.Trash-${UID}`)) {
+        return { ...found, uid: UID + 1 };
+      }
+      return found;
+    });
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(String(entries[0]?.["reason"])).toContain(`belongs to another user (uid ${UID + 1})`);
+    expect(existsSync(join(volume, "onvol.txt"))).toBe(true);
+  });
+
+  test("the trash is checked again after the name is claimed, just before the move", async () => {
+    const trash = linuxHost();
+    writeFileSync(join(workspace, "a.txt"), "x\n");
+    // files/ turns into a link the moment the record exists: the window
+    // between the claim and the rename.
+    _setPathProbe((path) => {
+      const found = facts(path, 1);
+      if (path === join(trash, "files") && existsSync(join(trash, "info/a.txt.trashinfo"))) {
+        return found === undefined ? undefined : { ...found, isSymlink: true, isDirectory: false };
+      }
+      return found;
+    });
+    const result = await callJson(trashPath, { paths: ["a.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(String(entries[0]?.["reason"])).toContain("files is a symbolic link");
+    expect(existsSync(join(workspace, "a.txt"))).toBe(true);
+    // The claimed record is withdrawn, not left pointing at nothing.
+    expect(readdirSync(join(trash, "info"))).toEqual([]);
+  });
+
+  test("a files/ name taken after the record was claimed moves the call to the next name", async () => {
+    const trash = linuxHost();
+    writeFileSync(join(workspace, "a.txt"), "x\n");
+    // files/a.txt "appears" once info/a.txt.trashinfo has been claimed.
+    _setPathProbe((path) => {
+      if (path === join(trash, "files/a.txt") && existsSync(join(trash, "info/a.txt.trashinfo"))) {
+        return facts(join(workspace, "a.txt"), 1);
+      }
+      return facts(path, 1);
+    });
+    const result = await callJson(trashPath, { paths: ["a.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(entries[0]?.["storedAs"]).toBe("a.2.txt");
+    // The first claim was withdrawn; only the record for the name used is left.
+    expect(readdirSync(join(trash, "info"))).toEqual(["a.2.txt.trashinfo"]);
+  });
+
+  test("a volume trash this call creates is 0700 all the way down", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    mkdirSync(volume, { recursive: true });
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    pretendSeparateFilesystem(volume);
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    expect(result["trashed"]).toBe(1);
+    for (const dir of [`.Trash-${UID}`, `.Trash-${UID}/files`, `.Trash-${UID}/info`]) {
+      expect(lstatSync(join(volume, dir)).mode & 0o777).toBe(0o700);
     }
   });
 
@@ -1627,6 +1761,23 @@ describe("TrashPath: the dry run predicts the destination the real call uses", (
     expect(
       (preview["entries"] as Array<Record<string, unknown>>).map((entry) => entry["wouldStoreAs"]),
     ).toEqual(["notes.txt", "notes.2.txt", "notes.3.txt"]);
+  });
+
+  test("a file already in files/ with no record is never overwritten", async () => {
+    const trash = linuxHost();
+    mkdirSync(join(trash, "files"), { recursive: true });
+    mkdirSync(join(trash, "info"), { recursive: true });
+    writeFileSync(join(trash, "files/notes.txt"), "EARLIER\n");
+    writeFileSync(join(workspace, "notes.txt"), "new\n");
+    const preview = await callJson(trashPath, { paths: ["notes.txt"], dryRun: true });
+    const real = await callJson(trashPath, { paths: ["notes.txt"] });
+    const predicted = (preview["entries"] as Array<Record<string, unknown>>)[0];
+    const actual = (real["entries"] as Array<Record<string, unknown>>)[0];
+    expect(predicted?.["wouldStoreAs"]).toBe("notes.2.txt");
+    // On 0.7.0 the claim looked only at info/, so the rename replaced it.
+    expect(actual?.["storedAs"]).toBe("notes.2.txt");
+    expect(readFileSync(join(trash, "files/notes.txt"), "utf8")).toBe("EARLIER\n");
+    expect(readFileSync(join(trash, "files/notes.2.txt"), "utf8")).toBe("new\n");
   });
 });
 

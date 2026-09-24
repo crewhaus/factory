@@ -151,6 +151,20 @@ security checks — a symlink points anywhere, and without the sticky bit any
 user can replace another user's trashed files), and `$topdir/.Trash-$uid`
 otherwise. When neither can be used the call is **refused with the reason**
 and the file is left alone. `gio trash` refuses in the same situation.
+
+Every directory the move writes through is checked, not just `.Trash`: the
+trash directory itself (for a top-directory trash), `files/` and `info/`
+must each be a real directory, not a symlink, owned by the user, as GLib
+requires (`st_uid == getuid()`). A `$topdir/.Trash/$uid` that fails falls
+back to `.Trash-$uid`; a `.Trash-$uid` that fails is refused. Missing
+directories are created one at a time, 0700, never with a `mkdir -p` that
+would follow a link, and the checks run again after creation and just
+before the rename. A name is claimed only when both `info/<name>.trashinfo`
+and `files/<name>` are free, so the move never replaces anything already in
+the trash, and the real call stores the file under the name the dry run
+predicted. When the workspace itself is a mount point (a devcontainer bind
+mount), its `.Trash-$uid` sits inside the workspace; it is used when it
+passes these checks, since refusing it would disable the tool there.
 Copy-then-unlink would break hard links, change the inode, double the space
 used by a large tree, and — on a failure halfway — leave a half-written copy
 beside an original the caller believes is in the trash.
