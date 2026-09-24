@@ -96,7 +96,9 @@ export const MAX_PLUGIN_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
  * The loader does NOT itself bind contributions to registries — that
  * is the responsibility of the calling host (which knows which
  * target shape is being assembled). Wiring decoupling keeps the loader
- * unit-testable without dragging in every downstream registry.
+ * unit-testable without dragging in every downstream registry. In this
+ * release hosts bind a plugin's tools and its `skills/` directory only;
+ * see {@link UNBOUND_CONTRIBUTION_KINDS}.
  *
  * Test layers: T1 (parsing + validation), T3 (load happy path),
  * T8 (path-escape + signature-tampering rejection).
@@ -869,16 +871,65 @@ function withPluginBridge(tool: RegisteredTool, allowedTools: ReadonlySet<string
   };
 }
 
+/** The plugin contribution kinds no host binds. */
+export type UnboundContributionKind = "channels" | "models" | "graders" | "targetEmitters";
+
+/**
+ * The extension points plugin-sdk declares that nothing in crewhaus binds, with
+ * why — the runtime counterpart of the Hangar's `DEFERRED_EXTENSION_POINTS`.
+ * A plugin that contributes one loads (its tools and skills still work), and
+ * the boot says the rest has no effect.
+ */
+export const UNBOUND_CONTRIBUTION_KINDS: Readonly<Record<UnboundContributionKind, string>> = {
+  channels:
+    "a channel daemon's adapters are built into it from the spec, and it does not read a plugin's",
+  models:
+    "models are resolved from the spec by the model router, which does not read a plugin's adapters",
+  graders:
+    "graders are loaded from .crewhaus/graders/<name>/index.ts (a default export of { name, grader }), not from a plugin",
+  targetEmitters:
+    "target shapes are part of the crewhaus compiler, which does not read a plugin's emitters",
+};
+
+const UNBOUND_SINGULAR: Readonly<Record<UnboundContributionKind, string>> = {
+  channels: "channel",
+  models: "model",
+  graders: "grader",
+  targetEmitters: "target emitter",
+};
+
+/** The boot note for a plugin's contributions of one unbound kind. */
+function unboundContributionNote(
+  pluginName: string,
+  kind: UnboundContributionKind,
+  items: ReadonlyArray<unknown>,
+): string {
+  const ids = items
+    .map((item) => {
+      const key = kind === "targetEmitters" ? "targetShape" : "id";
+      const id = isPlainObject(item) ? item[key] : undefined;
+      return typeof id === "string" ? JSON.stringify(id) : undefined;
+    })
+    .filter((id): id is string => id !== undefined);
+  const named =
+    ids.length > 0 ? ` (${ids.slice(0, 5).join(", ")}${ids.length > 5 ? ", …" : ""})` : "";
+  const noun = UNBOUND_SINGULAR[kind];
+  const count = items.length === 1 ? `1 ${noun}` : `${items.length} ${noun}s`;
+  return `plugin "${pluginName}" contributes ${count}${named}, which ${items.length === 1 ? "has" : "have"} no effect: ${UNBOUND_CONTRIBUTION_KINDS[kind]}. Only a plugin's tools and its skills/ directory are used.`;
+}
+
 /**
  * Item 3 (G32) — the aggregate of every activated plugin's contributions,
- * bucketed by kind for the host to bind. Tools are already normalized through
- * `buildTool` (so the security-relevant `scope` / `ioCapability` inference runs
- * on plugin-supplied tools exactly as on first-party ones — a plugin tool that
- * forgets `scope: "external"` still lowers external under an outward name);
- * `channels` / `models` / `graders` / `targetEmitters` pass through verbatim
- * for their respective hosts (channel daemon / model-router / eval stack /
- * compiler). `skillDirs` are the existing `<plugin>/skills` directories to feed
- * `skills-registry`'s `discoverSkills({ pluginDirs })`.
+ * bucketed by kind. Tools are already normalized through `buildTool` (so the
+ * security-relevant `scope` / `ioCapability` inference runs on
+ * plugin-supplied tools exactly as on first-party ones — a plugin tool that
+ * forgets `scope: "external"` still lowers external under an outward name)
+ * and are what hosts register. `channels` / `models` / `graders` /
+ * `targetEmitters` are COLLECTED, NOT BOUND: no host reads them in this
+ * release ({@link UNBOUND_CONTRIBUTION_KINDS}), and `warnings` says so for
+ * each plugin that contributes one. `skillDirs` are the existing
+ * `<plugin>/skills` directories to feed `skills-registry`'s
+ * `discoverSkills({ pluginDirs })`.
  */
 export type ActivatedPlugins = {
   readonly loaded: ReadonlyArray<LoadedPlugin>;
@@ -1316,10 +1367,23 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
       toolOwners.set(def.name, name);
       tools.push(withPluginBridge(built, bridgeTools));
     }
-    for (const channel of contributions.channels ?? []) channels.push(channel);
-    for (const model of contributions.models ?? []) models.push(model);
-    for (const grader of contributions.graders ?? []) graders.push(grader);
-    for (const emitter of contributions.targetEmitters ?? []) targetEmitters.push(emitter);
+    // Channels, models, graders and target emitters are collected (the
+    // buckets stay on ActivatedPlugins) but nothing binds them, and the boot
+    // says so rather than letting a plugin that contributes one look wired.
+    const buckets = { channels, models, graders, targetEmitters } as const;
+    for (const kind of Object.keys(UNBOUND_CONTRIBUTION_KINDS) as UnboundContributionKind[]) {
+      const items: unknown = contributions[kind];
+      if (items === undefined) continue;
+      if (!Array.isArray(items)) {
+        note(
+          `plugin "${name}": contributions.${kind} is ${shown(items)}, not a list, and was ignored.`,
+        );
+        continue;
+      }
+      if (items.length === 0) continue;
+      (buckets[kind] as unknown[]).push(...items);
+      note(unboundContributionNote(name, kind, items));
+    }
     // Skill-bundle convention: `<plugin-dir>/skills/` — a directory of
     // `<name>/SKILL.md` subdirs, exactly skills-registry's pluginDirs contract.
     // The entrypoint sits at `<plugin-dir>/index.js`, so its parent is the dir.

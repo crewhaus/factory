@@ -146,6 +146,14 @@ external, so what it sends is checked on the way out, and the boot says so.
 Two tools with one name — in one plugin or two — keep the first; the boot names
 the one left out.
 
+## What a plugin can contribute
+
+Tools, and skills in a `skills/` directory beside `plugin.json`. The SDK also
+declares channels, models, graders and target emitters, but nothing in crewhaus
+binds them yet: a plugin that contributes one still loads, and the boot says
+that part has no effect. A grader belongs in
+`.crewhaus/graders/<name>/index.ts` instead, where the eval runner loads it.
+
 ## Input schemas
 
 Give each tool a zod 3 schema, or a `jsonSchema` the model reads beside a

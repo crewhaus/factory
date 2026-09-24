@@ -13,20 +13,21 @@ import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
  * before either.
  *
  * v2 widens the v1 surface (Studio-only — see `crewhaus/utilities/studio-plugin-sdk`)
- * to cover the five extension points the catalog cares about:
+ * to declare five extension points:
  *
  *   1. **Tools** — anything you would otherwise pass to `buildTool()`.
- *   2. **Channels** — `ChannelAdapter`-shaped inbound surface (Slack,
- *      Telegram, … plus future plugins like Mastodon, IRC, etc.).
- *   3. **Models** — provider adapters that match the canonical
- *      `ProviderAdapter` contract from `adapter-anthropic`.
- *   4. **Graders** — evaluators that match the `RegisteredGrader`
- *      contract from `grader-registry`.
- *   5. **Target emitters** — compile-time target backends that match
- *      the `Emitter` contract from `compiler-core`.
+ *      BOUND: every host that activates plugins registers them.
+ *   2. **Channels** — `ChannelAdapter`-shaped inbound surface.
+ *   3. **Models** — provider adapters shaped like `ProviderAdapter`.
+ *   4. **Graders** — evaluators shaped like `RegisteredGrader`.
+ *   5. **Target emitters** — compile-time target backends shaped like
+ *      `Emitter`.
  *
- * The contributions are *declarations*; `plugin-loader` is responsible
- * for wiring each declaration into the host's registry at runtime.
+ * Only tools (and a plugin's `skills/` directory) are bound in this release.
+ * Channels, models, graders and target emitters are accepted and collected,
+ * and have no effect: no host reads them, and a boot that activates a plugin
+ * contributing one says so (`UNBOUND_CONTRIBUTION_KINDS` in plugin-loader).
+ * A grader belongs in `.crewhaus/graders/<name>/index.ts` instead.
  *
  * A plugin is code that runs INSIDE the crewhaus process, with its full
  * authority, from the moment it is imported. Of its declared
@@ -55,9 +56,9 @@ export type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
 /**
  * Structural shape of a channel adapter contribution. Matches the
  * `ChannelAdapter` interface duplicated across `channel-adapter-slack`
- * / `-telegram` / `-discord` / `-whatsapp` / `-imessage`. Plugins
- * implement this shape directly; `plugin-loader` adapts it into the
- * channel registry slot for the target shape.
+ * / `-telegram` / `-discord` / `-whatsapp` / `-imessage`. NOT BOUND in
+ * this release: a channel daemon's adapters are built into it from the
+ * spec, and a plugin's are collected and ignored, with a boot note.
  */
 export interface PluginChannelAdapter {
   readonly id: string;
@@ -75,9 +76,8 @@ export interface PluginChannelAdapter {
 /**
  * Structural shape of a provider adapter. Mirrors the `ProviderAdapter`
  * exported from `adapter-anthropic` without forcing the SDK to import
- * that package's transitive deps. The full provider request / stream
- * event types live in `adapter-anthropic`; plugins implementing this
- * type should import those for accurate parameter shapes.
+ * that package's transitive deps. NOT BOUND in this release: the model
+ * router resolves models from the spec and ignores a plugin's.
  */
 export interface PluginModelAdapter {
   readonly id: string;
@@ -94,7 +94,9 @@ export interface PluginModelAdapter {
 
 /**
  * Structural shape of a grader contribution. Matches `RegisteredGrader`
- * from `grader-registry`.
+ * from `grader-registry`. NOT BOUND in this release: put a grader in
+ * `.crewhaus/graders/<name>/index.ts` (default export `{ name, grader }`),
+ * which the eval runner loads.
  */
 export interface PluginGrader {
   readonly id: string;
@@ -109,7 +111,8 @@ export interface PluginGrader {
 /**
  * Structural shape of a target emitter contribution. Matches the
  * `Emitter` contract from `compiler-core` — a function that takes the
- * IR variant and returns a `Bundle` (file list).
+ * IR variant and returns a `Bundle` (file list). NOT BOUND in this
+ * release: target shapes are part of the compiler.
  */
 export interface PluginTargetEmitter {
   readonly targetShape: string;
