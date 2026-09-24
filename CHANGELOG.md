@@ -80,9 +80,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`mcp_servers` keys must fit in a tool name.** Use letters, digits, `-`
   and single `_`, starting and ending with a letter or digit. A key with a
   space, a dot or `__` now fails at compile time with a suggested rename,
-  instead of producing tool names every model request would reject. A server
-  whose tools would get a name longer than model providers accept (64
-  characters) fails to register; give it a shorter key.
+  instead of producing tool names every model request would reject. An MCP
+  tool whose full name would be longer than model providers accept (64
+  characters) is left out with a warning that says how short the server key
+  must be; the server's other tools still register.
 - **Plan mode honours deny and ask rules.** It used to decide on the tool's
   read-only flag alone, so an explicit `alwaysDeny` on a read-only network tool
   did nothing in plan mode. A matching deny or ask now denies there. Allow

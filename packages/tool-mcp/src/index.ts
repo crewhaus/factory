@@ -81,7 +81,69 @@ export type RegisterMcpServerOptions = {
   readonly perTool?: Readonly<Record<string, McpToolFlags>>;
   /** Logger callback fired once per registered tool. Useful for boot banners. */
   readonly onRegister?: (info: { fullName: string; remoteName: string }) => void;
+  /**
+   * Fired for a remote tool that is left out because its registered name
+   * would be longer than model providers accept (see
+   * {@link mcpToolNameLengthProblem}). The server's other tools are
+   * registered either way. Default: `console.warn(reason)`.
+   */
+  readonly onSkip?: (info: { fullName: string; remoteName: string; reason: string }) => void;
 };
+
+/**
+ * Why the remote tool `remoteName` on `serverName` cannot be registered under
+ * `mcp__<server>__<tool>`, or undefined when it can: the name would be longer
+ * than the {@link MAX_TOOL_NAME_LENGTH} characters model providers accept.
+ */
+export function mcpToolNameLengthProblem(
+  serverName: string,
+  remoteName: string,
+): string | undefined {
+  const fullName = namespacedToolName(serverName, remoteName);
+  if (fullName.length <= MAX_TOOL_NAME_LENGTH) return undefined;
+  const room = MAX_TOOL_NAME_LENGTH - (fullName.length - serverName.length);
+  return `mcp server "${serverName}" tool "${remoteName}" would be registered as "${fullName}", ${fullName.length} characters; model providers accept at most ${MAX_TOOL_NAME_LENGTH}. ${
+    room >= 1
+      ? `Give the server a name of at most ${room} characters in mcp_servers.`
+      : "The tool's own name is too long for any server name, so it cannot be offered to a model."
+  }`;
+}
+
+/**
+ * Register one remote tool, or — when its name cannot fit — report it through
+ * `onSkip` and register nothing. A too-long name only drops that tool: the
+ * 0.7.1 `mcp__` prefix made a few names that fitted before too long, and one
+ * of them must not take the server's other tools down with it.
+ */
+function registerOne(
+  host: McpHost,
+  serverName: string,
+  catalog: ToolCatalog,
+  remote: McpToolDefinition,
+  opts: RegisterMcpServerOptions,
+): void {
+  // Only a name that is otherwise valid is skipped for its length; anything
+  // else wrong with it still fails the server, as it always has.
+  const reason =
+    typeof remote.name === "string" &&
+    TOOL_NAME_PATTERN.test(remote.name) &&
+    mcpServerNameProblem(serverName) === undefined
+      ? mcpToolNameLengthProblem(serverName, remote.name)
+      : undefined;
+  if (reason !== undefined) {
+    const info = {
+      fullName: namespacedToolName(serverName, remote.name),
+      remoteName: remote.name,
+      reason,
+    };
+    if (opts.onSkip !== undefined) opts.onSkip(info);
+    else console.warn(`[mcp] ${reason} The server's other tools are registered.`);
+    return;
+  }
+  const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name));
+  catalog.register(tool);
+  opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
+}
 
 /**
  * The registered name of the remote tool `toolName` on `serverName`:
@@ -126,11 +188,13 @@ export function buildMcpRegisteredTool(
   const serverProblem = mcpServerNameProblem(serverName);
   if (serverProblem !== undefined) throw new McpError(serverProblem);
   const fullName = opts.registeredName ?? namespacedToolName(serverName, remote.name);
-  if (fullName.length > MAX_TOOL_NAME_LENGTH) {
-    throw new McpError(
-      `mcp server "${serverName}" tool "${remote.name}" would be registered as "${fullName}", ${fullName.length} characters; model providers accept at most ${MAX_TOOL_NAME_LENGTH}. Give the server a shorter name in mcp_servers.`,
-    );
-  }
+  const lengthProblem =
+    opts.registeredName === undefined
+      ? mcpToolNameLengthProblem(serverName, remote.name)
+      : fullName.length > MAX_TOOL_NAME_LENGTH
+        ? `mcp server "${serverName}" tool "${remote.name}" cannot be registered as "${fullName}": ${fullName.length} characters, and model providers accept at most ${MAX_TOOL_NAME_LENGTH}.`
+        : undefined;
+  if (lengthProblem !== undefined) throw new McpError(lengthProblem);
   const description = sanitizeDescription(remote.description) ?? `MCP tool ${fullName}`;
   return buildTool({
     name: fullName,
@@ -224,9 +288,7 @@ export async function registerMcpServer(
   await client.connect();
   const remoteTools = await client.listTools();
   for (const remote of remoteTools) {
-    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remote.name));
-    catalog.register(tool);
-    opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
+    registerOne(host, serverName, catalog, remote, opts);
   }
 }
 
@@ -357,9 +419,7 @@ export async function reconcileMcpServer(
   for (const remoteName of [...drift.added, ...drift.schemaChanged]) {
     const remote = byName.get(remoteName);
     if (remote === undefined) continue;
-    const tool = buildMcpRegisteredTool(host, serverName, remote, resolveFlags(opts, remoteName));
-    catalog.register(tool);
-    opts.onRegister?.({ fullName: tool.name, remoteName });
+    registerOne(host, serverName, catalog, remote, opts);
   }
   return { drift, snapshot };
 }

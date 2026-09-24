@@ -7,6 +7,7 @@ import { ToolCatalog } from "@crewhaus/tool-catalog";
 import {
   buildMcpRegisteredTool,
   mcpServerNameProblem,
+  mcpToolNameLengthProblem,
   namespacedToolName,
   registerMcpServer,
 } from "./index.js";
@@ -456,17 +457,54 @@ describe("0.7.1 — one spelling for MCP tool names (flag-truth-1#1, extension-p
     }
   });
 
-  test("a name longer than providers accept is refused at registration", () => {
+  test("a name longer than providers accept is refused, saying how short the server name must be", () => {
     const { host } = makeFakeHost({ serverName: "x", tools: [] });
     const long = "t".repeat(64 - "mcp__srv__".length + 1);
     expect(() =>
       buildMcpRegisteredTool(host, "srv", { name: long, inputSchema: {} }, flags),
     ).toThrow(
-      /65 characters; model providers accept at most 64\. Give the server a shorter name in mcp_servers\./,
+      /65 characters; model providers accept at most 64\. Give the server a name of at most 2 characters in mcp_servers\./,
     );
     const fits = "t".repeat(64 - "mcp__srv__".length);
     expect(
       buildMcpRegisteredTool(host, "srv", { name: fits, inputSchema: {} }, flags).name,
     ).toHaveLength(64);
+    // A remote name no server name can make room for says so.
+    expect(mcpToolNameLengthProblem("s", "t".repeat(57))).toMatch(
+      /The tool's own name is too long for any server name/,
+    );
+  });
+
+  test("registering a server drops only a tool whose name cannot fit", async () => {
+    // 60 characters as `srv__<tool>` (fine on 0.7.0), 65 with the prefix.
+    const long = "t".repeat(55);
+    const { host } = makeFakeHost({
+      serverName: "srv",
+      tools: [
+        { name: "ok", inputSchema: {} },
+        { name: long, inputSchema: {} },
+      ],
+    });
+    const catalog = new ToolCatalog();
+    const skipped: Array<{ fullName: string; remoteName: string; reason: string }> = [];
+    await registerMcpServer(host, "srv", catalog, { onSkip: (info) => skipped.push(info) });
+    expect(catalog.list().map((t) => t.name)).toEqual(["mcp__srv__ok"]);
+    expect(skipped).toEqual([
+      {
+        fullName: `mcp__srv__${long}`,
+        remoteName: long,
+        reason: expect.stringContaining("Give the server a name of at most 2 characters"),
+      },
+    ]);
+  });
+
+  test("an invalid name still fails the whole server, however long", async () => {
+    const { host } = makeFakeHost({
+      serverName: "srv",
+      tools: [{ name: `bad.${"t".repeat(70)}`, inputSchema: {} }],
+    });
+    await expect(registerMcpServer(host, "srv", new ToolCatalog())).rejects.toThrow(
+      /returned a tool with an invalid name/,
+    );
   });
 });
