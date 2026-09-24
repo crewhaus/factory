@@ -28,6 +28,7 @@ import {
   approvalId,
   askSession,
   makeHarness,
+  permissionAsk,
   writeApprovals,
   writeSession,
   writeSettings,
@@ -517,7 +518,7 @@ describe("PermissionsSuggest", () => {
   test("a recurring always-approved ask becomes an alwaysAllow keyed to the approved input", async () => {
     askSession(tmp, "sess_1", {
       toolName: "Read",
-      input: { file_path: "docs/notes.md" },
+      input: { path: "docs/notes.md" },
       approved: 3,
     });
     const out = await callJson(permissionsSuggest, {});
@@ -544,36 +545,55 @@ describe("PermissionsSuggest", () => {
   });
 
   test("below the ask threshold nothing is proposed", async () => {
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 2 });
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 2 });
     const out = await callJson(permissionsSuggest, {});
     expect(out["suggestions"]).toEqual([]);
     expect((out["asks"] as Array<{ asks: number }>)[0]?.asks).toBe(2);
   });
 
   test("thresholds are overridable, and `.optional()` defaults resolve in execute", async () => {
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 2 });
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 2 });
     const out = await callJson(permissionsSuggest, { minAsks: 2 });
     expect((out["thresholds"] as { minAsks: number }).minAsks).toBe(2);
     expect(out["suggestions"]).toHaveLength(1);
   });
 
-  test("read-only-ness is UNKNOWN unless the caller supplies it, and no suggestion claims it", async () => {
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+  test("a builtin's read-only flag is its own, not the caller's claim", async () => {
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
+    const out = await callJson(permissionsSuggest, {});
+    expect((out["suggestions"] as Array<{ readOnly: unknown }>)[0]?.readOnly).toBe(true);
+    const unknown = out["unknown"] as Array<{ field: string }>;
+    expect(unknown.map((u) => u.field)).not.toContain("suggestions[].readOnly");
+    // A claim cannot turn a builtin that writes into a read-only one.
+    rmSync(path.join(tmp, ".crewhaus"), { recursive: true, force: true });
+    askSession(tmp, "sess_1", { toolName: "Write", input: { path: "a.md" }, approved: 3 });
+    const claimed = await callJson(permissionsSuggest, { readOnlyTools: ["Write"] });
+    expect((claimed["suggestions"] as Array<{ readOnly: unknown }>)[0]?.readOnly).toBe(false);
+  });
+
+  test("read-only-ness of a tool that is not a builtin is UNKNOWN unless the caller supplies it", async () => {
+    writeSession(tmp, "sess_1", [
+      permissionAsk("mcp__notes__read", "approved"),
+      permissionAsk("mcp__notes__read", "approved"),
+      permissionAsk("mcp__notes__read", "approved"),
+    ]);
     const blind = await callJson(permissionsSuggest, {});
     expect((blind["suggestions"] as Array<{ readOnly: unknown }>)[0]?.readOnly).toBeNull();
-    const unknown = blind["unknown"] as Array<{ field: string }>;
-    expect(unknown.map((u) => u.field)).toContain("suggestions[].readOnly");
+    const unknown = blind["unknown"] as Array<{ field: string; reason: string }>;
+    expect(unknown.find((u) => u.field === "suggestions[].readOnly")?.reason).toContain(
+      "mcp__notes__read is not a builtin",
+    );
     // The evidence must not leave harness-advice's fail-closed "NOT read-only"
     // line standing as if it were an observation.
     const evidence = (blind["suggestions"] as Array<{ evidence: string[] }>)[0]?.evidence ?? [];
     expect(evidence.some((line) => line.includes("fail-closed default"))).toBe(true);
 
-    const told = await callJson(permissionsSuggest, { readOnlyTools: ["Read"] });
+    const told = await callJson(permissionsSuggest, { readOnlyTools: ["mcp__notes__read"] });
     expect((told["suggestions"] as Array<{ readOnly: unknown }>)[0]?.readOnly).toBe(true);
   });
 
   test("a settings file that does not parse withholds the diff instead of proposing against an empty baseline", async () => {
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
     writeSettings(tmp, "{ this is not json");
     const out = await callJson(permissionsSuggest, {});
     expect(out["diff"]).toBeNull();
@@ -585,7 +605,7 @@ describe("PermissionsSuggest", () => {
   });
 
   test("an existing identical rule is reported as already present, never duplicated", async () => {
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
     writeSettings(
       tmp,
       JSON.stringify({ permissions: { rules: [{ type: "alwaysAllow", pattern: "Read(a.md)" }] } }),
@@ -597,7 +617,7 @@ describe("PermissionsSuggest", () => {
   });
 
   test("a settings file holding a rule this reader cannot recognise withholds `merged`", async () => {
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
     writeSettings(
       tmp,
       JSON.stringify({
@@ -628,7 +648,7 @@ describe("PermissionsSuggest", () => {
 
   test("torn session lines make the ask counts a declared floor", async () => {
     writeSession(tmp, "sess_1", [
-      JSON.stringify({ kind: "tool_use", payload: { name: "Read", input: { file_path: "a.md" } } }),
+      JSON.stringify({ kind: "tool_use", payload: { name: "Read", input: { path: "a.md" } } }),
       "{torn",
       JSON.stringify({
         kind: "permission",
@@ -649,7 +669,7 @@ describe("PermissionsSuggest", () => {
     // the NEWEST file and takes the first slot: asking for one session would
     // mine the ledger and none of the history the counts are supposed to come
     // from.
-    askSession(tmp, "sess_a", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+    askSession(tmp, "sess_a", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
     writeFileSync(
       path.join(tmp, ".crewhaus", "sessions", "sess_a.events.jsonl"),
       `${JSON.stringify({ kind: "model_response", payload: {} })}\n`,
@@ -668,7 +688,7 @@ describe("PermissionsSuggest", () => {
 
   test("only the most recent N sessions are mined, and the window is reported", async () => {
     // Three sessions, each asking about a different tool; mine one.
-    askSession(tmp, "sess_a", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+    askSession(tmp, "sess_a", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
     askSession(tmp, "sess_b", { toolName: "Grep", input: { pattern: "x" }, approved: 3 });
     const out = await callJson(permissionsSuggest, { sessions: 1 });
     expect((out["mined"] as { mined: string[] }).mined).toHaveLength(1);
@@ -710,7 +730,7 @@ describe("package properties", () => {
       approval({ id: approvalId(1) }),
       approval({ id: approvalId(1), decision: "grant" }),
     ]);
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
     writeSettings(tmp, JSON.stringify({ permissions: { rules: [] } }));
     const before = snapshot(tmp);
     await call(approvalStatus, { dir: "alpha" });
@@ -728,7 +748,7 @@ describe("package properties", () => {
     mkdirSync(path.join(tmp, "broken", ".crewhaus", "sessions", "approvals.jsonl"), {
       recursive: true,
     });
-    askSession(tmp, "sess_1", { toolName: "Read", input: { file_path: "a.md" }, approved: 3 });
+    askSession(tmp, "sess_1", { toolName: "Read", input: { path: "a.md" }, approved: 3 });
     writeSettings(tmp, "{ not json");
 
     const results = [

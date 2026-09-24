@@ -142,6 +142,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`crewhaus permissions suggest` proposes rules scoped to what was
+  approved.** Three approvals of `RemovePath build/cache` used to become
+  `alwaysAllow RemovePath` — delete anything — and three `git status` became
+  "run any command", because only a handful of legacy tools said which
+  argument a rule is about. Every builtin now does, so the proposal is
+  `RemovePath(build/cache)`, `RunCommand(git status)`,
+  `HttpRequest(https://api.example.com/v1/items)`. When a proposal can only
+  cover the whole tool (the calls varied, the tool has no such argument, or
+  it is an MCP tool), the output says `BLANKET GRANT` with the reason, and
+  the settings diff marks the line. The `PermissionsSuggest` tool does the
+  same, reads each builtin's own read-only flag, and `ApprovalStatus` shows
+  the argument a rule would really be checked against.
 - **`crewhaus lint` and `compile` point out permission rules that can never
   fire.** A rule written with the spec key (`removePath(tmp/**)` — rules use
   the tool's name, `RemovePath`), a URL rule with a method in front

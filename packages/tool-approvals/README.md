@@ -68,10 +68,14 @@ actually means:  every .md file under notes/, forever
 That is a summarising tool turning into a privilege-escalation tool, silently,
 while showing the operator a pattern that *looks* like the file they approved.
 
-`@crewhaus/tool-permission-matcher` owns the two facts that stop it —
-`escapeGlobLiteral` (the escaping) and `OPERATIVE_ARG_FIELDS` (which input field
-a rule constrains) — and `@crewhaus/harness-advice`'s `patternFor` already uses
-both. This package does not re-derive either. It adds the check neither can
+Two facts stop it: `escapeGlobLiteral` (the escaping, in
+`@crewhaus/tool-permission-matcher`) and which input field a rule constrains —
+each builtin's own `operativeArgs`, which this package reads from the builtin
+manifest (`@crewhaus/tool-registry-manifest/flags`), since the bundle it runs in
+does not carry every tool. `@crewhaus/harness-advice`'s `aggregateAsks` reads a
+recorded call through those declarations exactly as the matcher will (a path
+with `..` collapsed, a URL in its parsed form, a repository as `owner/repo`),
+and `patternFor` escapes the result. This package does not re-derive either. It adds the check neither can
 make: **`lib/rule-check.ts` verifies the finished rule by running the real
 matcher over it**, against the approved call and against a generated set of
 near-misses, and refuses any rule that reaches past the call it came from.
@@ -120,16 +124,20 @@ the rule either.
 
 ### Blanket grants are labelled
 
-Three situations make a proposal cover the whole tool rather than the approved
-call. `rankSuggestions` explains one of them; this package says all three out
-loud, prefixed `BLANKET GRANT`, because the value of a suggestion is that a
-human can see what they are agreeing to:
+A proposal is scoped only when every recorded call of the tool acted on one and
+the same place. Otherwise it covers the whole tool, and its evidence says so in
+a line prefixed `BLANKET GRANT` with the reason, because the value of a
+suggestion is that a human can see what they are agreeing to:
 
-- several distinct inputs were observed (harness-advice's own note);
-- the one approved input contains a parenthesis, which the `Tool(arg)` grammar
-  cannot escape, so the argument constraint is dropped;
-- the tool has no operative-argument field at all — every MCP and custom tool —
-  so no rule about it can constrain arguments.
+- the calls acted on different places (the line gives a one-place rule to copy);
+- one call acted on several places — a source and a destination, several
+  recipients — which one rule value cannot cover;
+- a value no rule can name: a path outside the workspace, text that is not a
+  URL, or a parenthesis;
+- the tool declares no argument that decides where it acts (`[]`: the
+  clipboard, a session-local process handle);
+- the tool is not a builtin (MCP, custom), so which argument matters is not
+  known here.
 
 Each suggestion also carries `argConstrained`, the single field that separates
 "allow this call" from "allow this tool for anything".
@@ -174,9 +182,10 @@ That covers, specifically:
   baseline would propose additions that may already exist;
 - a `settings.json` holding a rule entry the reader does not recognise → the
   additions are still reported, but `diff.merged` is withheld. See below;
-- `readOnly` on a suggestion, when the caller did not supply `readOnlyTools` →
-  `null`, never `false`, with a line in the evidence saying that harness-advice's
-  fail-closed "not read-only" is a default and not an observation.
+- `readOnly` on a suggestion for a tool that is not a builtin, when the caller
+  did not name it in `readOnlyTools` → `null`, never `false`, with a line in the
+  evidence saying that harness-advice's fail-closed "not read-only" is a default
+  and not an observation. A builtin's own flag always comes from the manifest.
 
 `index.test.ts` walks every result of every tool and fails if any `null` lacks
 its `unknown` entry, so the rule cannot rot.
@@ -238,8 +247,10 @@ that quietly globbed would make "every `Read` park" also show `ReadSecrets`.
 
 A row carries the record's identity (`id`, `runId`, `sessionId`, `surface`,
 `inputHash`), its status and decision, and the **operative argument** — the input
-field a permission rule would constrain for that tool, read from the matcher's
-own `OPERATIVE_ARG_FIELDS`. That is the value an approver is actually judging,
+field a permission rule would constrain for that tool, read the way the matcher
+reads it: a builtin's declared `operativeArgs` (with the default it acts on when
+the call leaves the field out), else the matcher's `OPERATIVE_ARG_FIELDS`. That
+is the value an approver is actually judging,
 and showing any other field would show them a value no rule they write will be
 checked against.
 
@@ -299,9 +310,9 @@ fragment. Either way the cut is reported.
 
 They read a harness's ledger and its logs. They do not reach a running process,
 so "nothing is parked" is not "the run is healthy" — it is only "nothing is
-waiting on a permission decision". They do not reach the tool registry, so
-`readOnly` is a caller's claim (`readOnlyTools`) or it is unknown; it is never
-guessed from a name. And a suggestion mined from twenty sessions describes twenty
+waiting on a permission decision". They know the builtins from the manifest, not
+from the running registry: for an MCP or custom tool `readOnly` is a caller's
+claim (`readOnlyTools`) or it is unknown; it is never guessed from a name. And a suggestion mined from twenty sessions describes twenty
 sessions: the thresholds are visible in the result, and widening a permission on
 that evidence is a human's call, which is why it stays one.
 

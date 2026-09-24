@@ -10,6 +10,7 @@ export {
   type PermissionSubjectOptions,
   lexicalPathValues,
   operativeValuesFor,
+  operativeValuesOf,
   preparePermissionSubject,
   readOperativeField,
 } from "./permission-subject";

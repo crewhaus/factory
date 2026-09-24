@@ -303,8 +303,10 @@ import {
   existingSettingsRules,
   formatSettingsDiff,
   formatSuggestionLines,
+  isArgScoped,
   rankSuggestions,
   readOnlyByName,
+  suggestLookupFromTools,
 } from "@crewhaus/harness-advice/permissions-suggest";
 // 0.6.0 §7.8 / §9.1 — the shadow lane holds BOTH sides of one audition under
 // the primary's routeKey; these read the candidate side apart from the
@@ -15409,12 +15411,30 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
     );
   }
 
-  // Read-only-ness comes from the resolvable tool map (keyed by RegisteredTool
-  // `.name`, which is what the ask aggregate is keyed by).
+  // Read-only-ness and which argument decides where each tool acts come from
+  // the resolvable tool map (keyed by RegisteredTool `.name`, which is what
+  // the ask aggregate is keyed by). A recorded call is parsed with the tool's
+  // schema before its operative values are read, as the runtime does.
   const toolMap = await loadToolMap();
   const readOnly = readOnlyByName(toolMap);
-  const aggregates = aggregateAsks(sessions);
-  const suggestions: PermissionSuggestion[] = rankSuggestions(aggregates, readOnly);
+  const aggregates = aggregateAsks(sessions, suggestLookupFromTools(toolMap));
+  // Every proposal is checked against the real permission matcher before it
+  // is shown: a rule that would also cover a call nobody approved is refused.
+  const { verifyRule } = await import("@crewhaus/tool-approvals");
+  const suggestions: PermissionSuggestion[] = [];
+  const rejected: Array<{ pattern: string; reason: string }> = [];
+  for (const suggestion of rankSuggestions(aggregates, readOnly)) {
+    const agg = aggregates.get(suggestion.toolName);
+    const scoped = agg !== undefined && isArgScoped(agg);
+    const verdict = verifyRule(
+      suggestion.rule.pattern,
+      suggestion.toolName,
+      scoped ? agg.argSamples[0] : undefined,
+      scoped ? agg.argKind : undefined,
+    );
+    if (verdict.ok) suggestions.push(suggestion);
+    else rejected.push({ pattern: suggestion.rule.pattern, reason: verdict.reason });
+  }
 
   // Existing settings rules (the exact shape buildRuleSet consumes).
   const settingsPath = join(process.cwd(), ".crewhaus", "settings.json");
@@ -15431,7 +15451,7 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
 
   if (args.flags["json"] === true) {
     process.stdout.write(
-      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, diff }, null, 2)}\n`,
+      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, rejected, diff }, null, 2)}\n`,
     );
     if (args.flags["apply"] !== true) return;
   } else {
@@ -15442,6 +15462,9 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
       process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
     }
     for (const line of formatSuggestionLines(suggestions)) process.stdout.write(`${line}\n`);
+    for (const r of rejected) {
+      process.stdout.write(`[refused] ${r.pattern}\n  · ${r.reason}\n`);
+    }
     process.stdout.write("\n");
     for (const line of formatSettingsDiff(diff)) process.stdout.write(`${line}\n`);
   }

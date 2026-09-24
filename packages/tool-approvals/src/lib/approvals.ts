@@ -28,7 +28,10 @@
  * answering a question it has no authority over, and an operator who skipped it
  * on that advice would leave a run blocked that a grant would have resumed.
  */
+import type { OperativeArg } from "@crewhaus/tool-catalog";
+import { readOperativeField } from "@crewhaus/tool-executor";
 import { OPERATIVE_ARG_FIELDS } from "@crewhaus/tool-permission-matcher";
+import { TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import { type JsonlRead, readJsonlCapped } from "./jsonl";
 import { compareStrings } from "./unknown";
 
@@ -288,11 +291,12 @@ export type ApprovalRow = {
   readonly sessionId: string;
   readonly inputHash: string;
   /**
-   * The input field a permission rule would constrain for this tool, per
-   * `@crewhaus/tool-permission-matcher`'s `OPERATIVE_ARG_FIELDS` — the one an
-   * approver is actually judging. `null` for a tool with no entry in that table
-   * (every MCP tool, and any custom tool), where there is no field the matcher
-   * would check either.
+   * The input field a permission rule would constrain for this tool — the one
+   * an approver is actually judging: the first of a builtin's declared
+   * `operativeArgs` that the call carries (or fills with its default), else
+   * the matcher's name table. `null` when there is none: a tool that declares
+   * no scoping argument, and every MCP or custom tool, whose rules are
+   * checked against the call's text.
    */
   readonly operativeField: string | null;
   readonly operativeValue: string | null;
@@ -311,16 +315,26 @@ function typeName(value: unknown): string {
 }
 
 /**
- * The operative field and value for a tool, using the matcher's OWN table.
+ * The operative field and value for a tool, read the way the matcher reads it.
  *
- * Reading the same table the matcher reads is the point: a row that showed some
- * other field would be showing an approver a value that no rule they write
- * about it will ever be checked against.
+ * Reading what the matcher reads is the point: a row that showed some other
+ * field would be showing an approver a value that no rule they write about it
+ * will ever be checked against. A builtin's own declaration comes first (the
+ * builtin manifest carries it); the matcher's name table speaks only for a
+ * tool that declares nothing.
  */
 export function operativeOf(
   toolName: string,
   input: unknown,
 ): { readonly field: string | null; readonly value: string | null } {
+  const declared = TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs;
+  if (declared !== undefined) {
+    for (const arg of declared) {
+      const value = readOperativeField(input, arg as OperativeArg).find((v) => v.length > 0);
+      if (value !== undefined) return { field: arg.field, value };
+    }
+    return { field: null, value: null };
+  }
   const fields = OPERATIVE_ARG_FIELDS[toolName];
   if (fields === undefined || input === null || typeof input !== "object") {
     return { field: null, value: null };

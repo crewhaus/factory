@@ -105,10 +105,24 @@ export function operativeValuesFor(
   parsedInput: unknown,
   opts: PermissionSubjectOptions = {},
 ): ReadonlyArray<OperativeValue> | undefined {
-  if (tool.operativeArgs === undefined || tool.operativeArgs.length === 0) return undefined;
+  return operativeValuesOf(tool.operativeArgs, parsedInput, opts);
+}
+
+/**
+ * {@link operativeValuesFor} from a declaration alone — for a caller that has
+ * a tool's `operativeArgs` as data (the builtin manifest) but not the tool.
+ * The values are read the same way; the caller is responsible for passing an
+ * input the tool's schema has parsed, when it can.
+ */
+export function operativeValuesOf(
+  operativeArgs: ReadonlyArray<OperativeArg> | undefined,
+  parsedInput: unknown,
+  opts: PermissionSubjectOptions = {},
+): ReadonlyArray<OperativeValue> | undefined {
+  if (operativeArgs === undefined || operativeArgs.length === 0) return undefined;
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
-  for (const arg of tool.operativeArgs) {
+  for (const arg of operativeArgs) {
     for (const { value: raw, words } of readField(parsedInput, arg)) {
       switch (arg.kind) {
         case "path":

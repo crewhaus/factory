@@ -365,12 +365,28 @@ describe("orderApprovals", () => {
 // ---------------------------------------------------------------------------
 
 describe("toRow", () => {
-  test("the operative field comes from the matcher's own table", () => {
-    expect(operativeOf("Read", { file_path: "/etc/hosts", content: "x" })).toEqual({
-      field: "file_path",
+  test("the operative field is the one the tool declares", () => {
+    expect(operativeOf("Read", { path: "/etc/hosts", content: "x" })).toEqual({
+      field: "path",
       value: "/etc/hosts",
     });
     expect(operativeOf("Bash", { command: "ls" })).toEqual({ field: "command", value: "ls" });
+    // 0.7.1 builtins beyond the legacy name table: the URL, not the method…
+    expect(operativeOf("HttpRequest", { method: "DELETE", url: "https://x.test/a" })).toEqual({
+      field: "url",
+      value: "https://x.test/a",
+    });
+    // …a repository read in the light of its owner…
+    expect(operativeOf("IssueCreate", { owner: "crewhaus", repo: "factory", title: "t" })).toEqual({
+      field: "repo",
+      value: "crewhaus/factory",
+    });
+    // …and the default a tool acts on when the call leaves the field out.
+    expect(operativeOf("EnvFileUpsert", { entries: {} })).toEqual({ field: "path", value: ".env" });
+  });
+
+  test("a builtin with no scoping argument shows none, even when a table name would match", () => {
+    expect(operativeOf("ClipboardWrite", { text: "x" })).toEqual({ field: null, value: null });
   });
 
   test("a tool with no entry in that table gets NO operative value — there is no field a rule could constrain", () => {
@@ -381,14 +397,14 @@ describe("toRow", () => {
     const row = toRow(
       approval({
         toolName: "Write",
-        input: { file_path: "notes.md", content: "sk-live-abcdefghijklmnop" },
+        input: { path: "notes.md", content: "sk-live-abcdefghijklmnop" },
       }) as never,
     );
-    expect(row.operativeField).toBe("file_path");
+    expect(row.operativeField).toBe("path");
     expect(row.operativeValue).toBe("notes.md");
     expect(row.inputFields).toEqual([
       { key: "content", type: "string", chars: 24 },
-      { key: "file_path", type: "string", chars: 8 },
+      { key: "path", type: "string", chars: 8 },
     ]);
     // The whole row, serialized, must not carry the secret's TEXT anywhere.
     expect(JSON.stringify(row)).not.toContain("sk-live-abcdefghijklmnop");
