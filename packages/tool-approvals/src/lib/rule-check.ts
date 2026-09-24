@@ -24,8 +24,8 @@
  *
  *   1. THE TOOL NAME IS ALSO AN OBSERVED VALUE. `patternFor` embeds
  *      `agg.toolName` verbatim on both of its paths. Built-in names are fixed,
- *      but an MCP tool's registered name is `<server>__<tool>` composed from
- *      strings a REMOTE server declares (`namespacedToolName` does no
+ *      but an MCP tool's registered name is `mcp__<server>__<tool>` composed
+ *      from strings a REMOTE server declares (`namespacedToolName` does no
  *      sanitising), so a hostile or careless server can register `notes__read*`
  *      and have "always allow the tool you approved" compile to a rule covering
  *      every tool whose name starts `notes__read`.

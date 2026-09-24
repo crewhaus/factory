@@ -474,7 +474,7 @@ export class ToolCatalog {
    * `crewhaus run` quarantine path (apps/cli `runRunCli`) does NOT use it. It
    * reads the failing-server set from `.crewhaus/mcp/quarantine.json` (written
    * by `crewhaus mcp doctor`), filters the plain tools array by the
-   * `<server>__` name prefix, and appends a notice built by `mcp-doctor.ts`'s
+   * `mcp__<server>__` name prefix, and appends a notice built by `mcp-doctor.ts`'s
    * `quarantineNotice()` to the agent instructions. This method + `restore()`
    * + `quarantinedNames()` are a catalog-level API awaiting a caller.
    */

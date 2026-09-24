@@ -52,7 +52,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and why `ToolRegistry` is its own tool: growing `ListTools` instead would
   carry all of it into every bundle of every shape.
 
+- **A tool can say which argument a permission rule is about.** A rule like
+  `Write(src/**)` constrains one argument of the call, but nothing said which
+  one. A tool definition can now declare `operativeArgs`: the input field(s)
+  an argument pattern is checked against, and whether each is a path, URL,
+  command, text or id. The file, shell, fetch and web-search tools declare
+  theirs, and so do `RemovePath` and `EnvFileUpsert`. `buildTool` refuses a
+  declaration that names a field the tool's input does not have. Tool
+  packages written outside this repo can check `TOOL_CONTRACT_VERSION` in
+  `@crewhaus/tool-catalog`.
+
 ### Changed
+
+- **MCP tools are named `mcp__<server>__<tool>`**, the name the docs have
+  always used; they were registered as `<server>__<tool>`. This is the name
+  the model now sees. Permission rules, model-profile `deny`/`ask`, skill and
+  sub-agent `tools:` lists, hook matchers and `rate_limits` written with the
+  old spelling keep working, so no spec needs to change — but instructions
+  that tell the model to call a tool by its old name should be updated. A
+  model profile's `tools: [mcp__<server>__*]` now selects that server's tools,
+  where before it selected none.
+- **MCP calls get the stricter egress check the docs describe.** Now that
+  MCP tools are recognisable by name, an MCP call whose input carries text
+  that came from a tool result, an MCP response, a sub-agent or another source
+  other than the user is blocked, not only logged — the treatment `Fetch` and
+  `WebFetch` already get.
+- **`mcp_servers` keys must fit in a tool name.** Use letters, digits, `-`
+  and single `_`, starting and ending with a letter or digit. A key with a
+  space, a dot or `__` now fails at compile time with a suggested rename,
+  instead of producing tool names every model request would reject. A server
+  whose tools would get a name longer than model providers accept (64
+  characters) fails to register; give it a shorter key.
+- **Plan mode honours deny and ask rules.** It used to decide on the tool's
+  read-only flag alone, so an explicit `alwaysDeny` on a read-only network tool
+  did nothing in plan mode. A matching deny or ask now denies there. Allow
+  rules are still ignored, so plan mode can only get stricter.
+- **An argument-scoped allow must cover every argument it is about.** For
+  Read, Write and Edit that is `path` alone. For Grep it is the regex AND the
+  path, so `Grep(src/**)` no longer allows a search just because its path is
+  under `src/`. To allow searching, keep the bare `Grep` allow (the builtin
+  default) and deny what must stay out, e.g. `alwaysDeny Grep(.env)`.
+- **Paths and URLs in rules are matched where the tool will act.** A path is
+  resolved against the workspace first — `src/../.git` is `.git`, a symlinked
+  directory is followed — and matched workspace-relative, so write rules as
+  `src/**`, not `./src/**` or an absolute path (an absolute pattern still
+  matches the absolute path). A path outside the workspace never satisfies a
+  scoped allow. A URL is matched in its parsed form (`HTTP://Example.COM` is
+  `http://example.com/`).
+- **A call whose input the tool would reject is refused before any rule or
+  approval.** It could not run anyway; now it no longer parks an approval
+  first. The denial carries the tool's validation message.
+- **`CREWHAUS_SANDBOX` with a value that names no backend now blocks code
+  execution** with a message saying what to set, instead of letting the call
+  through to fail inside the tool.
 
 - **`ToolInventory` checks builtin names without being asked.** Its own
   docstring named the gap: a builtin key could only be checked against a
@@ -64,6 +116,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer says which list it used. The set comes from `BUILTIN_TOOL_MAP`, which
   this package already reaches and which is keys without prose, so no bundle
   granting a `tool-crewhaus` tool pays for the manifest's 455 KB.
+
+### Fixed
+
+- **A permission pattern can no longer stall the daemon.** A rule with several
+  `*` in it, matched against a long command, could block the event loop for
+  seconds or indefinitely. Patterns are now matched in time proportional to
+  the argument's length, and they match exactly what they matched before.
+- **`PermissionAudit` describes plan mode as it now works**, and matches a
+  rule written with the old MCP spelling against the new tool name.
+
+### Security
+
+- **Scoped deny and ask rules can no longer be dodged.** A deny such as
+  `alwaysDeny RemovePath(.git/**)` in front of a bare `alwaysAllow RemovePath`
+  failed to match as soon as the call carried one more argument — a `reason`,
+  a `method`, a made-up key — and the call fell through to the allow. Leaving
+  out an argument the tool fills with a default (`EnvFileUpsert` without
+  `path` writes `.env`) dodged it too. A deny or ask now fires when any
+  argument it is about matches, the rule sees defaults, and it is checked
+  against the input the tool will actually run on.
+- **Scoped allow rules can no longer be widened.** `Write(src/**)` authorised a
+  write to `.crewhaus/settings.json` — and so standing permissions on the next
+  run — when the call also carried a `file_path: "src/ok.ts"` the tool never
+  reads, when the path was `src/../.crewhaus/settings.json`, or when it went
+  through a symlinked directory. None of these pass now.
+- **A deny written the way the docs say now fires on MCP tools.**
+  `alwaysDeny mcp__github__*` matched nothing, because the tools were
+  registered under another name, so in auto mode the call simply ran.
+- **`CREWHAUS_SANDBOX=noop` with a stray space or a CRLF line ending no longer
+  runs model code on the host.** The permission floor read the value
+  untrimmed and saw a sandbox; the sandbox trimmed it and ran the code
+  directly. Both now read it the same way.
 
 ## [0.7.0] - 2026-09-22
 
