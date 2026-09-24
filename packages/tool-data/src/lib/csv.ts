@@ -14,7 +14,7 @@
  * RFC 4180 does not define.
  */
 
-import { setOwn } from "./json";
+import { OutputLimitError, setOwn } from "./json";
 
 export type CsvParseOptions = {
   delimiter: string;
@@ -238,6 +238,13 @@ export type CsvWriteOptions = {
   /** Quote every field, not only the ones that need it. */
   quoteAll: boolean;
   header: string[] | null;
+  /**
+   * Throw `OutputLimitError` once the text would pass this many characters.
+   * Records with keys that differ make a column for every key and a cell for
+   * every column in every row, so the output can be rows x columns even
+   * when the input was rows + columns.
+   */
+  maxChars?: number;
 };
 
 /** Quote a single field if it contains the delimiter, a quote, or a line break. */
@@ -273,19 +280,27 @@ export function cellToString(value: unknown): string {
  * nothing is written that this package cannot read back.
  */
 export function writeCsvRows(
-  rows: ReadonlyArray<ReadonlyArray<unknown>>,
+  rows: Iterable<ReadonlyArray<unknown>>,
   options: CsvWriteOptions,
 ): string {
   const dialect = csvDialectError(options.delimiter, options.quote);
   if (dialect !== null) throw new CsvError(dialect, 0);
+  const max = options.maxChars ?? Number.POSITIVE_INFINITY;
   const lines: string[] = [];
+  let chars = -options.newline.length;
+  const push = (line: string): void => {
+    chars += line.length + options.newline.length;
+    if (chars > max) throw new OutputLimitError(max, "the CSV");
+    lines.push(line);
+  };
   if (options.header !== null) {
-    lines.push(options.header.map((h) => escapeCsvField(h, options)).join(options.delimiter));
+    push(options.header.map((h) => escapeCsvField(h, options)).join(options.delimiter));
   }
   for (const row of rows) {
-    lines.push(
-      row.map((cell) => escapeCsvField(cellToString(cell), options)).join(options.delimiter),
-    );
+    // A row's cells are delimiter-separated at the least; checked before the
+    // row is built, so one enormous row is not built to be refused.
+    if (chars + row.length > max) throw new OutputLimitError(max, "the CSV");
+    push(row.map((cell) => escapeCsvField(cellToString(cell), options)).join(options.delimiter));
   }
   return lines.join(options.newline);
 }

@@ -58,6 +58,22 @@ that name, and a path only ever reads a record's own fields, so `exists
 constructor` does not match a record that has no such field. No tool here
 writes into `Object.prototype`, whatever the document or path says.
 
+## Limits
+
+A document may be up to 4,000,000 characters and nest up to 256 levels
+(each `[` or `{` is a level; YAML's own reader stops at 64). Deeper is
+refused before it is parsed: no real document is near it, and every tool
+here does some work per level. A result may be up to 16,000,000 characters
+— four times the input, so a document at the limit can still be
+pretty-printed. It is measured before it is built, because its size is not
+the input's: indentation writes depth x indent on every line, records
+converted from CSV repeat every column name once per row, and a join repeats
+a matched row once per partner. Past it the tool says so and builds nothing;
+`JsonQuery` instead returns the matches that fit, with `truncatedBy:
+"outputChars"`. A JSONPath query visits at most 5,000,000 nodes
+(`truncatedBy: "visits"`), and a JSON Patch may add at most 2,000,000
+values.
+
 ## The parsers are hand-written, so here is exactly what they support
 
 There is no YAML, TOML, XML or CSV dependency behind these tools. That keeps

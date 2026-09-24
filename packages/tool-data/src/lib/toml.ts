@@ -40,7 +40,7 @@
  * than pretending the output is complete.
  */
 
-import { getOwn, isPlainObject, setOwn } from "./json";
+import { OutputLimitError, getOwn, isPlainObject, setOwn } from "./json";
 
 export class TomlError extends Error {
   readonly line: number;
@@ -501,21 +501,45 @@ export type TomlWriteResult = { text: string; skipped: string[] };
  * keys that were dropped because TOML has no representation for them
  * (`null` and `undefined`).
  */
-export function stringifyToml(value: unknown): TomlWriteResult {
+export function stringifyToml(
+  value: unknown,
+  maxChars = Number.POSITIVE_INFINITY,
+): TomlWriteResult {
   if (!isPlainObject(value)) {
     throw new TomlError("TOML documents must be objects at the top level", 0);
   }
-  const skipped: string[] = [];
-  const lines: string[] = [];
-  emitTable(value, [], lines, skipped);
-  return { text: lines.join("\n"), skipped };
+  const out: TomlOut = { lines: [], skipped: [], chars: -1, max: maxChars };
+  emitTable(value, [], out);
+  return { text: out.lines.join("\n"), skipped: out.skipped };
+}
+
+/**
+ * Where emitTable writes. `chars` counts the text AND the skipped paths
+ * (both are returned), so a `maxChars` budget holds for everything: a table
+ * header repeats the whole dotted path once per table and per array-of-
+ * tables element, which makes TOML's size depth x width, not the input's.
+ */
+type TomlOut = {
+  readonly lines: string[];
+  readonly skipped: string[];
+  chars: number;
+  readonly max: number;
+};
+
+function charge(out: TomlOut, length: number): void {
+  out.chars += length;
+  if (out.chars > out.max) throw new OutputLimitError(out.max, "the TOML");
+}
+
+function emitLine(out: TomlOut, line: string): void {
+  charge(out, line.length + 1);
+  out.lines.push(line);
 }
 
 function emitTable(
   table: Record<string, unknown>,
   path: ReadonlyArray<string>,
-  lines: string[],
-  skipped: string[],
+  out: TomlOut,
   headerAlreadyWritten = false,
 ): void {
   const scalars: string[] = [];
@@ -525,7 +549,9 @@ function emitTable(
   for (const key of Object.keys(table)) {
     const v = table[key];
     if (v === null || v === undefined) {
-      skipped.push([...path, key].join("."));
+      const dropped = [...path, key].join(".");
+      charge(out, dropped.length + 2);
+      out.skipped.push(dropped);
       continue;
     }
     if (isTableArray(v)) {
@@ -544,20 +570,21 @@ function emitTable(
     path.length > 0 &&
     (scalars.length > 0 || (subTables.length === 0 && tableArrays.length === 0));
   if (needsHeader) {
-    if (lines.length > 0) lines.push("");
-    lines.push(`[${path.map(writeKey).join(".")}]`);
+    if (out.lines.length > 0) emitLine(out, "");
+    emitLine(out, `[${path.map(writeKey).join(".")}]`);
   }
-  lines.push(...scalars);
+  for (const line of scalars) emitLine(out, line);
 
   for (const [key, sub] of subTables) {
-    emitTable(sub, [...path, key], lines, skipped);
+    emitTable(sub, [...path, key], out);
   }
   for (const [key, arr] of tableArrays) {
     const childPath = [...path, key];
+    const header = `[[${childPath.map(writeKey).join(".")}]]`;
     for (const element of arr) {
-      if (lines.length > 0) lines.push("");
-      lines.push(`[[${childPath.map(writeKey).join(".")}]]`);
-      emitTable(element, childPath, lines, skipped, true);
+      if (out.lines.length > 0) emitLine(out, "");
+      emitLine(out, header);
+      emitTable(element, childPath, out, true);
     }
   }
 }

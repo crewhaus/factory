@@ -35,9 +35,14 @@ import {
 } from "./lib/csv";
 import { deepDiff } from "./lib/diff";
 import {
+  MAX_NESTING_DEPTH,
+  OutputLimitError,
   canonicalStringify,
   getOwn,
   isPlainObject,
+  jsonTextLength,
+  jsonTextNestsDeeper,
+  nestingDepthExceeds,
   parseJson,
   setOwn,
   sortKeysDeep,
@@ -76,9 +81,6 @@ import { TomlError, parseToml, stringifyToml } from "./lib/toml";
 import { XmlError, parseXml, toCompact } from "./lib/xml";
 import { YamlError, parseYaml, stringifyYaml } from "./lib/yaml";
 
-/** Compact JSON — no indentation, since the reader is a model, not a person. */
-const json = (value: unknown): string => JSON.stringify(value);
-
 /**
  * Guard for every tool that accepts a whole document. Keeps one pathological
  * input from filling a context window or exhausting memory. Callers hitting
@@ -90,6 +92,53 @@ function tooLarge(text: string, field: string): string | null {
   if (text.length <= MAX_INPUT_CHARS) return null;
   return `${field} is ${text.length} characters, over the ${MAX_INPUT_CHARS} limit — narrow the input first`;
 }
+
+/**
+ * The most characters one result may be: four times the input limit, so a
+ * document at the input limit can still be pretty-printed. A result is
+ * measured before it is built and refused past this, because its size is
+ * not the input's: indentation writes depth x indent on every line, a
+ * record set repeats every key once per row, and a join repeats a matched
+ * row once per partner.
+ */
+const MAX_OUTPUT_CHARS = 4 * MAX_INPUT_CHARS;
+
+/** The refusal for a result over MAX_OUTPUT_CHARS. Nothing was built. */
+function outputRefusal(what: string, hint: string): string {
+  return `${what} would be more than ${MAX_OUTPUT_CHARS} characters, the most one result may be, so nothing was built — ${hint}`;
+}
+
+/**
+ * Compact JSON — no indentation, since the reader is a model, not a person
+ * — measured first and refused past MAX_OUTPUT_CHARS.
+ */
+const json = (value: unknown): string =>
+  jsonTextLength(value, 0, MAX_OUTPUT_CHARS) > MAX_OUTPUT_CHARS
+    ? outputRefusal("the result", "narrow the input or ask for less")
+    : JSON.stringify(value);
+
+/** JSON.stringify with an indent, measured first and refused past MAX_OUTPUT_CHARS. */
+function pretty(value: unknown, indent: number, fallback: string): string {
+  if (jsonTextLength(value, indent, MAX_OUTPUT_CHARS) > MAX_OUTPUT_CHARS) {
+    return outputRefusal(
+      `the document at indent ${indent}`,
+      "use indent 0, or select part of it first (a pointer or JsonQuery)",
+    );
+  }
+  return JSON.stringify(value, null, indent) ?? fallback;
+}
+
+/** The refusal a writer's OutputLimitError becomes. */
+function writerRefusal(err: OutputLimitError): string {
+  return outputRefusal(
+    err.message.replace(/ would be more than \d+ characters$/, ""),
+    "narrow the input first",
+  );
+}
+
+/** The refusal for a document nested past MAX_NESTING_DEPTH. */
+const tooDeep = (field: string): string =>
+  `${field} nests deeper than ${MAX_NESTING_DEPTH} levels — narrow the input first`;
 
 /**
  * Read a document in any of the formats this package understands. Returns a
@@ -104,16 +153,27 @@ function readDocument(
   try {
     switch (format) {
       case "json": {
+        // Before parsing, so a hostile document never becomes a deep tree.
+        if (jsonTextNestsDeeper(text, MAX_NESTING_DEPTH))
+          return { ok: false, error: tooDeep("json") };
         const parsed = parseJson(text);
         return parsed.ok
           ? { ok: true, value: parsed.value }
           : { ok: false, error: `invalid JSON: ${parsed.error}` };
       }
       case "yaml":
+        // The YAML reader caps its own nesting, at 64.
         return { ok: true, value: parseYaml(text) };
-      case "toml":
-        return { ok: true, value: parseToml(text) };
+      case "toml": {
+        // Dotted keys, arrays and inline tables can all nest, and TOML has no
+        // cheap pre-scan, so the parsed value is checked.
+        const value = parseToml(text);
+        if (nestingDepthExceeds(value, MAX_NESTING_DEPTH))
+          return { ok: false, error: tooDeep("toml") };
+        return { ok: true, value };
+      }
       case "jsonl": {
+        // parseJsonl refuses a line nested past the cap, before parsing it.
         const out = parseJsonl(text, 100_000, true);
         if (out.failures.length > 0) {
           const first = out.failures[0] as { line: number; error: string };
@@ -144,6 +204,11 @@ function readDocument(
       return { ok: false, error: `invalid TOML on line ${err.line}: ${err.message}` };
     if (err instanceof CsvError)
       return { ok: false, error: `invalid CSV on line ${err.line}: ${err.message}` };
+    // A parser that recursed past the engine's stack on a pathological
+    // document: the same answer as the depth check, not an engine message.
+    if (err instanceof RangeError && /call stack/i.test(err.message)) {
+      return { ok: false, error: tooDeep(format) };
+    }
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -155,6 +220,7 @@ function readJson(
 ): { ok: true; value: unknown } | { ok: false; error: string } {
   const size = tooLarge(text, field);
   if (size !== null) return { ok: false, error: size };
+  if (jsonTextNestsDeeper(text, MAX_NESTING_DEPTH)) return { ok: false, error: tooDeep(field) };
   const parsed = parseJson(text);
   return parsed.ok
     ? { ok: true, value: parsed.value }
@@ -202,13 +268,41 @@ export const jsonQuery: RegisteredTool = buildTool({
     try {
       const steps = parsePath(input.path);
       const result = queryPath(doc.value, steps, limit);
-      return json({
-        count: result.matches.length,
-        truncated: result.truncated,
-        ...(input.valuesOnly === true
-          ? { values: result.matches.map((m) => m.value) }
-          : { matches: result.matches }),
-      });
+      // Built by hand, one match at a time, so the result stops at the output
+      // limit instead of being built whole and refused: `$..*` over a deep
+      // document returns each subtree once per ancestor.
+      const parts: string[] = [];
+      let chars = 0;
+      let cut = false;
+      for (const m of result.matches) {
+        const item = input.valuesOnly === true ? m.value : m;
+        const size = jsonTextLength(item, 0, MAX_OUTPUT_CHARS - chars);
+        if (chars + size + 1 > MAX_OUTPUT_CHARS) {
+          cut = true;
+          break;
+        }
+        parts.push(JSON.stringify(item) ?? "null");
+        chars += size + 1;
+      }
+      const truncatedBy =
+        result.stoppedAtVisits !== undefined
+          ? "visits"
+          : cut
+            ? "outputChars"
+            : result.truncated
+              ? "maxResults"
+              : null;
+      const head = `{"count":${parts.length},"truncated":${truncatedBy !== null}`;
+      const why =
+        truncatedBy === null
+          ? ""
+          : `,"truncatedBy":${JSON.stringify(truncatedBy)}${
+              truncatedBy === "visits"
+                ? `,"note":${JSON.stringify(`the query stopped after visiting ${result.stoppedAtVisits} nodes; these are the first matches in document order — narrow the path`)}`
+                : ""
+            }`;
+      const key = input.valuesOnly === true ? "values" : "matches";
+      return `${head}${why},"${key}":[${parts.join(",")}]}`;
     } catch (err) {
       if (err instanceof PathError) return `invalid path: ${err.message}`;
       throw err;
@@ -247,10 +341,13 @@ export const jsonPatch: RegisteredTool = buildTool({
       if ((op.op === "add" || op.op === "replace" || op.op === "test") && !("value" in op)) {
         return `operation ${i} (${op.op}) needs a "value"`;
       }
+      if (nestingDepthExceeds(op.value, MAX_NESTING_DEPTH)) {
+        return `operation ${i} (${op.op}): its value nests deeper than ${MAX_NESTING_DEPTH} levels`;
+      }
     }
     try {
       const patched = applyJsonPatch(doc.value, input.patch as unknown as PatchOp[]);
-      return JSON.stringify(patched, null, input.indent ?? 0);
+      return pretty(patched, input.indent ?? 0, "null");
     } catch (err) {
       if (err instanceof PatchError) {
         return `patch failed at operation ${err.opIndex}: ${err.message} — the document is unchanged`;
@@ -285,12 +382,12 @@ export const jsonMergePatch: RegisteredTool = buildTool({
     if (input.against !== undefined) {
       const other = readJson(input.against, "against");
       if (!other.ok) return other.error;
-      return JSON.stringify(diffMergePatch(doc.value, other.value), null, indent);
+      return pretty(diffMergePatch(doc.value, other.value), indent, "null");
     }
     if (input.patch === undefined) return "supply either patch (to apply) or against (to derive)";
     const patch = readJson(input.patch, "patch");
     if (!patch.ok) return patch.error;
-    return JSON.stringify(applyMergePatch(doc.value, patch.value), null, indent);
+    return pretty(applyMergePatch(doc.value, patch.value), indent, "null");
   },
 });
 
@@ -323,6 +420,13 @@ export const jsonFormat: RegisteredTool = buildTool({
       value = found.value;
     }
     const indent = input.indent ?? 2;
+    // Sorting keys does not change the length, so one measurement serves both.
+    if (jsonTextLength(value, indent, MAX_OUTPUT_CHARS) > MAX_OUTPUT_CHARS) {
+      return outputRefusal(
+        `the document at indent ${indent}`,
+        "use indent 0, or format part of it with pointer",
+      );
+    }
     const text =
       input.sortKeys === true
         ? canonicalStringify(value, indent)
@@ -412,11 +516,16 @@ export const dataConvert: RegisteredTool = buildTool({
       inferTypes: input.inferTypes ?? true,
     });
     if (!doc.ok) return doc.error;
-    return writeDocument(doc.value, input.to, {
-      indent: input.indent ?? 2,
-      delimiter,
-      header,
-    });
+    try {
+      return writeDocument(doc.value, input.to, {
+        indent: input.indent ?? 2,
+        delimiter,
+        header,
+      });
+    } catch (err) {
+      if (err instanceof OutputLimitError) return writerRefusal(err);
+      throw err;
+    }
   },
 });
 
@@ -427,21 +536,21 @@ function writeDocument(
 ): string {
   switch (format) {
     case "json":
-      return JSON.stringify(value, null, options.indent) ?? "null";
+      return pretty(value, options.indent, "null");
     case "yaml":
-      return stringifyYaml(value);
+      return stringifyYaml(value, 0, MAX_OUTPUT_CHARS);
     case "toml": {
       if (!isPlainObject(value)) {
         return "cannot write TOML: a TOML document must be an object at the top level, and this value is not";
       }
-      const out = stringifyToml(value);
+      const out = stringifyToml(value, MAX_OUTPUT_CHARS);
       return out.skipped.length === 0
         ? out.text
         : `${out.text}\n\n# dropped (TOML has no null): ${out.skipped.join(", ")}`;
     }
     case "jsonl": {
       if (!Array.isArray(value)) return "cannot write JSONL: the value is not an array";
-      return writeJsonl(value, true).text;
+      return writeJsonl(value, true, MAX_OUTPUT_CHARS).text;
     }
     default: {
       if (!Array.isArray(value)) return "cannot write CSV: the value is not an array of records";
@@ -453,6 +562,7 @@ function writeDocument(
           newline: "\n",
           quoteAll: false,
           header: null,
+          maxChars: MAX_OUTPUT_CHARS,
         });
       }
       if (!value.every(isPlainObject)) {
@@ -466,11 +576,23 @@ function writeDocument(
         newline: "\n",
         quoteAll: false,
         header: options.header ? columns : null,
+        maxChars: MAX_OUTPUT_CHARS,
       };
-      return writeCsvRows(
-        records.map((r) => columns.map((c) => getOwn(r, c))),
-        writeOptions,
-      );
+      // Every row carries a delimiter per column, so a sparse record set (a
+      // column per distinct key) is refused on arithmetic alone; the rows are
+      // built lazily in any case, so the writer's own count stops the rest.
+      if (records.length * Math.max(columns.length - 1, 0) > MAX_OUTPUT_CHARS) {
+        return outputRefusal(
+          `${records.length} rows of ${columns.length} columns as CSV`,
+          "the records do not share their keys; select the fields first",
+        );
+      }
+      const rows = {
+        *[Symbol.iterator]() {
+          for (const r of records) yield columns.map((c) => getOwn(r, c));
+        },
+      };
+      return writeCsvRows(rows, writeOptions);
     }
   }
 }
@@ -578,22 +700,39 @@ export const csvWrite: RegisteredTool = buildTool({
       newline: input.crlf === true ? "\r\n" : "\n",
       quoteAll: input.quoteAll ?? false,
       header: null,
+      maxChars: MAX_OUTPUT_CHARS,
     };
-    if (rowMode) {
-      return writeCsvRows(input.records as unknown[][], {
-        ...options,
-        header: input.columns ?? null,
-      });
+    try {
+      if (rowMode) {
+        return writeCsvRows(input.records as unknown[][], {
+          ...options,
+          header: input.columns ?? null,
+        });
+      }
+      if (!input.records.every(isPlainObject)) {
+        return "mix of records and rows — every element must be an object, or every element an array";
+      }
+      const records = input.records as Record_[];
+      const columns = input.columns ?? unionKeys(records);
+      // A delimiter per column per row: a sparse record set (a column per
+      // distinct key) is refused on arithmetic alone, and the rows are built
+      // lazily in any case, so the writer's own count stops the rest.
+      if (records.length * Math.max(columns.length - 1, 0) > MAX_OUTPUT_CHARS) {
+        return outputRefusal(
+          `${records.length} rows of ${columns.length} columns as CSV`,
+          "the records do not share their keys; pass columns to select the fields",
+        );
+      }
+      const rows = {
+        *[Symbol.iterator]() {
+          for (const r of records) yield columns.map((c) => cellToString(getOwn(r, c) ?? null));
+        },
+      };
+      return writeCsvRows(rows, { ...options, header: input.header === false ? null : columns });
+    } catch (err) {
+      if (err instanceof OutputLimitError) return writerRefusal(err);
+      throw err;
     }
-    if (!input.records.every(isPlainObject)) {
-      return "mix of records and rows — every element must be an object, or every element an array";
-    }
-    const records = input.records as Record_[];
-    const columns = input.columns ?? unionKeys(records);
-    return writeCsvRows(
-      records.map((r) => columns.map((c) => cellToString(getOwn(r, c) ?? null))),
-      { ...options, header: input.header === false ? null : columns },
-    );
   },
 });
 
@@ -823,12 +962,24 @@ export const flattenObject: RegisteredTool = buildTool({
   execute: async (input) => {
     const doc = readJson(input.json, "json");
     if (!doc.ok) return doc.error;
-    const flat = flattenObjectFn(
-      doc.value,
-      input.separator ?? ".",
-      input.expandArrays ?? true,
-      input.maxDepth ?? 32,
-    );
+    let flat: Record<string, unknown>;
+    try {
+      flat = flattenObjectFn(
+        doc.value,
+        input.separator ?? ".",
+        input.expandArrays ?? true,
+        input.maxDepth ?? 32,
+        MAX_OUTPUT_CHARS,
+      );
+    } catch (err) {
+      if (err instanceof OutputLimitError) {
+        return outputRefusal(
+          "the flattened keys",
+          "flatten part of the document, or lower maxDepth or turn off expandArrays",
+        );
+      }
+      throw err;
+    }
     return json(flat);
   },
 });
@@ -854,7 +1005,7 @@ export const unflattenObject: RegisteredTool = buildTool({
       input.separator ?? ".",
       input.arraysFromNumericKeys ?? true,
     );
-    return JSON.stringify(value, null, input.indent ?? 0);
+    return pretty(value, input.indent ?? 0, "undefined");
   },
 });
 
@@ -903,8 +1054,12 @@ export const jsonlWrite: RegisteredTool = buildTool({
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
-    const result = writeJsonl(input.values, input.trailingNewline ?? true);
-    return result.text;
+    try {
+      return writeJsonl(input.values, input.trailingNewline ?? true, MAX_OUTPUT_CHARS).text;
+    } catch (err) {
+      if (err instanceof OutputLimitError) return writerRefusal(err);
+      throw err;
+    }
   },
 });
 
@@ -1101,7 +1256,7 @@ export const jsonSortKeys: RegisteredTool = buildTool({
   execute: async (input) => {
     const doc = readJson(input.json, "json");
     if (!doc.ok) return doc.error;
-    return JSON.stringify(sortKeysDeep(doc.value), null, input.indent ?? 2) ?? "null";
+    return pretty(sortKeysDeep(doc.value), input.indent ?? 2, "null");
   },
 });
 

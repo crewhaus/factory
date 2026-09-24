@@ -8,7 +8,7 @@
  * failed — which is the behaviour RFC 6902 §5 requires.
  */
 
-import { deepClone, deepEqual, getOwn, isPlainObject, setOwn } from "./json";
+import { deepClone, deepEqual, isPlainObject, setOwn } from "./json";
 
 export class PatchError extends Error {
   readonly opIndex: number;
@@ -158,12 +158,49 @@ function removeAt(parent: unknown, token: string, pointer: string, i: number): u
 }
 
 /**
+ * The most values a patch may add to a document, over all its operations:
+ * about as many as the largest document this package reads holds. Each
+ * `copy` of the root doubles the document, so twenty of them on a
+ * seven-character document made 13.6 million characters.
+ */
+export const MAX_PATCH_ADDED_NODES = 2_000_000;
+
+/** Charge the values in `value` to the patch's budget; throw once it is spent. */
+function chargeNodes(value: unknown, budget: { left: number }, opIndex: number): void {
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    budget.left -= 1;
+    if (budget.left < 0) {
+      throw new PatchError(
+        `the patch would add more than ${MAX_PATCH_ADDED_NODES} values to the document`,
+        opIndex,
+      );
+    }
+    if (Array.isArray(node)) for (const el of node) stack.push(el);
+    else if (isPlainObject(node)) for (const k of Object.keys(node)) stack.push(node[k]);
+  }
+}
+
+/**
  * Apply an RFC 6902 patch. Returns the new document; the input is never
  * mutated. Throws `PatchError` (carrying the failing operation's index) if
- * any operation cannot be applied, leaving nothing half-done.
+ * any operation cannot be applied, leaving nothing half-done — including an
+ * operation that would take the values the patch adds (by add, replace or
+ * copy) past `maxAddedNodes`.
  */
-export function applyJsonPatch(doc: unknown, ops: ReadonlyArray<PatchOp>): unknown {
+export function applyJsonPatch(
+  doc: unknown,
+  ops: ReadonlyArray<PatchOp>,
+  maxAddedNodes = MAX_PATCH_ADDED_NODES,
+): unknown {
   let working = deepClone(doc);
+  const budget = { left: maxAddedNodes };
+  // Every value an operation adds is counted before it is cloned in.
+  const added = <T>(value: T, i: number): T => {
+    chargeNodes(value, budget, i);
+    return deepClone(value);
+  };
   ops.forEach((op, i) => {
     switch (op.op) {
       case "test": {
@@ -176,11 +213,11 @@ export function applyJsonPatch(doc: unknown, ops: ReadonlyArray<PatchOp>): unkno
       }
       case "add": {
         if (op.path === "") {
-          working = deepClone(op.value);
+          working = added(op.value, i);
           return;
         }
         const { parent, token } = locateParent(working, op.path, i);
-        addAt(parent, token, deepClone(op.value), op.path, i);
+        addAt(parent, token, added(op.value, i), op.path, i);
         return;
       }
       case "remove": {
@@ -191,7 +228,7 @@ export function applyJsonPatch(doc: unknown, ops: ReadonlyArray<PatchOp>): unkno
       }
       case "replace": {
         if (op.path === "") {
-          working = deepClone(op.value);
+          working = added(op.value, i);
           return;
         }
         const existing = resolvePointer(working, op.path);
@@ -200,7 +237,7 @@ export function applyJsonPatch(doc: unknown, ops: ReadonlyArray<PatchOp>): unkno
         }
         const { parent, token } = locateParent(working, op.path, i);
         removeAt(parent, token, op.path, i);
-        addAt(parent, token, deepClone(op.value), op.path, i);
+        addAt(parent, token, added(op.value, i), op.path, i);
         return;
       }
       case "move": {
@@ -227,11 +264,11 @@ export function applyJsonPatch(doc: unknown, ops: ReadonlyArray<PatchOp>): unkno
         const src = resolvePointer(working, op.from);
         if (!src.found) throw new PatchError(`cannot copy from "${op.from}": ${src.reason}`, i);
         if (op.path === "") {
-          working = deepClone(src.value);
+          working = added(src.value, i);
           return;
         }
         const dst = locateParent(working, op.path, i);
-        addAt(dst.parent, dst.token, deepClone(src.value), op.path, i);
+        addAt(dst.parent, dst.token, added(src.value, i), op.path, i);
         return;
       }
       default: {
@@ -247,18 +284,34 @@ export function applyJsonPatch(doc: unknown, ops: ReadonlyArray<PatchOp>): unkno
  * Apply an RFC 7386 merge patch: an object merges key by key, `null` deletes
  * a key, and any non-object patch replaces the target outright. Arrays are
  * replaced whole — that is the RFC's behaviour, not a shortcut here.
+ *
+ * The result is a fresh value that shares nothing with either input, and
+ * every node of it is built exactly once: a target key the patch leaves
+ * alone is cloned, and one it touches is merged from the ORIGINAL child.
+ * (0.7.0 deep-cloned the target and then recursed into the clone, cloning
+ * the rest of the tree again at every level — quadratic in depth.) Keys keep
+ * the target's order, with new keys after them in the patch's order.
  */
 export function applyMergePatch(target: unknown, patch: unknown): unknown {
   if (!isPlainObject(patch)) return deepClone(patch);
-  const base: Record<string, unknown> = isPlainObject(target)
-    ? (deepClone(target) as Record<string, unknown>)
-    : {};
-  for (const key of Object.keys(patch)) {
-    const value = patch[key];
-    if (value === null) delete base[key];
-    else setOwn(base, key, applyMergePatch(getOwn(base, key), value));
+  const out: Record<string, unknown> = {};
+  const source = isPlainObject(target) ? target : null;
+  if (source !== null) {
+    for (const key of Object.keys(source)) {
+      if (!Object.hasOwn(patch, key)) {
+        setOwn(out, key, deepClone(source[key]));
+        continue;
+      }
+      const value = patch[key];
+      if (value !== null) setOwn(out, key, applyMergePatch(source[key], value));
+    }
   }
-  return base;
+  for (const key of Object.keys(patch)) {
+    if (source !== null && Object.hasOwn(source, key)) continue;
+    const value = patch[key];
+    if (value !== null) setOwn(out, key, applyMergePatch(undefined, value));
+  }
+  return out;
 }
 
 /**

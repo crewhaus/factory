@@ -8,7 +8,14 @@
  * the same output every time.
  */
 
-import { canonicalStringify, deepEqual, getOwn, isPlainObject, setOwn } from "./json";
+import {
+  OutputLimitError,
+  canonicalStringify,
+  deepEqual,
+  getOwn,
+  isPlainObject,
+  setOwn,
+} from "./json";
 
 export type Record_ = Record<string, unknown>;
 
@@ -541,17 +548,27 @@ export function flattenObject(
   separator: string,
   expandArrays: boolean,
   maxDepth: number,
+  maxKeyChars = Number.POSITIVE_INFINITY,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+  // Every flattened key spells its whole path, so the keys alone are
+  // depth x leaves characters; `maxKeyChars` stops the walk (throwing
+  // OutputLimitError) before they are all built.
+  let keyChars = 0;
+  const put = (key: string, v: unknown): void => {
+    keyChars += key.length;
+    if (keyChars > maxKeyChars) throw new OutputLimitError(maxKeyChars, "the flattened keys");
+    setOwn(out, key, v);
+  };
   const walk = (node: unknown, prefix: string, depth: number): void => {
     if (depth >= maxDepth) {
-      setOwn(out, prefix, node);
+      put(prefix, node);
       return;
     }
     if (isPlainObject(node)) {
       const keys = Object.keys(node);
       if (keys.length === 0) {
-        if (prefix !== "") setOwn(out, prefix, {});
+        if (prefix !== "") put(prefix, {});
         return;
       }
       for (const k of keys)
@@ -560,7 +577,7 @@ export function flattenObject(
     }
     if (Array.isArray(node) && expandArrays) {
       if (node.length === 0) {
-        if (prefix !== "") setOwn(out, prefix, []);
+        if (prefix !== "") put(prefix, []);
         return;
       }
       node.forEach((el, i) =>
@@ -568,7 +585,7 @@ export function flattenObject(
       );
       return;
     }
-    setOwn(out, prefix, node);
+    put(prefix, node);
   };
   walk(value, "", 0);
   return out;
