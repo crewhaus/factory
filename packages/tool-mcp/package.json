@@ -21,6 +21,9 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/tool-registry-manifest": "workspace:*"
   },
   "license": "Apache-2.0",
