@@ -1386,6 +1386,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/otel-exporter": {

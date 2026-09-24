@@ -29,6 +29,9 @@ const existingDirs = new Set<string>();
 const writtenFiles = new Map<string, { contents: string; opts: unknown }>();
 
 mock.module("node:fs", () => ({
+  // Everything else stays real, so a package that reads through node:fs
+  // (tool-safety's bounded reader) still links against this stub.
+  ...realFs,
   existsSync: (p: string) => {
     fsCalls.push({ fn: "existsSync", args: [p] });
     return existingDirs.has(p);
@@ -118,6 +121,7 @@ describe("module-marketplace-client default writeFile seam", () => {
       pluginRegistry: fakePluginRegistry(),
       pluginsDir: "/var/plugins",
       // NOTE: no writeFileImpl -> the default node:fs path runs.
+      readEntrypointImpl: async () => undefined,
     });
     const result = await client.install("alpha-tools");
     expect(result.manifestPath).toBe("/var/plugins/alpha-tools/plugin.json");
@@ -141,6 +145,7 @@ describe("module-marketplace-client default writeFile seam", () => {
       registry: fakeRegistrySource(),
       pluginRegistry: fakePluginRegistry(),
       pluginsDir: "/var/plugins",
+      readEntrypointImpl: async () => undefined,
     });
     await client.install("alpha-tools");
     // existsSync(true) -> mkdirSync is NOT called for that dir.
@@ -148,21 +153,21 @@ describe("module-marketplace-client default writeFile seam", () => {
     expect(writtenFiles.has("/var/plugins/alpha-tools/plugin.json")).toBe(true);
   });
 
-  test("writes both the manifest and the source tarball through the default seam", async () => {
+  test("writes the manifest only: a source archive is not fetched or written", async () => {
+    let downloaded = false;
     const client = createMarketplaceClient({
       registry: fakeRegistrySource({
         async downloadSource() {
+          downloaded = true;
           return new TextEncoder().encode("tarball-bytes");
         },
       }),
       pluginRegistry: fakePluginRegistry(),
       pluginsDir: "/var/plugins",
+      readEntrypointImpl: async () => undefined,
     });
     await client.install("alpha-tools");
-    // Both the manifest and the base64 source land via the default writer.
-    expect(writtenFiles.has("/var/plugins/alpha-tools/plugin.json")).toBe(true);
-    const src = writtenFiles.get("/var/plugins/alpha-tools/source.bin");
-    expect(src).toBeDefined();
-    expect(src?.contents).toBe(Buffer.from("tarball-bytes").toString("base64"));
+    expect(downloaded).toBe(false);
+    expect([...writtenFiles.keys()]).toEqual(["/var/plugins/alpha-tools/plugin.json"]);
   });
 });

@@ -605,6 +605,9 @@ export const PLUGINS_SCHEMA: ParseArgsSchema = {
     { name: "registry-file", takesValue: true },
     // Signing: opt out of fail-closed verification (dev only).
     { name: "allow-unsigned", takesValue: false },
+    // install: a publisher key (.pem file or directory; several separated like
+    // PATH), trusted beside ~/.crewhaus/plugin-trust and the env var.
+    { name: "trust-anchor", takesValue: true },
     // publish: the manifest JSON to publish.
     { name: "manifest", takesValue: true },
     // publish/outdated: assemble + print without touching git/gh / network write.

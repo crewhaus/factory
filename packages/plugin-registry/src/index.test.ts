@@ -240,17 +240,24 @@ describe("verifyEntry", () => {
     const { publicKeyPem: trustedPem } = makeKeypair();
     const { privateKey: untrustedKey } = makeKeypair();
     const signed = signManifest({ name: "alpha", version: "1.0.0" }, untrustedKey);
-    const reg = createPluginRegistry({
+    // Persist the wrong-key manifest through a registry with no anchors (the
+    // read-only registry a boot builds), so verifyEntry's rejection is what
+    // is exercised. A registry WITH the anchor refuses it at register, even
+    // under allowUnsigned (see "a signature that is present must verify").
+    await createPluginRegistry({
       registryPath: REG_PATH,
-      trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem: trustedPem }],
-      // Bypass the register-time check so we can persist a wrong-key manifest
-      // and exercise verifyEntry's rejection specifically.
       allowUnsigned: true,
       readFileImpl: mem.read,
       writeFileImpl: mem.write,
       existsImpl: mem.exists,
+    }).register({ manifest: signed, sourcePath: "/p/alpha/manifest.json" });
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem: trustedPem }],
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
     });
-    await reg.register({ manifest: signed, sourcePath: "/p/alpha/manifest.json" });
     let caught: Error | undefined;
     try {
       await reg.verifyEntry("alpha");
@@ -401,6 +408,53 @@ describe("register signature verification (fail-closed)", () => {
     });
     const entry = await reg.register({ manifest: signed, sourcePath: "/p/alpha" });
     expect(entry.manifest.name).toBe("alpha");
+  });
+
+  // extension-path#2 (C015): allowUnsigned used to skip the check entirely,
+  // so `plugins install --allow-unsigned` persisted a FORGED signature as
+  // readily as a missing one — and the loader then refused it at every boot.
+  test("a signature that is present must verify, even under allowUnsigned", async () => {
+    const { publicKeyPem: trustedPem, privateKey: trustedKey } = makeKeypair();
+    const { privateKey: untrustedKey } = makeKeypair();
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem: trustedPem }],
+      allowUnsigned: true,
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
+    });
+    const forged = signManifest({ name: "alpha", version: "1.0.0" }, untrustedKey);
+    await expect(reg.verifyManifest?.(forged)).rejects.toThrow(/verification failed/);
+    await expect(reg.register({ manifest: forged, sourcePath: "/p/alpha" })).rejects.toThrow(
+      /signature verification failed for plugin "alpha" — not registered/,
+    );
+    expect(await reg.get("alpha")).toBeUndefined();
+    // Unsigned is what allowUnsigned allows; a good signature still registers.
+    await reg.register({ manifest: { name: "beta", version: "1.0.0" }, sourcePath: "/p/beta" });
+    const good = signManifest({ name: "gamma", version: "1.0.0" }, trustedKey);
+    await expect(reg.verifyManifest?.(good)).resolves.toBeUndefined();
+    await reg.register({ manifest: good, sourcePath: "/p/gamma" });
+    expect((await reg.list()).map((e) => e.manifest.name)).toEqual(["beta", "gamma"]);
+  });
+
+  test("verifyManifest refuses what register would, and writes nothing", async () => {
+    const { publicKeyPem } = makeKeypair();
+    const writes: string[] = [];
+    const reg = createPluginRegistry({
+      registryPath: REG_PATH,
+      trustAnchors: [{ kind: "pem", name: "trusted", publicKeyPem }],
+      readFileImpl: mem.read,
+      writeFileImpl: (p, c) => {
+        writes.push(p);
+        mem.write(p, c);
+      },
+      existsImpl: mem.exists,
+    });
+    await expect(reg.verifyManifest?.({ name: "alpha", version: "1.0.0" })).rejects.toThrow(
+      /refusing to register unsigned plugin "alpha"/,
+    );
+    expect(writes).toEqual([]);
   });
 
   test("allows an unsigned manifest when NO trust anchors are configured (back-compat)", async () => {

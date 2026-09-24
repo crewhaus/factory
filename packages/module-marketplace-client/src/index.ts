@@ -2,7 +2,24 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { PluginRegistry } from "@crewhaus/plugin-registry";
-import { type PluginManifest, canonicalJson, validatePluginManifest } from "@crewhaus/plugin-sdk";
+import {
+  type PluginManifest,
+  canonicalJson,
+  crewhausEngineProblem,
+  entrypointDigest,
+  validatePluginManifest,
+} from "@crewhaus/plugin-sdk";
+import { readFileBounded } from "@crewhaus/tool-safety/streams";
+import pkg from "../package.json" with { type: "json" };
+
+/**
+ * The crewhaus version install checks a manifest's `engines.crewhaus` range
+ * against: this package's own, which the release train bumps in lockstep.
+ */
+const HOST_VERSION: string = typeof pkg.version === "string" ? pkg.version : "0.0.0";
+
+/** The most of a plugin's index.js install reads to check it against `entrypointDigest`. */
+export const MAX_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
 
 /**
  * Section 42 — `@crewhaus/module-marketplace-client`.
@@ -19,6 +36,11 @@ import { type PluginManifest, canonicalJson, validatePluginManifest } from "@cre
  * primary consumer of `MarketplaceClient`. The `crewhaus plugins
  * {list,search,install,uninstall}` CLI subcommands (deferred to a CLI
  * follow-up) are the secondary consumer.
+ *
+ * Install delivers the MANIFEST only (0.7.x): no registry source ships code
+ * in a form crewhaus unpacks, and the loader imports `<plugin-dir>/index.js`.
+ * `install` says so in `warnings` (and `runnable: false`) until that file is
+ * there and matches the manifest's `entrypointDigest`.
  */
 
 export class ModuleMarketplaceError extends CrewhausError {
@@ -71,7 +93,11 @@ export interface ModuleRegistrySource {
   listPlugins(): Promise<ReadonlyArray<PluginMetadata>>;
   /** Fetch the full validated manifest for `name@version` (latest if version omitted). */
   getManifest(name: string, version?: string): Promise<PluginManifest>;
-  /** Optional source tarball. Required for `install` to write a plugin's files locally. */
+  /**
+   * Optional source archive. This crewhaus installs the manifest only and
+   * does not fetch or unpack an archive; `install` warns when a source offers
+   * one.
+   */
   downloadSource?(name: string, version: string): Promise<Uint8Array>;
 }
 
@@ -96,6 +122,15 @@ export type InstallOptions = {
 export type InstallResult = {
   readonly manifest: PluginManifest;
   readonly manifestPath: string;
+  /**
+   * Whether a spec that names the plugin can load it as installed: its
+   * `index.js` sits next to the manifest (matching `entrypointDigest` when
+   * the manifest sets one), and its `engines.crewhaus` range includes this
+   * crewhaus. When false, `warnings` says what is missing.
+   */
+  readonly runnable: boolean;
+  /** What the operator has to know or do before a spec can load the plugin. */
+  readonly warnings: ReadonlyArray<string>;
 };
 
 export type PublishDraft = {
@@ -114,7 +149,26 @@ export type MarketplaceClientOptions = {
   readonly pluginsDir: string;
   /** Test seam: override the file write. Defaults to a 0600-mode writeFileSync. */
   readonly writeFileImpl?: (path: string, contents: string) => void;
+  /**
+   * Test seam: read a plugin's `index.js`. Resolves `undefined` when there is
+   * no such file, and throws when it cannot be read as a regular file. The
+   * default reads at most {@link MAX_ENTRYPOINT_BYTES} and refuses a FIFO or
+   * other special file rather than blocking on it.
+   */
+  readonly readEntrypointImpl?: (path: string) => Promise<Uint8Array | undefined>;
+  /** The crewhaus version `engines.crewhaus` is checked against. Defaults to this package's. */
+  readonly hostVersion?: string;
 };
+
+async function defaultReadEntrypoint(path: string): Promise<Uint8Array | undefined> {
+  const read = await readFileBounded(path, { maxBytes: MAX_ENTRYPOINT_BYTES });
+  if (read.ok) {
+    if (read.truncated) throw new Error(`it is larger than ${MAX_ENTRYPOINT_BYTES} bytes`);
+    return read.bytes;
+  }
+  if (read.code === "not-found") return undefined;
+  throw new Error(read.reason);
+}
 
 function defaultWriteFile(path: string, contents: string): void {
   const dir = dirname(path);
@@ -167,6 +221,49 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
     throw new ModuleMarketplaceError("module-marketplace-client: pluginsDir is required");
   }
   const writeFile = opts.writeFileImpl ?? defaultWriteFile;
+  const readEntrypoint = opts.readEntrypointImpl ?? defaultReadEntrypoint;
+  const hostVersion = opts.hostVersion ?? HOST_VERSION;
+
+  /**
+   * Is the plugin's code where the loader will look, and the code the
+   * manifest names? Adds a warning for each thing that is not so.
+   */
+  async function checkEntrypoint(
+    manifest: PluginManifest,
+    entryPath: string,
+    warnings: string[],
+  ): Promise<boolean> {
+    const who = `${manifest.name}@${manifest.version}`;
+    const digestNote =
+      manifest.entrypointDigest !== undefined
+        ? " (its sha256 must equal the manifest's entrypointDigest)"
+        : "";
+    let bytes: Uint8Array | undefined;
+    try {
+      bytes = await readEntrypoint(entryPath);
+    } catch (err) {
+      warnings.push(
+        `${who}: ${entryPath} cannot be checked: ${err instanceof Error ? err.message : String(err)}. A spec that names the plugin will not start until it is a readable file${digestNote}.`,
+      );
+      return false;
+    }
+    if (bytes === undefined) {
+      warnings.push(
+        `${who} is installed as a manifest only: the registry delivers no code. Put the plugin's index.js at ${entryPath}${digestNote} before a spec names it in plugins:.`,
+      );
+      return false;
+    }
+    if (
+      manifest.entrypointDigest !== undefined &&
+      entrypointDigest(bytes) !== manifest.entrypointDigest
+    ) {
+      warnings.push(
+        `${who}: the index.js at ${entryPath} does not match the manifest's entrypointDigest, so a spec that names the plugin will be refused at boot until it does.`,
+      );
+      return false;
+    }
+    return true;
+  }
 
   return {
     async search(filter): Promise<ReadonlyArray<PluginMetadata>> {
@@ -200,26 +297,51 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
           `module-marketplace-client: remote manifest name "${manifest.name}" does not match install request for "${name}"`,
         );
       }
+      // A source that answers a pinned version with another one (a local
+      // directory falls back to <name>.json) must not install it silently.
+      if (version !== undefined && manifest.version !== version) {
+        throw new ModuleMarketplaceError(
+          `module-marketplace-client: registry "${opts.registry.id}" served ${manifest.name}@${manifest.version} when ${version} was asked for — not installed`,
+        );
+      }
+      // Refuse a manifest the registry will not register BEFORE it is
+      // written, so it never replaces a working manifest on disk.
+      await opts.pluginRegistry.verifyManifest?.(manifest);
       const subdir = installOpts?.subdir ?? manifest.name;
       const filename = installOpts?.manifestFilename ?? "plugin.json";
       const manifestPath = join(opts.pluginsDir, subdir, filename);
       writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-
-      // Source tarball is the registry's responsibility; if available, the
-      // client streams it to disk. We model the contract — the test suite
-      // exercises the with-source and without-source paths.
-      if (opts.registry.downloadSource) {
-        const bytes = await opts.registry.downloadSource(manifest.name, manifest.version);
-        const sourcePath = join(opts.pluginsDir, subdir, "source.bin");
-        writeFile(sourcePath, Buffer.from(bytes).toString("base64"));
-      }
-
       await opts.pluginRegistry.register({
         manifest,
         sourcePath: manifestPath,
         replace: true,
       });
-      return { manifest, manifestPath };
+
+      const warnings: string[] = [];
+      // The loader imports <plugin-dir>/index.js, and nothing here writes it.
+      // An archive a source offers is not fetched: unpacking one is how a
+      // symlink or a `../` path lands outside the plugin directory, and 0.7.x
+      // defines no archive format to verify against entrypointDigest.
+      if (opts.registry.downloadSource !== undefined) {
+        warnings.push(
+          `registry "${opts.registry.id}" offers a source archive for ${manifest.name}@${manifest.version}; this crewhaus installs the manifest only and does not fetch or unpack it.`,
+        );
+      }
+      const hasCode = await checkEntrypoint(
+        manifest,
+        join(opts.pluginsDir, subdir, "index.js"),
+        warnings,
+      );
+      const engine = crewhausEngineProblem(manifest, hostVersion);
+      if (engine !== undefined) {
+        warnings.push(`${engine}, so a spec that names it will be refused at boot.`);
+      }
+      return {
+        manifest,
+        manifestPath,
+        runnable: hasCode && engine === undefined,
+        warnings,
+      };
     },
 
     async uninstall(name): Promise<void> {

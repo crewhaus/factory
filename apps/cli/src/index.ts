@@ -1141,7 +1141,9 @@ import {
   defaultTemplateWorkspaceDir,
   formatOutdated,
   formatPluginList,
+  installLocationNotice,
   installedVersions,
+  resolveInstallTrustAnchors,
   resolveRegistryRef as resolveMarketplaceRegistryRef,
 } from "./marketplace-cli";
 // Item 38 — `crewhaus mcp doctor` core: per-server health scoring, listTools
@@ -18025,8 +18027,8 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
       "usage:\n" +
         "  crewhaus plugins list [--registry <dir|url>]           list the catalog\n" +
         "  crewhaus plugins search -q <text> [--registry <ref>]   search the catalog\n" +
-        "  crewhaus plugins install <name> [--version <v>]        fetch + register a plugin\n" +
-        "       [--allow-unsigned] [--plugins-dir <dir>]\n" +
+        "  crewhaus plugins install <name> [--version <v>]        verify + register a plugin's manifest\n" +
+        "       [--trust-anchor <pem>] [--allow-unsigned] [--plugins-dir <dir>]\n" +
         "  crewhaus plugins uninstall <name>                      unregister a plugin\n" +
         "  crewhaus plugins outdated [--registry <ref>]           installed vs latest report\n" +
         "  crewhaus plugins publish --manifest <plugin.json>      open a publish PR (item 60)\n" +
@@ -18034,9 +18036,11 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
         "\n" +
         "  The registry backend is a directory of manifest JSONs (or file:<dir>) or an\n" +
         "  http(s):// index; falls back to CREWHAUS_PLUGIN_REGISTRY, then the default\n" +
-        "  public registry (registry.crewhaus.ai/plugins). Install respects plugin-\n" +
-        "  registry's fail-closed signature verification; --allow-unsigned opts out for\n" +
-        "  local development.\n",
+        "  public registry (registry.crewhaus.ai/plugins). Install verifies the manifest\n" +
+        "  against the publisher keys in ~/.crewhaus/plugin-trust, CREWHAUS_PLUGIN_TRUST_\n" +
+        "  ANCHORS and --trust-anchor, and refuses it unsigned or unverified;\n" +
+        "  --allow-unsigned accepts an unsigned manifest for local development. Install\n" +
+        "  writes the manifest only: put the plugin's index.js next to it by hand.\n",
     );
     return;
   }
@@ -18073,17 +18077,34 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
     if (action === "install") {
       const name = args.positional[0];
       if (typeof name !== "string") die("missing <name>");
+      // The keys a boot trusts, so what install accepts is what will load.
+      const trustAnchorFlag = args.flags["trust-anchor"];
+      const trustAnchors = resolveInstallTrustAnchors({
+        allowUnsigned,
+        ...(typeof trustAnchorFlag === "string" ? { trustAnchorFlag } : {}),
+      });
+      const verifyingRegistry = createPluginRegistry({ registryPath, allowUnsigned, trustAnchors });
       const source = buildModuleRegistrySource(registryRef);
       const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
-      const client = createMarketplaceClient({ registry: source, pluginRegistry, pluginsDir });
+      const client = createMarketplaceClient({
+        registry: source,
+        pluginRegistry: verifyingRegistry,
+        pluginsDir,
+      });
       const versionFlag = args.flags["version"];
       const result = await client.install(
         name,
         typeof versionFlag === "string" ? versionFlag : undefined,
       );
+      // A signature that is present was verified (the registry refuses one
+      // that is not); only a missing one, or no key at all, is unverified.
+      const verified = trustAnchors.length > 0 && result.manifest.signature !== undefined;
       process.stdout.write(
-        `installed ${result.manifest.name}@${result.manifest.version} → ${result.manifestPath}\n`,
+        `installed ${result.manifest.name}@${result.manifest.version}${verified ? "" : " (UNVERIFIED: no signature was checked)"} → ${result.manifestPath}\n`,
       );
+      for (const warning of result.warnings) process.stderr.write(`[plugins] ${warning}\n`);
+      const elsewhere = installLocationNotice(pluginsDir, registryPath);
+      if (elsewhere !== undefined) process.stderr.write(`[plugins] ${elsewhere}\n`);
       return;
     }
     if (action === "uninstall") {
