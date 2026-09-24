@@ -1383,6 +1383,40 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(compiled.exitCode).toBe(0);
   });
 
+  test("a sub-agent's registered names are left alone, and its typo keeps their spelling", async () => {
+    // `tools: [Read, Grep]` is how 0.7.0 documented a sub-agent's list, and it
+    // compiles; lint --fix must not churn it or call it a typo.
+    const specPath = join(tmp, "crewhaus.yaml");
+    const spec = (reviewer: string, explorer: string): string =>
+      [
+        "name: t",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: hi",
+        "  sub_agents:",
+        "    reviewer:",
+        "      description: Reviews code.",
+        "      instructions: Review the diff.",
+        `      tools: [${reviewer}]`,
+        "    explorer:",
+        "      description: Explores.",
+        "      instructions: Explore.",
+        "      tools:",
+        `        - ${explorer}`,
+        "tools: [read, grep, webFetch]",
+        "",
+      ].join("\n");
+    writeFileSync(specPath, spec("Read, Grep, WebFetch", "Grep"));
+    const clean = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(clean.stdout).not.toContain("fixed: tool");
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
+    writeFileSync(specPath, spec("Reed, Grep, WebFetch", "Grpe"));
+    const typo = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
+    expect(typo.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
+  });
+
   test("a bare word in a list that is not tools: is left alone", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     const original =

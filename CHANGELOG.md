@@ -116,7 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`crewhaus lint` agrees with `crewhaus compile` about tools.** It reported
   "clean" for tools compile rejects. `lint --fix` now fixes a typo to a
   spelling compile accepts (`read`, not `Read`), and only inside a `tools:`
-  list.
+  list. A sub-agent's list accepts either spelling, so `lint --fix` leaves
+  `Read` there alone and fixes a typo in the spelling it was written in.
 - **`crewhaus tools suggest` and `tools audit` read the tools a spec really
   grants**: categories expanded, exclusions applied, and tools listed under
   `agent.tools` or per step, node or role included. `suggest` no longer

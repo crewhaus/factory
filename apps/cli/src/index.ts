@@ -477,6 +477,7 @@ import {
   SHAPE_TOOL_PROFILES,
   type SpecChainBlocks,
   type ToolShape,
+  builtinKeyForName,
   builtinToolsFor,
   categoriesForTool,
   registerToolConfigs,
@@ -2436,8 +2437,17 @@ function applyLintFixes(
       : "cli";
   const shapeKeys = builtinToolsFor(shape);
   const toolCandidates = shapeKeys.length > 0 ? shapeKeys : builtinToolsFor("cli");
-  const fixToken = (token: string): { to?: string; suggestion?: string } => {
-    const nearest = nearestToolName(token, toolCandidates, undefined, getReadOnly);
+  // A sub-agent's or a `models:` profile's list narrows tools the site
+  // already registers, and takes a builtin under either spelling: `Read` is
+  // correct there (0.7.0 documented it), so it is left alone. A typo there is
+  // fixed in the spelling it was written in, as 0.7.0's lint --fix did.
+  const registeredCandidates = toolCandidates.map((k) => BUILTIN_TOOLS[k]?.name ?? k);
+  const fixToken = (token: string, narrowing: boolean): { to?: string; suggestion?: string } => {
+    if (narrowing && builtinKeyForName(token) !== undefined) return {};
+    const pascal = narrowing && /^[A-Z]/.test(token);
+    // The resolver takes either spelling, so both candidate lists work with it.
+    const candidates = pascal ? registeredCandidates : toolCandidates;
+    const nearest = nearestToolName(token, candidates, undefined, getReadOnly);
     if (nearest?.kind === "match") return { to: nearest.name };
     if (nearest?.kind === "ambiguous") {
       const options = nearest.candidates.map((c) => `"${c}"`).join(" or ");
@@ -2451,11 +2461,21 @@ function applyLintFixes(
   // The block key the current list items belong to — only items of a
   // `tools:` list are tool names; a bare word in any other list is not.
   let listKey: { key: string; indent: number } | undefined;
+  // The mapping keys enclosing the current line, by indent: a `tools:` list
+  // under `sub_agents:` or `models:` narrows a site rather than being one.
+  const ancestors: Array<{ key: string; indent: number }> = [];
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (line === undefined) continue;
     const indent = line.length - line.trimStart().length;
     const trimmed = line.trim();
+    const mappingKey = /^(\s*)(-\s+)?([A-Za-z_][\w-]*):(\s|$)/.exec(line);
+    if (mappingKey?.[3] !== undefined) {
+      const keyIndent = (mappingKey[1]?.length ?? 0) + (mappingKey[2]?.length ?? 0);
+      while ((ancestors[ancestors.length - 1]?.indent ?? -1) >= keyIndent) ancestors.pop();
+      ancestors.push({ key: mappingKey[3], indent: keyIndent });
+    }
+    const narrowing = ancestors.some((a) => a.key === "sub_agents" || a.key === "models");
 
     const blockKey = /^(\s*)([A-Za-z_][\w-]*):\s*(#.*)?$/.exec(line);
     if (blockKey?.[2] !== undefined) {
@@ -2484,7 +2504,7 @@ function applyLintFixes(
     // A `- toolName` item of a `tools:` block list that is a typo.
     const toolMatch = /^(\s*-\s*)([A-Za-z]\w*)(\s*)$/.exec(line);
     if (toolMatch?.[2] !== undefined && listKey?.key === "tools") {
-      const fix = fixToken(toolMatch[2]);
+      const fix = fixToken(toolMatch[2], narrowing);
       if (fix.to !== undefined) {
         lines[i] = `${toolMatch[1]}${fix.to}`;
         applied.push(`tool "${toolMatch[2]}" → "${fix.to}" (nearest match)`);
@@ -2504,7 +2524,7 @@ function applyLintFixes(
       const fixed = tokens.map((raw) => {
         const token = raw.trim();
         if (!/^[A-Za-z]\w*$/.test(token)) return raw;
-        const fix = fixToken(token);
+        const fix = fixToken(token, narrowing);
         if (fix.suggestion !== undefined) suggested.push(fix.suggestion);
         if (fix.to === undefined) return raw;
         changed = true;
