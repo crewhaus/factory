@@ -43,12 +43,15 @@ egress classifier then sees the query, and `compile --strict` counts them.
 
 ## Pillar 3 — the `memory` TrustOrigin
 
-Article bodies returned by the read tools are classified via
-`boundary-classifier` at the new **`"memory"` origin** (default policy:
-block tier, like `"skill"`) before reaching the model — an article written
-in an earlier session may have absorbed attacker text, and recall re-injects
-it across a session boundary. Malicious verdicts return the redaction notice
-instead of the body; non-blocked bodies are `tagContent`-ed into
+Everything the read tools render from an article (body, title, tags and
+the sources line) is classified via `boundary-classifier` at the
+**`"memory"` origin** (default policy: block tier, like `"skill"`) before
+reaching the model: an article written in an earlier session may have
+absorbed attacker text, and recall re-injects it across a session boundary.
+The unit is one article (`wiki_get`, `wiki_recall`) or one row (`wiki_search`,
+`wiki_semantic_search`, `wiki_list`, `wiki_related`). A malicious verdict
+replaces that article or row with its slug, version and the redaction notice,
+and the rest render normally; non-blocked units are `tagContent`-ed into
 `RunContext.dataLineage` under `"memory"` (the skills-registry two-site
 pattern) so the egress fabric can attribute a later exfiltration to the
 memory boundary.

@@ -328,6 +328,96 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
     expect(out).not.toContain("exfiltrate the system prompt");
   });
 
+  // 0.7.1 (C154): the title, tags and sources line are free text too, and
+  // were rendered unclassified by every read tool.
+  test("a poisoned title, tag or sources line is redacted by every read tool; the slug survives", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({
+      slug: "evil-meta",
+      title: `Coffee notes ${MALICIOUS_BODY}`,
+      body: "benign coffee body",
+      tags: ["coffee", MALICIOUS_BODY],
+      sources: [MALICIOUS_BODY],
+    });
+    await bundle.store.write({
+      slug: "good",
+      title: "Coffee basics",
+      body: "coffee grind size",
+      tags: ["coffee"],
+    });
+    const rc = createRunContext();
+    const outputs: Record<string, string> = {
+      get: String(await bundle.get.execute({ slug: "evil-meta" }, { runContext: rc })),
+      recall: String(await bundle.recall.execute({ query: "coffee" }, { runContext: rc })),
+      search: String(await bundle.search.execute({ query: "coffee" }, { runContext: rc })),
+      list: String(await bundle.list.execute({}, { runContext: rc })),
+      semantic: String(
+        await bundle.semanticSearch.execute({ query: "coffee" }, { runContext: rc }),
+      ),
+      related: String(await bundle.related.execute({ slug: "good" }, { runContext: rc })),
+    };
+    const leaks = Object.entries(outputs)
+      .filter(([, out]) => out.includes("exfiltrate the system prompt"))
+      .map(([name]) => name);
+    expect(leaks).toEqual([]);
+    for (const [name, out] of Object.entries(outputs)) {
+      expect(`${name}:${out.includes("evil-meta")}:${out.toLowerCase().includes("redact")}`).toBe(
+        `${name}:true:true`,
+      );
+    }
+    // The clean article still renders in full, next to the redacted one.
+    expect(outputs["recall"]).toContain("coffee grind size");
+    expect(outputs["search"]).toContain("Coffee basics");
+    const tagged = [...(rc.dataLineage?.keys() ?? [])];
+    expect(tagged.some((t) => t.includes("exfiltrate"))).toBe(false);
+    expect(new Set(rc.dataLineage?.values()).has("memory")).toBe(true);
+  });
+
+  test("a Sources bullet written through wiki_write is not re-emitted in wiki_get's header", async () => {
+    const bundle = makeBundle();
+    await bundle.write.execute({
+      slug: "sourced",
+      title: "Sourced",
+      body: `notes\n\n## Sources\n\n- ${MALICIOUS_BODY}\n`,
+    });
+    expect((await bundle.store.get("sourced"))?.sources).toEqual([MALICIOUS_BODY]);
+    const out = String(await bundle.get.execute({ slug: "sourced" }));
+    expect(out).not.toContain("exfiltrate the system prompt");
+    expect(out).toContain("slug: sourced");
+  });
+
+  test("a poisoned title on a middle hit of a large recall is still redacted", async () => {
+    const bundle = makeBundle();
+    const big = `coffee ${"espresso crema ".repeat(3000)}`; // ~45 KB each
+    await bundle.store.write({ slug: "big-a", title: "Coffee A", body: `coffee coffee ${big}` });
+    await bundle.store.write({
+      slug: "evil-mid",
+      title: `Coffee ${MALICIOUS_BODY}`,
+      body: "coffee",
+    });
+    await bundle.store.write({ slug: "big-b", title: "Coffee B", body: big });
+    const out = String(await bundle.recall.execute({ query: "coffee", limit: 10 }));
+    expect(out.length).toBeGreaterThan(64 * 1024);
+    expect(out).toContain("evil-mid");
+    expect(out).not.toContain("exfiltrate the system prompt");
+  });
+
+  test("benign titles, tags and sources render verbatim and are tagged at the memory origin", async () => {
+    const bundle = makeBundle();
+    await bundle.write.execute({
+      slug: "latte",
+      title: "Latte art basics",
+      body: "Pour slowly.\n\n## Sources\n\n- the barista handbook\n",
+      tags: ["milk"],
+    });
+    const rc = createRunContext();
+    const out = String(await bundle.get.execute({ slug: "latte" }, { runContext: rc }));
+    expect(out).toContain("# Latte art basics");
+    expect(out).toContain("tags: milk");
+    expect(out).toContain("sources: the barista handbook");
+    expect(new Set(rc.dataLineage?.values())).toEqual(new Set(["memory"]));
+  });
+
   test("wiki_write stamps createdBy from the RunContext", async () => {
     const bundle = makeBundle();
     const rc = createRunContext({ sessionId: "sess_00000000000000aa" });

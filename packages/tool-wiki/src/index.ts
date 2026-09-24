@@ -41,15 +41,24 @@
  *
  * ## Pillar 3 — the `memory` TrustOrigin (two-site pattern)
  *
- * Article bodies returned by the read tools (`wiki_recall`, `wiki_get`)
- * are classified at the new `"memory"` TrustOrigin BEFORE they reach the
- * model: a wiki article written in an earlier session may have absorbed
- * attacker text (a poisoned page STUDYed into an article), and recall
- * re-injects it across a session boundary. On a malicious verdict the body
- * is replaced by the redaction notice; on a non-blocked verdict the body
- * is `tagContent`-ed into `RunContext.dataLineage` under origin `"memory"`
- * (the skills-registry two-site pattern) so the sink-side egress fabric
- * can attribute a later exfiltration to the memory boundary.
+ * Everything the read tools render from an article is classified at the
+ * `"memory"` TrustOrigin BEFORE it reaches the model: a wiki article written
+ * in an earlier session may have absorbed attacker text (a poisoned page
+ * STUDYed into an article), and recall re-injects it across a session
+ * boundary. That is the body, and also the title, the tags and the sources
+ * line, which are free text too (0.7.1; only the slug is validated).
+ *
+ * The unit is one article: `wiki_get` and `wiki_recall` classify each
+ * article's header and body together, and the list-style tools (`wiki_search`,
+ * `wiki_semantic_search`, `wiki_list`, `wiki_related`) classify each row. On
+ * a malicious verdict that article or row is replaced by its slug, version
+ * and the redaction notice (the slug stays, so a REFLECT pass can still find
+ * and fix it), and the others render normally. Per-article classification
+ * also keeps each unit inside the classifier's window, which a whole large
+ * result would not be. A non-blocked unit is `tagContent`-ed into
+ * `RunContext.dataLineage` under origin `"memory"` (the skills-registry
+ * two-site pattern) so the sink-side egress fabric can attribute a later
+ * exfiltration to the memory boundary.
  *
  * ## Write-path governance (design §3.3)
  *
@@ -313,26 +322,41 @@ function resolveRunContext(ctx: ToolExecuteContext | undefined): RunContext | un
   return bridge?.runContext;
 }
 
+type Classified =
+  | { readonly safe: true; readonly text: string }
+  | { readonly safe: false; readonly notice: string };
+
 /**
- * Pillar 3 source side, applied to ONE article body: classify at origin
- * `"memory"`, return the redaction notice on a malicious verdict, tag the
- * lineage otherwise. The caller splices the result into its rendering.
+ * Pillar 3 source side, applied to ONE rendered unit (an article with its
+ * header, or one list row): classify at origin `"memory"`, return the
+ * redaction notice on a malicious verdict, tag the lineage otherwise.
  */
-async function classifyBody(body: string, rc: RunContext | undefined): Promise<string> {
-  const boundary = await classifyBoundary(body, { origin: "memory" });
+async function classifyMemory(text: string, rc: RunContext | undefined): Promise<Classified> {
+  const boundary = await classifyBoundary(text, { origin: "memory" });
   if (boundary.action === "redact") {
-    return boundary.redacted ?? buildRedactionNotice(boundary.verdict.hits);
+    return {
+      safe: false,
+      notice: boundary.redacted ?? buildRedactionNotice(boundary.verdict.hits),
+    };
   }
   if (rc !== undefined) {
-    tagContent(rc, body, "memory");
+    tagContent(rc, text, "memory");
   }
-  return body;
+  return { safe: true, text };
 }
 
 function refLine(ref: WikiRef): string {
   const tagSuffix = ref.tags.length > 0 ? ` [${ref.tags.join(", ")}]` : "";
   const verifiedSuffix = ref.verified ? " ✓verified" : "";
   return `${ref.slug} (v${ref.version}, ${ref.status}, conf ${ref.confidence.toFixed(2)}${verifiedSuffix}) — ${ref.title}${tagSuffix}`;
+}
+
+/** One list row, classified: the ref line, or its slug and version with the
+ *  notice when the title or tags carry an injection. */
+async function safeRefLine(ref: WikiRef, rc: RunContext | undefined): Promise<string> {
+  const line = refLine(ref);
+  const c = await classifyMemory(line, rc);
+  return c.safe ? c.text : `${ref.slug} (v${ref.version}) — ${c.notice}`;
 }
 
 function hitHeader(hit: WikiHit): string {
@@ -397,7 +421,14 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       }
       const lines = [`${hits.length} wiki hit(s) for "${input.query}":`];
       for (const hit of hits) {
-        lines.push("", hitHeader(hit), await classifyBody(hit.body, rc));
+        // Header and body are one unit: the title and tags are free text too.
+        const c = await classifyMemory(`${hitHeader(hit)}\n${hit.body}`, rc);
+        lines.push(
+          "",
+          ...(c.safe
+            ? [c.text]
+            : [`--- ${hit.ref.slug} (v${hit.ref.version}) — [article redacted]`, c.notice]),
+        );
       }
       return lines.join("\n");
     },
@@ -410,7 +441,8 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
     inputSchema: semanticSearchSchema,
     readOnly: true,
     ...embedderScope,
-    execute: async (input) => {
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       const k = input.limit ?? 6;
       if (store.semanticSearch === undefined) {
         // Thredz-parity degradation: keyword-only plans fall back too.
@@ -418,7 +450,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         const lines = [
           "no embedder configured — degraded to keyword search (configure memory.wiki.embedder for semantic ranking):",
         ];
-        for (const ref of refs.slice(0, k)) lines.push(`  • ${refLine(ref)}`);
+        for (const ref of refs.slice(0, k)) lines.push(`  • ${await safeRefLine(ref, rc)}`);
         if (refs.length === 0) lines.push(`  (no keyword matches for "${input.query}")`);
         return lines.join("\n");
       }
@@ -428,7 +460,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       }
       const lines = [`${hits.length} semantic match(es) for "${input.query}":`];
       for (const hit of hits) {
-        lines.push(`  • (${hit.score.toFixed(3)}) ${refLine(hit.ref)}`);
+        lines.push(`  • (${hit.score.toFixed(3)}) ${await safeRefLine(hit.ref, rc)}`);
       }
       return lines.join("\n");
     },
@@ -441,11 +473,12 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
     inputSchema: searchSchema,
     readOnly: true,
     scope: "internal",
-    execute: async (input) => {
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       const refs = await store.search(input.query);
       if (refs.length === 0) return `no wiki articles matched "${input.query}"`;
       const lines = [`${refs.length} keyword match(es) for "${input.query}":`];
-      for (const ref of refs) lines.push(`  • ${refLine(ref)}`);
+      for (const ref of refs) lines.push(`  • ${await safeRefLine(ref, rc)}`);
       return lines.join("\n");
     },
   });
@@ -463,11 +496,6 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       const rc = resolveRunContext(ctx);
       const article = await store.get(input.slug);
       if (article === null) return `no wiki article with slug "${input.slug}"`;
-      const safeBody = await classifyBody(article.body, rc);
-      const body =
-        input.concise === true && safeBody.length > CONCISE_CHARS
-          ? `${safeBody.slice(0, CONCISE_CHARS).trimEnd()}\n… (concise — call wiki_get without concise for the full body)`
-          : safeBody;
       const header = [
         `# ${article.title}`,
         `slug: ${article.slug} · v${article.version} · ${article.status} · confidence ${article.confidence.toFixed(2)}${article.verified ? " · ✓verified" : ""}`,
@@ -475,6 +503,16 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         article.sources.length > 0 ? `sources: ${article.sources.join(" · ")}` : "",
         `updated: ${article.updatedAt}${article.supersedes !== undefined ? ` (supersedes v${article.supersedes})` : ""}`,
       ].filter((l) => l !== "");
+      // The title, tags and sources are free text too: the whole article is
+      // one unit, classified before anything is rendered.
+      const c = await classifyMemory(`${header.join("\n")}\n\n${article.body}`, rc);
+      if (!c.safe) {
+        return `slug: ${article.slug} · v${article.version} — [article redacted]\n\n${c.notice}`;
+      }
+      const body =
+        input.concise === true && article.body.length > CONCISE_CHARS
+          ? `${article.body.slice(0, CONCISE_CHARS).trimEnd()}\n… (concise — call wiki_get without concise for the full body)`
+          : article.body;
       return `${header.join("\n")}\n\n${body}`;
     },
   });
@@ -547,7 +585,8 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
     inputSchema: listSchema,
     readOnly: true,
     scope: "internal",
-    execute: async (input) => {
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       const limit = input.limit ?? 25;
       const sort = input.sort ?? "updated";
       const order = input.order ?? "asc"; // thredz default: stalest first
@@ -584,7 +623,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         `${rows.length}/${refs.length} article(s) (sort ${sort === "title" ? "title" : "updated"} ${order}):`,
         ...notes,
       ];
-      for (const ref of rows) lines.push(`  • ${ref.updatedAt}  ${refLine(ref)}`);
+      for (const ref of rows) lines.push(`  • ${ref.updatedAt}  ${await safeRefLine(ref, rc)}`);
       if (rows.length === 0) lines.push("  (none)");
       return lines.join("\n");
     },
@@ -597,7 +636,8 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
     inputSchema: relatedSchema,
     readOnly: true,
     ...embedderScope,
-    execute: async (input) => {
+    execute: async (input, ctx) => {
+      const rc = resolveRunContext(ctx);
       let refs: Awaited<ReturnType<WikiStore["related"]>>;
       try {
         refs = await store.related(input.slug);
@@ -606,7 +646,9 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       }
       if (refs.length === 0) return `no articles related to "${input.slug}"`;
       const lines = [`${refs.length} article(s) related to "${input.slug}":`];
-      for (const ref of refs) lines.push(`  • (${ref.relatedScore.toFixed(2)}) ${refLine(ref)}`);
+      for (const ref of refs) {
+        lines.push(`  • (${ref.relatedScore.toFixed(2)}) ${await safeRefLine(ref, rc)}`);
+      }
       return lines.join("\n");
     },
   });
