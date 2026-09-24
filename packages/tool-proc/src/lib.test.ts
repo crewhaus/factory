@@ -205,13 +205,22 @@ describe("inspectEnv", () => {
     expect(views).toEqual([{ name: "TOKEN", present: true, chars: 9 }]);
   });
 
-  test("a revealed value comes back in full", () => {
-    const { views } = inspectEnv(parent, ["TOKEN"], ["TOKEN"]);
-    expect(views[0]?.value).toBe("sk-abcdef");
+  test("a revealed value comes back in full only when the policy allows it", () => {
+    const allow = () => ({ ok: true }) as const;
+    expect(inspectEnv(parent, ["TOKEN"], ["TOKEN"], allow).views[0]?.value).toBe("sk-abcdef");
+    // The default policy reveals nothing, and says so.
+    expect(inspectEnv(parent, ["TOKEN"], ["TOKEN"]).views).toEqual([
+      { name: "TOKEN", present: true, chars: 9, withheld: "not-allowed" },
+    ]);
+    const deny = () => ({ ok: false, code: "credential-shaped" }) as const;
+    expect(inspectEnv(parent, ["TOKEN"], ["TOKEN"], deny).views[0]?.withheld).toBe(
+      "credential-shaped",
+    );
   });
 
   test("an unset variable is reported as absent, never invented", () => {
-    const { views } = inspectEnv(parent, ["MISSING"], ["MISSING"]);
+    const allow = () => ({ ok: true }) as const;
+    const { views } = inspectEnv(parent, ["MISSING"], ["MISSING"], allow);
     expect(views).toEqual([{ name: "MISSING", present: false, chars: 0 }]);
   });
 

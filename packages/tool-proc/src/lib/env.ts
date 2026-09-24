@@ -75,25 +75,39 @@ export function buildSpawnEnv(
   return { env, missing, invalid };
 }
 
-/** One variable as EnvInspect reports it. `value` is present only for names
- *  the caller explicitly asked to reveal. */
+/** Why a value named in `reveal` was not shown. */
+export type WithheldReason = "credential-shaped" | "not-allowed";
+
+/** One variable as EnvInspect reports it. `value` is present only for a
+ *  name the call asked to reveal AND the reveal policy allowed; `withheld`
+ *  says why a value asked for was not shown. */
 export type EnvView = {
   readonly name: string;
   readonly present: boolean;
   readonly chars: number;
   readonly value?: string;
+  readonly withheld?: WithheldReason;
 };
+
+/** Whether `name`'s value may be shown: the operator's list, never a credential. */
+export type RevealPolicy = (
+  name: string,
+) => { readonly ok: true } | { readonly ok: false; readonly code: string };
+
+/** The default policy: nothing is ever shown. */
+export const REVEAL_NOTHING: RevealPolicy = () => ({ ok: false, code: "not-allowed" });
 
 /**
  * Inspect named variables and nothing else. There is deliberately no way to
  * enumerate the environment: a caller must know the name to learn anything,
- * and learns only whether it is set and how long it is unless it names the
- * variable in `reveal`.
+ * and learns only whether it is set and how long it is — a value only for a
+ * name in `reveal` that `mayReveal` allows (C052).
  */
 export function inspectEnv(
   parent: Readonly<Record<string, string | undefined>>,
   names: readonly string[],
   reveal: readonly string[] = [],
+  mayReveal: RevealPolicy = REVEAL_NOTHING,
 ): { readonly views: EnvView[]; readonly invalid: readonly string[] } {
   const revealSet = new Set(reveal);
   const invalid: string[] = [];
@@ -112,7 +126,19 @@ export function inspectEnv(
       present: value !== undefined,
       chars: value === undefined ? 0 : value.length,
     };
-    views.push(value !== undefined && revealSet.has(name) ? { ...base, value } : base);
+    if (!revealSet.has(name)) {
+      views.push(base);
+      continue;
+    }
+    const decision = mayReveal(name);
+    if (!decision.ok) {
+      views.push({
+        ...base,
+        withheld: decision.code === "credential-shaped" ? "credential-shaped" : "not-allowed",
+      });
+      continue;
+    }
+    views.push(value !== undefined ? { ...base, value } : base);
   }
   // Sorted by name so two calls with the same names in a different order
   // return the same bytes.

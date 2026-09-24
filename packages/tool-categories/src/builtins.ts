@@ -209,6 +209,14 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     keys: ["vectorDelete"],
     binds: ["registerVectorTarget"],
   },
+  // 0.7.1 C052: which variables' VALUES EnvInspect may show
+  // (`tool_config.proc.env_reveal`); with no block it shows none.
+  registerProcConfig: {
+    package: "@crewhaus/tool-proc",
+    source: "tool_config",
+    label: "EnvInspect",
+    keys: ["proc"],
+  },
   registerTokenConfig: {
     package: "@crewhaus/tool-token",
     source: "tool_config",
@@ -838,7 +846,12 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
   waitForFile: { package: "@crewhaus/tool-proc", export: "waitForFile", name: "WaitForFile" },
   waitForOutput: { package: "@crewhaus/tool-proc", export: "waitForOutput", name: "WaitForOutput" },
   commandExists: { package: "@crewhaus/tool-proc", export: "commandExists", name: "CommandExists" },
-  envInspect: { package: "@crewhaus/tool-proc", export: "envInspect", name: "EnvInspect" },
+  envInspect: {
+    package: "@crewhaus/tool-proc",
+    export: "envInspect",
+    name: "EnvInspect",
+    initSymbol: "registerProcConfig",
+  },
   base64Encode: { package: "@crewhaus/tool-encode", export: "base64Encode", name: "Base64Encode" },
   base64Decode: { package: "@crewhaus/tool-encode", export: "base64Decode", name: "Base64Decode" },
   httpRequest: {

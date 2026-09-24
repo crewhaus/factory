@@ -26,6 +26,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   PROC_TOOLS,
   __resetRegistryForTest,
+  _resetProcConfig,
   commandExists,
   envInspect,
   processList,
@@ -33,6 +34,7 @@ import {
   processStart,
   processStatus,
   processStop,
+  registerProcConfig,
   retry,
   runCommand,
   runPipeline,
@@ -1077,12 +1079,104 @@ describe("EnvInspect", () => {
     expect(JSON.stringify(out)).not.toContain("sk-0123456789");
   });
 
-  test("reveals only what the caller names", async () => {
-    const out = await call(envInspect, {
-      names: ["TOOL_PROC_TOKEN"],
-      reveal: ["TOOL_PROC_TOKEN"],
+  // C052: before 0.7.1 the CALL chose what to reveal, so a model could read
+  // any key into its own context from a read-only tool plan mode runs unasked.
+  describe("a value is shown only where the operator allowed it", () => {
+    const KEY = ["sk-ant-api03-", "0123456789abcdef", "ABCDEFGH"].join("");
+    beforeEach(() => {
+      process.env["TOOL_PROC_API_KEY"] = KEY;
+      process.env["TOOL_PROC_MODE"] = "staging";
+      process.env["TOOL_PROC_PGPASSWORD"] = "hunter2";
+      process.env["TOOL_PROC_DATABASE_URL"] = "postgres://u:p@h/db";
+      process.env["TOOL_PROC_GITHUB_PAT"] = "ghp-lookalike-value";
     });
-    expect(out.variables[0].value).toBe("sk-0123456789");
+    afterEach(() => {
+      _resetProcConfig();
+      for (const n of [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_MODE",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ]) {
+        Reflect.deleteProperty(process.env, n);
+      }
+    });
+
+    test("with no tool_config, a reveal shows nothing and says why", async () => {
+      const out = await call(envInspect, {
+        names: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+        reveal: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+      });
+      expect(JSON.stringify(out)).not.toContain(KEY);
+      expect(JSON.stringify(out)).not.toContain("staging");
+      expect(out.variables).toEqual([
+        {
+          name: "TOOL_PROC_API_KEY",
+          present: true,
+          chars: KEY.length,
+          withheld: "credential-shaped",
+        },
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, withheld: "not-allowed" },
+      ]);
+      expect(out.note).toContain("tool_config.proc.env_reveal");
+    });
+
+    test("a listed, ordinary name is shown", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const out = await call(envInspect, { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] });
+      expect(out.variables).toEqual([
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, value: "staging" },
+      ]);
+    });
+
+    test("a credential-shaped name is never shown, and cannot be listed", async () => {
+      // Names the old suffix-only heuristics missed are caught too.
+      const secretNames = [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ];
+      for (const name of secretNames) {
+        expect(() => registerProcConfig({ env_reveal: [name] })).toThrow("looks like a credential");
+      }
+      const out = await call(envInspect, { names: secretNames, reveal: secretNames });
+      for (const secret of [KEY, "hunter2", "postgres://u:p@h/db", "ghp-lookalike-value"]) {
+        expect(JSON.stringify(out)).not.toContain(secret);
+      }
+      expect(out.variables.map((v: { withheld?: string }) => v.withheld)).toEqual([
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+      ]);
+    });
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const input = { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] };
+      const narrowed = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: [] } } as never)),
+      );
+      expect(narrowed.variables[0].withheld).toBe("not-allowed");
+      const broken = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: "x" } } as never)),
+      );
+      expect(broken.variables[0].withheld).toBe("not-allowed");
+    });
+
+    test("the registrar refuses a block it cannot read, naming the key", () => {
+      expect(() => registerProcConfig({ env_reveal: "NODE_ENV" })).toThrow(
+        "tool_config.proc.env_reveal",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["not a name"] })).toThrow(
+        "not an environment",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["A"], envReveal: ["B"] })).toThrow("both");
+      expect(() => registerProcConfig({})).not.toThrow();
+      expect(() => registerProcConfig({ allowed_origins: ["https://a.example"] })).not.toThrow();
+    });
   });
 
   test("revealing something that was not inspected is refused", async () => {

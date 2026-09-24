@@ -2200,7 +2200,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "envInspect",
     name: "EnvInspect",
     description:
-      "Report whether named environment variables are set, and how long their values are, revealing a value only when the caller names it. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
+      "Report whether named environment variables are set, and how long their values are. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. A value is shown only for a variable named in `reveal` that the operator listed in tool_config.proc.env_reveal, and never for one whose name looks like a credential (a key, token, secret, password or credential URL), listed or not; any other name in `reveal` comes back with `withheld` and the reason. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
     readOnly: true,
     destructive: false,
     scope: "internal",

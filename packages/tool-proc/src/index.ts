@@ -27,8 +27,10 @@ import { connect } from "node:net";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { checkEnvReveal } from "@crewhaus/tool-safety/env";
 import { z } from "zod";
 import { type BackoffPolicy, backoffDelayMs, totalBackoffMs } from "./lib/backoff";
+import { ENV_REVEAL_KEY, revealAllowFor } from "./lib/config";
 import { FALLBACK_PATH, buildSpawnEnv, inspectEnv } from "./lib/env";
 import { capText, compileSafePattern, formatArgv } from "./lib/format";
 import {
@@ -44,6 +46,7 @@ import { recheckContainment, resolveSafe, resolveSafeDir } from "./safe-path";
 import { runOnce, sleep } from "./spawn";
 
 export { __resetRegistryForTest };
+export { _resetProcConfig, registerProcConfig } from "./lib/config";
 
 /** Compact JSON — the reader is a model, not a person. */
 const json = (value: unknown): string => JSON.stringify(value);
@@ -985,7 +988,7 @@ export const commandExists: RegisteredTool = buildTool({
 export const envInspect: RegisteredTool = buildTool({
   name: "EnvInspect",
   description:
-    "Report whether named environment variables are set, and how long their values are, revealing a value only when the caller names it. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
+    "Report whether named environment variables are set, and how long their values are. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. A value is shown only for a variable named in `reveal` that the operator listed in tool_config.proc.env_reveal, and never for one whose name looks like a credential (a key, token, secret, password or credential URL), listed or not; any other name in `reveal` comes back with `withheld` and the reason. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
   inputSchema: z.object({
     names: z
       .array(z.string().min(1).max(255))
@@ -996,22 +999,34 @@ export const envInspect: RegisteredTool = buildTool({
       .array(z.string().min(1).max(255))
       .max(16)
       .optional()
-      .describe("variables whose actual value should be returned; must also appear in names"),
+      .describe(
+        "variables whose value should be returned; must also appear in names, and each must be listed in tool_config.proc.env_reveal and not look like a credential",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const named = new Set(input.names);
     const reveal = input.reveal ?? [];
     const notNamed = reveal.filter((r) => !named.has(r));
     if (notNamed.length > 0) {
       return `[EnvInspect error] reveal lists ${notNamed.join(", ")}, which names does not — add them to names to inspect them.`;
     }
-    const { views, invalid } = inspectEnv(process.env, input.names, reveal);
+    // The list comes from the operator (tool_config), never from the call.
+    const allowed = revealAllowFor(ctx?.toolConfig);
+    const { views, invalid } = inspectEnv(process.env, input.names, reveal, (name) =>
+      checkEnvReveal(name, { allowed, configKey: ENV_REVEAL_KEY }),
+    );
+    const withheld = views.filter((v) => v.withheld !== undefined);
     return json({
       variables: views,
       ...(invalid.length > 0 ? { notEnvironmentNames: invalid } : {}),
-      note: "values are withheld unless named in reveal",
+      note:
+        withheld.length === 0
+          ? "values are shown only for names in reveal that tool_config.proc.env_reveal lists"
+          : `values are shown only for names in reveal that ${ENV_REVEAL_KEY} lists, and never for a name that looks like a credential; ${withheld
+              .map((v) => `${v.name}: ${v.withheld}`)
+              .join(", ")}`,
     });
   },
 });
