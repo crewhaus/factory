@@ -6,7 +6,10 @@
  * parent but never widen it, and never widen what its own list allows.
  *
  * `evaluateWithReason` is first-match-wins, so the meet is built as one
- * ordered list, in the highest-priority source:
+ * ordered list, in the `settings` source with every other source empty. Not
+ * `flag`: a pool candidate's `permissions.deny` / `.ask` narrow a run by
+ * going ahead of `settings` (`narrowRuleSet`), and they must still narrow a
+ * child that runs under a meet.
  *
  *   1. every deny from either set;
  *   2. every ask from either set;
@@ -104,7 +107,7 @@ export type RuleSetMeet = {
 export function meetRuleSets(a: RuleSet, b: RuleSet): RuleSetMeet {
   const all = [...flatten(a), ...flatten(b)];
   const gate = (type: PermissionRule["type"]): PermissionRule[] =>
-    all.filter((r) => r.type === type).map((r) => ({ ...r, source: "flag" as const }));
+    all.filter((r) => r.type === type).map((r) => ({ ...r, source: "settings" as const }));
   const allowsA = flatten(a).filter((r) => r.type === "alwaysAllow");
   const allowsB = flatten(b).filter((r) => r.type === "alwaysAllow");
   const granted = new Set<string>();
@@ -122,12 +125,12 @@ export function meetRuleSets(a: RuleSet, b: RuleSet): RuleSetMeet {
   const allows: PermissionRule[] = [...granted].map((pattern) => ({
     type: "alwaysAllow",
     pattern,
-    source: "flag",
+    source: "settings",
   }));
   return {
     rules: {
-      flag: [...gate("alwaysDeny"), ...gate("alwaysAsk"), ...allows],
-      settings: [],
+      flag: [],
+      settings: [...gate("alwaysDeny"), ...gate("alwaysAsk"), ...allows],
       yaml: [],
       hooks: [],
       builtin: [],

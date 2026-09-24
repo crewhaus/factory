@@ -13,9 +13,10 @@ import {
   type PermissionMode,
   type PermissionRule,
   type RuleSet,
+  emptyRuleSet,
   evaluate,
 } from "@crewhaus/permission-engine";
-import { resolveChildPermissions } from "./index.js";
+import { narrowRuleSet, resolveChildPermissions } from "./index.js";
 import { intersectPatterns, meetRuleSets } from "./meet.js";
 
 const RANK: Record<Decision, number> = { deny: 0, ask: 1, allow: 2 };
@@ -60,9 +61,32 @@ describe("meetRuleSets", () => {
     };
     const meet = meetRuleSets(parent, own);
     expect(meet.ungranted).toEqual(["Bash(curl**)"]);
-    expect(meet.rules.flag.map((r) => `${r.type} ${r.pattern}`)).toEqual([
+    expect(meet.rules.settings.map((r) => `${r.type} ${r.pattern}`)).toEqual([
       "alwaysAllow Bash(git log**)",
     ]);
+  });
+
+  test("a pool candidate's deny still narrows a child that runs under a meet", () => {
+    // The runtime narrows each candidate with narrowRuleSet, whose rules go
+    // ahead of `settings`; a meet written in `flag` would outrank them.
+    const parent: RuleSet = {
+      ...emptyRuleSet,
+      yaml: [{ type: "alwaysAllow", pattern: "Bash(**)", source: "yaml" }],
+    };
+    const own: RuleSet = {
+      ...emptyRuleSet,
+      yaml: [{ type: "alwaysAllow", pattern: "Bash(git**)", source: "yaml" }],
+    };
+    const meet = meetRuleSets(parent, own).rules;
+    const candidate = narrowRuleSet(meet, ["Bash(git push**)"], []);
+    const bash = (command: string) => ({
+      toolName: "Bash",
+      input: { command },
+      readOnly: false,
+      destructive: false,
+    });
+    expect(evaluate(bash("git status"), "default", candidate)).toBe("allow");
+    expect(evaluate(bash("git push origin main"), "default", candidate)).toBe("deny");
   });
 
   test("PROPERTY: the child is never more permissive than the parent or its own set", () => {
