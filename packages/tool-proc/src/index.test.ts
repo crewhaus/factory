@@ -42,6 +42,7 @@ import {
   waitForOutput,
   waitForPort,
 } from "./index";
+import { _setPlatform, searchPath } from "./lib/which";
 
 let originalCwd: string;
 let tmp: string;
@@ -1147,6 +1148,56 @@ describe("CommandExists", () => {
   test("a path is refused: this looks up names, it does not stat wherever it is pointed", async () => {
     expect(await call(commandExists, { name: "/etc/passwd" })).toContain("is a path");
     expect(await call(commandExists, { name: "../sh" })).toContain("is a path");
+  });
+
+  describe("on Windows (C125)", () => {
+    const saved = { path: process.env["PATH"], pathext: process.env["PATHEXT"] };
+    afterEach(() => {
+      _setPlatform(undefined);
+      for (const [key, value] of [
+        ["PATH", saved.path],
+        ["PATHEXT", saved.pathext],
+      ] as const) {
+        if (value === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = value;
+      }
+    });
+
+    test("a bare name finds the program through PATHEXT, as RunCommand's spawn would", async () => {
+      const dir = join(tmp, "bin");
+      mkdirSync(dir);
+      // No execute bit: Windows has none, and the POSIX check must not apply.
+      writeFileSync(join(dir, "tool.exe"), "");
+      process.env["PATH"] = dir;
+      process.env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD";
+      _setPlatform("win32");
+      const out = await call(commandExists, { name: "tool" });
+      expect({ found: out.found, path: out.path }).toEqual({
+        found: true,
+        path: join(dir, "tool.exe"),
+      });
+      // Control: the same directory on POSIX has no program called "tool".
+      _setPlatform("linux");
+      expect((await call(commandExists, { name: "tool" })).found).toBe(false);
+    });
+
+    test("PATHEXT order, PATH order, a spelled-out extension and an extensionless file", () => {
+      const a = join(tmp, "a");
+      const b = join(tmp, "b");
+      mkdirSync(a);
+      mkdirSync(b);
+      writeFileSync(join(a, "git"), "");
+      writeFileSync(join(b, "git.exe"), "");
+      writeFileSync(join(b, "git.com"), "");
+      writeFileSync(join(a, "npm.cmd"), "");
+      const win = { pathValue: `"${a}";${b}`, platform: "win32" as const, pathext: ".COM;.EXE" };
+      // An extensionless `git` in an earlier directory is not a program there.
+      expect(searchPath("git", win)).toEqual({ path: join(b, "git.com"), searchedDirs: 2 });
+      expect(searchPath("git.exe", win).path).toBe(join(b, "git.exe"));
+      // .CMD is not in this PATHEXT, so npm is not found; with the default it is.
+      expect(searchPath("npm", win).path).toBeNull();
+      expect(searchPath("npm", { ...win, pathext: undefined }).path).toBe(join(a, "npm.cmd"));
+    });
   });
 
   test("the answer is stable across calls", async () => {

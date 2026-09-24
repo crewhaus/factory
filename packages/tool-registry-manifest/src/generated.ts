@@ -839,7 +839,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "commandExists",
     name: "CommandExists",
     description:
-      "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match.",
+      "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match; on Windows it tries PATHEXT's extensions (git finds git.exe) as the shell does.",
     readOnly: true,
     destructive: false,
     scope: "internal",

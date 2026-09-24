@@ -34,6 +34,7 @@ import { type BackoffPolicy, backoffDelayMs, totalBackoffMs } from "./lib/backof
 import { ENV_REVEAL_KEY, revealAllowFor } from "./lib/config";
 import { FALLBACK_PATH, buildSpawnEnv, inspectEnv } from "./lib/env";
 import { capText, compileSafePattern, formatArgv } from "./lib/format";
+import { hostPlatform, searchPath } from "./lib/which";
 import {
   type BgProc,
   __resetRegistryForTest,
@@ -1016,7 +1017,7 @@ export const waitForOutput: RegisteredTool = buildTool({
 export const commandExists: RegisteredTool = buildTool({
   name: "CommandExists",
   description:
-    "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match.",
+    "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match; on Windows it tries PATHEXT's extensions (git finds git.exe) as the shell does.",
   inputSchema: z.object({
     name: z.string().min(1).max(255).describe("a bare program name such as 'git' — not a path"),
   }),
@@ -1026,19 +1027,21 @@ export const commandExists: RegisteredTool = buildTool({
     if (input.name.includes("/") || input.name.includes("\\") || input.name.includes("\0")) {
       return `[CommandExists error] "${input.name}" is a path, not a program name — pass a bare name such as "git".`;
     }
-    const raw = process.env["PATH"] ?? FALLBACK_PATH;
-    const dirs = raw.split(path.delimiter).filter((d) => d !== "");
-    for (const dir of dirs) {
-      const candidate = path.join(dir, input.name);
-      try {
-        if (!statSync(candidate).isFile()) continue;
-        accessSync(candidate, fsConstants.X_OK);
-        return json({ name: input.name, found: true, path: candidate, searchedDirs: dirs.length });
-      } catch {
-        // Not here, or not executable — keep looking.
-      }
-    }
-    return json({ name: input.name, found: false, path: null, searchedDirs: dirs.length });
+    const platform = hostPlatform();
+    // The PATH RunCommand hands its child (buildSpawnEnv). FALLBACK_PATH is
+    // a POSIX list; a Windows host with no PATH has nothing to search.
+    const raw = process.env["PATH"] ?? (platform === "win32" ? "" : FALLBACK_PATH);
+    const found = searchPath(input.name, {
+      pathValue: raw,
+      platform,
+      pathext: process.env["PATHEXT"],
+    });
+    return json({
+      name: input.name,
+      found: found.path !== null,
+      path: found.path,
+      searchedDirs: found.searchedDirs,
+    });
   },
 });
 
