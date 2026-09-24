@@ -224,6 +224,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run — when the call also carried a `file_path: "src/ok.ts"` the tool never
   reads, when the path was `src/../.crewhaus/settings.json`, or when it went
   through a symlinked directory. None of these pass now.
+- **On macOS and Windows, a deny on a file can no longer be dodged by
+  changing the case of its name.** There `.ENV` opens `.env`, and
+  `.crewhaus/SETTINGS.JSON` is the settings file, but a path rule saw the
+  name as the model wrote it: `alwaysDeny Read(**/.env)` did not stop
+  `Read(.ENV)`. A path is now matched under the name the file is stored
+  with, and a deny or ask ignores letter case where the filesystem does —
+  also for a file the call is about to create. A name written with a
+  combining accent matches one written with the precomposed letter. On Linux
+  nothing changes: there, another case is another file.
 - **Every tool that sends to a place the model picks now gets the strict
   egress check.** `Fetch` and `WebFetch` blocked a call carrying text from a
   tool result, an MCP response or a sub-agent; `HttpRequest`, `HttpBatch`,

@@ -401,16 +401,25 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * - `outsideWorkspace` — the path lands outside the workspace, or where it
  *   lands could not be worked out. It never satisfies an allow rule and
  *   always satisfies a deny or ask rule.
+ * - `caseInsensitive` — the path lands on a filesystem that does not tell
+ *   names apart by letter case (macOS and Windows by default), or the runtime
+ *   could not find out. A deny or ask rule then compares it ignoring case, so
+ *   `alwaysDeny Write(.crewhaus/settings.json)` also fires on
+ *   `.crewhaus/Settings.json`, which is the same file there.
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
- * `**` + `/src/**` cannot reach into the directories ABOVE the workspace.
+ * `**` + `/src/**` cannot reach into the directories ABOVE the workspace. A
+ * deny or ask rule also compares a path in Unicode normal form C, so a name
+ * spelled with a combining accent (`cafe` + U+0301) is the name spelled with
+ * the precomposed one (`café`), as it is on macOS.
  */
 export type OperativeValue = {
   readonly kind: OperativeValueKind;
   readonly canonical: ReadonlyArray<string>;
   readonly spellings?: ReadonlyArray<string>;
   readonly outsideWorkspace?: boolean;
+  readonly caseInsensitive?: boolean;
 };
 
 export type MatchOptions = {
@@ -499,8 +508,32 @@ function fallbackValues(toolName: string, input: unknown): OperativeValue[] {
   return stringValues(input).map(undeclaredValue);
 }
 
+/** A path as a deny or ask rule compares it: NFC, and lower-cased when the filesystem ignores case. */
+function foldPath(value: string, ignoreCase: boolean): string {
+  const nfc = value.normalize("NFC");
+  return ignoreCase ? nfc.toLowerCase() : nfc;
+}
+
+/** Argument globs compiled in folded form, per pattern, built on first use. */
+const foldedArgGlobs = new WeakMap<CompiledPattern, Map<boolean, GlobMatcher>>();
+
+function foldedArgMatcher(compiled: CompiledPattern, ignoreCase: boolean): GlobMatcher {
+  let byMode = foldedArgGlobs.get(compiled);
+  if (byMode === undefined) {
+    byMode = new Map();
+    foldedArgGlobs.set(compiled, byMode);
+  }
+  let matcher = byMode.get(ignoreCase);
+  if (matcher === undefined) {
+    matcher = compileGlob(foldPath(compiled.argGlob ?? "", ignoreCase));
+    byMode.set(ignoreCase, matcher);
+  }
+  return matcher;
+}
+
 function valueMatches(
   value: OperativeValue,
+  compiled: CompiledPattern,
   argRe: GlobMatcher,
   absoluteGlob: boolean,
   polarity: RulePolarity,
@@ -511,6 +544,17 @@ function valueMatches(
   for (const candidate of candidates) {
     if (value.kind === "path" && isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
     if (argRe.test(candidate)) return true;
+  }
+  // A deny or ask on a path is not dodged by spelling the name another way
+  // the filesystem treats as the same: another Unicode normal form always,
+  // and another letter case where the filesystem ignores case.
+  if (polarity === "restrict" && value.kind === "path") {
+    const ignoreCase = value.caseInsensitive === true;
+    const folded = foldedArgMatcher(compiled, ignoreCase);
+    for (const candidate of candidates) {
+      if (isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
+      if (folded.test(foldPath(candidate, ignoreCase))) return true;
+    }
   }
   return false;
 }
@@ -547,8 +591,8 @@ export function matchesPattern(
   if (values.length === 0) return false;
   const absoluteGlob = globIsAbsolute(compiled.argGlob ?? "");
   return polarity === "allow"
-    ? values.every((v) => valueMatches(v, argRe, absoluteGlob, polarity))
-    : values.some((v) => valueMatches(v, argRe, absoluteGlob, polarity));
+    ? values.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity))
+    : values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
 }
 
 export {
