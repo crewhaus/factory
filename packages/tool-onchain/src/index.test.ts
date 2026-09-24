@@ -102,6 +102,13 @@ describe("AbiEncodeCall", () => {
     expect(result.data).toStartWith("0xa9059cbb");
   });
 
+  test("an address whose EIP-55 checksum fails is an error, not calldata (C132)", async () => {
+    const typo = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD";
+    await expect(
+      raw(abiEncodeCall, { signature: "transfer(address,uint256)", args: [typo, "1"] }),
+    ).rejects.toThrow(/checksum does not match/);
+  });
+
   test("a value that does not fit is an error, not truncated calldata", async () => {
     await expect(raw(abiEncodeCall, { signature: "f(uint8)", args: ["256"] })).rejects.toThrow(
       /uint8/,

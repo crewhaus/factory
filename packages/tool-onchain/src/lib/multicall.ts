@@ -27,7 +27,7 @@
  * or submits a transaction.
  */
 import { type AbiValue, type Decoded, decodeData, encodeCall } from "./abi";
-import { validateAddress } from "./address";
+import { checkedAddress } from "./address";
 
 /**
  * Where Multicall3 is deployed on most chains, via a deterministic deploy.
@@ -124,12 +124,6 @@ export type Aggregate3Result = {
   /** The revert, decoded, when this call failed. Null when it succeeded. */
   readonly revert: RevertReason | null;
 };
-
-function checkedAddress(raw: string, what: string): string {
-  const result = validateAddress(raw);
-  if (!result.valid) throw new Error(`${what}: ${result.reason}`);
-  return result.checksummed;
-}
 
 function checkedBytes(raw: string, what: string): string {
   const text = raw.trim();

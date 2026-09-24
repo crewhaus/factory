@@ -11,7 +11,7 @@
  * was actually shown, compared against the one the dapp asked for.
  */
 import { keccak256, toHex } from "@crewhaus/tool-encode";
-import { type AbiValue, encodeTuple, parseType } from "./abi";
+import { type AbiType, type AbiValue, encodeTuple, parseType } from "./abi";
 
 export type TypedField = { readonly name: string; readonly type: string };
 export type TypedTypes = Readonly<Record<string, ReadonlyArray<TypedField>>>;
@@ -100,13 +100,17 @@ function encodeField(type: string, value: unknown, types: TypedTypes, what: stri
   // Everything else must be an atomic ABI type. When it is not, the likely
   // mistake is a struct named in a field and left out of `types`, so say
   // both possibilities rather than only "not an ABI type".
+  let parsed: AbiType;
   try {
-    return encodeTuple([parseType(type)], [value as AbiValue], what);
+    parsed = parseType(type);
   } catch (err) {
     throw new Error(
       `${what}: "${type}" is neither a struct defined in types nor an ABI type (${(err as Error).message})`,
     );
   }
+  // Outside the try: a value the type refuses — an address whose checksum
+  // fails — is the value's problem, not an unknown type's.
+  return encodeTuple([parsed], [value as AbiValue], what);
 }
 
 export function hashStruct(

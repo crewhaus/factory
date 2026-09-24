@@ -75,6 +75,13 @@ nothing on a chain. So:
   against the bytes that follow it before building anything. Type strings
   are capped at 8,192 characters and 32 levels of nesting.
 
+- **An address re-typed between two calls.** `AbiEncodeCall` and
+  `TypedDataHash` (message fields and `verifyingContract` alike) check every
+  address they encode the way `AddressCheck` does: 0x and 40 hex characters,
+  and a mixed-case address must pass its EIP-55 checksum. All-lowercase and
+  all-uppercase hex carry no checksum and are accepted, as ethers and viem
+  accept them.
+
 An address with no checksum is reported as valid **and** as unverifiable,
 rather than letting `valid: true` be read as "no typo". A position with no
 debt has no health factor rather than an infinite one — `Infinity` would read

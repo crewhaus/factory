@@ -13,6 +13,7 @@
  * ether.
  */
 import { keccak256, toHex } from "@crewhaus/tool-encode";
+import { checkedAddress } from "./address";
 
 const WORD = 32;
 
@@ -327,9 +328,9 @@ function encodeValue(
   }
 
   if (type.base === "address") {
-    const bytes = hexToBytes(String(value), what);
-    if (bytes.length !== 20)
-      throw new Error(`${what}: an address is 20 bytes, got ${bytes.length}`);
+    // Shape AND checksum: a mixed-case address that fails EIP-55 has a wrong
+    // character in it, and encoding it anyway sends to that wrong address.
+    const bytes = hexToBytes(checkedAddress(value, what), what);
     const word = new Uint8Array(WORD);
     word.set(bytes, 12);
     return { head: word, tail: none };

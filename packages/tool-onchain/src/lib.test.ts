@@ -95,7 +95,7 @@ describe("ABI encoding, against real calldata", () => {
     expect(() => encodeCall("f(uint8)", [256n])).toThrow(/does not fit in a uint8/);
     expect(() => encodeCall("f(uint256)", [-1n])).toThrow(/negative/);
     expect(() => encodeCall("f(int8)", [128n])).toThrow(/does not fit in an int8/);
-    expect(() => encodeCall("f(address)", ["0x1234"])).toThrow(/20 bytes/);
+    expect(() => encodeCall("f(address)", ["0x1234"])).toThrow(/0x followed by 40 hex characters/);
     expect(() => encodeCall("f(bytes4)", ["0xdead"])).toThrow(/needs 4 bytes/);
   });
 
@@ -113,6 +113,57 @@ describe("ABI encoding, against real calldata", () => {
 
   test("an argument count mismatch is caught before anything is encoded", () => {
     expect(() => encodeCall("transfer(address,uint256)", [VITALIK])).toThrow(/takes 2 argument/);
+  });
+});
+
+describe("an address is checked where it is encoded, not only by AddressCheck (C132)", () => {
+  // EIP-55's own vector, and the same address with its last letter's case flipped.
+  const GOOD = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed";
+  const TYPO = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAeD";
+
+  test("a mixed-case address whose checksum fails is refused, not encoded", () => {
+    expect(validateAddress(TYPO).valid).toBe(false);
+    expect(() => encodeCall("transfer(address,uint256)", [TYPO, 1n])).toThrow(
+      "argument[0]: the EIP-55 checksum does not match — at least one character is wrong",
+    );
+    // Nested: an address inside a tuple inside an array.
+    expect(() =>
+      encodeCall("f((address,uint256)[])", [
+        [
+          [GOOD, 1n],
+          [TYPO, 2n],
+        ],
+      ]),
+    ).toThrow(/argument\[0\]\[1\]\[0\]: the EIP-55 checksum does not match/);
+  });
+
+  test("an address without its 0x, or with 0X, is refused as AddressCheck refuses it", () => {
+    expect(() => encodeCall("f(address)", [GOOD.slice(2)])).toThrow(/an address starts with 0x/);
+    expect(() => encodeCall("f(address)", [`0X${GOOD.slice(2)}`])).toThrow(
+      /starts with a lowercase 0x; this starts with 0X/,
+    );
+    expect(() => encodeCall("f(address)", [42])).toThrow(/an address is a 0x hex string/);
+  });
+
+  test("a good checksum, all-lowercase and all-uppercase hex encode to the same calldata", () => {
+    const want = encodeCall("f(address)", [GOOD]);
+    expect(encodeCall("f(address)", [GOOD.toLowerCase()])).toBe(want);
+    expect(encodeCall("f(address)", [`0x${GOOD.slice(2).toUpperCase()}`])).toBe(want);
+  });
+
+  test("TypedDataHash refuses the typo in a message field and in verifyingContract", () => {
+    const types = { Mail: [{ name: "to", type: "address" }] };
+    const digest = (domain: Record<string, unknown>, to: string) =>
+      typedDataDigest({ name: "T", chainId: 1, ...domain }, types, "Mail", { to }).digest;
+    expect(() => digest({}, TYPO)).toThrow(/Mail\.to\[0\]: the EIP-55 checksum does not match/);
+    expect(() => digest({ verifyingContract: TYPO }, GOOD)).toThrow(
+      /EIP712Domain\.verifyingContract\[0\]: the EIP-55 checksum does not match/,
+    );
+    // The refusal is about the value, not reported as an unknown type.
+    expect(() => digest({}, TYPO)).not.toThrow(/neither a struct/);
+    expect(digest({ verifyingContract: GOOD.toLowerCase() }, GOOD)).toBe(
+      digest({ verifyingContract: GOOD }, GOOD.toLowerCase()),
+    );
   });
 });
 
