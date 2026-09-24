@@ -1,6 +1,18 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
   SANDBOX_DEFAULT_ALLOWED_IMAGES,
+  SANDBOX_DEFAULT_MAX_OUTPUT_BYTES,
   SandboxError,
   createSandbox,
   resolveSandboxBackend,
@@ -301,13 +313,38 @@ describe("docker backend (no daemon required for argv assembly)", () => {
   });
 });
 
-// Drives the DockerLikeSandbox exec body to completion WITHOUT a docker daemon
-// by mocking Bun.spawn. No real process is spawned, no real clock is used, and
-// every spy is restored in afterEach so the noop suites above stay unaffected.
-describe("docker backend run path (Bun.spawn mocked — no daemon, no real I/O)", () => {
-  type SpawnArgs = { argv: readonly string[]; options: Record<string, unknown> };
-  let lastSpawn: SpawnArgs | undefined;
-  let killCalls: Array<string | number>;
+// Drives the DockerLikeSandbox exec body WITHOUT a docker daemon: Bun.spawn is
+// spied so `docker`/`podman` resolve to a fake CLI script. The fake behaves as
+// the real CLI does where it matters here: `run` starts the "container" in a
+// session of its own — a real container is outside the CLI's process group,
+// so killing the CLI does not stop it — and waits for it, holding the pipes;
+// `kill NAME` and `rm -f NAME` stop it by the --name it was given.
+const posix = process.platform !== "win32";
+const hasPerl = posix && Bun.spawnSync(["perl", "-e", "exit 0"]).exitCode === 0;
+
+function alive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitGone(pid: number, budgetMs: number): Promise<boolean> {
+  const until = performance.now() + budgetMs;
+  while (performance.now() < until) {
+    if (!alive(pid)) return true;
+    await Bun.sleep(20);
+  }
+  return !alive(pid);
+}
+
+describe.if(hasPerl)("docker backend run path (fake CLI — no daemon)", () => {
+  type SpawnCall = { argv: readonly string[]; options: Record<string, unknown> };
+  let dir = "";
+  let fake = "";
+  let calls: SpawnCall[] = [];
   let spawnSpy: ReturnType<typeof spyOn> | undefined;
 
   // Bracket-notation call into the Sandbox interface method (defined in
@@ -317,104 +354,167 @@ describe("docker backend run path (Bun.spawn mocked — no daemon, no real I/O)"
     return sandbox["exec"](args);
   }
 
-  /** A ReadableStream that yields a single UTF-8 string then closes. */
-  function streamOf(text: string): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
-      start(controller) {
-        if (text.length > 0) controller.enqueue(new TextEncoder().encode(text));
-        controller.close();
-      },
-    });
+  const FAKE_CLI = (d: string) => `#!/bin/sh
+D='${d}'
+[ -z "$FAKE_CLI_NOLOG" ] && printf '%s\\n' "$*" >> "$D/log"
+verb="$1"; shift
+case "$verb" in
+  run)
+    name=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name) name="$2"; shift 2 ;;
+        --tmpfs|--security-opt|-v|-e) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+      esac
+    done
+    shift
+    exec 3<&0
+    perl -e 'use POSIX (); POSIX::setsid(); exec @ARGV or exit 127' -- "$@" <&3 3<&- &
+    pid=$!
+    echo "$pid" > "$D/container-$name"
+    wait "$pid"
+    exit $?
+    ;;
+  kill|rm)
+    [ "$1" = "-f" ] && shift
+    pid=$(cat "$D/container-$1" 2>/dev/null)
+    if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null; exit 0; fi
+    echo "Error: No such container: $1" >&2
+    exit 1
+    ;;
+esac
+exit 125
+`;
+
+  function log(): string[] {
+    const file = join(dir, "log");
+    return existsSync(file)
+      ? readFileSync(file, "utf8")
+          .split("\n")
+          .filter((l) => l !== "")
+      : [];
   }
 
-  /** Fabricate a fake Bun subprocess with controllable exit + streams. */
-  function fakeProc(opts: {
-    exitCode: number;
-    stdout?: ReadableStream<Uint8Array>;
-    stderr?: ReadableStream<Uint8Array>;
-    killThrows?: boolean;
-  }): unknown {
-    const writes: string[] = [];
-    return {
-      stdin: {
-        write(chunk: string) {
-          writes.push(chunk);
-        },
-        end() {
-          /* no-op */
-        },
-      },
-      _writes: writes,
-      stdout: opts.stdout,
-      stderr: opts.stderr,
-      exited: Promise.resolve(opts.exitCode),
-      kill(sig: string | number) {
-        killCalls.push(sig);
-        if (opts.killThrows) throw new Error("already exited");
-      },
-    };
+  function containerPid(name: string): number {
+    return Number(readFileSync(join(dir, `container-${name}`), "utf8").trim());
   }
 
-  function mockSpawn(proc: unknown): void {
+  /** Resolves once the fake container of the first run has started. */
+  async function containerStarted(budgetMs: number): Promise<string> {
+    const until = performance.now() + budgetMs;
+    while (performance.now() < until) {
+      const f = readdirSync(dir).find((n) => n.startsWith("container-"));
+      if (f !== undefined && readFileSync(join(dir, f), "utf8").trim() !== "") {
+        return f.slice("container-".length);
+      }
+      await Bun.sleep(10);
+    }
+    throw new Error("the fake container never started");
+  }
+
+  function nameOf(runLine: string | undefined): string {
+    const m = /--name (\S+)/.exec(runLine ?? "");
+    return m?.[1] ?? "";
+  }
+
+  function routeCli(cliPath: (argv0: string) => string | undefined): void {
+    const orig = Bun.spawn.bind(Bun);
     spawnSpy = spyOn(Bun, "spawn").mockImplementation(((
       argv: readonly string[],
       options: Record<string, unknown>,
     ) => {
-      lastSpawn = { argv, options };
-      return proc;
+      calls.push({ argv, options });
+      const to = cliPath(argv[0] ?? "");
+      return orig(to === undefined ? [...argv] : [to, ...argv.slice(1)], options);
       // biome-ignore lint/suspicious/noExplicitAny: test double for Bun.spawn
     }) as any);
   }
 
   beforeEach(() => {
     resetEnv();
-    lastSpawn = undefined;
-    killCalls = [];
+    calls = [];
+    dir = mkdtempSync(join(tmpdir(), "sandbox-fake-cli-"));
+    fake = join(dir, "fake-cli");
+    writeFileSync(fake, FAKE_CLI(dir));
+    chmodSync(fake, 0o755);
+    // The first exec of a new file can be slow (macOS checks it); pay that
+    // here, not inside a test's timeout. `version` is logged nowhere.
+    Bun.spawnSync([fake, "version"], { env: { ...process.env, FAKE_CLI_NOLOG: "1" } });
+    routeCli((argv0) => (argv0 === "docker" || argv0 === "podman" ? fake : undefined));
   });
 
   afterEach(() => {
     spawnSpy?.mockRestore();
     spawnSpy = undefined;
+    // Never leave a fake container sleeping behind a failed assertion.
+    for (const f of readdirSync(dir)) {
+      if (!f.startsWith("container-")) continue;
+      const pid = Number(readFileSync(join(dir, f), "utf8").trim());
+      if (pid > 0 && alive(pid)) process.kill(pid, "SIGKILL");
+    }
+    rmSync(dir, { recursive: true, force: true });
     resetEnv();
   });
 
-  test("happy path: assembles docker argv, pipes stdin, collects streams, clears timer", async () => {
-    mockSpawn(fakeProc({ exitCode: 0, stdout: streamOf("out!"), stderr: streamOf("err!") }));
+  test("happy path: assembles docker argv, pipes stdin, collects streams, names the container", async () => {
     const sandbox = createSandbox({ backend: "docker" });
     const result = await runExec(sandbox, {
       image: "alpine:3.19",
-      argv: ["echo", "hi"],
+      argv: ["sh", "-c", "cat; echo err! >&2"],
       stdin: "payload-in",
     });
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe("out!");
-    expect(result.stderr).toBe("err!");
-    expect(result.timedOut).toBe(false);
+    expect(result).toMatchObject({
+      exitCode: 0,
+      stdout: "payload-in",
+      stderr: "err!\n",
+      timedOut: false,
+      aborted: false,
+      outputComplete: true,
+      stdoutDroppedBytes: 0,
+      stderrDroppedBytes: 0,
+    });
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
 
+    const run = calls[0];
+    expect(calls).toHaveLength(1); // a clean run issues no kill and no rm
     // The argv must lead with the docker CLI and the hardened default flags.
-    expect(lastSpawn?.argv[0]).toBe("docker");
-    expect(lastSpawn?.argv).toContain("--network=none");
-    expect(lastSpawn?.argv).toContain("--read-only");
-    expect(lastSpawn?.argv).toContain("--security-opt");
-    expect(lastSpawn?.argv).toContain("no-new-privileges");
+    expect(run?.argv[0]).toBe("docker");
+    expect(run?.argv).toContain("--network=none");
+    expect(run?.argv).toContain("--read-only");
+    expect(run?.argv).toContain("--security-opt");
+    expect(run?.argv).toContain("no-new-privileges");
+    const at = run?.argv.indexOf("--name") ?? -1;
+    expect(run?.argv[at + 1]).toMatch(/^crewhaus-sbx-[0-9a-f]{16}$/);
     // image + argv are appended verbatim as the trailing elements.
-    expect(lastSpawn?.argv.slice(-3)).toEqual(["alpine:3.19", "echo", "hi"]);
-  });
+    expect(run?.argv.slice(-4)).toEqual(["alpine:3.19", "sh", "-c", "cat; echo err! >&2"]);
+    // The CLI leads its own process group, and the caller's signal is not
+    // handed to Bun.spawn: its SIGTERM reaches the container's PID 1, which
+    // ignores it.
+    expect(run?.options["detached"]).toBe(true);
+    expect(run?.options["signal"]).toBeUndefined();
+  }, 20_000);
+
+  test("every run gets a container name of its own", async () => {
+    const sandbox = createSandbox({ backend: "docker" });
+    await runExec(sandbox, { image: "alpine:3.19", argv: ["true"] });
+    await runExec(sandbox, { image: "alpine:3.19", argv: ["true"] });
+    const names = log().map(nameOf);
+    expect(names).toHaveLength(2);
+    expect(names[0]).not.toBe(names[1]);
+  }, 20_000);
 
   test("network=true switches to --network=bridge", async () => {
-    mockSpawn(fakeProc({ exitCode: 0, stdout: streamOf(""), stderr: streamOf("") }));
     const sandbox = createSandbox({ backend: "docker", network: true });
     await runExec(sandbox, { image: "alpine:3.19", argv: ["true"] });
-    expect(lastSpawn?.argv).toContain("--network=bridge");
-    expect(lastSpawn?.argv).not.toContain("--network=none");
-  });
+    expect(calls[0]?.argv).toContain("--network=bridge");
+    expect(calls[0]?.argv).not.toContain("--network=none");
+  }, 20_000);
 
-  test("forwards env vars, mounts (with :ro), and an abort signal to docker", async () => {
-    mockSpawn(fakeProc({ exitCode: 0, stdout: streamOf(""), stderr: streamOf("") }));
+  test("forwards env vars and mounts (with :ro) to docker", async () => {
     const sandbox = createSandbox({ backend: "docker", mountWhitelist: ["/srv/agent"] });
-    const ac = new AbortController();
     await runExec(sandbox, {
       image: "alpine:3.19",
       argv: ["true"],
@@ -423,88 +523,33 @@ describe("docker backend run path (Bun.spawn mocked — no daemon, no real I/O)"
         { src: "/srv/agent/ro", dst: "/ro" },
         { src: "/srv/agent/rw", dst: "/rw", readonly: false },
       ],
-      signal: ac.signal,
     });
-    const argv = lastSpawn?.argv ?? [];
+    const argv = calls[0]?.argv ?? [];
     expect(argv).toContain("-e");
     expect(argv).toContain("FOO_BAR=1");
     expect(argv).toContain("/srv/agent/ro:/ro:ro");
     expect(argv).toContain("/srv/agent/rw:/rw");
-    expect(lastSpawn?.options["signal"]).toBe(ac.signal);
-  });
+  }, 20_000);
 
   test("streams stdout chunks through onStdoutChunk on the docker path", async () => {
-    mockSpawn(fakeProc({ exitCode: 0, stdout: streamOf("chunked"), stderr: streamOf("") }));
     const sandbox = createSandbox({ backend: "docker" });
     const chunks: string[] = [];
     const result = await runExec(sandbox, {
       image: "alpine:3.19",
-      argv: ["true"],
+      argv: ["printf", "chunked"],
       onStdoutChunk: (c) => chunks.push(c),
     });
     expect(chunks.join("")).toBe("chunked");
     expect(result.stdout).toBe("chunked");
-  });
+  }, 20_000);
 
-  test("timeout fires the SIGKILL timer callback (synchronous fake clock)", async () => {
-    mockSpawn(fakeProc({ exitCode: -1, stdout: streamOf(""), stderr: streamOf("") }));
-    // Replace the real timer with a synchronous shim so the callback runs
-    // immediately and no real handle is ever scheduled.
-    const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
-      fn();
-      return 0 as unknown as ReturnType<typeof setTimeout>;
-      // biome-ignore lint/suspicious/noExplicitAny: timer shim
-    }) as any);
-    const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
-      // biome-ignore lint/suspicious/noExplicitAny: timer shim
-      ((_id?: number | Timer) => {}) as any,
-    );
-    try {
-      const sandbox = createSandbox({ backend: "docker" });
-      const result = await runExec(sandbox, { image: "alpine:3.19", argv: ["true"], timeoutMs: 5 });
-      expect(result.timedOut).toBe(true);
-      expect(killCalls).toContain("SIGKILL");
-    } finally {
-      setSpy.mockRestore();
-      clearSpy.mockRestore();
-    }
-  });
-
-  test("timer callback swallows a kill() that throws (process already exited)", async () => {
-    mockSpawn(
-      fakeProc({ exitCode: -1, stdout: streamOf(""), stderr: streamOf(""), killThrows: true }),
-    );
-    const setSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void) => {
-      // Must not throw out of the run even though proc.kill throws.
-      expect(() => fn()).not.toThrow();
-      return 0 as unknown as ReturnType<typeof setTimeout>;
-      // biome-ignore lint/suspicious/noExplicitAny: timer shim
-    }) as any);
-    const clearSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
-      // biome-ignore lint/suspicious/noExplicitAny: timer shim
-      ((_id?: number | Timer) => {}) as any,
-    );
-    try {
-      const sandbox = createSandbox({ backend: "docker" });
-      const result = await runExec(sandbox, { image: "alpine:3.19", argv: ["true"], timeoutMs: 5 });
-      expect(result.timedOut).toBe(true);
-      expect(killCalls).toContain("SIGKILL");
-    } finally {
-      setSpy.mockRestore();
-      clearSpy.mockRestore();
-    }
-  });
-
-  test("run without stdin does not write to the pipe", async () => {
-    const proc = fakeProc({ exitCode: 0, stdout: streamOf(""), stderr: streamOf("") });
-    mockSpawn(proc);
+  test("run without stdin gives the program an empty stdin", async () => {
     const sandbox = createSandbox({ backend: "docker" });
-    await runExec(sandbox, { image: "alpine:3.19", argv: ["true"] });
-    expect((proc as { _writes: string[] })._writes).toEqual([]);
-  });
+    const result = await runExec(sandbox, { image: "alpine:3.19", argv: ["cat"] });
+    expect(result).toMatchObject({ exitCode: 0, stdout: "", timedOut: false });
+  }, 20_000);
 
   test("close() makes the docker sandbox refuse further runs", async () => {
-    mockSpawn(fakeProc({ exitCode: 0, stdout: streamOf(""), stderr: streamOf("") }));
     const sandbox = createSandbox({ backend: "docker" });
     await sandbox.close();
     await expect(runExec(sandbox, { image: "alpine:3.19", argv: ["true"] })).rejects.toThrow(
@@ -512,6 +557,7 @@ describe("docker backend run path (Bun.spawn mocked — no daemon, no real I/O)"
     );
     // Idempotent close.
     await sandbox.close();
+    expect(calls).toHaveLength(0);
   });
 
   test("docker constructor rejects a non-absolute mountWhitelist entry", () => {
@@ -524,39 +570,387 @@ describe("docker backend run path (Bun.spawn mocked — no daemon, no real I/O)"
     // Passing a NON-EMPTY allowedImages exercises the constructor's
     // `.filter((s) => s.length > 0)` callback (empty-array constructions
     // never invoke it). The custom list also replaces the curated default.
-    mockSpawn(fakeProc({ exitCode: 0, stdout: streamOf("ok"), stderr: streamOf("") }));
     const sandbox = createSandbox({ backend: "docker", allowedImages: ["custom:tag", ""] });
-    const result = await runExec(sandbox, { image: "custom:tag", argv: ["true"] });
+    const result = await runExec(sandbox, { image: "custom:tag", argv: ["printf", "ok"] });
     expect(result.stdout).toBe("ok");
     // A curated default image is now rejected because the explicit list won.
     await expect(runExec(sandbox, { image: "alpine:3.19", argv: ["true"] })).rejects.toThrow(
       /not on the allowlist/,
     );
-  });
+  }, 20_000);
 
-  test("multi-chunk stream flushes a split UTF-8 tail through onStdoutChunk", async () => {
-    // Two chunks where a 3-byte '€' is split across the boundary forces the
-    // TextDecoder streaming tail-flush branch in collectStream to run.
-    const euro = new TextEncoder().encode("€"); // [0xE2,0x82,0xAC]
-    const split = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array([0x41, euro[0] as number])); // "A" + first byte
-        controller.enqueue(new Uint8Array([euro[1] as number, euro[2] as number])); // rest of €
-        controller.close();
-      },
-    });
-    mockSpawn(fakeProc({ exitCode: 0, stdout: split, stderr: streamOf("") }));
+  test("a UTF-8 character split across chunks reaches onStdoutChunk whole", async () => {
+    // "A" + the first byte of "€", a pause, then its last two bytes.
     const sandbox = createSandbox({ backend: "docker" });
     const chunks: string[] = [];
     const result = await runExec(sandbox, {
       image: "alpine:3.19",
-      argv: ["true"],
+      argv: ["sh", "-c", "printf 'A\\342'; sleep 0.2; printf '\\202\\254'"],
       onStdoutChunk: (c) => chunks.push(c),
     });
     expect(result.stdout).toBe("A€");
     expect(chunks.join("")).toBe("A€");
+  }, 20_000);
+
+  test("a CLI that cannot start is a SandboxError that names it", async () => {
+    spawnSpy?.mockRestore();
+    routeCli((argv0) => (argv0 === "docker" ? join(dir, "no-such-cli") : undefined));
+    const sandbox = createSandbox({ backend: "docker" });
+    await expect(runExec(sandbox, { image: "alpine:3.19", argv: ["true"] })).rejects.toThrow(
+      /could not start docker/,
+    );
+  }, 20_000);
+
+  // security-6#0 / flag-truth-3#0: the timeout SIGKILLed only the CLI and then
+  // waited for pipes the still-running container held — the call returned when
+  // the program ended on its own, and the container outlived the timeout.
+  test("a timeout kills the container by name, and the call returns without waiting for it", async () => {
+    const sandbox = createSandbox({ backend: "docker" });
+    const t0 = performance.now();
+    const result = await runExec(sandbox, {
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "echo started; sleep 30; echo never"],
+      timeoutMs: 1_000,
+    });
+    const elapsed = performance.now() - t0;
+    const lines = log();
+    const name = nameOf(lines[0]);
+    expect(name).toMatch(/^crewhaus-sbx-[0-9a-f]{16}$/);
+    expect(result.timedOut).toBe(true);
+    expect(result.aborted).toBe(false);
+    expect(result.stdout).toBe("started\n");
+    // Killed by name, then removed in case it was created but never started.
+    expect(lines.slice(1)).toEqual([`kill ${name}`, `rm -f ${name}`]);
+    expect(await waitGone(containerPid(name), 2_000)).toBe(true);
+    // The fake container sleeps 30 s; returning in a fraction of that is the
+    // property, not a race.
+    expect(elapsed).toBeLessThan(10_000);
+  }, 20_000);
+
+  test("an abort stops the container the same way and says it was cancelled", async () => {
+    const sandbox = createSandbox({ backend: "docker" });
+    const controller = new AbortController();
+    // Abort once the container runs: the property is what an abort does to
+    // a running container, whatever the machine's spawn latency.
+    void containerStarted(10_000).then(() => controller.abort());
+    const t0 = performance.now();
+    const result = await runExec(sandbox, {
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "echo started; sleep 30; echo never"],
+      signal: controller.signal,
+    });
+    const elapsed = performance.now() - t0;
+    const lines = log();
+    const name = nameOf(lines[0]);
+    expect(result.aborted).toBe(true);
+    expect(result.timedOut).toBe(false);
+    expect(result.stdout).not.toContain("never");
+    expect(lines.slice(1)).toEqual([`kill ${name}`, `rm -f ${name}`]);
+    expect(await waitGone(containerPid(name), 2_000)).toBe(true);
+    expect(elapsed).toBeLessThan(10_000);
+  }, 20_000);
+
+  test("a signal aborted before the call starts nothing", async () => {
+    const sandbox = createSandbox({ backend: "docker" });
+    const controller = new AbortController();
+    controller.abort();
+    const result = await runExec(sandbox, {
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "echo should-not-run"],
+      signal: controller.signal,
+    });
+    expect(result).toMatchObject({ aborted: true, timedOut: false, exitCode: -1, stdout: "" });
+    expect(log()).toEqual([]);
+  });
+
+  test("the podman backend stops its container with podman kill", async () => {
+    const sandbox = createSandbox({ backend: "podman" });
+    const result = await runExec(sandbox, {
+      image: "alpine:3.19",
+      argv: ["sleep", "30"],
+      timeoutMs: 200,
+    });
+    expect(result.timedOut).toBe(true);
+    const verbs = calls.map((c) => `${c.argv[0]} ${c.argv[1]}`);
+    expect(verbs).toEqual(["podman run", "podman kill", "podman rm"]);
+  }, 20_000);
+});
+
+describe.if(posix)("noop backend: a timeout or abort takes down what the program started", () => {
+  beforeEach(() => {
+    resetEnv();
+  });
+  afterEach(() => {
+    resetEnv();
+  });
+
+  // The timeout used to SIGKILL only the direct child; a grandchild holding
+  // the pipe kept the call waiting until it finished on its own.
+  test("a grandchild holding the pipe does not hold the call past the timeout", async () => {
+    const sandbox = createSandbox({ backend: "noop" });
+    const t0 = performance.now();
+    const result = await sandbox.exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "echo started; sleep 30; echo never"],
+      timeoutMs: 300,
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.stdout).toBe("started\n");
+    expect(result.exitCode).not.toBe(0);
+    expect(performance.now() - t0).toBeLessThan(10_000);
+  }, 20_000);
+
+  test("an abort kills the program's group and says cancelled, not exit 0", async () => {
+    const sandbox = createSandbox({ backend: "noop" });
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 200);
+    const t0 = performance.now();
+    const result = await sandbox.exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "sleep 30; echo never"],
+      signal: controller.signal,
+    });
+    expect(result).toMatchObject({ aborted: true, timedOut: false, stdout: "" });
+    expect(result.exitCode).not.toBe(0);
+    expect(performance.now() - t0).toBeLessThan(10_000);
+  }, 20_000);
+
+  test("a signal aborted before the call runs nothing", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sandbox-noop-abort-"));
+    try {
+      const marker = join(dir, "ran");
+      const controller = new AbortController();
+      controller.abort();
+      const result = await createSandbox({ backend: "noop" }).exec({
+        image: "alpine:3.19",
+        argv: ["touch", marker],
+        signal: controller.signal,
+      });
+      expect(result).toMatchObject({ aborted: true, exitCode: -1 });
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
+
+// security-12#4 / security-6#8: stdout and stderr were buffered whole on the
+// host — 150 MB of program output reached the tool result, and 256 MiB of
+// verifier output cost 2.6 GiB of host memory. The cap now applies as bytes
+// arrive; past it the output is drained and counted, never held.
+describe.if(posix)("output is capped as it arrives", () => {
+  const FLOOD = "head -c 3000000 /dev/zero | tr '\\0' a; echo; echo TAIL";
+  const FLOOD_BYTES = 3_000_000 + 1 + 5;
+  const marker = (n: number) => `[stdout truncated: ${n} bytes dropped]\n`;
+
+  beforeEach(() => {
+    resetEnv();
+  });
+  afterEach(() => {
+    resetEnv();
+  });
+
+  for (const streaming of [false, true]) {
+    test(`keeps the start and the end, marks and counts the rest${streaming ? " (streaming)" : ""}`, async () => {
+      const chunks: string[] = [];
+      const result = await createSandbox({ backend: "noop" }).exec({
+        image: "alpine:3.19",
+        argv: ["sh", "-c", FLOOD],
+        maxOutputBytes: 65_536,
+        ...(streaming ? { onStdoutChunk: (c: string) => chunks.push(c) } : {}),
+      });
+      const dropped = FLOOD_BYTES - 65_536;
+      expect(result.exitCode).toBe(0);
+      expect(result.stdoutBytes).toBe(FLOOD_BYTES);
+      expect(result.stdoutDroppedBytes).toBe(dropped);
+      expect(result.stdout.startsWith("aaaa")).toBe(true);
+      expect(result.stdout.endsWith("\nTAIL\n")).toBe(true);
+      expect(result.stdout).toContain(`\n${marker(dropped)}`);
+      expect(Buffer.byteLength(result.stdout)).toBe(
+        65_536 + 1 + Buffer.byteLength(marker(dropped)),
+      );
+      if (streaming) {
+        // Only the kept start is streamed live, then one notice.
+        const streamed = chunks.join("");
+        expect(streamed.startsWith("a".repeat(32_768))).toBe(true);
+        expect(streamed.slice(32_768)).toBe(
+          "\n[stdout truncated: output past 32768 bytes is not streamed]\n",
+        );
+      }
+    }, 20_000);
+  }
+
+  test("with no cap given, the sandbox default (1 MiB per stream) applies", async () => {
+    const result = await createSandbox({ backend: "noop" }).exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", FLOOD],
+    });
+    expect(SANDBOX_DEFAULT_MAX_OUTPUT_BYTES).toBe(1024 * 1024);
+    expect(result.stdoutDroppedBytes).toBe(FLOOD_BYTES - SANDBOX_DEFAULT_MAX_OUTPUT_BYTES);
+    expect(result.stdout.endsWith("TAIL\n")).toBe(true);
+  }, 20_000);
+
+  test("a sandbox-level cap applies to every call, and a call can set its own", async () => {
+    const sandbox = createSandbox({ backend: "noop", maxOutputBytes: 1_000 });
+    const byDefault = await sandbox.exec({ image: "alpine:3.19", argv: ["sh", "-c", FLOOD] });
+    expect(byDefault.stdoutDroppedBytes).toBe(FLOOD_BYTES - 1_000);
+    const perCall = await sandbox.exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", FLOOD],
+      maxOutputBytes: 2_000,
+    });
+    expect(perCall.stdoutDroppedBytes).toBe(FLOOD_BYTES - 2_000);
+  }, 20_000);
+
+  test("stderr has its own cap, and output that fits is untouched", async () => {
+    const result = await createSandbox({ backend: "noop" }).exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "head -c 200000 /dev/zero | tr '\\0' e >&2; printf out"],
+      maxOutputBytes: 1_000,
+    });
+    expect(result.stdout).toBe("out");
+    expect(result.stdoutDroppedBytes).toBe(0);
+    expect(result.stderrBytes).toBe(200_000);
+    expect(result.stderrDroppedBytes).toBe(199_000);
+    expect(result.stderr).toContain("[stderr truncated: 199000 bytes dropped]");
+  }, 20_000);
+
+  test("a cap that falls inside a multi-byte character leaves no replacement character", async () => {
+    // 100 000 × "€" (3 bytes each); an odd cap puts both cuts mid-character.
+    const result = await createSandbox({ backend: "noop" }).exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "head -c 100000 /dev/zero | tr '\\0' x | sed 's/x/€/g' | tr -d '\\n'"],
+      maxOutputBytes: 1_001,
+    });
+    expect(result.stdoutBytes).toBe(300_000);
+    expect(result.stdout).not.toContain("�");
+    const dropped = result.stdoutDroppedBytes ?? 0;
+    // The marker sits on a line of its own between the kept start and end.
+    const line = `\n${marker(dropped)}`;
+    expect(result.stdout).toContain(`€${line}€`);
+    const kept = Buffer.byteLength(result.stdout) - Buffer.byteLength(line);
+    // Every byte is either in the text or counted as dropped.
+    expect(kept + dropped).toBe(300_000);
+    expect(kept).toBeLessThanOrEqual(1_001);
+  }, 20_000);
+
+  test("a live consumer that throws does not stop the run", async () => {
+    const result = await createSandbox({ backend: "noop" }).exec({
+      image: "alpine:3.19",
+      argv: ["printf", "fine"],
+      onStdoutChunk: () => {
+        throw new Error("consumer broke");
+      },
+    });
+    expect(result).toMatchObject({ exitCode: 0, stdout: "fine" });
+  });
+
+  test("a cap or a timeout that is not a number is refused, not obeyed", async () => {
+    const sandbox = createSandbox({ backend: "noop" });
+    for (const bad of [Number.NaN, -1, Number.POSITIVE_INFINITY]) {
+      await expect(
+        sandbox.exec({ image: "alpine:3.19", argv: ["true"], maxOutputBytes: bad }),
+      ).rejects.toThrow(/maxOutputBytes must be/);
+    }
+    for (const bad of [Number.NaN, 0, -5]) {
+      await expect(
+        sandbox.exec({ image: "alpine:3.19", argv: ["true"], timeoutMs: bad }),
+      ).rejects.toThrow(/timeoutMs must be/);
+    }
+    expect(() => createSandbox({ backend: "docker", maxOutputBytes: Number.NaN })).toThrow(
+      SandboxError,
+    );
+  });
+});
+
+// The real thing, where a docker daemon and the image are already here. It
+// never pulls: without alpine:3.19 locally the block is skipped.
+function dockerReady(): boolean {
+  if (!posix) return false;
+  try {
+    const info = Bun.spawnSync(["docker", "image", "inspect", "alpine:3.19"], {
+      stdout: "ignore",
+      stderr: "ignore",
+      timeout: 5_000,
+    });
+    return info.exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+describe.if(dockerReady())("docker backend against a real daemon", () => {
+  let names: string[] = [];
+  let spawnSpy: ReturnType<typeof spyOn> | undefined;
+
+  beforeEach(() => {
+    resetEnv();
+    names = [];
+    const orig = Bun.spawn.bind(Bun);
+    spawnSpy = spyOn(Bun, "spawn").mockImplementation(((
+      argv: readonly string[],
+      options: Record<string, unknown>,
+    ) => {
+      const at = argv.indexOf("--name");
+      if (argv[1] === "run" && at > 0) names.push(argv[at + 1] as string);
+      return orig([...argv], options);
+      // biome-ignore lint/suspicious/noExplicitAny: pass-through spy on Bun.spawn
+    }) as any);
+  });
+  afterEach(() => {
+    spawnSpy?.mockRestore();
+    for (const name of names) {
+      Bun.spawnSync(["docker", "rm", "-f", name], { stdout: "ignore", stderr: "ignore" });
+    }
+    resetEnv();
+  });
+
+  function left(name: string): string {
+    const ps = Bun.spawnSync(["docker", "ps", "-a", "-q", "--filter", `name=${name}`], {
+      timeout: 10_000,
+    });
+    return new TextDecoder().decode(ps.stdout).trim();
+  }
+
+  test("a busy loop is stopped at the timeout and no container is left", async () => {
+    const t0 = performance.now();
+    const result = await createSandbox({ backend: "docker" }).exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "echo started; while :; do :; done"],
+      timeoutMs: 1_000,
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.stdout).toBe("started\n");
+    expect(performance.now() - t0).toBeLessThan(20_000);
+    expect(names).toHaveLength(1);
+    expect(left(names[0] as string)).toBe("");
+  }, 30_000);
+
+  test("an abort stops the container and no container is left", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 1_000);
+    const result = await createSandbox({ backend: "docker" }).exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", "sleep 60"],
+      signal: controller.signal,
+    });
+    expect(result.aborted).toBe(true);
+    expect(left(names[0] as string)).toBe("");
+  }, 30_000);
+
+  test("a flood from the container is capped on the host", async () => {
+    const result = await createSandbox({ backend: "docker" }).exec({
+      image: "alpine:3.19",
+      argv: ["sh", "-c", FLOOD_IN_CONTAINER],
+      maxOutputBytes: 65_536,
+    });
+    expect(result.stdoutBytes).toBe(3_000_006);
+    expect(result.stdoutDroppedBytes).toBe(3_000_006 - 65_536);
+    expect(result.stdout.endsWith("TAIL\n")).toBe(true);
+  }, 30_000);
+});
+
+const FLOOD_IN_CONTAINER = "head -c 3000000 /dev/zero | tr '\\0' a; echo; echo TAIL";
 
 describe("one reading of CREWHAUS_SANDBOX (security-6#1)", () => {
   beforeEach(() => {
