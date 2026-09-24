@@ -461,6 +461,12 @@ describe("what a registrar would refuse, found at compile time", () => {
     ]);
   });
 
+  test("a host with a port but no scheme is named as that, not as a strange scheme", () => {
+    expect(
+      problems("registerHttpConfig", { allowed_origins: ["localhost:8080"] })[0]?.message,
+    ).toBe('"localhost:8080" is not an origin: it has no scheme. Write "https://localhost:8080".');
+  });
+
   test("a scheme the registrar refuses, and https-only lists", () => {
     expect(problems("registerCodehostConfig", { allowedOrigins: ["ftp://git.example"] })).toEqual([
       {

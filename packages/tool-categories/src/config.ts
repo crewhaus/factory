@@ -534,14 +534,16 @@ function originProblem(entry: unknown, httpsOnly: boolean): string | undefined {
   if (typeof entry !== "string") {
     return `must be an origin written as a string, such as "https://api.example.com".`;
   }
+  // A bare host (`api.example.com`, `localhost:8080`) first: the second one
+  // even parses, as a URL whose scheme is `localhost:`.
+  if (/^[A-Za-z0-9.-]+(:\d+)?$/.test(entry)) {
+    return `"${entry}" is not an origin: it has no scheme. Write "https://${entry}".`;
+  }
   let url: URL;
   try {
     url = new URL(entry);
   } catch {
-    const bare = /^[A-Za-z0-9.-]+(:\d+)?$/.test(entry);
-    return bare
-      ? `"${entry}" is not an origin: it has no scheme. Write "https://${entry}".`
-      : `"${entry}" is not an origin. Write it as https://host[:port].`;
+    return `"${entry}" is not an origin. Write it as https://host[:port].`;
   }
   const ok = httpsOnly
     ? url.protocol === "https:"

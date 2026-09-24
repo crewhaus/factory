@@ -27,7 +27,7 @@ for (const [, r] of regs) {
   for (const k of r.checks?.refused?.keys ?? []) keys.add(k);
 }
 const VALUES = ["", "api.example.com", "https://a.example", [], ["https://a.example"],
-  ["http://a.example"], ["api.example.com"], ["ftp://a.example"], ["https://"], [5], [null],
+  ["http://a.example"], ["api.example.com"], ["localhost:8080"], ["ftp://a.example"], ["https://"], [5], [null],
   null, true, 7, { a: 1 }];
 const out = [];
 for (const [symbol, reg] of regs) {
