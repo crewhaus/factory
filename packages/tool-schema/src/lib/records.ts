@@ -7,7 +7,13 @@
  * does every row match the schema, is the key actually unique, and does every
  * foreign key point at something that exists.
  */
-import { type Schema, type ValidationError, validateValue } from "./jsonschema";
+import {
+  type Schema,
+  type ValidationError,
+  type WorkBudget,
+  defaultWorkLimit,
+  validateValue,
+} from "./jsonschema";
 import { canonicalize, getPath, isPlainObject, preview, typeOf } from "./value";
 
 /** Joins a path and a keyword into one map key; a character no path contains. */
@@ -22,10 +28,19 @@ export type RowFailure = {
 };
 
 export type RecordsReport = {
+  /** False when any row failed OR could not be decided. */
   ok: boolean;
   total: number;
   passed: number;
   failed: number;
+  /**
+   * Rows with no verdict: the call's work budget ran out on or before them,
+   * so they are neither passed nor failed. Always 0 unless a schema's
+   * anyOf/oneOf/allOf over shared $refs multiplied past the budget.
+   */
+  undetermined: number;
+  /** The first undetermined row and why, or null. */
+  undeterminedFrom: { row: number; reason: string } | null;
   /** Failures, capped at `maxFailedRows`. */
   failures: RowFailure[];
   /** True when the failure list was cut short; `failed` is still the true count. */
@@ -81,13 +96,24 @@ export function validateRecords(
   >();
   const unsupported = new Set<string>();
   let failed = 0;
+  let undetermined = 0;
+  let undeterminedFrom: RecordsReport["undeterminedFrom"] = null;
+  // One budget for the whole call, sized by all the rows together: a
+  // per-row budget would let 20,000 hostile rows each spend a full one.
+  const budget: WorkBudget = { used: 0, limit: defaultWorkLimit(rows) };
 
   rows.forEach((row, index) => {
     const result = validateValue(row, schema, {
       assertFormat: opts.assertFormat,
       maxErrors: opts.maxErrorsPerRow,
+      budget,
     });
     for (const keyword of result.unsupportedKeywords) unsupported.add(keyword);
+    if (result.undetermined !== null) {
+      undetermined += 1;
+      undeterminedFrom ??= { row: index, reason: result.undetermined };
+      return;
+    }
     if (result.valid) return;
     failed += 1;
     if (failures.length < opts.maxFailedRows) {
@@ -122,10 +148,12 @@ export function validateRecords(
   );
 
   return {
-    ok: failed === 0,
+    ok: failed === 0 && undetermined === 0,
     total: rows.length,
-    passed: rows.length - failed,
+    passed: rows.length - failed - undetermined,
     failed,
+    undetermined,
+    undeterminedFrom,
     failures,
     truncated: failed > failures.length,
     topIssues,

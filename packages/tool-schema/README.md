@@ -64,6 +64,21 @@ sitting in a branch this particular value never reached is not in it. A
 
 `format` follows Draft-07 and is an annotation until you pass `assertFormat`.
 
+A recursive schema may recurse through any keyword, `anyOf`, `oneOf`, `not`,
+`if` and `contains` included; only the same `$ref` reached twice at the same
+place in the value is reported as a cycle.
+
+**The work is bounded.** `anyOf`, `oneOf` and `allOf` over `$ref`s that share
+a target multiply, so a small schema can ask for billions of evaluations.
+Each call gets a budget of subschema evaluations, sized to the value (at
+least 500,000, and 64 per node of the value). When a schema needs more,
+`JsonSchemaValidate` answers `valid: null` with `undetermined: true` and the
+reason, never a verdict either way; `ValidateRecords` shares one budget
+across its rows and counts the rows it could not decide as `undetermined`,
+neither passed nor failed, with `ok: false`. A failing alternative's reason
+is summarised in a bounded message, so nested alternatives cannot grow the
+result either.
+
 ## The formats
 
 Each format is a stated subset, not a full grammar, and each rejects the grey

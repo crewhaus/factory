@@ -49,6 +49,18 @@
  *   independently of the type.
  * - Errors stop accumulating at `maxErrors`, and the result says `truncated`.
  *
+ * ## A bounded amount of work, and "undetermined" when it runs out
+ *
+ * `anyOf`/`oneOf`/`allOf` over `$ref`s that share a target multiply: a
+ * 1.3 KB schema can ask for 2^30 subschema evaluations, and the walk is
+ * synchronous. Every subschema evaluation is counted against a budget
+ * (`maxWork`; by default the larger of {@link DEFAULT_MAX_WORK} and
+ * {@link WORK_PER_VALUE_NODE} per node of the value). When it runs out the
+ * walk stops and the result is `undetermined`, with `valid: false` and the
+ * reason — never a verdict either way. A failing branch is summarised in a
+ * bounded message, so the nested reasons of a deep `anyOf` cannot grow the
+ * result exponentially either.
+ *
  * `pattern` is an unanchored ECMA-262 match, per the spec — `"pattern": "a"`
  * matches `"banana"`.
  */
@@ -86,10 +98,55 @@ export type ValidateOptions = {
   assertFormat: boolean;
   /** Stop collecting after this many errors. */
   maxErrors: number;
+  /**
+   * Most subschema evaluations before the answer is `undetermined`. Default:
+   * the larger of DEFAULT_MAX_WORK and WORK_PER_VALUE_NODE per value node.
+   */
+  maxWork: number;
+  /**
+   * A budget shared with other calls (ValidateRecords draws every row from
+   * one). When given, `maxWork` is ignored.
+   */
+  budget: WorkBudget;
 };
 
+/** Subschema evaluations allowed and spent; shared by reference. */
+export type WorkBudget = { used: number; readonly limit: number };
+
+/** The budget floor: about a third of a second of the worst schemas measured (Apple silicon). */
+export const DEFAULT_MAX_WORK = 500_000;
+/** Work allowed per node of the value, so a large document is not refused for its size. */
+export const WORK_PER_VALUE_NODE = 64;
+
+/** Nodes in a JSON value (itself included), counted iteratively, stopping at `cap`. */
+export function countValueNodes(value: unknown, cap = Number.MAX_SAFE_INTEGER): number {
+  let count = 0;
+  const stack: unknown[] = [value];
+  while (stack.length > 0 && count < cap) {
+    const node = stack.pop();
+    count++;
+    if (Array.isArray(node)) for (const item of node) stack.push(item);
+    else if (isPlainObject(node)) for (const key of Object.keys(node)) stack.push(node[key]);
+  }
+  return count;
+}
+
+/** The default budget for validating `value`. */
+export function defaultWorkLimit(value: unknown): number {
+  const floorNodes = Math.ceil(DEFAULT_MAX_WORK / WORK_PER_VALUE_NODE);
+  const nodes = countValueNodes(value);
+  return nodes <= floorNodes ? DEFAULT_MAX_WORK : nodes * WORK_PER_VALUE_NODE;
+}
+
 export type ValidationResult = {
+  /** Never true when `undetermined` is set. */
   valid: boolean;
+  /**
+   * Why no verdict could be reached, or null when `valid` is the verdict.
+   * Set when the work budget ran out: the errors listed are the ones found
+   * before it did, and the value may be valid or invalid.
+   */
+  undetermined: string | null;
   errors: ValidationError[];
   /** True when `maxErrors` cut the list short. */
   truncated: boolean;
@@ -165,20 +222,42 @@ const MAX_DEPTH = 100;
 
 type Ctx = {
   root: Schema;
-  opts: ValidateOptions;
+  opts: Pick<ValidateOptions, "assertFormat" | "maxErrors">;
   errors: ValidationError[];
   truncated: boolean;
   unsupported: Set<string>;
   refStack: string[];
+  /**
+   * Where this context's `path` "" sits in the whole value. A branch is
+   * validated in a scratch context whose paths restart at "" (so its
+   * messages read relative to the branch), but the `$ref` cycle marker must
+   * be absolute: two levels of one recursive schema reach the same `$ref`
+   * at different places, and keyed on the relative path they collided, so a
+   * valid recursive value was reported as a cycle.
+   */
+  refBase: string;
   depth: number;
+  work: WorkBudget;
 };
+
+/** Thrown when the work budget runs out; caught only in `validateValue`. */
+class WorkExhausted extends Error {}
+
+/** Longest message one error carries; nested branch reasons are cut here. */
+const MAX_MESSAGE_CHARS = 1_000;
+/** Longest summary of one failing branch inside an anyOf/oneOf message. */
+const MAX_BRANCH_SUMMARY_CHARS = 200;
+
+function clip(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
 
 function fail(ctx: Ctx, path: string, keyword: string, schemaPath: string, message: string): false {
   if (ctx.errors.length >= ctx.opts.maxErrors) {
     ctx.truncated = true;
     return false;
   }
-  ctx.errors.push({ path, keyword, message, schemaPath });
+  ctx.errors.push({ path, keyword, message: clip(message, MAX_MESSAGE_CHARS), schemaPath });
   return false;
 }
 
@@ -187,6 +266,7 @@ function branchErrors(
   value: unknown,
   schema: Schema,
   ctx: Ctx,
+  path: string,
   schemaPath: string,
 ): ValidationError[] {
   const scratch: Ctx = {
@@ -196,7 +276,9 @@ function branchErrors(
     truncated: false,
     unsupported: ctx.unsupported,
     refStack: ctx.refStack,
+    refBase: `${ctx.refBase}${path}`,
     depth: ctx.depth,
+    work: ctx.work,
   };
   validateNode(value, schema, "", schemaPath, scratch);
   return scratch.errors;
@@ -206,7 +288,20 @@ function summarizeBranch(errors: ValidationError[]): string {
   if (errors.length === 0) return "no error";
   const first = errors[0] as ValidationError;
   const where = first.path === "" ? "" : ` at ${first.path}`;
-  return `${first.message}${where}`;
+  return clip(`${first.message}${where}`, MAX_BRANCH_SUMMARY_CHARS);
+}
+
+/** The reasons of every failing alternative, joined, within MAX_MESSAGE_CHARS. */
+function joinReasons(reasons: ReadonlyArray<string>): string {
+  let out = "";
+  for (let i = 0; i < reasons.length; i++) {
+    const next = out === "" ? (reasons[i] as string) : `${out}; ${reasons[i]}`;
+    if (next.length > MAX_MESSAGE_CHARS - 40) {
+      return `${out} … (+${reasons.length - i} more)`;
+    }
+    out = next;
+  }
+  return out;
 }
 
 function validateNumber(
@@ -430,8 +525,14 @@ function validateArray(
   }
   if (contains !== undefined) {
     const matched = value.some(
-      (item) =>
-        branchErrors(item, contains as Schema, ctx, joinPointer(sp, "contains")).length === 0,
+      (item, i) =>
+        branchErrors(
+          item,
+          contains as Schema,
+          ctx,
+          joinPointer(path, i),
+          joinPointer(sp, "contains"),
+        ).length === 0,
     );
     if (!matched) {
       fail(
@@ -500,6 +601,7 @@ function validateObject(
         key,
         propertyNames as Schema,
         ctx,
+        joinPointer(path, key),
         joinPointer(sp, "propertyNames"),
       );
       if (errors.length > 0) {
@@ -598,6 +700,7 @@ function validateLogic(
         value,
         anyOf[i] as Schema,
         ctx,
+        path,
         joinPointer(joinPointer(sp, "anyOf"), i),
       );
       if (errors.length === 0) anyPassed = true;
@@ -609,7 +712,7 @@ function validateLogic(
         path,
         "anyOf",
         joinPointer(sp, "anyOf"),
-        `matched none of the ${anyOf.length} alternatives — ${reasons.join("; ")}`,
+        `matched none of the ${anyOf.length} alternatives — ${joinReasons(reasons)}`,
       );
     }
   }
@@ -621,6 +724,7 @@ function validateLogic(
         value,
         oneOf[i] as Schema,
         ctx,
+        path,
         joinPointer(joinPointer(sp, "oneOf"), i),
       );
       if (errors.length === 0) passing.push(i);
@@ -632,7 +736,7 @@ function validateLogic(
         path,
         "oneOf",
         joinPointer(sp, "oneOf"),
-        `matched none of the ${oneOf.length} alternatives — ${reasons.join("; ")}`,
+        `matched none of the ${oneOf.length} alternatives — ${joinReasons(reasons)}`,
       );
     } else if (passing.length > 1) {
       fail(
@@ -645,13 +749,13 @@ function validateLogic(
     }
   }
   if (not !== undefined) {
-    if (branchErrors(value, not as Schema, ctx, joinPointer(sp, "not")).length === 0) {
+    if (branchErrors(value, not as Schema, ctx, path, joinPointer(sp, "not")).length === 0) {
       fail(ctx, path, "not", joinPointer(sp, "not"), "matched a schema it must not match");
     }
   }
   if (schema["if"] !== undefined) {
     const conditionHolds =
-      branchErrors(value, schema["if"] as Schema, ctx, joinPointer(sp, "if")).length === 0;
+      branchErrors(value, schema["if"] as Schema, ctx, path, joinPointer(sp, "if")).length === 0;
     const branch = conditionHolds ? schema["then"] : schema["else"];
     if (branch !== undefined) {
       validateNode(
@@ -689,6 +793,8 @@ function resolveRef(ref: string, ctx: Ctx): { schema: Schema } | { error: string
 
 /** Validate one value against one schema, appending any failures to `ctx`. */
 function validateNode(value: unknown, schema: Schema, path: string, sp: string, ctx: Ctx): void {
+  ctx.work.used += 1;
+  if (ctx.work.used > ctx.work.limit) throw new WorkExhausted();
   if (ctx.depth > MAX_DEPTH) {
     fail(
       ctx,
@@ -722,7 +828,9 @@ function validateNode(value: unknown, schema: Schema, path: string, sp: string, 
   // Draft-07: a `$ref` replaces its sibling keywords entirely.
   if (typeof schema["$ref"] === "string") {
     const ref = schema["$ref"];
-    const marker = `${ref}@${path}`;
+    // Keyed on the ABSOLUTE instance position: the same $ref twice at one
+    // place in the value, with nothing consumed between, is a real cycle.
+    const marker = `${ref}@${ctx.refBase}${path}`;
     if (ctx.refStack.includes(marker)) {
       fail(ctx, path, "$ref", joinPointer(sp, "$ref"), `$ref "${ref}" cycles at this position`);
       return;
@@ -802,6 +910,10 @@ export function validateValue(
   schema: Schema,
   options: Partial<ValidateOptions> = {},
 ): ValidationResult {
+  const work: WorkBudget = options.budget ?? {
+    used: 0,
+    limit: options.maxWork ?? defaultWorkLimit(value),
+  };
   const ctx: Ctx = {
     root: schema,
     opts: { assertFormat: options.assertFormat ?? false, maxErrors: options.maxErrors ?? 100 },
@@ -809,11 +921,20 @@ export function validateValue(
     truncated: false,
     unsupported: new Set<string>(),
     refStack: [],
+    refBase: "",
     depth: 0,
+    work,
   };
-  validateNode(value, schema, "", "", ctx);
+  let undetermined: string | null = null;
+  try {
+    validateNode(value, schema, "", "", ctx);
+  } catch (err) {
+    if (!(err instanceof WorkExhausted)) throw err;
+    undetermined = `the schema needed more than ${work.limit} subschema evaluations for this value, so no verdict was reached — anyOf, oneOf and allOf over shared $refs multiply`;
+  }
   return {
-    valid: ctx.errors.length === 0,
+    valid: undetermined === null && ctx.errors.length === 0,
+    undetermined,
     errors: ctx.errors,
     truncated: ctx.truncated,
     unsupportedKeywords: [...ctx.unsupported].sort(),

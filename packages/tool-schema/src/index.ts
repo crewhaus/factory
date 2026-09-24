@@ -108,6 +108,18 @@ export const jsonSchemaValidate: RegisteredTool = buildTool({
       assertFormat: input.assertFormat ?? false,
       maxErrors: input.maxErrors ?? 100,
     });
+    if (result.undetermined !== null) {
+      // Not a verdict either way: `valid` is null, never false or true.
+      return json({
+        valid: null,
+        undetermined: true,
+        reason: result.undetermined,
+        errorsBeforeStopping: result.errors,
+        ...(result.unsupportedKeywords.length > 0
+          ? { unsupportedKeywords: result.unsupportedKeywords }
+          : {}),
+      });
+    }
     return json({
       valid: result.valid,
       errorCount: result.errors.length,
@@ -196,6 +208,9 @@ export const validateRecords: RegisteredTool = buildTool({
       total: report.total,
       passed: report.passed,
       failed: report.failed,
+      ...(report.undetermined > 0
+        ? { undetermined: report.undetermined, undeterminedFrom: report.undeterminedFrom }
+        : {}),
       topIssues: report.topIssues.slice(0, 20),
       ...(report.unsupportedKeywords.length > 0
         ? { unsupportedKeywords: report.unsupportedKeywords }
