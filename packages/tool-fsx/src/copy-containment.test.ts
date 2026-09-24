@@ -155,6 +155,39 @@ describe("a link is judged from where the copy or move puts it (C068 chain)", ()
   });
 });
 
+describe("the verifiers' C068 cases, as they wrote them", () => {
+  beforeEach(() => {
+    mkdirSync(path.join(ws, "src/d1/d2"), { recursive: true });
+    write("src/target.txt", "inside");
+    // Leads to src/target.txt where it sits; one level up from the root at depth 1.
+    symlinkSync("../../target.txt", path.join(ws, "src/d1/d2/l"));
+  });
+
+  test("CopyPath of the directory to depth 1 is refused, dryRun included, and plants nothing", async () => {
+    for (const dryRun of [true, false]) {
+      const r = JSON.parse(
+        await call(copyPath, { source: "src/d1/d2", destination: "dest2", dryRun }),
+      );
+      expect(r).toMatchObject({ copied: false, code: "escapes-root" });
+    }
+    expect(() => lstatSync(path.join(ws, "dest2/l"))).toThrow();
+  });
+
+  test("MovePath of the single link to depth 0 is refused, and the link stays where it was", async () => {
+    const m = JSON.parse(await call(movePath, { source: "src/d1/d2/l", destination: "l" }));
+    expect(m).toMatchObject({ moved: false, code: "escapes-root" });
+    expect(lstatSync(path.join(ws, "src/d1/d2/l")).isSymbolicLink()).toBe(true);
+    expect(existsSync(path.join(ws, "l"))).toBe(false);
+  });
+
+  test("the same depth elsewhere still resolves inside, so it copies", async () => {
+    mkdirSync(path.join(ws, "src/e1"));
+    const r = JSON.parse(await call(copyPath, { source: "src/d1/d2", destination: "src/e1/e2" }));
+    expect(r).toMatchObject({ copied: true, symlinks: 1 });
+    expect(readFileSync(path.join(ws, "src/e1/e2/l"), "utf8")).toBe("inside");
+  });
+});
+
 describe("the EXDEV fallback of MovePath is the contained copy, then the delete", () => {
   const exdev = (): void => {
     throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });

@@ -308,6 +308,33 @@ describe("Read and Edit read only regular files, and only so much (C074)", () =>
   });
 });
 
+describe("a dangling link's target is walked as the kernel walks it (C068)", () => {
+  test("Write, Edit and Read refuse `evil -> a/y/../x` when `a/y -> ..`", async () => {
+    // The workspace gets its own parent, so the escape has somewhere to land.
+    const parent = mkdtempSync(path.join(tmpdir(), "tool-fs-parent-"));
+    const ws = path.join(parent, "ws");
+    await mkdir(path.join(ws, "a"), { recursive: true });
+    process.chdir(ws);
+    try {
+      symlinkSync("..", path.join(ws, "a", "y"));
+      symlinkSync("a/y/../landed.txt", path.join(ws, "evil"));
+      await expect(write.execute({ path: "evil", content: "PWNED" })).rejects.toBeInstanceOf(
+        ToolPermissionError,
+      );
+      await expect(
+        edit.execute({ path: "evil", oldString: "a", newString: "b" }),
+      ).rejects.toBeInstanceOf(ToolPermissionError);
+      await expect(read.execute({ path: "evil" })).rejects.toBeInstanceOf(ToolPermissionError);
+      // Neither where the kernel leads nor where the text reads was written.
+      expect(readdirSync(parent).sort()).toEqual(["ws"]);
+      expect(readdirSync(path.join(ws, "a"))).toEqual(["y"]);
+    } finally {
+      process.chdir(tmp);
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("Glob tool", () => {
   test("lists matching files relative to cwd", async () => {
     await writeFile(path.join(tmp, "a.ts"), "");
