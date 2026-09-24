@@ -17,6 +17,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -222,6 +223,88 @@ describe("ingestDocument — size cap", () => {
   test("default maxBytes is 1MB", () => {
     const parsed = ingestDocument.inputSchema.parse({ path: "x" });
     expect(parsed.maxBytes).toBeUndefined();
+  });
+});
+
+/** The content between the metadata separator and the closing tag. */
+function bodyOf(result: unknown): string {
+  const text = String(result);
+  const start = text.indexOf("\n---\n") + "\n---\n".length;
+  return text.slice(start, text.lastIndexOf("\n</document>"));
+}
+
+describe("ingestDocument — maxBytes bounds what is READ (C077)", () => {
+  test("a 5 GiB file is read as its first maxBytes, never allocated whole", async () => {
+    // Sparse: no disk cost. 0.7.0 allocated the whole file first, so this
+    // threw a RangeError however small maxBytes was.
+    writeFileSync(join(tmp, "huge.log"), "");
+    truncateSync(join(tmp, "huge.log"), 5 * 1024 ** 3);
+    const result = await ingestDocument.execute({ path: "huge.log", maxBytes: 1000 });
+    expect(result).toContain("TRUNCATED to 1000 bytes");
+    expect(result).toContain('"size":5368709120');
+    expect(result).toContain('"linesPartial":true');
+    expect(Buffer.byteLength(bodyOf(result))).toBe(1000);
+  });
+
+  test("memory stays bounded by maxBytes, not by the file", async () => {
+    writeFileSync(join(tmp, "big.log"), "");
+    truncateSync(join(tmp, "big.log"), 64 * 1024 ** 2);
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    const result = await ingestDocument.execute({ path: "big.log", maxBytes: 1000 });
+    const grew = process.memoryUsage().rss - before;
+    expect(result).toContain("TRUNCATED to 1000 bytes");
+    // 0.7.0: about three times the file, some 190 MiB here.
+    expect(grew).toBeLessThan(32 * 1024 ** 2);
+  }, 20_000);
+
+  test("the cut never splits a character, and never exceeds maxBytes", async () => {
+    writeFile("accents.txt", "é".repeat(100));
+    const body = bodyOf(await ingestDocument.execute({ path: "accents.txt", maxBytes: 51 }));
+    expect(body.includes("\uFFFD")).toBe(false);
+    expect(Buffer.byteLength(body)).toBeLessThanOrEqual(51);
+    expect(body).toBe("é".repeat(25));
+  });
+
+  test("line counts of a truncated file describe the part read, and say so", async () => {
+    writeFile("many.log", "x\n".repeat(10_000));
+    const result = await ingestDocument.execute({ path: "many.log", maxBytes: 100 });
+    expect(result).toContain('"lines":50');
+    expect(result).toContain('"linesPartial":true');
+    // A file that fits is counted exactly, with no flag.
+    const whole = await ingestDocument.execute({ path: "many.log" });
+    expect(whole).toContain('"lines":10000');
+    expect(whole).not.toContain("linesPartial");
+  });
+
+  test("a truncated .json is not validated, rather than called invalid", async () => {
+    writeFile("data.json", `${JSON.stringify({ k: "v".repeat(40) })}   junk`);
+    const cut = await ingestDocument.execute({ path: "data.json", maxBytes: 50 });
+    expect(cut).toContain('"valid_json":null');
+    expect(cut).toContain("skipped: the file is larger than maxBytes");
+    writeFile("small.json", '{"k":1}');
+    expect(await ingestDocument.execute({ path: "small.json" })).toContain('"valid_json":true');
+  });
+
+  test("a truncated .csv counts rows in the part read, flagged, with columns from the header", async () => {
+    writeFile("rows.csv", `a,b,c\n${"1,2,3\n".repeat(1000)}`);
+    const result = await ingestDocument.execute({ path: "rows.csv", maxBytes: 60 });
+    expect(result).toContain('"rowsPartial":true');
+    expect(result).toContain('"columns":3');
+    expect(result).not.toContain('"rows":1001');
+  });
+
+  test("a registered parser is told the budget, and its output is cut on a character boundary", async () => {
+    let told: unknown;
+    registerDocumentParser(".bin", (_path, options) => {
+      told = options;
+      return { content: "ü".repeat(100) };
+    });
+    writeFile("blob.bin", "raw");
+    const result = await ingestDocument.execute({ path: "blob.bin", maxBytes: 31 });
+    expect(told).toEqual({ maxBytes: 31 });
+    expect(result).toContain("TRUNCATED to 31 bytes");
+    expect(bodyOf(result)).toBe("ü".repeat(15));
   });
 });
 
