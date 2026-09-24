@@ -44,6 +44,7 @@
  * cookie jar, and no certificate handling beyond the runtime's own.
  */
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { lookup as dnsLookup, resolveTxt } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
 import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
@@ -1497,7 +1498,69 @@ export function describeFailure(err: unknown, deadline?: Deadline): string {
 // idempotency
 // ---------------------------------------------------------------------------
 
-export type LedgerEntry = { readonly tool: string; readonly result: string };
+/**
+ * What makes two calls under one key the SAME request: every argument except
+ * the ones that only say how to deliver it (the key itself, deadlines, byte
+ * caps, retry pacing), each reduced to a SHA-256 of its canonical JSON. Kept
+ * per field, so a refusal can say which fields differed without keeping
+ * the message itself in memory. A caller-supplied clock reading that only
+ * stamps the message (EmailSend's `date`, a webhook signature's timestamp)
+ * is left out by the caller: a retry that re-reads its clock is still a
+ * retry.
+ */
+export type RequestFingerprint = ReadonlyMap<string, string>;
+
+const DELIVERY_KNOBS = new Set([
+  "idempotencyKey",
+  "idempotencyHeader",
+  "timeoutMs",
+  "maxBytes",
+  "retries",
+  "backoffMs",
+  "justification",
+]);
+
+/** Object keys sorted, so `{a, b}` and `{b, a}` are one request. */
+function sortedKeys(_key: string, value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const sorted: Record<string, unknown> = Object.create(null);
+  for (const key of Object.keys(value).sort()) {
+    sorted[key] = (value as Record<string, unknown>)[key];
+  }
+  return sorted;
+}
+
+export function requestFingerprint(args: Readonly<Record<string, unknown>>): RequestFingerprint {
+  const fields = new Map<string, string>();
+  for (const key of Object.keys(args).sort()) {
+    const value = args[key];
+    if (DELIVERY_KNOBS.has(key) || value === undefined) continue;
+    const canonical = JSON.stringify(value, sortedKeys) ?? "undefined";
+    fields.set(key, createHash("sha256").update(canonical, "utf8").digest("hex"));
+  }
+  return fields;
+}
+
+/** The fields two fingerprints disagree on, sorted; empty when they match. */
+function differingFields(a: RequestFingerprint, b: RequestFingerprint): string[] {
+  const names = new Set([...a.keys(), ...b.keys()]);
+  return [...names].filter((name) => a.get(name) !== b.get(name)).sort(byString);
+}
+
+export type LedgerEntry = {
+  readonly tool: string;
+  readonly fingerprint: RequestFingerprint;
+  readonly result: string;
+};
+
+/**
+ * `replay` — this key already sent this request; here is what it returned.
+ * `conflict` — this key already sent a DIFFERENT request, which this call
+ * must not be mistaken for: it is refused and sends nothing.
+ */
+export type LedgerAnswer =
+  | { readonly kind: "replay"; readonly result: string }
+  | { readonly kind: "conflict"; readonly differs: readonly string[] };
 
 /**
  * The per-process record of what has already been sent under which key.
@@ -1506,8 +1569,14 @@ export type LedgerEntry = { readonly tool: string; readonly result: string };
  * agent, and "post it again" is the wrong answer when the first post
  * succeeded. Every sending tool takes an `idempotencyKey`; the key is passed
  * to the provider when the provider honours one, AND recorded here, so a
- * second call with the same key returns the first call's result and posts
- * nothing.
+ * second call with the same key and the same request returns the first
+ * call's result and posts nothing.
+ *
+ * A key names ONE request. The same key with a different destination or
+ * body used to be answered from here too, so it returned the first call's
+ * `sent: true` and message id for a message that was never sent. It is now
+ * a `conflict`, which the tool refuses (as a provider that honours
+ * Idempotency-Key would), and nothing goes out.
  *
  * This is deliberate hidden state, and it is the one place in the package
  * where a repeated call does not repeat its effect — which is the entire
@@ -1518,12 +1587,26 @@ export type LedgerEntry = { readonly tool: string; readonly result: string };
 const LEDGER_LIMIT = 512;
 const ledger = new Map<string, LedgerEntry>();
 
-export function ledgerLookup(tool: string, key: string | undefined): LedgerEntry | undefined {
+export function ledgerLookup(
+  tool: string,
+  key: string | undefined,
+  fingerprint: RequestFingerprint,
+): LedgerAnswer | undefined {
   if (key === undefined || key === "") return undefined;
-  return ledger.get(`${tool}\u0000${key}`);
+  const entry = ledger.get(`${tool}\u0000${key}`);
+  if (entry === undefined) return undefined;
+  const differs = differingFields(entry.fingerprint, fingerprint);
+  return differs.length === 0
+    ? { kind: "replay", result: entry.result }
+    : { kind: "conflict", differs };
 }
 
-export function ledgerRecord(tool: string, key: string | undefined, result: string): void {
+export function ledgerRecord(
+  tool: string,
+  key: string | undefined,
+  fingerprint: RequestFingerprint,
+  result: string,
+): void {
   if (key === undefined || key === "") return;
   const id = `${tool}\u0000${key}`;
   if (ledger.size >= LEDGER_LIMIT && !ledger.has(id)) {
@@ -1531,7 +1614,7 @@ export function ledgerRecord(tool: string, key: string | undefined, result: stri
     const oldest = ledger.keys().next();
     if (!oldest.done) ledger.delete(oldest.value);
   }
-  ledger.set(id, { tool, result });
+  ledger.set(id, { tool, fingerprint, result });
 }
 
 /** Test-only — a fresh process's empty ledger. */

@@ -1708,6 +1708,160 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
 });
 
 // ---------------------------------------------------------------------------
+// idempotency
+// ---------------------------------------------------------------------------
+
+describe("an idempotency key names one message", () => {
+  const sms = {
+    provider: "gateway",
+    to: "+15550001111",
+    body: "disk full",
+    idempotencyKey: "daily",
+  };
+
+  test("the same key for a different recipient or body sends nothing and says so", async () => {
+    const first = String(await smsSend.execute(sms));
+    expect(first).toContain('"sent":true');
+    // A true retry still replays the first result, byte for byte.
+    expect(String(await smsSend.execute(sms))).toBe(first);
+    const other = String(
+      await smsSend.execute({ ...sms, to: "+15550002222", body: "CPU melting" }),
+    );
+    // 0.7.0 returned the first call's {"sent":true,…,"messageId":"SM123"}
+    // here, for a message that was never sent to +15550002222.
+    expect({ other, posts: requests.length }).toEqual({
+      other:
+        'nothing was sent: idempotencyKey "daily" already sent a different SmsSend request in this process (it differed in body, to). A key names one message — use a new key for a new message',
+      posts: 1,
+    });
+  });
+
+  test("ChatPost, PushNotify and WebhookPost refuse a changed request under a used key", async () => {
+    const pairs: Array<[string, () => Promise<unknown>, () => Promise<unknown>]> = [
+      [
+        "ChatPost",
+        () =>
+          chatPost.execute({
+            platform: "slack",
+            webhookUrlEnv: WEBHOOK_VAR,
+            text: "a",
+            idempotencyKey: "k",
+          }),
+        () =>
+          chatPost.execute({
+            platform: "slack",
+            webhookUrlEnv: WEBHOOK_VAR,
+            text: "b",
+            idempotencyKey: "k",
+          }),
+      ],
+      [
+        "PushNotify",
+        () =>
+          pushNotify.execute({
+            provider: "gateway",
+            to: "device-token",
+            body: "a",
+            idempotencyKey: "k",
+          }),
+        () =>
+          pushNotify.execute({
+            provider: "gateway",
+            to: "device-token",
+            body: "a",
+            data: { extra: "1" },
+            idempotencyKey: "k",
+          }),
+      ],
+      [
+        "WebhookPost",
+        () =>
+          webhookPost.execute({ url: `${origin}/hook`, payload: { n: 1 }, idempotencyKey: "k" }),
+        () =>
+          webhookPost.execute({ url: `${origin}/hook`, payload: { n: 2 }, idempotencyKey: "k" }),
+      ],
+    ];
+    const seen: Array<{ tool: string; first: boolean; second: string }> = [];
+    for (const [tool, a, b] of pairs) {
+      const before = requests.length;
+      const first = String(await a()).includes('"sent":true');
+      const second = String(await b());
+      seen.push({
+        tool,
+        first,
+        second: `${second.includes(`already sent a different ${tool} request`)} ${requests.length - before}`,
+      });
+    }
+    expect(seen).toEqual([
+      { tool: "ChatPost", first: true, second: "true 1" },
+      { tool: "PushNotify", first: true, second: "true 1" },
+      { tool: "WebhookPost", first: true, second: "true 1" },
+    ]);
+  });
+
+  test("a retry that changes only how it is delivered, or its clock reading, is still a retry", async () => {
+    const chat = {
+      platform: "slack",
+      webhookUrlEnv: WEBHOOK_VAR,
+      text: "once",
+      idempotencyKey: "r1",
+    };
+    const first = String(await chatPost.execute(chat));
+    const retried = String(await chatPost.execute({ ...chat, timeoutMs: 9_000, maxBytes: 4096 }));
+    expect(retried).toBe(first);
+
+    const hook = {
+      url: `${origin}/hook`,
+      payload: { b: 2, a: 1 },
+      signing: { secretEnv: SECRET_VAR, scheme: "timestamped", timestampSeconds: 1758100000 },
+      idempotencyKey: "r2",
+    };
+    const sent = String(await webhookPost.execute(hook));
+    const again = String(
+      await webhookPost.execute({
+        ...hook,
+        // The same object with its keys in another order is the same payload.
+        payload: { a: 1, b: 2 },
+        signing: { ...hook.signing, timestampSeconds: 1758100060 },
+        retries: 2,
+        backoffMs: 10,
+      }),
+    );
+    expect(again).toBe(sent);
+    expect(requests.length).toBe(2);
+
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const mail = {
+        from: { address: "ci@example.com" },
+        to: [{ address: "ops@example.com" }],
+        subject: "Nightly",
+        text: "green",
+        host: "127.0.0.1",
+        port,
+        requireTls: false,
+        idempotencyKey: "r3",
+      };
+      const once = String(await emailSend.execute({ ...mail, date: "2026-09-17T09:30:00Z" }));
+      const twice = String(await emailSend.execute({ ...mail, date: "2026-09-17T09:31:00Z" }));
+      expect(twice).toBe(once);
+      const changed = String(
+        await emailSend.execute({
+          ...mail,
+          to: [{ address: "x@team.test" }],
+          date: "2026-09-17T09:32:00Z",
+        }),
+      );
+      expect(changed).toContain("already sent a different EmailSend request");
+      expect(changed).toContain("(it differed in to)");
+      expect(log.messages.length).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // instants
 // ---------------------------------------------------------------------------
 

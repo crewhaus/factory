@@ -263,7 +263,10 @@ Stated rather than papered over:
 - **Implicit TLS (port 465) is untested** for the same reason.
 - **The idempotency ledger is per-process.** A retry after a restart will send
   again. The ledger is the second line of defence; the key is also passed to
-  the provider, which is the first.
+  the provider, which is the first. A key names one message: the same key
+  with a different destination or content is refused and sends nothing,
+  while a retry that changes only its timeout, byte cap, retry pacing or
+  clock reading (`date`, a signature timestamp) returns the first result.
 - **`ChatUpdate` does not return the previous text,** because the platform
   does not give it back.
 - **`EmailSendPreflight` does not fold provider-specific aliases.** Two

@@ -37,8 +37,9 @@
  * The one deliberate exception to "same input, same output" is the
  * idempotency ledger in `./net`: a second call carrying an
  * `idempotencyKey` that already succeeded returns the first result and posts
- * nothing. That is the point of an idempotency key, and it is the only
- * hidden state in the package.
+ * nothing — when it is the same request; the same key with a different
+ * destination or content is refused. That is the point of an idempotency
+ * key, and it is the only hidden state in the package.
  */
 import { readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
@@ -100,6 +101,7 @@ import {
   recipientAllowed,
   redactorFor,
   rejectInlineCredentials,
+  requestFingerprint,
   resolveNotifyConfig,
   resolveSecret,
   safeUrlLabel,
@@ -113,6 +115,7 @@ import type {
   DestinationKind,
   NotifyConfig,
   ProviderProfile,
+  RequestFingerprint,
   TxtAnswer,
 } from "./net";
 import { resolveSafe } from "./paths";
@@ -198,7 +201,7 @@ const idempotencySchema = z
   .max(200)
   .optional()
   .describe(
-    "a key that makes a retry safe: the first call under this key is sent and recorded for the life of the process, and a later call with the same key returns that result without sending again. It is also passed to the provider where the provider honours one",
+    "a key that makes a retry safe: the first call under this key is sent and recorded for the life of the process, and a later call with the same key and the same request returns that result without sending again. The same key with a different destination or content is refused and sends nothing — a key names one message. It is also passed to the provider where the provider honours one",
   );
 
 const authSchema = z
@@ -397,6 +400,24 @@ function inlineWebhookCredential(url: URL): string | null {
 }
 
 const notSentBecause = (reason: string): string => `nothing was sent: ${reason}`;
+
+/**
+ * What the idempotency ledger already says about this call, or undefined
+ * when it should go ahead: the first call's result for a retry of the same
+ * request, and a refusal for a different request under a key already used.
+ */
+function ledgerAnswer(
+  tool: string,
+  key: string | undefined,
+  fingerprint: RequestFingerprint,
+): string | undefined {
+  const answer = ledgerLookup(tool, key, fingerprint);
+  if (answer === undefined) return undefined;
+  if (answer.kind === "replay") return answer.result;
+  return notSentBecause(
+    `idempotencyKey "${key}" already sent a different ${tool} request in this process (it differed in ${answer.differs.join(", ")}). A key names one message — use a new key for a new message`,
+  );
+}
 
 // ---------------------------------------------------------------------------
 // chat
@@ -635,8 +656,9 @@ export const chatPost: RegisteredTool = buildTool({
       timeoutMs?: number;
       maxBytes?: number;
     };
-    const cached = ledgerLookup("ChatPost", args.idempotencyKey);
-    if (cached !== undefined) return cached.result;
+    const fingerprint = requestFingerprint(args);
+    const cached = ledgerAnswer("ChatPost", args.idempotencyKey, fingerprint);
+    if (cached !== undefined) return cached;
 
     const rendered = renderMessage(args.platform, args.text, args.blocks);
     if (typeof rendered === "string") return notSentBecause(rendered);
@@ -712,7 +734,7 @@ export const chatPost: RegisteredTool = buildTool({
           ...(warnings.length > 0 ? { warnings: warnings.sort(byString) } : {}),
         }),
       );
-      ledgerRecord("ChatPost", args.idempotencyKey, result);
+      ledgerRecord("ChatPost", args.idempotencyKey, fingerprint, result);
       return result;
     } catch (err) {
       return prepared.redact(notSentBecause(describeFailure(err, prepared.deadline)));
@@ -1287,8 +1309,11 @@ export const emailSend: RegisteredTool = buildTool({
       idempotencyKey?: string;
       timeoutMs?: number;
     };
-    const cached = ledgerLookup("EmailSend", args.idempotencyKey);
-    if (cached !== undefined) return cached.result;
+    // `date` only stamps the message, so a retry that re-reads its clock is
+    // still the same message; everything that says who gets what is compared.
+    const fingerprint = requestFingerprint({ ...args, date: undefined });
+    const cached = ledgerAnswer("EmailSend", args.idempotencyKey, fingerprint);
+    if (cached !== undefined) return cached;
 
     const cfg = resolveNotifyConfig(ctx?.toolConfig);
     const everyone = [...(args.to ?? []), ...(args.cc ?? []), ...(args.bcc ?? [])];
@@ -1363,7 +1388,7 @@ export const emailSend: RegisteredTool = buildTool({
           queued: outcome.queued,
         }),
       );
-      ledgerRecord("EmailSend", args.idempotencyKey, result);
+      ledgerRecord("EmailSend", args.idempotencyKey, fingerprint, result);
       return result;
     } catch (err) {
       return redact(notSentBecause(describeFailure(err, deadline)));
@@ -1781,8 +1806,15 @@ export const webhookPost: RegisteredTool = buildTool({
       timeoutMs?: number;
       maxBytes?: number;
     };
-    const cached = ledgerLookup("WebhookPost", args.idempotencyKey);
-    if (cached !== undefined) return cached.result;
+    // A signature's timestamp only stamps the delivery; the payload and the
+    // destination are what make it a different request.
+    const fingerprint = requestFingerprint({
+      ...args,
+      signing:
+        args.signing === undefined ? undefined : { ...args.signing, timestampSeconds: undefined },
+    });
+    const cached = ledgerAnswer("WebhookPost", args.idempotencyKey, fingerprint);
+    if (cached !== undefined) return cached;
 
     if ((args.url === undefined) === (args.urlEnv === undefined)) {
       return notSentBecause("give exactly one of url or urlEnv");
@@ -1870,7 +1902,7 @@ export const webhookPost: RegisteredTool = buildTool({
               ...(outcome.body !== "" ? { response: outcome.body } : {}),
             }),
           );
-          ledgerRecord("WebhookPost", args.idempotencyKey, result);
+          ledgerRecord("WebhookPost", args.idempotencyKey, fingerprint, result);
           return result;
         }
 
@@ -2011,8 +2043,9 @@ async function runProviderSend(
     const refused = destinationRefusal(values["to"] ?? "", kind, cfg);
     if (refused !== null) return notSentBecause(refused);
   }
-  const cached = ledgerLookup(toolName, args.idempotencyKey);
-  if (cached !== undefined) return cached.result;
+  const fingerprint = requestFingerprint({ provider: providerName, ...values });
+  const cached = ledgerAnswer(toolName, args.idempotencyKey, fingerprint);
+  if (cached !== undefined) return cached;
 
   const call = buildProviderCall(cfg, providerName, values, args.idempotencyKey);
   if (!call.ok) return notSentBecause(call.message);
@@ -2052,7 +2085,7 @@ async function runProviderSend(
         ...(typeof status === "string" ? { deliveryStatus: status } : {}),
       }),
     );
-    ledgerRecord(toolName, args.idempotencyKey, result);
+    ledgerRecord(toolName, args.idempotencyKey, fingerprint, result);
     return result;
   } catch (err) {
     return prepared.redact(notSentBecause(describeFailure(err, prepared.deadline)));
