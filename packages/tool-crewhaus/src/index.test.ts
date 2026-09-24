@@ -1275,6 +1275,31 @@ describe("permission reporting matches the engine", () => {
     ]);
   });
 
+  test("a rule naming a tool the runtime adds on its own is not a dead rule", async () => {
+    // procode's `alwaysAllow Skill` and the browser starter's `alwaysAllow
+    // Type` were listed as covering nothing, with "Write Shell" / "Write Tree".
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [read, shell, tree]",
+      "permissions:",
+      "  rules:",
+      "    - { type: alwaysAllow, pattern: Skill }",
+      "    - { type: alwaysAllow, pattern: Type }",
+      "    - { type: alwaysAllow, pattern: Shel }",
+    ].join("\n");
+    const result = await callJson<{
+      ruleProblems: Array<{ pattern: string; code: string; suggestion?: string }>;
+    }>(permissionAudit, { spec });
+    // Only the real typo is reported — and not "corrected" into allowing Shell.
+    expect(result.ruleProblems.map((p) => [p.pattern, p.code, p.suggestion])).toEqual([
+      ["Shel", "unknown-tool", undefined],
+    ]);
+  });
+
   test("a rule in the pre-0.7.1 MCP spelling still names an mcp__ tool", async () => {
     const spec = [
       "name: demo",

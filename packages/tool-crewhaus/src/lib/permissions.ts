@@ -31,6 +31,7 @@ import { isOutwardName } from "@crewhaus/tool-builder";
 import { legacyMcpToolName } from "@crewhaus/tool-catalog";
 import {
   type PermissionRuleProblem,
+  type RuleToolDescriptor,
   permissionRuleProblems,
 } from "@crewhaus/tool-permission-matcher";
 import { compareStrings } from "./spec-view";
@@ -284,8 +285,13 @@ export type AuditPermissionsInput = {
    * `undefined` for anything the manifest does not describe.
    */
   readonly flagsOf?: (tool: string) => ToolFlagsLike | undefined;
-  /** Every builtin, for spotting a rule that names none of them. */
-  readonly knownTools?: readonly ToolFlagsLike[];
+  /**
+   * Every tool that exists — the builtins and the tools the runtime registers
+   * on its own (`Skill`, `Type`, …) — for spotting a rule that names none of
+   * them. A tool given without flags is treated as one that may change or
+   * delete things.
+   */
+  readonly knownTools?: readonly RuleToolDescriptor[];
   /** The MCP servers the spec declares. */
   readonly mcpServers?: readonly string[];
   /** The spec's `security.justification.judge`, when it sets one. */

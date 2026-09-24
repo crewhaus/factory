@@ -11,18 +11,30 @@ import {
   permissionRuleProblems,
 } from "./index";
 
-const tool = (name: string, operativeArgs?: RuleToolDescriptor["operativeArgs"]) => ({
+const tool = (
+  name: string,
+  operativeArgs?: RuleToolDescriptor["operativeArgs"],
+  flags: { destructive?: boolean; requiresSandbox?: boolean } = {},
+) => ({
   name,
   key: name.charAt(0).toLowerCase() + name.slice(1),
   ...(operativeArgs !== undefined ? { operativeArgs } : {}),
+  ...flags,
 });
-const removePath = tool("RemovePath", [{ kind: "path" }]);
-const httpRequest = tool("HttpRequest", [{ kind: "url" }]);
+const safe = { destructive: false, requiresSandbox: false };
+const removePath = tool("RemovePath", [{ kind: "path" }], { destructive: true });
+const httpRequest = tool("HttpRequest", [{ kind: "url" }], { destructive: true });
 const runCommand = tool("RunCommand", [{ kind: "command" }]);
 const clipboardWrite = tool("ClipboardWrite", []);
 const legacy = tool("Legacy");
 const granted = [removePath, httpRequest, runCommand, clipboardWrite, legacy];
-const known = [...granted, tool("HttpBatch", [{ kind: "url" }]), tool("Write", [{ kind: "path" }])];
+const known = [
+  ...granted,
+  tool("HttpBatch", [{ kind: "url" }]),
+  tool("Write", [{ kind: "path" }]),
+  tool("Tree", [{ kind: "path" }], safe),
+  tool("Shell", [], { destructive: true, requiresSandbox: true }),
+];
 
 function problems(patterns: string[], mcpServers: string[] = []) {
   return permissionRuleProblems({
@@ -47,12 +59,55 @@ describe("rules that name no tool", () => {
   });
 
   test("a near miss of a tool name, and nothing for a name it has never heard of", () => {
-    expect(problems(["HttpReqest"])[0]).toMatchObject({
-      code: "unknown-tool",
-      suggestion: "HttpRequest",
-    });
+    expect(problems(["Tre"])[0]).toMatchObject({ code: "unknown-tool", suggestion: "Tree" });
     // `Task`, `Consult` and a sub-agent's own tools are added at run time.
     expect(problems(["Task", "Consult", "SomeCustomTool(x)"])).toEqual([]);
+  });
+
+  test("a correction never turns an allow into a grant of a tool that can do more", () => {
+    // `alwaysAllow Skil` corrected to `Shell` would allow running code.
+    for (const typo of ["Shel", "HttpReqest"]) {
+      const [p] = problems([typo]);
+      expect(p?.code).toBe("unknown-tool");
+      expect(p?.suggestion).toBeUndefined();
+      expect(p?.message).toContain("is not offered as the fix");
+    }
+    expect(problems(["Shel"])[0]?.message).toBe(
+      'rule "Shel" matches no tool, so it never fires. The nearest name is Shell, which may change or delete things, so it is not offered as the fix: write "Shell" only if you mean to allow Shell, or remove the rule.',
+    );
+    // A tool whose flags are not known is treated as one that can do more.
+    const unknownFlags = permissionRuleProblems({
+      rules: [{ type: "alwaysAllow", pattern: "Clik" }],
+      granted: [],
+      known: [{ name: "Click" }],
+      mcpServers: [],
+    });
+    expect(unknownFlags[0]?.suggestion).toBeUndefined();
+    // A deny or an ask may be corrected towards any tool: it only narrows.
+    for (const type of ["alwaysDeny", "alwaysAsk"]) {
+      const [p] = permissionRuleProblems({
+        rules: [{ type, pattern: "Shel" }],
+        granted,
+        known,
+        mcpServers: [],
+      });
+      expect(p?.suggestion).toBe("Shell");
+    }
+  });
+
+  test("a runtime tool the caller knows is never read as a typo of a builtin", () => {
+    // What `crewhaus lint` passes: the builtins plus RUNTIME_TOOL_NAMES.
+    const withRuntime = [...known, { name: "Skill" }, { name: "Type" }];
+    const found = permissionRuleProblems({
+      rules: ["Skill", "Type"].map((pattern) => ({ type: "alwaysAllow", pattern })),
+      granted,
+      known: withRuntime,
+      mcpServers: [],
+    });
+    expect(found).toEqual([]);
+    // …and without them, the near miss is reported (the 0.7.1 review finding),
+    // with no fix that widens the allow.
+    expect(problems(["Type"])[0]).toMatchObject({ code: "unknown-tool", suggestion: "Tree" });
   });
 
   test("an MCP rule for a server the spec does not declare", () => {

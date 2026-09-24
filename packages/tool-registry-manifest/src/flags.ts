@@ -5533,3 +5533,64 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
 export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
   Object.values(TOOL_FLAGS).map((flags) => [flags.name, flags]),
 );
+
+/**
+ * The other tools this release defines: ones the runtime registers without a
+ * spec listing them (`Skill`, `ListTools`, `Task`, the browser shape's
+ * `Type`, the memory and plan tools, `Consult`, …). Names only — how
+ * each is gated depends on how the runtime builds it. A permission rule
+ * naming one of these names a real tool, even though no builtin has the name.
+ *
+ * Read from the source by `apps/cli/src/runtime-tool-names.ts`, not written
+ * out; `apps/cli/src/tool-registry.test.ts` fails when it is stale.
+ */
+export const RUNTIME_TOOL_NAMES: ReadonlyArray<string> = [
+  "CiteFact",
+  "Click",
+  "Consult",
+  "Escalate",
+  "EvmBlockNumber",
+  "EvmCall",
+  "EvmGetBalance",
+  "EvmGetLogs",
+  "EvmGetTransaction",
+  "EvmGetTransactionReceipt",
+  "EvmSendTransaction",
+  "EvmSimulate",
+  "FindElement",
+  "FocusRead",
+  "FocusWrite",
+  "GoalList",
+  "GoalUpdate",
+  "GoalWrite",
+  "Handoff",
+  "Key",
+  "ListTools",
+  "MemoryClear",
+  "MemoryForget",
+  "Navigate",
+  "PlanComplete",
+  "PlanRead",
+  "PlanUpdate",
+  "Recall",
+  "Remember",
+  "Retrieve",
+  "Screenshot",
+  "Scroll",
+  "SendMessage",
+  "Skill",
+  "Source",
+  "Task",
+  "Type",
+  "log_knowledge_gap",
+  "run_exam",
+  "wiki_get",
+  "wiki_list",
+  "wiki_recall",
+  "wiki_related",
+  "wiki_search",
+  "wiki_semantic_search",
+  "wiki_set_signals",
+  "wiki_stats",
+  "wiki_write",
+];

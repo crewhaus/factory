@@ -50,7 +50,11 @@ import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
 import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { TOOL_FLAGS, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
+import {
+  RUNTIME_TOOL_NAMES,
+  TOOL_FLAGS,
+  TOOL_FLAGS_BY_NAME,
+} from "@crewhaus/tool-registry-manifest/flags";
 import { z } from "zod";
 import { HARNESS_SPEC_FILENAME, discoverHarnesses } from "./discover";
 import {
@@ -633,7 +637,9 @@ export const permissionAudit: RegisteredTool = buildTool({
       // "external" read off six legacy names and "destructive" read off
       // nothing.
       flagsOf: (tool) => TOOL_FLAGS[tool] ?? TOOL_FLAGS_BY_NAME.get(tool),
-      knownTools: Object.values(TOOL_FLAGS),
+      // The builtins, and the tools the runtime registers without a spec
+      // listing them — `alwaysAllow Skill` names a real tool.
+      knownTools: [...Object.values(TOOL_FLAGS), ...RUNTIME_TOOL_NAMES.map((name) => ({ name }))],
       mcpServers: view.value.mcpServers.map((s) => s.name),
       ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });

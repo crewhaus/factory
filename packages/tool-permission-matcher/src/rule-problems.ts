@@ -11,7 +11,15 @@
  * Only what can be shown is reported. A rule naming a tool this module has
  * never heard of is NOT reported as dead — the runtime adds tools a spec does
  * not list (`Task`, `Consult`, a sub-agent's tools from disk) — unless the
- * name is one or two letters away from a tool it does know.
+ * name is one or two letters away from a tool it does know. The caller's
+ * `known` list must therefore carry the tools the runtime registers on its
+ * own (`Skill`, the browser shape's `Type`), not only the builtins, or a real
+ * tool name reads as a typo of a builtin.
+ *
+ * A correction never widens an allow: when the nearest name belongs to a tool
+ * that can change or delete things, or needs a sandbox (or its flags are not
+ * known), an allow rule is reported without a `Write "…"` fix, because
+ * following it would grant that tool.
  *
  * Pure: plain data in, findings out.
  */
@@ -28,6 +36,9 @@ export type RuleToolDescriptor = {
    * nothing to check an argument pattern against.
    */
   readonly operativeArgs?: ReadonlyArray<{ readonly kind: string }>;
+  /** Its flags, when known. Absent reads as "may be destructive". */
+  readonly destructive?: boolean;
+  readonly requiresSandbox?: boolean;
 };
 
 export type PermissionRuleProblemCode =
@@ -170,7 +181,9 @@ export function permissionRuleProblems(
         if (hit !== undefined) {
           report(
             "tool-key-not-name",
-            `rule "${rule.pattern}" names ${toolGlob}, the key a spec lists the tool under, but a rule is matched against the tool's name, ${hit.name}, so this rule never fires. Write "${fixed}".`,
+            hit.key !== undefined
+              ? `rule "${rule.pattern}" names ${toolGlob}, the key a spec lists the tool under, but a rule is matched against the tool's name, ${hit.name}, so this rule never fires. Write "${fixed}".`
+              : `rule "${rule.pattern}" names ${toolGlob}, but a rule is matched against the tool's name, ${hit.name}, so this rule never fires. Write "${fixed}".`,
             fixed,
           );
           continue;
@@ -192,17 +205,27 @@ export function permissionRuleProblems(
       }
       if (!GLOB_META.test(toolGlob) && !input.known.some((t) => t.name === toolGlob)) {
         const near = input.known
-          .map((t) => ({ name: t.name, d: distance(toolGlob, t.name, 2) }))
+          .map((t) => ({ tool: t, name: t.name, d: distance(toolGlob, t.name, 2) }))
           .filter((c) => c.d <= 2)
           .sort((a, b) => a.d - b.d || (a.name < b.name ? -1 : 1));
         const best = near[0];
         if (best !== undefined && near.filter((c) => c.d === best.d).length === 1) {
           const fixed = withTool(rule.pattern, best.name);
-          report(
-            "unknown-tool",
-            `rule "${rule.pattern}" matches no tool. Did you mean ${best.name}? Write "${fixed}".`,
-            fixed,
-          );
+          const widens =
+            rule.type === "alwaysAllow" &&
+            (best.tool.destructive !== false || best.tool.requiresSandbox !== false);
+          if (widens) {
+            report(
+              "unknown-tool",
+              `rule "${rule.pattern}" matches no tool, so it never fires. The nearest name is ${best.name}, which may change or delete things, so it is not offered as the fix: write "${fixed}" only if you mean to allow ${best.name}, or remove the rule.`,
+            );
+          } else {
+            report(
+              "unknown-tool",
+              `rule "${rule.pattern}" matches no tool. Did you mean ${best.name}? Write "${fixed}".`,
+              fixed,
+            );
+          }
         }
       }
       continue;

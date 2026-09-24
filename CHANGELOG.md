@@ -187,7 +187,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`HttpRequest(GET https://…)`), a near-miss tool name, an MCP server the
   spec does not declare, and an argument pattern on a tool that has no
   argument saying where it acts each get a warning with the corrected rule.
-  `compile --strict` fails on them, like other fixable warnings.
+  `compile --strict` fails on them, like other fixable warnings. A rule
+  naming a tool the runtime adds without a spec listing it (`Skill`,
+  `ListTools`, `Task`, the browser shape's `Type`) is a real rule and is left
+  alone. A near-miss name in an allow rule is never "corrected" to a tool
+  that can change or delete things: the warning names it, and the choice
+  stays yours.
 - **A permission pattern can no longer stall the daemon.** A rule with several
   `*` in it, matched against a long command, could block the event loop for
   seconds or indefinitely. Patterns are now matched in time proportional to

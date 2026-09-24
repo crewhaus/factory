@@ -33,6 +33,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runtimeToolNames } from "../apps/cli/src/runtime-tool-names";
 import { CLI_RUNTIME_TOOL_KEYS, TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
 import { BUILTIN_TOOL_MAP } from "../packages/target-cli/src/index";
 import { categoriesForTool } from "../packages/tool-categories/src/index";
@@ -91,6 +92,7 @@ type ToolLike = {
 
 const rows: string[] = [];
 const flagRows: string[] = [];
+const builtinNames = new Set<string>();
 for (const key of keys) {
   const entry = BUILTIN_TOOL_MAP[key];
   if (entry === undefined) throw new Error(`no BUILTIN_TOOL_MAP entry for ${key}`);
@@ -116,6 +118,7 @@ for (const key of keys) {
     package: entry.package,
     keywords: TOOL_KEYWORDS[key] ?? [],
   });
+  builtinNames.add(tool.name);
   rows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projected)},`);
   flagRows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projectToolFlags(projected))},`);
 }
@@ -178,6 +181,18 @@ ${flagRows.join("\n")}
 export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
   Object.values(TOOL_FLAGS).map((flags) => [flags.name, flags]),
 );
+
+/**
+ * The other tools this release defines: ones the runtime registers without a
+ * spec listing them (\`Skill\`, \`ListTools\`, \`Task\`, the browser shape's
+ * \`Type\`, the memory and plan tools, \`Consult\`, …). Names only — how
+ * each is gated depends on how the runtime builds it. A permission rule
+ * naming one of these names a real tool, even though no builtin has the name.
+ *
+ * Read from the source by \`apps/cli/src/runtime-tool-names.ts\`, not written
+ * out; \`apps/cli/src/tool-registry.test.ts\` fails when it is stale.
+ */
+export const RUNTIME_TOOL_NAMES: ReadonlyArray<string> = ${JSON.stringify(runtimeToolNames(REPO_ROOT, builtinNames))};
 `,
 );
 

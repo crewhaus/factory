@@ -9,7 +9,11 @@ import {
   type RuleToolDescriptor,
   permissionRuleProblems,
 } from "@crewhaus/tool-permission-matcher";
-import { TOOL_FLAGS, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
+import {
+  RUNTIME_TOOL_NAMES,
+  TOOL_FLAGS,
+  TOOL_FLAGS_BY_NAME,
+} from "@crewhaus/tool-registry-manifest/flags";
 import { auditModelPlan } from "./model-plan-lint";
 import { auditSpecToolNames, collectToolNames } from "./scope-audit";
 
@@ -183,8 +187,17 @@ export function runLint(
   return { ok: findings.every((f) => f.severity !== "error"), findings, spec, ir };
 }
 
-/** The builtins, as the rule checker needs them. */
-const KNOWN_BUILTINS: ReadonlyArray<RuleToolDescriptor> = Object.values(TOOL_FLAGS);
+/**
+ * Every tool a rule can name, as the rule checker needs them: the builtins,
+ * with their flags, and the tools the runtime registers without a spec
+ * listing them (`Skill`, `ListTools`, the browser shape's `Type`, …), by name.
+ * Without the second half a real tool name reads as a typo of a builtin, and
+ * the "fix" for `alwaysAllow Skill` was `Shell`.
+ */
+export const KNOWN_TOOLS: ReadonlyArray<RuleToolDescriptor> = [
+  ...Object.values(TOOL_FLAGS),
+  ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
+];
 
 /**
  * The permission rules of a lowered spec that can never do what they say
@@ -216,7 +229,7 @@ export function permissionRuleProblemsOf(
   return permissionRuleProblems({
     rules,
     granted,
-    known: KNOWN_BUILTINS,
+    known: KNOWN_TOOLS,
     mcpServers: Object.keys(node.mcp_servers ?? {}),
   });
 }
