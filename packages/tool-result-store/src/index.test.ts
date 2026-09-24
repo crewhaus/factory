@@ -1,5 +1,14 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
@@ -8,6 +17,7 @@ import type { ToolResult } from "@crewhaus/tool-executor";
 import {
   DEFAULT_PREVIEW_LINES,
   DEFAULT_THRESHOLD_BYTES,
+  MAX_NAME_ATTEMPTS,
   assertUnderRoot,
   previewHead,
   resolveStoragePath,
@@ -281,6 +291,123 @@ describe("storeAndPreview — over threshold", () => {
     expect(out.persisted).toBe(true);
     expect(out.fullPath).toContain(`${rootDir}/run_f/tu_6.txt`);
   });
+});
+
+// C129 — a tool_use_id repeats within a run whenever a provider sends none
+// and one is synthesised per response (Gemini's `gemini_Bash_0` in every
+// turn). The store treated the taken name as "the same result, already
+// saved", so the second call's pointer named the FIRST call's output and its
+// own output was lost.
+describe("storeAndPreview — a repeated tool_use_id", () => {
+  const T = DEFAULT_THRESHOLD_BYTES;
+  const pointerOf = (out: { previewContent: unknown }): string => {
+    const m = /\[truncated, full output at (.+)\]$/.exec(String(out.previewContent));
+    if (m === null) throw new Error(`no pointer in ${String(out.previewContent).slice(-120)}`);
+    return m[1] as string;
+  };
+
+  test("different content under the same ids never points at the earlier output", async () => {
+    const rootDir = newTempRoot();
+    const ids = { runId: "run_e", toolUseId: "tu_5", rootDir };
+    const first = await storeAndPreview(makeResult("A".repeat(T + 10)), ids);
+    const second = await storeAndPreview(makeResult("B".repeat(T + 10)), ids);
+    expect(second.fullPath).not.toBe(first.fullPath);
+    expect(second.fullPath).toBe(join(rootDir, "run_e", "tu_5.2.txt"));
+    expect(readFileSync(second.fullPath as string, "utf8")).toBe("B".repeat(T + 10));
+    expect(readFileSync(first.fullPath as string, "utf8")).toBe("A".repeat(T + 10));
+    expect(pointerOf(second)).toBe(second.fullPath as string);
+    expect(second.reused).toBeUndefined();
+    // A third distinct result takes the next name; a retry of the second
+    // reuses the second's file.
+    const third = await storeAndPreview(makeResult("C".repeat(T + 10)), ids);
+    expect(third.fullPath).toBe(join(rootDir, "run_e", "tu_5.3.txt"));
+    const retry = await storeAndPreview(makeResult("B".repeat(T + 10)), ids);
+    expect(retry.fullPath).toBe(second.fullPath);
+    expect(retry.reused).toBe(true);
+  });
+
+  test("a result that is a prefix of the saved one is not the same result", async () => {
+    const rootDir = newTempRoot();
+    const ids = { runId: "run_p", toolUseId: "tu_p", rootDir };
+    const long = await storeAndPreview(makeResult(`${"x".repeat(T + 10)}tail`), ids);
+    const short = await storeAndPreview(makeResult("x".repeat(T + 10)), ids);
+    expect(short.fullPath).not.toBe(long.fullPath);
+    expect(readFileSync(short.fullPath as string, "utf8")).toBe("x".repeat(T + 10));
+  });
+
+  test("a link planted at the name is neither written through nor reused", async () => {
+    const rootDir = newTempRoot();
+    const outside = newTempRoot();
+    const target = join(outside, "victim.txt");
+    const content = "S".repeat(T + 10);
+    // Even a link to a file holding the very same bytes is not reused: the
+    // pointer must name a file the store itself wrote.
+    writeFileSync(target, content);
+    mkdirSync(join(rootDir, "run_l"), { recursive: true });
+    symlinkSync(target, join(rootDir, "run_l", "tu_l.txt"));
+    symlinkSync(join(outside, "absent.txt"), join(rootDir, "run_l", "tu_l.2.txt"));
+    const out = await storeAndPreview(makeResult(content), {
+      runId: "run_l",
+      toolUseId: "tu_l",
+      rootDir,
+    });
+    expect(out.fullPath).toBe(join(rootDir, "run_l", "tu_l.3.txt"));
+    expect(readFileSync(target, "utf8")).toBe(content);
+    expect(existsSync(join(outside, "absent.txt"))).toBe(false);
+    expect(pointerOf(out)).toBe(out.fullPath as string);
+  });
+
+  test("a FIFO planted at the name is skipped, not opened", async () => {
+    if (process.platform === "win32") return;
+    const rootDir = newTempRoot();
+    mkdirSync(join(rootDir, "run_f"), { recursive: true });
+    const fifo = join(rootDir, "run_f", "tu_f.txt");
+    const made = Bun.spawnSync(["mkfifo", fifo]);
+    expect(made.exitCode).toBe(0);
+    const out = await storeAndPreview(makeResult("F".repeat(T + 10)), {
+      runId: "run_f",
+      toolUseId: "tu_f",
+      rootDir,
+    });
+    expect(out.fullPath).toBe(join(rootDir, "run_f", "tu_f.2.txt"));
+    expect(readFileSync(out.fullPath as string, "utf8")).toBe("F".repeat(T + 10));
+  });
+
+  test("a run directory linked out of the root is refused, and the model still gets the preview", async () => {
+    const rootDir = newTempRoot();
+    const outside = newTempRoot();
+    symlinkSync(outside, join(rootDir, "run_o"));
+    const out = await storeAndPreview(makeResult(`first line\n${"O".repeat(T + 10)}`), {
+      runId: "run_o",
+      toolUseId: "tu_o",
+      rootDir,
+    });
+    expect(out.persisted).toBe(false);
+    expect(out.fullPath).toBeNull();
+    expect(Bun.spawnSync(["ls", outside]).stdout.toString()).toBe("");
+    expect(out.unsaved).toContain("run_o/tu_o.txt");
+    const preview = String(out.previewContent);
+    expect(preview.startsWith("first line\n")).toBe(true);
+    expect(preview).toContain("[truncated; the full output could not be saved: ");
+    expect(preview).toContain("run_o/tu_o.txt");
+  });
+
+  test("the name search is bounded", async () => {
+    const rootDir = newTempRoot();
+    const dir = join(rootDir, "run_b");
+    mkdirSync(dir, { recursive: true });
+    for (let n = 1; n <= MAX_NAME_ATTEMPTS; n++) {
+      writeFileSync(join(dir, n === 1 ? "tu_b.txt" : `tu_b.${n}.txt`), "other");
+    }
+    const out = await storeAndPreview(makeResult("b".repeat(T + 10)), {
+      runId: "run_b",
+      toolUseId: "tu_b",
+      rootDir,
+    });
+    expect(out.persisted).toBe(false);
+    expect(out.unsaved).toContain("is taken");
+    expect(existsSync(join(dir, `tu_b.${MAX_NAME_ATTEMPTS + 1}.txt`))).toBe(false);
+  }, 20_000);
 });
 
 describe("storeAndPreview — path traversal guard", () => {

@@ -6544,10 +6544,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       },
     );
     if (stored.persisted) {
-      runContext.logger.info("tool result persisted", {
+      // A retried call whose bytes were already on disk wrote nothing.
+      runContext.logger.info(
+        stored.reused === true ? "tool result already persisted" : "tool result persisted",
+        { toolUseId: tu.id, toolName: tu.name, fullPath: stored.fullPath },
+      );
+    } else if (stored.unsaved !== undefined) {
+      runContext.logger.warn("tool result could not be persisted; the model sees the preview", {
         toolUseId: tu.id,
         toolName: tu.name,
-        fullPath: stored.fullPath,
+        reason: stored.unsaved,
       });
     }
     // Section 18 — post-tool prompt-injection classifier. Runs after the

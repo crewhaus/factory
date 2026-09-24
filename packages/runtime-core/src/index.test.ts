@@ -1312,6 +1312,65 @@ describe("runChatLoop — Section 8 result store", () => {
   });
 });
 
+// C129 — an id-less provider's synthesised id repeats across turns
+// (`gemini_Big_0`). The second turn's pointer named the first turn's file,
+// and its own output was never saved.
+describe("runChatLoop — a tool_use id repeated across turns", () => {
+  test("each turn's preview points at a file holding that turn's output", async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmpRoot = mkdtempSync(join(tmpdir(), "crewhaus-runtime-repeat-id-"));
+    const oldCwd = process.cwd();
+    process.chdir(tmpRoot);
+    try {
+      const payloads = ["first ".repeat(3000), "second ".repeat(3000)];
+      let calls = 0;
+      const bigTool = buildTool({
+        name: "Big",
+        description: "a different large string each call",
+        inputSchema: z.object({}),
+        readOnly: true,
+        execute: async () => payloads[calls++] ?? "",
+      });
+      const use = { type: "tool_use", id: "gemini_Big_0", name: "Big", input: {} };
+      const { adapter, capturedMessages } = makeScriptedClient([
+        [use as Anthropic.ToolUseBlock],
+        [use as Anthropic.ToolUseBlock],
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      const input = new PassThrough();
+      input.write("go\n");
+      input.end();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        _adapter: adapter,
+        input,
+        tools: [bigTool],
+        permissionMode: "bypass",
+      });
+      const pointerIn = (call: number): string => {
+        const msgs = capturedMessages()[call] ?? [];
+        const last = msgs[msgs.length - 1];
+        const block = (last?.content as Anthropic.ToolResultBlockParam[])[0];
+        const text = typeof block?.content === "string" ? block.content : "";
+        const m = /full output at (.+?)\]$/.exec(text);
+        if (m === null) throw new Error(`no pointer in turn ${call}`);
+        return m[1] as string;
+      };
+      const first = pointerIn(1);
+      const second = pointerIn(2);
+      expect(second).not.toBe(first);
+      expect(readFileSync(first, "utf8")).toBe(payloads[0] as string);
+      expect(readFileSync(second, "utf8")).toBe(payloads[1] as string);
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("runChatLoop — a one-line tool result reaches the model capped (flag-truth-6#4)", () => {
   test("a 1 MB single-line result is sent as a preview of at most the threshold", async () => {
     const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");

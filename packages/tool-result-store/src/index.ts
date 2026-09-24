@@ -14,9 +14,18 @@
  *     the common case of one long line — a JSON-encoded result — which the
  *     line limit alone passed through whole.
  *
- * Idempotent writes: the file is created with `flag: "wx"` (write-
- * exclusive). If a previous run already wrote the same `(runId,
- * toolUseId)` pair we treat that as success and reuse the existing file.
+ * Exclusive writes: the file is created new (`O_EXCL`, via
+ * `@crewhaus/tool-safety/fs` `createExclusive`), so nothing is ever written
+ * through a link or over an existing file, and the directory it lands in
+ * must physically be inside `rootDir`. A `tool_use_id` is NOT unique within
+ * a run: providers that send no id get one synthesised per response
+ * (Gemini's `gemini_<name>_<n>`, an OpenAI-compatible server's
+ * `call_<n>`), so two calls can share one. When the name is taken, the file
+ * there is compared with this result: the same bytes (a retried call) reuse
+ * it; anything else — different output, a link, a FIFO — moves on to
+ * `<toolUseId>.<n>.txt`, and the preview's pointer names the file actually
+ * written. A result that cannot be saved at all still reaches the model as
+ * a preview, marked as cut short with the reason, instead of ending the run.
  *
  * Path traversal: `runId` and `toolUseId` are joined under `rootDir`
  * after rejecting any value containing path separators or `..` to
@@ -27,12 +36,14 @@
  * GrowthBook flag to override per tool. We collapse to a single global
  * threshold and a plain-text marker.
  */
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join, resolve, sep } from "node:path";
+import { closeSync, writeSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
 import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
 import type { ToolExecuteResult } from "@crewhaus/tool-catalog";
 import type { ToolResult } from "@crewhaus/tool-executor";
+import { createExclusive, openForRead } from "@crewhaus/tool-safety/fs";
 
 // When a tenant context is active, fail closed on a resolved storage path that
 // escapes the tenant's toolResultRoot (CWE-1230). Outside a tenant scope (the
@@ -61,11 +72,27 @@ export type StoredResult = {
   readonly previewContent: ToolExecuteResult;
   readonly fullPath: string | null;
   readonly persisted: boolean;
+  /**
+   * The full output was already on disk at `fullPath`, byte for byte (a
+   * retried call), and nothing was written this time.
+   */
+  readonly reused?: boolean;
+  /**
+   * The result was over the threshold but could not be saved; the preview
+   * says so and `fullPath` is null. Why, naming the path tried.
+   */
+  readonly unsaved?: string;
 };
 
 export const DEFAULT_THRESHOLD_BYTES = 10240;
 export const DEFAULT_PREVIEW_LINES = 100;
 export const DEFAULT_ROOT_DIR = ".crewhaus/tool-results";
+
+/**
+ * How many names (`<id>.txt`, then `<id>.2.txt` …) one result tries before
+ * it is reported unsaved. Each taken name costs one bounded compare-read.
+ */
+export const MAX_NAME_ATTEMPTS = 1000;
 
 /**
  * If `result.content` is at or under threshold, return it unchanged.
@@ -99,22 +126,88 @@ export async function storeAndPreview(
   rejectUnsafeSegment("runId", opts.runId);
   rejectUnsafeSegment("toolUseId", opts.toolUseId);
 
-  const fullPath = join(rootDir, opts.runId, `${opts.toolUseId}.txt`);
-  fence(resolve(fullPath));
-  await mkdir(dirname(fullPath), { recursive: true });
-  try {
-    await writeFile(fullPath, result.content, { flag: "wx" });
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "EEXIST") throw err;
-    // Another run already persisted this exact (runId, toolUseId) — treat
-    // as success. The body is identical because tool_use_id is unique.
-  }
-
   const head = previewHead(result.content, previewLines, previewBytes);
-  const previewContent = `${head}\n[truncated, full output at ${fullPath}]`;
+  fence(resolve(join(rootDir, opts.runId, `${opts.toolUseId}.txt`)));
+  const saved = await saveExclusive(rootDir, opts.runId, opts.toolUseId, result.content);
+  if (!saved.ok) {
+    return {
+      previewContent: `${head}\n[truncated; the full output could not be saved: ${saved.reason}]`,
+      fullPath: null,
+      persisted: false,
+      unsaved: saved.reason,
+    };
+  }
+  const previewContent = `${head}\n[truncated, full output at ${saved.fullPath}]`;
+  return {
+    previewContent,
+    fullPath: saved.fullPath,
+    persisted: true,
+    ...(saved.reused ? { reused: true } : {}),
+  };
+}
 
-  return { previewContent, fullPath, persisted: true };
+type Saved =
+  | { readonly ok: true; readonly fullPath: string; readonly reused: boolean }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Write `content` to a NEW file under `<rootDir>/<runId>/`, first as
+ * `<toolUseId>.txt`, then `<toolUseId>.<n>.txt` while the name is taken by
+ * anything that is not these exact bytes. Never writes through a link, over
+ * an existing file, or outside `rootDir`.
+ */
+async function saveExclusive(
+  rootDir: string,
+  runId: string,
+  toolUseId: string,
+  content: string,
+): Promise<Saved> {
+  const bytes = Buffer.from(content, "utf8");
+  try {
+    // The root is the runtime's own directory, never a model-named path.
+    await mkdir(rootDir, { recursive: true });
+  } catch (err) {
+    return { ok: false, reason: `${rootDir} could not be created (${(err as Error).message})` };
+  }
+  for (let n = 1; n <= MAX_NAME_ATTEMPTS; n++) {
+    const name = n === 1 ? `${toolUseId}.txt` : `${toolUseId}.${n}.txt`;
+    const rel = `${runId}/${name}`;
+    const fullPath = join(rootDir, runId, name);
+    fence(resolve(fullPath));
+    const created = createExclusive(rootDir, rel, { createParents: true });
+    if (created.ok) {
+      try {
+        let off = 0;
+        while (off < bytes.length) off += writeSync(created.fd, bytes, off, bytes.length - off);
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `${fullPath} could not be written (${(err as Error).message})`,
+        };
+      } finally {
+        closeSync(created.fd);
+      }
+      return { ok: true, fullPath, reused: false };
+    }
+    // A link or a special file at the name is not this result: try the next
+    // name, without opening it. Any other refusal (the run directory linked
+    // out of the root, no permission) would refuse every name alike.
+    if (created.code === "is-symlink" || created.code === "not-regular-file") continue;
+    if (created.code !== "exists") return { ok: false, reason: created.reason };
+    // A regular file is there. The same bytes are a retried call: reuse
+    // them. Anything else is another call's output under a repeated id.
+    const existing = await openForRead(rootDir, rel, {
+      maxBytes: bytes.length,
+      followLeafSymlink: false,
+    });
+    if (existing.ok && !existing.truncated && Buffer.from(existing.bytes).equals(bytes)) {
+      return { ok: true, fullPath, reused: true };
+    }
+  }
+  return {
+    ok: false,
+    reason: `every name from ${join(rootDir, runId, `${toolUseId}.txt`)} to ${toolUseId}.${MAX_NAME_ATTEMPTS}.txt is taken`,
+  };
 }
 
 /**

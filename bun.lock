@@ -3157,6 +3157,7 @@
         "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/tool-retrieve": {
