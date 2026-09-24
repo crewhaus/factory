@@ -506,6 +506,36 @@ describe("test output parsers", () => {
     expect(outcome.failures[0]?.message).not.toContain("import { expect");
   });
 
+  test("bun: a status line is parsed in linear time, whatever its spacing (C079)", () => {
+    // 0.7.0's status pattern retried a long run of spaces from every split
+    // point: this line took about eight seconds.
+    const started = performance.now();
+    const outcome = parseBunTest(`a.test.ts:\n(fail) x${" ".repeat(100_000)}y\n`);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(outcome.failed).toBe(1);
+    expect(outcome.failures[0]?.name.length).toBe(100_002);
+  });
+
+  test("bun: the timing suffix is cut, and any other bracket is part of the name", () => {
+    const outcome = parseBunTest(
+      [
+        "a.test.ts:",
+        "(pass) suite > adds [0.12ms]",
+        "(fail) suite > name [1.23ms]",
+        "(fail) weird [name]",
+        "(fail) spaced   [3.00 ms]",
+        "(fail) glued[4.00ms]",
+      ].join("\n"),
+    );
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failures.map((f) => f.name)).toEqual([
+      "suite > name",
+      "weird [name]",
+      "spaced",
+      "glued[4.00ms]",
+    ]);
+  });
+
   test("bun: a green run reports no failures at all", () => {
     const outcome = parseBunTest(" 12 pass\n 0 fail\nRan 12 tests across 3 files. [40.00ms]");
     expect(outcome.failed).toBe(0);
@@ -685,7 +715,21 @@ describe("test output parsers", () => {
 
 describe("caller-supplied patterns", () => {
   test("a repetition nested in a repetition is rejected", () => {
-    for (const pattern of ["^(a|a|aa)+$", "(a+)+", "(a*)*", "(\\w+)+$", "(ab{1,})+"]) {
+    for (const pattern of ["^(a|a|aa)+$", "(a+)+", "(a*)*", "(\\w+)+$"]) {
+      expect({ pattern, unsafe: hasNestedRepetition(pattern) }).toEqual({ pattern, unsafe: true });
+    }
+  });
+
+  test("a bounded outer count does not make a nested repetition safe (C079)", () => {
+    // 0.7.0 treated `{1,99}` as bounded and so safe: each of these cost about
+    // 650 ms per long identifier, run against every name in the tree.
+    for (const pattern of [
+      "^(a|a){1,99}$",
+      "^(\\w|[a-zA-Z]){1,64}Z$",
+      "^(\\w+){2,64}$",
+      "(a?){30}a{30}",
+      "(\\w{1,})*$",
+    ]) {
       expect({ pattern, unsafe: hasNestedRepetition(pattern) }).toEqual({ pattern, unsafe: true });
     }
   });
@@ -700,6 +744,10 @@ describe("caller-supplied patterns", () => {
       "[+*]+",
       "\\(a+\\)",
       "(a|b){0,3}",
+      // Each pass starts with the `a` its run of b's cannot match, so it ends
+      // in exactly one place: linear, and the shared screen admits it.
+      "(ab{1,})+",
+      "(\\d{1,3}\\.){3}\\d{1,3}",
     ]) {
       expect({ pattern, unsafe: hasNestedRepetition(pattern) }).toEqual({ pattern, unsafe: false });
     }

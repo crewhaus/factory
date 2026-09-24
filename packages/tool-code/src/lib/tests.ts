@@ -140,6 +140,17 @@ function withLocation(failure: TestFailure): TestFailure {
  * count block is authoritative because recent versions print nothing at all
  * for a passing test.
  */
+/**
+ * `suite > adds [0.12ms]` without its timing suffix: the last `[` that
+ * follows whitespace and opens exactly `[<digits>ms]` or `[<digits>s]`.
+ * Any other bracket (`weird [name]`) is part of the name.
+ */
+function withoutTiming(rest: string): string {
+  const open = rest.lastIndexOf("[");
+  if (open <= 0 || !/\s/.test(rest[open - 1] as string)) return rest;
+  return /^\[[\d.]+\s*m?s\]\s*$/.test(rest.slice(open)) ? rest.slice(0, open) : rest;
+}
+
 export function parseBunTest(text: string): TestOutcome {
   const lines = stripAnsi(text).split("\n");
   const failures: TestFailure[] = [];
@@ -149,7 +160,13 @@ export function parseBunTest(text: string): TestOutcome {
   let skipped = 0;
   let sawAny = false;
 
-  const statusRe = /^\((?<status>pass|fail|skip|todo)\)\s+(?<name>.*?)(?:\s+\[[\d.]+\s*m?s\])?$/;
+  // Linear by construction (C079). The 0.7.0 pattern ended in a lazy name
+  // and an OPTIONAL `\s+[1.2ms]` suffix, so a status line with a long run
+  // of spaces was retried from every split point: 40,000 characters took
+  // over a second, and a 400,000-character report minutes. Here the
+  // status and the rest are one greedy pass that cannot fail after `\s+`,
+  // and the timing suffix is cut off by position.
+  const statusRe = /^\((pass|fail|skip|todo)\)\s+([\s\S]*)$/;
 
   // Lines seen since the last status line or file header: bun prints a
   // failure's detail ABOVE the `(fail)` line that names the test.
@@ -169,8 +186,8 @@ export function parseBunTest(text: string): TestOutcome {
       continue;
     }
     sawAny = true;
-    const status = m.groups?.["status"];
-    const name = (m.groups?.["name"] ?? "").trim();
+    const status = m[1];
+    const name = withoutTiming(m[2] ?? "").trim();
     const detail = pending;
     pending = [];
     if (status === "pass") {

@@ -840,6 +840,41 @@ describe("WaitForOutput", () => {
     expect(out.match).toBe("FATAL");
   });
 
+  test("a brace-quantified nested pattern is refused at once, not run to the deadline (C079)", async () => {
+    const started = await call(processStart, {
+      argv: ["sh", "-c", "echo deadbeefcafe0123456789abcdef0123456789ab; sleep 5"],
+    });
+    // 0.7.0's scanner took `{1,}` for a literal and ran this: ~6.7 s of a
+    // blocked event loop and a false reason "deadline".
+    const out = await call(waitForOutput, {
+      id: started.id,
+      pattern: "(\\w{1,})*$",
+      timeoutMs: 3_000,
+    });
+    expect(String(out)).toContain("[WaitForOutput error]");
+    expect(String(out)).toContain("exponentially");
+  });
+
+  test("a match the worker could not finish is undetermined, never 'deadline' or no-match (C079)", async () => {
+    const started = await call(processStart, {
+      argv: ["sh", "-c", `printf '${"a".repeat(300)}'; sleep 5`],
+    });
+    await Bun.sleep(200);
+    // Screened as safe (star height 1) but cubic: ~1 s on 300 characters,
+    // past this call's budget. Bounded: the abandoned worker stops within
+    // about a second.
+    const out = await call(waitForOutput, {
+      id: started.id,
+      pattern: "\\w*\\w*\\w*!",
+      timeoutMs: 250,
+    });
+    expect({ matched: out.matched, reason: out.reason }).toEqual({
+      matched: null,
+      reason: "undetermined",
+    });
+    expect(String(out.detail)).toContain("pattern could not be evaluated");
+  }, 20_000);
+
   test("the deadline is honoured when the pattern never appears", async () => {
     const started = await call(processStart, { argv: ["sleep", "30"] });
     const at = Date.now();

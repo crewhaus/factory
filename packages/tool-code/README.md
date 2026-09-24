@@ -171,9 +171,15 @@ report as a clean result.
   running, so the places where caller text meets a pattern are bounded up
   front: the stack and test-output parsers cap a single LINE before matching
   it (an unbounded line made frame splitting quadratic — twelve seconds for
-  four thousand characters), and `AstQuery` refuses a `pattern` that repeats a
-  group which itself repeats or branches (`(a+)+`, `(a|a)*`) rather than
-  running it against every name in a tree.
+  four thousand characters), and the bun status-line parse is linear. A
+  caller's `AstQuery` `pattern` is screened by `@crewhaus/tool-safety`'s
+  shared regex screen, which refuses a group that repeats or branches
+  ambiguously (`(a+)+`, `(a|a)*`, `^(\w+){2,64}$`), and then runs over the
+  declaration names in its regex worker under a deadline. A name it could
+  not answer for (the engine gave up, or it is longer than 1,024
+  characters) is listed under `uncheckedNames`, never dropped as a
+  non-match; a run that could not finish at all is reported as such, with
+  no list.
 - **No implicit downloads.** A node tool is only ever used from the project's
   own `node_modules/.bin`. `bunx`/`npx` without a local install would fetch
   from the registry, which is an outbound call these tools do not declare; a

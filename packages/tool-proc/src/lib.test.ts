@@ -99,6 +99,37 @@ describe("compileSafePattern", () => {
     expect(Date.now() - started).toBeLessThan(100);
   });
 
+  test("a brace or optional quantifier inside a repeated group is still nesting (C079)", () => {
+    // 0.7.0 counted only `*` and `+` inside a group, so each of these passed
+    // and JavaScriptCore then gave up on it as a false "no match".
+    for (const source of [
+      "(a{1,})+$",
+      "(\\w{1,})*$",
+      "(\\w{1,64})*$",
+      "(\\w\\w?)*$",
+      "(?:a{1,}){1,}$",
+      "(a?){20}a{20}",
+      "^(a|a){1,99}$",
+    ]) {
+      expect({ source, ok: compileSafePattern(source, "").ok }).toEqual({ source, ok: false });
+    }
+  });
+
+  test("the shared screen admits what a waiting pattern really looks like", () => {
+    // Including a quantified alternation whose branches cannot overlap, which
+    // 0.7.0's scanner refused wholesale.
+    for (const source of [
+      "(\\d{1,3}\\.){3}\\d{1,3}",
+      "Listening on (\\d+)",
+      "(ready|listening)",
+      "a{2,5}",
+      "\\{literal\\}",
+      "(a|b)*$",
+    ]) {
+      expect({ source, ok: compileSafePattern(source, "").ok }).toEqual({ source, ok: true });
+    }
+  });
+
   test("a character class containing a bracket does not confuse the scan", () => {
     const out = compileSafePattern("[)(]+", "");
     expect(out.ok).toBe(true);

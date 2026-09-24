@@ -706,6 +706,33 @@ describe("code intelligence over a real tree", () => {
     expect(message).toContain("could not use the pattern");
   });
 
+  test("AstQuery refuses a nested repetition hidden behind a bounded count (C079)", async () => {
+    const message = await call(astQuery, { cwd: "src", pattern: "^(\\w|[a-zA-Z]){1,64}Z$" });
+    expect(message).toContain("refused the pattern");
+  });
+
+  test("AstQuery never drops a name the pattern could not be checked against (C079)", async () => {
+    // A name longer than AstQuery runs its pattern on is undetermined for
+    // the pattern: listed as unchecked, not silently filtered out.
+    write("src/long.ts", `export const ${"a".repeat(2_000)} = 1;\n`);
+    const result = await callJson(astQuery, { cwd: "src", pattern: "^[a-z]" });
+    const names = (result["declarations"] as Array<Record<string, unknown>>).map((d) => d["name"]);
+    expect(names).toContain("helper");
+    expect(names.some((n) => String(n).length > 1_024)).toBe(false);
+    expect(result["uncheckedCount"]).toBe(1);
+    expect(String((result["uncheckedNames"] as string[])[0]).length).toBe(2_000);
+  });
+
+  test("AstQuery whose pattern run could not finish reports that, not an empty list (C079)", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const message = String(
+      await astQuery.execute({ cwd: "src", pattern: "^help" }, { signal: controller.signal }),
+    );
+    expect(message).toContain("could not evaluate the pattern");
+    expect(message).not.toContain('"declarations"');
+  });
+
   test("SymbolOutline gives line ranges for one file", async () => {
     const result = await callJson(symbolOutline, { file: "src/util.ts", includeImports: true });
     const declarations = result["declarations"] as Array<Record<string, unknown>>;

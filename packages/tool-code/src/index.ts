@@ -34,6 +34,7 @@ import { realpathSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { describeRegexOutcome, runRegex, screenUserRegex } from "@crewhaus/tool-safety/regex";
 import { z } from "zod";
 import {
   detectBuild,
@@ -1131,10 +1132,13 @@ const declarationKinds = z.enum([
   "accessor",
 ]);
 
+/** Longest declaration name AstQuery's `pattern` is run against. */
+const MAX_PATTERN_NAME_CHARS = 1_024;
+
 export const astQuery: RegisteredTool = buildTool({
   name: "AstQuery",
   description:
-    "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run.",
+    "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run, and a name the pattern could not be checked against is listed as unchecked, never dropped as a non-match.",
   inputSchema: z.object({
     cwd: cwdField,
     kinds: z.array(declarationKinds).max(10).optional().describe("only these kinds"),
@@ -1147,22 +1151,18 @@ export const astQuery: RegisteredTool = buildTool({
     maxResults: z.number().int().positive().max(5_000).optional(),
   }),
   ...READ_FILES,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const dir = resolveDir("AstQuery", input.cwd);
     if (!dir.ok) return dir.message;
-    let matcher: RegExp | undefined;
     if (input.pattern !== undefined) {
-      // Refused before it is compiled: this pattern is run against every
-      // declaration name in the tree, and a JavaScript regular expression
-      // cannot be interrupted once it has started, so there is no deadline to
-      // fall back on. See `hasNestedRepetition`.
+      // Refused before anything runs: this pattern is tried against every
+      // declaration name in the tree. See `hasNestedRepetition`.
       if (hasNestedRepetition(input.pattern)) {
-        return `AstQuery refused the pattern /${input.pattern}/: it repeats a group that itself repeats or branches (\`(a+)+\`, \`(a|a)*\`), which can take exponential time on an ordinary identifier and cannot be interrupted once it starts. Rewrite it without the nested repetition — \`^(get|set)\` rather than \`^(get|set)+\`.`;
+        return `AstQuery refused the pattern /${input.pattern}/: it repeats a group whose passes can match the same text more than one way (\`(a+)+\`, \`(a|a)*\`, \`(\\w+){2,64}\`), which can take exponential time on an ordinary identifier. Rewrite it without the nested repetition — \`^(get|set)\` rather than \`^(get|set)+\`.`;
       }
-      try {
-        matcher = new RegExp(input.pattern);
-      } catch (err) {
-        return `AstQuery could not use the pattern /${input.pattern}/: ${(err as Error).message}`;
+      const verdict = screenUserRegex(input.pattern);
+      if (!verdict.ok) {
+        return `AstQuery could not use the pattern /${input.pattern}/: ${verdict.reason}`;
       }
     }
     const collected = collectSources(
@@ -1172,25 +1172,77 @@ export const astQuery: RegisteredTool = buildTool({
     );
     const kinds = input.kinds === undefined ? undefined : new Set<string>(input.kinds);
     const includeMembers = input.includeMembers ?? true;
-    const results: Array<Record<string, unknown>> = [];
+    type Found = {
+      file: { workspacePath: string };
+      decl: ReturnType<typeof scanDeclarations>[number];
+    };
+    const candidates: Found[] = [];
     for (const file of collected.files) {
       for (const decl of scanDeclarations(file.text)) {
         if (!includeMembers && decl.parent !== undefined) continue;
         if (kinds !== undefined && !kinds.has(decl.kind)) continue;
         if (input.name !== undefined && decl.name !== input.name) continue;
-        if (matcher !== undefined && !matcher.test(decl.name)) continue;
         if (input.exportedOnly === true && !decl.exported) continue;
-        results.push({
-          file: file.workspacePath,
-          kind: decl.kind,
-          name: decl.name,
-          ...(decl.parent === undefined ? {} : { parent: decl.parent }),
-          startLine: decl.startLine,
-          endLine: decl.endLine,
-          exported: decl.exported,
-          signature: decl.signature,
-        });
+        candidates.push({ file, decl });
       }
+    }
+    // The pattern runs over the candidates' names in @crewhaus/tool-safety's
+    // regex worker, once per distinct name, under a deadline (C079). A name
+    // it could not answer for is listed, never taken for a non-match.
+    let unchecked: string[] = [];
+    let uncheckedWhy: string | undefined;
+    let keep: (name: string) => boolean = () => true;
+    if (input.pattern !== undefined && candidates.length > 0) {
+      const names = [...new Set(candidates.map((c) => c.decl.name))];
+      const outcome = await runRegex({
+        op: "testEach",
+        pattern: input.pattern,
+        inputs: names,
+        maxMatches: names.length,
+        onGiveUp: "skip",
+        // No identifier is this long; one that is gets listed as unchecked
+        // rather than run, which also bounds what a runaway match can cost.
+        maxItemChars: MAX_PATTERN_NAME_CHARS,
+        deadlineMs: 5_000,
+        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        ...(ctx?.runContext !== undefined ? { runawayKey: ctx.runContext.sessionId } : {}),
+      });
+      let matched: ReadonlyArray<number>;
+      let unknown: ReadonlyArray<number>;
+      if (outcome.status === "ok") {
+        matched = outcome.result.matched;
+        unknown = outcome.result.undetermined;
+      } else if (
+        (outcome.status === "timeout" || outcome.status === "gave-up") &&
+        outcome.partial !== undefined
+      ) {
+        // Answers before the stop stand; every name after it is unchecked.
+        matched = outcome.partial.matched;
+        const answered = new Set(outcome.partial.undetermined);
+        const upTo = outcome.partial.scanned;
+        unknown = names.map((_, i) => i).filter((i) => i >= upTo || answered.has(i));
+        uncheckedWhy = describeRegexOutcome(outcome);
+      } else {
+        return `AstQuery could not evaluate the pattern /${input.pattern}/ against the declaration names: ${describeRegexOutcome(outcome)}. No declarations are reported, rather than a list that silently leaves some out.`;
+      }
+      const hit = new Set(matched.map((i) => names[i] as string));
+      const skip = new Set(unknown.map((i) => names[i] as string));
+      unchecked = [...skip].sort();
+      keep = (name) => hit.has(name) && !skip.has(name);
+    }
+    const results: Array<Record<string, unknown>> = [];
+    for (const { file, decl } of candidates) {
+      if (!keep(decl.name)) continue;
+      results.push({
+        file: file.workspacePath,
+        kind: decl.kind,
+        name: decl.name,
+        ...(decl.parent === undefined ? {} : { parent: decl.parent }),
+        startLine: decl.startLine,
+        endLine: decl.endLine,
+        exported: decl.exported,
+        signature: decl.signature,
+      });
     }
     const capped = capList(results, input.maxResults ?? 1_000);
     return json({
@@ -1200,6 +1252,15 @@ export const astQuery: RegisteredTool = buildTool({
       ...(capped.truncated ? { resultsTruncated: true } : {}),
       ...(collected.truncated ? { scanTruncated: true } : {}),
       ...(collected.skipped.length === 0 ? {} : { skippedFiles: collected.skipped.length }),
+      ...(unchecked.length === 0
+        ? {}
+        : {
+            uncheckedNames: unchecked.slice(0, 50),
+            uncheckedCount: unchecked.length,
+            uncheckedReason:
+              uncheckedWhy ??
+              "the pattern engine gave up on these names; they may or may not match, and are not in `declarations`",
+          }),
       method: "lexical scan, not a parser",
     });
   },

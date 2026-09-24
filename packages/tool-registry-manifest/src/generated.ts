@@ -239,7 +239,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "astQuery",
     name: "AstQuery",
     description:
-      "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run.",
+      "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run, and a name the pattern could not be checked against is listed as unchecked, never dropped as a non-match.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -8162,7 +8162,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "waitForOutput",
     name: "WaitForOutput",
     description:
-      "Watch a background process's output until a pattern matches, a failure pattern matches first, or a required deadline passes. Use it to wait for the line that means ready — 'Listening on', 'compiled successfully' — and to give up early when the line that means broken shows up instead. It reads without consuming, so ProcessOutput still returns everything afterwards.",
+      "Watch a background process's output until a pattern matches, a failure pattern matches first, or a required deadline passes. Use it to wait for the line that means ready — 'Listening on', 'compiled successfully' — and to give up early when the line that means broken shows up instead. It reads without consuming, so ProcessOutput still returns everything afterwards. A pattern that could not be evaluated ends the wait as undetermined (matched: null), never as a miss.",
     readOnly: true,
     destructive: false,
     scope: "internal",
