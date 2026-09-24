@@ -42,6 +42,7 @@
 import { Buffer } from "node:buffer";
 import { lookup as dnsLookup, resolveTxt } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import { joinTxtChunks, normalizeDomain } from "./lib/dns-records";
 
 /** Refusal by the allow-list, the SSRF gate, or a redirect rule. */
@@ -1062,12 +1063,18 @@ export type RawFetch = (req: Request, pinnedIp: string) => Promise<Response>;
 /**
  * Dial the vetted IP while keeping the real hostname for the `Host` header
  * and TLS SNI, so virtual hosting and certificate validation still work.
+ *
+ * Both branches fetch with the body kept RAW (`fetchRaw`, Bun's
+ * `decompress: false`). Without it Bun inflates a gzip, deflate, br or zstd
+ * reply in native code before any reader sees a byte, so a 300 KB gzip reply
+ * cost about 860 MB however small `maxBytes` was (security-5#7).
+ * {@link readCapped} decodes the body itself, under the cap.
  */
 function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (unbracketed === pinnedIp || pinnedIp === "") return globalThis.fetch(req);
+  if (unbracketed === pinnedIp || pinnedIp === "") return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -1086,7 +1093,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     init.body = req.body;
     init.duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 let rawFetch: RawFetch = pinnedFetch;
@@ -1132,6 +1139,13 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     const lower = name.toLowerCase();
     return CREDENTIAL_HEADERS.has(lower) || o.credentialHeaders?.has(lower) === true;
   };
+  // Ask for the body as it is. The reader decodes gzip, deflate, br and zstd
+  // under the cap anyway, so a provider that compresses regardless still
+  // works; asking for identity just spares the decoding. A caller that set
+  // its own Accept-Encoding keeps it.
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === "accept-encoding")) {
+    headers["accept-encoding"] = "identity";
+  }
   let redirects = 0;
   let credentialsDropped = false;
   let current = o.url;
@@ -1219,52 +1233,45 @@ export type CappedBody = {
 };
 
 /**
- * Drain a body with a hard byte cap, cancelling the stream the moment the cap
- * is passed so a hostile endpoint cannot pin memory. The cap bounds what is
- * ever held, not what is kept after buffering.
+ * Drain a body with a hard byte cap on its DECODED size, so a hostile
+ * endpoint cannot pin memory: the body arrives raw (see `pinnedFetch`), a
+ * gzip, deflate, br or zstd body is decoded here in small steps, and the
+ * decoder stops once `maxBytes` exist. The cap bounds what is ever held, not
+ * what is kept after buffering.
+ *
+ * A body this reader cannot decode within the bound (an unknown or stacked
+ * coding, a corrupt stream) is a refusal that quotes nothing the endpoint
+ * sent. An aborted read throws an `AbortError`, so `describeFailure` reports
+ * the deadline or the abort as it does for the request itself.
  */
-export async function readCapped(res: Response, maxBytes: number): Promise<CappedBody> {
-  if (res.body === null) return { text: "", bytes: 0, truncated: false };
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let truncated = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        chunks.push(value.subarray(0, maxBytes - total));
-        total = maxBytes;
-        truncated = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
+export async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<CappedBody> {
+  const read = await readResponseBounded(res, {
+    maxBytes,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (read.ok) return { text: read.text, bytes: read.bytes.byteLength, truncated: read.truncated };
+  switch (read.code) {
+    case "aborted": {
+      const err = new Error("the read was aborted before the reply ended");
+      err.name = "AbortError";
+      throw err;
     }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
+    case "unsupported-encoding":
+      throw new NotifyPermissionError(
+        "the endpoint sent its reply in a content-encoding this tool cannot decode within its byte cap, so the reply was not read",
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      throw new NotifyPermissionError(
+        "the endpoint's reply is labelled as compressed but could not be decoded, so it was not read",
+      );
+    default:
+      throw new NotifyPermissionError("the endpoint's reply could not be read to the end");
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return {
-    text: new TextDecoder("utf-8", { fatal: false }).decode(merged),
-    bytes: total,
-    truncated,
-  };
 }
 
 /** A URL the caller supplied, or a readable refusal that does not echo it. */

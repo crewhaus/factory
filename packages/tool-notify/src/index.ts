@@ -290,7 +290,7 @@ async function send(
     redirect: "refuse",
     credentialHeaders: secretHeaders,
   });
-  const capped = await readCapped(opened.res, maxBytes);
+  const capped = await readCapped(opened.res, maxBytes, prepared.deadline.signal);
   let parsed: unknown;
   try {
     parsed = JSON.parse(capped.text);
@@ -2137,7 +2137,11 @@ export const deliveryCheck: RegisteredTool = buildTool({
         redirect: "follow",
         credentialHeaders: applied.secretHeaders,
       });
-      const capped = await readCapped(opened.res, args.maxBytes ?? DEFAULT_MAX_BYTES);
+      const capped = await readCapped(
+        opened.res,
+        args.maxBytes ?? DEFAULT_MAX_BYTES,
+        deadline.signal,
+      );
       let parsedBody: unknown;
       try {
         parsedBody = JSON.parse(capped.text);
