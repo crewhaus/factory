@@ -143,7 +143,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `http://example.com/`).
 - **A call whose input the tool would reject is refused before any rule or
   approval.** It could not run anyway; now it no longer parks an approval
-  first. The denial carries the tool's validation message.
+  first. The model gets the tool's validation message, as before. It is not
+  a permission decision, so it does not count as a denial in eval safety
+  violations or deny alerts.
 - **`CREWHAUS_SANDBOX` with a value that names no backend now blocks code
   execution** with a message saying what to set, instead of letting the call
   through to fail inside the tool.

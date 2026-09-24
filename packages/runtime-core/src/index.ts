@@ -5793,15 +5793,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       canonicalizePath: workspacePathCanonicalizer(),
     });
     if (!subject.ok) {
-      bus.publish({
-        ...bus.envelope(),
-        kind: "permission_decision",
-        toolName: tu.name,
-        decision: "deny",
-        mode: permissionMode,
-        reason: subject.reason,
-        ...callAttribution,
-      });
+      // Not a permission decision: no rule was consulted, and the call fails
+      // the way a malformed call always has — an `is_error` tool result, with
+      // `tool_call_end` recording it. Publishing it as a `permission_decision`
+      // deny would count every malformed call as a policy denial (eval
+      // safety_violations, the deny alerts and SLOs).
       return finish({
         type: "tool_result",
         tool_use_id: tu.id,

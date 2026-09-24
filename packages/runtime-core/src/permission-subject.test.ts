@@ -45,9 +45,13 @@ import { runChatLoop } from "./index";
 
 type Call = { readonly name: string; readonly input: unknown };
 
+/** Every request the last adapter saw, so a test can read the tool_result it sent back. */
+let requests: ProviderRequest[] = [];
+
 /** One tool_use, then "done". */
 function adapterFor(call: Call): ProviderAdapter {
   let i = 0;
+  requests = [];
   return {
     providerId: "anthropic",
     features: {
@@ -58,7 +62,8 @@ function adapterFor(call: Call): ProviderAdapter {
       web_search: true,
     },
     estimateTokens: () => 0,
-    stream: (_req: ProviderRequest) => {
+    stream: (req: ProviderRequest) => {
+      requests.push(req);
       const first = i === 0;
       i++;
       return (async function* () {
@@ -379,21 +384,37 @@ describe("plan mode honours a deny on a read-only tool (permission-integration#6
   });
 });
 
-describe("an input the schema rejects is denied before any rule or approval", () => {
-  test("denied with the schema's message, in every mode", async () => {
+describe("an input the schema rejects is refused before any rule or approval", () => {
+  test("refused with the schema's message, in every mode, and not counted as a denial", async () => {
     for (const mode of [...MODES, "bypass" as const]) {
       ran = [];
-      const r = await run(
-        { name: "Write", input: { path: 5, content: "x" } },
-        rules(["alwaysAllow", "Write"]),
-        mode,
-      );
-      expect({ mode, ran: r.ran, decision: r.decision }).toEqual({
-        mode,
-        ran: false,
-        decision: "deny",
+      const runContext = createRunContext();
+      const events: TraceEvent[] = [];
+      runContext.eventBus.subscribe((e) => events.push(e));
+      await runChatLoop({
+        model: "test-model",
+        instructions: "permission e2e",
+        runContext,
+        sessionRootDir: mkdtempSync(join(root, "sess-")),
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        permissionMode: mode,
+        permissionRules: rules(["alwaysAllow", "Write"]),
+        tools: TOOLS,
+        _adapter: adapterFor({ name: "Write", input: { path: 5, content: "x" } }),
       });
-      expect(r.reason).toMatch(/^invalid input for tool "Write": Expected string, received number/);
+      expect({ mode, ran: ran.length > 0 }).toEqual({ mode, ran: false });
+      // No rule was consulted, so there is no permission_decision to count as
+      // a deny (eval safety_violations, deny alerts); tool_call_end says it
+      // failed, as a malformed call always did.
+      expect(events.filter((e) => e.kind === "permission_decision")).toEqual([]);
+      const end = events.find((e) => e.kind === "tool_call_end");
+      expect(end?.kind === "tool_call_end" ? end.isError : undefined).toBe(true);
+      // The model is told why, in the schema's words.
+      const sent = JSON.stringify(requests[1]?.messages ?? []);
+      expect(sent).toContain(
+        'invalid input for tool \\"Write\\": Expected string, received number',
+      );
     }
   });
 });
