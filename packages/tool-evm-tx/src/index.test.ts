@@ -58,6 +58,23 @@ describe("EvmSendTransaction & EvmSimulate — tool flags", () => {
     expect(EVM_TX_TOOL_MAP.evmSimulate.readOnly).toBe(true);
     expect(EVM_TX_TOOL_MAP.evmSimulate.destructive).toBe(false);
   });
+  test("EvmSimulate declares the RPC boundary it crosses (C044)", () => {
+    // eth_call and eth_estimateGas carry the model's calldata to the node:
+    // undeclared, the egress classifier never saw it.
+    const t = EVM_TX_TOOL_MAP.evmSimulate;
+    expect({ readOnly: t.readOnly, scope: t.scope, io: t.ioCapability }).toEqual({
+      readOnly: true,
+      scope: "external",
+      io: "network",
+    });
+    expect(t.requireJustification).toBe(false);
+  });
+  test("every tool in the package declares where it sends", () => {
+    const tools = Object.values(EVM_TX_TOOL_MAP);
+    expect(tools).toHaveLength(2);
+    for (const t of tools)
+      expect([t.name, t.scope, t.ioCapability]).toEqual([t.name, "external", "network"]);
+  });
 });
 
 describe("EvmSendTransaction — happy path through wallet-engine", () => {
