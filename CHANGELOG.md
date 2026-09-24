@@ -202,6 +202,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send to a place you configured (`SendMessage`, `WebSearch`,
   `ImageGenerate`, a code host's reads) still only log. To relax one sink for
   a deployment, pass `resolveSinkScope` to the runtime.
+- **`PermissionsSuggest` no longer reads session logs linked in from outside
+  the workspace.** It checked the sessions folder but not the files in it, so
+  a symbolic link planted there made it read another project's transcript and
+  repeat the commands in it — secrets included — in its proposals. Such a log
+  is now skipped and listed as unreadable. `ApprovalStatus` and
+  `ApprovalsInbox` likewise no longer read a harness's `.env` through a link
+  that leads outside; they report the session root as unknown instead.
 - **A deny written the way the docs say now fires on MCP tools.**
   `alwaysDeny mcp__github__*` matched nothing, because the tools were
   registered under another name, so in auto mode the call simply ran.

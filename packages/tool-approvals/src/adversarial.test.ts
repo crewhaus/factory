@@ -14,7 +14,7 @@
  * call, and nothing adjacent to it.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -370,6 +370,54 @@ describe("a proposal that covers more than the approved call says so", () => {
       expect(s.argConstrained).toBe(true);
       expect(s.verified).toContain("matches the approved call");
       expect(s.evidence.some((l) => l.startsWith("BLANKET GRANT"))).toBe(false);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// a planted session log is not a way out of the workspace (security-2#2)
+// ---------------------------------------------------------------------------
+
+describe("a session log that links outside the workspace", () => {
+  test("is not mined, and nothing it holds reaches the answer", async () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "crewhaus-tool-approvals-outside-"));
+    try {
+      // Another project's transcript, holding a secret inside a tool input and
+      // three approved asks — enough to become a suggestion if it were read.
+      const secretCommand =
+        "curl -H 'Authorization: Bearer sk-OUTSIDE-SECRET' https://internal.example";
+      const foreign = path.join(outside, "other-project-session.jsonl");
+      writeFileSync(
+        foreign,
+        `${[
+          toolUse("Bash", { command: secretCommand }),
+          permissionAsk("Bash", "approved"),
+          permissionAsk("Bash", "approved"),
+          permissionAsk("Bash", "approved"),
+        ].join("\n")}\n`,
+      );
+      const sessions = path.join(tmp, "h", ".crewhaus", "sessions");
+      mkdirSync(sessions, { recursive: true });
+      symlinkSync(foreign, path.join(sessions, "sess_planted.jsonl"));
+
+      const raw = await permissionsSuggest.execute({ dir: "h" });
+      const out = JSON.parse(raw) as {
+        mined: { mined: string[]; unreadable: Array<{ file: string; reason: string }> };
+        suggestions: unknown[];
+        unknown: Array<{ field: string }>;
+      };
+      expect(out.mined.mined).toEqual([]);
+      expect(out.suggestions).toEqual([]);
+      expect(out.mined.unreadable).toEqual([
+        {
+          file: "sess_planted.jsonl",
+          reason: "is a symbolic link that leads outside the workspace, so it was not read",
+        },
+      ]);
+      expect(out.unknown.map((u) => u.field)).toContain("mined.unreadable");
+      expect(raw).not.toContain("sk-OUTSIDE-SECRET");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 });

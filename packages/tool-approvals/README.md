@@ -271,7 +271,13 @@ including through a symlink that lives inside the workspace and points out of it
 and including a dangling link, which is still a door. A NUL in a path is refused
 on the string the caller wrote, before any syscall sees it. The harness directory
 being contained is not enough on its own, so `.crewhaus/sessions` inside it is
-re-checked — it may itself be a link out of the workspace.
+re-checked — it may itself be a link out of the workspace. So is each file read
+inside it: a session log, or a harness's `.env` / `.env.local`, that is a link
+leading outside the workspace is not opened. A log like that is listed under
+`mined.unreadable` with the reason; an `.env` like that makes the relocation
+answer "unknown" rather than "no". A link that stays inside the workspace is
+followed, and no file is ever opened through a link that appeared after the
+check.
 
 The fleet walk never follows a directory symlink, never descends into
 `node_modules` or a harness's own `.crewhaus/`, and stops at each harness, since
