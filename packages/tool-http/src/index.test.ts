@@ -988,6 +988,29 @@ describe("HttpBatch", () => {
   // healthy request exposed to the failure: still in flight when the failure
   // lands, or not yet started when the deadline fires.
 
+  test("a transport failure that lands after the deadline's time is reported as itself", async () => {
+    // The stub holds the event loop past the 50ms per-request deadline and
+    // then fails, so the failure is delivered before the deadline's timer can
+    // run: deterministic, with no race against real I/O.
+    _setRawFetch(async () => {
+      const started = performance.now();
+      while (performance.now() - started < 80) {
+        // spin
+      }
+      throw new TypeError("fetch failed: ECONNRESET");
+    });
+    try {
+      const result = await run(httpBatch, { requests: [{ url: `${origin}/json` }], timeoutMs: 50 });
+      // 0.7.0 said "deadline elapsed before the request completed", off the
+      // clock, and the reset was never mentioned.
+      expect(result.results[0].error).toBe(
+        "TypeError: fetch failed: ECONNRESET (the deadline had also elapsed)",
+      );
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
+
   test("a failure never cancels a sibling that is still in flight", async () => {
     // The refused origin fails before any I/O; /slow is then mid-request for
     // two seconds. An abort that fanned out from the failure would reach it.

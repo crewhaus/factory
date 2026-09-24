@@ -655,11 +655,32 @@ export function expandIpv6(raw: string): number[] | null {
 // deadlines
 // ---------------------------------------------------------------------------
 
+/**
+ * The reason a deadline's own timer aborts its signal with. An error is
+ * traced to the deadline by this reason, never by the clock: a transport
+ * failure that merely ARRIVES after the deadline's time (a starved event
+ * loop delivers it before the timer callback runs) is that failure, and a
+ * runtime cancel aborts with the runtime's reason instead.
+ */
+export class DeadlineElapsedError extends Error {
+  override readonly name = "TimeoutError";
+}
+
 export type Deadline = {
   readonly signal: AbortSignal;
   /** Milliseconds left; never negative. */
   remaining(): number;
+  /**
+   * The clock says the time is up. For scheduling (stop starting new work),
+   * never for saying why something failed — that is {@link timedOut}.
+   */
   expired(): boolean;
+  /**
+   * The deadline's timer — or an outer deadline's, forwarded — really
+   * aborted the signal. False for a runtime cancel, and false while the
+   * timer has not run, however late the clock says it is.
+   */
+  timedOut(): boolean;
   /** Clear the timer. Always call it, or the process keeps a handle alive. */
   cancel(): void;
 };
@@ -673,7 +694,10 @@ export type Deadline = {
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const ctrl = new AbortController();
   const startedAt = Date.now();
-  const timer = setTimeout(() => ctrl.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(
+    () => ctrl.abort(new DeadlineElapsedError(`deadline of ${ms}ms elapsed`)),
+    ms,
+  );
   const onOuter = () => ctrl.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) ctrl.abort(outer.reason);
@@ -683,6 +707,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
     signal: ctrl.signal,
     remaining: () => Math.max(0, ms - (Date.now() - startedAt)),
     expired: () => Date.now() - startedAt >= ms,
+    timedOut: () => ctrl.signal.aborted && ctrl.signal.reason instanceof DeadlineElapsedError,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);
@@ -1143,10 +1168,28 @@ export async function readCapped(
  */
 export function describeFailure(err: unknown, deadline?: Deadline): string {
   if (err instanceof CodehostPermissionError) return err.message;
-  if (deadline?.expired() === true) return "deadline elapsed before the request completed";
+  // The cause decides, not the clock: see DeadlineElapsedError.
+  if (isDeadlineAbort(err, deadline)) return "deadline elapsed before the request completed";
+  const aborted = "the request was aborted before it completed";
+  if (deadline?.signal.aborted === true && err === deadline.signal.reason) return aborted;
   if (err instanceof Error) {
-    if (err.name === "AbortError") return "the request was aborted before it completed";
-    return `${err.name}: ${err.message}`;
+    if (err.name === "AbortError") return aborted;
+    // A real failure that arrived late is still that failure; the clock is
+    // mentioned, because the caller may want a longer deadline as well.
+    const late = deadline?.expired() === true ? " (the deadline had also elapsed)" : "";
+    return `${err.name}: ${err.message}${late}`;
   }
   return String(err);
+}
+
+/**
+ * Whether `err` is what the deadline's own timer did: its abort reason, or an
+ * abort-shaped error (a body reader's AbortError) raised after that timer
+ * fired. Exported for the few callers that report a deadline themselves.
+ */
+export function isDeadlineAbort(err: unknown, deadline?: Deadline): boolean {
+  if (err instanceof DeadlineElapsedError) return true;
+  if (deadline?.timedOut() !== true) return false;
+  if (err === deadline.signal.reason) return true;
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
 }

@@ -82,6 +82,7 @@ import {
   byString,
   canonicalizeOriginOf,
   describeFailure,
+  isDeadlineAbort,
   json,
   openRequest,
   parseUrl,
@@ -1563,7 +1564,7 @@ export const sseRead: RegisteredTool = buildTool({
             if (outcome.code !== "aborted" && outcome.code !== "stalled") {
               return describeFailure(bodyFailure(outcome), deadline);
             }
-            stoppedBy = deadline.expired() ? "deadline" : "error";
+            stoppedBy = deadline.timedOut() ? "deadline" : "error";
           } else if (outcome.truncated) {
             stoppedBy = "byteCap";
           } else {
@@ -1571,7 +1572,10 @@ export const sseRead: RegisteredTool = buildTool({
           }
         }
       } catch (err) {
-        stoppedBy = deadline.expired() ? "deadline" : "error";
+        // Why the stream stopped is the cause, not the clock: an error that
+        // arrived after the deadline's time but before its timer ran is an
+        // error.
+        stoppedBy = isDeadlineAbort(err, deadline) ? "deadline" : "error";
         if (stoppedBy === "error" && !(err instanceof Error && err.name === "AbortError")) {
           return describeFailure(err, deadline);
         }
