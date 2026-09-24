@@ -23,9 +23,25 @@
  * requirement: an emitter must never have to know what a category is.
  */
 import { CrewhausError } from "@crewhaus/errors";
-import { CATEGORIES, type CategoryDef, leafCategories, rollUpCategories } from "./registry";
+import {
+  CATEGORIES,
+  type CategoryDef,
+  LOCAL_TOOLS_IN_NETWORK_ROLLUP,
+  NETWORK_LEAVES_OUTSIDE_ROLLUP,
+  NETWORK_TOOLS_OUTSIDE_ROLLUP,
+  leafCategories,
+  rollUpCategories,
+} from "./registry";
 
-export { CATEGORIES, type CategoryDef, leafCategories, rollUpCategories };
+export {
+  CATEGORIES,
+  type CategoryDef,
+  LOCAL_TOOLS_IN_NETWORK_ROLLUP,
+  NETWORK_LEAVES_OUTSIDE_ROLLUP,
+  NETWORK_TOOLS_OUTSIDE_ROLLUP,
+  leafCategories,
+  rollUpCategories,
+};
 export {
   BUILTIN_TOOLS,
   type BootRegistrar,

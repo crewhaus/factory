@@ -1474,6 +1474,8 @@ export type CategoryRow = {
   readonly tools: ReadonlyArray<string>;
   /** For a roll-up, the categories it rolls up. */
   readonly includes?: ReadonlyArray<string>;
+  /** What the title cannot say in a line (the network roll-up's gaps). */
+  readonly note?: string;
 };
 
 /**
@@ -1485,7 +1487,12 @@ export function buildCategoryRows(
   categories: Readonly<
     Record<
       string,
-      { title: string; tools?: ReadonlyArray<string>; includes?: ReadonlyArray<string> }
+      {
+        title: string;
+        tools?: ReadonlyArray<string>;
+        includes?: ReadonlyArray<string>;
+        note?: string;
+      }
     >
   >,
   resolve: (name: string) => ReadonlyArray<string>,
@@ -1498,6 +1505,7 @@ export function buildCategoryRows(
       kind: (def.tools !== undefined ? "leaf" : "roll-up") as "leaf" | "roll-up",
       tools: resolve(name),
       ...(def.includes !== undefined ? { includes: [...def.includes] } : {}),
+      ...(def.note !== undefined ? { note: def.note } : {}),
     }))
     .sort((a, b) => {
       // Leaves first, then roll-ups: an operator scanning for "what can I
@@ -1517,6 +1525,7 @@ export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] 
     for (const r of leaves) {
       lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
       lines.push(`    ${r.tools.join(", ")}`);
+      if (r.note !== undefined) lines.push(`    note: ${r.note}`);
     }
   }
   if (rollUps.length > 0) {
@@ -1525,6 +1534,7 @@ export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] 
     for (const r of rollUps) {
       lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
       lines.push(`    = ${(r.includes ?? []).map((c) => `all-${c}`).join(" + ")}`);
+      if (r.note !== undefined) lines.push(`    note: ${r.note}`);
     }
   }
   lines.push("");

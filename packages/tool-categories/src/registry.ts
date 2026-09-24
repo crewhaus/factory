@@ -24,6 +24,11 @@ export type CategoryDef = {
   readonly tools?: ReadonlyArray<string>;
   /** Other category names this one rolls up. Expanded transitively. */
   readonly includes?: ReadonlyArray<string>;
+  /**
+   * What the title cannot say in a line and an operator must not miss —
+   * printed under the category by `crewhaus tools categories`.
+   */
+  readonly note?: string;
 };
 
 /**
@@ -938,12 +943,28 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     includes: ["onchain", "chainread", "chaincall", "token", "defi"],
   },
   network: {
-    title: "Everything that reaches the network",
+    // C038 — this was titled "Everything that reaches the network", and it
+    // never was: its leaves were picked by hand, and the code-host,
+    // messaging, observability and KYC tools (and a few strays in local
+    // leaves) reach the network without being in it, so `-all-network`
+    // quietly kept them. The title now says what it holds. Widening it would
+    // grant those tools to every 0.7.0 spec that wrote `all-network`, which a
+    // patch release must not do. NETWORK_LEAVES_OUTSIDE_ROLLUP and
+    // NETWORK_TOOLS_OUTSIDE_ROLLUP below name every network tool left out,
+    // `./index.test.ts` holds them to the builtin table's io column in both
+    // directions, and the note prints them.
+    //
     // A leaf may sit in more than one roll-up — `text` is in both `compute`
-    // and `content`. These three are listed under `code` because that is what
-    // they are FOR, and here because of what they DO: a registry read, an OSV
-    // query and an OCI manifest fetch all leave the machine, and a roll-up
-    // that claims "everything that reaches the network" has to mean it.
+    // and `content`. registry, supplychain and containers are listed under
+    // `code` because that is what they are FOR, and here because of what they
+    // DO: a registry read, an OSV query and an OCI manifest fetch all leave
+    // the machine. Leaves are whole packages, so four local helpers come
+    // along: webhookSign and webhookVerify (HMAC, in http),
+    // manifestDependencySet (edits a local manifest, in registry) and
+    // ciWorkflowAudit (reads local workflow files, in supplychain).
+    title:
+      "Web, HTTP, package and container registries, supply chain and chain reads and calls — not every tool that reaches the network",
+    note: "also reach the network, outside this roll-up: all-codehost, all-notify, all-obs and all-kyc, and imageGenerate, waitForPort, preflightRun, vectorDelete, packageManifestVerify and federationDiscover. Exclude them by name: -all-network does not.",
     includes: [
       "web",
       "http",
@@ -965,6 +986,48 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     includes: ["ingest", "documents", "media", "text", "html"],
   },
 });
+
+/**
+ * Leaves whose purpose is to reach the network but that the `network`
+ * roll-up does not include (see its comment), with why. Every network tool
+ * in them is covered by this entry.
+ */
+export const NETWORK_LEAVES_OUTSIDE_ROLLUP: Readonly<Record<string, string>> = Object.freeze({
+  codehost:
+    "code-host API calls; adding them would grant the PR, issue and release tools to every spec that wrote all-network on 0.7.0",
+  notify:
+    "messaging (chat, email, SMS, push, webhooks); a patch release does not grant messaging to all-network specs",
+  obs: "metrics, logs, alerts and status pages of the operator's own services",
+  kyc: "business-registry and VAT lookups",
+});
+
+/**
+ * Single tools that reach the network from a leaf that is otherwise local,
+ * so neither leaf can join the roll-up whole. Named one by one, so a new
+ * network tool in a local leaf fails the guard instead of hiding here.
+ */
+export const NETWORK_TOOLS_OUTSIDE_ROLLUP: Readonly<Record<string, string>> = Object.freeze({
+  imageGenerate: "the one networked tool in media (an image-generation API)",
+  waitForPort: "the one networked tool in proc (it polls a TCP host and port)",
+  preflightRun:
+    "the one networked tool in crewhaus (its preflight checks reach the services a harness uses)",
+  vectorDelete: "the one networked tool in state (it deletes from the registered vector store)",
+  packageManifestVerify:
+    "the one networked tool in distribution (it fetches every URL a published manifest points at)",
+  federationDiscover:
+    "the one networked tool in discovery (it checks which federation peers answer)",
+});
+
+/**
+ * Tools the `network` roll-up holds that do no network I/O, because their
+ * leaf is a network package (see the roll-up's comment).
+ */
+export const LOCAL_TOOLS_IN_NETWORK_ROLLUP: ReadonlyArray<string> = Object.freeze([
+  "ciWorkflowAudit",
+  "manifestDependencySet",
+  "webhookSign",
+  "webhookVerify",
+]);
 
 /** Category names that own tool keys directly. */
 export function leafCategories(): ReadonlyArray<string> {

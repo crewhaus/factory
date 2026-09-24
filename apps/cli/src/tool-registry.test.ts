@@ -33,6 +33,7 @@ import {
   TOOL_KEYWORDS,
   buildCategoryRows,
   diffToolMapKeys,
+  formatCategoryLines,
 } from "./tools-cli";
 
 describe("category registry vs. the real builtin set", () => {
@@ -186,6 +187,22 @@ describe("buildCategoryRows", () => {
       expect(row.title.length).toBeGreaterThan(0);
       expect(row.tools.length).toBeGreaterThan(0);
     }
+  });
+
+  // C038 — `tools categories` is where an operator reads what all-network
+  // holds, so the network tools it leaves out are printed under it.
+  test("the network roll-up prints the network tools it leaves out", () => {
+    const rows = buildCategoryRows(CATEGORIES, toolsInCategory);
+    const network = rows.find((r) => r.name === "network");
+    expect(network?.note).toContain("all-codehost");
+    const lines = formatCategoryLines(rows);
+    const at = lines.findIndex((l) => l.startsWith("  all-network  "));
+    expect(at).toBeGreaterThan(-1);
+    expect(lines[at + 2]).toBe(`    note: ${network?.note}`);
+    // Only the rows that carry a note print one.
+    expect(lines.filter((l) => l.startsWith("    note: "))).toHaveLength(
+      rows.filter((r) => r.note !== undefined).length,
+    );
   });
 });
 

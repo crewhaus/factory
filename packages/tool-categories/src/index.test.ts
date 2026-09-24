@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  BUILTIN_TOOLS,
   CATEGORIES,
+  LOCAL_TOOLS_IN_NETWORK_ROLLUP,
+  NETWORK_LEAVES_OUTSIDE_ROLLUP,
+  NETWORK_TOOLS_OUTSIDE_ROLLUP,
   ToolCategoryError,
   allRegisteredTools,
   categoriesForTool,
@@ -299,5 +303,102 @@ describe("lookup helpers", () => {
 
   test("categoriesForTool is empty for an unknown key", () => {
     expect(categoriesForTool("definitelyNotATool")).toEqual([]);
+  });
+});
+
+// C038 — the `network` roll-up was titled "Everything that reaches the
+// network" while half the builtins whose row says io: "network" sat outside
+// it, and it held four tools that never touch the network. Its title now
+// says what it holds; this guard keeps the roll-up, the two exemption lists
+// and the builtin table's io column (itself checked against every tool by
+// apps/cli/src/tool-registry.test.ts) in agreement, both ways.
+describe("the network roll-up and the io column agree", () => {
+  const inRollup = new Set(toolsInCategory("network"));
+  const leafOf = (key: string): string | undefined =>
+    leafCategories().find((c) => (CATEGORIES[c]?.tools ?? []).includes(key));
+  const networkBuiltins = Object.entries(BUILTIN_TOOLS)
+    .filter(([, e]) => e.io === "network")
+    .map(([k]) => k);
+  // A shape-specific builtin (sendMessage, evmSendTransaction) is in no
+  // category at all, so no roll-up can hold it.
+  const categorized = networkBuiltins.filter((k) => BUILTIN_TOOLS[k]?.shapes === undefined);
+
+  test("every categorized network builtin is in the roll-up or listed outside it", () => {
+    const unlisted = categorized.filter(
+      (k) =>
+        !inRollup.has(k) &&
+        !((leafOf(k) ?? "") in NETWORK_LEAVES_OUTSIDE_ROLLUP) &&
+        !(k in NETWORK_TOOLS_OUTSIDE_ROLLUP),
+    );
+    expect(unlisted).toEqual([]);
+    // The guard's hit count: the lists really carry the tools left out.
+    const outside = categorized.filter((k) => !inRollup.has(k));
+    expect(outside.length).toBeGreaterThan(40);
+    expect(networkBuiltins.length - categorized.length).toBe(2);
+  });
+
+  test("every listed leaf still reaches the network and is still outside the roll-up", () => {
+    const rollupLeaves = new Set(
+      (CATEGORIES["network"]?.includes ?? []).flatMap((c) =>
+        CATEGORIES[c]?.tools !== undefined ? [c] : (CATEGORIES[c]?.includes ?? []),
+      ),
+    );
+    const stale: string[] = [];
+    for (const leaf of Object.keys(NETWORK_LEAVES_OUTSIDE_ROLLUP)) {
+      const tools = CATEGORIES[leaf]?.tools;
+      if (tools === undefined) stale.push(`${leaf}: not a leaf`);
+      else if (!tools.some((k) => BUILTIN_TOOLS[k]?.io === "network"))
+        stale.push(`${leaf}: no network tool`);
+      if (rollupLeaves.has(leaf)) stale.push(`${leaf}: now in the roll-up`);
+    }
+    expect(stale).toEqual([]);
+    expect(Object.keys(NETWORK_LEAVES_OUTSIDE_ROLLUP).length).toBeGreaterThan(0);
+  });
+
+  test("every listed tool still reaches the network, from a leaf the roll-up and the leaf list leave out", () => {
+    const stale: string[] = [];
+    for (const key of Object.keys(NETWORK_TOOLS_OUTSIDE_ROLLUP)) {
+      if (BUILTIN_TOOLS[key]?.io !== "network") stale.push(`${key}: not a network builtin`);
+      if (inRollup.has(key)) stale.push(`${key}: now in the roll-up`);
+      if ((leafOf(key) ?? "") in NETWORK_LEAVES_OUTSIDE_ROLLUP)
+        stale.push(`${key}: its whole leaf is listed`);
+    }
+    expect(stale).toEqual([]);
+    expect(Object.keys(NETWORK_TOOLS_OUTSIDE_ROLLUP).length).toBeGreaterThan(0);
+  });
+
+  test("the only roll-up members with no network I/O are the named local helpers", () => {
+    const local = [...inRollup].filter((k) => BUILTIN_TOOLS[k]?.io !== "network").sort();
+    expect(local).toEqual([...LOCAL_TOOLS_IN_NETWORK_ROLLUP].sort());
+  });
+
+  test("the note names every leaf and tool left out, and the title no longer claims everything", () => {
+    const def = CATEGORIES["network"];
+    expect(def?.title).not.toMatch(/^everything/i);
+    const note = def?.note ?? "";
+    for (const leaf of Object.keys(NETWORK_LEAVES_OUTSIDE_ROLLUP)) {
+      expect(note).toContain(`all-${leaf}`);
+    }
+    for (const key of Object.keys(NETWORK_TOOLS_OUTSIDE_ROLLUP)) expect(note).toContain(key);
+  });
+
+  test("the roll-up grants what it granted on 0.7.0", () => {
+    // Retitled, not widened: a spec that wrote all-network keeps its grant.
+    expect([...inRollup].sort()).toEqual(
+      [
+        "web",
+        "http",
+        "registry",
+        "supplychain",
+        "containers",
+        "chainread",
+        "chaincall",
+        "token",
+        "defi",
+      ]
+        .flatMap((c) => toolsInCategory(c))
+        .filter((k, i, a) => a.indexOf(k) === i)
+        .sort(),
+    );
   });
 });
