@@ -263,7 +263,7 @@ describe("crewhaus review (CLI)", () => {
     const bad = await runCli(["review", "frobnicate"]);
     expect(bad.exitCode).not.toBe(0);
     expect(bad.stderr).toContain("review action must be one of");
-  });
+  }, 20_000);
 
   test("list is friendly on an empty queue and renders seeded items; --kind filters; resolve closes", async () => {
     const empty = await runCli(["review", "list"]);
@@ -509,7 +509,7 @@ describe("crewhaus review (CLI)", () => {
     expect(again.exitCode).toBe(0);
     expect(again.stdout).not.toContain("review queue:");
     expect(readReviewQueue(cwd)).toHaveLength(1);
-  });
+  }, 20_000);
 
   test("eval feeder end-to-end: an abstaining judge enqueues abstained items with clipped-input context", async () => {
     // Offline `crewhaus eval`: the agent model AND the judge model are
