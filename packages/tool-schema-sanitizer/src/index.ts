@@ -40,6 +40,9 @@
  *   `strict: true`. Schemas that can't be expressed in the strict subset
  *   return `null` and stay non-strict (best-effort, never a 400).
  *
+ * Inlining is bounded ({@link inlineRefsWithReport}): a `$ref` DAG cannot
+ * grow a small schema exponentially.
+ *
  * The Anthropic adapter deliberately does NOT consume this — the
  * canonical schema IS Anthropic's tool-input shape, so it passes through
  * untouched.
@@ -111,7 +114,8 @@ function resolvePointer(root: JsonSchema, ref: string): unknown {
   let current: unknown = root;
   for (const segment of segments) {
     if (isSchemaObject(current)) {
-      current = current[segment];
+      // Own keys only: `#/__proto__` names nothing in the document.
+      current = Object.hasOwn(current, segment) ? current[segment] : undefined;
     } else if (Array.isArray(current)) {
       const index = Number(segment);
       current = Number.isInteger(index) ? current[index] : undefined;
@@ -123,50 +127,152 @@ function resolvePointer(root: JsonSchema, ref: string): unknown {
 }
 
 /**
+ * How much inlining one schema may do. A `$ref` is copied in full wherever
+ * it is used, so a definition referenced twice by a definition referenced
+ * twice (a DAG, not a cycle) doubles at every level: a 2 KB schema used to
+ * inline to tens of megabytes, rebuilt on every Gemini, Bedrock and OpenAI
+ * request (flag-truth-4#6). Past either limit a `$ref` is not expanded (see
+ * {@link inlineRefsWithReport}).
+ */
+export type InlineBudget = {
+  /**
+   * Roughly how many bytes of JSON the inlined schema may reach before a
+   * further `$ref` is left unexpanded. Content the caller wrote without a
+   * `$ref` is never cut: the budget bounds what inlining ADDS.
+   */
+  readonly maxBytes?: number;
+  /** How many `$ref`s may be expanded inside one another. */
+  readonly maxRefDepth?: number;
+};
+
+/** The default {@link InlineBudget.maxBytes}: 256 KiB, about 64k tokens of schema. */
+export const DEFAULT_INLINE_MAX_BYTES = 256 * 1024;
+/** The default {@link InlineBudget.maxRefDepth}. */
+export const DEFAULT_INLINE_MAX_REF_DEPTH = 32;
+
+/** What a `$ref` that was not expanded says in its place. */
+export const REF_NOT_EXPANDED_NOTE =
+  "(not expanded: this tool's schema is too large to inline in full, so any value is accepted here)";
+
+export type InlineReport = {
+  readonly schema: JsonSchema;
+  /** How many `$ref`s were left unexpanded because a budget ran out. 0 = fully inlined. */
+  readonly truncatedRefs: number;
+};
+
+type Budget = {
+  bytes: number;
+  truncated: number;
+  readonly maxBytes: number;
+  readonly maxRefDepth: number;
+};
+
+/**
  * Deep-clone `schema`, resolving every local `$ref` against the document
  * root and dropping the `$defs`/`definitions` containers. `refStack`
  * tracks the pointers currently being expanded on this path so a
  * recursive definition breaks into a permissive `{}` instead of looping
  * forever. Sibling keywords alongside a `$ref` (Draft 2020-12 allows
  * them) override the referenced target.
+ *
+ * Bounded: see {@link inlineRefsWithReport}, which also says whether
+ * anything was left out.
  */
-export function inlineRefs(schema: JsonSchema): JsonSchema {
-  const expanded = expandNode(schema, schema, []);
-  return isSchemaObject(expanded) ? expanded : {};
+export function inlineRefs(schema: JsonSchema, budget: InlineBudget = {}): JsonSchema {
+  return inlineRefsWithReport(schema, budget).schema;
 }
 
-function expandValue(value: unknown, root: JsonSchema, refStack: readonly string[]): unknown {
-  if (Array.isArray(value)) return value.map((item) => expandValue(item, root, refStack));
-  if (isSchemaObject(value)) return expandNode(value, root, refStack);
+/**
+ * {@link inlineRefs}, and how many `$ref`s it left unexpanded.
+ *
+ * Inlining counts the JSON it emits, repeats included. Once that passes
+ * `maxBytes`, or a `$ref` sits `maxRefDepth` expansions deep, the `$ref` is
+ * replaced by its sibling keywords plus a description saying it was not
+ * expanded ({@link REF_NOT_EXPANDED_NOTE}) — permissive, the way a cycle
+ * already breaks, and labelled, so the model is told. The tool's own
+ * validator (or the MCP server) still checks every call. The result is at
+ * most the budget plus the definitions being expanded when it ran out, so it
+ * grows with the input, never exponentially.
+ */
+export function inlineRefsWithReport(schema: JsonSchema, budget: InlineBudget = {}): InlineReport {
+  const state: Budget = {
+    bytes: 0,
+    truncated: 0,
+    maxBytes: budget.maxBytes ?? DEFAULT_INLINE_MAX_BYTES,
+    maxRefDepth: budget.maxRefDepth ?? DEFAULT_INLINE_MAX_REF_DEPTH,
+  };
+  const expanded = expandNode(schema, schema, [], state);
+  return { schema: isSchemaObject(expanded) ? expanded : {}, truncatedRefs: state.truncated };
+}
+
+/** The JSON size of a value copied verbatim (literal data, a primitive). */
+function literalBytes(value: unknown): number {
+  if (typeof value === "string") return value.length + 2;
+  if (typeof value === "number" || typeof value === "boolean") return String(value).length;
+  if (value === null || value === undefined) return 4;
+  return JSON.stringify(value)?.length ?? 4;
+}
+
+function expandValue(
+  value: unknown,
+  root: JsonSchema,
+  refStack: readonly string[],
+  budget: Budget,
+): unknown {
+  if (Array.isArray(value)) {
+    budget.bytes += 2 + value.length;
+    return value.map((item) => expandValue(item, root, refStack, budget));
+  }
+  if (isSchemaObject(value)) return expandNode(value, root, refStack, budget);
+  budget.bytes += literalBytes(value);
   return value;
 }
 
-function expandNode(node: JsonSchema, root: JsonSchema, refStack: readonly string[]): JsonSchema {
+function expandNode(
+  node: JsonSchema,
+  root: JsonSchema,
+  refStack: readonly string[],
+  budget: Budget,
+): JsonSchema {
   const ref = node["$ref"];
   if (typeof ref === "string") {
-    const siblings = expandSchemaEntries(withoutKey(node, "$ref"), root, refStack);
+    const siblings = expandSchemaEntries(withoutKey(node, "$ref"), root, refStack, budget);
     if (refStack.includes(ref)) return siblings; // cycle → break with siblings only
     const target = resolvePointer(root, ref);
     if (!isSchemaObject(target)) return siblings; // unresolvable → drop the ref
-    const expandedTarget = expandNode(target, root, [...refStack, ref]);
+    if (budget.bytes >= budget.maxBytes || refStack.length >= budget.maxRefDepth) {
+      budget.truncated++;
+      const own = siblings["description"];
+      const description =
+        typeof own === "string" && own !== ""
+          ? `${own} ${REF_NOT_EXPANDED_NOTE}`
+          : REF_NOT_EXPANDED_NOTE;
+      budget.bytes += description.length + 16;
+      return { ...siblings, description };
+    }
+    const expandedTarget = expandNode(target, root, [...refStack, ref], budget);
     return { ...expandedTarget, ...siblings }; // siblings win
   }
-  return expandSchemaEntries(node, root, refStack);
+  return expandSchemaEntries(node, root, refStack, budget);
 }
 
 function expandSchemaEntries(
   node: JsonSchema,
   root: JsonSchema,
   refStack: readonly string[],
+  budget: Budget,
 ): JsonSchema {
   const out: JsonSchema = {};
+  budget.bytes += 2;
   for (const [key, value] of Object.entries(node)) {
     if (DEF_CONTAINER_KEYS.has(key)) continue; // drop containers post-inline
+    budget.bytes += key.length + 4;
     if (DATA_KEYWORDS.has(key)) {
       out[key] = value; // literal data — never treated as a sub-schema
+      budget.bytes += literalBytes(value);
       continue;
     }
-    out[key] = expandValue(value, root, refStack);
+    out[key] = expandValue(value, root, refStack, budget);
   }
   return out;
 }
@@ -485,9 +591,15 @@ const OPENAI_STRICT_DISQUALIFIERS: ReadonlySet<string> = new Set([
  * property listed in `required` — with properties that were previously
  * optional made nullable (`type: ["T", "null"]`), the documented way to
  * keep a field optional under strict mode.
+ *
+ * A schema whose `$ref`s could not all be inlined
+ * ({@link inlineRefsWithReport}) stays non-strict: the permissive stand-in
+ * has no strict form, and the adapter sends the original schema instead,
+ * which loses nothing.
  */
 export function toOpenAIStrictSchema(schema: JsonSchema): JsonSchema | null {
-  const inlined = inlineRefs(schema);
+  const { schema: inlined, truncatedRefs } = inlineRefsWithReport(schema);
+  if (truncatedRefs > 0) return null;
   if (!qualifiesForStrict(inlined)) return null;
   return makeStrict(inlined);
 }

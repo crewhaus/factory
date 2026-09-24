@@ -632,3 +632,49 @@ describe("toOpenAIChatParams — temperature (NEW-HUNT-2)", () => {
     expect("temperature" in params).toBe(false);
   });
 });
+
+/**
+ * An MCP-style `$ref` DAG: each level references the next twice, so a naive
+ * inline copies the leaf 2^depth times (flag-truth-4#6).
+ */
+function dagSchema(depth: number): Record<string, unknown> {
+  const defs: Record<string, unknown> = { [`d${depth}`]: { type: "string" } };
+  for (let i = 0; i < depth; i++) {
+    defs[`d${i}`] = {
+      type: "object",
+      properties: { a: { $ref: `#/$defs/d${i + 1}` }, b: { $ref: `#/$defs/d${i + 1}` } },
+      required: ["a", "b"],
+    };
+  }
+  return {
+    type: "object",
+    properties: { root: { $ref: "#/$defs/d0" } },
+    required: ["root"],
+    $defs: defs,
+  };
+}
+
+describe("toOpenAIChatParams — a $ref DAG in a tool schema (flag-truth-4#6)", () => {
+  test("a schema too large to inline is sent as written, non-strict", () => {
+    const schema = dagSchema(16);
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [{ name: "deep", description: "deep schema", input_schema: schema }],
+    });
+    const fn = params.tools?.[0]?.function as { strict?: boolean; parameters?: unknown };
+    // The strict upgrade would have been a 5 MB inlined copy; the original
+    // (with its $refs) goes instead, which OpenAI resolves itself.
+    expect(fn.strict).toBeUndefined();
+    expect(fn.parameters).toBe(schema);
+    expect(JSON.stringify(params).length).toBeLessThan(10_000);
+  });
+
+  test("a DAG shallow enough to inline is still upgraded to strict", () => {
+    const params = toOpenAIChatParams({
+      ...baseReq,
+      tools: [{ name: "shallow", description: "shallow schema", input_schema: dagSchema(3) }],
+    });
+    const fn = params.tools?.[0]?.function as { strict?: boolean };
+    expect(fn.strict).toBe(true);
+  });
+});

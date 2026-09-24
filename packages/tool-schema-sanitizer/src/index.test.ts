@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DEFAULT_INLINE_MAX_BYTES,
   type JsonSchema,
+  REF_NOT_EXPANDED_NOTE,
   inlineRefs,
+  inlineRefsWithReport,
   sanitizeBedrockSchema,
   sanitizeGeminiSchema,
   sanitizeToolSchema,
@@ -117,6 +120,141 @@ describe("inlineRefs", () => {
     expect(out["default"]).toEqual({ $ref: "not-a-real-ref" });
   });
 });
+
+/**
+ * A `$ref` DAG: `d<i>` has two properties that both reference `d<i+1>`, so a
+ * naive inline copies `d<depth>` 2^depth times. Every property is required,
+ * so the strict-mode tests below are about the budget, not about optional
+ * keys.
+ */
+function dag(depth: number): JsonSchema {
+  const defs: JsonSchema = { [`d${depth}`]: { type: "string" } };
+  for (let i = 0; i < depth; i++) {
+    defs[`d${i}`] = {
+      type: "object",
+      properties: { a: { $ref: `#/$defs/d${i + 1}` }, b: { $ref: `#/$defs/d${i + 1}` } },
+      required: ["a", "b"],
+    };
+  }
+  return {
+    type: "object",
+    properties: { root: { $ref: "#/$defs/d0" } },
+    required: ["root"],
+    $defs: defs,
+  };
+}
+
+/** How many times `needle` occurs in `hay`. */
+function occurrences(hay: string, needle: string): number {
+  return hay.split(needle).length - 1;
+}
+
+describe("inlineRefs — a $ref DAG cannot grow a schema exponentially (flag-truth-4#6)", () => {
+  // A depth-16 DAG inlined naively is 5 MB of JSON (2^16 copies of the leaf);
+  // the budget holds it near DEFAULT_INLINE_MAX_BYTES, whatever the depth.
+  const bound = 2 * DEFAULT_INLINE_MAX_BYTES;
+
+  test("a deep DAG is cut near the budget, and the cut is labelled", () => {
+    for (const depth of [16, 40]) {
+      const { schema, truncatedRefs } = inlineRefsWithReport(dag(depth));
+      const json = JSON.stringify(schema);
+      expect({ depth, size: json.length <= bound }).toEqual({ depth, size: true });
+      expect(truncatedRefs).toBeGreaterThan(0);
+      // Every unexpanded $ref says so, and nothing else carries the note.
+      expect(occurrences(json, REF_NOT_EXPANDED_NOTE)).toBe(truncatedRefs);
+      expect(json).not.toContain("$ref");
+    }
+  });
+
+  test("the provider projections of a deep DAG are bounded too", () => {
+    for (const sanitize of [sanitizeGeminiSchema, sanitizeBedrockSchema]) {
+      const json = JSON.stringify(sanitize(dag(16)));
+      expect(json.length).toBeLessThanOrEqual(bound);
+      expect(json).toContain(REF_NOT_EXPANDED_NOTE);
+    }
+  });
+
+  test("a shallow DAG is still inlined in full, with no note", () => {
+    const { schema, truncatedRefs } = inlineRefsWithReport(dag(4));
+    const json = JSON.stringify(schema);
+    expect(truncatedRefs).toBe(0);
+    expect(json).not.toContain(REF_NOT_EXPANDED_NOTE);
+    // 2^4 copies of the leaf, all there.
+    expect(occurrences(json, '{"type":"string"}')).toBe(16);
+  });
+
+  test("one small definition used three times is inlined three times", () => {
+    const out = inlineRefs({
+      type: "object",
+      properties: {
+        x: { $ref: "#/$defs/P" },
+        y: { $ref: "#/$defs/P" },
+        z: { $ref: "#/$defs/P" },
+      },
+      $defs: { P: { type: "object", properties: { n: { type: "number" } } } },
+    });
+    for (const key of ["x", "y", "z"]) {
+      expect((out["properties"] as JsonSchema)[key]).toEqual({
+        type: "object",
+        properties: { n: { type: "number" } },
+      });
+    }
+  });
+
+  test("a chain of $refs deeper than the depth cap stops there, once", () => {
+    const defs: JsonSchema = { c40: { type: "string" } };
+    for (let i = 0; i < 40; i++) {
+      defs[`c${i}`] = {
+        type: "object",
+        properties: { next: { $ref: `#/$defs/c${i + 1}` } },
+      };
+    }
+    const report = inlineRefsWithReport({ $ref: "#/$defs/c0", $defs: defs });
+    // No fan-out, so the byte budget never runs out: only the depth cap cuts.
+    expect(report.truncatedRefs).toBe(1);
+    let node = report.schema;
+    let depth = 0;
+    while (isObject(node["properties"])) {
+      node = (node["properties"] as JsonSchema)["next"] as JsonSchema;
+      depth++;
+    }
+    expect(depth).toBe(32);
+    expect(node["description"]).toBe(REF_NOT_EXPANDED_NOTE);
+  });
+
+  test("a caller's budget is honoured, and a $ref's own description is kept", () => {
+    const report = inlineRefsWithReport(
+      {
+        type: "object",
+        properties: {
+          big: { $ref: "#/$defs/Big" },
+          later: { $ref: "#/$defs/Big", description: "the second copy" },
+        },
+        $defs: { Big: { type: "object", properties: { note: { type: "string" } } } },
+      },
+      { maxBytes: 60 },
+    );
+    const props = report.schema["properties"] as JsonSchema;
+    expect(report.truncatedRefs).toBe(1);
+    expect((props["big"] as JsonSchema)["type"]).toBe("object");
+    expect(props["later"]).toEqual({ description: `the second copy ${REF_NOT_EXPANDED_NOTE}` });
+  });
+
+  test("a pointer resolves only keys the document itself has", () => {
+    // A schema object whose prototype carries a definition-shaped value:
+    // `#/inherited` names nothing in the document.
+    const root = Object.assign(Object.create({ inherited: { type: "string" } }) as JsonSchema, {
+      type: "object",
+      properties: { x: { $ref: "#/inherited", description: "kept" } },
+    });
+    const x = (inlineRefs(root)["properties"] as JsonSchema)["x"];
+    expect(x).toEqual({ description: "kept" });
+  });
+});
+
+function isObject(value: unknown): value is JsonSchema {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 describe("sanitizeGeminiSchema — projects onto the OpenAPI subset", () => {
   test("the ref-heavy schema loses every Gemini-rejected keyword", () => {
@@ -325,5 +463,11 @@ describe("toOpenAIStrictSchema — upgrade or bail", () => {
 
   test("returns null for a non-object root", () => {
     expect(toOpenAIStrictSchema({ type: "string" })).toBeNull();
+  });
+
+  test("a schema whose $refs could not all be inlined stays non-strict", () => {
+    // Every property of the DAG is required, so only the budget decides.
+    expect(toOpenAIStrictSchema(dag(4))).not.toBeNull();
+    expect(toOpenAIStrictSchema(dag(16))).toBeNull();
   });
 });

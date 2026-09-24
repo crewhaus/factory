@@ -501,3 +501,37 @@ describe("toGeminiParams — temperature (NEW-HUNT-2)", () => {
     expect(toGeminiParams(baseReq).config?.temperature).toBeUndefined();
   });
 });
+
+/**
+ * An MCP-style `$ref` DAG: each level references the next twice, so a naive
+ * inline copies the leaf 2^depth times (flag-truth-4#6).
+ */
+function dagSchema(depth: number): Record<string, unknown> {
+  const defs: Record<string, unknown> = { [`d${depth}`]: { type: "string" } };
+  for (let i = 0; i < depth; i++) {
+    defs[`d${i}`] = {
+      type: "object",
+      properties: { a: { $ref: `#/$defs/d${i + 1}` }, b: { $ref: `#/$defs/d${i + 1}` } },
+      required: ["a", "b"],
+    };
+  }
+  return {
+    type: "object",
+    properties: { root: { $ref: "#/$defs/d0" } },
+    required: ["root"],
+    $defs: defs,
+  };
+}
+
+describe("toGeminiParams — a $ref DAG in a tool schema (flag-truth-4#6)", () => {
+  test("the request stays small: the schema is inlined within a budget", () => {
+    const params = toGeminiParams({
+      ...baseReq,
+      tools: [{ name: "deep", description: "deep schema", input_schema: dagSchema(16) }],
+    });
+    // Inlined naively this one tool was 5 MB, rebuilt on every request.
+    const size = JSON.stringify(params).length;
+    expect(size).toBeLessThan(1_000_000);
+    expect(JSON.stringify(params)).toContain("not expanded");
+  });
+});
