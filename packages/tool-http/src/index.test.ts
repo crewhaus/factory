@@ -38,6 +38,7 @@ import {
   _resetHttpConfig,
   _setDnsLookup,
   _setDnsRecordResolver,
+  _setRawFetch,
   dnsLookup,
   downloadFile,
   feedParse,
@@ -1382,20 +1383,44 @@ describe("SseRead", () => {
   });
 
   test("the deadline stops a stream that never terminates", async () => {
-    // The budget has to outlast connecting and fall well short of the
-    // stream, or the test measures the runner rather than the deadline. At
-    // 12ms against a stream that ended after four events it measured both,
-    // and on CI the connection itself did not finish in time.
+    // The budget has to cover connecting, the response head AND the first
+    // event on a contended runner, and fall far short of the stream (one
+    // event per 5 ms or more, for at least 50 s). CI has taken 300-375 ms
+    // for a single loopback request, so 300 ms raced the runner: a deadline
+    // before the head came back as a plain failure string, one before the
+    // first event as count 0 (C117; #481 fixed the same race in HttpBatch).
+    // 2 s is far above the first and far below the second. maxEvents is the
+    // schema's maximum, and at 5 ms an event it cannot pre-empt the deadline.
     const started = performance.now();
     const result = await run(sseRead, {
       url: `${origin}/sse-forever`,
-      maxEvents: 10_000,
-      timeoutMs: 300,
+      maxEvents: 1_000,
+      timeoutMs: 2_000,
     });
     expect(result.stoppedBy).toBe("deadline");
     expect(result.count).toBeGreaterThan(0);
     // It stopped because of the budget, not because the stream ran out.
     expect(performance.now() - started).toBeLessThan(10_000);
+  }, 20_000);
+
+  test("half a second of connect latency still leaves the deadline to end the read", async () => {
+    // The latency CI has shown, and more, injected in front of the real
+    // fetch: the 300 ms budget this test file used to give failed here.
+    _setRawFetch(async (req) => {
+      await Bun.sleep(500);
+      return fetch(req, { decompress: false } as RequestInit);
+    });
+    try {
+      const result = await run(sseRead, {
+        url: `${origin}/sse-forever`,
+        maxEvents: 1_000,
+        timeoutMs: 2_000,
+      });
+      expect(result.stoppedBy).toBe("deadline");
+      expect(result.count).toBeGreaterThan(0);
+    } finally {
+      _setRawFetch(undefined);
+    }
   }, 20_000);
 
   test("events after the terminator in the same chunk are not returned", async () => {
@@ -1675,8 +1700,13 @@ describe("DnsLookup / TlsInspect", () => {
           "openssl",
           "req",
           "-x509",
+          // An EC key: RSA-2048 keygen is the heavy-tailed part of this test
+          // (70-670 ms locally), and TlsInspect reports nothing about the
+          // key type, so P-256 loses no coverage.
           "-newkey",
-          "rsa:2048",
+          "ec",
+          "-pkeyopt",
+          "ec_paramgen_curve:prime256v1",
           "-nodes",
           "-days",
           "30",
@@ -1689,7 +1719,13 @@ describe("DnsLookup / TlsInspect", () => {
           "-out",
           certPath,
         ]);
-        if (made.exitCode !== 0) return; // no usable openssl — nothing to assert
+        // skipIf covers a machine with no openssl. One that has it but cannot
+        // build the fixture is a failure, not a pass with nothing asserted.
+        expect(
+          made.exitCode === 0
+            ? ""
+            : `openssl exited ${made.exitCode}: ${made.stderr.toString().trim()}`,
+        ).toBe("");
 
         const tlsServer = Bun.serve({
           port: 0,
@@ -1721,6 +1757,9 @@ describe("DnsLookup / TlsInspect", () => {
         rmSync(dir, { recursive: true, force: true });
       }
     },
+    // Key generation plus a TLS handshake: 0.8-2.9 s on CI with RSA, where
+    // bun's default budget is 5 s.
+    20_000,
   );
 });
 
