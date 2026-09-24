@@ -229,6 +229,7 @@ export const read: RegisteredTool = buildTool({
   inputSchema: readSchema,
   readOnly: true,
   concurrencySafe: true,
+  operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
     const abs = resolveSafe("Read", input.path);
     return readFileNoFollow("Read", abs).toString("utf8");
@@ -242,6 +243,7 @@ export const write: RegisteredTool = buildTool({
     "Atomically write UTF-8 text to a file inside the workspace (replaces existing content).",
   inputSchema: writeSchema,
   destructive: true,
+  operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
     const abs = resolveSafe("Write", input.path);
     const tmp = `${abs}.tmp.${randomBytes(6).toString("hex")}`;
@@ -267,6 +269,7 @@ export const edit: RegisteredTool = buildTool({
     "Replace the unique occurrence of oldString with newString in a workspace file. Errors when oldString matches zero or multiple times.",
   inputSchema: editSchema,
   destructive: true,
+  operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
     const abs = resolveSafe("Edit", input.path);
     const original = readFileNoFollow("Edit", abs).toString("utf8");
@@ -310,6 +313,9 @@ export const glob: RegisteredTool = buildTool({
   inputSchema: globSchema,
   readOnly: true,
   concurrencySafe: true,
+  // The pattern is a path with wildcards in it; resolving it as a path is
+  // what keeps `src/../**` from passing a `Glob(src/**)` rule.
+  operativeArgs: [{ field: "pattern", kind: "path" }],
   execute: async (input) => {
     rejectTraversalPattern("Glob", input.pattern);
     const cwd = process.cwd();
@@ -434,6 +440,13 @@ export const grep: RegisteredTool = buildTool({
   inputSchema: grepSchema,
   readOnly: true,
   concurrencySafe: true,
+  // Both fields are operative: a `Grep(src/**)` allow needs `path` in src/
+  // AND the regex to match, so a regex cannot carry an out-of-scope path;
+  // a `Grep(*password*)` deny fires on the regex alone.
+  operativeArgs: [
+    { field: "pattern", kind: "text" },
+    { field: "path", kind: "path" },
+  ],
   execute: async (input) => {
     const root = process.cwd();
     let baseAbs = root;

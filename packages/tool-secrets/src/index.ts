@@ -476,6 +476,10 @@ export const envFileUpsert: RegisteredTool = buildTool({
   destructive: true,
   scope: "external",
   ioCapability: "process",
+  // The file a rule is about. Leaving `path` out writes `.env`, so a rule
+  // sees `.env` too — `alwaysDeny EnvFileUpsert(.env)` cannot be dodged by
+  // omitting the field.
+  operativeArgs: [{ field: "path", kind: "path", default: ".env" }],
   execute: async (input, ctx?: ToolExecuteContext) => {
     const path = input.path ?? ".env";
     const timeoutMs = input.timeout ?? DEFAULT_TIMEOUT_MS;

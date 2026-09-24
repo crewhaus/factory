@@ -1091,6 +1091,9 @@ export const removePath: RegisteredTool = buildTool({
     maxEntries: z.number().int().min(1).max(500_000).optional(),
   }),
   destructive: true,
+  // A `RemovePath(build/**)` rule is about `path`, resolved the way this tool
+  // resolves it: through a symlinked directory, `build/link/x` is `src/x`.
+  operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
     const target = resolveSafe("RemovePath", input.path);
     if (target.abs === workspaceRoot()) return "refusing to delete the workspace root";
