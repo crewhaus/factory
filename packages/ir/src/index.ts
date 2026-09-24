@@ -2574,13 +2574,17 @@ export type IrChainTrigger =
     };
 
 /**
- * Section 47 — IR for the `onchain` target shape. The compiled daemon
+ * Section 47 — IR for the `onchain` target shape. The intended daemon
  * subscribes to the configured triggers, dedupes events by `(txHash,
  * logIndex)` within `idempotencyWindowMs`, and runs one
- * `runChatLoop({singleTurn: true})` per inbound trigger with the
- * decoded payload as the user message. The agent has access to the
- * standard tool catalog (including §47 `tool-evm` + `tool-evm-tx`) so
- * it can respond with transactions, alerts, or notifications.
+ * `runChatLoop({singleTurn: true})` per inbound trigger with the decoded
+ * payload as the user message.
+ *
+ * Not yet: the emitter (target-onchain) wires the chain adapters and the
+ * trigger metadata only and emits no agent loop, so `tools`, `toolConfigs`
+ * and `mcp_servers` are lowered here but nothing consumes them. The compiler
+ * says so (an accepted-but-unwired warning per key) and the bundle README
+ * marks each tool "not wired" (C140, shape-reach#7).
  */
 export type IrChainV0 = {
   readonly version: 0;
@@ -2623,6 +2627,11 @@ export type IrChainV0 = {
  */
 export type IrChainGameTurnSemantics = "turn-based" | "real-time" | "async";
 
+/**
+ * Like {@link IrChainV0}, the onchain-game emitter runs no agent loop yet:
+ * `tools`, `toolConfigs` and `mcp_servers` are lowered and not consumed, and
+ * the compiler warns for each one declared.
+ */
 export type IrChainGameV0 = {
   readonly version: 0;
   readonly name: string;
