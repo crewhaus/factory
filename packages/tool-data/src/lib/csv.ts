@@ -14,6 +14,8 @@
  * RFC 4180 does not define.
  */
 
+import { setOwn } from "./json";
+
 export type CsvParseOptions = {
   delimiter: string;
   quote: string;
@@ -170,10 +172,10 @@ export function rowsToRecords(
     header.forEach((name, j) => {
       const cell = row[j];
       if (cell === undefined) {
-        rec[name] = null;
+        setOwn(rec, name, null);
         return;
       }
-      rec[name] = infer ? inferScalar(cell, nullTokens) : cell;
+      setOwn(rec, name, infer ? inferScalar(cell, nullTokens) : cell);
     });
     records.push(rec);
   });

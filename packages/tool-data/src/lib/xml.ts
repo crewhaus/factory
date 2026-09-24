@@ -38,6 +38,8 @@
  *   elements, so `<` inside them must be escaped.
  */
 
+import { getOwn, setOwn } from "./json";
+
 export class XmlError extends Error {
   readonly line: number;
   constructor(message: string, line: number) {
@@ -222,7 +224,7 @@ function readTag(
     if (src[i] !== "=") {
       // A bare attribute is HTML's `<input disabled>`; XML requires a value.
       if (mode === "xml") throw new XmlError(`attribute "${attrRaw}" has no value`, line);
-      attributes[attrName] = "";
+      setOwn(attributes, attrName, "");
       continue;
     }
     i += 1;
@@ -231,14 +233,14 @@ function readTag(
     if (quote === '"' || quote === "'") {
       const end = src.indexOf(quote, i + 1);
       if (end < 0) throw new XmlError(`unterminated value for "${attrRaw}"`, line);
-      attributes[attrName] = decodeEntities(src.slice(i + 1, end), line);
+      setOwn(attributes, attrName, decodeEntities(src.slice(i + 1, end), line));
       i = end + 1;
       continue;
     }
     if (mode === "xml") throw new XmlError(`value for "${attrRaw}" must be quoted`, line);
     const valueStart = i;
     while (i < src.length && !/[\s>]/.test(src[i] as string)) i += 1;
-    attributes[attrName] = decodeEntities(src.slice(valueStart, i), line);
+    setOwn(attributes, attrName, decodeEntities(src.slice(valueStart, i), line));
   }
 }
 
@@ -318,10 +320,12 @@ export function toCompact(nodes: ReadonlyArray<XmlNode>): unknown {
       continue;
     }
     const value = compactElement(node);
-    const existing = out[node.name];
-    if (existing === undefined) out[node.name] = value;
+    // Own fields only: an element named `constructor` or `__proto__` is
+    // data like any other, not a reach into Object.prototype.
+    const existing = getOwn(out, node.name);
+    if (existing === undefined) setOwn(out, node.name, value);
     else if (Array.isArray(existing)) existing.push(value);
-    else out[node.name] = [existing, value];
+    else setOwn(out, node.name, [existing, value]);
   }
   const text = texts.join("").trim();
   if (Object.keys(out).length === 0) return text;
@@ -339,7 +343,11 @@ function compactElement(el: XmlElement): unknown {
     if (inner !== "") out["#text"] = inner;
     return out;
   }
-  Object.assign(out, inner);
+  // Not Object.assign: it would call the `__proto__` setter for a child
+  // element of that name, instead of copying it.
+  for (const k of Object.keys(inner as Record<string, unknown>)) {
+    setOwn(out, k, (inner as Record<string, unknown>)[k]);
+  }
   return out;
 }
 

@@ -34,7 +34,7 @@
  * position, never a silent empty result.
  */
 
-import { isPlainObject } from "./json";
+import { getOwn, isPlainObject } from "./json";
 
 export type PathStep =
   | { kind: "child"; name: string }
@@ -367,7 +367,7 @@ export function sliceIndices(
 function matchesFilter(value: unknown, step: Extract<PathStep, { kind: "filter" }>): boolean {
   let cur: unknown = value;
   for (const seg of step.field) {
-    if (isPlainObject(cur)) cur = cur[seg];
+    if (isPlainObject(cur)) cur = getOwn(cur, seg);
     else if (Array.isArray(cur) && /^-?\d+$/.test(seg)) {
       const i = Number(seg);
       cur = cur[i < 0 ? cur.length + i : i];

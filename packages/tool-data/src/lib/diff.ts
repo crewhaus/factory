@@ -8,7 +8,7 @@
  * `keyArraysBy`, which matches elements by a field instead of by position.
  */
 
-import { deepEqual, isPlainObject, typeOf } from "./json";
+import { deepEqual, getOwn, isPlainObject, typeOf } from "./json";
 import { formatPointer } from "./patch";
 
 export type DiffKind = "added" | "removed" | "changed";
@@ -158,7 +158,7 @@ function canKey(arr: ReadonlyArray<unknown>, key: string): boolean {
   const seen = new Set<string>();
   for (const el of arr) {
     if (!isPlainObject(el)) return false;
-    const v = el[key];
+    const v = getOwn(el, key);
     if (v === undefined || v === null || typeof v === "object") return false;
     const s = String(v);
     if (seen.has(s)) return false;
@@ -179,7 +179,7 @@ function diffKeyedArrays(
   const index = (arr: ReadonlyArray<unknown>): Map<string, { i: number; value: unknown }> => {
     const m = new Map<string, { i: number; value: unknown }>();
     arr.forEach((el, i) => {
-      const v = (el as Record<string, unknown>)[key];
+      const v = getOwn(el as Record<string, unknown>, key);
       m.set(String(v), { i, value: el });
     });
     return m;

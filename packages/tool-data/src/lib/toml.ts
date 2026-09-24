@@ -40,7 +40,7 @@
  * than pretending the output is complete.
  */
 
-import { isPlainObject } from "./json";
+import { getOwn, isPlainObject, setOwn } from "./json";
 
 export class TomlError extends Error {
   readonly line: number;
@@ -178,10 +178,10 @@ function descend(
 ): Record<string, unknown> {
   let node: Record<string, unknown> = root;
   path.forEach((seg, idx) => {
-    const existing = node[seg];
+    const existing = getOwn(node, seg);
     if (existing === undefined) {
       const fresh: Record<string, unknown> = {};
-      node[seg] = fresh;
+      setOwn(node, seg, fresh);
       node = fresh;
       return;
     }
@@ -211,10 +211,10 @@ function pushArrayTable(
 ): Record<string, unknown> {
   const parent = descend(root, path.slice(0, -1), c);
   const key = path[path.length - 1] as string;
-  const existing = parent[key];
+  const existing = getOwn(parent, key);
   const fresh: Record<string, unknown> = {};
   if (existing === undefined) {
-    parent[key] = [fresh];
+    setOwn(parent, key, [fresh]);
     return fresh;
   }
   if (!Array.isArray(existing)) {
@@ -254,10 +254,10 @@ function assign(
       }
       tables.dotted.add(absolute);
     }
-    const existing = node[seg];
+    const existing = getOwn(node, seg);
     if (existing === undefined) {
       const fresh: Record<string, unknown> = {};
-      node[seg] = fresh;
+      setOwn(node, seg, fresh);
       node = fresh;
       return;
     }
@@ -270,7 +270,7 @@ function assign(
   if (Object.hasOwn(node, key)) {
     throw new TomlError(`key "${[...tablePath, ...path].join(".")}" is defined twice`, c.line);
   }
-  node[key] = value;
+  setOwn(node, key, value);
 }
 
 function readString(c: Cursor): string {

@@ -40,7 +40,7 @@
  * scalars, so the output is unambiguous.
  */
 
-import { isPlainObject } from "./json";
+import { isPlainObject, setOwn } from "./json";
 
 export class YamlError extends Error {
   readonly line: number;
@@ -173,15 +173,15 @@ function parseMapping(state: State, indent: number, depth: number): Record<strin
     const valueText = stripComment(line.content.slice(colon + 1).trim());
     state.i += 1;
     if (valueText === "") {
-      out[key] = parseChildBlock(state, indent, depth);
+      setOwn(out, key, parseChildBlock(state, indent, depth));
       continue;
     }
     const block = blockScalarHeader(valueText);
     if (block !== null) {
-      out[key] = readBlockScalar(state, indent, block, line.lineNo);
+      setOwn(out, key, readBlockScalar(state, indent, block, line.lineNo));
       continue;
     }
-    out[key] = parseScalarValue(valueText, line.lineNo);
+    setOwn(out, key, parseScalarValue(valueText, line.lineNo));
   }
   return out;
 }
@@ -478,7 +478,7 @@ function parseFlowNode(s: FlowState, depth: number): unknown {
       skipFlowSpace(s);
       if (s.text[s.i] !== ":") throw new YamlError("expected ':' in a flow mapping", s.lineNo);
       s.i += 1;
-      out[String(coerceFlowKey(key, s.lineNo))] = parseFlowNode(s, depth + 1);
+      setOwn(out, String(coerceFlowKey(key, s.lineNo)), parseFlowNode(s, depth + 1));
       skipFlowSpace(s);
       const d = s.text[s.i];
       if (d === ",") {

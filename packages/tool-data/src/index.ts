@@ -33,7 +33,15 @@ import {
   writeCsvRows,
 } from "./lib/csv";
 import { deepDiff } from "./lib/diff";
-import { canonicalStringify, isPlainObject, parseJson, sortKeysDeep, stableHash } from "./lib/json";
+import {
+  canonicalStringify,
+  getOwn,
+  isPlainObject,
+  parseJson,
+  setOwn,
+  sortKeysDeep,
+  stableHash,
+} from "./lib/json";
 import { parseJsonl, writeJsonl } from "./lib/jsonl";
 import { PathError, parsePath, queryPath } from "./lib/jsonpath";
 import {
@@ -739,7 +747,9 @@ export const recordsToColumns: RegisteredTool = buildTool({
       return json({ rowCount: input.records.length, columns: all });
     }
     const picked: Record<string, unknown[]> = {};
-    for (const c of input.columns) picked[c] = all[c] ?? input.records.map(() => null);
+    for (const c of input.columns) {
+      setOwn(picked, c, (getOwn(all, c) as unknown[] | undefined) ?? input.records.map(() => null));
+    }
     return json({ rowCount: input.records.length, columns: picked });
   },
 });

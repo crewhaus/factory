@@ -14,6 +14,39 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Read `key` only when it is the object's OWN property. A key taken from the
+ * data (a dotted path segment, a TOML table name, an XML element name) must
+ * never reach an inherited member: `constructor` would read
+ * `Object.prototype.constructor`, and `__proto__` would hand back
+ * `Object.prototype` itself as something to write into — which is how one
+ * hostile document polluted every object in the process.
+ */
+export function getOwn(obj: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
+/**
+ * Write `key` as an own data property. For every key but `__proto__` plain
+ * assignment already does that; `__proto__` alone is an accessor inherited
+ * from `Object.prototype`, whose setter would replace the object's prototype
+ * (dropping the key) instead of storing it. `defineProperty` stores it as the
+ * data it is, so `{"__proto__": …}` round-trips like any other key — the
+ * way `JSON.parse` itself reads it.
+ */
+export function setOwn(obj: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === "__proto__") {
+    Object.defineProperty(obj, key, {
+      value,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  } else {
+    obj[key] = value;
+  }
+}
+
 /** Structural equality over JSON values. Key order is irrelevant; NaN never appears in JSON. */
 export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -42,7 +75,7 @@ export function deepClone<T>(value: T): T {
   if (Array.isArray(value)) return value.map((v) => deepClone(v)) as unknown as T;
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
-    for (const k of Object.keys(value)) out[k] = deepClone(value[k]);
+    for (const k of Object.keys(value)) setOwn(out, k, deepClone(value[k]));
     return out as T;
   }
   return value;
@@ -71,7 +104,7 @@ export function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
-    for (const k of Object.keys(value).sort()) out[k] = sortKeysDeep(value[k]);
+    for (const k of Object.keys(value).sort()) setOwn(out, k, sortKeysDeep(value[k]));
     return out;
   }
   return value;

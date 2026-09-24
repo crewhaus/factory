@@ -8,7 +8,7 @@
  * failed — which is the behaviour RFC 6902 §5 requires.
  */
 
-import { deepClone, deepEqual, isPlainObject } from "./json";
+import { deepClone, deepEqual, getOwn, isPlainObject, setOwn } from "./json";
 
 export class PatchError extends Error {
   readonly opIndex: number;
@@ -127,7 +127,9 @@ function addAt(parent: unknown, token: string, value: unknown, pointer: string, 
     return;
   }
   if (isPlainObject(parent)) {
-    parent[token] = value;
+    // An own member even for `__proto__`: assignment would call the setter,
+    // change nothing, and report success.
+    setOwn(parent, token, value);
     return;
   }
   throw new PatchError(`cannot add to a ${typeof parent} at "${pointer}"`, i);
@@ -254,7 +256,7 @@ export function applyMergePatch(target: unknown, patch: unknown): unknown {
   for (const key of Object.keys(patch)) {
     const value = patch[key];
     if (value === null) delete base[key];
-    else base[key] = applyMergePatch(base[key], value);
+    else setOwn(base, key, applyMergePatch(getOwn(base, key), value));
   }
   return base;
 }
@@ -270,14 +272,14 @@ export function diffMergePatch(from: unknown, to: unknown): unknown {
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(to)) {
     if (!Object.hasOwn(from, key)) {
-      out[key] = deepClone(to[key]);
+      setOwn(out, key, deepClone(to[key]));
       continue;
     }
     if (deepEqual(from[key], to[key])) continue;
-    out[key] = diffMergePatch(from[key], to[key]);
+    setOwn(out, key, diffMergePatch(from[key], to[key]));
   }
   for (const key of Object.keys(from)) {
-    if (!Object.hasOwn(to, key)) out[key] = null;
+    if (!Object.hasOwn(to, key)) setOwn(out, key, null);
   }
   return out;
 }

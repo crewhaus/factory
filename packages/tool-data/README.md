@@ -51,6 +51,13 @@ previous tool in the chain. Field references inside the record tools are
 dotted paths (`user.team.id`), so nested records work without flattening
 them first.
 
+A key is data whatever it is called. `constructor`, `toString` and
+`__proto__` are ordinary field names: an XML `<constructor>` element, a CSV
+`__proto__` column and a TOML `[__proto__]` table all come back as fields of
+that name, and a path only ever reads a record's own fields, so `exists
+constructor` does not match a record that has no such field. No tool here
+writes into `Object.prototype`, whatever the document or path says.
+
 ## The parsers are hand-written, so here is exactly what they support
 
 There is no YAML, TOML, XML or CSV dependency behind these tools. That keeps

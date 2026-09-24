@@ -8,17 +8,21 @@
  * the same output every time.
  */
 
-import { canonicalStringify, deepEqual, isPlainObject } from "./json";
+import { canonicalStringify, deepEqual, getOwn, isPlainObject, setOwn } from "./json";
 
 export type Record_ = Record<string, unknown>;
 
-/** Read a dotted path out of a record. Returns undefined for any miss. */
+/**
+ * Read a dotted path out of a record. Returns undefined for any miss. Only
+ * the record's own fields are read: `constructor` on a record that has no
+ * such field is a miss, not `Object.prototype.constructor`.
+ */
 export function getPath(record: unknown, path: string): unknown {
   if (path === "") return record;
   let cur: unknown = record;
   for (const seg of path.split(".")) {
     if (isPlainObject(cur)) {
-      cur = cur[seg];
+      cur = getOwn(cur, seg);
       continue;
     }
     if (Array.isArray(cur) && /^\d+$/.test(seg)) {
@@ -30,22 +34,27 @@ export function getPath(record: unknown, path: string): unknown {
   return cur;
 }
 
-/** Write a dotted path into a record, creating intermediate objects. */
+/**
+ * Write a dotted path into a record, creating intermediate objects. Every
+ * segment is an own field of the object it names — descent never follows an
+ * inherited member, so `__proto__.x` writes a field called `__proto__`, not
+ * into `Object.prototype`.
+ */
 export function setPath(target: Record_, path: string, value: unknown): void {
   const segs = path.split(".");
   let cur: Record_ = target;
   for (let i = 0; i < segs.length - 1; i++) {
     const seg = segs[i] as string;
-    const next = cur[seg];
+    const next = getOwn(cur, seg);
     if (!isPlainObject(next)) {
       const fresh: Record_ = {};
-      cur[seg] = fresh;
+      setOwn(cur, seg, fresh);
       cur = fresh;
     } else {
       cur = next as Record_;
     }
   }
-  cur[segs[segs.length - 1] as string] = value;
+  setOwn(cur, segs[segs.length - 1] as string, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,9 +275,10 @@ export function omitFields(record: Record_, fields: ReadonlyArray<string>): Reco
     let cur: unknown = out;
     for (let i = 0; i < segs.length - 1; i++) {
       if (!isPlainObject(cur)) break;
-      cur = cur[segs[i] as string];
+      cur = getOwn(cur, segs[i] as string);
     }
-    if (isPlainObject(cur)) delete cur[segs[segs.length - 1] as string];
+    const last = segs[segs.length - 1] as string;
+    if (isPlainObject(cur) && Object.hasOwn(cur, last)) delete cur[last];
   }
   return out;
 }
@@ -277,7 +287,7 @@ function structuredCloneish(value: Record_): Record_ {
   const out: Record_ = {};
   for (const k of Object.keys(value)) {
     const v = value[k];
-    out[k] = isPlainObject(v) ? structuredCloneish(v as Record_) : v;
+    setOwn(out, k, isPlainObject(v) ? structuredCloneish(v as Record_) : v);
   }
   return out;
 }
@@ -304,7 +314,7 @@ export function aggregate(
   const buckets = new Map<string, { key: Record_; rows: Record_[] }>();
   for (const rec of records) {
     const key: Record_ = {};
-    for (const field of groupBy) key[field] = getPath(rec, field) ?? null;
+    for (const field of groupBy) setOwn(key, field, getPath(rec, field) ?? null);
     const id = canonicalStringify(key);
     const existing = buckets.get(id);
     if (existing === undefined) buckets.set(id, { key, rows: [rec] });
@@ -319,37 +329,49 @@ export function aggregate(
       const values = bucket.rows.map((r) => getPath(r, field));
       switch (agg.fn) {
         case "count":
-          out[agg.as] = field === "" ? bucket.rows.length : values.filter(isPresent).length;
+          setOwn(out, agg.as, field === "" ? bucket.rows.length : values.filter(isPresent).length);
           break;
         case "sum":
         case "avg": {
           const nums = values.filter((v): v is number => typeof v === "number");
           skipped += values.filter(isPresent).length - nums.length;
           const total = nums.reduce((a, b) => a + b, 0);
-          out[agg.as] = agg.fn === "sum" ? total : nums.length === 0 ? null : total / nums.length;
+          setOwn(
+            out,
+            agg.as,
+            agg.fn === "sum" ? total : nums.length === 0 ? null : total / nums.length,
+          );
           break;
         }
         case "min":
         case "max": {
           const present = values.filter(isPresent);
           if (present.length === 0) {
-            out[agg.as] = null;
+            setOwn(out, agg.as, null);
             break;
           }
-          out[agg.as] = present.reduce((best, v) => {
-            const cmp = totalCompare(v, best);
-            return (agg.fn === "min" ? cmp < 0 : cmp > 0) ? v : best;
-          });
+          setOwn(
+            out,
+            agg.as,
+            present.reduce((best, v) => {
+              const cmp = totalCompare(v, best);
+              return (agg.fn === "min" ? cmp < 0 : cmp > 0) ? v : best;
+            }),
+          );
           break;
         }
         case "first":
-          out[agg.as] = values[0] ?? null;
+          setOwn(out, agg.as, values[0] ?? null);
           break;
         case "last":
-          out[agg.as] = values[values.length - 1] ?? null;
+          setOwn(out, agg.as, values[values.length - 1] ?? null);
           break;
         case "distinct":
-          out[agg.as] = new Set(values.filter(isPresent).map((v) => canonicalStringify(v))).size;
+          setOwn(
+            out,
+            agg.as,
+            new Set(values.filter(isPresent).map((v) => canonicalStringify(v))).size,
+          );
           break;
         default:
           break;
@@ -438,7 +460,7 @@ export function joinRecords(
 function mergeRow(left: Record_, right: Record_, prefix: string): Record_ {
   const out: Record_ = { ...left };
   for (const k of Object.keys(right)) {
-    out[Object.hasOwn(left, k) ? `${prefix}${k}` : k] = right[k];
+    setOwn(out, Object.hasOwn(left, k) ? `${prefix}${k}` : k, right[k]);
   }
   return out;
 }
@@ -459,7 +481,12 @@ export function recordsToColumns(records: ReadonlyArray<Record_>): Record<string
     }
   }
   const out: Record<string, unknown[]> = {};
-  for (const k of keys) out[k] = records.map((r) => (Object.hasOwn(r, k) ? r[k] : null));
+  for (const k of keys)
+    setOwn(
+      out,
+      k,
+      records.map((r) => (Object.hasOwn(r, k) ? r[k] : null)),
+    );
   return out;
 }
 
@@ -480,7 +507,7 @@ export function columnsToRecords(columns: Record<string, ReadonlyArray<unknown>>
     const rec: Record_ = {};
     for (const k of keys) {
       const col = columns[k] ?? [];
-      rec[k] = i < col.length ? col[i] : null;
+      setOwn(rec, k, i < col.length ? col[i] : null);
     }
     records.push(rec);
   }
@@ -497,13 +524,13 @@ export function flattenObject(
   const out: Record<string, unknown> = {};
   const walk = (node: unknown, prefix: string, depth: number): void => {
     if (depth >= maxDepth) {
-      out[prefix] = node;
+      setOwn(out, prefix, node);
       return;
     }
     if (isPlainObject(node)) {
       const keys = Object.keys(node);
       if (keys.length === 0) {
-        if (prefix !== "") out[prefix] = {};
+        if (prefix !== "") setOwn(out, prefix, {});
         return;
       }
       for (const k of keys)
@@ -512,7 +539,7 @@ export function flattenObject(
     }
     if (Array.isArray(node) && expandArrays) {
       if (node.length === 0) {
-        if (prefix !== "") out[prefix] = [];
+        if (prefix !== "") setOwn(out, prefix, []);
         return;
       }
       node.forEach((el, i) =>
@@ -520,7 +547,7 @@ export function flattenObject(
       );
       return;
     }
-    out[prefix] = node;
+    setOwn(out, prefix, node);
   };
   walk(value, "", 0);
   return out;
@@ -543,16 +570,16 @@ export function unflattenObject(
     let cur: Record_ = root;
     for (let i = 0; i < segs.length - 1; i++) {
       const seg = segs[i] as string;
-      const next = cur[seg];
+      const next = getOwn(cur, seg);
       if (!isPlainObject(next)) {
         const fresh: Record_ = {};
-        cur[seg] = fresh;
+        setOwn(cur, seg, fresh);
         cur = fresh;
       } else {
         cur = next as Record_;
       }
     }
-    cur[segs[segs.length - 1] as string] = flat[key];
+    setOwn(cur, segs[segs.length - 1] as string, flat[key]);
   }
   return arraysFromNumericKeys ? arrayify(root) : root;
 }
@@ -561,7 +588,7 @@ function arrayify(node: unknown): unknown {
   if (!isPlainObject(node)) return node;
   const keys = Object.keys(node);
   const converted: Record_ = {};
-  for (const k of keys) converted[k] = arrayify(node[k]);
+  for (const k of keys) setOwn(converted, k, arrayify(node[k]));
   if (keys.length === 0) return converted;
   const allNumeric = keys.every((k) => /^(0|[1-9][0-9]*)$/.test(k));
   if (!allNumeric) return converted;
