@@ -5,6 +5,7 @@ import {
   JUSTIFICATION_FIELD_DESCRIPTION,
   JUSTIFICATION_INPUT_FIELD,
   type RegisteredTool,
+  TOOL_CONTRACT_VERSION,
   ToolCatalog,
   ToolCatalogError,
   defaultCatalog,
@@ -264,5 +265,15 @@ describe("justification schema advertisement (#386)", () => {
     expect(stripJustificationField(undefined)).toBe(undefined);
     const arr = [1, 2];
     expect(stripJustificationField(arr)).toBe(arr);
+  });
+});
+
+describe("TOOL_CONTRACT_VERSION", () => {
+  test("is a semver string an external tool package can compare against", () => {
+    expect(TOOL_CONTRACT_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    // 1.1.0 added `operativeArgs`; an older reader must not assume it exists.
+    const [major, minor] = TOOL_CONTRACT_VERSION.split(".").map(Number);
+    expect(major).toBe(1);
+    expect(minor).toBeGreaterThanOrEqual(1);
   });
 });

@@ -156,6 +156,57 @@ export type ModelFeatureRequirement = {
   readonly web_search?: boolean;
 };
 
+/**
+ * The version of the tool contract this package defines: the
+ * `ToolDefinition` an author writes, and the `RegisteredTool` the runtime
+ * holds. A tool package published outside this repo can compare it against
+ * the version it was written for before it relies on a field.
+ *
+ * Semver: a new OPTIONAL field is a minor bump, a field that changes meaning
+ * or becomes required is a major one.
+ *
+ * - `1.0.0` — the contract as released in crewhaus 0.7.0.
+ * - `1.1.0` — adds `operativeArgs`.
+ */
+export const TOOL_CONTRACT_VERSION = "1.1.0";
+
+/**
+ * What an operative argument holds, which decides how a permission rule's
+ * argument glob is compared with it:
+ *
+ * - `"path"` — a filesystem path. It is resolved against the workspace root
+ *   before matching: `..` collapsed and symlinked directories followed, so a
+ *   rule is checked against the file the tool will actually touch. A path
+ *   that lands outside the workspace never satisfies an allow rule and always
+ *   satisfies a deny or ask rule.
+ * - `"url"` — a URL, compared in its parsed (WHATWG `href`) form, so
+ *   `HTTP://Example.COM` and `http://example.com/` are one value.
+ * - `"command"` — a command line. An array (an argv) is joined with single
+ *   spaces, so `Tool(git status)` matches `["git", "status"]`.
+ * - `"text"` and `"id"` — compared as written. An `"id"` field may also hold a
+ *   number, which is compared as its decimal string.
+ */
+export type OperativeArgKind = "path" | "url" | "command" | "text" | "id";
+
+/**
+ * One input field a permission rule's argument glob constrains — the rule
+ * `Write(src/**)` is about Write's `path`, not its `content`.
+ *
+ * `field` names the field in the tool's input schema. Use dots for a nested
+ * field (`target.path`). An array anywhere on the way is walked element by
+ * element, so `requests.url` covers the `url` of every request.
+ *
+ * `default` is the value the tool uses when the field is omitted, for a tool
+ * that fills the default in `execute` rather than in its schema. Without it,
+ * a call that leaves the field out would carry no value for a deny rule to
+ * catch, while the tool still acts on the default.
+ */
+export type OperativeArg = {
+  readonly field: string;
+  readonly kind: OperativeArgKind;
+  readonly default?: string;
+};
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   description: string;
@@ -264,6 +315,28 @@ export interface ToolDefinition<TInput = unknown> {
    * or returning `false` routes the call serial.
    */
   concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
+  /**
+   * The input field(s) a permission rule's argument glob is checked against —
+   * see {@link OperativeArg}. `buildTool` refuses a declaration that names a
+   * field the input schema does not have.
+   *
+   * How a rule reads them:
+   *
+   * - an `alwaysAllow` rule matches only when EVERY operative value in the
+   *   call matches its glob, so one in-scope value cannot carry an
+   *   out-of-scope one;
+   * - an `alwaysDeny` or `alwaysAsk` rule matches when ANY operative value
+   *   does.
+   *
+   * Values are read from the input AFTER the tool's schema has parsed it: the
+   * same object `execute` receives, with unknown keys stripped.
+   *
+   * Omitted ⇒ the rule falls back to the tool's string values: an allow needs
+   * every one of them to match, a deny or ask fires on any. That is safe but
+   * blunt: a tool with a message or a note field can rarely be given a scoped
+   * allow. Declaring the operative field is what makes a scoped allow usable.
+   */
+  operativeArgs?: ReadonlyArray<OperativeArg>;
 }
 
 /** Normalized form stored in the catalog. All flags are required booleans and
@@ -309,6 +382,9 @@ export interface RegisteredTool {
   /** See ToolDefinition.concurrencyClassifier. Optional; when absent the
    *  orchestrator partitions on the static concurrency flags alone. */
   concurrencyClassifier?: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) => boolean;
+  /** See ToolDefinition.operativeArgs. Optional and passed through verbatim
+   *  by `buildTool` after it has checked every field against the schema. */
+  operativeArgs?: ReadonlyArray<OperativeArg>;
 }
 
 export class ToolCatalogError extends CrewhausError {
