@@ -24,6 +24,13 @@
  * classifier finds nothing in it; it is external because a click submits
  * what was typed. `Scroll` carries no data and moves nothing off the page,
  * so it stays internal.
+ *
+ * Failures (0.7.1): a driver failure throws a `MouseKeyboardError`, as
+ * `Navigate` and `Screenshot` do, so the run records the call as failed
+ * (`is_error`, `tool_stats` error counts, eval graders). The message keeps
+ * the `[Click error] …` text the model saw before. These tools used to
+ * return that text as an ordinary result, so a click or keystroke that
+ * never happened was recorded as a success.
  */
 import type { Driver, MouseButton } from "@crewhaus/computer-use-driver";
 import { CrewhausError } from "@crewhaus/errors";
@@ -36,6 +43,25 @@ export class MouseKeyboardError extends CrewhausError {
   constructor(message: string, cause?: unknown) {
     super("tool", message, cause);
   }
+}
+
+/**
+ * The error a tool throws when the driver fails. Keeps the `[<Tool> error]`
+ * prefix, and reads any thrown value (a string, `null`, an object without a
+ * usable `toString`) without throwing again.
+ */
+function driverFailed(tool: "Click" | "Type" | "Key" | "Scroll", err: unknown): MouseKeyboardError {
+  let detail: string;
+  if (err instanceof Error) {
+    detail = err.message !== "" ? err.message : err.name;
+  } else {
+    try {
+      detail = String(err);
+    } catch {
+      detail = "the driver threw a value that has no text";
+    }
+  }
+  return new MouseKeyboardError(`[${tool} error] ${detail}`, err);
 }
 
 export type CreateMouseKeyboardToolsOptions = {
@@ -87,7 +113,7 @@ export function createClickTool(opts: CreateMouseKeyboardToolsOptions): Register
       try {
         await opts.driver.click(input.x, input.y, button);
       } catch (err) {
-        return `[Click error] ${(err as Error).message ?? String(err)}`;
+        throw driverFailed("Click", err);
       }
       return `Clicked ${button} at (${input.x}, ${input.y}).`;
     },
@@ -110,7 +136,7 @@ export function createTypeTool(opts: CreateMouseKeyboardToolsOptions): Registere
       try {
         await opts.driver.type(input.text);
       } catch (err) {
-        return `[Type error] ${(err as Error).message ?? String(err)}`;
+        throw driverFailed("Type", err);
       }
       return `Typed ${input.text.length} chars.`;
     },
@@ -133,7 +159,7 @@ export function createKeyTool(opts: CreateMouseKeyboardToolsOptions): Registered
       try {
         await opts.driver.key(input.combo);
       } catch (err) {
-        return `[Key error] ${(err as Error).message ?? String(err)}`;
+        throw driverFailed("Key", err);
       }
       return `Pressed ${input.combo}.`;
     },
@@ -154,7 +180,7 @@ export function createScrollTool(opts: CreateMouseKeyboardToolsOptions): Registe
       try {
         await opts.driver.scroll(input.dx, input.dy);
       } catch (err) {
-        return `[Scroll error] ${(err as Error).message ?? String(err)}`;
+        throw driverFailed("Scroll", err);
       }
       return `Scrolled (${input.dx}, ${input.dy}).`;
     },

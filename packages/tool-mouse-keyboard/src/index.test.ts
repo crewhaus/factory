@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { Driver } from "@crewhaus/computer-use-driver";
 import { auditToolScopes } from "@crewhaus/tool-builder";
+import { executeTool } from "@crewhaus/tool-executor";
 import {
   MouseKeyboardError,
   createAllMouseKeyboardTools,
@@ -39,9 +40,10 @@ function recordingDriver(): { driver: Driver; calls: string[] } {
   return { driver, calls };
 }
 
-// A driver whose single named method rejects; all others are inert no-ops.
-// Lets each tool's error-catch branch be exercised in isolation.
-function throwingDriver(method: "click" | "type" | "key" | "scroll", message: string): Driver {
+// A driver whose single named method rejects with `thrown` (any value, not
+// only an Error); all others are inert no-ops. Lets each tool's failure path
+// be exercised in isolation.
+function throwingDriver(method: "click" | "type" | "key" | "scroll", thrown: unknown): Driver {
   const base: Driver = {
     backend: "chromium",
     async connect() {},
@@ -61,7 +63,7 @@ function throwingDriver(method: "click" | "type" | "key" | "scroll", message: st
   return {
     ...base,
     [method]: async () => {
-      throw new Error(message);
+      throw thrown;
     },
   };
 }
@@ -139,75 +141,96 @@ describe("Mouse + keyboard tools (T1 wrapping)", () => {
     expect(tools.key.name).toBe("Key");
     expect(tools.scroll.name).toBe("Scroll");
   });
+});
 
-  test("driver errors are surfaced as tool result strings (not thrown)", async () => {
-    const driver: Driver = {
-      backend: "chromium",
-      async connect() {},
-      async goto() {},
-      async screenshot() {
-        return new Uint8Array();
-      },
-      async click() {
-        throw new Error("driver explosion");
-      },
-      async type() {},
-      async key() {},
-      async scroll() {},
-      async getViewport() {
-        return { width: 0, height: 0, devicePixelRatio: 1 };
-      },
-      async disconnect() {},
-    };
-    const tool = createClickTool({ driver });
-    const r = await tool.execute({ x: 1, y: 1 }, {});
-    expect(typeof r === "string" && r.includes("[Click error]")).toBe(true);
+/**
+ * 0.7.1 (C206) — a driver failure is a failed call. These tools used to catch
+ * it and return "[Click error] …" as an ordinary result, so the run recorded a
+ * click or keystroke that never happened as a success (is_error false, no
+ * tool_stats error, nothing for a grader to see), while Navigate and
+ * Screenshot, on the same driver, reported theirs as errors.
+ */
+describe("a driver failure is reported as a failed call", () => {
+  const cases = [
+    { tool: "Click", method: "click", make: createClickTool, input: { x: 1, y: 1 } },
+    { tool: "Type", method: "type", make: createTypeTool, input: { text: "hi" } },
+    { tool: "Key", method: "key", make: createKeyTool, input: { combo: "Enter" } },
+    { tool: "Scroll", method: "scroll", make: createScrollTool, input: { dx: 0, dy: 5 } },
+  ] as const;
+
+  test("each tool throws MouseKeyboardError carrying the driver's error", async () => {
+    let checked = 0;
+    for (const c of cases) {
+      const root = new Error("page crashed: Target closed");
+      const tool = c.make({ driver: throwingDriver(c.method, root) });
+      const err = await tool.execute(c.input, {}).then(
+        (r) => r,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(MouseKeyboardError);
+      // The text the model sees is the one it saw before, prefix included.
+      expect((err as MouseKeyboardError).message).toBe(
+        `[${c.tool} error] page crashed: Target closed`,
+      );
+      expect((err as MouseKeyboardError).cause).toBe(root);
+      checked += 1;
+    }
+    expect(checked).toBe(4);
   });
 
-  test("Type driver errors are surfaced as a [Type error] result string", async () => {
-    const driver = throwingDriver("type", "type blew up");
-    const tool = createTypeTool({ driver });
-    const r = await tool.execute({ text: "hi" }, {});
-    expect(typeof r === "string" && r.includes("[Type error] type blew up")).toBe(true);
+  test("through the executor the call is an error, with the driver's text", async () => {
+    const seen: string[] = [];
+    for (const c of cases) {
+      const tool = c.make({
+        driver: throwingDriver(c.method, new Error("page crashed: Target closed")),
+      });
+      const r = await executeTool(tool, c.input, { toolUseId: `t-${c.tool}` });
+      seen.push(`${c.tool}:${r.isError}:${String(r.content)}`);
+    }
+    expect(seen).toEqual([
+      "Click:true:[Click error] page crashed: Target closed",
+      "Type:true:[Type error] page crashed: Target closed",
+      "Key:true:[Key error] page crashed: Target closed",
+      "Scroll:true:[Scroll error] page crashed: Target closed",
+    ]);
   });
 
-  test("Key driver errors are surfaced as a [Key error] result string", async () => {
-    const driver = throwingDriver("key", "key blew up");
-    const tool = createKeyTool({ driver });
-    const r = await tool.execute({ combo: "Enter" }, {});
-    expect(typeof r === "string" && r.includes("[Key error] key blew up")).toBe(true);
+  test("a call the driver completes is still a success", async () => {
+    const seen: string[] = [];
+    for (const c of cases) {
+      const { driver } = recordingDriver();
+      const r = await executeTool(c.make({ driver }), c.input, { toolUseId: `ok-${c.tool}` });
+      seen.push(`${c.tool}:${r.isError}`);
+    }
+    expect(seen).toEqual(["Click:false", "Type:false", "Key:false", "Scroll:false"]);
   });
 
-  test("Scroll driver errors are surfaced as a [Scroll error] result string", async () => {
-    const driver = throwingDriver("scroll", "scroll blew up");
-    const tool = createScrollTool({ driver });
-    const r = await tool.execute({ dx: 0, dy: 10 }, {});
-    expect(typeof r === "string" && r.includes("[Scroll error] scroll blew up")).toBe(true);
-  });
-
-  test("non-Error throw still yields a result string (String(err) fallback)", async () => {
-    // err.message is undefined → falls through to String(err).
-    const driver: Driver = {
-      backend: "chromium",
-      async connect() {},
-      async goto() {},
-      async screenshot() {
-        return new Uint8Array();
-      },
-      async click() {
-        throw "raw string failure";
-      },
-      async type() {},
-      async key() {},
-      async scroll() {},
-      async getViewport() {
-        return { width: 0, height: 0, devicePixelRatio: 1 };
-      },
-      async disconnect() {},
-    };
-    const tool = createClickTool({ driver });
-    const r = await tool.execute({ x: 1, y: 1 }, {});
-    expect(typeof r === "string" && r.includes("[Click error] raw string failure")).toBe(true);
+  // `(err as Error).message ?? String(err)` read `.message` off whatever was
+  // thrown, so a driver that threw null or undefined crashed the catch with a
+  // TypeError that named neither the tool nor the failure.
+  test("a value that is not an Error is read without a second throw", async () => {
+    const unprintable = Object.create(null) as object;
+    const thrownValues: ReadonlyArray<readonly [unknown, string]> = [
+      ["raw string failure", "[Click error] raw string failure"],
+      [null, "[Click error] null"],
+      [undefined, "[Click error] undefined"],
+      [42, "[Click error] 42"],
+      [unprintable, "[Click error] the driver threw a value that has no text"],
+      [new Error(""), "[Click error] Error"],
+    ];
+    const messages: string[] = [];
+    for (const [thrown, expected] of thrownValues) {
+      const tool = createClickTool({ driver: throwingDriver("click", thrown) });
+      const err = await tool.execute({ x: 1, y: 1 }, {}).then(
+        (r) => r,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(MouseKeyboardError);
+      expect((err as MouseKeyboardError).cause).toBe(thrown);
+      messages.push((err as MouseKeyboardError).message);
+      expect((err as MouseKeyboardError).message).toBe(expected);
+    }
+    expect(messages).toHaveLength(thrownValues.length);
   });
 });
 
