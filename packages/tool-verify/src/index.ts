@@ -28,10 +28,11 @@ import {
   readableText,
   textOf,
 } from "@crewhaus/tool-html";
-import { openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { joinRel, openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { describeRegexOutcome, openRegexSession, runRegex } from "@crewhaus/tool-safety/regex";
 import { textSimilarity } from "@crewhaus/tool-text";
 import { z } from "zod";
+import { integrityLimits, integrityWalk } from "./integrity";
 import {
   citationDefinitions,
   citedClaims,
@@ -237,40 +238,76 @@ async function goldenCompareRun(
 
   if (isTree) {
     const actualAt = resolveSafe("GoldenCompare", input.actualFile as string);
-    let goldenFiles: string[];
-    try {
-      goldenFiles = filesUnder(goldenAt.real);
-    } catch {
-      return `the golden directory "${goldenAt.rel}" does not exist — create it with GoldenUpdate once the output is right`;
+    // Both trees walked completely: dotfiles, node_modules and links
+    // included, since a tampered `.github/workflows/ci.yml` or a stray
+    // `.env` is exactly the change a tree golden exists to catch.
+    const golden = integrityWalk(root, goldenAt.rel);
+    if (!golden.ok) {
+      return `the golden directory "${goldenAt.rel}" could not be read (${golden.reason}) — create it with GoldenUpdate once the output is right`;
     }
-    const actualFiles = filesUnder(actualAt.real);
-    const added = actualFiles.filter((f) => !goldenFiles.includes(f));
-    const removed = goldenFiles.filter((f) => !actualFiles.includes(f));
+    const actual = integrityWalk(root, actualAt.rel);
+    if (!actual.ok) return `GoldenCompare could not walk "${actualAt.rel}": ${actual.reason}`;
+    const goldenByRel = new Map(golden.entries.map((e) => [e.rel, e]));
+    const actualByRel = new Map(actual.entries.map((e) => [e.rel, e]));
+    const added = actual.entries.filter((e) => !goldenByRel.has(e.rel)).map((e) => e.rel);
+    const removed = golden.entries.filter((e) => !actualByRel.has(e.rel)).map((e) => e.rel);
     const changed: string[] = [];
-    for (const file of goldenFiles.filter((f) => actualFiles.includes(f))) {
-      const a = (
-        await normalizeOutput(
-          readCapped(join(goldenAt.real, file), file).toString("utf-8"),
-          options,
-        )
-      ).text;
-      const b = (
-        await normalizeOutput(
-          readCapped(join(actualAt.real, file), file).toString("utf-8"),
-          options,
-        )
-      ).text;
-      if (a !== b) changed.push(file);
+    const unreadable: string[] = [
+      ...golden.unreadableDirs.map((d) => `golden ${d} (a directory that could not be listed)`),
+      ...actual.unreadableDirs.map((d) => `actual ${d} (a directory that could not be listed)`),
+    ];
+    const readText = (real: string, rel: string): string | null => {
+      const read = openForReadSync(root, real, {
+        maxBytes: LIMITS.fileBytes,
+        followLeafSymlink: false,
+      });
+      if (!read.ok || read.truncated) {
+        unreadable.push(`${rel}: ${read.ok ? "over the size limit" : read.reason}`);
+        return null;
+      }
+      return read.text;
+    };
+    for (const g of golden.entries) {
+      const a = actualByRel.get(g.rel);
+      if (a === undefined) continue;
+      if (g.kind !== a.kind) {
+        changed.push(g.rel);
+        continue;
+      }
+      if (g.kind === "symlink") {
+        // A link is compared by where it points, not by what is there:
+        // retargeting one is a change even when both targets match.
+        if (g.link?.text !== a.link?.text) changed.push(g.rel);
+        continue;
+      }
+      if (g.kind !== "file") {
+        unreadable.push(`${g.rel}: a ${g.kind}, not a regular file; not opened`);
+        continue;
+      }
+      const goldenText = readText(g.real, g.rel);
+      const actualText = readText(a.real, a.rel);
+      if (goldenText === null || actualText === null) continue;
+      const left = (await normalizeOutput(goldenText, options)).text;
+      const right = (await normalizeOutput(actualText, options)).text;
+      if (left !== right) changed.push(g.rel);
     }
+    const truncated = golden.truncated || actual.truncated;
     return json({
       mode: "tree",
       golden: goldenAt.rel,
       actual: actualAt.rel,
-      match: added.length === 0 && removed.length === 0 && changed.length === 0,
-      fileCount: actualFiles.length,
+      match:
+        added.length === 0 &&
+        removed.length === 0 &&
+        changed.length === 0 &&
+        unreadable.length === 0 &&
+        !truncated,
+      fileCount: actual.entries.length,
       added,
       removed,
       changed,
+      truncated,
+      ...(unreadable.length > 0 ? { unreadable } : {}),
     });
   }
 
@@ -371,7 +408,7 @@ export const goldenUpdate: RegisteredTool = buildTool({
 export const checksumVerify: RegisteredTool = buildTool({
   name: "ChecksumVerify",
   description:
-    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and a file on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship.",
+    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included; symlinks are reported, never followed out of the workspace; a walk that stops early is not ok.",
   inputSchema: z
     .object({
       directory: z.string().optional().describe("what to hash; defaults to the workspace root"),
@@ -380,6 +417,13 @@ export const checksumVerify: RegisteredTool = buildTool({
         .optional()
         .describe("workspace-relative SHA256SUMS file to check against"),
       files: z.array(z.string()).max(LIMITS.files).optional().describe("hash just these"),
+      exclude: z
+        .array(z.string().min(1).max(1_024))
+        .max(64)
+        .optional()
+        .describe(
+          "paths under the directory to leave out with everything below them, e.g. .git; listed back as excluded",
+        ),
       write: z
         .boolean()
         .optional()
@@ -389,44 +433,117 @@ export const checksumVerify: RegisteredTool = buildTool({
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
+    const root = workspaceRoot();
     const base = resolveSafe("ChecksumVerify", input.directory ?? ".");
-    const relatives =
-      input.files ??
-      (() => {
-        try {
-          return filesUnder(base.real);
-        } catch {
-          return [];
-        }
-      })();
+    const manifestAt =
+      input.manifest === undefined ? undefined : resolveSafe("ChecksumVerify", input.manifest);
+    const writing = input.manifest === undefined || input.write === true;
 
     const digests = new Map<string, string>();
     const unreadable: string[] = [];
-    for (const rel of relatives) {
-      try {
-        const at = resolveSafe("ChecksumVerify", join(input.directory ?? ".", rel));
-        digests.set(rel, sha256(readCapped(at.real, rel)));
-      } catch (err) {
-        unreadable.push(`${rel}: ${(err as Error).message}`);
+    /** Everything the walk found, hashable or not: what "unexpected" is measured against. */
+    const onDisk = new Set<string>();
+    const symlinks: Array<{ path: string; target: string }> = [];
+    let truncated = false;
+
+    const hash = (rel: string): void => {
+      const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
+      if (!read.ok) {
+        unreadable.push(`${rel}: ${read.reason}`);
+      } else if (read.truncated) {
+        unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
+      } else {
+        digests.set(rel, sha256(Buffer.from(read.bytes)));
+      }
+    };
+
+    if (input.files !== undefined) {
+      for (const rel of input.files) {
+        try {
+          const at = resolveSafe("ChecksumVerify", join(input.directory ?? ".", rel));
+          digests.set(rel, sha256(readCapped(at.real, rel)));
+          onDisk.add(rel);
+        } catch (err) {
+          unreadable.push(`${rel}: ${(err as Error).message}`);
+        }
+      }
+    } else {
+      const walk = integrityWalk(root, base.rel, {
+        ...(input.exclude === undefined ? {} : { exclude: input.exclude }),
+      });
+      if (!walk.ok) return `ChecksumVerify could not walk "${base.rel || "."}": ${walk.reason}`;
+      truncated = walk.truncated;
+      for (const dir of walk.unreadableDirs)
+        unreadable.push(`${dir} (a directory that could not be listed)`);
+      // The manifest itself, when it sits inside the directory it describes,
+      // is neither listed in itself nor unexpected.
+      const self =
+        manifestAt === undefined
+          ? undefined
+          : base.rel === ""
+            ? manifestAt.rel
+            : manifestAt.rel.startsWith(`${base.rel}/`)
+              ? manifestAt.rel.slice(base.rel.length + 1)
+              : undefined;
+      for (const entry of walk.entries) {
+        if (entry.rel === self) continue;
+        onDisk.add(entry.rel);
+        if (entry.kind === "file") {
+          hash(entry.rel);
+        } else if (entry.kind === "symlink") {
+          const target = entry.link?.text ?? "";
+          symlinks.push({ path: entry.rel, target });
+          // A link is hashed as `sha256sum` would, through to its file, but
+          // only when that file is inside the workspace; one that leads out
+          // is never read.
+          if (entry.link?.inside !== true) {
+            unreadable.push(`${entry.rel}: a symlink that leads outside the workspace; not read`);
+          } else if (entry.link.dangling) {
+            unreadable.push(`${entry.rel}: a symlink whose target does not exist`);
+          } else {
+            hash(entry.rel);
+          }
+        } else {
+          unreadable.push(`${entry.rel}: a ${entry.kind}, not a regular file; not opened`);
+        }
       }
     }
 
-    if (input.manifest === undefined || input.write === true) {
+    const walkReport = {
+      truncated,
+      ...(symlinks.length > 0 ? { symlinks } : {}),
+      ...(input.exclude !== undefined && input.exclude.length > 0
+        ? { excluded: input.exclude }
+        : {}),
+    };
+
+    if (writing) {
+      if (truncated) {
+        // A partial manifest would later verify a partial tree.
+        return json({
+          directory: base.rel,
+          ...walkReport,
+          unreadable,
+          manifest: null,
+          reason: `the directory holds more than the ${integrityLimits().maxEntries} entries (or ${integrityLimits().maxDepth} levels) one walk covers, so no manifest was written; narrow the directory or exclude part of it`,
+        });
+      }
       const body = [...digests.entries()].map(([rel, hash]) => `${hash}  ${rel}`).join("\n");
       return json({
         directory: base.rel,
         fileCount: digests.size,
+        ...walkReport,
         unreadable,
         manifest: `${body}\n`,
       });
     }
 
-    const manifestAt = resolveSafe("ChecksumVerify", input.manifest);
+    const at = manifestAt as SafePath;
     let manifestText: string;
     try {
-      manifestText = readCapped(manifestAt.real, manifestAt.rel).toString("utf-8");
+      manifestText = readCapped(at.real, at.rel).toString("utf-8");
     } catch {
-      return `the manifest "${manifestAt.rel}" does not exist; run with write:true to produce one`;
+      return `the manifest "${at.rel}" does not exist; run with write:true to produce one`;
     }
     const expected = new Map<string, string>();
     for (const line of manifestText.split("\n")) {
@@ -440,23 +557,32 @@ export const checksumVerify: RegisteredTool = buildTool({
     const unexpected: string[] = [];
     for (const [rel, want] of expected) {
       const got = digests.get(rel);
-      if (got === undefined) missing.push(rel);
-      else if (got !== want) mismatched.push(rel);
+      // Listed and on disk but not hashable is in `unreadable` already.
+      if (got === undefined) {
+        if (!onDisk.has(rel)) missing.push(rel);
+      } else if (got !== want) mismatched.push(rel);
     }
-    for (const rel of digests.keys()) if (!expected.has(rel)) unexpected.push(rel);
+    for (const rel of onDisk) if (!expected.has(rel)) unexpected.push(rel);
 
     return json({
       directory: base.rel,
-      manifest: manifestAt.rel,
+      manifest: at.rel,
       // Each failure mode is separate: missing, changed and extra need
       // different action, and an extra file is how something ships that
-      // nobody meant to ship.
-      ok: mismatched.length === 0 && missing.length === 0 && unexpected.length === 0,
+      // nobody meant to ship. Anything that could not be read, and a walk
+      // that stopped early, leave the answer open, so they are not ok.
+      ok:
+        mismatched.length === 0 &&
+        missing.length === 0 &&
+        unexpected.length === 0 &&
+        unreadable.length === 0 &&
+        !truncated,
       checked: expected.size,
       mismatched,
       missing,
       unexpected,
       unreadable,
+      ...walkReport,
     });
   },
 });

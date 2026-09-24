@@ -26,6 +26,7 @@ import {
   markdownLinkCheck,
   seoLint,
 } from "./index";
+import { _setIntegrityLimitsForTest, integrityWalk } from "./integrity";
 
 const originalCwd = process.cwd();
 let workspace: string;
@@ -231,6 +232,36 @@ describe("GoldenCompare and GoldenUpdate", () => {
     });
   });
 
+  test("a tree compare sees dotfiles, skipped names and links", async () => {
+    // 0.7.0 answered match: true for every one of these differences.
+    for (const side of ["golden", "actual"]) {
+      mkdirSync(join(workspace, side, ".github/workflows"), { recursive: true });
+      writeFileSync(join(workspace, side, "a.txt"), "same");
+      symlinkSync("a.txt", join(workspace, side, "link"));
+    }
+    writeFileSync(join(workspace, "golden/.github/workflows/ci.yml"), "on: push\n");
+    writeFileSync(join(workspace, "actual/.github/workflows/ci.yml"), "on: pull_request_target\n");
+    writeFileSync(join(workspace, "actual/.env"), "TOKEN=x");
+    mkdirSync(join(workspace, "actual/dist"));
+    writeFileSync(join(workspace, "actual/dist/x.js"), "x");
+    rmSync(join(workspace, "actual/link"));
+    symlinkSync(".env", join(workspace, "actual/link"));
+    const result = await call<{
+      match: boolean;
+      added: string[];
+      changed: string[];
+      removed: string[];
+      truncated: boolean;
+    }>(goldenCompare, { actualFile: "actual", golden: "golden" });
+    expect(result).toMatchObject({
+      match: false,
+      added: [".env", "dist/x.js"],
+      removed: [],
+      changed: [".github/workflows/ci.yml", "link"],
+      truncated: false,
+    });
+  });
+
   test("a path outside the workspace is refused", async () => {
     await expect(raw(goldenCompare, { actual: "x", golden: "../g.txt" })).rejects.toThrow(
       /escapes the workspace/,
@@ -274,6 +305,181 @@ describe("ChecksumVerify", () => {
 
   test("a missing manifest says how to make one", async () => {
     expect(await raw(checksumVerify, { manifest: "nope" })).toContain("write:true");
+  });
+
+  describe("every entry is walked, and an early stop is not ok", () => {
+    type Check = {
+      ok: boolean;
+      truncated: boolean;
+      mismatched: string[];
+      missing: string[];
+      unexpected: string[];
+      unreadable: string[];
+      symlinks?: Array<{ path: string; target: string }>;
+    };
+
+    test("dotfiles, skipped directory names and links are unexpected when unlisted", async () => {
+      // 0.7.0 walked past every one of these and answered ok: true.
+      mkdirSync(join(workspace, "art/node_modules"), { recursive: true });
+      mkdirSync(join(workspace, "art/build"));
+      writeFileSync(join(workspace, "art/a.txt"), "a");
+      const w = await call<{ manifest: string; truncated: boolean }>(checksumVerify, {
+        directory: "art",
+        write: true,
+      });
+      expect(w.truncated).toBe(false);
+      writeFileSync(join(workspace, "SUMS"), w.manifest);
+      writeFileSync(join(workspace, "art/.npmrc"), "//registry/:_authToken=x");
+      writeFileSync(join(workspace, "art/node_modules/x.js"), "x");
+      writeFileSync(join(workspace, "art/build/y.js"), "y");
+      writeFileSync(join(workspace, "t.txt"), "t");
+      symlinkSync("../t.txt", join(workspace, "art/link"));
+      const r = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
+      expect(r.ok).toBe(false);
+      expect(r.truncated).toBe(false);
+      expect([...r.unexpected].sort()).toEqual([
+        ".npmrc",
+        "build/y.js",
+        "link",
+        "node_modules/x.js",
+      ]);
+      expect(r.symlinks).toEqual([{ path: "link", target: "../t.txt" }]);
+    });
+
+    test("a dotfile in the manifest is hashed, so a change to it is caught", async () => {
+      mkdirSync(join(workspace, "art/.github/workflows"), { recursive: true });
+      writeFileSync(join(workspace, "art/.github/workflows/ci.yml"), "on: push\n");
+      writeFileSync(join(workspace, "art/index.js"), "x");
+      const w = await call<{ manifest: string }>(checksumVerify, { directory: "art", write: true });
+      expect(w.manifest).toContain(".github/workflows/ci.yml");
+      writeFileSync(join(workspace, "SUMS"), w.manifest);
+      expect(
+        await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" }),
+      ).toMatchObject({ ok: true, mismatched: [], missing: [], unexpected: [] });
+      writeFileSync(
+        join(workspace, "art/.github/workflows/ci.yml"),
+        "on: [push, pull_request_target]\n",
+      );
+      const r = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
+      expect(r).toMatchObject({ ok: false, mismatched: [".github/workflows/ci.yml"], missing: [] });
+    });
+
+    test("a manifest inside the directory it describes is not unexpected", async () => {
+      mkdirSync(join(workspace, "art"));
+      writeFileSync(join(workspace, "art/a.txt"), "a");
+      const w = await call<{ manifest: string }>(checksumVerify, { directory: "art", write: true });
+      writeFileSync(join(workspace, "art/SHA256SUMS"), w.manifest);
+      const r = await call<Check>(checksumVerify, {
+        directory: "art",
+        manifest: "art/SHA256SUMS",
+      });
+      expect(r).toMatchObject({ ok: true, unexpected: [] });
+    });
+
+    test("a link out of the workspace is never read, and one inside is hashed like sha256sum", async () => {
+      const outside = mkdtempSync(join(tmpdir(), "crewhaus-verify-outside-"));
+      try {
+        writeFileSync(join(outside, "secret.txt"), "SENTINEL-OUTSIDE");
+        mkdirSync(join(workspace, "art"));
+        writeFileSync(join(workspace, "art/index.js"), "code");
+        symlinkSync("index.js", join(workspace, "art/in-link.js"));
+        symlinkSync(join(outside, "secret.txt"), join(workspace, "art/out-link"));
+        const w = await call<{ manifest: string; unreadable: string[] }>(checksumVerify, {
+          directory: "art",
+          write: true,
+        });
+        const lines = w.manifest.trim().split("\n");
+        expect(lines.map((l) => l.split("  ")[1])).toEqual(["in-link.js", "index.js"]);
+        expect(lines[0]?.split("  ")[0]).toBe(lines[1]?.split("  ")[0]);
+        expect(w.unreadable).toEqual([
+          "out-link: a symlink that leads outside the workspace; not read",
+        ]);
+        writeFileSync(join(workspace, "SUMS"), w.manifest);
+        const raw1 = await raw(checksumVerify, { directory: "art", manifest: "SUMS" });
+        expect(raw1).not.toContain("SENTINEL");
+        const r = JSON.parse(raw1) as Check;
+        expect(r.ok).toBe(false);
+        expect(r.unexpected).toEqual(["out-link"]);
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    });
+
+    test.skipIf(process.platform === "win32")(
+      "a FIFO in the directory is named, not opened, and not ok",
+      async () => {
+        mkdirSync(join(workspace, "art"));
+        writeFileSync(join(workspace, "art/a.txt"), "a");
+        expect(Bun.spawnSync(["mkfifo", join(workspace, "art/pipe")]).exitCode).toBe(0);
+        const w = await call<{ manifest: string; unreadable: string[] }>(checksumVerify, {
+          directory: "art",
+          write: true,
+        });
+        expect(w.unreadable).toEqual(["pipe: a fifo, not a regular file; not opened"]);
+        writeFileSync(join(workspace, "SUMS"), w.manifest);
+        const r = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
+        expect(r.ok).toBe(false);
+        expect(r.unexpected).toEqual(["pipe"]);
+      },
+    );
+
+    test("a walk that stops early is not ok, and write refuses a partial manifest", async () => {
+      mkdirSync(join(workspace, "art/deep/deeper"), { recursive: true });
+      writeFileSync(join(workspace, "art/deep/deeper/x.txt"), "x");
+      writeFileSync(join(workspace, "art/top.txt"), "t");
+      writeFileSync(join(workspace, "SUMS"), `${"0".repeat(64)}  top.txt\n`);
+      for (const limits of [
+        { maxEntries: 2, maxDepth: 64 },
+        { maxEntries: 100, maxDepth: 2 },
+      ]) {
+        _setIntegrityLimitsForTest(limits);
+        try {
+          const w = await call<{ manifest: string | null; truncated: boolean; reason: string }>(
+            checksumVerify,
+            { directory: "art", write: true },
+          );
+          expect({ limits, w }).toMatchObject({ limits, w: { manifest: null, truncated: true } });
+          expect(w.reason).toMatch(/no manifest was written/);
+          const r = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
+          expect({ limits, truncated: r.truncated, ok: r.ok }).toEqual({
+            limits,
+            truncated: true,
+            ok: false,
+          });
+        } finally {
+          _setIntegrityLimitsForTest(undefined);
+        }
+      }
+      // Under the real limits the same tree is walked completely.
+      const whole = await call<{ truncated: boolean }>(checksumVerify, {
+        directory: "art",
+        write: true,
+      });
+      expect(whole.truncated).toBe(false);
+    });
+
+    test("the walk's entry cap is checked before an entry is added", () => {
+      mkdirSync(join(workspace, "art"));
+      for (const name of ["a", "b", "c"]) writeFileSync(join(workspace, "art", name), name);
+      const capped = integrityWalk(workspace, "art", { maxEntries: 2 });
+      expect(capped).toMatchObject({ ok: true, truncated: true });
+      expect(capped.ok && capped.entries.length).toBe(2);
+      const full = integrityWalk(workspace, "art", { maxEntries: 3 });
+      expect(full).toMatchObject({ ok: true, truncated: false });
+    });
+
+    test("exclude leaves a named path out, and says so", async () => {
+      mkdirSync(join(workspace, ".git"));
+      writeFileSync(join(workspace, ".git/HEAD"), "ref");
+      writeFileSync(join(workspace, "a.txt"), "a");
+      const w = await call<{ manifest: string; excluded: string[] }>(checksumVerify, {
+        write: true,
+        exclude: [".git"],
+      });
+      expect(w.excluded).toEqual([".git"]);
+      expect(w.manifest).not.toContain(".git");
+      expect(w.manifest).toContain("a.txt");
+    });
   });
 });
 

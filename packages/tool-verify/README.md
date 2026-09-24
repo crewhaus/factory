@@ -61,7 +61,17 @@ re-derive them:
 - `ChecksumVerify` reports **missing**, **changed** and **unexpected** files
   separately. An unexpected extra file is how something ships that nobody
   meant to ship, and it is invisible in a simple "does everything listed
-  still match".
+  still match". So it walks EVERY entry of the directory: dotfiles, `.git`,
+  `node_modules`, `dist` and the rest included, unless you name them in
+  `exclude` (they come back as `excluded`). A symlink is listed under
+  `symlinks` and is never followed out of the workspace: one that stays
+  inside is hashed through to its file, as `sha256sum` does, and one that
+  leads out, a FIFO or a device is reported under `unreadable` without being
+  opened. A manifest that sits inside the directory it describes is left out
+  of it. Anything unreadable, and a walk that stopped at its cap (`truncated`),
+  make the answer not `ok`, and `write: true` refuses to emit a partial
+  manifest. `GoldenCompare` walks a tree the same way, and compares links by
+  where they point.
 - `AcceptanceCheck` reports every check's own verdict, so one failure does
   not hide the others and a pass is a list of things that were actually
   checked rather than an opinion.
