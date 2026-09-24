@@ -5610,7 +5610,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "piiRedact",
     name: "PiiRedact",
     description:
-      "Replace detected personal data with a stable token — either a plain type placeholder or an HMAC pseudonym keyed from a named environment variable, so the same value redacts identically across documents without being reversible. Use it when a document has to leave the system but the records still need to line up afterwards; it returns the redacted text plus counts by type, never the values it removed.",
+      "Replace detected personal data with a stable token — either a plain type placeholder or an HMAC pseudonym keyed from a named environment variable the operator allowed, so the same value redacts identically across documents without being reversible. Use it when a document has to leave the system but the records still need to line up afterwards; it returns the redacted text plus counts by type, never the values it removed.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -6869,7 +6869,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "signPayload",
     name: "SignPayload",
     description:
-      "Produce an HMAC over a payload using a key read from a named environment variable. Use it to stamp a record so a later reader can tell it was not altered; the key is named, never passed, so it cannot end up in a transcript, and it never appears in the result.",
+      "Produce an HMAC over a payload using a key read from a named environment variable, one the operator listed in tool_config.secure.key_env_vars (no other variable is read). Use it to stamp a record so a later reader can tell it was not altered; the key is named, never passed, so it cannot end up in a transcript, and it never appears in the result.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -8134,7 +8134,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "verifyPayload",
     name: "VerifyPayload",
     description:
-      "Check an HMAC against a payload in constant time, with the key read from a named environment variable. Use it before trusting a record that claims to be unaltered; the comparison is a double HMAC, so a wrong-length or malformed signature returns false rather than leaking timing.",
+      "Check an HMAC against a payload in constant time, with the key read from a named environment variable, one the operator listed in tool_config.secure.key_env_vars (no other variable is read). Use it before trusting a record that claims to be unaltered; the comparison is a double HMAC, so a wrong-length or malformed signature returns false rather than leaking timing.",
     readOnly: true,
     destructive: false,
     scope: "internal",

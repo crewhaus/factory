@@ -26,6 +26,7 @@ import {
   promptInjectionScan,
   pseudonymize,
   redactForExport,
+  registerSecureConfig,
   secretScan,
   signPayload,
   urlSafetyCheck,
@@ -51,6 +52,12 @@ let tmp: string;
 
 beforeEach(() => {
   process.env[KEY_VAR] = "a-test-key-value";
+  // The operator's list (tool_config.secure.key_env_vars): the only names a
+  // keyed tool may read. The two unset names are listed so their tests reach
+  // the "unset" answer rather than the "not listed" one.
+  registerSecureConfig({
+    key_env_vars: [KEY_VAR, "CREWHAUS_DEFINITELY_UNSET_KEY", "CREWHAUS_NOT_SET_AT_ALL"],
+  });
   tmp = mkdtempSync(path.join(tmpdir(), "crewhaus-secure-"));
   process.chdir(tmp);
 });
@@ -59,6 +66,7 @@ afterEach(() => {
   process.chdir(originalCwd);
   rmSync(tmp, { recursive: true, force: true });
   delete process.env[KEY_VAR];
+  registerSecureConfig({});
 });
 
 describe("package-wide contract", () => {
@@ -798,8 +806,10 @@ describe("SignPayload and VerifyPayload", () => {
   });
 
   test("a key name that is not an env-var name is refused", async () => {
-    const out = await signPayload.execute({ payload: "x", keyEnvVar: "not a var" });
-    expect(String(out)).toContain("not a valid environment variable name");
+    const out = await signPayload.execute({ payload: "x", keyEnvVar: "bad name!" });
+    expect(String(out)).toContain("must name an environment variable");
+    // Not quoted back: a value that is not a name is most often the key itself.
+    expect(String(out)).not.toContain("bad name!");
   });
 
   test("base64url encoding round-trips", async () => {
