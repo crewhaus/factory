@@ -329,7 +329,16 @@ export async function vetEndpoint(rawUrl: string): Promise<VettedEndpoint> {
   try {
     url = new URL(rawUrl);
   } catch {
-    throw new RpcEndpointError(`"${rawUrl}" is not a URL`);
+    // Nothing of the value is repeated: a provider key lives in the path, and
+    // a URL that fails to parse is most often a keyed URL missing its scheme
+    // (rpc.ts, invariant 3). The hint is read from the shape alone.
+    throw new RpcEndpointError(
+      `rpcUrl is not an absolute URL — ${
+        /^[a-z][a-z0-9+.-]*:\/\//i.test(rawUrl)
+          ? "check the host and the port"
+          : "it must start with https:// (or http://)"
+      }. The value is not repeated here, because a provider keeps its key in the path.`,
+    );
   }
 
   if (url.protocol !== "https:" && url.protocol !== "http:") {
