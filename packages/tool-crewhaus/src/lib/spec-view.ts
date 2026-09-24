@@ -24,6 +24,7 @@
  * shape — is redacted by `redactArgs` before it is shown.
  */
 
+import { createHash } from "node:crypto";
 import { ENV_REF_RE } from "@crewhaus/preflight";
 
 export type LooseRecord = Record<string, unknown>;
@@ -56,7 +57,68 @@ export type McpServerView = {
   readonly headerKeys?: readonly string[];
   /** Tool names the spec narrows trust flags for (`tool_flags.per_tool`). */
   readonly flaggedTools?: readonly string[];
+  /**
+   * The trust flags `tool_flags` sets, by name (`destructive`,
+   * `requireJustification`; `readOnly` only in a document the schema would
+   * refuse): `defaults` for every tool on the server, `perTool` per tool.
+   * Absent when the server declares no `tool_flags`.
+   */
+  readonly toolFlags?: {
+    readonly defaults?: readonly string[];
+    readonly perTool?: Readonly<Record<string, readonly string[]>>;
+  };
 };
+
+/**
+ * Fingerprints of what a server view withholds — env and header VALUES, the
+ * raw argv, an `sse` URL's query, userinfo and fragment — so a diff can say a
+ * value CHANGED without either side's value (or a digest of it) ever leaving
+ * the process: this table is keyed by the view object and is never part of
+ * the view's data, so no report can serialize it. A view that did not come
+ * from {@link buildSpecView} in this process has no entry, and a diff then
+ * compares what the view shows and nothing more.
+ */
+type WithheldDigests = {
+  readonly env: ReadonlyMap<string, string>;
+  readonly headers: ReadonlyMap<string, string>;
+  readonly argv?: string;
+  readonly url?: string;
+};
+const WITHHELD = new WeakMap<McpServerView, WithheldDigests>();
+
+function digest(value: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(value) ?? "")
+    .digest("hex");
+}
+
+function digestMap(record: LooseRecord | undefined): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [key, value] of Object.entries(record ?? {})) out.set(key, digest(value));
+  return out;
+}
+
+/** The trust flags one `tool_flags` entry sets to true, sorted. */
+const TRUST_FLAG_NAMES = ["destructive", "readOnly", "requireJustification"] as const;
+function flagsSet(entry: unknown): string[] {
+  const record = asRecord(entry);
+  if (record === undefined) return [];
+  return TRUST_FLAG_NAMES.filter((flag) => record[flag] === true);
+}
+
+function toolFlagsView(block: unknown): McpServerView["toolFlags"] | undefined {
+  const flags = asRecord(block);
+  if (flags === undefined) return undefined;
+  const perToolRaw = asRecord(flags["per_tool"]);
+  const perTool: Record<string, readonly string[]> = {};
+  for (const tool of Object.keys(perToolRaw ?? {}).sort(compareStrings)) {
+    perTool[tool] = flagsSet(perToolRaw?.[tool]);
+  }
+  return {
+    ...(flags["defaults"] !== undefined ? { defaults: flagsSet(flags["defaults"]) } : {}),
+    ...(perToolRaw !== undefined ? { perTool } : {}),
+  };
+}
 
 export type PermissionRuleView = { readonly type: string; readonly pattern: string };
 
@@ -248,7 +310,8 @@ function mcpServerViews(block: unknown): McpServerView[] {
     const perTool = asRecord(asRecord(config["tool_flags"])?.["per_tool"]);
     const rawArgs = config["args"];
     const args = isStringArray(rawArgs) ? redactArgs(rawArgs) : undefined;
-    out.push({
+    const toolFlags = toolFlagsView(config["tool_flags"]);
+    const view: McpServerView = {
       name,
       transport: asString(config["transport"]) ?? "unknown",
       ...(asString(config["command"]) !== undefined
@@ -263,7 +326,15 @@ function mcpServerViews(block: unknown): McpServerView[] {
       ...(env !== undefined ? { envKeys: Object.keys(env).sort(compareStrings) } : {}),
       ...(headers !== undefined ? { headerKeys: Object.keys(headers).sort(compareStrings) } : {}),
       ...(perTool !== undefined ? { flaggedTools: Object.keys(perTool).sort(compareStrings) } : {}),
+      ...(toolFlags !== undefined ? { toolFlags } : {}),
+    };
+    WITHHELD.set(view, {
+      env: digestMap(env),
+      headers: digestMap(headers),
+      ...(rawArgs !== undefined ? { argv: digest(rawArgs) } : {}),
+      ...(typeof config["url"] === "string" ? { url: digest(config["url"]) } : {}),
     });
+    out.push(view);
   }
   out.sort((a, b) => compareStrings(a.name, b.name));
   return out;
@@ -499,16 +570,7 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
       continue;
     }
     if (from === undefined || to === undefined) continue;
-    const fromText = describeServer(from);
-    const toText = describeServer(to);
-    if (fromText !== toText) {
-      push({ kind: "mcp-server", path, from: fromText, to: toText, widens: false });
-    }
-    if (from.required && !to.required) {
-      // A peer that may now be absent is a smaller guarantee, not a wider
-      // capability — reported, not flagged.
-      push({ kind: "mcp-server-optional", path, from: "required", to: "optional", widens: false });
-    }
+    for (const change of diffServer(path, from, to)) push(change);
   }
 
   // permissions
@@ -576,6 +638,145 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
       compareStrings(a.to ?? "", b.to ?? ""),
   );
   return changes;
+}
+
+/**
+ * What changed about ONE server present on both sides (security-5#4).
+ *
+ * A server is what it RUNS and what it runs WITH, so every one of these
+ * widens: a different transport, command, argv or endpoint is a different
+ * program behind the same tool names (a routine pin bump runs new code that
+ * may expose new tools — conservative, and deliberately so); an added `env`
+ * or `headers` key hands it something it did not have; a changed value
+ * (withheld — see {@link WITHHELD}) may switch it from paper to live; and a
+ * trust flag removed (`destructive`, `requireJustification`) or `readOnly`
+ * added lets plan and auto mode run its tools without asking. Removing a key
+ * or tightening a flag is reported and does not widen. Names only: no value,
+ * and no digest of one, is ever put in a change.
+ */
+function diffServer(path: string, from: McpServerView, to: McpServerView): SpecChange[] {
+  const out: SpecChange[] = [];
+  const fromText = describeServer(from);
+  const toText = describeServer(to);
+  if (fromText !== toText) {
+    out.push({ kind: "mcp-server", path, from: fromText, to: toText, widens: true });
+  }
+  const fromDigests = WITHHELD.get(from);
+  const toDigests = WITHHELD.get(to);
+  if (fromDigests !== undefined && toDigests !== undefined) {
+    // Only what the display text above cannot show: a redacted argv entry,
+    // or an `sse` URL's query, userinfo or fragment.
+    if (fromText === toText && fromDigests.argv !== toDigests.argv) {
+      out.push({
+        kind: "mcp-server-args-value-changed",
+        path,
+        to: "a redacted argv value changed (withheld)",
+        widens: true,
+      });
+    }
+    if (fromText === toText && fromDigests.url !== toDigests.url) {
+      out.push({
+        kind: "mcp-server-url-value-changed",
+        path,
+        to: "the URL's query, userinfo or fragment changed (withheld)",
+        widens: true,
+      });
+    }
+  }
+  const keyed: ReadonlyArray<
+    readonly ["env" | "header", readonly string[] | undefined, readonly string[] | undefined]
+  > = [
+    ["env", from.envKeys, to.envKeys],
+    ["header", from.headerKeys, to.headerKeys],
+  ];
+  for (const [what, before, after] of keyed) {
+    const { added, removed } = diffSets(before ?? [], after ?? []);
+    for (const key of added) {
+      out.push({ kind: `mcp-server-${what}-added`, path, to: key, widens: true });
+    }
+    for (const key of removed) {
+      out.push({ kind: `mcp-server-${what}-removed`, path, from: key, widens: false });
+    }
+    const fromValues = what === "env" ? fromDigests?.env : fromDigests?.headers;
+    const toValues = what === "env" ? toDigests?.env : toDigests?.headers;
+    if (fromValues === undefined || toValues === undefined) continue;
+    const kept = (before ?? []).filter((key) => (after ?? []).includes(key));
+    for (const key of kept) {
+      if (fromValues.get(key) === toValues.get(key)) continue;
+      out.push({
+        kind: `mcp-server-${what}-value-changed`,
+        path,
+        to: `${key} (value withheld)`,
+        widens: true,
+      });
+    }
+  }
+  out.push(...diffToolFlags(path, from.toolFlags, to.toolFlags));
+  if (from.required && !to.required) {
+    // A peer that may now be absent is a smaller guarantee, not a wider
+    // capability — reported, not flagged.
+    out.push({
+      kind: "mcp-server-optional",
+      path,
+      from: "required",
+      to: "optional",
+      widens: false,
+    });
+  }
+  if (!from.required && to.required) {
+    out.push({
+      kind: "mcp-server-required",
+      path,
+      from: "optional",
+      to: "required",
+      widens: false,
+    });
+  }
+  return out;
+}
+
+/** A trust flag whose REMOVAL loosens a tool: it asked, or it was gated. */
+const TIGHTENING_FLAGS: ReadonlySet<string> = new Set(["destructive", "requireJustification"]);
+
+function diffToolFlags(
+  path: string,
+  from: McpServerView["toolFlags"],
+  to: McpServerView["toolFlags"],
+): SpecChange[] {
+  const out: SpecChange[] = [];
+  const entries: Array<[string, readonly string[], readonly string[]]> = [
+    [`${path}.tool_flags.defaults`, from?.defaults ?? [], to?.defaults ?? []],
+  ];
+  const tools = new Set([...Object.keys(from?.perTool ?? {}), ...Object.keys(to?.perTool ?? {})]);
+  for (const tool of [...tools].sort(compareStrings)) {
+    entries.push([
+      `${path}.tool_flags.per_tool.${tool}`,
+      from?.perTool?.[tool] ?? [],
+      to?.perTool?.[tool] ?? [],
+    ]);
+  }
+  for (const [flagPath, before, after] of entries) {
+    const { added, removed } = diffSets(before, after);
+    for (const flag of removed) {
+      out.push({
+        kind: "mcp-tool-flag-removed",
+        path: flagPath,
+        from: flag,
+        widens: TIGHTENING_FLAGS.has(flag),
+      });
+    }
+    for (const flag of added) {
+      // `readOnly` is a GRANT: plan and auto mode run a read-only tool
+      // without asking. Every other flag tightens.
+      out.push({
+        kind: "mcp-tool-flag-added",
+        path: flagPath,
+        to: flag,
+        widens: flag === "readOnly",
+      });
+    }
+  }
+  return out;
 }
 
 function describeServer(server: McpServerView): string {

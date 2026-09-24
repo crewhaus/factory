@@ -7013,7 +7013,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "specDiff",
     name: "SpecDiff",
     description:
-      "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
+      "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. An existing MCP server counts too: a different command, argv, transport or endpoint, an added env or header key, a changed env, header or redacted-argv value (reported without the value) and a removed destructive or requireJustification trust flag all widen. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
     readOnly: true,
     destructive: false,
     scope: "internal",

@@ -319,6 +319,16 @@ describe("SpecDiff", () => {
     expect(result.changes.map((c) => c.kind)).toEqual(["tool-added"]);
   });
 
+  test("swapping an existing MCP server's command widens (0.7.1)", async () => {
+    const withServer = `${CLI_SPEC}\nmcp_servers:\n  thredz:\n    transport: stdio\n    command: bunx\n    args: ["thredz-mcp@0.3.0"]`;
+    const result = await callJson<{ widens: boolean; changes: Array<{ kind: string }> }>(specDiff, {
+      before: { spec: withServer },
+      after: { spec: withServer.replace("command: bunx", "command: npx") },
+    });
+    expect(result.widens).toBe(true);
+    expect(result.changes.map((c) => c.kind)).toEqual(["mcp-server"]);
+  });
+
   test("an unchanged pair reports no changes", async () => {
     const result = await callJson<{ changed: boolean }>(specDiff, {
       before: { spec: CLI_SPEC },

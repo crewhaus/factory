@@ -240,6 +240,197 @@ describe("spec diff", () => {
     ].join("\n");
     expect(diffSpecViews(view(CLI_SPEC), view(reordered))).toEqual([]);
   });
+
+  // 0.7.1 (security-5#4): an existing server was compared only by its display
+  // string, and any difference was hard-coded widens:false; env/header keys
+  // and tool_flags were never compared at all.
+  describe("an MCP server present on both sides", () => {
+    const server = (lines: readonly string[]): string =>
+      [
+        ...CLI_SPEC.split("\n").slice(0, CLI_SPEC.split("\n").indexOf("mcp_servers:")),
+        ...lines,
+      ].join("\n");
+    const base = server([
+      "mcp_servers:",
+      "  broker:",
+      "    transport: stdio",
+      "    command: bun",
+      "    args: [a.ts, --api-key, sk-live-abc123xyz]",
+      "    env:",
+      "      BROKER_MODE: paper",
+      "    tool_flags:",
+      "      per_tool:",
+      "        place_order: { destructive: true }",
+    ]);
+    const diff = (after: string) => diffSpecViews(view(base), view(after));
+    const edit = (from: string, to: string): string => {
+      expect(base).toContain(from);
+      return base.replace(from, to);
+    };
+
+    test("a command swap widens", () => {
+      const changes = diff(edit("command: bun", "command: npx"));
+      expect(changes).toEqual([
+        {
+          kind: "mcp-server",
+          path: "mcp_servers.broker",
+          from: "stdio:bun a.ts --api-key (redacted)",
+          to: "stdio:npx a.ts --api-key (redacted)",
+          widens: true,
+        },
+      ]);
+    });
+
+    test("an argv change widens, and a changed REDACTED value is reported without it", () => {
+      expect(diff(edit("a.ts,", "b.ts,")).map((c) => [c.kind, c.widens])).toEqual([
+        ["mcp-server", true],
+      ]);
+      const rotated = diff(edit("sk-live-abc123xyz", "sk-live-zzz999qqq"));
+      expect(rotated.map((c) => [c.kind, c.widens])).toEqual([
+        ["mcp-server-args-value-changed", true],
+      ]);
+      expect(JSON.stringify(rotated)).not.toContain("sk-live");
+    });
+
+    test("stdio → sse, and an sse endpoint or query change, widen", () => {
+      const sse = server([
+        "mcp_servers:",
+        "  broker:",
+        "    transport: sse",
+        "    url: https://mcp.example.test/v1?token=AAA",
+      ]);
+      const toSse = diffSpecViews(view(base), view(sse));
+      expect(toSse.find((c) => c.kind === "mcp-server")?.widens).toBe(true);
+      const path = diffSpecViews(view(sse), view(sse.replace("/v1?", "/v2?")));
+      expect(path.map((c) => [c.kind, c.widens])).toEqual([["mcp-server", true]]);
+      const query = diffSpecViews(view(sse), view(sse.replace("token=AAA", "token=BBB")));
+      expect(query.map((c) => [c.kind, c.widens])).toEqual([
+        ["mcp-server-url-value-changed", true],
+      ]);
+      expect(JSON.stringify(query)).not.toContain("AAA");
+    });
+
+    test("an added env key widens and names only the key; a removed one does not widen", () => {
+      const added = diff(
+        edit(
+          "      BROKER_MODE: paper",
+          "      BROKER_MODE: paper\n      ADMIN_KEY: sk-live-abc123",
+        ),
+      );
+      expect(added).toEqual([
+        { kind: "mcp-server-env-added", path: "mcp_servers.broker", to: "ADMIN_KEY", widens: true },
+      ]);
+      expect(JSON.stringify(added)).not.toContain("sk-live-abc123");
+      const removed = diffSpecViews(
+        view(base.replace("      BROKER_MODE: paper", "      BROKER_MODE: paper\n      X: y")),
+        view(base),
+      );
+      expect(removed).toEqual([
+        { kind: "mcp-server-env-removed", path: "mcp_servers.broker", from: "X", widens: false },
+      ]);
+    });
+
+    test("a changed env VALUE widens and is withheld", () => {
+      const live = diff(edit("BROKER_MODE: paper", "BROKER_MODE: live"));
+      expect(live).toEqual([
+        {
+          kind: "mcp-server-env-value-changed",
+          path: "mcp_servers.broker",
+          to: "BROKER_MODE (value withheld)",
+          widens: true,
+        },
+      ]);
+      expect(JSON.stringify(live)).not.toMatch(/paper|live"/);
+    });
+
+    test("an added header key widens", () => {
+      const sse = server([
+        "mcp_servers:",
+        "  s:",
+        "    transport: sse",
+        "    url: https://h.test/x",
+      ]);
+      const withHeader = `${sse}\n    headers:\n      Authorization: Bearer x`;
+      expect(diffSpecViews(view(sse), view(withHeader))).toEqual([
+        {
+          kind: "mcp-server-header-added",
+          path: "mcp_servers.s",
+          to: "Authorization",
+          widens: true,
+        },
+      ]);
+    });
+
+    test("removing a destructive flag widens; adding one does not", () => {
+      const removed = diff(edit("place_order: { destructive: true }", "place_order: {}"));
+      expect(removed).toEqual([
+        {
+          kind: "mcp-tool-flag-removed",
+          path: "mcp_servers.broker.tool_flags.per_tool.place_order",
+          from: "destructive",
+          widens: true,
+        },
+      ]);
+      // Dropping the whole block drops the flag with it.
+      const dropped = diff(base.split("\n").slice(0, -3).join("\n"));
+      expect(dropped.map((c) => [c.kind, c.from, c.widens])).toEqual([
+        ["mcp-tool-flag-removed", "destructive", true],
+      ]);
+      const tightened = diffSpecViews(
+        view(edit("place_order: { destructive: true }", "place_order: {}")),
+        view(base),
+      );
+      expect(tightened.map((c) => [c.kind, c.to, c.widens])).toEqual([
+        ["mcp-tool-flag-added", "destructive", false],
+      ]);
+    });
+
+    test("adding readOnly (which the schema refuses) would widen: plan and auto mode run it unasked", () => {
+      const doc = (flags: Record<string, unknown>) => ({
+        name: "x",
+        target: "cli",
+        mcp_servers: { s: { transport: "stdio", command: "bun", tool_flags: flags } },
+      });
+      const changes = diffSpecViews(
+        buildSpecView(doc({}), []),
+        buildSpecView(doc({ defaults: { readOnly: true } }), []),
+      );
+      expect(changes).toEqual([
+        {
+          kind: "mcp-tool-flag-added",
+          path: "mcp_servers.s.tool_flags.defaults",
+          to: "readOnly",
+          widens: true,
+        },
+      ]);
+    });
+
+    test("optional → required is reported and does not widen", () => {
+      const optional = edit("    command: bun", "    command: bun\n    required: false");
+      expect(diffSpecViews(view(optional), view(base))).toEqual([
+        {
+          kind: "mcp-server-required",
+          path: "mcp_servers.broker",
+          from: "optional",
+          to: "required",
+          widens: false,
+        },
+      ]);
+    });
+
+    test("identical servers, and views that did not come from this process, report nothing extra", () => {
+      expect(diff(base)).toEqual([]);
+      // A view round-tripped through JSON has no withheld digests: only what
+      // it shows is compared, and nothing is invented.
+      const copy = (v: ReturnType<typeof view>) => JSON.parse(JSON.stringify(v));
+      expect(
+        diffSpecViews(
+          copy(view(base)),
+          copy(view(edit("BROKER_MODE: paper", "BROKER_MODE: live"))),
+        ),
+      ).toEqual([]);
+    });
+  });
 });
 
 describe("permission patterns", () => {
