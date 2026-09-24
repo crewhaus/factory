@@ -87,12 +87,35 @@ left out with a warning, and the plugin's other tools load. Permission rules
 and crewhaus's own grants key on tool names, so a plugin `Grep` would otherwise
 run under the grant crewhaus gives the builtin one.
 
+## Tool definitions are checked at boot
+
+A plugin is JavaScript, so nothing typed its tools. Each one is checked before
+the plugin loads, and one that is malformed refuses the whole plugin at boot,
+naming the tool and the field:
+
+- `name`: 1-64 letters, digits, `_` or `-`.
+- `description` (optional) a string; `execute` a function.
+- `readOnly`, `destructive`, `requiresSandbox`, `requireJustification`,
+  `concurrencySafe`, `classifyOutput`: `true`, `false` or absent. A string
+  such as `"false"` is refused: plan mode reads it as set, and the sandbox and
+  justification checks read it as unset.
+- `scope`: `"internal"` or `"external"`; `ioCapability`: `"network"` or
+  `"process"`.
+- `inputSchema`: a zod schema (it validates every call). `jsonSchema`, when
+  given, an object schema.
+
+A tool that declares `ioCapability` but not `scope: "external"` runs as
+external, so what it sends is checked on the way out, and the boot says so.
+Two tools with one name — in one plugin or two — keep the first; the boot names
+the one left out.
+
 ## Input schemas
 
 Give each tool a zod 3 schema, or a `jsonSchema` the model reads beside a
 schema of your own. A zod 4 schema without a `jsonSchema` is converted with
 zod's own converter; if zod cannot describe it, the tool is shown to the model
-with no parameters and the boot says so.
+with no parameters and the boot says so. A validator that is not zod needs a
+`jsonSchema`.
 
 ## Code
 

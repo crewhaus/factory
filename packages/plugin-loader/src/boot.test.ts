@@ -41,7 +41,9 @@ function keypair() {
   return { pem: publicKey.export({ type: "spki", format: "pem" }).toString(), privateKey };
 }
 
-const ENTRY = `export default { contributions: { tools: [{ name: "Greet", description: "says hi", inputSchema: { safeParse: (v) => ({ success: true, data: v }), parse: (v) => v }, execute: async () => "hi" }] } };\n`;
+// No zod of its own here, so the tool gives the model a JSON Schema beside a
+// pass-through validator (a schema crewhaus cannot describe is refused, C105).
+const ENTRY = `export default { contributions: { tools: [{ name: "Greet", description: "says hi", jsonSchema: { type: "object", properties: {} }, inputSchema: { safeParse: (v) => ({ success: true, data: v }), parse: (v) => v }, execute: async () => "hi" }] } };\n`;
 
 /** Install one plugin the way `crewhaus plugins install` leaves it. */
 async function install(

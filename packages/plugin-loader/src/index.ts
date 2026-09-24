@@ -32,7 +32,7 @@ import {
   manifestPayloadForSigning,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
-import { buildTool } from "@crewhaus/tool-builder";
+import { auditToolScopes, buildTool } from "@crewhaus/tool-builder";
 import { RUNTIME_TOOL_NAMES, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import {
   createExclusive,
@@ -893,6 +893,117 @@ function isZod4Schema(schema: unknown): boolean {
   return schema !== null && typeof schema === "object" && "_zod" in schema;
 }
 
+function isZod3Schema(schema: unknown): boolean {
+  const def = (schema as { _def?: { typeName?: unknown } } | null)?._def;
+  return typeof def?.typeName === "string";
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** A value as a message shows it: short, and never a whole object. */
+function shown(value: unknown): string {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (typeof value === "string") {
+    return `the string ${JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}…` : value)}`;
+  }
+  if (Array.isArray(value)) return "a list";
+  if (typeof value === "function") return "a function";
+  if (typeof value === "object") return "an object";
+  return `${typeof value} ${String(value)}`;
+}
+
+/** The names every model provider accepts for a tool. */
+const PLUGIN_TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/** The flags every consumer reads as booleans (`=== true`, or truthiness). */
+const TOOL_FLAG_FIELDS = [
+  "concurrencySafe",
+  "readOnly",
+  "destructive",
+  "requiresSandbox",
+  "classifyOutput",
+  "requireJustification",
+] as const;
+
+/** Why a contributed tool has no usable name, or undefined when it has one. */
+function pluginToolNameProblem(tool: unknown): string | undefined {
+  if (!isPlainObject(tool)) return `is ${shown(tool)}, not a tool definition`;
+  const name = tool["name"];
+  if (typeof name !== "string") return `has no name (name is ${shown(name)})`;
+  if (!PLUGIN_TOOL_NAME.test(name)) {
+    return `name ${JSON.stringify(name)} must be 1-64 letters, digits, "_" or "-", the names model providers accept`;
+  }
+  return undefined;
+}
+
+/**
+ * Why a plugin's tool definition cannot be trusted as written, or undefined
+ * when it can. A plugin is JavaScript, so nothing typed its tools: every flag
+ * is read by something that compares it (`=== true`, `=== "external"`) or
+ * tests its truth, and a string there fails open — `readOnly: "false"` is
+ * truthy, so plan mode would run the tool; `requiresSandbox: "true"` is not
+ * `true`, so the sandbox floor would skip it. A schema crewhaus cannot read
+ * would crash every run that lists the tool, whether or not the model calls
+ * it. So each field must be what the tool contract says, or absent.
+ */
+function pluginToolDefinitionProblem(tool: unknown): string | undefined {
+  const unnamed = pluginToolNameProblem(tool);
+  if (unnamed !== undefined) return unnamed;
+  const t = tool as Record<string, unknown>;
+  if (t["description"] !== undefined && typeof t["description"] !== "string") {
+    return `description is ${shown(t["description"])}, not a string`;
+  }
+  if (typeof t["execute"] !== "function")
+    return `execute is ${shown(t["execute"])}, not a function`;
+  for (const field of TOOL_FLAG_FIELDS) {
+    const value = t[field];
+    if (value !== undefined && typeof value !== "boolean") {
+      return `${field} is ${shown(value)}, not true or false`;
+    }
+  }
+  const scope = t["scope"];
+  if (scope !== undefined && scope !== "internal" && scope !== "external") {
+    return `scope is ${shown(scope)}, not "internal" or "external"`;
+  }
+  const io = t["ioCapability"];
+  if (io !== undefined && io !== "network" && io !== "process") {
+    return `ioCapability is ${shown(io)}, not "network" or "process"`;
+  }
+  const schema = t["inputSchema"];
+  if (
+    schema === null ||
+    typeof schema !== "object" ||
+    typeof (schema as { safeParse?: unknown }).safeParse !== "function"
+  ) {
+    return `inputSchema is ${shown(schema)}; it must be a schema with safeParse (zod), which checks every call`;
+  }
+  const json = t["jsonSchema"];
+  if (json !== undefined) {
+    if (!isPlainObject(json)) return `jsonSchema is ${shown(json)}, not a JSON Schema object`;
+    if (json["type"] !== undefined && json["type"] !== "object") {
+      return `jsonSchema describes ${JSON.stringify(json["type"])} input; a tool's input is an object`;
+    }
+  } else if (!isZod3Schema(schema) && !isZod4Schema(schema)) {
+    return "inputSchema is not a zod schema crewhaus can describe to the model, and the tool gives no jsonSchema: use zod, or add a jsonSchema";
+  }
+  if (
+    t["concurrencyClassifier"] !== undefined &&
+    typeof t["concurrencyClassifier"] !== "function"
+  ) {
+    return `concurrencyClassifier is ${shown(t["concurrencyClassifier"])}, not a function`;
+  }
+  if (t["requiresModelFeatures"] !== undefined && !isPlainObject(t["requiresModelFeatures"])) {
+    return `requiresModelFeatures is ${shown(t["requiresModelFeatures"])}, not an object`;
+  }
+  if (t["operativeArgs"] !== undefined && !Array.isArray(t["operativeArgs"])) {
+    return `operativeArgs is ${shown(t["operativeArgs"])}, not a list`;
+  }
+  return undefined;
+}
+
 /**
  * A plugin tool's definition with a JSON Schema the model can read. crewhaus
  * describes a tool's input to the model with a zod 3 converter, which reads a
@@ -969,6 +1080,8 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
   const targetEmitters: PluginTargetEmitter[] = [];
   const skillDirs: string[] = [];
   const warnings: string[] = [];
+  /** Tool name → the plugin that contributed it, so a second one is left out by name. */
+  const toolOwners = new Map<string, string>();
   const note = (msg: string): void => {
     warnings.push(msg);
     opts.warn?.(`[plugins] ${msg}`);
@@ -1008,21 +1121,68 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
     }
     loaded.push(plugin);
     const contributions = readContributions(plugin.module.default);
-    // Normalize tools through buildTool so plugin tools get the same
-    // fail-closed scope/justification inference as first-party tools. A
-    // plugin is signed, in-process code, so its descriptions are not
-    // boundary-classified the way a remote MCP server's are.
-    for (const tool of contributions.tools ?? []) {
-      const described = await describePluginToolInput(name, tool as ToolDefinition<unknown>);
-      if (described.warning !== undefined) note(described.warning);
-      const built = buildTool(described.def);
-      const reserved = reservedPluginToolNameReason(built.name);
+    const contributed = contributions.tools ?? [];
+    if (!Array.isArray(contributed)) {
+      throw new PluginLoaderError(
+        `plugin "${name}": contributions.tools is ${shown(contributed)}, not a list of tools — refusing to load the plugin`,
+      );
+    }
+    // Every tool is checked before any is kept: a malformed one refuses the
+    // whole plugin at boot, naming the tool and the field, instead of failing
+    // open on a flag or crashing the first turn. Then it is normalized through
+    // buildTool, the same fail-closed scope/justification inference as
+    // first-party tools. A plugin is signed, in-process code, so its
+    // descriptions are not boundary-classified the way a remote MCP
+    // server's are.
+    for (const [index, tool] of contributed.entries()) {
+      const label =
+        isPlainObject(tool) && typeof tool["name"] === "string"
+          ? `tool ${JSON.stringify(tool["name"])}`
+          : `tools[${index}]`;
+      const refuse = (why: string, cause?: unknown): PluginLoaderError =>
+        new PluginLoaderError(
+          `plugin "${name}" ${label}: ${why} — refusing to load the plugin`,
+          cause,
+        );
+      const unnamed = pluginToolNameProblem(tool);
+      if (unnamed !== undefined) throw refuse(unnamed);
+      const def = tool as ToolDefinition<unknown>;
+      const reserved = reservedPluginToolNameReason(def.name);
       if (reserved !== undefined) {
         note(
-          `plugin "${name}" tool "${built.name}" was left out: ${reserved}. Rename it in the plugin (for example "${name}_${built.name}").`,
+          `plugin "${name}" tool "${def.name}" was left out: ${reserved}. Rename it in the plugin (for example "${name}_${def.name}").`,
         );
         continue;
       }
+      const malformed = pluginToolDefinitionProblem(tool);
+      if (malformed !== undefined) throw refuse(malformed);
+      const owner = toolOwners.get(def.name);
+      if (owner !== undefined) {
+        note(
+          owner === name
+            ? `plugin "${name}" contributes two tools named "${def.name}"; the second was left out.`
+            : `plugin "${name}" tool "${def.name}" was left out: plugin "${owner}" already contributes a tool of that name.`,
+        );
+        continue;
+      }
+      const described = await describePluginToolInput(name, def);
+      if (described.warning !== undefined) note(described.warning);
+      let built: RegisteredTool;
+      try {
+        built = buildTool(described.def);
+      } catch (err) {
+        throw refuse(err instanceof Error ? err.message : String(err), err);
+      }
+      // A tool that says it crosses a network or process boundary runs as
+      // external, so its payloads pass the egress check — the rule compile
+      // --strict holds first-party tools to, through the same audit.
+      if (auditToolScopes([built]).length > 0) {
+        note(
+          `plugin "${name}" tool "${def.name}" declares ioCapability "${built.ioCapability}" but not scope "external"; it runs as external, so what it sends is checked on the way out. Set scope: "external" in the plugin.`,
+        );
+        built = { ...built, scope: "external" };
+      }
+      toolOwners.set(def.name, name);
       tools.push(built);
     }
     for (const channel of contributions.channels ?? []) channels.push(channel);
