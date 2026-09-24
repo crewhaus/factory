@@ -10,12 +10,14 @@ export class PatternParseError extends CrewhausError {
 export type CompiledPattern = {
   readonly toolGlob: string;
   readonly argGlob: string | null;
-  readonly _toolRe: RegExp;
-  readonly _argRe: RegExp | null;
+  /** The compiled tool-name glob. Internal: use {@link matchesToolName}. */
+  readonly _toolRe: GlobMatcher;
+  /** The compiled argument glob, or null for a bare tool pattern. */
+  readonly _argRe: GlobMatcher | null;
 };
 
 /**
- * The glob metacharacters `globToRegex` treats specially — the ONLY characters
+ * The glob metacharacters the glob compiler treats specially — the ONLY characters
  * that widen a match beyond a literal (`*` = any run, `?` = one char). Every
  * other character (`. + ^ $ { } ( ) | [ ] \`) is regex-escaped and matched
  * literally. `\` is the escape lead-in: `\*`, `\?`, `\\` match the literal
@@ -29,7 +31,7 @@ export const GLOB_METACHARS: readonly string[] = Object.freeze(["\\", "*", "?"])
  * Escape a raw string so it matches ONLY itself when spliced into a glob
  * pattern. Backslash-escapes every {@link GLOB_METACHARS} character (backslash
  * first, so we don't double-escape the escapes we add). Round-trips through
- * `globToRegex`: `escapeGlobLiteral("a*b")` → `"a\\*b"` → matches only "a*b".
+ * the glob compiler: `escapeGlobLiteral("a*b")` → `"a\\*b"` → matches only "a*b".
  */
 export function escapeGlobLiteral(value: string): string {
   let out = "";
@@ -41,97 +43,223 @@ export function escapeGlobLiteral(value: string): string {
 }
 
 /**
- * What the regex emitted so far ends with — the context a `**` token needs in
- * order to be boundary-aware: `a/**` must also match `a`, and a leading
- * double-star segment must also match a bare `b`.
+ * Where the tokenizer stands when it reads a `**`, which decides what the
+ * `**` means at a path-segment boundary: `a/**` must also match `a`, and a
+ * leading double-star segment must also match a bare `b`.
  *
  *   - `"start"` — nothing emitted yet, OR the previous token was a `**` group
  *     that already absorbed the separator after it, so a new path segment
  *     begins here.
- *   - `"sep"`   — the regex ends with the literal `/` emitted for a glob `/`.
- *     A `**` in this position folds that separator into its own optional group.
+ *   - `"sep"`   — the last token is the literal `/` of a glob `/`. A `**` in
+ *     this position folds that separator into its own optional group.
  *   - `"other"` — anything else; a `**` here is mid-segment and just means
  *     "any run of characters".
  *
- * Tracking this explicitly replaces the old `re.slice(0, -1)` guesswork, which
- * silently mangled the regex whenever the assumed trailing `/` was not there:
- * a bare `**` compiled to `^(?:/.*)?$` (issue #17 — a catch-all `Bash(**)` rule
- * was dead), and two adjacent double-star segments compiled to a regex that
- * required a trailing separator.
+ * Tracking this explicitly (rather than guessing from what was emitted) is the
+ * fix for issue #17: a bare `**` once compiled to something that matched only
+ * the empty string or a string starting with `/`, so a catch-all `Bash(**)`
+ * rule was dead.
  */
 type GlobPos = "start" | "sep" | "other";
 
-function globToRegex(glob: string): RegExp {
-  // Tokenize character by character so replacement text is never re-processed.
-  // This avoids the chaining bug where .* emitted for ** gets re-replaced by
-  // the single-* rule on the next pass.
-  let re = "";
+/**
+ * One step of a compiled glob. The grammar is small, and every construct is
+ * one of these:
+ *
+ *   - `lit`       — one literal UTF-16 code unit;
+ *   - `qmark`     — `?`: one code unit that is not `/`;
+ *   - `star`      — `*`: any run of code units without a `/`;
+ *   - `any`       — `**` mid-segment: any run at all, newlines included;
+ *   - `optPrefix` — a leading `**` + `/`: an optional "any run then `/`";
+ *   - `mid`       — `/` + `**` + `/`: a `/`, optionally followed by
+ *                   "any run then `/`";
+ *   - `optSuffix` — a trailing `/` + `**`: an optional "`/` then any run".
+ */
+type GlobToken =
+  | { readonly k: "lit"; readonly c: number }
+  | { readonly k: "qmark" | "star" | "any" | "optPrefix" | "mid" | "optSuffix" };
+
+const SLASH = 0x2f;
+
+function tokenizeGlob(glob: string): GlobToken[] {
+  const tokens: GlobToken[] = [];
   let i = 0;
   let pos: GlobPos = "start";
-
   while (i < glob.length) {
     const ch = glob.charAt(i);
-
     if (ch === "\\" && i + 1 < glob.length) {
-      // Escape lead-in: the next char is taken literally (regex-escaped),
-      // never interpreted as a glob metachar. Lets `escapeGlobLiteral` emit
-      // `\*`/`\?`/`\\` that match the literal `*`/`?`/`\`. The escaped char is
-      // regex-escaped against the FULL metachar set (incl. `*`/`?`, which are
-      // regex quantifiers) so e.g. `\?` becomes `\?` in the regex, not a bare
-      // `?` that would make the previous atom optional.
-      const lit = glob.charAt(i + 1);
-      re += lit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      // An escaped `/` is still the separator character in the emitted regex,
-      // so a following `**` may fold it exactly as it would an unescaped one.
-      pos = lit === "/" ? "sep" : "other";
+      // Escape lead-in: the next code unit is literal, never a metachar. Lets
+      // `escapeGlobLiteral` emit `\*`/`\?`/`\\` that match the literal
+      // character. An escaped `/` is still a separator, so a following `**`
+      // folds it exactly as it would an unescaped one.
+      const lit = glob.charCodeAt(i + 1);
+      tokens.push({ k: "lit", c: lit });
+      pos = lit === SLASH ? "sep" : "other";
       i += 2;
     } else if (ch === "*" && glob[i + 1] === "*") {
       const afterTwo = glob[i + 2];
-
       if (afterTwo === "/" && pos === "start") {
-        // `**/` at a segment start → optional any-dir prefix.
-        re += "(?:.*/)?";
+        tokens.push({ k: "optPrefix" });
         pos = "start";
         i += 3;
       } else if (afterTwo === "/" && pos === "sep") {
-        // `/**/` in the middle → any sub-tree (the leading `/` is already
-        // emitted, so fold it into the group).
-        re = `${re.slice(0, -1)}(?:/.*/|/)`;
+        tokens.pop(); // the `/` just emitted is part of this group
+        tokens.push({ k: "mid" });
         pos = "start";
         i += 3;
       } else if (afterTwo === undefined && pos === "sep") {
-        // `/**` at the end → optional any-dir suffix (leading `/` folded in).
-        re = `${re.slice(0, -1)}(?:/.*)?`;
+        tokens.pop();
+        tokens.push({ k: "optSuffix" });
         pos = "other";
         i += 2;
       } else {
-        // Everything else — a bare `**`, a `**` glued to a non-separator
-        // (`rm**`), or a redundant `**` right after another `**` group:
-        // any run of characters, separators included.
-        re += ".*";
+        // A bare `**`, a `**` glued to a non-separator (`rm**`), or a
+        // redundant `**` right after another `**` group: any run at all.
+        tokens.push({ k: "any" });
         pos = "other";
         i += 2;
       }
     } else if (ch === "*") {
-      re += "[^/]*";
+      tokens.push({ k: "star" });
       pos = "other";
       i++;
     } else if (ch === "?") {
-      re += "[^/]";
+      tokens.push({ k: "qmark" });
       pos = "other";
       i++;
     } else {
-      re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+      tokens.push({ k: "lit", c: glob.charCodeAt(i) });
       pos = ch === "/" ? "sep" : "other";
       i++;
     }
   }
+  return tokens;
+}
 
-  // `s` (dotAll) so the `.` emitted for `**` also crosses newlines. Without it
-  // `**` was NOT a superset of `*` (`[^/]*` matches a newline, `.*` did not),
-  // which let a multi-line command slip past a `**` guard: the builtin
-  // `alwaysAsk Bash(rm**)` floor did not fire on "rm -rf /\necho done".
-  return new RegExp(`^${re}$`, "s");
+/** A state of the glob automaton. Index 0 is always the accepting state. */
+type GlobState =
+  | { readonly t: "lit"; readonly c: number; readonly out: number }
+  | { readonly t: "notSlash"; readonly out: number }
+  | { readonly t: "anyChar"; readonly out: number }
+  | { t: "split"; a: number; readonly b: number }
+  | { readonly t: "accept" };
+
+/**
+ * A compiled glob: `test(value)` says whether the glob matches the whole of
+ * `value`.
+ *
+ * This used to be a JavaScript RegExp, and a backtracking regex with several
+ * `*` in it takes polynomial time — `Bash(*git*push*--force*)` against an
+ * 18 KB command blocked the event loop for twelve seconds, and a rule with a
+ * handful more wildcards did not finish at all. Every tool call is matched
+ * against every rule, synchronously, with a model-supplied argument.
+ *
+ * So the glob is compiled to a small automaton and run by keeping the SET of
+ * states it could be in (Thompson's construction). Each character is looked
+ * at once, against each state once: the time is proportional to the length
+ * of the value times the length of the glob, whatever the input looks like.
+ * The language accepted is exactly the old regex's — the test suite checks
+ * the two against each other.
+ */
+export type GlobMatcher = { readonly test: (value: string) => boolean };
+
+function compileGlob(glob: string): GlobMatcher {
+  const tokens = tokenizeGlob(glob);
+  // Fast path: a glob with no metacharacters is a string comparison. Most
+  // tool-name halves (`Read`, `Bash`) are this.
+  if (tokens.every((t) => t.k === "lit")) {
+    let literal = "";
+    for (const t of tokens) literal += String.fromCharCode((t as { c: number }).c);
+    return { test: (value: string) => value === literal };
+  }
+
+  const states: GlobState[] = [{ t: "accept" }];
+  const push = (state: GlobState): number => states.push(state) - 1;
+  const loop = (t: "notSlash" | "anyChar", exit: number): number => {
+    const split: GlobState = { t: "split", a: -1, b: exit };
+    const splitAt = push(split);
+    split.a = push({ t, out: splitAt });
+    return splitAt;
+  };
+  const optionalRunThenSlash = (next: number): number => {
+    const slash = push({ t: "lit", c: SLASH, out: next });
+    return push({ t: "split", a: loop("anyChar", slash), b: next });
+  };
+
+  // Build right to left, so each fragment knows where it continues.
+  let next = 0;
+  for (let i = tokens.length - 1; i >= 0; i--) {
+    const token = tokens[i] as GlobToken;
+    switch (token.k) {
+      case "lit":
+        next = push({ t: "lit", c: token.c, out: next });
+        break;
+      case "qmark":
+        next = push({ t: "notSlash", out: next });
+        break;
+      case "star":
+        next = loop("notSlash", next);
+        break;
+      case "any":
+        next = loop("anyChar", next);
+        break;
+      case "optPrefix":
+        next = optionalRunThenSlash(next);
+        break;
+      case "mid":
+        next = push({ t: "lit", c: SLASH, out: optionalRunThenSlash(next) });
+        break;
+      case "optSuffix": {
+        const slash = push({ t: "lit", c: SLASH, out: loop("anyChar", next) });
+        next = push({ t: "split", a: slash, b: next });
+        break;
+      }
+    }
+  }
+  const start = next;
+  const count = states.length;
+
+  return {
+    test(value: string): boolean {
+      // `seen[s] === step` ⇔ state s is already in the set for this step.
+      const seen = new Int32Array(count).fill(-1);
+      let current: number[] = [];
+      let following: number[] = [];
+      const stack: number[] = [];
+      const add = (into: number[], state: number, step: number): void => {
+        stack.push(state);
+        while (stack.length > 0) {
+          const s = stack.pop() as number;
+          if (seen[s] === step) continue;
+          seen[s] = step;
+          const st = states[s] as GlobState;
+          if (st.t === "split") {
+            stack.push(st.b, st.a);
+          } else {
+            into.push(s);
+          }
+        }
+      };
+      add(current, start, 0);
+      for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        following.length = 0;
+        for (const s of current) {
+          const st = states[s] as GlobState;
+          if (
+            (st.t === "lit" && st.c === c) ||
+            (st.t === "notSlash" && c !== SLASH) ||
+            st.t === "anyChar"
+          ) {
+            add(following, st.out, i + 1);
+          }
+        }
+        if (following.length === 0) return false;
+        [current, following] = [following, current];
+      }
+      return current.includes(0);
+    },
+  };
 }
 
 export function compilePattern(pattern: string): CompiledPattern {
@@ -140,7 +268,7 @@ export function compilePattern(pattern: string): CompiledPattern {
   const parenIdx = pattern.indexOf("(");
   if (parenIdx === -1) {
     const toolGlob = pattern.trim();
-    return { toolGlob, argGlob: null, _toolRe: globToRegex(toolGlob), _argRe: null };
+    return { toolGlob, argGlob: null, _toolRe: compileGlob(toolGlob), _argRe: null };
   }
 
   if (!pattern.endsWith(")")) {
@@ -155,8 +283,8 @@ export function compilePattern(pattern: string): CompiledPattern {
   return {
     toolGlob,
     argGlob,
-    _toolRe: globToRegex(toolGlob),
-    _argRe: globToRegex(argGlob),
+    _toolRe: compileGlob(toolGlob),
+    _argRe: compileGlob(argGlob),
   };
 }
 
@@ -167,15 +295,18 @@ function stringValues(input: unknown): string[] {
 }
 
 /**
- * The operative argument field(s) per built-in tool — the input the permission
- * arg-glob is meant to constrain. Matching ONLY these stops a decoy field (e.g.
- * Write's `content`, or an attacker-injected key) from satisfying an allow rule
- * (#145). Names cover both the tool-fs fields and the Claude-Code-style aliases.
+ * The operative argument field(s) per well-known tool NAME — the input a
+ * permission arg-glob is meant to constrain.
  *
- * EXPORTED as the single source of truth: `crewhaus permissions suggest`
- * imports this so a suggested pattern always targets the SAME field the matcher
- * checks (previously hand-copied in permissions-suggest.ts — a silent-desync
- * risk).
+ * Since 0.7.1 this table is a FALLBACK. A tool says for itself which fields a
+ * rule constrains (`operativeArgs` on its definition), and the runtime hands
+ * the matcher those values, already canonicalised. The table only speaks for
+ * a tool that declares nothing but carries one of these names — an MCP or
+ * custom tool called `Write`, say — which is why it keeps the Claude-Code
+ * style `file_path` alias next to `path`.
+ *
+ * Exported because `crewhaus permissions suggest` and the approvals tooling
+ * read it to show an operator the field a rule would be checked against.
  */
 export const OPERATIVE_ARG_FIELDS: Readonly<Record<string, readonly string[]>> = {
   Bash: ["command"],
@@ -190,32 +321,204 @@ export const OPERATIVE_ARG_FIELDS: Readonly<Record<string, readonly string[]>> =
   Navigate: ["url"],
 };
 
+// ---------------------------------------------------------------------------
+// MCP tool names
+// ---------------------------------------------------------------------------
+
+/**
+ * The prefix of every tool an MCP server contributes:
+ * `mcp__<server>__<tool>`.
+ */
+export const MCP_TOOL_NAME_PREFIX = "mcp__";
+
+/**
+ * The spelling an MCP tool name had before crewhaus 0.7.1, `<server>__<tool>`,
+ * or `undefined` when `name` is not an MCP tool name. A rule written against
+ * the old spelling keeps matching through it.
+ */
+export function legacyMcpToolName(name: string): string | undefined {
+  if (!name.startsWith(MCP_TOOL_NAME_PREFIX)) return undefined;
+  const rest = name.slice(MCP_TOOL_NAME_PREFIX.length);
+  const sep = rest.indexOf("__");
+  // A server name is never empty and never contains `__`.
+  if (sep <= 0 || sep + 2 >= rest.length) return undefined;
+  return rest;
+}
+
+/**
+ * Does the pattern's tool half name `toolName`? An MCP tool also answers to
+ * its pre-0.7.1 spelling, so a rule written `github__*` still governs
+ * `mcp__github__create_issue`. The alias runs one way only: `mcp__x__y` never
+ * matches a tool that is not an MCP tool.
+ */
+export function matchesToolName(compiled: CompiledPattern, toolName: string): boolean {
+  if (compiled._toolRe.test(toolName)) return true;
+  const legacy = legacyMcpToolName(toolName);
+  return legacy !== undefined && compiled._toolRe.test(legacy);
+}
+
+// ---------------------------------------------------------------------------
+// Operative values
+// ---------------------------------------------------------------------------
+
+/** Which way a rule points. `allow` grants; `restrict` is a deny or an ask. */
+export type RulePolarity = "allow" | "restrict";
+
+/** Mirrors `OperativeArgKind` in `@crewhaus/tool-catalog`. */
+export type OperativeValueKind = "path" | "url" | "command" | "text" | "id";
+
+/**
+ * One value a rule's argument glob is checked against, prepared by the
+ * runtime from the tool's declared `operativeArgs` and its PARSED input.
+ *
+ * - `canonical` — the spelling(s) of what the tool will act on: for a path,
+ *   the workspace-relative location with `..` collapsed and symlinks
+ *   followed, plus the same location as an absolute path. An allow rule must
+ *   match one of these.
+ * - `spellings` — other ways of writing the same value (what the model sent,
+ *   the path before symlinks were followed). A deny or ask rule also fires on
+ *   these, so a rule written against either form is not dodged.
+ * - `outsideWorkspace` — the path lands outside the workspace, or where it
+ *   lands could not be worked out. It never satisfies an allow rule and
+ *   always satisfies a deny or ask rule.
+ *
+ * For a `path` value, a glob that starts with `/` is compared with the
+ * absolute spellings and any other glob with the relative ones, so
+ * `**` + `/src/**` cannot reach into the directories ABOVE the workspace.
+ */
+export type OperativeValue = {
+  readonly kind: OperativeValueKind;
+  readonly canonical: ReadonlyArray<string>;
+  readonly spellings?: ReadonlyArray<string>;
+  readonly outsideWorkspace?: boolean;
+};
+
+export type MatchOptions = {
+  /** Default `"allow"`, the conservative reading for a grant. */
+  readonly polarity?: RulePolarity;
+  /**
+   * The tool's declared operative values, canonicalised by the runtime.
+   * Absent ⇒ the tool declared none, and the matcher falls back to the
+   * {@link OPERATIVE_ARG_FIELDS} name table, then to every string in `input`.
+   * Present but empty ⇒ the tool declares operative fields and this call
+   * carries none of them, so no argument-scoped rule can match it.
+   */
+  readonly operativeValues?: ReadonlyArray<OperativeValue>;
+};
+
+function isAbsoluteSpelling(value: string): boolean {
+  return value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(value);
+}
+
+/** True when an argument glob is written as an absolute path. */
+function globIsAbsolute(argGlob: string): boolean {
+  return argGlob.startsWith("/") || argGlob.startsWith("\\/") || /^[A-Za-z]:[\\/]/.test(argGlob);
+}
+
+const DOT_DOT_SEGMENT = /(^|[\\/])\.\.([\\/]|$)/;
+
+/**
+ * Collapse `.` and `..` segments without touching the filesystem.
+ * `escapes` is true when a relative path climbs above its starting point.
+ */
+function lexicalNormalize(value: string): { readonly path: string; readonly escapes: boolean } {
+  const absolute = value.startsWith("/");
+  const out: string[] = [];
+  let escapes = false;
+  for (const segment of value.split(/[\\/]/)) {
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (out.length > 0) out.pop();
+      else if (!absolute) escapes = true;
+      continue;
+    }
+    out.push(segment);
+  }
+  const joined = out.join("/");
+  return { path: absolute ? `/${joined}` : joined === "" ? "." : joined, escapes };
+}
+
+/**
+ * A string from an input the tool has not described. Nothing says it is a
+ * path, but it may be one, so a `..` segment in it is read the careful way
+ * round for each polarity: an allow never matches it (what it resolves to is
+ * unknown), and a deny or ask sees it with the `..` collapsed — and fires
+ * outright when it climbs out of wherever it starts.
+ */
+function undeclaredValue(value: string): OperativeValue {
+  if (!DOT_DOT_SEGMENT.test(value)) return { kind: "text", canonical: [value] };
+  const lexical = lexicalNormalize(value);
+  return {
+    kind: "text",
+    canonical: [],
+    spellings: [value, lexical.path],
+    ...(lexical.escapes ? { outsideWorkspace: true } : {}),
+  };
+}
+
+function fallbackValues(toolName: string, input: unknown): OperativeValue[] {
+  const fields = OPERATIVE_ARG_FIELDS[toolName];
+  if (fields !== undefined && input !== null && typeof input === "object") {
+    const record = input as Record<string, unknown>;
+    const present: string[] = [];
+    for (const f of fields) {
+      const v = record[f];
+      if (typeof v === "string") present.push(v);
+    }
+    if (present.length > 0) return present.map(undeclaredValue);
+    // operative field absent → every string in the input
+  }
+  return stringValues(input).map(undeclaredValue);
+}
+
+function valueMatches(
+  value: OperativeValue,
+  argRe: GlobMatcher,
+  absoluteGlob: boolean,
+  polarity: RulePolarity,
+): boolean {
+  if (value.outsideWorkspace === true) return polarity === "restrict";
+  const candidates =
+    polarity === "allow" ? value.canonical : [...value.canonical, ...(value.spellings ?? [])];
+  for (const candidate of candidates) {
+    if (value.kind === "path" && isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
+    if (argRe.test(candidate)) return true;
+  }
+  return false;
+}
+
+/**
+ * Does a rule's pattern match this tool call?
+ *
+ * The tool half is matched against the tool's name (see
+ * {@link matchesToolName}). A bare pattern stops there. An argument glob is
+ * matched against the call's operative values, and how depends on which way
+ * the rule points:
+ *
+ * - `polarity: "allow"` (the default) — EVERY operative value must match. One
+ *   in-scope value cannot carry an out-of-scope one: `Write(src/**)` does not
+ *   authorise `{ file_path: "src/ok.ts", path: ".git/hooks/pre-commit" }`.
+ * - `polarity: "restrict"` (deny, ask) — ANY operative value matching is
+ *   enough. A deny that needed every value to match would be dodged by
+ *   adding one more argument.
+ *
+ * A call with no operative value matches no argument-scoped rule of either
+ * polarity.
+ */
 export function matchesPattern(
   compiled: CompiledPattern,
   toolName: string,
   input: unknown,
+  options: MatchOptions = {},
 ): boolean {
-  if (!compiled._toolRe.test(toolName)) return false;
+  if (!matchesToolName(compiled, toolName)) return false;
   const argRe = compiled._argRe;
   if (argRe === null) return true;
-
-  // Match the arg-glob against the tool's OPERATIVE field(s) only, so a decoy
-  // field cannot authorize a malicious operative one (#145). The previous
-  // `.some` over every string in the input was the bypass.
-  const fields = OPERATIVE_ARG_FIELDS[toolName];
-  if (fields !== undefined && input !== null && typeof input === "object") {
-    const record = input as Record<string, unknown>;
-    const vals: string[] = [];
-    for (const f of fields) {
-      const v = record[f];
-      if (typeof v === "string") vals.push(v);
-    }
-    if (vals.length > 0) return vals.some((v) => argRe.test(v));
-    // operative field absent → fall through to the conservative check
-  }
-
-  // Unknown tool (or operative field absent): require EVERY string to match, so
-  // a decoy field cannot authorize the call. No strings at all → deny.
-  const all = stringValues(input);
-  return all.length > 0 && all.every((v) => argRe.test(v));
+  const polarity = options.polarity ?? "allow";
+  const values = options.operativeValues ?? fallbackValues(toolName, input);
+  if (values.length === 0) return false;
+  const absoluteGlob = globIsAbsolute(compiled.argGlob ?? "");
+  return polarity === "allow"
+    ? values.every((v) => valueMatches(v, argRe, absoluteGlob, polarity))
+    : values.some((v) => valueMatches(v, argRe, absoluteGlob, polarity));
 }
