@@ -460,6 +460,51 @@ describe("retry arithmetic", () => {
     expect(parseRetryAfterMs("soon", 0)).toBeNull();
   });
 
+  test("a Retry-After date is the GMT instant it names, whatever the host zone", () => {
+    const now = Date.parse("2026-09-23T09:00:00Z");
+    /**
+     * Run `body` with the process's zone set to `tz`, then put it back. Never
+     * by deleting TZ: in Bun that freezes the zone for the rest of the
+     * process. `bun test` runs in UTC when TZ is unset.
+     */
+    const inZone = <T>(tz: string, body: () => T): T => {
+      const previous = process.env["TZ"];
+      process.env["TZ"] = tz;
+      try {
+        return body();
+      } finally {
+        process.env["TZ"] = previous === undefined || previous === "" ? "Etc/UTC" : previous;
+      }
+    };
+    const read = [
+      "Wed, 23 Sep 2026 10:00:00 GMT", // IMF-fixdate
+      "Wednesday, 23-Sep-26 10:00:00 GMT", // rfc850-date
+      "Wed Sep 23 10:00:00 2026", // asctime-date: GMT, with no zone written
+      "2026-09-23T10:00:00Z", // not an HTTP-date, but it carries its offset
+      "2026-09-23T19:00:00+09:00",
+    ];
+    const unread = [
+      "2026-09-23T10:00:00", // offset-less ISO: host-local per ECMAScript
+      "Wed, 23 Sep 2026 10:00:00", // RFC 1123 with the zone left off
+      "Wed, 23 Sep 2026 10:00:00 PST", // an HTTP-date is GMT only
+      "Wed, 31 Sep 2026 10:00:00 GMT", // a day September does not have
+    ];
+    const seen: Array<{ tz: string; text: string; ms: number | null }> = [];
+    for (const tz of ["UTC", "Asia/Tokyo", "America/Los_Angeles"]) {
+      // Proves the zone really changed, so the assertions are not vacuous.
+      const hour = inZone(tz, () => new Date(now).getHours());
+      expect({ tz, moved: tz === "UTC" || hour !== 9 }).toEqual({ tz, moved: true });
+      for (const text of [...read, ...unread]) {
+        seen.push({ tz, text, ms: inZone(tz, () => parseRetryAfterMs(text, now)) });
+      }
+    }
+    // 0.7.0 handed these to Date.parse: the asctime form waited 0 under
+    // Asia/Tokyo and eight hours under America/Los_Angeles.
+    expect(seen.filter((s) => read.includes(s.text) && s.ms !== 3_600_000)).toEqual([]);
+    expect(seen.filter((s) => unread.includes(s.text) && s.ms !== null)).toEqual([]);
+    expect(seen).toHaveLength(27);
+  });
+
   test("the server's Retry-After wins over the curve", () => {
     const delay = nextDelayMs({
       attempt: 5,
