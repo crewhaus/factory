@@ -250,7 +250,7 @@ import {
   parseEvalRoutingMode,
   resolveJudgeModelRef,
   resolveRegistryGrader,
-  runEval as runEvalLib,
+  runEval as runEvalCore,
   warnUnconsumedCombinePolicy,
 } from "@crewhaus/eval-runner";
 import { openEventLog } from "@crewhaus/event-log";
@@ -1505,7 +1505,7 @@ import {
 // v0.3.0 Goal 3 — `doctor --probe`'s thredz check (wiki_stats round-trip
 // through the spec's synthesized/user-declared thredz MCP server).
 import { probeThredz, thredzProbeTarget, thredzProbeToCheck } from "./thredz-probe";
-import { loadBuiltinTools } from "./tool-packages";
+import { importToolPackage, loadBuiltinTools } from "./tool-packages";
 // Item 18 — `crewhaus tools` namespace (list/suggest/audit + the loadToolMap
 // ↔ BUILTIN_TOOL_MAP sync floor), in a side-effect-free module so it is
 // unit-testable (this entry file runs an argv switch on import).
@@ -3624,6 +3624,15 @@ async function detectDefaultModel(): Promise<string | undefined> {
 async function loadToolMap(): Promise<Record<string, RegisteredTool>> {
   return loadBuiltinTools(CLI_RUNTIME_TOOL_KEYS);
 }
+
+/**
+ * Every eval this CLI runs — `crewhaus eval`, `optimize`, the advice and
+ * matrix arms — imports tool packages through the CLI's literal loader
+ * table, so a spec's tools wire the same way `crewhaus run` wires them, in a
+ * checkout and in the single-binary build alike.
+ */
+const runEvalLib: typeof runEvalCore = (args) =>
+  runEvalCore({ ...args, opts: { importToolPackage, ...args.opts } });
 
 /**
  * Section 14 — apply per-tool config from the IR's `toolConfigs` map by
@@ -22973,7 +22982,14 @@ switch (subcommand) {
       );
       await runEvalReport(parseFor([aliasVerb, ...rest.slice(1)], EVAL_REPORT_SCHEMA));
     } else {
-      await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+      // A structured failure (an unknown tool, a package that will not load,
+      // a bad grader config) is a one-line error, not a stack trace.
+      try {
+        await runEvalSubcommand(parseFor(rest, EVAL_SCHEMA));
+      } catch (err) {
+        if (err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
     }
     break;
   }
@@ -22998,7 +23014,12 @@ switch (subcommand) {
     break;
   }
   case "optimize":
-    await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
+    try {
+      await runOptimize(parseFor(rest, OPTIMIZE_SCHEMA));
+    } catch (err) {
+      if (err instanceof CrewhausError) die(err.message);
+      throw err;
+    }
     break;
   case "flywheel": {
     const action = rest[0] ?? "";

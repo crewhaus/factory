@@ -34,6 +34,7 @@ export {
   SHAPE_TOOL_PROFILES,
   type ShapeToolProfile,
   type ToolConfigInit,
+  type ToolPackageImporter,
   type ToolShape,
   type ToolSite,
   type ToolVerdict,
@@ -41,8 +42,10 @@ export {
   builtinToolsFor,
   checkBuiltinTool,
   planToolConfigInits,
+  registerToolConfigs,
   registeredToolName,
   resolveBuiltinTools,
+  sandboxAvailableFromEnv,
   unknownToolMessage,
 } from "./shapes";
 

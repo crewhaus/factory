@@ -20,7 +20,8 @@
     "@crewhaus/target-graph": "workspace:*",
     "@crewhaus/target-pipeline": "workspace:*",
     "@crewhaus/target-workflow": "workspace:*",
-    "@crewhaus/tenancy": "workspace:*"
+    "@crewhaus/tenancy": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

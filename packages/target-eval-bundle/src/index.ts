@@ -22,6 +22,7 @@ import {
   type IrEvalV0,
   renderBundleReadme,
 } from "@crewhaus/ir";
+import { resolveBuiltinTools } from "@crewhaus/tool-categories";
 import type { EvalBridge } from "./runtime";
 
 /**
@@ -53,6 +54,31 @@ export function emitEval(ir: IrEvalV0, opts: EmitEvalOptions = {}): Bundle {
   const bridge = opts.bridge;
   const seedLine = ir.seed !== undefined ? `  seed: ${ir.seed},\n` : "";
   const toolsLine = ir.agent.tools.length > 0 ? `  // Tools: ${ir.agent.tools.join(", ")}\n` : "";
+  // shape-reach#1 — the default invoker wires AGENT_TOOLS through the shared
+  // builtin table. The bundle imports each tool's package statically (so its
+  // manifest pins it and `bun install` fetches it) and hands the modules to
+  // the runner, instead of the runner guessing at a dynamic import. A bridge
+  // with a compiled entry runs its own tools, so it needs none of this.
+  const drivesOwnTools = bridge?.entryImport !== undefined;
+  let toolPackages: ReadonlyArray<string> = [];
+  if (!drivesOwnTools && ir.agent.tools.length > 0) {
+    // A name the eval shape cannot run throws BuiltinToolError (a
+    // CrewhausError, so the CLI prints it as a one-line error).
+    toolPackages = resolveBuiltinTools("eval", [{ tools: ir.agent.tools }]).packages;
+  }
+  const toolPackageImports = toolPackages
+    .map((pkg, i) => `import * as __toolPackage${i} from ${escapeJsonString(pkg)};\n`)
+    .join("");
+  const toolPackagesConst =
+    toolPackages.length > 0
+      ? `const TOOL_PACKAGES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {\n${toolPackages
+          .map((pkg, i) => `  ${escapeJsonString(pkg)}: __toolPackage${i},\n`)
+          .join("")}};\n`
+      : "";
+  const importToolPackageLine =
+    toolPackages.length > 0
+      ? "      importToolPackage: async (pkg: string) => TOOL_PACKAGES[pkg] ?? import(pkg),\n"
+      : "";
   // A spec that DECLARES `split: test` is the explicit release-gate opt-in,
   // so the emitted bundle passes the registry's allowTestSplit escape hatch
   // (without it the guarded get() throws at runtime with no way out). Other
@@ -123,13 +149,14 @@ import { createFileBackedRegistry, overallDatasetHash } from "@crewhaus/dataset-
 import { parseGradersConfig } from "@crewhaus/eval-grader";
 import { recordEvalRun } from "@crewhaus/eval-report";
 import { runEval } from "@crewhaus/eval-runner";
-${bridgeImports}
+${bridgeImports}${toolPackageImports}
 const SPEC_NAME = ${escapeJsonString(ir.name)};
 const MODEL = ${escapeJsonString(ir.agent.model)};
 const INSTRUCTIONS = ${escapeJsonString(ir.agent.instructions)};
 const DATASET = ${JSON.stringify(ir.dataset)} as const;
 const GRADER_CONFIGS = ${JSON.stringify(ir.graders)};
 const AGENT_TOOLS = ${JSON.stringify(ir.agent.tools)};
+${toolPackagesConst}
 const CONCURRENCY = ${ir.concurrency};
 ${taxonomyConst}${bridgeConsts}${toolsLine}
 async function main(): Promise<void> {
@@ -178,7 +205,7 @@ async function main(): Promise<void> {
       // so a bundle run pinned as a baseline still has the dataset identity
       // \`eval --sentinel\` compares against.
       datasetHash,
-${cliVersionLine}${invokerLine}${seedLine}    },
+${cliVersionLine}${invokerLine}${importToolPackageLine}${seedLine}    },
   });
   // Run history — the same \`.crewhaus/evals/index.jsonl\` \`crewhaus eval\`
   // appends to, so \`crewhaus eval-report history\`, \`baseline set\` and the

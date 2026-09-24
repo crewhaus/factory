@@ -786,6 +786,13 @@ export type RunEvalOptions = {
   readonly invoker?: AgentInvoker;
   readonly cwd?: string;
   /**
+   * How the default invoker imports a tool package when it wires the spec's
+   * `tools:`. The CLI passes its literal loader table (a single-binary build
+   * embeds only literal import specifiers); a compiled eval bundle passes the
+   * packages it imported. Default: `import(pkg)`.
+   */
+  readonly importToolPackage?: (pkg: string) => Promise<Readonly<Record<string, unknown>>>;
+  /**
    * v0.3.0 §7.3 (PR 19) — resolves `type: registry` grader entries by name.
    * An eval config opts into registered grader packs (`continuity.*` after
    * `registerContinuityGraders`, `twelve.*` after `register12MetricRubric`)

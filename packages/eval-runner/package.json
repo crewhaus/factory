@@ -48,6 +48,7 @@
     "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*",
     "@crewhaus/tool-fetch": "workspace:*",
     "@crewhaus/tool-fs": "workspace:*",
     "@crewhaus/tool-image": "workspace:*",

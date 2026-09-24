@@ -288,11 +288,61 @@ describe("wireRunOnce — tools", () => {
     expect(deps.spawnSubAgent).toBeUndefined();
   });
 
-  test("throws RunnerError listing known tools for an unknown tool name", async () => {
+  test("throws RunnerError naming an unknown tool, with the compiler's wording", async () => {
     const ir = baseIr({ tools: ["read", "nope"] });
     await expect(wireRunOnce(ir, { cwd: newCwd() })).rejects.toThrow(
-      /unknown tool "nope" — known tools: /,
+      /tools: unknown tool "nope" — /,
     );
+  });
+
+  test("a 0.7.0 builtin wires through the shared table (shape-reach#1)", async () => {
+    const imported: string[] = [];
+    // Two tools from one package this file does not mock: one import.
+    const ir = baseIr({ tools: ["jsonQuery", "csvParse"] });
+    const deps = await wireRunOnce(ir, {
+      cwd: newCwd(),
+      // By file: eval-runner does not depend on tool-data, and workspace
+      // packages are linked per package. The importer seam is the point.
+      importToolPackage: async (pkg) => {
+        imported.push(pkg);
+        const dir = pkg.replace("@crewhaus/", "");
+        return (await import(`../../${dir}/src/index.ts`)) as Record<string, unknown>;
+      },
+    });
+    expect(deps.tools.map((t) => t.name)).toEqual(["JsonQuery", "CsvParse"]);
+    expect(imported).toEqual(["@crewhaus/tool-data"]);
+    expect(deps.sandboxAvailable).toBeUndefined();
+  });
+
+  test("a code-execution tool reports the sandbox from CREWHAUS_SANDBOX", async () => {
+    const before = process.env["CREWHAUS_SANDBOX"];
+    process.env["CREWHAUS_SANDBOX"] = "noop";
+    try {
+      const deps = await wireRunOnce(baseIr({ tools: ["python"] }), {
+        cwd: newCwd(),
+        importToolPackage: async (pkg) =>
+          (await import(`../../${pkg.replace("@crewhaus/", "")}/src/index.ts`)) as Record<
+            string,
+            unknown
+          >,
+      });
+      expect(deps.sandboxAvailable).toBe(false);
+    } finally {
+      if (before === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_SANDBOX");
+      else process.env["CREWHAUS_SANDBOX"] = before;
+    }
+  });
+
+  test("a package that fails to load is a RunnerError naming the package", async () => {
+    const ir = baseIr({ tools: ["gitStatus"] });
+    await expect(
+      wireRunOnce(ir, {
+        cwd: newCwd(),
+        importToolPackage: async () => {
+          throw new Error("not installed");
+        },
+      }),
+    ).rejects.toThrow("could not load @crewhaus/tool-git: not installed");
   });
 
   test("applies fetch + webFetch tool configs when present (registerXConfig)", async () => {

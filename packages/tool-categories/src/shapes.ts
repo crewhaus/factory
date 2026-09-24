@@ -291,6 +291,43 @@ export function planToolConfigInits(sites: ReadonlyArray<ToolSite>): ReadonlyArr
   return plan;
 }
 
+/** Imports a tool package; the caller decides how (a literal loader table in the CLI binary). */
+export type ToolPackageImporter = (pkg: string) => Promise<Readonly<Record<string, unknown>>>;
+
+/**
+ * The runtime half of {@link planToolConfigInits}: call each registrar with
+ * its blob, importing its package through `importPackage`. `crewhaus eval`
+ * calls this before wiring tools, so an eval measures the tool_config the
+ * compiled bundle applies. Throws when a package does not export the
+ * registrar the table names.
+ */
+export async function registerToolConfigs(
+  sites: ReadonlyArray<ToolSite>,
+  importPackage: ToolPackageImporter,
+): Promise<ReadonlyArray<ToolConfigInit>> {
+  const plan = planToolConfigInits(sites);
+  for (const init of plan) {
+    const registrar = (await importPackage(init.package))[init.initSymbol];
+    if (typeof registrar !== "function") {
+      throw new BuiltinToolError(
+        `${init.package} does not export ${init.initSymbol}, the tool_config registrar the builtin table names for "${init.key}"`,
+      );
+    }
+    (registrar as (config: unknown) => void)(init.config);
+  }
+  return plan;
+}
+
+/**
+ * `sandboxAvailable` from the environment — the runtime twin of
+ * {@link SANDBOX_AVAILABLE_EXPR}: unset means docker, `noop` means none.
+ */
+export function sandboxAvailableFromEnv(
+  env: Readonly<Record<string, string | undefined>>,
+): boolean {
+  return (env["CREWHAUS_SANDBOX"] ?? "docker").toLowerCase() !== "noop";
+}
+
 export type ResolvedTools = {
   /** `import { a, b } from "@crewhaus/tool-x";`, one line per package, sorted. */
   readonly imports: ReadonlyArray<string>;
