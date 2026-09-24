@@ -1189,7 +1189,12 @@ export const cliVersionPin: RegisteredTool = buildTool({
       .optional()
       .describe("include registry entries whose directory has vanished (default false)"),
   }),
-  readOnly: true,
+  // NOT read-only (0.7.1, permission-integration#7): with `probe` it runs
+  // `<bin> --version` for a binary found in a harness's node_modules/.bin —
+  // a program the workspace supplies — and plan mode runs every read-only
+  // tool without asking. Nothing it runs is expected to change anything, so
+  // it is not destructive, and auto mode still allows it.
+  readOnly: false,
   scope: "external",
   ioCapability: "process",
   execute: async (input) => {

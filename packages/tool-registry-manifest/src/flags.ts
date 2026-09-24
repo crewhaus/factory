@@ -440,7 +440,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
   cliVersionPin: {
     key: "cliVersionPin",
     name: "CliVersionPin",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -1153,7 +1153,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
   diagnostics: {
     key: "diagnostics",
     name: "Diagnostics",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -1279,7 +1279,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "external",
     ioCapability: "network",
     requiresSandbox: false,
-    requireJustification: false,
+    requireJustification: true,
     operativeArgs: [
       { field: "url", kind: "url" },
       { field: "path", kind: "path" },
@@ -1859,7 +1859,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
   formatCheck: {
     key: "formatCheck",
     name: "FormatCheck",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -3111,7 +3111,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
   lint: {
     key: "lint",
     name: "Lint",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -5097,7 +5097,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
   typecheck: {
     key: "typecheck",
     name: "Typecheck",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",

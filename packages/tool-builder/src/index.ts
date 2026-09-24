@@ -334,13 +334,21 @@ function checkOperativeArgs(
  * The defaults are NOT all fail-closed, and auto mode is where that shows:
  *
  * - `readOnly: false` is the cautious value — plan mode denies the tool.
+ *   `readOnly: true` is a grant (plan and auto mode run the tool without
+ *   asking), so a tool that spawns a program the WORKSPACE supplies — a
+ *   project's linter, a binary in node_modules/.bin — is never read-only,
+ *   however read-only the program's job is.
  * - `destructive: false` is the PERMISSIVE value. In auto mode a tool that is
  *   neither read-only nor destructive is allowed with no prompt, so a tool
  *   that deletes, overwrites or spends must say `destructive: true` to be
  *   asked about.
  * - `requiresSandbox: false` and `requireJustification: false` are
  *   permissive too: the sandbox floor and the intent gate apply only to a
- *   tool that opts in.
+ *   tool that opts in. A destructive tool that goes to a place the model
+ *   chose (`scope: "external"` with a `url` or `recipient` operative
+ *   argument) MUST opt in to `requireJustification`.
+ *
+ * apps/cli/src/flag-rules.test.ts holds these rules over every builtin.
  * - `scope` defaults to `"internal"`, except for a definitionally outward name
  *   (see {@link isOutwardName}), which defaults to `"external"`.
  * - `classifyOutput: true` — the post-tool injection classifier runs unless

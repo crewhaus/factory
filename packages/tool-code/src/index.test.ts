@@ -449,22 +449,23 @@ describe("diagnostic tools against the project's own toolchain", () => {
   }, 60_000);
 });
 
-describe("the read-only checkers cannot be pointed at another program", () => {
-  // A readOnly tool is allowed without asking in auto mode and is the ONLY
-  // thing allowed in plan mode (permission-engine `evaluateWithReason`). A
-  // read-only tool that accepted a caller's argv would therefore be an
-  // unreviewed `sh -c`, which is why these three take no `command`.
+describe("the checkers cannot be pointed at another program", () => {
+  // They are allowed without asking in auto mode (not destructive), which is
+  // why they take no `command`: a checker that accepted a caller's argv would
+  // be an unreviewed `sh -c`. They are NOT read-only (0.7.1): the program they
+  // run comes from the workspace (node_modules/.bin, a JS config), and plan
+  // mode runs every read-only tool without asking.
   const checkers: ReadonlyArray<[string, RegisteredTool]> = [
     ["Typecheck", typecheck],
     ["Lint", lint],
     ["FormatCheck", formatCheck],
   ];
 
-  test("each one declares readOnly and is therefore auto-allowed", () => {
+  test("each one is auto-allowed, and denied in plan mode", () => {
     for (const [name, tool] of checkers) {
       expect({ name, readOnly: tool.readOnly, destructive: tool.destructive }).toEqual({
         name,
-        readOnly: true,
+        readOnly: false,
         destructive: false,
       });
     }

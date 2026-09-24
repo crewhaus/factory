@@ -85,6 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where the tool acts, such as a message body, no longer matches: deny the
   tool, or deny its destination, instead. `crewhaus lint` points out such
   rules.
+- **`DownloadFile` now asks for a justification**, like `HttpRequest`: it
+  fetches from a URL the model chose and writes the result into the
+  workspace. The rule every builtin now follows is written down in
+  AGENTS.md: a destructive tool that goes to a place the model chose is
+  justification-gated. In production that needs a judge
+  (`security.justification.judge: claude`), or the call is denied; set
+  `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` to accept the built-in rule
+  check instead. No other tool's justification flag changed.
 - **MCP tools are named `mcp__<server>__<tool>`**, the name the docs have
   always used; they were registered as `<server>__<tool>`. This is the name
   the model now sees. Permission rules, model-profile `deny`/`ask`, skill and
@@ -137,8 +145,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported, and the "not checked" note is gone. An explicit `knownTools` still
   wins, for a spec being checked against a different release's runtime, and the
   answer says which list it used. The set comes from `BUILTIN_TOOL_MAP`, which
-  this package already reaches and which is keys without prose, so no bundle
-  granting a `tool-crewhaus` tool pays for the manifest's 455 KB.
+  this package already reaches and which is keys without prose, so a bundle
+  granting a `tool-crewhaus` tool never loads the manifest's 455 KB of
+  descriptions.
 
 ### Fixed
 
@@ -202,6 +211,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   send to a place you configured (`SendMessage`, `WebSearch`,
   `ImageGenerate`, a code host's reads) still only log. To relax one sink for
   a deployment, pass `resolveSinkScope` to the runtime.
+- **Plan mode no longer runs the project's own tools.** `Typecheck`, `Lint`,
+  `FormatCheck`, `Diagnostics` and `CliVersionPin` were marked read-only, so
+  plan mode ran them without asking — and the program they run is the
+  project's (`node_modules/.bin/eslint`, an `eslint.config.js`, a harness's
+  own CLI), so planning in a cloned repository ran its code. They are no
+  longer read-only: plan mode denies them. Auto mode still runs them without
+  asking, and default mode still asks, as before.
 - **`PermissionsSuggest` no longer reads session logs linked in from outside
   the workspace.** It checked the sessions folder but not the files in it, so
   a symbolic link planted there made it read another project's transcript and

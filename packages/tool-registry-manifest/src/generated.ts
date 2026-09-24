@@ -694,7 +694,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     name: "CliVersionPin",
     description:
       "Show which crewhaus CLI each harness would run and which version its bundle was COMPILED WITH, and roll the fleet up by version so a harness left behind on an old CLI is visible. The harnesses come from this machine's registry unless directories are given; the compiledWith stamp is @crewhaus/harness-supervisor's, the binary is its resolver's (harness node_modules/.bin first, then PATH). This tool does NOT install, switch or pin a version — that is @crewhaus/chvm talking to the npm registry, and this package has neither the dependency nor a network call — so the result names the command instead of pretending. With probe:true it runs `<bin> --version` once per DISTINCT binary, with a timeout, and only for a binary inside the workspace unless allowExternalCli is set. A version it could not read is reported as unknown WITH the reason, never as agreeing with the others. It writes NOTHING: the registry is enumerated through @crewhaus/harness-registry's own CREWHAUS_NO_REGISTRY switch, so the missing-directory stamps a plain list() would persist are computed and reported but not written. At most 500 harnesses are inspected; past that the result carries truncated:true and every count describes that subset rather than the fleet. A spec or bundle that a symlink puts outside the workspace is reported as undetermined with the reason, never opened.",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -1788,7 +1788,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     name: "Diagnostics",
     description:
       "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and nothing is written.",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -1989,7 +1989,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "external",
     ioCapability: "network",
     requiresSandbox: false,
-    requireJustification: false,
+    requireJustification: true,
     operativeArgs: [
       { field: "url", kind: "url" },
       { field: "path", kind: "path" },
@@ -2855,7 +2855,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     name: "FormatCheck",
     description:
       "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program.",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -4736,7 +4736,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     name: "Lint",
     description:
       "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, so nothing is rewritten and no caller can substitute another program — Format is the tool that writes.",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",
@@ -7817,7 +7817,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     name: "Typecheck",
     description:
       "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode so nothing is written, and there is no way to point this tool at a different program — that is what keeps it a read; RunBuild is where an arbitrary command belongs.",
-    readOnly: true,
+    readOnly: false,
     destructive: false,
     scope: "external",
     ioCapability: "process",

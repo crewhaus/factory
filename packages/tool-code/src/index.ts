@@ -163,16 +163,19 @@ const extensionsField = z
  * concurrency-safe: two type checks racing on one `.tsbuildinfo` is exactly
  * the contention the flag exists to prevent.
  *
- * `readOnly` here is a promise about WHICH program runs, not only about the
- * flags it is given: every tool carrying these flags spawns a command worked
- * out from the project's own files by `./detect`, and none of them accepts a
- * caller-supplied `command`. The flag is what the permission engine decides
- * on — auto mode allows a read without asking, plan mode allows only reads —
- * so a read-only tool that let a caller name the program would be an
- * unreviewed `sh -c` wearing a checker's badge.
+ * NOT `readOnly` (0.7.1, permission-integration#7). None of these accepts a
+ * caller-supplied `command` — the program is worked out from the project's
+ * own files by `./detect` — but that program IS the project's:
+ * `node_modules/.bin/eslint`, an `eslint.config.js`, a TypeScript plugin. All
+ * of it is code the workspace supplies, and plan mode runs every read-only
+ * tool without asking, so a read-only checker was a way to run a cloned
+ * repository's code during a plan. The rule for the whole registry is in
+ * apps/cli/src/flag-rules.test.ts: a read-only tool may spawn only a program
+ * the tool itself fixes. Not `destructive` either: a checker is not expected
+ * to change anything, so auto mode still runs it without asking, as before.
  */
 const READ_SPAWN = {
-  readOnly: true,
+  readOnly: false,
   concurrencySafe: false,
   scope: "external",
   ioCapability: "process",

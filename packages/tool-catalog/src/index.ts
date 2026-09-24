@@ -320,12 +320,20 @@ export interface ToolDefinition<TInput = unknown> {
    * never see a field their own schema doesn't allow. A tool that declares
    * the field itself keeps receiving it verbatim.
    *
-   * Default at normalization is `false`. Recommended `true` for any tool
-   * with destructive or external side effects (evm-tx, message-channel,
-   * federation outbound). Independent of `scope` — a tool can be
-   * `internal` and still require justification (e.g. a destructive fs
-   * delete), and a tool can be `external` without requiring justification
-   * (e.g. a read-only public-data fetch).
+   * Default at normalization is `false`.
+   *
+   * THE RULE (0.7.1): a `destructive` tool that goes to a place the model
+   * chose — `scope: "external"` with a `url` or `recipient` operative
+   * argument ({@link hasModelChosenDestination}) — MUST set this: it changes
+   * or delivers something where the model pointed it (a message, a post, an
+   * HTTP call, a download). Other tools MAY set it when their effect deserves
+   * an intent check (a fleet mutation, a secret rotation). A destructive tool
+   * that acts only inside the workspace (Write, RemovePath, Bash) is not
+   * required to: the permission gate already asks, and without an LLM judge
+   * a justification fails closed in production, so gating every write would
+   * stop every write. apps/cli/src/flag-rules.test.ts holds the rule over
+   * every builtin and lists the gated set, so a change either way is
+   * deliberate.
    */
   requireJustification?: boolean;
   /**

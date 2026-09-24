@@ -878,6 +878,13 @@ export const downloadFile: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   destructive: true,
+  // 0.7.1 (permission-integration#11) — the rule every builtin now follows:
+  // a destructive tool that goes to a place the model chose (a url or
+  // recipient operative argument) is justification-gated. The request goes to
+  // a URL the model picked, carrying whatever it put in it, and what comes
+  // back is written into the workspace — as for HttpRequest, which has
+  // always been gated.
+  requireJustification: true,
   execute: async (input, ctx) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;

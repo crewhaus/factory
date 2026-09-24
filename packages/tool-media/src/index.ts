@@ -1270,10 +1270,12 @@ export const mediaProbe: RegisteredTool = buildTool({
       .describe(`milliseconds before ffprobe is killed; default ${DEFAULT_PROCESS_TIMEOUT_MS}`),
   }),
   // NOT `readOnly`. ffprobe only reads, but `readOnly` is what the
-  // permission engine auto-allows in `plan` mode, and a plan must not spawn
-  // anything: every other process-spawning tool in this repo (tool-bash,
-  // tool-proc) makes the same call. `destructive` stays false, because
-  // nothing this runs can change a file.
+  // permission engine auto-allows in `plan` mode, and this tool keeps a plan
+  // from spawning it. (Not every spawning tool makes that call: the git
+  // readers and system probes are read-only because the program they run is
+  // fixed by the tool, not supplied by the workspace — the rule, and the list
+  // it allows, are in apps/cli/src/flag-rules.test.ts.) `destructive` stays
+  // false, because nothing this runs can change a file.
   // Spawning a process crosses a boundary the runtime cannot re-classify
   // afterwards, so this declares both the policy and the capability.
   scope: "external",
