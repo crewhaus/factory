@@ -397,7 +397,9 @@ describe("crewhaus compile", () => {
     const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
     expect(result.exitCode).toBe(1);
     // Clean die() output: prefixed "crewhaus: " and names the offending tool.
-    expect(result.stderr).toContain('crewhaus: unknown tool "mcp__evil__exfiltrate"');
+    // The compiler names the site (`tools:`) and where MCP tools come from.
+    expect(result.stderr).toContain('crewhaus: tools: unknown tool "mcp__evil__exfiltrate"');
+    expect(result.stderr).toContain("mcp_servers");
     // The gate was bypassed — it is NOT the source of this failure…
     expect(result.stderr).not.toContain("[strict]");
     // …and the emitter error did NOT escape as an uncaught crash: neither the
@@ -420,7 +422,7 @@ describe("crewhaus compile", () => {
     const outDir = join(tmp, "out");
     const result = await runCli(["compile", specPath, "--allow-unmarked-sinks", "-o", outDir]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain('crewhaus: unknown tool "not-a-real-tool"');
+    expect(result.stderr).toContain('crewhaus: tools: unknown tool "not-a-real-tool"');
     expect(result.stderr).not.toContain("TargetEmitError");
     expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);

@@ -1280,7 +1280,7 @@ describe("graph nodes and sub-agents gain routing (§7.7)", () => {
     // The emitted literal carries it right after the provenance key.
     const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
     expect(agentTs).toContain(
-      'instructions: "help", tools: ["read"], model: "claude-haiku-4-5", permissions: "inherit", inherit_bypass: false, modelProfile: "fast", overlay: "You are the fast lane.", thinking: {"effort":"low"}, maxTokens: 4096,',
+      'instructions: "help", tools: ["Read"], model: "claude-haiku-4-5", permissions: "inherit", inherit_bypass: false, modelProfile: "fast", overlay: "You are the fast lane.", thinking: {"effort":"low"}, maxTokens: 4096,',
     );
   });
 
@@ -1297,8 +1297,10 @@ describe("graph nodes and sub-agents gain routing (§7.7)", () => {
       "tools: [read]",
     );
     const agentTs = compile(yaml, opts).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    // 0.7.1 — the spec key `read` lowers to the registered name `Read`, the
+    // name the child catalog is filtered by (before, the child got no tools).
     expect(agentTs).toContain(
-      '["helper", { name: "helper", description: "helps", instructions: "help", tools: ["read"], permissions: "inherit", inherit_bypass: false }],',
+      '["helper", { name: "helper", description: "helps", instructions: "help", tools: ["Read"], permissions: "inherit", inherit_bypass: false }],',
     );
   });
 });

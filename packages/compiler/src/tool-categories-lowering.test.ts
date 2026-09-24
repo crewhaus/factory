@@ -121,7 +121,9 @@ edges: []
 tools: [read]
 `) as unknown as { subAgents?: Array<{ tools: string[] }> };
     const sub = ir.subAgents?.[0];
-    expect(sub?.tools).toEqual(["glob", "grep", "read"]);
+    // shape-reach#3 — expanded, then mapped to the registered names the
+    // child catalog is filtered by; spec keys here gave the child no tools.
+    expect(sub?.tools).toEqual(["Glob", "Grep", "Read"]);
   });
 });
 

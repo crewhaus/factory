@@ -62,6 +62,16 @@ export type BundleReadmeOptions = {
   readonly includeWorkspaceNote?: boolean;
   /** Extra sections appended at the end (e.g. claude-plugin's Origin). */
   readonly extraSections?: readonly BundleReadmeSection[];
+  /**
+   * Tools the spec names but this bundle does not carry — every one of them
+   * (`"all"`: a shape with no tool catalog, or an export such as a Claude
+   * Code plugin) or a named few (a cf-worker leaves out what the edge cannot
+   * run). Their row says so instead of calling them built-in.
+   */
+  readonly unwiredTools?: {
+    readonly names: ReadonlySet<string> | "all";
+    readonly note: string;
+  };
 };
 
 /**
@@ -461,12 +471,20 @@ function toolNotes(name: string, configured: ReadonlySet<string>): string {
   return notes.length > 0 ? notes.join("; ") : "—";
 }
 
-function renderToolsSection(ir: IrNode): string | undefined {
+function renderToolsSection(
+  ir: IrNode,
+  unwired?: BundleReadmeOptions["unwiredTools"],
+): string | undefined {
   const usage = collectToolUsage(ir);
   if (usage.size === 0) return undefined;
   const configured = collectConfiguredToolNames(ir);
+  const isUnwired = (name: string): boolean =>
+    unwired !== undefined && (unwired.names === "all" || unwired.names.has(name));
   const rows = [...usage.keys()].sort().map((name) => {
     const contexts = [...(usage.get(name) ?? new Set<string>())].sort().join(", ");
+    if (isUnwired(name) && unwired !== undefined) {
+      return `| \`${escapeCell(name)}\` | ${contexts} | not wired | ${escapeCell(unwired.note)} |`;
+    }
     return `| \`${escapeCell(name)}\` | ${contexts} | ${toolScopeHint(name)} | ${toolNotes(name, configured)} |`;
   });
   return ["| Tool | Used by | Scope | Notes |", "| --- | --- | --- | --- |", ...rows].join("\n");
@@ -560,7 +578,7 @@ export function renderBundleReadme(ir: IrNode, opts: BundleReadmeOptions = {}): 
   // 0.6.0 §4.3 — the `models:` registry, when the spec declared one.
   const profiles = renderModelProfilesSection(ir);
   if (profiles !== undefined) sections.push({ heading: "Model profiles", body: profiles });
-  const tools = renderToolsSection(ir);
+  const tools = renderToolsSection(ir, opts.unwiredTools);
   if (tools !== undefined) sections.push({ heading: "Tools", body: tools });
   const mcp = renderMcpSection(ir);
   if (mcp !== undefined) sections.push({ heading: "MCP servers", body: mcp });

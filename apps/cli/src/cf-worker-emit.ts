@@ -19,7 +19,12 @@
  * typed IR variant, narrowed on the `target` discriminant — never the raw
  * spec.
  */
-import { type Bundle, assertToolScopesStrict } from "@crewhaus/compiler";
+import {
+  type Bundle,
+  type CompileResult,
+  assertCfWorkerToolsEdgeSafe,
+  assertToolScopesStrict,
+} from "@crewhaus/compiler";
 import { CompilerError } from "@crewhaus/errors";
 import type { IrNode } from "@crewhaus/ir";
 import { emitCfWorkerCli } from "@crewhaus/target-cf-worker-cli";
@@ -49,13 +54,23 @@ export type CfWorkerEmitOptions = {
  * (a `CrewhausError`, so the CLI routes it through `die()` for a clean
  * one-liner) on an unsupported target.
  */
-export function emitCfWorkerBundle(ir: IrNode, opts: CfWorkerEmitOptions = {}): Bundle {
+export function emitCfWorkerBundle(ir: IrNode, opts: CfWorkerEmitOptions = {}): CompileResult {
   // FR-002 — Pillar 3 sink-side gate. This path drives lower()+emit directly
   // (bypassing compile()), so apply the SAME offline scope audit
   // compile({ strict: true }) runs over the lowered IR: an outward-reaching
   // sink whose scope:"external" cannot be verified offline is rejected here
   // too, exactly as the compiler-worker's cf-worker branch does.
   assertToolScopesStrict(ir);
+  // The edge tool gate: host tools the edge has always refused, and builtins
+  // no shape can run, throw; any other builtin the worker does not wire is an
+  // `edge-unsafe-tool` warning (the CLI prints it, and --strict escalates it)
+  // rather than a silent omission.
+  const warnings = assertCfWorkerToolsEdgeSafe(ir);
+  const bundle = emitFor(ir, opts);
+  return { files: bundle.files, warnings };
+}
+
+function emitFor(ir: IrNode, opts: CfWorkerEmitOptions): Bundle {
   const emitOpts = {
     ...(opts.allowedOrigins !== undefined ? { allowedOrigins: opts.allowedOrigins } : {}),
     ...(opts.readme !== undefined ? { readme: opts.readme } : {}),

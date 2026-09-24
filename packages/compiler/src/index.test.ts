@@ -2526,7 +2526,8 @@ agent:
     // Sorted by name: alpha < zeta.
     expect(ir.subAgents.map((s) => s.name)).toEqual(["alpha", "zeta"]);
     const alpha = ir.subAgents[0];
-    expect(alpha?.tools).toEqual(["bash"]);
+    // A spec key lowers to the registered name the child catalog filters by.
+    expect(alpha?.tools).toEqual(["Bash"]);
     expect(alpha?.model).toBe("alpha-model");
     expect(alpha?.permissions).toBe("scoped");
     expect(alpha?.inheritBypass).toBe(true);

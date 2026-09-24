@@ -1868,8 +1868,11 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "    crewhaus: warning[<code>] <path>: <message>\n" +
         "  Codes today: accepted-but-unwired (a spec key a shape ACCEPTS but\n" +
         "  whose emitter does not wire yet — legal-but-inert config),\n" +
-        "  edge-unsafe-tool (a custom tool whose edge-safety the cf-worker\n" +
-        "  flavour cannot verify offline), channel-reactions-join\n" +
+        "  edge-unsafe-tool (a tool the cf-worker flavour leaves out: a\n" +
+        "  builtin the edge does not run, or a custom tool it cannot verify),\n" +
+        "  tool-unwired (a builtin that compiles but that nothing binds, so\n" +
+        "  every call fails), sub-agent-tool-ungranted (a sub-agent lists a\n" +
+        "  builtin its parent never registers), channel-reactions-join\n" +
         "  (informational — reaction feedback attributes to the exact turn\n" +
         "  only once the outbound-ts join file accumulates), and the 0.6.0\n" +
         "  model-plan-* / model-sunset / model-capabilities-unknown /\n" +
@@ -2066,7 +2069,9 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     // tool the edge doesn't yet run) is a CompilerError → clean one-liner.
     try {
       const cfIr = lower(parseSpec(yamlText));
-      bundle = { files: emitCfWorkerBundle(cfIr, { readme }).files, warnings: [] };
+      // Warnings ride along like compile()'s: printed below, and escalated by
+      // --strict before any file is written.
+      bundle = emitCfWorkerBundle(cfIr, { readme });
     } catch (err) {
       if (err instanceof CrewhausError) die(err.message);
       throw err;

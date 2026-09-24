@@ -1932,6 +1932,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
       },
       "devDependencies": {
@@ -1946,6 +1947,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
       },
       "devDependencies": {
@@ -1960,6 +1962,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/model-router": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
       },
       "devDependencies": {
