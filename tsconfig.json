@@ -90,6 +90,7 @@
     { "path": "./packages/tool-categories" },
     { "path": "./packages/tool-registry-manifest" },
     { "path": "./packages/tool-text" },
+    { "path": "./packages/tool-safety" },
     { "path": "./packages/tool-data" },
     { "path": "./packages/tool-encode" },
     { "path": "./packages/tool-datetime" },

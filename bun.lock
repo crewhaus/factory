@@ -3167,6 +3167,10 @@
         "@crewhaus/tool-executor": "workspace:*",
       },
     },
+    "packages/tool-safety": {
+      "name": "@crewhaus/tool-safety",
+      "version": "0.7.0",
+    },
     "packages/tool-schema": {
       "name": "@crewhaus/tool-schema",
       "version": "0.7.0",
@@ -4092,6 +4096,8 @@
     "@crewhaus/tool-retrieve": ["@crewhaus/tool-retrieve@workspace:packages/tool-retrieve"],
 
     "@crewhaus/tool-routing": ["@crewhaus/tool-routing@workspace:packages/tool-routing"],
+
+    "@crewhaus/tool-safety": ["@crewhaus/tool-safety@workspace:packages/tool-safety"],
 
     "@crewhaus/tool-schema": ["@crewhaus/tool-schema@workspace:packages/tool-schema"],
 
