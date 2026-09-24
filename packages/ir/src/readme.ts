@@ -206,10 +206,19 @@ const NESTED_TOOL_CONTEXTS: Record<string, string> = {
  */
 function collectToolUsage(ir: unknown): ReadonlyMap<string, ReadonlySet<string>> {
   const usage = new Map<string, Set<string>>();
+  // A builtin is spelled `read` in a shape's tools: list and `Read` in a
+  // sub-agent's (the registered name the child is filtered by). They are one
+  // tool, so rows merge without regard to case — no two builtins differ only
+  // in case — under the first spelling seen (the agent's own list is visited
+  // first).
+  const displayName = new Map<string, string>();
   const add = (tool: string, context: string): void => {
-    const contexts = usage.get(tool) ?? new Set<string>();
+    const lower = tool.toLowerCase();
+    const shown = displayName.get(lower) ?? tool;
+    displayName.set(lower, shown);
+    const contexts = usage.get(shown) ?? new Set<string>();
     contexts.add(context);
-    usage.set(tool, contexts);
+    usage.set(shown, contexts);
   };
   const visit = (node: unknown, context: string): void => {
     if (Array.isArray(node)) {

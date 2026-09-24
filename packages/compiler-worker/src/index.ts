@@ -1,6 +1,8 @@
 import {
   type Bundle,
+  type CompileWarning,
   SpecParseError,
+  assertCfWorkerToolsEdgeSafe,
   assertToolScopesStrict,
   compile,
   lower,
@@ -138,7 +140,8 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
   const emitAs: "local" | "cf-worker" = body.emitAs === "cf-worker" ? "cf-worker" : "local";
 
   try {
-    let bundle: Bundle;
+    // A CompileResult is a Bundle plus its `warnings`; both branches return one.
+    let bundle: Bundle & { readonly warnings?: ReadonlyArray<CompileWarning> };
     if (emitAs === "cf-worker") {
       const spec = parseSpec(body.yaml);
       const ir = lower(spec);
@@ -148,6 +151,11 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
       // sink (a `mcp__*` tool, or a built-in like Fetch/WebFetch/SendMessage)
       // whose scope:"external" cannot be verified offline is rejected here too.
       assertToolScopesStrict(ir);
+      // The edge tool gate, as `crewhaus compile --emit-as cf-worker` runs it:
+      // host tools the edge always refused throw (400 COMPILE); any other
+      // builtin the worker leaves out comes back as an edge-unsafe-tool
+      // warning beside the bundle instead of vanishing.
+      const edgeWarnings = assertCfWorkerToolsEdgeSafe(ir);
       const allowedOrigins = Array.isArray(body.allowedOrigins)
         ? body.allowedOrigins.filter((o): o is string => typeof o === "string")
         : undefined;
@@ -157,13 +165,13 @@ async function handleCompile(request: Request, env: Env, cors: HeadersInit): Pro
       // target shapes are driven from the IR, not re-derived in the target).
       switch (ir.target) {
         case "cli":
-          bundle = emitCfWorkerCli(ir, opts);
+          bundle = { ...emitCfWorkerCli(ir, opts), warnings: edgeWarnings };
           break;
         case "workflow":
-          bundle = emitCfWorkerWorkflow(ir, opts);
+          bundle = { ...emitCfWorkerWorkflow(ir, opts), warnings: edgeWarnings };
           break;
         case "graph":
-          bundle = emitCfWorkerGraph(ir, opts);
+          bundle = { ...emitCfWorkerGraph(ir, opts), warnings: edgeWarnings };
           break;
         default:
           return jsonResponse(

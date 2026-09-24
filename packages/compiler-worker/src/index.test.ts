@@ -76,6 +76,31 @@ agent:
     expect(file?.content).toContain("runWorkerLoop");
   });
 
+  test("POST /compile emitAs:cf-worker returns a warning for each builtin the worker leaves out", async () => {
+    const yaml = `
+name: edge
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [webFetch, gitStatus]
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      bundle: { warnings?: Array<{ code: string; message: string }> };
+    };
+    expect(body.bundle.warnings?.map((w) => w.code)).toEqual(["edge-unsafe-tool"]);
+    expect(body.bundle.warnings?.[0]?.message).toContain('tool "gitStatus" is a builtin');
+  });
+
   test("POST /compile emitAs:cf-worker with a workflow spec returns a worker.js bundle", async () => {
     const yaml = `
 name: hello-workflow

@@ -146,6 +146,25 @@ describe("renderBundleReadme — tool table (item 42)", () => {
     expect(md.indexOf("| `bash` |")).toBeLessThan(md.indexOf("| `python` |"));
   });
 
+  test("a tool the agent lists as `read` and a sub-agent as `Read` is one row", () => {
+    const cli = baseCliIr({
+      tools: ["read"],
+      subAgents: [
+        {
+          name: "researcher",
+          description: "digs",
+          instructions: "dig",
+          tools: ["Read"],
+          permissions: "inherit",
+          inheritBypass: false,
+        },
+      ],
+    });
+    const md = renderBundleReadme(cli);
+    expect(md).toContain("| `read` | agent, sub-agent `researcher` | built-in | — |");
+    expect(md).not.toContain("| `Read` |");
+  });
+
   test("nested tools carry their declaring context (sub-agent / workflow step)", () => {
     const cli = baseCliIr({
       tools: ["read"],
