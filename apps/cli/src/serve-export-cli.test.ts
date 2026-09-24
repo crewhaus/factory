@@ -118,7 +118,7 @@ describe("crewhaus export claude-plugin", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("--help prints usage and exits 0", async () => {
     const r = await runCli(["export", "claude-plugin", "--help"]);

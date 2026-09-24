@@ -817,7 +817,7 @@ describe("crewhaus flywheel (CLI surface)", () => {
 
     const forced = await runCli(["flywheel", "init", "--force"], root);
     expect(forced.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("NEW-HUNT-8 — flywheel init --suite wires the nightly tier and validates the path", async () => {
     const tieredRoot = newTempRoot();

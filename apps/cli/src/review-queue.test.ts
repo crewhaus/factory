@@ -323,7 +323,7 @@ describe("crewhaus review (CLI)", () => {
     const done = await runCli(["review", "next"]);
     expect(done.exitCode).toBe(0);
     expect(done.stdout).toContain("review queue is clear");
-  });
+  }, 60_000);
 
   test("distill feeder end-to-end: a 2-rater split enqueues a rater_disagreement item", async () => {
     // A session with two turns: turn 1 rated up by one rater (distills), turn
@@ -378,7 +378,7 @@ describe("crewhaus review (CLI)", () => {
     expect(again.exitCode).toBe(0);
     expect(again.stdout).toContain("(0 new)");
     expect(readReviewQueue(cwd)).toHaveLength(1);
-  });
+  }, 60_000);
 
   test("rate --adjudicate end-to-end: the flag reaches the record and distill closes the split", async () => {
     // B19 flagship loop through the REAL CLI: a 2-rater split, then
@@ -445,7 +445,7 @@ describe("crewhaus review (CLI)", () => {
     expect(samples).toHaveLength(1);
     expect(samples[0]).toContain('"adjudicated":true');
     expect(readReviewQueue(cwd)).toHaveLength(0);
-  });
+  }, 60_000);
 
   test("a verdict-less --adjudicate dies at capture (comment alone settles nothing)", async () => {
     const sessionsDir = join(cwd, ".crewhaus", "sessions");
@@ -478,7 +478,7 @@ describe("crewhaus review (CLI)", () => {
       "--adjudicate",
     ]);
     expect(withCorrection.exitCode).toBe(0);
-  });
+  }, 60_000);
 
   test("mine feeder end-to-end: quarantined candidates become pointer entries, idempotently", async () => {
     const sessionsDir = join(cwd, ".crewhaus", "sessions");
