@@ -879,6 +879,119 @@ describe("containment", () => {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * C072: the tools contain the directory a caller names, then look for FIXED
+ * names in it. A planted `requirements.txt -> <outside>/credentials` sits
+ * exactly there, and so does a FIFO. Each test plants one, asserts the
+ * outside bytes never reach the result, and that the result says which file
+ * was not read and why, instead of "no manifest".
+ */
+describe("containment of the fixed-name files a tool looks for", () => {
+  const SENTINEL = "SENTINEL_OUTSIDE_7f3a";
+
+  test("DependencyList does not read a requirements.txt linked out, and says so", async () => {
+    writeFileSync(join(outside, "credentials"), `api_key = ${SENTINEL}\n`);
+    mkdirSync(join(workspace, "proj"));
+    symlinkSync(join(outside, "credentials"), join(workspace, "proj", "requirements.txt"));
+    const message = await call(dependencyList, { cwd: "proj" });
+    expect(message).not.toContain(SENTINEL);
+    expect(message).toContain("proj/requirements.txt");
+    expect(message).toContain("outside the workspace");
+    // The refusal names the caller's file, never where the link led.
+    expect(message).not.toContain(outside);
+  });
+
+  test("a refused manifest is listed beside the ones that were read", async () => {
+    writeFileSync(join(outside, "pkg.json"), JSON.stringify({ dependencies: { [SENTINEL]: "1" } }));
+    write("proj/go.mod", "module example.com/x\n\ngo 1.22\n\nrequire golang.org/x/text v0.3.0\n");
+    symlinkSync(join(outside, "pkg.json"), join(workspace, "proj", "package.json"));
+    const out = await callJson(dependencyList, { cwd: "proj" });
+    expect(JSON.stringify(out)).not.toContain(SENTINEL);
+    expect(out["manifests"]).toEqual(["go.mod"]);
+    expect(out["skipped"]).toEqual([
+      { file: "proj/package.json", reason: expect.stringContaining("outside the workspace") },
+    ]);
+  });
+
+  test("PackageScripts neither reads a package.json linked out nor climbs past it", async () => {
+    write("package.json", JSON.stringify({ scripts: { root: "echo root" } }));
+    writeFileSync(join(outside, "package.json"), JSON.stringify({ scripts: { go: SENTINEL } }));
+    mkdirSync(join(workspace, "proj"));
+    symlinkSync(join(outside, "package.json"), join(workspace, "proj", "package.json"));
+    const message = await call(packageScripts, { cwd: "proj" });
+    expect(message).not.toContain(SENTINEL);
+    // The workspace root's own scripts are not passed off as proj's.
+    expect(message).not.toContain("echo root");
+    expect(message).toContain("proj/package.json");
+  });
+
+  test("WorkspacePackages does not read a root package.json linked out", async () => {
+    writeFileSync(
+      join(outside, "package.json"),
+      JSON.stringify({ name: SENTINEL, workspaces: ["packages/*"] }),
+    );
+    write("packages/a/package.json", JSON.stringify({ name: "a" }));
+    symlinkSync(join(outside, "package.json"), join(workspace, "package.json"));
+    const message = await call(workspacePackages, {});
+    expect(message).not.toContain(SENTINEL);
+    expect(message).toContain("outside the workspace");
+  });
+
+  test("CoverageSummary refuses a found report linked out, as it refuses one passed as `file`", async () => {
+    writeFileSync(join(outside, "lcov.info"), `SF:/${SENTINEL}.ts\nLF:1\nLH:1\nend_of_record\n`);
+    mkdirSync(join(workspace, "coverage"));
+    symlinkSync(join(outside, "lcov.info"), join(workspace, "coverage", "lcov.info"));
+    const found = await call(coverageSummary, {});
+    const named = await call(coverageSummary, { file: "coverage/lcov.info" });
+    for (const message of [found, named]) {
+      expect(message).not.toContain(SENTINEL);
+      expect(message).toContain("outside the workspace root");
+    }
+    // A whole coverage directory linked out is refused the same way.
+    rmSync(join(workspace, "coverage"), { recursive: true });
+    mkdirSync(join(outside, "covdir"));
+    writeFileSync(join(outside, "covdir", "lcov.info"), `SF:/${SENTINEL}.ts\nend_of_record\n`);
+    symlinkSync(join(outside, "covdir"), join(workspace, "coverage"));
+    const viaDir = await call(coverageSummary, {});
+    expect(viaDir).not.toContain(SENTINEL);
+    expect(viaDir).toContain("outside the workspace root");
+  });
+
+  test("control: a manifest linked to another file INSIDE the workspace is still read", async () => {
+    write("shared/requirements.txt", "requests==2.0\n");
+    mkdirSync(join(workspace, "proj"));
+    symlinkSync("../shared/requirements.txt", join(workspace, "proj", "requirements.txt"));
+    const out = await callJson(dependencyList, { cwd: "proj" });
+    expect(out["manifests"]).toEqual(["requirements.txt"]);
+    expect(JSON.stringify(out["dependencies"])).toContain("requests");
+    expect(out["skipped"]).toBeUndefined();
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO named requirements.txt is refused without being opened, so nothing blocks",
+    async () => {
+      mkdirSync(join(workspace, "proj"));
+      expect(Bun.spawnSync(["mkfifo", join(workspace, "proj", "requirements.txt")]).exitCode).toBe(
+        0,
+      );
+      // In a child: before the fix readFileSync on the FIFO blocked the event
+      // loop for good, which no in-process timeout could interrupt.
+      const script = `process.chdir(${JSON.stringify(workspace)});
+const m = await import(${JSON.stringify(join(import.meta.dir, "index.ts"))});
+console.log(await m.dependencyList.execute({ cwd: "proj" }));`;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      const code = await child.exited;
+      clearTimeout(killer);
+      const stdout = await new Response(child.stdout).text();
+      expect({ code, signal: child.signalCode }).toEqual({ code: 0, signal: null });
+      expect(stdout).toContain("proj/requirements.txt");
+      expect(stdout).toContain("fifo");
+    },
+    20_000,
+  );
+});
+
 describe("project and dependency tools", () => {
   beforeEach(() => {
     write(

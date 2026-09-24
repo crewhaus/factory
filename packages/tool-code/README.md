@@ -130,7 +130,15 @@ report as a clean result.
 
 - **Containment.** Every caller-supplied path goes through `src/paths.ts`
   `resolveSafe` and is refused if it leaves the workspace root — including via
-  a symlink inside the tree that points outside it.
+  a symlink inside the tree that points outside it. So does every file a tool
+  opens on its own: the fixed names it looks for in a directory
+  (`package.json`, `requirements.txt`, `pyproject.toml`, the lockfiles,
+  `pnpm-workspace.yaml`, a coverage report) are read through
+  `@crewhaus/tool-safety`'s contained reader. One linked out of the
+  workspace, or a FIFO or device under that name, is not read, and the
+  result lists it under `skipped` with the reason, so a refused manifest is
+  never reported as a missing one. A link to another file inside the
+  workspace is followed as before.
 - **Arguments.** Nothing reaches a shell; argv is always an array. That stops
   a caller reaching `sh`, not a program's own option parser, so every caller
   value that lands in argv as a bare word is refused when it begins with `-`,

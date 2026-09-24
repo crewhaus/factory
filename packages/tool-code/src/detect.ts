@@ -16,7 +16,7 @@
  */
 import * as path from "node:path";
 import { parsePackageJson } from "./lib/deps";
-import { fileExists, readTextFile } from "./walk";
+import { type SkippedFile, fileExists, readTextFile } from "./walk";
 
 export type Toolchain = {
   readonly argv: readonly string[];
@@ -82,13 +82,27 @@ export function localBinary(dir: string, root: string, name: string): string | u
 
 type Manifest = NonNullable<ReturnType<typeof parsePackageJson>>;
 
-/** Read the nearest `package.json` at or above `dir`. */
+/**
+ * Read the nearest `package.json` at or above `dir`.
+ *
+ * A `package.json` that exists but may not be read (a link leading out of
+ * the workspace, a FIFO) STOPS the search, and is listed in `skipped` when
+ * given: climbing past it would answer with an ancestor's manifest as if it
+ * were this directory's.
+ */
 export function nearestManifest(
   dir: string,
   root: string,
+  skipped?: SkippedFile[],
 ): { manifest: Manifest; dir: string } | undefined {
   for (const candidate of ancestors(dir, root)) {
-    const text = readTextFile(path.join(candidate, "package.json"));
+    const refused: SkippedFile[] = [];
+    const text = readTextFile(path.join(candidate, "package.json"), undefined, refused);
+    if (refused.length > 0) {
+      skipped?.push(...refused);
+      return undefined;
+    }
+
     if (text === undefined) continue;
     const manifest = parsePackageJson(text);
     if (manifest !== undefined) return { manifest, dir: candidate };

@@ -105,6 +105,7 @@ import {
   DEFAULT_MAX_FILES,
   MAX_FILE_BYTES,
   SOURCE_EXTENSIONS,
+  type SkippedFile,
   fileExists,
   readTextFile,
   walkFiles,
@@ -1493,12 +1494,13 @@ export const todoScan: RegisteredTool = buildTool({
 
 type LockSource = { readonly file: string; readonly locked: readonly LockedVersion[] };
 
-/** Read whichever lockfiles are present, plus a note for the unreadable one. */
+/** Read whichever lockfiles are present, plus a note for each unreadable one. */
 function readLocks(dirAbs: string): { sources: LockSource[]; notes: string[] } {
   const sources: LockSource[] = [];
   const notes: string[] = [];
+  const skipped: SkippedFile[] = [];
   const add = (name: string): void => {
-    const text = readTextFile(path.join(dirAbs, name));
+    const text = readTextFile(path.join(dirAbs, name), MAX_FILE_BYTES, skipped);
     if (text === undefined) return;
     // The filename-to-reader mapping lives in `deps.ts` and only there, so a
     // format cannot end up half-added — read by one caller and invisible to
@@ -1513,6 +1515,7 @@ function readLocks(dirAbs: string): { sources: LockSource[]; notes: string[] } {
   add("yarn.lock");
   add("pnpm-lock.yaml");
   add("Cargo.lock");
+  for (const s of skipped) notes.push(`${s.file}: ${s.reason}`);
   if (fileExists(path.join(dirAbs, "bun.lockb"))) {
     notes.push(
       "bun.lockb is bun's BINARY lockfile and cannot be read here; run `bun install --save-text-lockfile` to get a bun.lock this tool can read",
@@ -1521,11 +1524,23 @@ function readLocks(dirAbs: string): { sources: LockSource[]; notes: string[] } {
   return { sources, notes };
 }
 
-/** Every manifest present in a directory, read into one dependency list. */
-function readManifests(dirAbs: string): { dependencies: Dependency[]; manifests: string[] } {
+/**
+ * Every manifest present in a directory, read into one dependency list, and
+ * the ones that exist but were not read (a link leading out of the
+ * workspace, a FIFO, an oversized file), so "no manifest" is never the answer
+ * for a manifest that was refused.
+ */
+function readManifests(dirAbs: string): {
+  dependencies: Dependency[];
+  manifests: string[];
+  skipped: SkippedFile[];
+} {
   const dependencies: Dependency[] = [];
   const manifests: string[] = [];
-  const pkg = readTextFile(path.join(dirAbs, "package.json"));
+  const skipped: SkippedFile[] = [];
+  const read = (name: string): string | undefined =>
+    readTextFile(path.join(dirAbs, name), MAX_FILE_BYTES, skipped);
+  const pkg = read("package.json");
   if (pkg !== undefined) {
     const parsed = parsePackageJson(pkg);
     if (parsed !== undefined) {
@@ -1534,27 +1549,33 @@ function readManifests(dirAbs: string): { dependencies: Dependency[]; manifests:
     }
   }
   for (const name of ["requirements.txt", "requirements-dev.txt"]) {
-    const text = readTextFile(path.join(dirAbs, name));
+    const text = read(name);
     if (text === undefined) continue;
     dependencies.push(...parseRequirementsTxt(text, name));
     manifests.push(name);
   }
-  const pyproject = readTextFile(path.join(dirAbs, "pyproject.toml"));
+  const pyproject = read("pyproject.toml");
   if (pyproject !== undefined) {
     dependencies.push(...parsePyproject(pyproject));
     manifests.push("pyproject.toml");
   }
-  const gomod = readTextFile(path.join(dirAbs, "go.mod"));
+  const gomod = read("go.mod");
   if (gomod !== undefined) {
     dependencies.push(...parseGoMod(gomod));
     manifests.push("go.mod");
   }
-  const cargo = readTextFile(path.join(dirAbs, "Cargo.toml"));
+  const cargo = read("Cargo.toml");
   if (cargo !== undefined) {
     dependencies.push(...parseCargoToml(cargo));
     manifests.push("Cargo.toml");
   }
-  return { dependencies, manifests: manifests.sort() };
+  return { dependencies, manifests: manifests.sort(), skipped };
+}
+
+/** " (not read: a — why; b — why)", or "" when nothing was skipped. */
+function skippedClause(skipped: readonly SkippedFile[]): string {
+  if (skipped.length === 0) return "";
+  return ` (not read: ${skipped.map((s) => `${s.file} — ${s.reason}`).join("; ")})`;
 }
 
 export const dependencyList: RegisteredTool = buildTool({
@@ -1579,9 +1600,9 @@ export const dependencyList: RegisteredTool = buildTool({
   execute: async (input) => {
     const dir = resolveDir("DependencyList", input.cwd);
     if (!dir.ok) return dir.message;
-    const { dependencies, manifests } = readManifests(dir.value);
+    const { dependencies, manifests, skipped } = readManifests(dir.value);
     if (manifests.length === 0) {
-      return `DependencyList found no manifest in "${input.cwd ?? "."}" — no package.json, requirements.txt, pyproject.toml, go.mod or Cargo.toml.`;
+      return `DependencyList found no readable manifest in "${input.cwd ?? "."}" — no package.json, requirements.txt, pyproject.toml, go.mod or Cargo.toml${skippedClause(skipped)}.`;
     }
     const scopes = input.scopes === undefined ? undefined : new Set<string>(input.scopes);
     const ecosystems =
@@ -1616,6 +1637,7 @@ export const dependencyList: RegisteredTool = buildTool({
         ...(lockIndex.has(d.name) ? { locked: (lockIndex.get(d.name) as string[]).sort() } : {}),
       })),
       ...(capped.truncated ? { resultsTruncated: true } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
       ...(locks !== undefined && locks.notes.length > 0 ? { notes: locks.notes } : {}),
     });
   },
@@ -1637,9 +1659,9 @@ export const dependencyOutdated: RegisteredTool = buildTool({
   execute: async (input) => {
     const dir = resolveDir("DependencyOutdated", input.cwd);
     if (!dir.ok) return dir.message;
-    const { dependencies, manifests } = readManifests(dir.value);
+    const { dependencies, manifests, skipped } = readManifests(dir.value);
     if (manifests.length === 0) {
-      return `DependencyOutdated found no manifest in "${input.cwd ?? "."}".`;
+      return `DependencyOutdated found no readable manifest in "${input.cwd ?? "."}"${skippedClause(skipped)}.`;
     }
     const { sources, notes } = readLocks(dir.value);
     if (sources.length === 0) {
@@ -1711,6 +1733,7 @@ export const dependencyOutdated: RegisteredTool = buildTool({
         ? { uncheckable: uncheckable.slice(0, limit) }
         : { uncheckableCount: uncheckable.length }),
       ...(notes.length > 0 ? { notes } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
       // Said in the result, not only in the description: a caller who sees
       // `ok: true` must not read it as "every dependency checked out".
       ecosystemsCompared: ["npm", "cargo"],
@@ -1734,9 +1757,10 @@ export const packageScripts: RegisteredTool = buildTool({
     const dir = resolveDir("PackageScripts", input.cwd);
     if (!dir.ok) return dir.message;
     const root = path.resolve(process.cwd());
-    const found = nearestManifest(dir.value, root);
+    const skipped: SkippedFile[] = [];
+    const found = nearestManifest(dir.value, root, skipped);
     if (found === undefined) {
-      return `PackageScripts found no package.json at or above "${input.cwd ?? "."}".`;
+      return `PackageScripts found no readable package.json at or above "${input.cwd ?? "."}"${skippedClause(skipped)}.`;
     }
     const manager = detectPackageManager(found.dir, root);
     const entries = Object.entries(found.manifest.scripts)
@@ -1772,14 +1796,23 @@ export const workspacePackages: RegisteredTool = buildTool({
   execute: async (input) => {
     const dir = resolveDir("WorkspacePackages", input.cwd);
     if (!dir.ok) return dir.message;
-    const rootManifestText = readTextFile(path.join(dir.value, "package.json"));
+    const skipped: SkippedFile[] = [];
+    const rootManifestText = readTextFile(
+      path.join(dir.value, "package.json"),
+      MAX_FILE_BYTES,
+      skipped,
+    );
     const rootManifest =
       rootManifestText === undefined ? undefined : parsePackageJson(rootManifestText);
     let globs = rootManifest?.workspaces ?? [];
     if (globs.length === 0) {
       // pnpm keeps the same list in its own file; only the `packages:` list is
       // read, which is all this needs and all a partial YAML read can promise.
-      const pnpm = readTextFile(path.join(dir.value, "pnpm-workspace.yaml"));
+      const pnpm = readTextFile(
+        path.join(dir.value, "pnpm-workspace.yaml"),
+        MAX_FILE_BYTES,
+        skipped,
+      );
       if (pnpm !== undefined) {
         globs = [...pnpm.matchAll(/^\s*-\s*["']?([^"'\n]+)["']?\s*$/gm)].map((m) =>
           (m[1] as string).trim(),
@@ -1787,7 +1820,7 @@ export const workspacePackages: RegisteredTool = buildTool({
       }
     }
     if (globs.length === 0) {
-      return `WorkspacePackages found no workspaces in "${input.cwd ?? "."}" — the root package.json declares none and there is no pnpm-workspace.yaml. This does not look like a monorepo root.`;
+      return `WorkspacePackages found no workspaces in "${input.cwd ?? "."}" — the root package.json declares none and there is no pnpm-workspace.yaml${skippedClause(skipped)}. This does not look like a monorepo root.`;
     }
 
     const walked = walkFiles({
@@ -1801,7 +1834,7 @@ export const workspacePackages: RegisteredTool = buildTool({
       if (!rel.endsWith("package.json") || rel === "package.json") continue;
       const memberDir = rel.slice(0, rel.length - "/package.json".length);
       if (!globs.some((glob) => matchWorkspaceGlob(memberDir, glob))) continue;
-      const text = readTextFile(path.join(dir.value, rel));
+      const text = readTextFile(path.join(dir.value, rel), MAX_FILE_BYTES, skipped);
       if (text === undefined) continue;
       const manifest = parsePackageJson(text);
       if (manifest?.name === undefined) continue;
@@ -1832,6 +1865,7 @@ export const workspacePackages: RegisteredTool = buildTool({
         ...(input.includeDependencies === false ? {} : { dependsOn: adjacency.get(m.name) ?? [] }),
       })),
       ...(capped.truncated ? { resultsTruncated: true } : {}),
+      ...(skipped.length > 0 ? { skipped } : {}),
       cycles: stronglyConnected(
         members.map((m) => m.name),
         adjacency,
@@ -1891,7 +1925,15 @@ export const coverageSummary: RegisteredTool = buildTool({
     } else {
       for (const candidate of COVERAGE_CANDIDATES) {
         if (fileExists(path.join(dir.value, candidate))) {
-          reportRel = relPosix(root, path.join(dir.value, candidate));
+          // The found candidate is contained exactly like an explicit `file`:
+          // `fileExists` follows a link, and one leading out of the
+          // workspace is refused by name, never read (C072).
+          const resolved = resolveFile(
+            "CoverageSummary",
+            relPosix(root, path.join(dir.value, candidate)),
+          );
+          if (!resolved.ok) return resolved.message;
+          reportRel = relPosix(root, resolved.value);
           break;
         }
       }
@@ -1899,9 +1941,10 @@ export const coverageSummary: RegisteredTool = buildTool({
     if (reportRel === undefined) {
       return `CoverageSummary found no coverage report under "${input.cwd ?? "."}" (looked for ${COVERAGE_CANDIDATES.join(", ")}). Run the tests with coverage enabled first, or pass \`file\`.`;
     }
-    const text = readTextFile(path.join(root, reportRel), 20_000_000);
+    const unread: SkippedFile[] = [];
+    const text = readTextFile(path.join(root, reportRel), 20_000_000, unread);
     if (text === undefined) {
-      return `CoverageSummary could not read "${reportRel}": it is not a text file, or it is larger than 20MB.`;
+      return `CoverageSummary could not read "${reportRel}": ${unread[0]?.reason ?? "it is not a text file, or it is larger than 20MB"}.`;
     }
     const istanbul = text.trimStart().startsWith("{") ? parseIstanbulSummary(text) : undefined;
     const files = istanbul !== undefined ? [...istanbul.files] : parseLcov(text);
