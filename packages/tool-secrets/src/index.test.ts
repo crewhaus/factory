@@ -402,6 +402,26 @@ describe("EnvFileUpsert", () => {
     expect(result.warnings).toBeUndefined();
   });
 
+  test("a value a shell would run or expand is refused, and the file is untouched (C137)", async () => {
+    writeFileSync(envFile(), "LOG_LEVEL=info\n");
+    const before = readEnv();
+    // No whitespace in any of them: whitespace had its own refusal already.
+    for (const value of ["p4$(id)", "a`id`b", "x;y", "$HOME/x", "a&b"]) {
+      const text = await raw(envFileUpsert, {
+        entries: [
+          { key: "LOG_LEVEL", value: "debug" },
+          { key: "DB_PASSWORD", value },
+        ],
+      });
+      expect({ value, refused: text.includes("a shell sourcing the file") }).toEqual({
+        value,
+        refused: true,
+      });
+      // All or nothing: the ordinary entry beside it was not written either.
+      expect(readEnv()).toBe(before);
+    }
+  });
+
   test("an existing file keeps its comments, blanks and key order", async () => {
     writeFileSync(envFile(), ENV_HANDWRITTEN);
     await call(envFileUpsert, { entries: [{ key: "SLACK_BOT_TOKEN", value: "xoxb-new" }] });
@@ -628,6 +648,23 @@ describe("SecretRotate", () => {
       generate: { bytes: 32, encoding: "base64url" },
     });
     expect(result.note).toContain("stays valid at that provider until you revoke it");
+  });
+
+  test("a new value the .env cannot hold fails before KEY_PREVIOUS is written (C137)", async () => {
+    writeFileSync(envFile(), "API_TOKEN=old\n");
+    _setEnv({ NEXT_TOKEN: "n3w&x" });
+    const result = await call(secretRotate, {
+      ref: "envfile:.env#API_TOKEN",
+      newValueFrom: "env:NEXT_TOKEN",
+    });
+    expect({ ok: result.ok, failedAt: result.failedAt }).toEqual({
+      ok: false,
+      failedAt: "new-value",
+    });
+    expect(String(result.reason)).toContain("a shell sourcing the file");
+    expect(JSON.stringify(result)).not.toContain("n3w&x");
+    // Untouched: no rotated value, and no KEY_PREVIOUS left behind.
+    expect(readEnv()).toBe("API_TOKEN=old\n");
   });
 
   test("the rotation is recorded, with fingerprints and no values", async () => {

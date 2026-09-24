@@ -49,6 +49,7 @@ import { classifyWrite, helperName } from "./lib/backends";
 import {
   type Edit,
   type EnvDoc,
+  encodeBare,
   parseEnvDoc,
   planUnset,
   planUpsert,
@@ -903,6 +904,16 @@ export const secretRotate: RegisteredTool = buildTool({
           // fact worth recording before a credential is replaced with it.
           detail: `read from ${resolution.source}${resolution.note !== undefined ? ` — ${resolution.note}` : ""}`,
         });
+      }
+      // An envfile can hold only a value it can write losslessly for every
+      // reader (see encodeBare). Refused HERE, before keep-previous touches
+      // the file: a refusal at write-new would leave KEY_PREVIOUS written
+      // beside an unchanged KEY (C137).
+      if (ref.kind === "envfile") {
+        const encodable = encodeBare(ref.key, newValue);
+        if (!encodable.ok) {
+          return failed("new-value", `${encodable.message} Nothing was written.`);
+        }
       }
       const afterFingerprint = fingerprint(newValue);
       if (beforeFingerprint === afterFingerprint) {

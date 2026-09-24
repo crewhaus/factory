@@ -159,6 +159,19 @@ export function encodeBare(key: string, value: string): Resolved<string> {
     return why("contains whitespace, which a shell that sources the file would split on");
   if (value.startsWith('"') || value.startsWith("'")) return why("starts with a quote");
   if (value.includes("#")) return why('contains "#", which a reader may strip as a comment');
+  // A shell sourcing the file, and Bun's own .env autoloader (a harness run
+  // from its directory loads that .env), both INTERPRET some characters the
+  // canonical reader keeps literally: `$` and `${X}` expand (Bun expands `$`
+  // even inside single quotes), a backtick or `$(…)` runs a command, `;` `|`
+  // `&` end the assignment, `~` expands after `=` and `:`, `\` escapes. No
+  // quoting form reads the same in all three, so a value with any character
+  // outside this set is refused (C137) — never quoted, never written bare.
+  const active = /[^A-Za-z0-9_@%+=:,./-]/.exec(value);
+  if (active !== null) {
+    return refuse(
+      `the value for ${key} contains ${JSON.stringify(active[0])}, which a shell sourcing the file or Bun's .env loader would interpret (expand, run, or split on) while the canonical reader keeps it literally, so its meaning would depend on which reader opens the file. Only letters, digits and _ @ % + = : , . / - are written; write this value by hand, or use one without shell-active characters (a generated base64, base64url or hex value always qualifies).`,
+    );
+  }
 
   const line = `${key}=${value}`;
   // The proof, not a guess: the bytes about to be written, read back by the
@@ -202,9 +215,6 @@ export function planUpsert(doc: EnvDoc, key: string, value: string): Resolved<Ed
       `"${key}" is not a .env key (letters, digits and underscore, not starting with a digit).`,
     );
   }
-  const encoded = encodeBare(key, value);
-  if (!encoded.ok) return encoded;
-
   const live = liveAssignments(doc, key);
   if (live.length > 1) {
     const where = live.map((index) => index + 1).join(" and ");
@@ -219,8 +229,19 @@ export function planUpsert(doc: EnvDoc, key: string, value: string): Resolved<Ed
     const current = lines[index] as EnvLine;
     const previous = decodeAssignment(current.raw);
     if (previous === value) {
+      // Nothing is written, so there is nothing to encode: a value an
+      // operator quoted by hand stays as they wrote it.
       return { ok: true, value: { how: "unchanged", doc, previous } };
     }
+  }
+  // Every path below WRITES the value, so it must encode losslessly first.
+  const encoded = encodeBare(key, value);
+  if (!encoded.ok) return encoded;
+
+  if (live.length === 1) {
+    const index = live[0] as number;
+    const current = lines[index] as EnvLine;
+    const previous = decodeAssignment(current.raw);
     const match = current.raw.trim().match(ASSIGN_RE);
     const prefix = match?.[1] ?? "";
     const indent = current.raw.slice(0, current.raw.length - current.raw.trimStart().length);

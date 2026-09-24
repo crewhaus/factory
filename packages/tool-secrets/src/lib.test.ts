@@ -681,6 +681,91 @@ describe("what may be written into a .env, and what is refused", () => {
     });
   }
 
+  // C137: characters a shell sourcing the file, or Bun's .env autoloader,
+  // interprets while the canonical reader keeps them literally. No quoting
+  // form reads the same in all three, so each is refused — and the refusal
+  // must not promise that the canonical (double-quoting) quoter would help.
+  const shellActive: [string, string][] = [
+    ["a dollar", "ab$HOME"],
+    ["a braced expansion", "p${X}q"],
+    ["a command substitution", "p4$(id)"],
+    ["a backtick", "a`id`b"],
+    ["a semicolon", "x;y"],
+    ["a pipe", "a|b"],
+    ["an ampersand", "a&b"],
+    ["a backslash", "a\\b"],
+    ["a bang", "a!b"],
+    ["a star", "a*b"],
+    ["a question mark", "a?b"],
+    ["a leading tilde", "~/x"],
+    ["a tilde after a colon", "a:~/x"],
+    ["an open paren", "a(b"],
+    ["a close paren", "a)b"],
+    ["a less-than", "a<b"],
+    ["a greater-than", "a>b"],
+    ["a mid-value single quote", "a'b"],
+    ["a mid-value double quote", 'a"b'],
+  ];
+  for (const [what, value] of shellActive) {
+    test(`refuses ${what}: a shell or Bun would read it differently`, () => {
+      const encoded = encodeBare("K", value);
+      expect({ what, ok: encoded.ok }).toEqual({ what, ok: false });
+      if (!encoded.ok) {
+        expect(encoded.message).toContain("shell");
+        expect(encoded.message).toContain(".env loader");
+        expect(encoded.message).not.toContain("encodeEnvValue");
+      }
+    });
+  }
+
+  test.skipIf(process.platform === "win32")(
+    "every value it accepts reads back the same through sh and through Bun's .env autoloader",
+    () => {
+      const corpus = [
+        ...shellActive.map(([, v]) => v),
+        SECRET,
+        "sk-live-abc_123.def/ghi+jkl=",
+        Buffer.from(SECRET).toString("base64"),
+        Buffer.from(SECRET).toString("base64url"),
+        Buffer.from(SECRET).toString("hex"),
+        "a-b_c.d:e@f/g+h=",
+        "a,b%c",
+        "-leading-dash",
+        "",
+      ];
+      let accepted = 0;
+      for (const value of corpus) {
+        const encoded = encodeBare("K", value);
+        if (!encoded.ok) continue;
+        accepted += 1;
+        const dir = mkdtempSync(join(tmpdir(), "crewhaus-envbare-"));
+        try {
+          writeFileSync(join(dir, ".env"), `K=${encoded.value}\n`);
+          const sh = Bun.spawnSync(["sh", "-c", 'set -a; . ./.env; printf %s "$K"'], {
+            cwd: dir,
+            env: { PATH: "/usr/bin:/bin" },
+          });
+          const bun = Bun.spawnSync(
+            [process.execPath, "-e", 'process.stdout.write(process.env.K ?? "<unset>")'],
+            { cwd: dir, env: { PATH: "/usr/bin:/bin" } },
+          );
+          expect({ value, sh: sh.stdout.toString(), bun: bun.stdout.toString() }).toEqual({
+            value,
+            sh: value,
+            bun: value,
+          });
+          // Sourcing ran nothing: no file appeared beside the .env.
+          expect(readdirSync(dir)).toEqual([".env"]);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+      // Every positive was accepted, and none of the shell-active ones.
+      expect(accepted).toBe(corpus.length - shellActive.length);
+    },
+    30_000,
+  );
+
   test("everything this package writes round-trips through the CANONICAL reader", () => {
     const values = [
       SECRET,

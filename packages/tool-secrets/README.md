@@ -94,6 +94,19 @@ message naming the export that would remove the limitation. That is a real gap �
 write such a value by hand until `encodeEnvValue` is exported — and it is the
 honest one. A refusal an operator can act on beats a secret silently rewritten.
 
+The canonical reader is not the only one. A shell that sources the file
+(these files carry `export` lines) and Bun's own `.env` autoloader (a harness
+started from its directory loads that `.env`) both interpret characters the
+canonical reader keeps literally: `$` and `${X}` expand, a backtick or `$(…)`
+runs a command, `;` `|` `&` end the assignment, `~` expands, `\` escapes. Bun
+expands `$` even inside single quotes, and double quotes (what `encodeEnvValue`
+writes) leave `$` and the backtick live for both, so **no quoting form** keeps
+such a value the same for all three readers. A value is written only when
+every character is a letter, a digit or one of `_ @ % + = : , . / -`; anything
+else is refused, naming the character. Generated rotation values (base64,
+base64url, hex) always qualify. `SecretRotate` checks this before it writes
+anything, so a refused new value leaves no `KEY_PREVIOUS` behind.
+
 ## Rotation, in the order that matters
 
 If a rotation half-succeeds, the operator is locked out of their own service. So
