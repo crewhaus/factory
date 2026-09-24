@@ -15,9 +15,32 @@
  * 2. Boundedness. Every spawn carries a deadline and forwards the caller's
  *    abort signal, and every result is capped. A tool that can hang forever, or
  *    return a gigabyte of patch, is a defect.
+ * 3. A read runs no program the repository names (C007). See `./hardening`:
+ *    every invocation switches off the fsmonitor hook, signature display and
+ *    implicit bare repositories; a read also switches off external diff
+ *    drivers, textconv, submodule recursion and the repository's own filter
+ *    drivers, and gets the environment without the harness's credentials.
+ *
+ * This module is also `@crewhaus/tool-git/run`, so tool-changeset's DiffLint
+ * spawns git through the same hardened runner instead of a copy of it.
  */
 import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
+import { withoutCredentials } from "@crewhaus/tool-safety/env";
+import {
+  FILTER_PROBE_ARGS,
+  FILTER_PROBE_ARGS_LEGACY,
+  HARDENED_CONFIG_ARGS,
+  hardenReadArgs,
+  neutraliseRepositoryFilters,
+} from "./hardening";
+
+export {
+  HARDENED_CONFIG_ARGS,
+  hardenReadArgs,
+  neutraliseRepositoryFilters,
+  neutralisedNote,
+} from "./hardening";
 
 /** Default wall-clock budget for one git invocation. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
@@ -221,8 +244,18 @@ export type RunOptions = {
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
   readonly stdin?: string;
-  /** Adds GIT_OPTIONAL_LOCKS=0 so a read never contends for the index lock. */
+  /**
+   * A read: adds GIT_OPTIONAL_LOCKS=0 so it never contends for the index
+   * lock, inserts the read switches of `hardenReadArgs`, and spawns git
+   * without the harness's credentials (a read needs none: nothing here talks
+   * to a remote or signs).
+   */
   readonly readOnly?: boolean;
+  /**
+   * `-c` pairs placed before the subcommand, after the global ones: the
+   * filter drivers `probeRepositoryFilters` switched off for a read.
+   */
+  readonly configArgs?: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
   readonly maxOutputChars?: number;
 };
@@ -236,8 +269,10 @@ export type RunOptions = {
  *   in a path, so a file named `café.txt` comes back mangled.
  * - `advice.detachedHead=false`: advice text is help for a human at a terminal
  *   and only adds noise to a tool result.
+ * - `HARDENED_CONFIG_ARGS`: no fsmonitor hook, no signature program, no
+ *   implicit bare repository (see `./hardening`).
  */
-const GLOBAL_ARGS: readonly string[] = [
+export const GLOBAL_ARGS: readonly string[] = Object.freeze([
   "--no-pager",
   "-c",
   "core.quotepath=false",
@@ -245,7 +280,8 @@ const GLOBAL_ARGS: readonly string[] = [
   "color.ui=false",
   "-c",
   "advice.detachedHead=false",
-];
+  ...HARDENED_CONFIG_ARGS,
+]);
 
 /** Ceiling on how much of a run's stderr is kept. */
 const MAX_STDERR_CHARS = 8_000;
@@ -314,18 +350,28 @@ async function drain(
 
 /** Run git once, bounded by a deadline and the caller's abort signal. */
 export async function runGit(args: readonly string[], opts: RunOptions): Promise<GitRun> {
-  const argv = ["git", ...GLOBAL_ARGS, ...args];
+  const readOnly = opts.readOnly === true;
+  const argv = [
+    "git",
+    ...GLOBAL_ARGS,
+    ...(opts.configArgs ?? []),
+    ...(readOnly ? hardenReadArgs(args) : args),
+  ];
   const cap = opts.maxOutputChars ?? MAX_OUTPUT_CHARS;
   // LC_ALL=C pins git's own diagnostics to one language, so a message this
   // package matches on does not change with the operator's locale.
   // GIT_TERMINAL_PROMPT=0 guarantees git never blocks waiting on a terminal.
-  const env: Record<string, string | undefined> = {
-    ...process.env,
+  const pinned: Record<string, string> = {
     LC_ALL: "C",
     GIT_TERMINAL_PROMPT: "0",
-    ...(opts.readOnly === true ? { GIT_OPTIONAL_LOCKS: "0" } : {}),
+    ...(readOnly ? { GIT_OPTIONAL_LOCKS: "0" } : {}),
     ...opts.env,
   };
+  // A write keeps the full environment: a commit may sign through an agent,
+  // and its hooks are the repository's, approved with the write.
+  const env: Record<string, string | undefined> = readOnly
+    ? withoutCredentials(process.env, pinned).env
+    : { ...process.env, ...pinned };
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {
@@ -392,6 +438,12 @@ export type Repo = {
   readonly root: string;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  /**
+   * The repository's own filter drivers a read switches off (`filter.<name>`
+   * each). Empty for almost every repository; a tool whose result a filter
+   * could change says so with `neutralisedNote` when it is not.
+   */
+  readonly neutralised: readonly string[];
   run(args: readonly string[], opts?: Partial<RunOptions>): Promise<GitRun>;
 };
 
@@ -438,11 +490,20 @@ export async function openRepo(
     // repository, and reporting it as "not a git repository" would send the
     // caller looking for the wrong problem.
     if (top.timedOut) return refuse(failure(toolName, top));
+    if (/cannot use bare repository/i.test(top.stderr))
+      return refuse(bareRefusal(toolName, requested));
     return refuse(
       `${toolName} refused "${requested}": it is not a git repository (no .git found from there). git said: ${firstLine(top.stderr)}`,
     );
   }
   const root = top.stdout.trim();
+
+  const filters = await probeRepositoryFilters(toolName, cwd, {
+    timeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (!filters.ok) return filters;
+  const { configArgs, neutralised } = filters.value;
 
   return {
     ok: true,
@@ -450,6 +511,7 @@ export async function openRepo(
       cwd,
       root,
       timeoutMs,
+      neutralised,
       ...(signal !== undefined ? { signal } : {}),
       run: (args, opts) =>
         runGit(args, {
@@ -457,8 +519,57 @@ export async function openRepo(
           timeoutMs,
           ...(signal !== undefined ? { signal } : {}),
           ...opts,
+          // Only a read loses the repository's filters: a write that skipped
+          // a clean filter would store the wrong bytes.
+          ...(opts?.readOnly === true && configArgs.length > 0 ? { configArgs } : {}),
         }),
     },
+  };
+}
+
+/** The refusal for a repository directory git found by being run inside it. */
+export function bareRefusal(toolName: string, requested: string): string {
+  return `${toolName} refused "${requested}": it is a repository directory itself (a bare repository, or a directory laid out like one) that git found by being run inside it. A read-only tool does not run git there, because that directory's own config can name programs git would run. Run it from a working tree instead.`;
+}
+
+/**
+ * List the filter drivers the repository's own config defines, and the `-c`
+ * pairs that switch them off for a read (see `./hardening`). The listing
+ * itself runs nothing: reading config executes no helper.
+ */
+export async function probeRepositoryFilters(
+  toolName: string,
+  cwd: string,
+  opts: { readonly timeoutMs: number; readonly signal?: AbortSignal },
+): Promise<Resolved<{ configArgs: readonly string[]; neutralised: readonly string[] }>> {
+  const runOpts = { cwd, readOnly: true, ...opts };
+  let withScope = true;
+  let probe = await runGit(FILTER_PROBE_ARGS, runOpts);
+  // 129 is git's usage error: a git older than 2.26 has no --show-scope.
+  if (probe.code === 129 && /show-scope/.test(probe.stderr)) {
+    withScope = false;
+    probe = await runGit(FILTER_PROBE_ARGS_LEGACY, runOpts);
+  }
+  // Exit 1 is "no key matched": no filter configured anywhere.
+  if (probe.code === 1 && probe.stdout === "")
+    return { ok: true, value: { configArgs: [], neutralised: [] } };
+  if (probe.code !== 0 || probe.timedOut || probe.truncated) {
+    return refuse(
+      `${toolName} could not list this repository's filter configuration, so it cannot promise a read runs no program the repository names: ${
+        probe.timedOut
+          ? "the listing timed out"
+          : probe.truncated
+            ? "the listing was cut at the output cap"
+            : `git exit ${probe.code}: ${firstLine(probe.stderr)}`
+      }`,
+    );
+  }
+  const neutralisation = neutraliseRepositoryFilters(probe.stdout, withScope);
+  if (!neutralisation.ok)
+    return refuse(`${toolName} refused this repository: ${neutralisation.reason}.`);
+  return {
+    ok: true,
+    value: { configArgs: neutralisation.configArgs, neutralised: neutralisation.neutralised },
   };
 }
 

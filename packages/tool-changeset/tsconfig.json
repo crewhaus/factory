@@ -21,6 +21,9 @@
       "path": "../tool-code"
     },
     {
+      "path": "../tool-git"
+    },
+    {
       "path": "../tool-executor"
     }
   ],

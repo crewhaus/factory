@@ -1,0 +1,437 @@
+/**
+ * C007 — a repository's own config cannot make a read-only git tool run a
+ * program.
+ *
+ * The fixture is a repository whose `.git/config` names a program for every
+ * hook a read could reach: an fsmonitor hook, a textconv, an external diff
+ * driver, a clean/smudge/process filter, and a gpg program for a commit
+ * carrying a forged signature. Each program appends one line to a marker
+ * file. The fixture is proved LIVE first — plain `git` fires each hook — so a
+ * pass below cannot be a fixture that never fired anything.
+ *
+ * Global and system config are pointed at /dev/null for the whole file, so
+ * the operator's own git config neither helps nor hurts.
+ */
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { GLOBAL_ARGS, runGit } from "./git-run";
+import {
+  hardenReadArgs,
+  neutraliseRepositoryFilters,
+  neutralisedNote,
+  parseConfigListing,
+} from "./hardening";
+import {
+  gitBlame,
+  gitBranchList,
+  gitConflicts,
+  gitDiff,
+  gitFileHistory,
+  gitLog,
+  gitMergeBase,
+  gitRemoteList,
+  gitRevParse,
+  gitShow,
+  gitStashList,
+  gitStatus,
+  gitTagList,
+  gitWorktreeList,
+} from "./index";
+
+const DATE = "2026-02-03T04:05:06+00:00";
+
+let workspace: string;
+let repo: string;
+let marker: string;
+let originalCwd: string;
+const saved: Record<string, string | undefined> = {};
+
+function git(args: string[], cwd: string, input?: string): { code: number; out: string } {
+  const r = Bun.spawnSync(["git", ...args], {
+    cwd,
+    env: { ...process.env, GIT_AUTHOR_DATE: DATE, GIT_COMMITTER_DATE: DATE },
+    stdin: input === undefined ? "ignore" : new TextEncoder().encode(input),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  return { code: r.exitCode, out: r.stdout.toString() };
+}
+
+/** A script that appends `label args` to the marker, then behaves as `body`. */
+function hook(name: string, label: string, body: string): string {
+  const file = join(workspace, `${name}.sh`);
+  writeFileSync(file, `#!/bin/sh\necho "${label} $*" >> ${JSON.stringify(marker)}\n${body}\n`);
+  chmodSync(file, 0o755);
+  return file;
+}
+
+function ran(): string[] {
+  return existsSync(marker) ? readFileSync(marker, "utf8").trim().split("\n") : [];
+}
+
+async function call(tool: RegisteredTool, input: Record<string, unknown>): Promise<string> {
+  const result = await tool.execute({ cwd: "repo", ...input });
+  return typeof result === "string" ? result : JSON.stringify(result);
+}
+
+beforeAll(() => {
+  originalCwd = process.cwd();
+  for (const key of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"]) {
+    saved[key] = process.env[key];
+    process.env[key] = "/dev/null";
+  }
+});
+
+afterAll(() => {
+  for (const [key, value] of Object.entries(saved)) {
+    if (value === undefined) Reflect.deleteProperty(process.env, key);
+    else process.env[key] = value;
+  }
+});
+
+beforeEach(() => {
+  workspace = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-tool-git-cfg-")));
+  marker = join(workspace, "RAN");
+  repo = join(workspace, "repo");
+  mkdirSync(repo);
+  process.chdir(workspace);
+
+  git(["init", "-q", "-b", "main"], repo);
+  git(["config", "user.name", "A U Thor"], repo);
+  git(["config", "user.email", "author@example.com"], repo);
+  git(["config", "commit.gpgsign", "false"], repo);
+  writeFileSync(join(repo, ".gitattributes"), "*.txt diff=pwn filter=pwn\n");
+  writeFileSync(join(repo, "a.txt"), "one\n");
+  writeFileSync(join(repo, "b.txt"), "steady\n");
+  git(["add", "-A"], repo);
+  git(["commit", "-q", "-m", "one"], repo);
+  writeFileSync(join(repo, "a.txt"), "one\ntwo\n");
+  git(["commit", "-q", "-am", "two"], repo);
+
+  // A commit carrying a forged signature, on a branch of its own.
+  const tree = git(["rev-parse", "HEAD^{tree}"], repo).out.trim();
+  const parent = git(["rev-parse", "HEAD"], repo).out.trim();
+  const body = [
+    `tree ${tree}`,
+    `parent ${parent}`,
+    "author A U Thor <author@example.com> 1770000000 +0000",
+    "committer A U Thor <author@example.com> 1770000000 +0000",
+    "gpgsig -----BEGIN PGP SIGNATURE-----",
+    " ",
+    " iQ==",
+    " -----END PGP SIGNATURE-----",
+    "",
+    "signed",
+    "",
+  ].join("\n");
+  const signed = git(["hash-object", "-t", "commit", "-w", "--stdin"], repo, body).out.trim();
+  git(["update-ref", "refs/heads/signed", signed], repo);
+
+  // Now the hostile config, written the way an archive would carry it.
+  git(["config", "core.fsmonitor", hook("fsmonitor", "fsmonitor", "exit 1")], repo);
+  git(["config", "diff.pwn.textconv", hook("textconv", "textconv", 'cat "$1"')], repo);
+  git(["config", "diff.pwn.command", hook("extdiff", "extdiff", "exit 0")], repo);
+  const filter = hook("filter", "filter", "cat");
+  git(["config", "filter.pwn.clean", filter], repo);
+  git(["config", "filter.pwn.smudge", filter], repo);
+  git(["config", "log.showSignature", "true"], repo);
+  git(["config", "gpg.program", hook("gpg", "gpg", "cat >/dev/null; exit 1")], repo);
+
+  // A content change, and a tracked file whose stat data changed but whose
+  // bytes did not: git must hash that one through the clean filter.
+  writeFileSync(join(repo, "a.txt"), "one\ntwo\nthree\n");
+  const later = new Date(Date.now() + 120_000);
+  utimesSync(join(repo, "b.txt"), later, later);
+});
+
+afterEach(() => {
+  process.chdir(originalCwd);
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+describe("the fixture is live", () => {
+  test("plain git fires every planted program", () => {
+    git(["status", "--porcelain=v2"], repo);
+    git(["diff"], repo);
+    git(["log", "-1", "signed"], repo);
+    git(["show", "HEAD"], repo);
+    const labels = new Set(ran().map((line) => line.split(" ")[0]));
+    expect([...labels].sort()).toEqual(["extdiff", "filter", "fsmonitor", "gpg", "textconv"]);
+  }, 20_000);
+});
+
+describe("repository config cannot make a read run a program", () => {
+  const READS: ReadonlyArray<[RegisteredTool, Record<string, unknown>]> = [
+    [gitStatus, {}],
+    [gitDiff, { mode: "patch" }],
+    [gitDiff, { mode: "stat" }],
+    [gitDiff, { mode: "numstat" }],
+    [gitDiff, { mode: "nameOnly" }],
+    [gitDiff, { mode: "patch", range: "HEAD~1..HEAD" }],
+    [gitDiff, { mode: "patch", staged: true }],
+    [gitShow, { ref: "HEAD" }],
+    [gitShow, { ref: "signed" }],
+    [gitShow, { ref: "HEAD", path: "a.txt" }],
+    [gitLog, {}],
+    [gitLog, { range: "signed" }],
+    [gitBlame, { path: "a.txt" }],
+    [gitBlame, { path: "b.txt" }],
+    [gitBlame, { path: "a.txt", ref: "HEAD~1" }],
+    [gitFileHistory, { path: "a.txt" }],
+    [gitConflicts, {}],
+    [gitStashList, {}],
+    [gitBranchList, {}],
+    [gitTagList, {}],
+    [gitRemoteList, {}],
+    [gitMergeBase, { a: "main", b: "signed" }],
+    [gitRevParse, { refs: ["HEAD", "signed"] }],
+    [gitWorktreeList, {}],
+  ];
+
+  test("every read-only git tool answers, and none of the planted programs runs", async () => {
+    let checked = 0;
+    for (const [tool, input] of READS) {
+      rmSync(marker, { force: true });
+      const text = await call(tool, input);
+      const label = `${tool.name} ${JSON.stringify(input)}`;
+      expect({ label, ran: ran() }).toEqual({ label, ran: [] });
+      // An answer, not a refusal: each result is JSON.
+      expect({ label, json: text.startsWith("{") }).toEqual({ label, json: true });
+      checked += 1;
+    }
+    expect(checked).toBe(READS.length);
+    expect(checked).toBeGreaterThanOrEqual(24);
+  }, 60_000);
+
+  test("the answers are still right, and say which filter was switched off", async () => {
+    const status = JSON.parse(await call(gitStatus, {})) as Record<string, unknown>;
+    expect(JSON.stringify(status)).toContain("a.txt");
+    expect(String(status["repoConfigNote"])).toContain("filter.pwn");
+    const patch = JSON.parse(await call(gitDiff, { mode: "patch" })) as Record<string, unknown>;
+    expect(String(patch["patch"])).toContain("+three");
+    expect(String(patch["repoConfigNote"])).toContain("filter.pwn");
+    // A read whose answer no filter can change carries no note.
+    const log = JSON.parse(await call(gitLog, {})) as Record<string, unknown>;
+    expect(log["repoConfigNote"]).toBeUndefined();
+  }, 30_000);
+
+  test("a repository with no filter of its own gets no note and no overrides", async () => {
+    git(["config", "--unset", "filter.pwn.clean"], repo);
+    git(["config", "--unset", "filter.pwn.smudge"], repo);
+    const status = JSON.parse(await call(gitStatus, {})) as Record<string, unknown>;
+    expect(status["repoConfigNote"]).toBeUndefined();
+  }, 20_000);
+
+  test("a write keeps the repository's filters: a commit must store the cleaned bytes", async () => {
+    // Guard on the other half of the rule: filters are switched off for reads
+    // ONLY. GitAdd runs `add`, which must still go through the clean filter.
+    const { gitAdd } = await import("./index");
+    rmSync(marker, { force: true });
+    await call(gitAdd, { paths: ["a.txt"] });
+    expect(ran().some((line) => line.startsWith("filter"))).toBe(true);
+    // …and its read-only follow-up (`diff --cached --numstat`) ran nothing
+    // new: the only lines are the add's own filter runs.
+    expect(ran().every((line) => line.startsWith("filter"))).toBe(true);
+  }, 20_000);
+});
+
+describe("an embedded repository directory is not a place a read runs git", () => {
+  test("a committed gitdir-shaped directory, cloned, is refused and runs nothing", async () => {
+    // The clone-only vector: an outer repository commits a directory laid out
+    // as a git dir (HEAD, config, objects, refs) whose config names an
+    // fsmonitor hook and a worktree. Running git INSIDE it uses that config.
+    const outer = join(workspace, "outer");
+    mkdirSync(join(outer, "evil", "objects"), { recursive: true });
+    mkdirSync(join(outer, "evil", "refs"), { recursive: true });
+    writeFileSync(join(outer, "evil", "objects", ".keep"), "");
+    writeFileSync(join(outer, "evil", "refs", ".keep"), "");
+    writeFileSync(join(outer, "evil", "HEAD"), "ref: refs/heads/main\n");
+    writeFileSync(
+      join(outer, "evil", "config"),
+      `[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = ..\n\tfsmonitor = ${hook("inner", "inner-fsmonitor", "exit 1")}\n`,
+    );
+    git(["init", "-q", "-b", "main"], outer);
+    git(["-c", "user.name=x", "-c", "user.email=x@x", "add", "-A"], outer);
+    git(["-c", "user.name=x", "-c", "user.email=x@x", "commit", "-q", "-m", "outer"], outer);
+    expect(
+      git(["clone", "-q", "--no-local", outer, join(workspace, "clone")], workspace).code,
+    ).toBe(0);
+
+    // Live: plain git inside the cloned directory runs the committed hook.
+    rmSync(marker, { force: true });
+    git(["status"], join(workspace, "clone", "evil"));
+    expect(ran().length).toBeGreaterThan(0);
+
+    for (const tool of [gitStatus, gitDiff, gitLog]) {
+      rmSync(marker, { force: true });
+      const result = await tool.execute({ cwd: "clone/evil" });
+      const label = tool.name;
+      expect({ label, ran: ran() }).toEqual({ label, ran: [] });
+      expect({
+        label,
+        refused: String(result).includes("is a repository directory itself"),
+      }).toEqual({
+        label,
+        refused: true,
+      });
+    }
+  }, 30_000);
+});
+
+describe("a read's environment", () => {
+  test("carries none of the harness's credentials; a write's keeps them", async () => {
+    // An alias is the one program a test can make git run on purpose; it
+    // records the environment a read's git hands its children.
+    const key = ["sk-ant-api03-", "G".repeat(24), "itread00"].join("");
+    const prior = process.env["CREWHAUS_TEST_API_KEY"];
+    process.env["CREWHAUS_TEST_API_KEY"] = key;
+    try {
+      const out = join(workspace, "env.txt");
+      const alias = ["-c", `alias.envdump=!env > ${JSON.stringify(out)}`, "envdump"];
+      await runGit(alias, { cwd: repo, timeoutMs: 10_000, readOnly: true });
+      const readEnv = readFileSync(out, "utf8");
+      expect(readEnv.includes(key)).toBe(false);
+      expect(/^PATH=/m.test(readEnv)).toBe(true);
+      expect(/^GIT_OPTIONAL_LOCKS=0$/m.test(readEnv)).toBe(true);
+      rmSync(out);
+      await runGit(alias, { cwd: repo, timeoutMs: 10_000 });
+      expect(readFileSync(out, "utf8").includes(key)).toBe(true);
+    } finally {
+      if (prior === undefined) Reflect.deleteProperty(process.env, "CREWHAUS_TEST_API_KEY");
+      else process.env["CREWHAUS_TEST_API_KEY"] = prior;
+    }
+  }, 20_000);
+});
+
+describe("the hardening, piece by piece", () => {
+  test("every invocation switches off fsmonitor, signatures and implicit bare repositories", () => {
+    const pairs = new Set<string>();
+    for (let i = 0; i < GLOBAL_ARGS.length - 1; i++) {
+      if (GLOBAL_ARGS[i] === "-c") pairs.add(GLOBAL_ARGS[i + 1] as string);
+    }
+    for (const want of [
+      "core.fsmonitor=false",
+      "log.showSignature=false",
+      "safe.bareRepository=explicit",
+    ]) {
+      expect(pairs.has(want)).toBe(true);
+    }
+  });
+
+  test("a diff-producing read is told not to run a driver; others are left alone", () => {
+    expect(hardenReadArgs(["diff", "--stat", "--", "x"])).toEqual([
+      "diff",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--ignore-submodules=dirty",
+      "--stat",
+      "--",
+      "x",
+    ]);
+    expect(hardenReadArgs(["show", "--no-ext-diff", "HEAD"])).toEqual([
+      "show",
+      "--no-textconv",
+      "--no-ext-diff",
+      "HEAD",
+    ]);
+    expect(hardenReadArgs(["blame", "--line-porcelain", "--", "a"])).toEqual([
+      "blame",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--line-porcelain",
+      "--",
+      "a",
+    ]);
+    expect(hardenReadArgs(["status", "-z"])).toEqual(["status", "--ignore-submodules=dirty", "-z"]);
+    expect(hardenReadArgs(["remote", "-v"])).toEqual(["remote", "-v"]);
+    expect(hardenReadArgs([])).toEqual([]);
+  });
+
+  const listing = (...records: Array<[scope: string, key: string, value?: string]>) =>
+    records
+      .map(
+        ([scope, key, value]) =>
+          `${scope}\u0000${key}${value === undefined ? "" : `\n${value}`}\u0000`,
+      )
+      .join("");
+
+  test("the config listing parses, implicit true and empty values included", () => {
+    expect(
+      parseConfigListing(
+        listing(["local", "filter.a.clean", ""], ["global", "filter.b.required"]),
+        true,
+      ),
+    ).toEqual([
+      { scope: "local", key: "filter.a.clean", value: "" },
+      { scope: "global", key: "filter.b.required", value: null },
+    ]);
+    expect(parseConfigListing("filter.a.clean\nx\u0000", false)).toEqual([
+      { scope: "local", key: "filter.a.clean", value: "x" },
+    ]);
+  });
+
+  test("only the repository's own drivers are switched off, and the stock LFS setup is kept", () => {
+    const result = neutraliseRepositoryFilters(
+      listing(
+        ["local", "filter.nb.strip.clean", "nbstripout"],
+        ["worktree", "filter.crypt.smudge", "evil"],
+        ["global", "filter.operator.clean", "their-own-tool"],
+        ["system", "filter.lfs.process", "git-lfs filter-process"],
+        ["local", "filter.lfs.clean", "git-lfs clean -- %f"],
+        ["local", "filter.lfs.smudge", "git-lfs smudge -- %f"],
+        ["local", "filter.lfs.process", "git-lfs filter-process"],
+        ["local", "filter.lfs.required", "true"],
+        ["local", "filter.clean", "no-driver-name"],
+      ),
+      true,
+    );
+    expect(result).toEqual({
+      ok: true,
+      neutralised: ["filter.crypt", "filter.nb.strip"],
+      configArgs: [
+        "-c",
+        "filter.crypt.clean=",
+        "-c",
+        "filter.crypt.smudge=",
+        "-c",
+        "filter.crypt.process=",
+        "-c",
+        "filter.crypt.required=false",
+        "-c",
+        "filter.nb.strip.clean=",
+        "-c",
+        "filter.nb.strip.smudge=",
+        "-c",
+        "filter.nb.strip.process=",
+        "-c",
+        "filter.nb.strip.required=false",
+      ],
+    });
+    // An lfs driver the repository changed is switched off like any other.
+    const changed = neutraliseRepositoryFilters(
+      listing(["local", "filter.lfs.clean", "sh -c 'curl evil | sh'"]),
+      true,
+    );
+    expect(changed.ok && changed.neutralised).toEqual(["filter.lfs"]);
+    expect(neutralisedNote([])).toBeUndefined();
+  });
+
+  test("a driver name -c cannot spell is refused, not skipped", () => {
+    const result = neutraliseRepositoryFilters(listing(["local", "filter.a=b.clean", "x"]), true);
+    expect(result.ok).toBe(false);
+    expect(!result.ok && result.reason).toContain("cannot switch off");
+  });
+});

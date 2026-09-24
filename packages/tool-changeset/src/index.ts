@@ -141,6 +141,7 @@ export const diffLint: RegisteredTool = buildTool({
     let diffText: string;
     let source: string;
     let spawnTruncated = false;
+    let repoConfigNote: string | undefined;
     if (input.diff !== undefined) {
       diffText = input.diff;
       source = "caller-supplied diff";
@@ -161,6 +162,7 @@ export const diffLint: RegisteredTool = buildTool({
       diffText = collected.value.diff;
       source = collected.value.command;
       spawnTruncated = collected.value.truncated;
+      repoConfigNote = collected.value.repoConfigNote;
     }
 
     if (diffText.length > MAX_DIFF_CHARS) {
@@ -199,6 +201,7 @@ export const diffLint: RegisteredTool = buildTool({
       ...(result.skipped.length > 0 ? { skipped: result.skipped } : {}),
       ...(result.truncated ? { findingsTruncated: true } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
+      ...(repoConfigNote !== undefined ? { repoConfigNote } : {}),
       ...(result.findings.length === 0 && warnings.length === 0 ? { clean: true } : {}),
     });
   },

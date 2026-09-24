@@ -34,6 +34,7 @@ import {
   checkRefArgs,
   failure,
   json,
+  neutralisedNote,
   openRepo,
   resolveInsideRoot,
   truncationNote,
@@ -104,6 +105,18 @@ const WRITE_FLAGS = {
   ioCapability: "process",
 } as const;
 
+/**
+ * `repoConfigNote`, when a read switched off filter drivers the repository's
+ * own config names (see `./hardening`): the tools whose answer a filter
+ * could change say so, and say nothing for every other repository.
+ */
+function repoConfigNote(repo: { readonly neutralised: readonly string[] }): {
+  repoConfigNote?: string;
+} {
+  const note = neutralisedNote(repo.neutralised);
+  return note === undefined ? {} : { repoConfigNote: note };
+}
+
 /** Largest patch `GitApplyPatch` will accept, so one call cannot be unbounded. */
 const MAX_PATCH_CHARS = 4_000_000;
 /** Largest conflicted file `GitConflicts` will read looking for markers. */
@@ -142,7 +155,7 @@ export const gitStatus: RegisteredTool = buildTool({
       { readOnly: true },
     );
     if (run.code !== 0) return failure("GitStatus", run);
-    return json(parseStatusV2(run.stdout));
+    return json({ ...parseStatusV2(run.stdout), ...repoConfigNote(opened.value) });
   },
 });
 
@@ -202,19 +215,26 @@ export const gitDiff: RegisteredTool = buildTool({
     const run = await repo.run(args, { readOnly: true });
     if (run.code !== 0) return failure("GitDiff", run);
     const note = truncationNote(run);
+    const config = repoConfigNote(repo);
 
     if (mode === "numstat") {
       const files = parseNumstat(run.stdout);
       const added = files.reduce((sum, f) => sum + (f.added ?? 0), 0);
       const removed = files.reduce((sum, f) => sum + (f.removed ?? 0), 0);
-      return json({ mode, files: files.length, added, removed, changes: files, note });
+      return json({ mode, files: files.length, added, removed, changes: files, note, ...config });
     }
     if (mode === "nameOnly") {
       const files = splitNul(run.stdout).sort();
-      return json({ mode, files: files.length, paths: files, note });
+      return json({ mode, files: files.length, paths: files, note, ...config });
     }
     const body = run.stdout.replace(/\n+$/, "");
-    return json({ mode, empty: body === "", [mode === "patch" ? "patch" : "stat"]: body, note });
+    return json({
+      mode,
+      empty: body === "",
+      [mode === "patch" ? "patch" : "stat"]: body,
+      note,
+      ...config,
+    });
   },
 });
 
@@ -381,6 +401,7 @@ export const gitBlame: RegisteredTool = buildTool({
       count: lines.length,
       truncated: all.length > max || run.truncated,
       lines,
+      ...repoConfigNote(repo),
     });
   },
 });
@@ -700,6 +721,7 @@ export const gitConflicts: RegisteredTool = buildTool({
       truncated: paths.length > max,
       clean: paths.length === 0,
       files,
+      ...repoConfigNote(repo),
     });
   },
 });

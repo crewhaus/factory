@@ -125,6 +125,14 @@ git selector (`cwd`, `ref`, `range`, `staged`, `paths`) and the tool runs
 nobody here reads. Passing both is refused: with the text in hand there is
 nothing for git to do.
 
+That `git diff` goes through `@crewhaus/tool-git`'s runner, so it is a read
+in the strong sense: no program the repository's own config names runs. The
+fsmonitor hook, external diff drivers, textconv and the repository's own
+filter drivers are switched off (a result says `repoConfigNote` when a filter
+was skipped), a repository directory committed inside another one is refused
+rather than run in, and git gets the environment without the harness's
+credentials.
+
 The tool declares `scope: "external"` and `ioCapability: "process"` whichever
 way it is called. A static flag describes the worst case, and a capability
 that is sometimes true is true.
