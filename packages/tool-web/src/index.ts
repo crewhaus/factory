@@ -16,7 +16,8 @@ import { z } from "zod";
  *   - SSRF guard (independent of the allow-list, re-checked on every
  *     redirect hop): rejects loopback, link-local / 169.254.0.0/16,
  *     RFC1918, CGNAT, *.local / *.localhost, and DNS-rebinding targets.
- *   - Manual redirect handling, max 5; allow-list re-checked at every hop.
+ *   - Manual redirect handling, max 5; allow-list re-checked at every hop,
+ *     BEFORE any DNS resolution, so a host outside it is never looked up.
  *   - 30 s default timeout (`AbortController`, honours `ctx.signal`).
  *   - 5 MB response body cap.
  *   - HTML pages run through cheerio + turndown to produce markdown that
@@ -455,15 +456,18 @@ async function performWebFetch(
         `WebFetch denied: scheme "${currentUrl.protocol}" — only http/https allowed`,
       );
     }
-    // SSRF guard — independent of the allow-list, enforced on every hop.
-    // The returned IP pins the socket so a rebinding resolver can't swap in a
-    // private address between this check and connect.
-    const pinnedIp = await assertNotSsrf(currentUrl.hostname);
+    // The allow-list comes first, on every hop: a DNS lookup is itself egress
+    // (a label like `<hex-of-a-secret>.attacker.test` reaches the attacker's
+    // name server), so a host the operator did not allow is never resolved.
     if (!isHostAllowed(currentUrl.hostname, cfg)) {
       throw new WebFetchPermissionError(
         `WebFetch denied: host "${currentUrl.hostname}" is not in allowed_domains`,
       );
     }
+    // SSRF guard — independent of the allow-list, enforced on every allowed
+    // hop. The returned IP pins the socket so a rebinding resolver can't swap
+    // in a private address between this check and connect.
+    const pinnedIp = await assertNotSsrf(currentUrl.hostname);
 
     const res = await rawFetch(
       new Request(currentUrl.toString(), {
