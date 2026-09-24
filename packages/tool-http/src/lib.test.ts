@@ -274,34 +274,44 @@ describe("credentials", () => {
     expect(rejectInlineCredentials({ accept: "application/json" })).toBeNull();
   });
 
-  test("bearer, basic and header profiles read the named variable", () => {
+  test("bearer, basic and header profiles read a variable the operator listed", () => {
     const env = { TOKEN: "s3cret", PASS: "pw" };
+    const cfg = buildHttpConfig({ allowed_auth_envs: ["TOKEN", "PASS"] });
     const bearer: Record<string, string> = {};
-    expect(applyAuth(bearer, { type: "bearer", envVar: "TOKEN" }, env)).toBeNull();
+    expect(applyAuth(bearer, { type: "bearer", envVar: "TOKEN" }, cfg, env)).toMatchObject({
+      ok: true,
+      secrets: ["s3cret"],
+    });
     expect(bearer["Authorization"]).toBe("Bearer s3cret");
 
     const basic: Record<string, string> = {};
-    expect(applyAuth(basic, { type: "basic", envVar: "PASS", username: "ada" }, env)).toBeNull();
-    expect(basic["Authorization"]).toBe(`Basic ${Buffer.from("ada:pw").toString("base64")}`);
+    const encoded = Buffer.from("ada:pw").toString("base64");
+    expect(
+      applyAuth(basic, { type: "basic", envVar: "PASS", username: "ada" }, cfg, env),
+    ).toMatchObject({ ok: true, secrets: ["pw", "ada:pw", encoded] });
+    expect(basic["Authorization"]).toBe(`Basic ${encoded}`);
 
     const custom: Record<string, string> = {};
     expect(
-      applyAuth(custom, { type: "header", envVar: "TOKEN", headerName: "X-Api-Key" }, env),
-    ).toBeNull();
+      applyAuth(custom, { type: "header", envVar: "TOKEN", headerName: "X-Api-Key" }, cfg, env),
+    ).toMatchObject({ ok: true, secretHeaders: new Set(["x-api-key"]) });
     expect(custom["X-Api-Key"]).toBe("s3cret");
   });
 
-  test("an unset variable is a readable refusal that never names the value", () => {
-    const message = applyAuth({}, { type: "bearer", envVar: "MISSING_TOKEN" }, {});
+  test("an unset listed variable is a readable refusal that never names the value", () => {
+    const cfg = buildHttpConfig({ allowed_auth_envs: ["MISSING_TOKEN"] });
+    const applied = applyAuth({}, { type: "bearer", envVar: "MISSING_TOKEN" }, cfg, {});
+    expect(applied.ok).toBe(false);
+    const message = applied.ok ? "" : applied.message;
     expect(message).toContain("MISSING_TOKEN");
     expect(message).toContain("unset or empty");
   });
 
   test("a basic profile without a username is refused rather than half-applied", () => {
     const headers: Record<string, string> = {};
-    expect(applyAuth(headers, { type: "basic", envVar: "PASS" }, { PASS: "pw" })).toContain(
-      "username",
-    );
+    const cfg = buildHttpConfig({ allowed_auth_envs: ["PASS"] });
+    const applied = applyAuth(headers, { type: "basic", envVar: "PASS" }, cfg, { PASS: "pw" });
+    expect(applied.ok ? "" : applied.message).toContain("username");
     expect(Object.keys(headers)).toEqual([]);
   });
 

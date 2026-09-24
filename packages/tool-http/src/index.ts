@@ -28,7 +28,10 @@
  * Secrets: no tool accepts an inline credential. An `auth` profile names an
  * environment VARIABLE, and inline `Authorization`/`Cookie` headers are
  * refused, because a token a model can put in a tool argument is a token in
- * the transcript, the trace and the eval report.
+ * the transcript, the trace and the eval report. The variable must be one
+ * the operator listed in `tool_config.http.allowed_auth_envs` (optionally
+ * bound to origins): the model chooses among those names, never adds one.
+ * Whatever a server echoes of the credential is scrubbed from the result.
  *
  * Results are compact JSON, and a caller's mistake comes back as a readable
  * string rather than an exception.
@@ -49,6 +52,7 @@ import { connect as tlsConnect } from "node:tls";
 import type { DetailedPeerCertificate } from "node:tls";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { redactKnownSecrets, redactKnownSecretsDeep } from "@crewhaus/tool-safety/env";
 import { decodeBody } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { formatDn, summarizeCert } from "./lib/cert";
@@ -131,7 +135,9 @@ const authSchema = z
     envVar: z
       .string()
       .min(1)
-      .describe("NAME of the environment variable holding the secret — never the secret itself"),
+      .describe(
+        "NAME of the environment variable holding the secret — never the secret itself; it must be listed in tool_config.http.allowed_auth_envs",
+      ),
     headerName: z.string().min(1).optional().describe('header to set when type is "header"'),
     username: z
       .string()
@@ -190,24 +196,61 @@ type PreparedHeaders =
        * in `Authorization`.
        */
       readonly secretHeaders: ReadonlySet<string>;
+      /** Where the operator allows the credential to go, when it bound it. */
+      readonly credentialOrigins: ReadonlySet<string> | undefined;
     }
   | { readonly ok: false; readonly message: string };
 
-/** Reject inline credentials, then attach the auth profile's secret. */
+/**
+ * Reject inline credentials, then attach the auth profile's secret: only
+ * from a variable `tool_config.http.allowed_auth_envs` lists. Every spelling
+ * of the resolved secret is added to `secrets`, which the tool's
+ * {@link scrubbing} wrapper removes from whatever the call returns.
+ */
 function prepareHeaders(
   raw: Record<string, string> | undefined,
   auth: AuthProfile | undefined,
+  cfg: HttpConfig,
+  secrets: string[],
 ): PreparedHeaders {
   const headers: Record<string, string> = { ...(raw ?? {}) };
   const inline = rejectInlineCredentials(headers);
   if (inline !== null) return { ok: false, message: inline };
-  const authError = applyAuth(headers, auth);
-  if (authError !== null) return { ok: false, message: authError };
-  const named = authHeaderName(auth);
+  const applied = applyAuth(headers, auth, cfg);
+  if (!applied.ok) return { ok: false, message: applied.message };
+  secrets.push(...applied.secrets);
   return {
     ok: true,
     headers,
-    secretHeaders: named === undefined ? new Set<string>() : new Set([named]),
+    secretHeaders: applied.secretHeaders,
+    credentialOrigins: applied.credentialOrigins,
+  };
+}
+
+/**
+ * The execute of a tool that can carry a credential, with every known
+ * spelling of it scrubbed from what comes back.
+ *
+ * The credential is only ever placed in a header, and the echoed request
+ * headers are redacted by name. But a server that echoes the request (a
+ * debugging endpoint, a JSON page that repeats a header), a 401 that quotes
+ * the rejected key, or a JSON preview of the body would put the secret into
+ * the transcript, the trace and the eval report. `secrets` is filled by
+ * {@link prepareHeaders}; a JSON result is redacted value by value, so it
+ * still parses.
+ */
+function scrubbing<TInput>(
+  run: (input: TInput, ctx: ToolExecuteContext | undefined, secrets: string[]) => Promise<string>,
+): (input: TInput, ctx?: ToolExecuteContext) => Promise<string> {
+  return async (input, ctx) => {
+    const secrets: string[] = [];
+    const out = await run(input, ctx, secrets);
+    if (secrets.length === 0) return out;
+    try {
+      return JSON.stringify(redactKnownSecretsDeep(JSON.parse(out) as unknown, secrets));
+    } catch {
+      return redactKnownSecrets(out, secrets);
+    }
   };
 }
 
@@ -345,13 +388,12 @@ export const httpRequest: RegisteredTool = buildTool({
   ioCapability: "network",
   destructive: true,
   requireJustification: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const method = input.method ?? "GET";
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const retryOn = new Set(input.retryOnStatus ?? []);
@@ -371,6 +413,7 @@ export const httpRequest: RegisteredTool = buildTool({
           redirect: input.redirect ?? "follow",
           maxRedirects: input.maxRedirects ?? MAX_REDIRECTS,
           credentialHeaders: prepared.secretHeaders,
+          credentialOrigins: prepared.credentialOrigins,
         });
         const status = opened.res.status;
         const shouldRetry = attempt < maxRetries && retryOn.has(status);
@@ -418,7 +461,7 @@ export const httpRequest: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -490,7 +533,7 @@ export const httpPaginate: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const first = parseUrl(input.url);
     if (typeof first === "string") return first;
     if (
@@ -502,10 +545,9 @@ export const httpPaginate: RegisteredTool = buildTool({
     if (input.style === "page" && input.pageParam === undefined) {
       return 'style "page" needs pageParam — the query parameter holding the page number';
     }
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const deadline = startDeadline(input.timeoutMs, ctx?.signal);
     const maxTotalBytes = input.maxTotalBytes ?? MAX_MAX_BYTES;
@@ -543,6 +585,7 @@ export const httpPaginate: RegisteredTool = buildTool({
           cfg,
           redirect: "follow",
           credentialHeaders: prepared.secretHeaders,
+          credentialOrigins: prepared.credentialOrigins,
         });
         const body = await readCapped(opened.res, maxBytes, deadline.signal);
         pages++;
@@ -638,7 +681,7 @@ export const httpPaginate: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -667,17 +710,16 @@ export const graphqlQuery: RegisteredTool = buildTool({
   ioCapability: "network",
   destructive: true,
   requireJustification: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
+    const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
     if (!prepared.ok) return prepared.message;
     // Case-insensitively, so a caller that wrote "Content-Type" does not end
     // up with two of them on the wire.
     setDefaultHeader(prepared.headers, "content-type", "application/json");
     setDefaultHeader(prepared.headers, "accept", "application/json");
-
-    const cfg = configFor(ctx);
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       const opened = await openRequest({
@@ -693,6 +735,7 @@ export const graphqlQuery: RegisteredTool = buildTool({
         cfg,
         redirect: "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
       const body = await readCapped(
         opened.res,
@@ -720,7 +763,7 @@ export const graphqlQuery: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -770,7 +813,7 @@ export const httpBatch: RegisteredTool = buildTool({
   ioCapability: "network",
   destructive: true,
   requireJustification: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const cfg = configFor(ctx);
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const perRequestMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -787,7 +830,7 @@ export const httpBatch: RegisteredTool = buildTool({
         async (req, index) => {
           const url = parseUrl(req.url);
           if (typeof url === "string") return { index, url: req.url, ok: false, error: url };
-          const prepared = prepareHeaders(req.headers, input.auth);
+          const prepared = prepareHeaders(req.headers, input.auth, cfg, secrets);
           if (!prepared.ok) return { index, url: req.url, ok: false, error: prepared.message };
           if (overall.expired()) {
             return {
@@ -811,6 +854,7 @@ export const httpBatch: RegisteredTool = buildTool({
               cfg,
               redirect: "follow",
               credentialHeaders: prepared.secretHeaders,
+              credentialOrigins: prepared.credentialOrigins,
             });
             const body = await readCapped(opened.res, maxBytes, deadline.signal);
             return {
@@ -840,7 +884,7 @@ export const httpBatch: RegisteredTool = buildTool({
     } finally {
       overall.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -892,10 +936,11 @@ export const downloadFile: RegisteredTool = buildTool({
   // back is written into the workspace — as for HttpRequest, which has
   // always been gated.
   requireJustification: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
+    const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
     if (!prepared.ok) return prepared.message;
 
     let target: ReturnType<typeof resolveSafe>;
@@ -914,8 +959,6 @@ export const downloadFile: RegisteredTool = buildTool({
     ) {
       return `"${target.rel}" already exists — pass overwrite: true to replace it`;
     }
-
-    const cfg = configFor(ctx);
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     // A distinct partial name per call so two concurrent downloads into the
@@ -930,6 +973,7 @@ export const downloadFile: RegisteredTool = buildTool({
         cfg,
         redirect: "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
       if (opened.res.status < 200 || opened.res.status >= 300) {
         try {
@@ -967,7 +1011,7 @@ export const downloadFile: RegisteredTool = buildTool({
       deadline.cancel();
       rmSync(partial, { force: true });
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------
@@ -993,13 +1037,12 @@ export const headRequest: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       let opened = await openRequest({
@@ -1010,6 +1053,7 @@ export const headRequest: RegisteredTool = buildTool({
         cfg,
         redirect: input.redirect ?? "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
       let usedRangedGet = false;
       if (
@@ -1029,6 +1073,7 @@ export const headRequest: RegisteredTool = buildTool({
           cfg,
           redirect: input.redirect ?? "follow",
           credentialHeaders: prepared.secretHeaders,
+          credentialOrigins: prepared.credentialOrigins,
         });
         usedRangedGet = true;
       }
@@ -1064,7 +1109,7 @@ export const headRequest: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 export const urlReachable: RegisteredTool = buildTool({
@@ -1240,16 +1285,15 @@ export const httpWaitFor: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
     if (input.expectStatus === undefined && input.expectJson === undefined) {
       return "nothing to wait for — give expectStatus, expectJson, or both";
     }
-    const prepared = prepareHeaders(input.headers, input.auth);
-    if (!prepared.ok) return prepared.message;
-
     const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
+    if (!prepared.ok) return prepared.message;
     const method = input.method ?? "GET";
     if (method === "HEAD" && input.expectJson !== undefined) {
       return "expectJson needs a body, so it cannot be used with method HEAD";
@@ -1282,6 +1326,7 @@ export const httpWaitFor: RegisteredTool = buildTool({
             cfg,
             redirect: "follow",
             credentialHeaders: prepared.secretHeaders,
+            credentialOrigins: prepared.credentialOrigins,
           });
           lastStatus = opened.res.status;
           const statusOk = wantStatus.size === 0 || wantStatus.has(opened.res.status);
@@ -1336,7 +1381,7 @@ export const httpWaitFor: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 /**
@@ -1382,14 +1427,13 @@ export const sseRead: RegisteredTool = buildTool({
   scope: "external",
   ioCapability: "network",
   readOnly: true,
-  execute: async (input, ctx) => {
+  execute: scrubbing(async (input, ctx, secrets) => {
     const url = parseUrl(input.url);
     if (typeof url === "string") return url;
-    const prepared = prepareHeaders(input.headers, input.auth);
+    const cfg = configFor(ctx);
+    const prepared = prepareHeaders(input.headers, input.auth, cfg, secrets);
     if (!prepared.ok) return prepared.message;
     setDefaultHeader(prepared.headers, "accept", "text/event-stream");
-
-    const cfg = configFor(ctx);
     const maxEvents = input.maxEvents ?? 50;
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_BYTES;
     const deadline = startDeadline(input.timeoutMs, ctx?.signal);
@@ -1407,6 +1451,7 @@ export const sseRead: RegisteredTool = buildTool({
         cfg,
         redirect: "follow",
         credentialHeaders: prepared.secretHeaders,
+        credentialOrigins: prepared.credentialOrigins,
       });
       status = opened.res.status;
       if (status < 200 || status >= 300 || opened.res.body === null) {
@@ -1478,7 +1523,7 @@ export const sseRead: RegisteredTool = buildTool({
     } finally {
       deadline.cancel();
     }
-  },
+  }),
 });
 
 // ---------------------------------------------------------------------------

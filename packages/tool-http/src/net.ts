@@ -43,6 +43,7 @@
 import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
 import {
   type ResponseReadFailure,
   fetchRaw,
@@ -84,16 +85,37 @@ export type HttpConfig = {
    * separately, so there is exactly one list to audit.
    */
   readonly allowedHosts: ReadonlySet<string>;
+  /**
+   * The environment variables an `auth` profile may read, each with the
+   * canonical origins its credential may be sent to (`null`: any origin in
+   * `allowedOrigins`). Empty (the default) refuses every auth profile: the
+   * operator names the credentials, and a tool call may only choose among
+   * them.
+   */
+  readonly authEnvs: ReadonlyMap<string, ReadonlySet<string> | null>;
 };
+
+/**
+ * `allowed_auth_envs`: a list of variable names, whose credentials may go
+ * to any allowed origin, or a map from a name to the origins its credential
+ * may go to.
+ */
+export type AuthEnvsInput = readonly string[] | Readonly<Record<string, readonly string[]>>;
 
 export type HttpConfigInput = {
   readonly allowed_origins?: readonly string[];
   readonly allowedOrigins?: readonly string[];
+  readonly allowed_auth_envs?: AuthEnvsInput;
+  readonly allowedAuthEnvs?: AuthEnvsInput;
 };
+
+/** Where an operator allows an auth profile's variable. Every refusal names it. */
+export const AUTH_ENVS_KEY = "tool_config.http.allowed_auth_envs";
 
 const EMPTY_CONFIG: HttpConfig = {
   allowedOrigins: new Set<string>(),
   allowedHosts: new Set<string>(),
+  authEnvs: new Map(),
 };
 
 let httpConfig: HttpConfig = EMPTY_CONFIG;
@@ -108,7 +130,60 @@ export function buildHttpConfig(input: HttpConfigInput): HttpConfig {
     origins.add(canonical);
     hosts.add(new URL(canonical).hostname.toLowerCase());
   }
-  return { allowedOrigins: origins, allowedHosts: hosts };
+  const authEnvs = buildAuthEnvs(input.allowedAuthEnvs ?? input.allowed_auth_envs, origins);
+  return { allowedOrigins: origins, allowedHosts: hosts, authEnvs };
+}
+
+/**
+ * Check `allowed_auth_envs` at boot. A malformed entry throws, so a
+ * misconfiguration surfaces when the harness starts, not at the first call.
+ * An entry is never quoted: an operator who pasted a token here, or wrote
+ * `$GITHUB_TOKEN` (which the bundle resolves to the token itself), would
+ * otherwise see it printed.
+ */
+function buildAuthEnvs(
+  raw: unknown,
+  origins: ReadonlySet<string>,
+): ReadonlyMap<string, ReadonlySet<string> | null> {
+  const out = new Map<string, ReadonlySet<string> | null>();
+  if (raw === undefined || raw === null) return out;
+  const checkName = (name: unknown, where: string): string => {
+    if (!isEnvName(name) || looksLikePastedSecret(name)) {
+      throw new HttpPermissionError(
+        `${AUTH_ENVS_KEY} lists environment variable NAMES (such as GITHUB_TOKEN, written without a $); ${where} is not one, and has not been echoed back`,
+      );
+    }
+    return name;
+  };
+  if (Array.isArray(raw)) {
+    raw.forEach((name, index) => out.set(checkName(name, `entry ${index + 1}`), null));
+    return out;
+  }
+  if (typeof raw !== "object") {
+    throw new HttpPermissionError(
+      `${AUTH_ENVS_KEY} must be a list of variable names, or a map from a variable name to the origins its credential may be sent to`,
+    );
+  }
+  Object.entries(raw as Record<string, unknown>).forEach(([key, bound], index) => {
+    const name = checkName(key, `key ${index + 1}`);
+    if (!Array.isArray(bound) || bound.length === 0) {
+      throw new HttpPermissionError(
+        `${AUTH_ENVS_KEY}.${name} must list the origins its credential may be sent to`,
+      );
+    }
+    const set = new Set<string>();
+    for (const origin of bound) {
+      const canonical = canonicalizeOrigin(String(origin));
+      if (!origins.has(canonical)) {
+        throw new HttpPermissionError(
+          `${AUTH_ENVS_KEY}.${name} lists ${canonical}, which is not in allowed_origins`,
+        );
+      }
+      set.add(canonical);
+    }
+    out.set(name, set);
+  });
+  return out;
 }
 
 /** Replace the process-global allow-list. Codegen calls this at boot. */
@@ -661,41 +736,88 @@ export function rejectInlineCredentials(headers: Record<string, string>): string
   return null;
 }
 
+export type AppliedAuth =
+  | {
+      readonly ok: true;
+      /** Lowercased names of the headers the profile set. */
+      readonly secretHeaders: ReadonlySet<string>;
+      /**
+       * Every spelling of the credential a server could echo back, for the
+       * redactor: the secret, and for `basic` the `user:secret` pair and its
+       * base64 (which cannot be derived from the secret alone).
+       */
+      readonly secrets: readonly string[];
+      /** The origins the credential may be sent to, when the operator bound it. */
+      readonly credentialOrigins: ReadonlySet<string> | undefined;
+    }
+  | { readonly ok: false; readonly message: string };
+
 /**
- * Apply an auth profile. Returns a readable message when the named variable
- * is unset or the profile is incomplete; the secret itself is never echoed,
- * not even in the error.
+ * Apply an auth profile. The variable must be one the operator listed in
+ * `tool_config.http.allowed_auth_envs`: a tool call may choose among those
+ * names and can never add one, so a model cannot send ANTHROPIC_API_KEY (or
+ * any other process secret) as a bearer token to an allowed origin. The
+ * refusal names the key to set, is the same whether or not an unlisted
+ * variable is set, and never quotes a value, or a "name" that is really a
+ * pasted token.
  */
 export function applyAuth(
   headers: Record<string, string>,
   auth: AuthProfile | undefined,
+  cfg: HttpConfig,
   env: Record<string, string | undefined> = process.env,
-): string | null {
-  if (auth === undefined) return null;
-  const secret = env[auth.envVar];
-  if (secret === undefined || secret === "") {
-    return `auth profile names environment variable "${auth.envVar}", which is unset or empty in this process`;
+): AppliedAuth {
+  if (auth === undefined) {
+    return { ok: true, secretHeaders: new Set(), secrets: [], credentialOrigins: undefined };
   }
+  const resolved = resolveCredentialEnv(auth.envVar, {
+    allowed: [...cfg.authEnvs.keys()],
+    purpose: "the auth profile",
+    configKey: AUTH_ENVS_KEY,
+    env,
+  });
+  if (!resolved.ok) return { ok: false, message: resolved.reason };
+  const secret = resolved.value;
+  const credentialOrigins = cfg.authEnvs.get(resolved.name) ?? undefined;
   if (auth.type === "bearer") {
     headers["Authorization"] = `Bearer ${secret}`;
-    return null;
+    return {
+      ok: true,
+      secretHeaders: new Set(["authorization"]),
+      secrets: [secret],
+      credentialOrigins,
+    };
   }
   if (auth.type === "basic") {
     if (auth.username === undefined) {
-      return 'auth type "basic" needs a username; the password comes from envVar';
+      return {
+        ok: false,
+        message: 'auth type "basic" needs a username; the password comes from envVar',
+      };
     }
-    const encoded = Buffer.from(`${auth.username}:${secret}`, "utf8").toString("base64");
+    const pair = `${auth.username}:${secret}`;
+    const encoded = Buffer.from(pair, "utf8").toString("base64");
     headers["Authorization"] = `Basic ${encoded}`;
-    return null;
+    return {
+      ok: true,
+      secretHeaders: new Set(["authorization"]),
+      secrets: [secret, pair, encoded],
+      credentialOrigins,
+    };
   }
   if (auth.headerName === undefined) {
-    return 'auth type "header" needs a headerName';
+    return { ok: false, message: 'auth type "header" needs a headerName' };
   }
   if (auth.headerName.toLowerCase() === "host") {
-    return 'auth type "header" cannot set the Host header';
+    return { ok: false, message: 'auth type "header" cannot set the Host header' };
   }
   headers[auth.headerName] = `${auth.prefix ?? ""}${secret}`;
-  return null;
+  return {
+    ok: true,
+    secretHeaders: new Set([auth.headerName.toLowerCase()]),
+    secrets: [secret],
+    credentialOrigins,
+  };
 }
 
 /**
@@ -810,6 +932,12 @@ export type OpenOptions = {
    * alongside `Authorization`, `Proxy-Authorization` and `Cookie`.
    */
   readonly credentialHeaders?: ReadonlySet<string>;
+  /**
+   * The canonical origins the auth profile's credential may be sent to,
+   * when the operator bound it (`allowed_auth_envs` in map form). A request
+   * to any other origin carrying it is refused before the socket opens.
+   */
+  readonly credentialOrigins?: ReadonlySet<string> | undefined;
 };
 
 export type OpenResult = {
@@ -855,6 +983,18 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     assertNoUserinfo(current);
     assertOriginAllowed(current, o.cfg);
+    if (
+      o.credentialOrigins !== undefined &&
+      !o.credentialOrigins.has(currentOrigin) &&
+      Object.keys(headers).some(isCredential)
+    ) {
+      // The operator bound this credential to named origins. A later hop
+      // has already dropped it at the origin change, so this is the first
+      // request: refuse it rather than send the credential elsewhere.
+      throw new HttpPermissionError(
+        `the auth profile's credential may be sent only to ${[...o.credentialOrigins].sort(byString).join(", ")} (${AUTH_ENVS_KEY}); ${currentOrigin} is not one of them`,
+      );
+    }
     const pinnedIp = await assertNotSsrf(current.hostname);
 
     const init: RequestInit = {

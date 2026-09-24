@@ -18,6 +18,8 @@ tool_config:
     allowed_origins:  # REQUIRED — an empty list denies everything
       - https://api.example.com
       - https://api.github.com
+    allowed_auth_envs:  # the only variables an auth profile may read
+      GITHUB_TOKEN: [https://api.github.com]  # ...and where each may be sent
 ```
 
 | Tool | What it does |
@@ -72,7 +74,9 @@ second HTTP surface with a weaker gate would be the same hole twice.
    A URL carrying `user:pass@` is refused outright — at the first hop and at
    every redirect — because userinfo is a credential that would otherwise ride
    in `finalUrl` and `redirects` straight into a transcript.
-8. Every request has a deadline and every body a byte cap. The polling and
+8. Every request has a deadline and every body a byte cap, on its decoded
+   size: bodies are fetched raw and decoded under the cap, so a compressed
+   reply cannot inflate past it. Requests ask for `identity`. The polling and
    streaming tools *require* the deadline rather than defaulting it,
    `HttpBatch` bounds the batch as well as each request, and `HttpPaginate`
    bounds the bytes across all pages as well as within one — a per-page cap is
@@ -93,6 +97,25 @@ and an inline `Authorization` or `Cookie` header is refused with a message
 pointing at `auth`, as is a URL with `user:pass@` in it. A token a model can
 put in a tool argument is a token in the transcript, the trace event and the
 eval report.
+
+The variable must be one you list in `tool_config.http.allowed_auth_envs`.
+A tool call may choose among the listed names and can never add one, so a
+model cannot send another process secret (your LLM provider key, say) to an
+allowed origin. With no list, every `auth` profile is refused. Write the
+list as names, whose credentials may go to any allowed origin, or as a map
+from a name to the origins its credential may go to:
+
+```yaml
+allowed_auth_envs: [GITHUB_TOKEN, STATUS_API_KEY]      # any allowed origin
+allowed_auth_envs:                                      # or bound
+  GITHUB_TOKEN: [https://api.github.com]
+```
+
+A request that would carry a bound credential anywhere else is refused
+before it is sent. Whatever the server echoes back (a 401 that quotes the
+key, a debug endpoint that repeats the headers) is scrubbed from the result,
+in its URL-encoded and base64 spellings too, and for `basic` the
+`user:secret` pair as well.
 
 Echoed request headers come back as `<redacted>` — including the one a
 `{ "type": "header", "headerName": "X-Api-Key" }` profile set, which is just as

@@ -84,6 +84,11 @@ let origin = "";
 let otherOrigin = "";
 /** Per-test counters, so a flaky-endpoint test starts from a known state. */
 let flakyCalls = 0;
+/**
+ * What `/echo` (on either server) really received. A tool result scrubs the
+ * credential, so what arrived on the wire is read here.
+ */
+let echoSeen: Array<{ authorization: string | null; apiKey: string | null }> = [];
 let jobCalls = 0;
 
 const FEED_XML = `<?xml version="1.0"?><rss version="2.0"><channel>
@@ -116,6 +121,10 @@ async function mainHandler(req: Request): Promise<Response> {
   if (p === "/json") return jsonRes({ hello: "world" });
 
   if (p === "/echo") {
+    echoSeen.push({
+      authorization: req.headers.get("authorization"),
+      apiKey: req.headers.get("x-api-key"),
+    });
     return jsonRes({
       method: req.method,
       path: `${url.pathname}${url.search}`,
@@ -282,11 +291,16 @@ async function mainHandler(req: Request): Promise<Response> {
 beforeEach(() => {
   flakyCalls = 0;
   jobCalls = 0;
+  echoSeen = [];
   main = Bun.serve({ port: 0, fetch: mainHandler });
   other = Bun.serve({
     port: 0,
     fetch: async (req) => {
       const url = new URL(req.url);
+      echoSeen.push({
+        authorization: req.headers.get("authorization"),
+        apiKey: req.headers.get("x-api-key"),
+      });
       return new Response(
         JSON.stringify({
           server: "other",
@@ -301,7 +315,10 @@ beforeEach(() => {
   });
   origin = `http://127.0.0.1:${main.port}`;
   otherOrigin = `http://127.0.0.1:${other.port}`;
-  registerHttpConfig({ allowed_origins: [origin, otherOrigin] });
+  registerHttpConfig({
+    allowed_origins: [origin, otherOrigin],
+    allowed_auth_envs: [TOKEN_VAR, "CREWHAUS_TEST_ABSENT"],
+  });
   __setPrivateHostsAllowedForTest(true);
   process.env[TOKEN_VAR] = "s3cret-token";
   process.env[SECRET_VAR] = "whsec_fixture";
@@ -586,6 +603,7 @@ describe("refusals", () => {
     });
     expect(result).toContain("CREWHAUS_TEST_ABSENT");
     expect(result).toContain("unset or empty");
+    expect(echoSeen).toEqual([]);
   });
 
   test("a deadline fires and is reported as a deadline", async () => {
@@ -634,7 +652,9 @@ describe("HttpRequest", () => {
       auth: { type: "bearer", envVar: TOKEN_VAR },
       parseJson: true,
     });
-    expect(result.json.authorization).toBe("Bearer s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: "Bearer s3cret-token", apiKey: null }]);
+    // The server repeated it back; the result does not.
+    expect(result.json.authorization).toBe("Bearer <redacted>");
     expect(result.requestHeaders["Authorization"]).toBe("<redacted>");
     expect(JSON.stringify(result.requestHeaders)).not.toContain("s3cret-token");
   });
@@ -645,7 +665,8 @@ describe("HttpRequest", () => {
       auth: { type: "header", envVar: TOKEN_VAR, headerName: "X-Api-Key" },
       parseJson: true,
     });
-    expect(result.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: "s3cret-token" }]);
+    expect(result.json.apiKey).toBe("<redacted>");
   });
 
   test("a header-type auth secret is redacted in the echo, not just the Authorization one", async () => {
@@ -655,7 +676,7 @@ describe("HttpRequest", () => {
       parseJson: true,
     });
     // The server really did receive it...
-    expect(result.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: "s3cret-token" }]);
     // ...and the model really does not.
     expect(result.requestHeaders["X-Api-Key"]).toBe("<redacted>");
     expect(JSON.stringify(result.requestHeaders)).not.toContain("s3cret-token");
@@ -667,7 +688,8 @@ describe("HttpRequest", () => {
       auth: { type: "header", envVar: TOKEN_VAR, headerName: "X-Api-Key" },
       parseJson: true,
     });
-    expect(same.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen.at(-1)).toEqual({ authorization: null, apiKey: "s3cret-token" });
+    expect(same.json.apiKey).toBe("<redacted>");
     expect(same.credentialsDropped).toBe(false);
 
     const cross = await run(httpRequest, {
@@ -677,6 +699,7 @@ describe("HttpRequest", () => {
     });
     expect(cross.json.server).toBe("other");
     expect(cross.json.apiKey).toBeNull();
+    expect(echoSeen.at(-1)).toEqual({ authorization: null, apiKey: null });
     expect(cross.credentialsDropped).toBe(true);
   });
 
@@ -715,7 +738,8 @@ describe("HttpRequest", () => {
       auth: { type: "bearer", envVar: TOKEN_VAR },
       parseJson: true,
     });
-    expect(result.json.authorization).toBe("Bearer s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: "Bearer s3cret-token", apiKey: null }]);
+    expect(result.json.authorization).toBe("Bearer <redacted>");
     expect(result.credentialsDropped).toBe(false);
     expect(result.redirects.length).toBe(1);
   });
@@ -728,6 +752,7 @@ describe("HttpRequest", () => {
     });
     expect(result.json.server).toBe("other");
     expect(result.json.authorization).toBeNull();
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: null }]);
     expect(result.credentialsDropped).toBe(true);
   });
 
@@ -1035,8 +1060,12 @@ describe("HttpBatch", () => {
       requests: [{ url: `${origin}/echo` }, { url: `${origin}/echo` }],
       auth: { type: "bearer", envVar: TOKEN_VAR },
     });
+    expect(echoSeen).toEqual([
+      { authorization: "Bearer s3cret-token", apiKey: null },
+      { authorization: "Bearer s3cret-token", apiKey: null },
+    ]);
     for (const entry of result.results) {
-      expect(JSON.parse(entry.body).authorization).toBe("Bearer s3cret-token");
+      expect(JSON.parse(entry.body).authorization).toBe("Bearer <redacted>");
     }
   });
 });
