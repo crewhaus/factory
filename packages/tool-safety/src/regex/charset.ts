@@ -231,14 +231,16 @@ const FOLD_MEMO_ENTRIES = 512;
  *
  * Its cost depends on how many case-paired characters the set holds, not on
  * the number of classes: each range is located in a sorted index by binary
- * search, so a single literal costs a few comparisons. Results are memoised;
- * `charge` is told the cost of a result that was not.
+ * search, so a single literal costs a few comparisons. Results are memoised.
+ * `charge` is told what the work costs, and the set's key, whether or not
+ * the memo answers, so a caller's accounting does not depend on what was
+ * folded before.
  */
-export function fold(set: CharSet, charge?: (units: number) => void): CharSet {
+export function fold(set: CharSet, charge?: (units: number, key: string) => void): CharSet {
   const key = set.join(",");
+  charge?.(foldCost(set), key);
   const hit = foldMemo.get(key);
   if (hit !== undefined) return hit;
-  charge?.(foldCost(set));
   foldIndex ??= buildFoldIndex();
   const { members, classes } = foldIndex;
   const extra: Array<[number, number]> = [];
@@ -259,7 +261,7 @@ export function fold(set: CharSet, charge?: (units: number) => void): CharSet {
 /**
  * The cost {@link fold} pays for `set` when it is not memoised, in the
  * screen's work units: one per range, plus one per case-paired member it
- * visits. `fold` reports it through `charge` before doing the work.
+ * visits.
  */
 function foldCost(set: CharSet): number {
   foldIndex ??= buildFoldIndex();

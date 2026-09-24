@@ -211,6 +211,7 @@ function screenUncached(
   // 0.1 ms each, measured on Bun 1.3.14), and a `v`-mode set operation over
   // one (`[\p{L}--[a-z]]`, `[\p{Any}&&\p{L}]`) 1–3.5 ms. They are charged to
   // the budget before anything is compiled.
+  chargedKeys.clear();
   workLeft = maxWork - compileCost(pattern, flags);
   if (workLeft < 0) {
     workLeft = 0;
@@ -306,6 +307,20 @@ class UnanalysableError extends Error {}
 
 let workLeft = 0;
 
+/**
+ * Work already charged in this screen, by key. A set folded, or asked of the
+ * engine, twice in one pattern is paid for once, and whether a process-wide
+ * memo already held it makes no difference: the same pattern always costs
+ * the same, so its verdict does not depend on what was screened before.
+ */
+const chargedKeys = new Set<string>();
+
+function spendOnce(units: number, key: string): void {
+  if (chargedKeys.has(key)) return;
+  chargedKeys.add(key);
+  spend(units);
+}
+
 function spend(units: number): void {
   workLeft -= units;
   if (workLeft < 0) throw new UnanalysableError(OUT_OF_WORK);
@@ -365,9 +380,9 @@ const ASSUMED_ABOVE: ReadonlyArray<readonly [number, number]> = (() => {
 
 function engineSet(source: string, flags: string): CharSet {
   const key = `${flags}/${source}`;
+  spendOnce(512, `engine:${key}`);
   const hit = engineSets.get(key);
   if (hit !== undefined) return hit;
-  spend(512);
   let re: RegExp;
   try {
     re = new RegExp(`^(?:${source})$`, flags);
@@ -496,7 +511,7 @@ class Parser {
   }
 
   private caseSet(set: CharSet): CharSet {
-    return this.mode.foldCase ? fold(set, spend) : set;
+    return this.mode.foldCase ? fold(set, (units, key) => spendOnce(units, `fold:${key}`)) : set;
   }
 
   private group(): Node {
