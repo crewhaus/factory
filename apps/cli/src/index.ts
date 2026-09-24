@@ -1897,7 +1897,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  every call fails), tool-config-unused (a tool_config block no listed\n" +
         "  tool reads, so the setting is not in force), sub-agent-tool-ungranted\n" +
         "  (a sub-agent lists a builtin its parent never registers),\n" +
-        "  channel-reactions-join\n" +
+        "  provider-tool-cap (a fallback, tier or pool model whose provider\n" +
+        "  refuses that many tools on one request — OpenAI, Azure OpenAI and\n" +
+        "  Groq take 128, Gemini 512; when no model can take them it is an\n" +
+        "  error), channel-reactions-join\n" +
         "  (informational — reaction feedback attributes to the exact turn\n" +
         "  only once the outbound-ts join file accumulates),\n" +
         "  channel-plugins-at-start (informational — a channel daemon skips a\n" +

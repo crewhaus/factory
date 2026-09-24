@@ -37,6 +37,7 @@ import {
   type PricingTable,
   computeCostMicros,
   createCostTracker,
+  providerToolLimit,
   resolveCapabilities,
   resolvePricing,
   sumRoleCost,
@@ -221,6 +222,7 @@ import {
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
+import { type ServingModel, type ToolLimitVerdict, checkServingToolLimits } from "./tool-limit";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -3142,6 +3144,17 @@ export function buildTimeoutFailureReport(timeout: TimeoutAbortReason): FailureR
  * `base` array unchanged (same reference) when there are no plugin tools, so a
  * run without the `plugins` option is byte-identical to a pre-G32 runtime.
  */
+/**
+ * provider-limits#0 — act on a boot tool-limit verdict: no model can take the
+ * run's tools → a `ConfigError` before any model call; some model cannot →
+ * one `[tools]` line per model on stderr, beside the `[failover]` and
+ * `[model_pool]` boot lines.
+ */
+function reportToolLimits(verdict: ToolLimitVerdict): void {
+  if (verdict.fatal !== undefined) throw new ConfigError(verdict.fatal);
+  for (const line of verdict.warnings) process.stderr.write(`[tools] ${line}\n`);
+}
+
 function mergeEffectiveTools(
   base: ReadonlyArray<RegisteredTool>,
   pluginTools: ReadonlyArray<RegisteredTool> | undefined,
@@ -3273,6 +3286,48 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     throw new ConfigError(
       `model "${opts.model}" (provider ${providerId}) does not support tool use — remove tools or pick a tool-capable model`,
     );
+  }
+  // provider-limits#0 — the same fail-early rule for the tool COUNT: OpenAI
+  // (and Azure OpenAI, Groq) refuse more than 128 tools on one request,
+  // Gemini more than 512, and they refuse every request of the run. The list
+  // is final here (builtins, loop tools, MCP, plugin and hybrid tools), so
+  // this is the check `--model` overrides and MCP servers cannot slip past.
+  // A pool is checked per candidate below, once each candidate's subset is
+  // known.
+  if (opts.modelPool === undefined) {
+    const count = effectiveTools.length;
+    const serving: ServingModel[] =
+      opts.modelTiers !== undefined
+        ? (["fast", "default"] as const).map((tier) => {
+            const model = (opts.modelTiers as NonNullable<typeof opts.modelTiers>)[tier];
+            return {
+              model,
+              toolCount: count,
+              role: "serves",
+              label: `model_tiers.${tier} "${model}"`,
+              whenOver: `the run starts, and every turn routed to the ${tier} tier fails`,
+            } satisfies ServingModel;
+          })
+        : [opts.model, ...modelFallbacks].map(
+            (model, i) =>
+              ({
+                model,
+                toolCount: count,
+                role: "serves",
+                label: i === 0 ? `model "${model}"` : `model_fallbacks[${i - 1}] "${model}"`,
+                whenOver: "the run starts because another model in the chain can serve",
+              }) satisfies ServingModel,
+          );
+    if (opts.budget?.onExceed.kind === "degrade") {
+      serving.push({
+        model: opts.budget.onExceed.model,
+        toolCount: count,
+        role: "degrade",
+        label: `budget degrade model "${opts.budget.onExceed.model}"`,
+        whenOver: "a budget degrade to it would fail every call",
+      });
+    }
+    reportToolLimits(checkServingToolLimits(serving));
   }
   let compactionAdapter: ProviderAdapter;
   let compactionWireModelId: string;
@@ -4391,6 +4446,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
   const armIdOf = (candidate: PoolCandidate): string =>
     poolCandidateConfigs.get(candidate)?.profile ?? candidate.modelString;
+  // provider-limits#0 — each pool candidate against its provider's
+  // per-request tool limit, counted on the subset IT is advertised. One over
+  // its limit is left out of routing (the `tool-limit` eligibility exclusion
+  // in preRoute); a pool none of whose candidates can accept its tools
+  // cannot make one call, and stops here.
+  if (poolRouter !== undefined) {
+    const serving: ServingModel[] = [];
+    for (const [candidate, ad] of candidateAdvertisements) {
+      serving.push({
+        model: candidate.modelString,
+        toolCount: ad.names.size,
+        role: "serves",
+        label: `model_pool candidate "${armIdOf(candidate)}"`,
+        whenOver: "routing leaves it out",
+      });
+    }
+    if (budgetDegradeRung !== undefined && !candidateAdvertisements.has(budgetDegradeRung)) {
+      serving.push({
+        model: budgetDegradeRung.modelString,
+        toolCount: effectiveTools.length,
+        role: "degrade",
+        label: `budget degrade model "${budgetDegradeRung.modelString}"`,
+        whenOver: "a budget degrade to it would fail every call",
+      });
+    }
+    reportToolLimits(checkServingToolLimits(serving));
+  }
   {
     const currentToolNames = [...effectiveTools.map((t) => t.name)].sort();
     const prior = resumedToolNames === undefined ? undefined : [...resumedToolNames].sort();
@@ -7441,11 +7523,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 const maxOutputTokens =
                   cfg?.capabilities?.maxOutputTokens ?? table?.maxOutputTokens;
                 const breakerState = c.breaker?.state();
+                const toolLimit = providerToolLimit(c.modelString);
                 return {
                   armId: armIdOf(c),
                   modelString: c.modelString,
                   tags: c.tags,
                   ...(breakerState !== undefined ? { breakerState } : {}),
+                  ...(toolLimit !== undefined
+                    ? {
+                        toolLimit: {
+                          toolCount: plan.advertisedNames.size,
+                          maxTools: toolLimit.maxTools,
+                        },
+                      }
+                    : {}),
                   capabilities: {
                     features: plan.features,
                     ...(contextWindow !== undefined ? { contextWindow } : {}),

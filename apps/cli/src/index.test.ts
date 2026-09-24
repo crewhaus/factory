@@ -591,6 +591,42 @@ describe("crewhaus compile", () => {
     expect(existsSync(strictOut)).toBe(false);
   }, 30_000);
 
+  // provider-limits#0 — 0.7.0 compiled `tools: [all-code]` on an OpenAI model
+  // (even under --strict) and every call then failed with the provider's 400.
+  test("compile refuses a tool list the only model's provider cannot take, and --strict refuses an over-limit fallback", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const head = "name: wide\ntarget: cli\nagent:\n  instructions: i\n";
+    writeFileSync(specPath, `${head}  model: openai/gpt-5\ntools: [all-code]\n`);
+    const outDir = join(tmp, "out");
+    const refused = await runCli(["compile", specPath, "--no-register", "-o", outDir], {
+      cwd: tmp,
+    });
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toMatch(
+      /^crewhaus: tools: \d+ tools \(from tools:\) exceed the 128-tool limit OpenAI puts on one request, so every call to model "openai\/gpt-5" is refused\./,
+    );
+    expect(refused.stderr).not.toContain("    at ");
+    expect(existsSync(outDir)).toBe(false);
+
+    writeFileSync(
+      specPath,
+      `${head}  model: claude-sonnet-4-6\n  model_fallbacks: [openai/gpt-4o]\ntools: [all-code]\n`,
+    );
+    const loose = await runCli(["compile", specPath, "--no-register", "-o", outDir], { cwd: tmp });
+    expect(loose.exitCode).toBe(0);
+    expect(loose.stderr).toContain(
+      "crewhaus: warning[provider-tool-cap] agent.model_fallbacks[0]:",
+    );
+    const strictOut = join(tmp, "strict-out");
+    const strict = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", strictOut],
+      { cwd: tmp },
+    );
+    expect(strict.exitCode).toBe(1);
+    expect(strict.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
+    expect(existsSync(strictOut)).toBe(false);
+  }, 30_000);
+
   test("compile --strict passes a warning-free spec (and prints no warning lines)", async () => {
     const outDir = join(tmp, "out");
     const result = await runCli(
