@@ -103,13 +103,17 @@ describe("checkBuiltinTool", () => {
     expect(v.kind === "refused" && v.message).toContain("SendMessage and Handoff");
   });
 
-  test("a withheld builtin is refused on every shape", () => {
-    for (const shape of SHAPES) {
+  test("evmSendTransaction compiles where 0.7.0 compiled it, with a warning that it cannot sign", () => {
+    // 0.7.0 compiled it on graph, workflow and crew, and every call failed. A
+    // patch release keeps such a spec compiling, and says why it cannot work.
+    for (const shape of ["graph", "workflow", "crew"] as const) {
       const v = checkBuiltinTool("evmSendTransaction", shape);
-      expect(v.kind).toBe("refused");
-      expect(v.kind === "refused" && v.message).toContain("no shape can run it");
-      expect(v.kind === "refused" && v.message).toContain("EvmSimulate runs the same transaction");
+      expect(v.kind).toBe("inert");
+      expect(v.kind === "inert" && v.message).toBe(
+        `tool "evmSendTransaction" compiles on the ${shape} shape, but no custody provider that can sign ships in this release, so every call returns an error; evmSimulate runs the same transaction without signing. Remove it from tools until a release binds it.`,
+      );
     }
+    expect(checkBuiltinTool("evmSendTransaction", "cli").kind).toBe("refused");
   });
 
   test("a chain reader compiles on its own shapes and names the registrar that binds it", () => {

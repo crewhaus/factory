@@ -14561,7 +14561,6 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       const lines = [
         `${key} (${shapeOnly.name}) — ${shapeOnly.package}`,
         `  carried by: ${shapes}`,
-        ...(shapeOnly.withheld !== undefined ? [`  not available: ${shapeOnly.withheld}`] : []),
         ...(shapeOnly.inert !== undefined ? [`  note: ${shapeOnly.inert}`] : []),
       ];
       if (jsonMode) {

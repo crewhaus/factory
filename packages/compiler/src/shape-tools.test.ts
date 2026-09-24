@@ -45,10 +45,14 @@ describe("0.7.0 tools and categories compile on every host shape", () => {
     );
   });
 
-  test("a withheld builtin is refused on the shape that used to emit it (flag-truth-6#7)", () => {
-    expect(() => compile(graph("[evmSendTransaction]"))).toThrow(
-      /nodes\.plan\.tools: tool "evmSendTransaction" is a builtin, but no shape can run it: no custody provider that can sign ships in this release/,
+  test("evmSendTransaction still compiles where 0.7.0 compiled it, with a warning (flag-truth-6#7)", () => {
+    const result = compile(graph("[evmSendTransaction]"));
+    const warning = result.warnings.find(
+      (w) => w.code === "tool-unwired" && w.message.includes("evmSendTransaction"),
     );
+    expect(warning?.path).toBe("nodes.plan.tools");
+    expect(warning?.message).toContain("no custody provider that can sign ships in this release");
+    expect(agentTs(graph("[evmSendTransaction]"))).toContain("evmSendTransaction");
   });
 
   test("a chain reader with no chains block compiles with a warning that says what to write", () => {
@@ -180,9 +184,8 @@ describe("assertCfWorkerToolsEdgeSafe", () => {
     );
   });
 
-  test("a withheld builtin refuses on the edge too", () => {
-    expect(() => assertCfWorkerToolsEdgeSafe(cliIr("[evmSendTransaction]"))).toThrow(
-      /no shape can run it/,
-    );
+  test("a builtin the edge cannot sign with is left out with a warning", () => {
+    const warnings = assertCfWorkerToolsEdgeSafe(cliIr("[evmSendTransaction]"));
+    expect(warnings.map((w) => w.code)).toEqual(["edge-unsafe-tool"]);
   });
 });

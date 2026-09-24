@@ -1024,7 +1024,7 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
  * differs from a host shape's:
  *   - THROWS `CompilerError` for the host tools the edge has always refused
  *     (bash / the filesystem / code execution / devices — the
- *     `@crewhaus/worker-runtime` policy) and for a builtin no shape can run;
+ *     `@crewhaus/worker-runtime` policy);
  *   - WARNS (`edge-unsafe-tool`) for any other builtin the worker does not
  *     wire, with the reason — it is left out of the worker. A spec that
  *     compiled on 0.7.0 keeps compiling; `--strict` makes it an error;
@@ -1037,23 +1037,10 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
 export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWarning> {
   const sites = toolSitesOf(ir);
   const { rejected, warned } = partitionEdgeTools(sites.flatMap((site) => site.tools));
-  const withheld: string[] = [];
-  for (const site of sites) {
-    for (const key of new Set(site.tools)) {
-      const verdict = checkBuiltinTool(key, "cf-worker");
-      if (verdict.kind === "refused" && verdict.entry.withheld !== undefined) {
-        withheld.push(`${site.path}: ${verdict.message}`);
-      }
-    }
-  }
-  if (rejected.length > 0 || withheld.length > 0) {
-    const host =
-      rejected.length > 0
-        ? [
-            `cf-worker target cannot run ${rejected.length} host tool(s): ${rejected.map((r) => r.reason).join("; ")}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
-          ]
-        : [];
-    throw new CompilerError([...host, ...withheld].join("\n"));
+  if (rejected.length > 0) {
+    throw new CompilerError(
+      `cf-worker target cannot run ${rejected.length} host tool(s): ${rejected.map((r) => r.reason).join("; ")}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
+    );
   }
   const warnings: CompileWarning[] = [];
   const reported = new Set<string>();

@@ -61,8 +61,6 @@ export type BuiltinToolEntry = {
    * call returns an error. The compiler warns (an error under `--strict`).
    */
   readonly inert?: string;
-  /** No shape can run the tool in this release; the compiler refuses it. */
-  readonly withheld?: string;
 };
 
 /**
@@ -348,7 +346,7 @@ export type ChainBootConfig = {
 };
 
 const EVM_WALLET_UNBOUND =
-  "no custody provider that can sign ships in this release, so every call would fail. EvmSimulate runs the same transaction without signing";
+  "no custody provider that can sign ships in this release, so every call returns an error; evmSimulate runs the same transaction without signing";
 
 export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.freeze({
   read: { package: "@crewhaus/tool-fs", export: "read", name: "Read" },
@@ -2537,7 +2535,9 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     io: "network",
     justify: true,
     shapes: ["graph", "workflow", "crew"],
-    withheld: EVM_WALLET_UNBOUND,
+    // Inert, not withheld: 0.7.0 compiled it (every call failed), and a spec
+    // that did must keep compiling in a patch release — with a warning.
+    inert: EVM_WALLET_UNBOUND,
   },
   evmSimulate: {
     package: "@crewhaus/tool-evm-tx",

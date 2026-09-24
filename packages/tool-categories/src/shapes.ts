@@ -158,16 +158,13 @@ function list(names: ReadonlyArray<string>): string {
 /** The keys the edge worker wires, for the cf-worker refusal text. */
 function edgeKeys(): ReadonlyArray<string> {
   return Object.entries(BUILTIN_TOOLS)
-    .filter(([, e]) => e.edge === true && e.withheld === undefined)
+    .filter(([, e]) => e.edge === true && e.inert === undefined)
     .map(([k]) => k);
 }
 
 function refusal(key: string, entry: BuiltinToolEntry, shape: ToolShape): string | undefined {
   const profile = SHAPE_TOOL_PROFILES[shape];
   const head = `tool "${key}" is a builtin, but ${profile.label} cannot run it`;
-  if (entry.withheld !== undefined) {
-    return `tool "${key}" is a builtin, but no shape can run it: ${entry.withheld}. Remove it from tools.`;
-  }
   if (profile.runtime === "edge") {
     if (entry.edge === true) return undefined;
     const why =

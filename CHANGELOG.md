@@ -72,9 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   builtins, and it now suggests the nearest builtin and how to search for one
   instead of listing every builtin. Compile errors about tools start with the
   spec path they concern (`nodes.plan.tools:`).
-- **`evmSendTransaction` no longer compiles.** It compiled on graph, workflow
-  and crew, but no custody provider that can sign ships in this release, so
-  every call failed. Remove it from `tools:`; `evmSimulate` runs the same
+- **`evmSendTransaction` says it cannot sign.** It compiles on graph,
+  workflow and crew, but no custody provider that can sign ships in this
+  release, so every call fails. Compile now warns (`tool-unwired`, an error
+  under `--strict`). Remove it from `tools:`; `evmSimulate` runs the same
   transaction without signing.
 - **Two different `tool_config` blocks for one package are a compile error.**
   A package reads one block, so `tool_config.http` and
