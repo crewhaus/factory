@@ -17,10 +17,13 @@
  *    caller that cannot see when its own inhibitor lapses will hold another.
  * 2. **A PID IS NOT AN IDENTITY.** Pids are reused, and `release` reading a
  *    stale state file would otherwise send SIGTERM to whatever now owns that
- *    number. So the state file records the backend program, and `release` and
- *    `status` VERIFY the live process's command line before signalling
- *    anything. A mismatch is reported as `stale` and the file is cleared —
- *    nothing is killed.
+ *    number. So `release` and `status` VERIFY the live process's command line
+ *    against the holder THIS package starts on this platform
+ *    ({@link isHolderCommand}) before signalling anything — never against a
+ *    value the record itself carries, since the record also supplies the pid.
+ *    A mismatch is reported as `stale` and the file is cleared — nothing is
+ *    killed. The record lives in a per-user private directory outside the
+ *    workspace, where the agent's file tools cannot plant one.
  * 3. **WINDOWS CANNOT DO THIS IN A ONE-LINER.** `SetThreadExecutionState` is
  *    THREAD-scoped and its effect dies with the thread, so a PowerShell
  *    one-liner that sets the flag and exits does precisely nothing — the
@@ -43,8 +46,64 @@ export type AssertionScope = "system" | "display";
 export const MAX_HOLD_MINUTES = 480;
 export const DEFAULT_HOLD_MINUTES = 30;
 
-/** Where the held assertion is remembered, relative to the workspace root. */
-export const STATE_RELATIVE_PATH = ".crewhaus/power-assertion.json";
+/**
+ * Where 0.7.0 remembered the held assertion, relative to the workspace root.
+ *
+ * NOT READ ANY MORE, only reported. A file in the workspace can be written by
+ * the agent the tool serves (Write, CopyPath, an extracted archive), and the
+ * record names the pid `release` signals: a planted record made `release`
+ * SIGTERM any process of the operator's (security-10#1). The record now lives
+ * in a private per-user directory — see `powerStateFile` in ../index.ts.
+ */
+export const LEGACY_STATE_RELATIVE_PATH = ".crewhaus/power-assertion.json";
+
+/**
+ * The program this package's holder runs on `platform` — the ONE source for
+ * both `planHold` and the identity check `release` makes before signalling.
+ * The check used to compare against the `marker` field of the state record,
+ * which is the same record that supplies the pid, so whoever wrote the record
+ * chose what the live process was checked against (security-10#1).
+ */
+export function holderMarker(platform: HostPlatform): string | undefined {
+  switch (platform) {
+    case "darwin":
+      return DARWIN_HOLDER;
+    case "linux":
+      return LINUX_HOLDER;
+    case "win32":
+      return WINDOWS_HOLDER_TYPE;
+    default:
+      return undefined;
+  }
+}
+
+const DARWIN_HOLDER = "caffeinate";
+const LINUX_HOLDER = "systemd-inhibit";
+/** The type name the Windows holder script defines; see WINDOWS_INHIBIT. */
+const WINDOWS_HOLDER_TYPE = "CHPwr";
+
+/**
+ * Is `commandLine` a holder THIS package starts on `platform`?
+ *
+ * The program must be the platform's holder, and the arguments must carry
+ * what `planHold` always gives it: `-t <seconds>` for caffeinate,
+ * `--who=crewhaus` for systemd-inhibit, and the generated type name inside a
+ * powershell host. An operator's own `caffeinate -d` is therefore never
+ * taken for ours.
+ */
+export function isHolderCommand(platform: HostPlatform, commandLine: string): boolean {
+  const marker = holderMarker(platform);
+  if (marker === undefined || !commandMatchesMarker(commandLine, marker)) return false;
+  const tokens = commandLine.trim().split(/\s+/);
+  switch (platform) {
+    case "darwin":
+      return tokens.includes("-t");
+    case "linux":
+      return tokens.includes("--who=crewhaus");
+    default:
+      return true;
+  }
+}
 
 export const WINDOWS_INHIBIT = registerPowerShellScript({
   name: "power-inhibit",
@@ -157,7 +216,7 @@ export function planHold(
       const argv = ["caffeinate", "-i", "-m"];
       if (scope === "display") argv.push("-d");
       argv.push("-t", String(seconds));
-      return { ok: true, backend: "caffeinate", marker: "caffeinate", request: { argv } };
+      return { ok: true, backend: "caffeinate", marker: DARWIN_HOLDER, request: { argv } };
     }
     case "linux": {
       const what = scope === "display" ? "idle:sleep:handle-lid-switch" : "idle:sleep";
@@ -175,7 +234,7 @@ export function planHold(
       return {
         ok: true,
         backend: "systemd-inhibit",
-        marker: "systemd-inhibit",
+        marker: LINUX_HOLDER,
         request: { argv },
       };
     }
@@ -188,7 +247,7 @@ export function planHold(
       return {
         ok: true,
         backend: "powershell SetThreadExecutionState",
-        marker: "CHPwr",
+        marker: WINDOWS_HOLDER_TYPE,
         request: { argv: built.argv, env: built.env },
       };
     }
@@ -279,7 +338,8 @@ export function commandMatchesMarker(commandLine: string, marker: string): boole
 }
 
 export function classifyLiveness(
-  marker: string,
+  /** The holder's program name, or a predicate over the live command line. */
+  holder: string | ((commandLine: string) => boolean),
   result: {
     readonly code: number;
     readonly stdout: string;
@@ -309,7 +369,8 @@ export function classifyLiveness(
   }
   const line = result.stdout.trim();
   if (line === "") return "gone";
-  return commandMatchesMarker(line, marker) ? "alive" : "reused";
+  const ours = typeof holder === "string" ? commandMatchesMarker(line, holder) : holder(line);
+  return ours ? "alive" : "reused";
 }
 
 /** Minutes to a bounded second count, or a refusal naming the ceiling. */

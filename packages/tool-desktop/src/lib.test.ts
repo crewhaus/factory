@@ -48,7 +48,13 @@ import {
 } from "./lib/escape";
 import { buildToastXml, classifyNotify } from "./lib/notify";
 import { classifyTarget, uriScheme } from "./lib/open";
-import { boundedSeconds, classifyLiveness } from "./lib/power";
+import {
+  boundedSeconds,
+  classifyLiveness,
+  holderMarker,
+  isHolderCommand,
+  planHold,
+} from "./lib/power";
 import {
   parseIoregIdleSeconds,
   parseIoregLocked,
@@ -442,4 +448,30 @@ test("liveness keeps four answers apart, so a reused pid is never signalled", ()
   expect(classifyLiveness("caffeinate", probe({ timedOut: true }))).toBe("unknown");
   expect(classifyLiveness("caffeinate", probe({ missing: true }))).toBe("unknown");
   expect(classifyLiveness("caffeinate", probe({ refused: true }))).toBe("unknown");
+});
+
+test("the holder the identity check expects is the holder planHold starts", () => {
+  // security-10#1: one source for both. The check used to read the marker
+  // from the state record, which also supplies the pid.
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    const plan = planHold(platform, "system", 60, null);
+    if (!plan.ok) throw new Error(`no plan for ${platform}`);
+    expect(holderMarker(platform)).toBe(plan.marker);
+    // What planHold starts passes the check on its own platform...
+    const line =
+      platform === "win32"
+        ? `"C:\\Windows\\powershell.exe" -NoProfile -Command "${plan.request.argv.at(-1) ?? ""}"`
+        : plan.request.argv.join(" ");
+    expect(isHolderCommand(platform, line)).toBe(true);
+  }
+  expect(holderMarker("unsupported")).toBeUndefined();
+  // ...and a same-program process this package did not start does not.
+  expect(isHolderCommand("darwin", "caffeinate -d")).toBe(false);
+  expect(isHolderCommand("darwin", "/usr/bin/caffeinate -i -m -t 1800")).toBe(true);
+  expect(isHolderCommand("linux", "systemd-inhibit --what=sleep sleep 60")).toBe(false);
+  expect(isHolderCommand("linux", "systemd-inhibit --who=crewhaus --mode=block sleep 60")).toBe(
+    true,
+  );
+  expect(isHolderCommand("darwin", "sleep 300")).toBe(false);
+  expect(isHolderCommand("win32", '"C:\\Program Files\\chrome.exe" --type=renderer')).toBe(false);
 });
