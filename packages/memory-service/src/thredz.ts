@@ -113,7 +113,8 @@ export function thredzAliasToolNames(messaging = false): readonly string[] {
  * `@crewhaus/tool-wiki` / the goal tools' intent, so the backend flip never
  * relaxes a permission posture: `wiki_write`/`wiki_set_signals` keep their
  * Pillar 3 justification gate, `log_knowledge_gap` stays the un-gated honest
- * path, reads stay readOnly.
+ * path, reads stay readOnly. `inbox_poll` can consume, so it is not one of
+ * the reads (see its entry).
  */
 export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   wiki_recall: { readOnly: true },
@@ -139,6 +140,17 @@ export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   // Item 5 (G44) / #401 — the messaging set. Reads are reads; everything
   // that mutates the agent directory or a mailbox is destructive.
   //
+  // `inbox_poll` is not a read (0.7.1): its `mode: "consume"` advances the
+  // agent's at-least-once cursor and its `ack` commits one — the same effect
+  // as `message_ack` — and the call forwards both to the server untouched.
+  // Flags cannot depend on the arguments, so it is neither readOnly nor
+  // destructive: plan mode refuses it, default mode asks unless a rule
+  // allows it, and auto mode lets the heartbeat that polls every tick run
+  // without asking (making it destructive would stall every auto-mode A2A
+  // daemon that has no rule for it). The cursor stays recoverable
+  // (`message_ack` seek with `allowRegression`), and `thread_get` reads a
+  // thread without touching it.
+  //
   // `message_send` additionally carries the Pillar 3 intent gate, exactly as
   // the built-in `SendMessage` does and exactly as the spec's own
   // `thredz.messaging` docblock promises ("the send-side tools are
@@ -148,7 +160,7 @@ export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   // mutations are directory bookkeeping scoped to this agent's own handle,
   // so gating them would only train operators to wave the gate through.
   agent_list: { readOnly: true },
-  inbox_poll: { readOnly: true },
+  inbox_poll: { readOnly: false, destructive: false },
   thread_get: { readOnly: true },
   agent_register: { destructive: true },
   agent_update: { destructive: true },
