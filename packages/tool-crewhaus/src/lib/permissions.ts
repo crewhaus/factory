@@ -26,6 +26,7 @@
  */
 
 import { isOutwardName } from "@crewhaus/tool-builder";
+import { legacyMcpToolName } from "@crewhaus/tool-catalog";
 import { compareStrings } from "./spec-view";
 
 /** A rule as a spec declares it. */
@@ -71,9 +72,10 @@ export type PermissionAuditResult = {
    */
   readonly malformedRules: readonly RuleLike[];
   /**
-   * True when `mode` makes the rule list moot: in `plan` the engine decides
-   * on the tool's own `readOnly` flag and consults no rule at all, so every
-   * `decision` below describes a rule that will not be reached.
+   * True when `mode` overrides part of the rule list: in `plan` the engine
+   * ignores every allow rule, reads deny and ask rules (both deny — plan mode
+   * cannot ask), and otherwise decides on the tool's own `readOnly` flag. The
+   * `decision`s below are computed that way.
    */
   readonly modeOverridesRules: boolean;
   readonly findings: readonly PermissionFinding[];
@@ -154,11 +156,17 @@ export function compileToolGlob(glob: string): RegExp {
   return new RegExp(`^${re}$`, "s");
 }
 
-/** How well `pattern` covers `toolName`. A malformed pattern covers nothing. */
+/**
+ * How well `pattern` covers `toolName`. A malformed pattern covers nothing.
+ * An MCP tool (`mcp__<server>__<tool>`) is also covered by a pattern written
+ * against its pre-0.7.1 spelling `<server>__<tool>`, as the engine does.
+ */
 export function patternCoverage(pattern: string, toolName: string): Coverage {
   const split = splitPattern(pattern);
   if (split === undefined) return "none";
-  if (!compileToolGlob(split.toolGlob).test(toolName)) return "none";
+  const glob = compileToolGlob(split.toolGlob);
+  const legacy = legacyMcpToolName(toolName);
+  if (!glob.test(toolName) && (legacy === undefined || !glob.test(legacy))) return "none";
   return split.argGlob === null ? "full" : "conditional";
 }
 
@@ -220,9 +228,8 @@ export type AuditPermissionsInput = {
 export function auditPermissions(input: AuditPermissionsInput): PermissionAuditResult {
   const destructive = input.destructiveTools ?? new Set<string>();
   const fallback = fallbackDecision(input.mode);
-  // `plan` never reaches the rule list — `evaluateWithReason` returns on the
-  // tool's own readOnly flag before the scan — so a report that presented
-  // rule decisions under it would be describing code that does not run.
+  // `plan` reads only deny and ask rules (both deny) and ignores allows, so
+  // the scan below skips allows and reports a matched ask as a deny there.
   const modeOverridesRules = input.mode === "plan";
   const malformedRules = input.rules
     .filter((rule) => splitPattern(rule.pattern) === undefined)
@@ -240,6 +247,7 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     const registered = toRegisteredName(tool);
     let matched: { rule: RuleLike; coverage: Coverage } | undefined;
     for (const rule of input.rules) {
+      if (modeOverridesRules && rule.type === "alwaysAllow") continue;
       if (splitPattern(rule.pattern) === undefined) {
         // Mirror the engine: a broken guard still gates, a broken grant does
         // not. Scanning in declaration order, so this rule wins here exactly
@@ -265,7 +273,12 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     const isDestructive = destructive.has(tool) || destructive.has(registered);
     const entry: ToolPermission = {
       tool,
-      decision: matched !== undefined ? decisionOf(matched.rule.type) : fallback,
+      decision:
+        matched === undefined
+          ? fallback
+          : modeOverridesRules
+            ? "deny"
+            : decisionOf(matched.rule.type),
       ...(matched !== undefined ? { rule: matched.rule } : {}),
       conditional: matched?.coverage === "conditional",
       external,
@@ -307,7 +320,7 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     findings.push({
       tool: "<every tool>",
       reason:
-        'permissions.mode is "plan", under which the engine allows read-only tools and denies the rest without consulting a single rule — the decisions reported here are what WOULD apply in default or auto mode',
+        'permissions.mode is "plan": the engine ignores every allow rule, denies a call any deny or ask rule matches (plan mode cannot ask), and otherwise allows read-only tools and denies the rest — the decisions reported here are computed that way',
     });
   }
 

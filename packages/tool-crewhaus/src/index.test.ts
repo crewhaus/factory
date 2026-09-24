@@ -1125,26 +1125,66 @@ describe("permission reporting matches the engine", () => {
     expect(result.tools.every((t) => t.decision !== "allow")).toBe(true);
   });
 
-  test("plan mode says the rules are not reached", async () => {
+  test("plan mode reports what plan mode does: allows ignored, deny and ask deny (0.7.1)", async () => {
     const spec = [
       "name: demo",
       "target: cli",
       "agent:",
       "  model: claude-sonnet-4-6",
       "  instructions: x",
-      "tools: [read]",
+      "tools: [read, webFetch, grep]",
       "permissions:",
       "  mode: plan",
       "  rules:",
       "    - type: alwaysAllow",
       "      pattern: Read",
+      "    - type: alwaysDeny",
+      "      pattern: WebFetch",
+      "    - type: alwaysAsk",
+      "      pattern: Grep",
     ].join("\n");
     const result = await callJson<{
       modeOverridesRules: boolean;
+      tools: Array<{ tool: string; decision: string }>;
       findings: Array<{ reason: string }>;
     }>(permissionAudit, { spec });
     expect(result.modeOverridesRules).toBe(true);
-    expect(result.findings.some((f) => f.reason.includes("consulting a single rule"))).toBe(true);
+    const decisions = Object.fromEntries(result.tools.map((t) => [t.tool, t.decision]));
+    expect(decisions).toEqual({
+      grep: "deny",
+      read: "allow for read-only tools, deny for the rest",
+      webFetch: "deny",
+    });
+    expect(
+      result.findings.some((f) => f.reason.includes("the engine ignores every allow rule")),
+    ).toBe(true);
+  });
+
+  test("a rule in the pre-0.7.1 MCP spelling still names an mcp__ tool", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+      "tools: [mcp__github__create_issue]",
+      "mcp_servers:",
+      "  github:",
+      "    transport: stdio",
+      "    command: npx",
+      "permissions:",
+      "  rules:",
+      "    - type: alwaysDeny",
+      "      pattern: github__create_issue",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string }>;
+      unusedRules: unknown[];
+    }>(permissionAudit, { spec });
+    expect(result.tools).toContainEqual(
+      expect.objectContaining({ tool: "mcp__github__create_issue", decision: "deny" }),
+    );
+    expect(result.unusedRules).toEqual([]);
   });
 });
 
