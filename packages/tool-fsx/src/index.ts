@@ -713,6 +713,7 @@ export const readLines: RegisteredTool = buildTool({
       }
       current = "";
       currentChars = 0;
+      cut = false;
     };
 
     try {
@@ -755,7 +756,12 @@ export const readLines: RegisteredTool = buildTool({
               break scan;
             }
             if (budgetLeft === 0) {
-              stoppedAtBudget = true;
+              // Out of budget with lines still wanted: stopped by the budget
+              // only if there IS another line; at the end of the file the
+              // answer is complete.
+              const more = stop + 1 < read || readSync(fd, buffer, 0, 1, chunkStart + read) > 0;
+              if (more) stoppedAtBudget = true;
+              else endOfFile = true;
               break scan;
             }
           }

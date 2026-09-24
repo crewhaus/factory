@@ -681,6 +681,20 @@ describe("ReadLines keeps to a character budget (C164)", () => {
     expect(out).toMatchObject({ truncated: true, stoppedAtBudget: true, end: 1 });
   });
 
+  test("a budget used up exactly by the file's last line is a complete answer, not a cut one", async () => {
+    write("last.txt", `${"z".repeat(1024)}\n`);
+    const out = await run(readLines, { path: "last.txt", maxChars: 1024 });
+    expect(out).toEqual({
+      path: "last.txt",
+      start: 1,
+      end: 1,
+      requestedEnd: 500,
+      lines: ["z".repeat(1024)],
+      returned: 1,
+      endOfFile: true,
+    });
+  });
+
   test("an overlong line before start is skipped without breaking the numbering", async () => {
     write("skip.txt", `head\n${"q".repeat(1_000_000)}\nok\n`);
     const out = await run(readLines, { path: "skip.txt", start: 3, maxLines: 1 });
