@@ -53,6 +53,7 @@ export {
   decodeAggregate3,
   decodeRevertData,
   encodeAggregate3,
+  parseMulticallMap,
 } from "./lib/multicall";
 
 const json = (value: unknown): string => JSON.stringify(value);

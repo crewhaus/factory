@@ -229,7 +229,9 @@ describe("every boot seam in a tool package has a delivery path", () => {
     const by = (how: "code" | "name") =>
       seams.filter((s) => s.by === how || s.by === "both").map((s) => s.symbol);
     expect(seams.length).toBe(35);
-    expect(by("code").length).toBe(21);
+    // 22: registerTokenConfig also keeps tool-token's Multicall3 deployments
+    // (C127), so its own code now assigns module state, not only its name.
+    expect(by("code").length).toBe(22);
     expect(by("name").length).toBe(34);
     expect(by("code")).toContain("setChainRpcResolver");
     expect(by("name")).toContain("registerChannelAdapter");

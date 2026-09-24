@@ -388,6 +388,19 @@ describe("configuration", () => {
     );
   });
 
+  test("a Multicall3 deployment is held to the address check at config time (C127)", () => {
+    // The aggregator answers every read in a batch; 0.7.0 lowercased whatever
+    // was written, so a mistyped mixed-case address became every answer.
+    expect(() =>
+      buildDefiConfig({ multicall3: { "324": "0xF9cda624FBC7e059355ce98a31693d299FACd964" } }),
+    ).toThrow(/multicall3\["324"\]: the EIP-55 checksum does not match/);
+    expect(() => buildDefiConfig({ multicall3: { "324": "0x1234" } })).toThrow(DefiError);
+    expect(
+      buildDefiConfig({ multicall3: { "324": "0xF9cda624FBC7e059355ce98a31693d299FACd963" } })
+        .multicall,
+    ).toEqual(new Map([["324", "0xf9cda624fbc7e059355ce98a31693d299facd963"]]));
+  });
+
   test("a pyth feed without a price id is refused at config time", () => {
     expect(() =>
       buildDefiConfig({

@@ -24,6 +24,7 @@
  */
 import { assertReadOnlyMethod } from "@crewhaus/chain-adapter-base";
 import { CrewhausError } from "@crewhaus/errors";
+import { parseMulticallMap } from "@crewhaus/tool-onchain";
 
 /** A refusal this package chose: a missing endpoint, a bad shape, a write attempt. */
 export class DefiError extends CrewhausError {
@@ -90,12 +91,18 @@ export function buildDefiConfig(input: DefiConfigInput): DefiConfig {
     if (typeof url !== "string") throw new DefiError(`rpc["${chainId}"] must be a URL string`);
     endpoints.set(String(chainId), assertEndpoint(url, chainId));
   }
-  const multicall = new Map<string, string>();
-  for (const [chainId, address] of Object.entries(input.multicall3 ?? {})) {
-    if (typeof address !== "string") {
-      throw new DefiError(`multicall3["${chainId}"] must be an address string`);
-    }
-    multicall.set(String(chainId), address.trim().toLowerCase());
+  // Checked like any address a coder writes: shape, and the EIP-55 checksum
+  // when it carries one. The deployment answers every read in a batch.
+  let multicall: Map<string, string>;
+  try {
+    multicall = new Map(
+      [...parseMulticallMap(input.multicall3, "multicall3")].map(([id, a]) => [
+        id,
+        a.toLowerCase(),
+      ]),
+    );
+  } catch (err) {
+    throw new DefiError((err as Error).message);
   }
   const feeds = new Map<string, FeedPin>();
   for (const [name, row] of Object.entries(input.feeds ?? {})) {

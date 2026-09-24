@@ -42,6 +42,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { MULTICALL3_ADDRESS } from "@crewhaus/tool-onchain";
 import { z } from "zod";
+import { resolveAggregator } from "./lib/boot";
 import {
   type BatchCall,
   type CallOutcome,
@@ -96,7 +97,12 @@ export {
   chainReaderFromAdapters,
   hasChainReader,
 } from "./lib/chain";
-export { type TokenConfigInput, bindTokenChains, registerTokenConfig } from "./lib/boot";
+export {
+  type Aggregator,
+  type TokenConfigInput,
+  bindTokenChains,
+  registerTokenConfig,
+} from "./lib/boot";
 export {
   type MetadataFetch,
   type MetadataResponse,
@@ -145,7 +151,9 @@ const batchField = z
 const multicallField = z
   .string()
   .optional()
-  .describe(`Multicall3's address on this chain; default ${MULTICALL3_ADDRESS}`);
+  .describe(
+    `leave it out: batches go to the canonical Multicall3 (${MULTICALL3_ADDRESS}) or the one the operator configured for the chain, and any other address is refused`,
+  );
 
 // ---------------------------------------------------------------------------
 // shared helpers
@@ -476,7 +484,7 @@ export const tokenResolve: RegisteredTool = buildTool({
   // through whatever the runtime bound to the seam.
   scope: "external",
   ioCapability: "network",
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const query = input.query.trim();
     const lists = (input.lists ?? []) as ReadonlyArray<TokenList>;
     const policy = input.policy ?? "listed-only";
@@ -584,6 +592,12 @@ export const tokenResolve: RegisteredTool = buildTool({
 
     const facts = new Map<string, Erc20Facts & { hasCode: boolean | null }>();
     let blockNumber: string | null = null;
+    // Resolved before any read: an aggregator the operator did not name is
+    // refused, not asked.
+    const aggregator =
+      confirm && (input.batch ?? true)
+        ? resolveAggregator(input.chainId, input.multicall3Address, ctx?.toolConfig)
+        : null;
     if (confirm) {
       const calls: BatchCall[] = [];
       for (const [i, candidate] of candidates.entries()) {
@@ -593,10 +607,8 @@ export const tokenResolve: RegisteredTool = buildTool({
         chainId: input.chainId,
         calls,
         blockTag,
-        batch: input.batch ?? true,
-        ...(input.multicall3Address !== undefined
-          ? { multicall3Address: input.multicall3Address }
-          : {}),
+        batch: aggregator !== null,
+        ...(aggregator !== null ? { multicall3Address: aggregator.address } : {}),
       });
       blockNumber = read.blockNumber;
       for (const [i, candidate] of candidates.entries()) {
@@ -621,7 +633,14 @@ export const tokenResolve: RegisteredTool = buildTool({
       });
     }
 
-    const shared = { ...base, blockNumber, confirmedOnchain: confirm, candidates: flagged };
+    const shared = {
+      ...base,
+      blockNumber,
+      confirmedOnchain: confirm,
+      // Who answered the batched reads, since every one of them is its word.
+      aggregator,
+      candidates: flagged,
+    };
 
     if (flagged.length > 1) {
       return json({
@@ -728,10 +747,13 @@ export const erc20Balance: RegisteredTool = buildTool({
   concurrencySafe: true,
   scope: "external",
   ioCapability: "network",
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const blockTag = input.blockTag ?? "latest";
     const batch = input.batch ?? true;
-    const multicall = input.multicall3Address ?? MULTICALL3_ADDRESS;
+    const aggregator = batch
+      ? resolveAggregator(input.chainId, input.multicall3Address, ctx?.toolConfig)
+      : null;
+    const multicall = aggregator?.address ?? MULTICALL3_ADDRESS;
     const isNative = input.token.trim().toLowerCase() === "native";
 
     if (!isNative && !ADDRESS_SHAPE.test(input.token.trim())) {
@@ -810,6 +832,7 @@ export const erc20Balance: RegisteredTool = buildTool({
         blockTag,
         blockNumber,
         batched: batch,
+        aggregator,
         token: { kind: "native", address: null, decimals },
         balances,
         warnings,
@@ -897,6 +920,7 @@ export const erc20Balance: RegisteredTool = buildTool({
       blockTag,
       blockNumber: read.blockNumber,
       batched: read.batched,
+      aggregator,
       token: {
         kind: "erc20",
         address: token,
@@ -1006,6 +1030,10 @@ export const erc721TokenInfo: RegisteredTool = buildTool({
       );
     }
 
+    const aggregator =
+      (input.batch ?? true)
+        ? resolveAggregator(input.chainId, input.multicall3Address, ctx?.toolConfig)
+        : null;
     const code =
       (input.checkCode ?? true) ? await readHasCode(input.chainId, contract, blockTag) : null;
     if (code !== null && !code.hasCode) {
@@ -1045,10 +1073,8 @@ export const erc721TokenInfo: RegisteredTool = buildTool({
       chainId: input.chainId,
       calls,
       blockTag,
-      batch: input.batch ?? true,
-      ...(input.multicall3Address !== undefined
-        ? { multicall3Address: input.multicall3Address }
-        : {}),
+      batch: aggregator !== null,
+      ...(aggregator !== null ? { multicall3Address: aggregator.address } : {}),
     });
 
     const says = (key: string): boolean | null => {
@@ -1237,6 +1263,7 @@ export const erc721TokenInfo: RegisteredTool = buildTool({
       blockTag,
       blockNumber: read.blockNumber,
       batched: read.batched,
+      aggregator,
       standard,
       standardSource,
       interfaces,

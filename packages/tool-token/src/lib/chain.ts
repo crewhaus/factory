@@ -252,7 +252,7 @@ export async function readCalls(opts: {
     rows = decodeAggregate3(asHex(answer, "the Multicall3 batch"), request.callCount);
   } catch (err) {
     throw new TokenError(
-      `the Multicall3 batch at ${request.to} did not answer with results: ${(err as Error).message}. If this chain has no Multicall3 deployment at that address, pass multicall3Address, or batch:false to read the calls one at a time.`,
+      `the Multicall3 batch at ${request.to} did not answer with results: ${(err as Error).message}. If this chain's Multicall3 is deployed elsewhere, the operator names it in tool_config.token.multicall3; or pass batch:false to read the calls one at a time.`,
     );
   }
 
