@@ -1488,6 +1488,40 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(readFileSync(specPath, "utf-8")).toBe(original);
   });
 
+  test("an MCP server's args are not tool names, and a flow tools: list is fixed to spec keys", async () => {
+    // shape-reach#6 — the fixer used to rewrite any bare-word list item within
+    // three edits of a tool name: files→PrFiles, logs→Glob, build→Uuid in an
+    // MCP server's argv, which then compiled clean.
+    const specPath = join(tmp, "crewhaus.yaml");
+    const mcp = [
+      "mcp_servers:",
+      "  files:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      "      - files",
+      "      - logs",
+      "      - build",
+      "      - reports",
+      "  more:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args: [files, logs, build, reports]",
+    ].join("\n");
+    const spec = (tools: string): string =>
+      `name: t\ntarget: cli\nagent:\n  model: m\n  instructions: hi\n${mcp}\ntools: [${tools}]\n`;
+    writeFileSync(specPath, spec("raed, webfetch"));
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    // Exactly the two tool typos, each to the spec key a tools: list takes.
+    expect(result.stdout.split("\n").filter((l) => l.startsWith("fixed:"))).toEqual([
+      'fixed: tool "raed" → "read" (nearest match)',
+      'fixed: tool "webfetch" → "webFetch" (nearest match)',
+    ]);
+    expect(readFileSync(specPath, "utf-8")).toBe(spec("read, webFetch"));
+  });
+
   test("lint reports a tool the spec's shape cannot compile, in compile's words", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(
