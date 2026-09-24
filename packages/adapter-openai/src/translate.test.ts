@@ -90,22 +90,16 @@ describe("toOpenAIChatParams", () => {
       ],
       toolChoice: { type: "tool", name: "Read" },
     });
-    // A plain object schema qualifies for Structured-Outputs strict mode:
-    // `additionalProperties: false`, every property in `required`, and the
-    // (originally optional) `path` made nullable so omission is expressible.
+    // `path` is optional, so the tool stays non-strict: strict mode would
+    // make the model send `path: null` to leave it out, and the tool's
+    // validator refuses null (provider-limits#2). The schema rides as is.
     expect(params.tools).toEqual([
       {
         type: "function",
         function: {
           name: "Read",
           description: "Read a file",
-          parameters: {
-            type: "object",
-            properties: { path: { type: ["string", "null"] } },
-            required: ["path"],
-            additionalProperties: false,
-          },
-          strict: true,
+          parameters: { type: "object", properties: { path: { type: "string" } } },
         },
       },
     ]);
@@ -130,7 +124,7 @@ describe("toOpenAIChatParams", () => {
               target: { $ref: "#/$defs/Endpoint" },
               retries: { type: "integer" },
             },
-            required: ["target"],
+            required: ["target", "retries"],
             $defs: {
               Endpoint: {
                 type: "object",
@@ -149,10 +143,11 @@ describe("toOpenAIChatParams", () => {
     expect(fn.strict).toBe(true);
     const p = fn.parameters as Record<string, unknown>;
     expect(p["additionalProperties"]).toBe(false);
-    // both properties required under strict; the optional one made nullable
     expect(new Set(p["required"] as string[])).toEqual(new Set(["target", "retries"]));
     const props = p["properties"] as Record<string, Record<string, unknown>>;
-    expect(props["retries"]?.["type"]).toEqual(["integer", "null"]);
+    expect(props["retries"]?.["type"]).toBe("integer");
+    // Nothing was made nullable: the model is never forced to send null.
+    expect(JSON.stringify(p)).not.toContain('"null"');
     // ref inlined + nested object also locked down
     const target = props["target"] as Record<string, unknown>;
     expect(target["additionalProperties"]).toBe(false);

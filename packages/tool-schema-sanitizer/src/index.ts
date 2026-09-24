@@ -34,11 +34,13 @@
  * - {@link toOpenAIStrictSchema} — OpenAI Structured-Outputs strict mode.
  *   OpenAI is the inverse case: rather than downcast, we UPGRADE a
  *   qualifying schema (object root, keywords entirely inside the strict
- *   subset) into a strict-ready form — `additionalProperties: false` on
- *   every object, every property listed in `required`, previously
- *   optional properties made nullable — so the adapter can set
- *   `strict: true`. Schemas that can't be expressed in the strict subset
- *   return `null` and stay non-strict (best-effort, never a 400).
+ *   subset, every property of every object already required) into a
+ *   strict-ready form — `additionalProperties: false` on every object —
+ *   so the adapter can set `strict: true`. Schemas that can't be
+ *   expressed in the strict subset return `null` and stay non-strict
+ *   (best-effort, never a 400). A schema with an optional property stays
+ *   non-strict: strict would make the model send `null` for it, which the
+ *   tool's validator refuses.
  *
  * Inlining is bounded ({@link inlineRefsWithReport}): a `$ref` DAG cannot
  * grow a small schema exponentially.
@@ -586,16 +588,18 @@ const OPENAI_STRICT_DISQUALIFIERS: ReadonlySet<string> = new Set([
  * when it can't be expressed in the strict subset.
  *
  * A qualifying schema is an object-rooted schema whose every node uses
- * only strict-supported keywords. The returned schema has `$ref`s
- * inlined, `additionalProperties: false` on every object, and every
- * property listed in `required` — with properties that were previously
- * optional made nullable (`type: ["T", "null"]`), the documented way to
- * keep a field optional under strict mode.
+ * only strict-supported keywords AND whose every object already lists
+ * every one of its properties in `required`. The returned schema has
+ * `$ref`s inlined and `additionalProperties: false` on every object.
  *
- * A schema whose `$ref`s could not all be inlined
- * ({@link inlineRefsWithReport}) stays non-strict: the permissive stand-in
- * has no strict form, and the adapter sends the original schema instead,
- * which loses nothing.
+ * A schema with an optional property anywhere stays non-strict. Strict
+ * mode makes the model send every key, so the only way to leave one out
+ * is to send `null`; the tools' validators read `null` as a value, not as
+ * absence, and refused the call (`Grep` with `path: null` — provider-limits#2).
+ * Non-strict, the model simply omits the key. So does a schema whose
+ * `$ref`s could not all be inlined ({@link inlineRefsWithReport}): the
+ * permissive stand-in has no strict form, and the adapter sends the
+ * original schema instead, which loses nothing.
  */
 export function toOpenAIStrictSchema(schema: JsonSchema): JsonSchema | null {
   const { schema: inlined, truncatedRefs } = inlineRefsWithReport(schema);
@@ -619,10 +623,23 @@ function strictNodeOk(node: JsonSchema): boolean {
   const additional = node["additionalProperties"];
   if (additional === true || isSchemaObject(additional)) return false;
 
-  if (isSchemaObject(node["properties"])) {
-    for (const value of Object.values(node["properties"])) {
+  const properties = node["properties"];
+  if (isSchemaObject(properties)) {
+    // Every property must already be required: strict would force an
+    // optional one to be sent, as `null` (see toOpenAIStrictSchema).
+    const required = new Set(
+      Array.isArray(node["required"])
+        ? node["required"].filter((r): r is string => typeof r === "string")
+        : [],
+    );
+    for (const [key, value] of Object.entries(properties)) {
+      if (!required.has(key)) return false;
       if (isSchemaObject(value) && !strictNodeOk(value)) return false;
     }
+  } else if (node["type"] === "object" && additional !== false) {
+    // `{ type: "object" }` with no properties is a free-form object; strict
+    // would lock it to `{}`.
+    return false;
   }
   if (Array.isArray(node["items"])) return false; // tuple typing is unsupported
   if (isSchemaObject(node["items"]) && !strictNodeOk(node["items"])) return false;
@@ -638,20 +655,12 @@ function makeStrict(node: JsonSchema): JsonSchema {
   const out: JsonSchema = { ...node };
 
   if (isSchemaObject(out["properties"])) {
-    const originalRequired = new Set(
-      Array.isArray(out["required"])
-        ? out["required"].filter((r): r is string => typeof r === "string")
-        : [],
-    );
+    // strictNodeOk has checked every property is already required.
     const props: JsonSchema = {};
     const allKeys: string[] = [];
     for (const [key, value] of Object.entries(out["properties"])) {
       allKeys.push(key);
-      let child: unknown = isSchemaObject(value) ? makeStrict(value) : value;
-      // Strict requires every property in `required`; a property that
-      // was optional becomes nullable so omission is still expressible.
-      if (isSchemaObject(child) && !originalRequired.has(key)) child = makeNullable(child);
-      props[key] = child;
+      props[key] = isSchemaObject(value) ? makeStrict(value) : value;
     }
     out["properties"] = props;
     out["required"] = allKeys;
@@ -663,20 +672,6 @@ function makeStrict(node: JsonSchema): JsonSchema {
   if (isSchemaObject(out["items"])) out["items"] = makeStrict(out["items"]);
   if (Array.isArray(out["anyOf"])) {
     out["anyOf"] = out["anyOf"].map((m) => (isSchemaObject(m) ? makeStrict(m) : m));
-  }
-  return out;
-}
-
-function makeNullable(node: JsonSchema): JsonSchema {
-  const out: JsonSchema = { ...node };
-  const type = out["type"];
-  if (typeof type === "string") {
-    if (type !== "null") out["type"] = [type, "null"];
-  } else if (Array.isArray(type)) {
-    if (!type.includes("null")) out["type"] = [...type, "null"];
-  } else if (Array.isArray(out["anyOf"])) {
-    const hasNull = out["anyOf"].some((m) => isSchemaObject(m) && m["type"] === "null");
-    if (!hasNull) out["anyOf"] = [...out["anyOf"], { type: "null" }];
   }
   return out;
 }

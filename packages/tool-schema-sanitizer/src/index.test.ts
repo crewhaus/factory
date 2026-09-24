@@ -401,29 +401,80 @@ describe("toOpenAIStrictSchema — upgrade or bail", () => {
         a: { $ref: "#/$defs/S" },
         b: { type: "number" },
       },
-      required: ["a"],
+      required: ["a", "b"],
       $defs: { S: { type: "string" } },
     });
     expect(out).not.toBeNull();
     const schema = out as JsonSchema;
     expect(schema["additionalProperties"]).toBe(false);
-    // both properties required under strict
     expect(new Set(schema["required"] as string[])).toEqual(new Set(["a", "b"]));
     // ref inlined
     const a = (schema["properties"] as JsonSchema)["a"] as JsonSchema;
     expect(a["type"]).toBe("string");
+    // Nothing was made nullable: the model is never forced to send null.
+    expect(JSON.stringify(schema)).not.toContain('"null"');
   });
 
-  test("a previously optional property is made nullable", () => {
-    const out = toOpenAIStrictSchema({
+  // provider-limits#2 — strict made an optional property nullable, so the
+  // model had to send `path: null` to leave Grep's path unset, and the tool's
+  // validator refused null. A schema with an optional property stays
+  // non-strict, where the model can simply leave the key out.
+  test("a schema with an optional property stays non-strict", () => {
+    expect(
+      toOpenAIStrictSchema({
+        type: "object",
+        properties: { a: { type: "string" }, b: { type: "number" } },
+        required: ["a"],
+      }),
+    ).toBeNull();
+    expect(
+      toOpenAIStrictSchema({
+        type: "object",
+        properties: { path: { type: "string" } },
+      }),
+    ).toBeNull();
+  });
+
+  test("an optional property anywhere keeps the schema non-strict", () => {
+    const nested = (inner: JsonSchema): JsonSchema => ({
       type: "object",
-      properties: { a: { type: "string" }, b: { type: "number" } },
-      required: ["a"],
-    }) as JsonSchema;
-    const b = (out["properties"] as JsonSchema)["b"] as JsonSchema;
-    expect(b["type"]).toEqual(["number", "null"]);
-    const a = (out["properties"] as JsonSchema)["a"] as JsonSchema;
-    expect(a["type"]).toBe("string"); // required stays plain
+      properties: { outer: inner },
+      required: ["outer"],
+    });
+    const partial: JsonSchema = {
+      type: "object",
+      properties: { x: { type: "string" }, y: { type: "string" } },
+      required: ["x"],
+    };
+    expect(toOpenAIStrictSchema(nested(partial))).toBeNull();
+    expect(toOpenAIStrictSchema(nested({ type: "array", items: partial }))).toBeNull();
+    expect(toOpenAIStrictSchema(nested({ anyOf: [partial, { type: "string" }] }))).toBeNull();
+    // The same shapes with every property required still upgrade.
+    const full = { ...partial, required: ["x", "y"] };
+    expect(toOpenAIStrictSchema(nested(full))).not.toBeNull();
+    expect(toOpenAIStrictSchema(nested({ type: "array", items: full }))).not.toBeNull();
+  });
+
+  test("a free-form object is not locked to {}", () => {
+    // `{ type: "object" }` accepts any keys; strict would allow none.
+    expect(
+      toOpenAIStrictSchema({
+        type: "object",
+        properties: { data: { type: "object" } },
+        required: ["data"],
+      }),
+    ).toBeNull();
+    expect(toOpenAIStrictSchema({ type: "object" })).toBeNull();
+    // An object that already forbids extra keys is fine.
+    expect(
+      toOpenAIStrictSchema({ type: "object", properties: {}, additionalProperties: false }),
+    ).toEqual({ type: "object", properties: {}, required: [], additionalProperties: false });
+  });
+
+  test("a schema whose $refs could not all be inlined stays non-strict", () => {
+    // Every property of the DAG is required, so only the budget decides.
+    expect(toOpenAIStrictSchema(dag(4))).not.toBeNull();
+    expect(toOpenAIStrictSchema(dag(16))).toBeNull();
   });
 
   test("nested objects also get additionalProperties false", () => {
@@ -463,11 +514,5 @@ describe("toOpenAIStrictSchema — upgrade or bail", () => {
 
   test("returns null for a non-object root", () => {
     expect(toOpenAIStrictSchema({ type: "string" })).toBeNull();
-  });
-
-  test("a schema whose $refs could not all be inlined stays non-strict", () => {
-    // Every property of the DAG is required, so only the budget decides.
-    expect(toOpenAIStrictSchema(dag(4))).not.toBeNull();
-    expect(toOpenAIStrictSchema(dag(16))).toBeNull();
   });
 });
