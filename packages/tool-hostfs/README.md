@@ -47,7 +47,10 @@ is absent, and it is not the same instruction to a caller.
 
 **Bounded twice.** `timeoutMs` is required and `maxEvents` defaults to 100.
 Whichever bound ends the watch is reported. `maxEvents: 1` is the common
-shape — "come back as soon as something settles".
+shape — "come back as soon as something settles". The `match` glob (like
+`OsIndexSearch`'s `exclude`) is matched segment by segment, never compiled to
+a backtracking RegExp, so no pattern can stall the event loop the deadline
+runs on.
 
 **One save is one event.** Events for the same path inside a settle window
 (`settleMs`, default 200ms) fold into one, which reports the `rawCount` it
