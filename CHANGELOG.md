@@ -142,6 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `crewhaus eval`, and a model pool candidate reads the same keys. Write it
   under the package key (`http`), a tool's key (`httpRequest`) or its
   registered name (`HttpRequest`). `crewhaus tools show <tool>` names the key.
+  Because a block 0.7.0 ignored is now applied, a malformed one no longer
+  passes unnoticed. `compile` and `lint` report an allow-list entry that is not
+  an origin (`api.example.com` instead of `https://api.example.com`) and a key
+  the tool refuses (`tool_config.chainread.allow_private_hosts`), naming the key
+  and what to write. Anything else a tool refuses in its block stops the
+  harness at start, naming the key.
 - **`tool_config.WebFetch` restricts WebFetch.** Written with the registered
   name — the spelling permission rules use — the block was dropped at boot and
   WebFetch could reach any host.
@@ -183,6 +189,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcp_servers` values are; a missing variable stops the start and names it.
   A value read that way is never repeated in an error, and chain RPC errors
   name only the endpoint's origin, never the path a provider keeps its key in.
+  A 0.7.0 spec that meant such a value literally now needs the variable set.
+  Compile refuses a credential value that looks like a reference but is not
+  one (`${API_KEY}`, `$api_key`): write `$API_KEY`. A literal that merely starts
+  with `$`, such as a bcrypt hash, is left alone. With `--emit-as cf-worker`,
+  compile refuses any `$VAR` value, because a Worker has no environment at
+  boot: write the value itself.
 - **Signed plugins verify on every boot path.** The cli and channel bundles
   and `crewhaus run` read trust anchors from `~/.crewhaus/plugin-trust/*.pem`
   and `CREWHAUS_PLUGIN_TRUST_ANCHORS`, so a signed plugin loads; before, no

@@ -29,6 +29,7 @@ export { CATEGORIES, type CategoryDef, leafCategories, rollUpCategories };
 export {
   BUILTIN_TOOLS,
   type BootRegistrar,
+  type RegistrarChecks,
   type BuiltinToolEntry,
   type ChainBootConfig,
   HOST_BOOT_SEAMS,
@@ -57,6 +58,7 @@ export {
   toolConfigEnvRefs,
   toolConfigHint,
   toolConfigKeysReaching,
+  toolConfigProblems,
 } from "./config";
 export {
   BuiltinToolError,

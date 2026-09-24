@@ -365,6 +365,7 @@ export function resolveBuiltinTools(
     wiredForInit.push({
       tools: wiredKeys,
       ...(site.toolConfigs !== undefined ? { toolConfigs: site.toolConfigs } : {}),
+      ...(site.path !== undefined ? { path: site.path } : {}),
     });
   }
 

@@ -70,7 +70,9 @@ export function emitManaged(ir: IrManagedV0, opts: EmitReadmeOptions = {}): Bund
     files.push({
       path: "README.md",
       content: renderBundleReadme(ir, {
-        toolFacts: readmeToolFacts([{ tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {} }]),
+        toolFacts: readmeToolFacts([
+          { tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {}, path: AGENT_TOOL_CONFIG },
+        ]),
       }),
     });
   }
@@ -83,6 +85,12 @@ export class TargetEmitError extends CrewhausError {
     super("compiler", message, cause);
   }
 }
+
+/**
+ * Where this shape's block sits in the spec. README rows and boot errors name
+ * it, so they point at the key the operator actually wrote.
+ */
+const AGENT_TOOL_CONFIG = "agent.tool_config";
 
 /**
  * Loop contract 0.4 (Batch F, G81) — resolve the managed spec's `agent.tools`
@@ -109,7 +117,9 @@ function resolveManagedTools(
   if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("managed", [{ tools: toolNames, toolConfigs }]);
+    resolved = resolveBuiltinTools("managed", [
+      { tools: toolNames, toolConfigs, path: AGENT_TOOL_CONFIG },
+    ]);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;

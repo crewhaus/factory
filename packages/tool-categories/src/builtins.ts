@@ -89,7 +89,44 @@ export type BootRegistrar = {
   /** `tool_config` only: the package-level keys, the documented one first. */
   readonly keys?: ReadonlyArray<string>;
   readonly binds?: ReadonlyArray<string>;
+  /**
+   * What the registrar refuses that compile can already see, so `compile`
+   * and `lint` report it with the key and the fix instead of the harness
+   * stopping at start. `apps/cli/src/tool-config-checks.test.ts` runs every
+   * registrar over probes and fails when it and these checks disagree.
+   */
+  readonly checks?: RegistrarChecks;
 };
+
+/** The data-only half of a registrar's validation. See {@link BootRegistrar.checks}. */
+export type RegistrarChecks = {
+  /** Keys a spec may not set at all, and the sentence that says why and what to write. */
+  readonly refused?: { readonly keys: ReadonlyArray<string>; readonly fix: string };
+  /**
+   * A list of origins. `keys` are its spellings in the order the registrar
+   * reads them (the first one set wins). `onlyOne`: setting two is refused,
+   * and the value must be a list (a registrar without it iterates the value,
+   * so it takes "" as empty). `httpsOnly`: plain http is refused.
+   */
+  readonly origins?: {
+    readonly keys: ReadonlyArray<string>;
+    readonly onlyOne?: true;
+    readonly httpsOnly?: true;
+  };
+};
+
+/** The allow-list the fetch, http, codehost, notify and obs tools read: camelCase wins. */
+const ORIGINS_CAMEL_FIRST: RegistrarChecks = {
+  origins: { keys: ["allowedOrigins", "allowed_origins"] },
+};
+
+const NO_PRIVATE_HOSTS = (list: string): RegistrarChecks => ({
+  refused: {
+    keys: ["allow_private_hosts", "allowPrivateHosts"],
+    fix: `a spec cannot open loopback or private addresses. Remove it, and list the ${list} under allowed_origins`,
+  },
+  origins: { keys: ["allowed_origins", "allowedOrigins"], onlyOne: true },
+});
 
 export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Object.freeze({
   registerFetchConfig: {
@@ -97,6 +134,7 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     source: "tool_config",
     label: "Fetch (and DependencyAudit's OSV mirror)",
     keys: ["fetch"],
+    checks: ORIGINS_CAMEL_FIRST,
   },
   registerWebFetchConfig: {
     package: "@crewhaus/tool-web",
@@ -121,24 +159,28 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     source: "tool_config",
     label: "the http tools",
     keys: ["http"],
+    checks: ORIGINS_CAMEL_FIRST,
   },
   registerCodehostConfig: {
     package: "@crewhaus/tool-codehost",
     source: "tool_config",
     label: "the codehost tools",
     keys: ["codehost"],
+    checks: ORIGINS_CAMEL_FIRST,
   },
   registerNotifyConfig: {
     package: "@crewhaus/tool-notify",
     source: "tool_config",
     label: "the notify tools",
     keys: ["notify"],
+    checks: ORIGINS_CAMEL_FIRST,
   },
   registerObsConfig: {
     package: "@crewhaus/tool-obs",
     source: "tool_config",
     label: "the obs tools",
     keys: ["obs"],
+    checks: ORIGINS_CAMEL_FIRST,
   },
   registerDefiConfig: {
     package: "@crewhaus/tool-defi",
@@ -152,6 +194,7 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     label: "the chainread tools",
     keys: ["chainread"],
     binds: ["setRpcEndpointPolicy"],
+    checks: NO_PRIVATE_HOSTS("public RPC origins"),
   },
   registerDiscoveryConfig: {
     package: "@crewhaus/tool-discovery",
@@ -159,6 +202,7 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     label: "FederationDiscover",
     keys: ["federationDiscover"],
     binds: ["setPeerPolicy"],
+    checks: NO_PRIVATE_HOSTS("peer origins"),
   },
   registerVectorDeleteConfig: {
     package: "@crewhaus/tool-state",
@@ -173,6 +217,9 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     label: "the token tools",
     keys: ["token"],
     binds: ["_setMetadataFetch"],
+    checks: {
+      origins: { keys: ["metadata_origins", "metadataOrigins"], onlyOne: true, httpsOnly: true },
+    },
   },
   bindTokenChains: {
     package: "@crewhaus/tool-token",

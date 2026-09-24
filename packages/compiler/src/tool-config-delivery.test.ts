@@ -6,8 +6,9 @@
  * compile said nothing about it.
  */
 import { describe, expect, test } from "bun:test";
+import { parseSpec } from "@crewhaus/spec";
 import { BUILTIN_TOOLS, TOOL_BOOT_REGISTRARS } from "@crewhaus/tool-categories";
-import { compile } from "./index";
+import { compile, lower, toolSitesOf } from "./index";
 
 const cli = (body: string): string =>
   `name: c\ntarget: cli\nagent:\n  model: claude-sonnet-4-6\n  instructions: i\n${body}`;
@@ -210,7 +211,113 @@ describe("$VAR in tool_config", () => {
         ),
       ),
     ).toThrow(
-      "tool_config.vectorDelete.api_key looks like an environment reference but is not one. Write $UPPER_SNAKE_CASE",
+      /^tool_config\.vectorDelete\.api_key: looks like an environment reference, but is not one\. Write \$UPPER_SNAKE_CASE/,
     );
   });
+});
+
+describe("a block its registrar would refuse at boot fails the compile", () => {
+  // 0.7.0 ignored these blocks, so the bundle booted; 0.7.1 applies them, and
+  // the registrar refuses them. Compile says so, with the key and the fix,
+  // rather than the harness stopping at start.
+  test("an allow-list entry with no scheme", () => {
+    expect(() =>
+      compile(
+        cli(
+          "tools: [httpRequest]\ntool_config:\n  http:\n    allowed_origins: [api.example.com]\n",
+        ),
+      ),
+    ).toThrow(
+      'tool_config.http.allowed_origins[0]: "api.example.com" is not an origin: it has no scheme. Write "https://api.example.com".',
+    );
+  });
+
+  test("a key the registrar refuses: chainread cannot open private addresses", () => {
+    expect(() =>
+      compile(
+        cli("tools: [evmGetBlock]\ntool_config:\n  chainread:\n    allow_private_hosts: true\n"),
+      ),
+    ).toThrow(
+      "tool_config.chainread.allow_private_hosts: is not accepted: a spec cannot open loopback or private addresses.",
+    );
+  });
+
+  test("the path is the site's own, on a nested shape too", () => {
+    const yaml = [
+      "name: w",
+      "target: workflow",
+      "model: claude-sonnet-4-6",
+      "steps:",
+      "  - name: fetch",
+      "    instructions: i",
+      "    tools: [httpRequest]",
+      "    tool_config:",
+      "      http: { allowed_origins: [api.example.com] }",
+    ].join("\n");
+    expect(() => compile(yaml)).toThrow(/^steps\[0\]\.tool_config\.http\.allowed_origins\[0\]: /);
+  });
+});
+
+describe("README rows and boot errors name the block where the spec wrote it", () => {
+  // The path each shape's diagnostics use (toolSitesOf), not a flat
+  // `tool_config`: channel and managed nest the block under `agent`.
+  const block =
+    "http:\n      allowed_origins: [https://api.example.com]\n      headers: { Authorization: $API_TOKEN }";
+  const specs: Record<string, string> = {
+    channel: [
+      "name: ch",
+      "target: channel",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  tools: [httpRequest]",
+      "  tool_config:",
+      `    ${block.replaceAll("\n      ", "\n      ")}`,
+      "channels:",
+      "  slack:",
+      "    botToken: $SLACK_BOT_TOKEN",
+      "    signingSecret: $SLACK_SIGNING_SECRET",
+      "routing:",
+      "  sessionKey: thread",
+    ].join("\n"),
+    managed: [
+      "name: m",
+      "target: managed",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: i",
+      "  tools: [httpRequest]",
+      "  tool_config:",
+      `    ${block}`,
+      "tenants:",
+      "  - id: t1",
+      "    budget: { maxInputTokens: 1000, maxOutputTokens: 1000 }",
+    ].join("\n"),
+    workflow: [
+      "name: w",
+      "target: workflow",
+      "model: claude-sonnet-4-6",
+      "steps:",
+      "  - name: call",
+      "    instructions: i",
+      "    tools: [httpRequest]",
+      "    tool_config:",
+      `      ${block.replaceAll("\n      ", "\n        ")}`,
+    ].join("\n"),
+  };
+  for (const [shape, yaml] of Object.entries(specs)) {
+    test(shape, () => {
+      const [site] = toolSitesOf(lower(parseSpec(yaml)));
+      const where = `${site?.path.replace(/tools$/, "tool_config")}.http`;
+      expect(where).not.toBe("tool_config.http");
+      const result = compile(yaml);
+      const code = result.files
+        .filter((f) => f.path.endsWith(".ts"))
+        .map((f) => f.content)
+        .join("\n");
+      expect(code).toContain(`, "${where}", process.env);`);
+      const readme = result.files.find((f) => f.path === "README.md")?.content ?? "";
+      expect(readme).toContain(`configured by \`${where}\``);
+    });
+  }
 });

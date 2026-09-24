@@ -233,7 +233,24 @@ function unusedMessage(key: string, site: ToolSite): string {
   if (near !== undefined) {
     return `ignored, because no builtin reads this key. Did you mean ${sitePath(site)}.${near}?`;
   }
-  return "ignored, because no builtin reads this key. Write the block under a tool's key (fetch), its registered name (Fetch) or its package key (http).";
+  if (key.toLowerCase() === "mcp" || key.startsWith("mcp__")) {
+    return "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server. Remove the block.";
+  }
+  const readable = consumableKeys(site);
+  if (readable.length === 0) {
+    return `ignored, because no builtin is called ${key}, and no tool in tools takes a tool_config block. Remove the block.`;
+  }
+  return `ignored, because no builtin is called ${key}. The tools here read ${readable.join(", ")}: write the block under one of those, or remove it.`;
+}
+
+/** The documented key of each registrar this site's tools name, sorted. */
+function consumableKeys(site: ToolSite): ReadonlyArray<string> {
+  const keys = new Set<string>();
+  for (const tool of site.tools) {
+    const symbol = entryOf(tool)?.initSymbol;
+    if (symbol !== undefined) keys.add(documentedKey(symbol));
+  }
+  return [...keys].sort();
 }
 
 /**
@@ -400,9 +417,18 @@ export function toolConfigEnvRefs(
 }
 
 /**
- * A credential-shaped key (`api_key`, `token`) whose value starts with `$` but
- * is not a valid reference is almost always a typo — `$slack_token`,
- * `${API_KEY}` — that would ship as a literal string. One notice per value.
+ * A `$` and one word, braced or not: `$slack_token`, `${API_KEY}`, `$1KEY`.
+ * Only a value of this form reads as a reference; `$2b$10$…` (a bcrypt hash)
+ * or `$ecret!` does not, and ships as the literal it is.
+ */
+const REF_LOOKALIKE_RE = /^\$(?:\{[^}]*\}|[A-Za-z0-9_]+)$/;
+
+/**
+ * A credential-shaped key (`api_key`, `token`) whose value looks like an
+ * environment reference but is not a valid one is almost always a typo —
+ * `$slack_token`, `${API_KEY}` — that would ship as a literal string. One
+ * notice per value. The message does not repeat the path: every caller prints
+ * it in front.
  */
 export function malformedToolConfigRefs(
   value: unknown,
@@ -414,12 +440,13 @@ export function malformedToolConfigRefs(
       if (
         key !== undefined &&
         CREDENTIAL_KEY_RE.test(key) &&
-        node.startsWith("$") &&
+        REF_LOOKALIKE_RE.test(node) &&
         envRefName(node) === undefined
       ) {
         out.push({
           path,
-          message: `${path} looks like an environment reference but is not one. Write $UPPER_SNAKE_CASE, for example $API_KEY — no lowercase, no leading digit, no braces.`,
+          message:
+            "looks like an environment reference, but is not one. Write $UPPER_SNAKE_CASE, for example $API_KEY — no lowercase, no leading digit, no braces. If it is the value itself, set it in an environment variable and write that variable's name here.",
         });
       }
       return;
@@ -436,6 +463,93 @@ export function malformedToolConfigRefs(
   };
   visit(value, where, undefined);
   return out;
+}
+
+/**
+ * What a registrar would refuse in its block at boot, found at compile time:
+ * the checks its row in `TOOL_BOOT_REGISTRARS` declares. A `$VAR` value is
+ * skipped — it is read, and checked, when the harness starts. Each notice's
+ * path is where the problem sits and its message what to write instead.
+ */
+export function toolConfigProblems(init: ToolConfigInit): ReadonlyArray<ToolConfigNotice> {
+  const checks = TOOL_BOOT_REGISTRARS[init.initSymbol]?.checks;
+  const block = init.config;
+  if (checks === undefined || block === null || typeof block !== "object" || Array.isArray(block)) {
+    return [];
+  }
+  const rec = block as Record<string, unknown>;
+  const out: ToolConfigNotice[] = [];
+  for (const key of checks.refused?.keys ?? []) {
+    if (Object.hasOwn(rec, key)) {
+      out.push({
+        path: pathJoin(init.where, key),
+        message: `is not accepted: ${checks.refused?.fix}.`,
+      });
+    }
+  }
+  const origins = checks.origins;
+  if (origins === undefined) return out;
+  const [first, ...rest] = origins.keys;
+  if (first === undefined) return out;
+  const both = rest.find((k) => Object.hasOwn(rec, k));
+  if (origins.onlyOne === true && Object.hasOwn(rec, first) && both !== undefined) {
+    out.push({
+      path: init.where,
+      message: `sets both ${first} and ${both}. Write the list once, as ${first}.`,
+    });
+    return out;
+  }
+  // Read the list as the registrar does, `a ?? b`: the first spelling that is
+  // set wins, and with none set the last one's value (`null` included) is
+  // what a registrar with `onlyOne` checks; the others default to empty.
+  const key =
+    origins.keys.find((k) => rec[k] !== undefined && rec[k] !== null) ??
+    origins.keys[origins.keys.length - 1] ??
+    first;
+  const value = rec[key];
+  if (value === undefined || (value === null && origins.onlyOne !== true)) return out;
+  const listPath = pathJoin(init.where, key);
+  const example = origins.httpsOnly === true ? "https://ipfs.io" : "https://api.example.com";
+  // A registrar that iterates its list (`for … of`) takes "" as empty.
+  if (value === "" && origins.onlyOne !== true) return out;
+  if (!Array.isArray(value)) {
+    out.push({
+      path: listPath,
+      message: `must be a list of origins, for example ["${example}"].`,
+    });
+    return out;
+  }
+  value.forEach((entry, i) => {
+    const at = pathJoin(listPath, i);
+    if (typeof entry === "string" && envRefName(entry) !== undefined) return;
+    const problem = originProblem(entry, origins.httpsOnly === true);
+    if (problem !== undefined) out.push({ path: at, message: problem });
+  });
+  return out;
+}
+
+/** Why one allow-list entry is not an origin the registrar accepts, or undefined. */
+function originProblem(entry: unknown, httpsOnly: boolean): string | undefined {
+  const scheme = httpsOnly ? "https" : "http or https";
+  if (typeof entry !== "string") {
+    return `must be an origin written as a string, such as "https://api.example.com".`;
+  }
+  let url: URL;
+  try {
+    url = new URL(entry);
+  } catch {
+    const bare = /^[A-Za-z0-9.-]+(:\d+)?$/.test(entry);
+    return bare
+      ? `"${entry}" is not an origin: it has no scheme. Write "https://${entry}".`
+      : `"${entry}" is not an origin. Write it as https://host[:port].`;
+  }
+  const ok = httpsOnly
+    ? url.protocol === "https:"
+    : url.protocol === "https:" || url.protocol === "http:";
+  if (!ok) {
+    return `"${url.protocol}//${url.host}" is not ${scheme}. Write it as https://host[:port].`;
+  }
+  return undefined;
 }
 
 /** An environment to read references from: `process.env`, or a test's map. */

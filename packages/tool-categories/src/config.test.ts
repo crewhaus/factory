@@ -12,6 +12,7 @@ import {
   resolveToolConfigEnv,
   toolConfigBlockFor,
   toolConfigEnvRefs,
+  toolConfigProblems,
 } from "./config";
 import { BuiltinToolError } from "./error";
 import { resolveBuiltinTools } from "./shapes";
@@ -195,10 +196,22 @@ describe("keys nothing reads", () => {
     ]);
   });
 
-  test("a key nothing knows", () => {
-    expect(unused(["fetch"], { allowlist: HTTP })).toEqual([
-      "ignored, because no builtin reads this key. Write the block under a tool's key (fetch), its registered name (Fetch) or its package key (http).",
+  test("a key nothing knows names the keys this site's tools do read", () => {
+    expect(unused(["fetch", "httpRequest", "read"], { allowlist: HTTP })).toEqual([
+      "ignored, because no builtin is called allowlist. The tools here read fetch, http: write the block under one of those, or remove it.",
     ]);
+    expect(unused(["read"], { allowlist: HTTP })).toEqual([
+      "ignored, because no builtin is called allowlist, and no tool in tools takes a tool_config block. Remove the block.",
+    ]);
+  });
+
+  test("an mcp block is not pointed at a builtin", () => {
+    // What hello-expert's snapshot wrote: MCP tool flags under tool_config.
+    const flags = { thredz: { wiki_write: { destructive: true } } };
+    const expected =
+      "ignored, because MCP tools do not read tool_config: an MCP server's tools take their settings from the server. Remove the block.";
+    expect(unused(["read", "fetch"], { mcp: flags })).toEqual([expected]);
+    expect(unused(["fetch"], { mcp__thredz__wiki_write: {} })).toEqual([expected]);
   });
 
   test("a misspelled key is pointed at the key this site reads", () => {
@@ -312,6 +325,25 @@ describe("$VAR references", () => {
     ).toEqual(["tool_config.x.api_key", "tool_config.x.token"]);
   });
 
+  test("the notice does not repeat its path: every caller prints it in front", () => {
+    const [notice] = malformedToolConfigRefs({ api_key: "${API_KEY}" }, "tool_config.x");
+    expect(notice?.path).toBe("tool_config.x.api_key");
+    expect(notice?.message.startsWith("looks like an environment reference, but is not one.")).toBe(
+      true,
+    );
+    expect(notice?.message).not.toContain("tool_config.x");
+  });
+
+  test("a literal credential that merely starts with $ is left alone", () => {
+    // A bcrypt hash, and a secret with punctuation: neither reads as a reference.
+    expect(
+      malformedToolConfigRefs(
+        { api_key: "$2b$10$abcdefghijklmnopqrstuv", token: "$ecret!pa55" },
+        "tool_config.x",
+      ),
+    ).toEqual([]);
+  });
+
   test("a block without a reference renders byte-identically to 0.7.0", () => {
     expect(
       renderToolConfigInit({
@@ -406,5 +438,72 @@ describe("the chain blocks", () => {
       expect.stringMatching(/^applyToolConfig\(bindEvmChains, \{"chains":\[/),
       expect.stringMatching(/^applyToolConfig\(bindEvmTxChains, /),
     ]);
+  });
+});
+
+describe("what a registrar would refuse, found at compile time", () => {
+  const problems = (initSymbol: string, config: unknown) =>
+    toolConfigProblems({
+      key: "k",
+      package: TOOL_BOOT_REGISTRARS[initSymbol]?.package ?? "",
+      initSymbol,
+      config,
+      where: "tool_config.k",
+    });
+
+  test("an allow-list entry with no scheme names the entry and the fix", () => {
+    expect(problems("registerHttpConfig", { allowed_origins: ["api.example.com"] })).toEqual([
+      {
+        path: "tool_config.k.allowed_origins[0]",
+        message:
+          '"api.example.com" is not an origin: it has no scheme. Write "https://api.example.com".',
+      },
+    ]);
+  });
+
+  test("a scheme the registrar refuses, and https-only lists", () => {
+    expect(problems("registerCodehostConfig", { allowedOrigins: ["ftp://git.example"] })).toEqual([
+      {
+        path: "tool_config.k.allowedOrigins[0]",
+        message: '"ftp://git.example" is not http or https. Write it as https://host[:port].',
+      },
+    ]);
+    expect(
+      problems("registerTokenConfig", { metadata_origins: ["http://ipfs.example"] })[0]?.message,
+    ).toBe('"http://ipfs.example" is not https. Write it as https://host[:port].');
+  });
+
+  test("a refused key says why and what to write instead", () => {
+    expect(problems("registerChainreadConfig", { allow_private_hosts: true })).toEqual([
+      {
+        path: "tool_config.k.allow_private_hosts",
+        message:
+          "is not accepted: a spec cannot open loopback or private addresses. Remove it, and list the public RPC origins under allowed_origins.",
+      },
+    ]);
+  });
+
+  test("two spellings of one list, where the registrar refuses that", () => {
+    expect(
+      problems("registerDiscoveryConfig", {
+        allowed_origins: ["https://a.example"],
+        allowedOrigins: ["https://b.example"],
+      }),
+    ).toEqual([
+      {
+        path: "tool_config.k",
+        message:
+          "sets both allowed_origins and allowedOrigins. Write the list once, as allowed_origins.",
+      },
+    ]);
+  });
+
+  test("a $VAR entry is checked when the harness starts, not here", () => {
+    expect(problems("registerHttpConfig", { allowed_origins: ["$API_ORIGIN"] })).toEqual([]);
+  });
+
+  test("a well-formed block, and a registrar with no declared checks, pass", () => {
+    expect(problems("registerHttpConfig", HTTP)).toEqual([]);
+    expect(problems("registerWebFetchConfig", { allowed_origins: ["nope"] })).toEqual([]);
   });
 });

@@ -101,7 +101,10 @@ export function emitChannelBot(ir: IrChannelV0, opts: EmitChannelBotOptions = {}
     files.push({
       path: "README.md",
       content: renderBundleReadme(ir, {
-        toolFacts: readmeToolFacts([{ tools: ir.tools, toolConfigs: ir.toolConfigs }], ir),
+        toolFacts: readmeToolFacts(
+          [{ tools: ir.tools, toolConfigs: ir.toolConfigs, path: AGENT_TOOL_CONFIG }],
+          ir,
+        ),
       }),
     });
   }
@@ -114,6 +117,12 @@ export class TargetEmitError extends CrewhausError {
     super("compiler", message, cause);
   }
 }
+
+/**
+ * Where this shape's block sits in the spec. README rows and boot errors name
+ * it, so they point at the key the operator actually wrote.
+ */
+const AGENT_TOOL_CONFIG = "agent.tool_config";
 
 /**
  * The spec's `agent.tools` → imports, `tool_config` registrations and
@@ -134,7 +143,11 @@ function resolveTools(
   if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("channel", [{ tools: toolNames, toolConfigs }], chains);
+    resolved = resolveBuiltinTools(
+      "channel",
+      [{ tools: toolNames, toolConfigs, path: AGENT_TOOL_CONFIG }],
+      chains,
+    );
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;

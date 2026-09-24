@@ -141,6 +141,7 @@ import {
   expandToolSelectors,
   malformedToolConfigRefs,
   registeredToolName,
+  toolConfigProblems,
 } from "@crewhaus/tool-categories";
 // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
 // lives in `@crewhaus/worker-runtime` (the runtime that would execute the
@@ -656,21 +657,29 @@ function budgetDegradeOutsidePool(
  */
 function collectToolNames(ir: unknown): string[] {
   const names = new Set<string>();
-  const visit = (node: unknown): void => {
+  // Lowering spells a sub-agent's list with registered names (`WebSearch`) so
+  // the child catalog filter matches; on 0.7.0 it kept the spec keys the
+  // author wrote. Read a builtin there back to its key, so the gate sees what
+  // it saw on 0.7.0: a builtin is vetted (`apps/cli/src/tool-registry.test.ts`
+  // pins each one's scope to its io facts), and an `mcp__*` name, which is no
+  // builtin, stays gated. Every other list keeps its spelling.
+  const visit = (node: unknown, inSubAgent: boolean): void => {
     if (Array.isArray(node)) {
-      for (const item of node) visit(item);
+      for (const item of node) visit(item, inSubAgent);
       return;
     }
     if (node !== null && typeof node === "object") {
       for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
         if (key === "tools" && Array.isArray(value)) {
-          for (const v of value) if (typeof v === "string") names.add(v);
+          for (const v of value) {
+            if (typeof v === "string") names.add(inSubAgent ? (builtinKeyForName(v) ?? v) : v);
+          }
         }
-        visit(value);
+        visit(value, inSubAgent || key === "subAgents");
       }
     }
   };
-  visit(ir);
+  visit(ir, false);
   return [...names];
 }
 
@@ -689,12 +698,7 @@ function collectToolNames(ir: unknown): string[] {
 export function assertToolScopesStrict(ir: IrNode): void {
   const findings: ScopeFinding[] = [];
   for (const name of collectToolNames(ir)) {
-    // The gate keys on the spec key, as it did on 0.7.0. Lowering spells a
-    // sub-agent's list with registered names (`WebSearch`), which
-    // `isOutwardName` matches, so read a builtin's key back first: a builtin
-    // is vetted, and `apps/cli/src/tool-registry.test.ts` pins each one's
-    // scope to its io facts. An `mcp__*` name is no builtin and stays gated.
-    if (isOutwardName(builtinKeyForName(name) ?? name)) {
+    if (isOutwardName(name)) {
       findings.push({
         toolName: name,
         reason:
@@ -878,8 +882,10 @@ export function checkShapeTools(ir: IrNode): {
  * - two different blocks for one boot registrar (`http` and `httpRequest`,
  *   or `fetch` in two steps of one process) are an ERROR naming both — the
  *   registrar holds one setting, so one block would be dropped;
- * - a credential-shaped value that starts with `$` but is not a valid
- *   `$UPPER_SNAKE` reference is an ERROR, since it would ship as a literal;
+ * - a credential-shaped value that looks like a `$UPPER_SNAKE` reference but
+ *   is not a valid one is an ERROR, since it would ship as a literal;
+ * - a block its registrar would refuse at boot (a refused key, an allow-list
+ *   entry that is not an origin) is an ERROR naming the key and the fix;
  * - a key no listed tool reads is a `tool-config-unused` WARNING, which
  *   `--strict` escalates — a restriction written under a key nothing reads
  *   is a restriction that is not in force;
@@ -904,6 +910,10 @@ function checkToolConfigDelivery(ir: IrNode): {
   for (const u of check.unused) {
     warnings.push({ code: "tool-config-unused", path: u.path, message: u.message });
   }
+  // A block the registrar would refuse at boot fails here, with its key.
+  // 0.7.0 ignored many of these blocks, so a spec that ran then can meet
+  // this now; compile is the place to find out, not the harness's start.
+  for (const init of check.inits) errors.push(...toolConfigProblems(init));
   for (const site of sites) {
     for (const bad of malformedToolConfigRefs(site.toolConfigs ?? {}, toolConfigPathOf(site))) {
       errors.push(bad);
