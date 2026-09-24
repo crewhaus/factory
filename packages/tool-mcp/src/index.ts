@@ -248,15 +248,19 @@ async function registerOne(
   opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
 }
 
-/** Report a remote tool that is left out through `onSkip`, or stderr by default. */
+/**
+ * Report a remote tool that is left out through `onSkip`, or stderr by
+ * default. `fullName` is the name it would have been registered under.
+ */
 function reportSkip(
   serverName: string,
   remote: Pick<McpToolDefinition, "name">,
   reason: string,
   opts: RegisterMcpServerOptions,
+  fullName: string = namespacedToolName(serverName, String(remote.name)),
 ): void {
   const remoteName = String(remote.name);
-  const info = { fullName: namespacedToolName(serverName, remoteName), remoteName, reason };
+  const info = { fullName, remoteName, reason };
   if (opts.onSkip !== undefined) opts.onSkip(info);
   else console.warn(`[mcp] ${reason} The server's other tools are registered.`);
 }
@@ -1062,7 +1066,7 @@ export async function registerMcpToolAliases(
     const problem = await mcpToolDefinitionProblem(serverName, remote);
     if (problem !== undefined) {
       refused.push(remote.name);
-      reportSkip(serverName, remote, problem, opts);
+      reportSkip(serverName, remote, problem, opts, remote.name);
       continue;
     }
     const tool = buildMcpRegisteredTool(

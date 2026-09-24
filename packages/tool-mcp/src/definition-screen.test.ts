@@ -366,7 +366,7 @@ describe("every registration path screens", () => {
       "thredz",
       catalog,
       ["wiki_recall", "wiki_get", "wiki_stats"],
-      { onSkip: ({ remoteName }) => skipped.push(remoteName) },
+      { onSkip: ({ fullName }) => skipped.push(fullName) },
     );
     expect(result).toEqual({
       registered: ["wiki_get"],
