@@ -14,10 +14,14 @@
  * checked: nothing type-checks the inside of a string.
  *
  * Protocol (one request at a time per worker):
- *   → { id, op, …request, giveUpMs, progressEveryMs }
+ *   → { id, op, …request, giveUpMs, progressEveryMs, skip, maxItemChars }
  *   ← { kind: "ready" }                                  once, at startup
- *   ← { kind: "progress", id, completed, matched?, ruleIndexes? }  batch ops
+ *   ← { kind: "progress", id, completed, …increments }   batch ops
  *   ← { kind: "done", id, status, result?, partial?, … }
+ *
+ * Batch ops take `skip`: when true, an input the engine gives up on (or one
+ * longer than `maxItemChars`) is listed in `undetermined` and the batch goes
+ * on; when false, the first give-up ends the batch as "gave-up".
  *
  * WHY EVERY exec IS TIMED. When JavaScriptCore exceeds its backtracking
  * budget it abandons the match and returns null — exactly what "no match"
@@ -232,69 +236,183 @@ function progress(id, completed, extra) {
   postMessage(msg);
 }
 
+/* A batch op's progress reporter: every progressEveryMs, the increments of
+   each named list since the last report. */
+function Reporter(id, lists) {
+  this.id = id;
+  this.lists = lists;
+  this.sent = {};
+  for (var k in lists) this.sent[k] = 0;
+  this.last = performance.now();
+}
+Reporter.prototype.tick = function (completed, scalars) {
+  var now = performance.now();
+  if (now - this.last < progressEveryMs) return;
+  var extra = {};
+  for (var s in scalars) extra[s] = scalars[s];
+  for (var k in this.lists) {
+    extra[k] = this.lists[k].slice(this.sent[k]);
+    this.sent[k] = this.lists[k].length;
+  }
+  progress(this.id, completed, extra);
+  this.last = now;
+};
+
+/* One input of a batch: the match, or undefined when it is skipped as
+   undetermined. A give-up is rethrown unless the batch skips. */
+function tryRun(req, re, s) {
+  if (s.length > req.maxItemChars) {
+    if (req.skip) return undefined;
+    throw new TooLarge("item");
+  }
+  try {
+    return run(re, s, 0);
+  } catch (e) {
+    if (req.skip && e instanceof GaveUp) return undefined;
+    throw e;
+  }
+}
+
 function opTestEach(req) {
   var re = new RegExp(req.pattern, req.flags);
   var inputs = req.inputs;
   var matched = [];
-  var sent = 0;
-  var last = performance.now();
+  var undetermined = [];
+  var report = new Reporter(req.id, { matched: matched, undetermined: undetermined });
   var truncated = false;
   var i = 0;
   try {
     for (; i < inputs.length; i++) {
-      if (run(re, inputs[i], 0) !== null) {
+      var m = tryRun(req, re, inputs[i]);
+      if (m === undefined) {
+        undetermined.push(i);
+      } else if (m !== null) {
         if (matched.length >= req.maxMatches) { truncated = true; break; }
         matched.push(i);
       }
-      var now = performance.now();
-      if (now - last >= progressEveryMs) {
-        progress(req.id, i + 1, { matched: matched.slice(sent) });
-        sent = matched.length;
-        last = now;
-      }
+      report.tick(i + 1);
     }
   } catch (e) {
     if (e instanceof GaveUp) {
       e.index = i;
-      e.partial = { matched: matched, scanned: i, truncated: false };
+      e.partial = { matched: matched, scanned: i, truncated: false, undetermined: undetermined };
     }
     throw e;
   }
-  return { status: "ok", result: { matched: matched, scanned: i, truncated: truncated } };
+  return { status: "ok", result: { matched: matched, scanned: i, truncated: truncated, undetermined: undetermined } };
+}
+
+function compileRules(rules) {
+  var out = [];
+  for (var r = 0; r < rules.length; r++) out.push(new RegExp(rules[r].pattern, rules[r].flags));
+  return out;
 }
 
 function opFirstMatchingRule(req) {
-  var rules = [];
-  for (var r = 0; r < req.rules.length; r++) rules.push(new RegExp(req.rules[r].pattern, req.rules[r].flags));
+  var rules = compileRules(req.rules);
   var inputs = req.inputs;
   var ruleIndexes = [];
-  var sent = 0;
-  var last = performance.now();
+  var undetermined = [];
+  var report = new Reporter(req.id, { ruleIndexes: ruleIndexes, undetermined: undetermined });
   var i = 0;
   var j = 0;
   try {
     for (; i < inputs.length; i++) {
       var hit = -1;
       for (j = 0; j < rules.length; j++) {
-        if (run(rules[j], inputs[i], 0) !== null) { hit = j; break; }
+        var m = tryRun(req, rules[j], inputs[i]);
+        /* An earlier rule that could not be answered leaves "which rule
+           matches first" undetermined, whatever the later rules say. */
+        if (m === undefined) { hit = null; break; }
+        if (m !== null) { hit = j; break; }
       }
+      if (hit === null) undetermined.push(i);
       ruleIndexes.push(hit);
-      var now = performance.now();
-      if (now - last >= progressEveryMs) {
-        progress(req.id, i + 1, { ruleIndexes: ruleIndexes.slice(sent) });
-        sent = ruleIndexes.length;
-        last = now;
-      }
+      report.tick(i + 1);
     }
   } catch (e) {
     if (e instanceof GaveUp) {
       e.index = i;
       e.ruleIndex = j;
-      e.partial = { ruleIndexes: ruleIndexes };
+      e.partial = { ruleIndexes: ruleIndexes, undetermined: undetermined };
     }
     throw e;
   }
-  return { status: "ok", result: { ruleIndexes: ruleIndexes } };
+  return { status: "ok", result: { ruleIndexes: ruleIndexes, undetermined: undetermined } };
+}
+
+/* Every pattern against every input. Hits and undetermined answers travel
+   as flat [pattern, input, pattern, input, …] lists. */
+function opTestMatrix(req) {
+  var patterns = compileRules(req.patterns);
+  var inputs = req.inputs;
+  var hits = [];
+  var unknown = [];
+  var report = new Reporter(req.id, { hits: hits, unknown: unknown });
+  var i = 0;
+  var p = 0;
+  try {
+    for (; i < inputs.length; i++) {
+      for (p = 0; p < patterns.length; p++) {
+        var m = tryRun(req, patterns[p], inputs[i]);
+        if (m === undefined) unknown.push(p, i);
+        else if (m !== null) hits.push(p, i);
+      }
+      report.tick(i + 1);
+    }
+  } catch (e) {
+    if (e instanceof GaveUp) {
+      e.index = i;
+      e.ruleIndex = p;
+      e.partial = { hits: hits, unknown: unknown, completed: i };
+    }
+    throw e;
+  }
+  return { status: "ok", result: { hits: hits, unknown: unknown } };
+}
+
+/* One replacement over many inputs; the outputs' total size is capped. */
+function opReplaceEach(req) {
+  var inputs = req.inputs;
+  var outputs = [];
+  var undetermined = [];
+  var report = new Reporter(req.id, { outputs: outputs, undetermined: undetermined });
+  var chars = 0;
+  var replacements = 0;
+  var i = 0;
+  try {
+    for (; i < inputs.length; i++) {
+      var s = inputs[i];
+      var one;
+      if (s.length > req.maxItemChars) {
+        if (!req.skip) throw new TooLarge("item");
+        one = undefined;
+      } else {
+        try {
+          one = opReplace({ pattern: req.pattern, flags: req.flags, input: s, replacement: req.replacement, maxOutputChars: req.maxOutputChars - chars }).result;
+        } catch (e) {
+          if (!(req.skip && e instanceof GaveUp)) throw e;
+          one = undefined;
+        }
+      }
+      if (one === undefined) {
+        undetermined.push(i);
+        outputs.push(null);
+      } else {
+        chars += one.output.length;
+        replacements += one.replacements;
+        outputs.push(one.output);
+      }
+      report.tick(i + 1, { replacements: replacements });
+    }
+  } catch (e) {
+    if (e instanceof GaveUp) {
+      e.index = i;
+      e.partial = { outputs: outputs, replacements: replacements, undetermined: undetermined };
+    }
+    throw e;
+  }
+  return { status: "ok", result: { outputs: outputs, replacements: replacements, undetermined: undetermined } };
 }
 
 var ops = {
@@ -303,7 +421,9 @@ var ops = {
   replace: opReplace,
   split: opSplit,
   testEach: opTestEach,
-  firstMatchingRule: opFirstMatchingRule
+  firstMatchingRule: opFirstMatchingRule,
+  testMatrix: opTestMatrix,
+  replaceEach: opReplaceEach
 };
 
 self.onmessage = function (ev) {
@@ -323,7 +443,7 @@ self.onmessage = function (ev) {
       if (e.ruleIndex !== undefined) out.ruleIndex = e.ruleIndex;
       if (e.partial !== undefined) out.partial = e.partial;
     } else if (e instanceof TooLarge) {
-      out = { status: "output-too-large" };
+      out = { status: e.what === "item" ? "item-too-large" : "output-too-large" };
     } else {
       out = { status: "error", code: "exec-threw", reason: String(e && e.message ? e.message : e) };
     }

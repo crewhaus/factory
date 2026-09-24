@@ -18,7 +18,10 @@ A regex written by the model, or by an operator, runs on text the model or a rem
 ### Running a pattern: `runRegex` and `openRegexSession`
 
 ```ts
-const outcome = await runRegex({ op: "testEach", pattern, flags, inputs: lines, deadlineMs: 1000 });
+const outcome = await runRegex({
+  op: "testEach", pattern, flags, inputs: lines,
+  deadlineMs: 1000, signal: ctx.signal, runawayKey: ctx.sessionId,
+});
 if (outcome.status === "ok") {
   report(outcome.result.matched);                           // definite
 } else {
@@ -26,7 +29,7 @@ if (outcome.status === "ok") {
 }
 ```
 
-The match runs in a Bun Worker. At the deadline the worker is terminated and the caller gets `timeout`.
+The match runs in a Bun Worker. At the deadline, or when `signal` fires, the worker is terminated and the caller gets `timeout` (or `error`/`aborted`).
 
 | `op` | What it does | `result` |
 |---|---|---|
@@ -34,15 +37,25 @@ The match runs in a Bun Worker. At the deadline the worker is terminated and the
 | `matchAll` | Finds every match (`g` implied), up to `maxMatches` | `{ matches, truncated, truncatedBy? }` |
 | `replace` | Replaces with a string replacement, supporting `$&` `$1` `$<n>` `` $` `` `$'` `$$` | `{ output, replacements }` |
 | `split` | Behaves like `String.prototype.split`, captures included | `{ pieces, truncated, truncatedBy? }` |
-| `testEach` | Runs one pattern over many inputs | `{ matched: indexes, scanned, truncated }` |
-| `firstMatchingRule` | Runs many patterns over many inputs and finds the first rule that hits each input | `{ ruleIndexes }` (-1 = none) |
+| `testEach` | Runs one pattern over many inputs | `{ matched: indexes, scanned, truncated, undetermined }` |
+| `firstMatchingRule` | Runs many patterns over many inputs and finds the first rule that hits each input | `{ ruleIndexes, undetermined }` (-1 = none, null = undetermined) |
+| `testMatrix` | Runs every pattern against every input | `{ matched, undetermined }`, one index list per pattern |
+| `replaceEach` | Runs one `replace` over many inputs; `maxOutputChars` caps all outputs together | `{ outputs, replacements, undetermined }` |
 
-`replace`, `split` and `matchAll` give the same answers as the built-in methods; `run.test.ts` compares them across a battery of patterns, inputs and replacement templates. The batch ops (`testEach` and `firstMatchingRule`) exist so a tool that scans many lines pays for one round trip, not one per line.
+`replace`, `split` and `matchAll` give the same answers as the built-in methods; `run.test.ts` compares them across a battery of patterns, inputs and replacement templates. The batch ops exist so a tool that scans many lines, or many rules, pays for one round trip, not one per line.
+
+**Batch options.** A batch op takes `onGiveUp`. `"stop"` (the default) ends the batch at the first input the engine gives up on, as `gave-up` with `partial` answers before it. `"skip"` lists that input in `undetermined` and answers the rest while the deadline allows; in `firstMatchingRule`, an input is undetermined as soon as one rule before the matching one could not be answered. `maxItemChars` (default 65 536) is the longest single input a batch runs: past it, `"stop"` refuses the request as `input-too-large` with the `index`, and `"skip"` reports the input as undetermined without running it. `firstMatchingRule` and `testMatrix` also cap the patterns' combined length (`maxTotalPatternChars`, default 100 000).
+
+**A synchronous evaluator** (a `runChecks` predicate, a `rows.filter(...)` callback, a JSON Schema `pattern`) cannot await a worker. Run the batch first, then evaluate against the answers:
+
+1. Walk the rules and the rows, and collect every distinct (pattern, flags) and every value it will be tested on.
+2. Run one `testMatrix` with `onGiveUp: "skip"`.
+3. Evaluate synchronously, looking each (pattern, value) answer up. An answer in `undetermined`, or missing because the run did not finish, is undetermined, and the evaluator treats it as the tool's kind requires (see below).
 
 For warm reuse, open a session: `const s = openRegexSession(); … await s.run(req); … s.close();`. Runs on a session are queued, never concurrent. Measured on an Apple-silicon Mac with Bun 1.3.14:
 
-- A warm session run costs about **0.02 ms**.
-- A one-shot `runRegex`, which starts a worker, costs about **2.2 ms**.
+- A warm session run costs about **0.02 ms**, or **0.07 ms** under `i`. The pattern's screen is cached after its first run; that first screen costs 0.01–0.3 ms for everyday patterns and at most a few milliseconds (see the screen below).
+- A one-shot `runRegex`, which starts a worker, costs about **2.3 ms**.
 - `testEach` over 10 000 log lines takes **4.3 ms**, against 0.3 ms for a synchronous loop. Most of the difference is copying the inputs to the worker.
 
 `runRegex` is a one-run session.
@@ -55,9 +68,9 @@ Only `status: "ok"` carries a definite answer. Every other status means the help
 |---|---|
 | `rejected` | The pattern was refused before running (`code`: `pattern-too-long`, `invalid-flags`, `flag-not-allowed`, `invalid-syntax`, `nested-quantifier`, `overlapping-alternation`, `unanalysable`). Report it as invalid input. |
 | `input-too-large` / `output-too-large` | A cap would be exceeded. A replace is refused, never cut short. |
-| `timeout` | The deadline passed. Batch ops add `completed` and `partial`, which cover the inputs answered before the stop. |
+| `timeout` | The deadline passed, while screening or while matching. Batch ops add `completed` and `partial`, which cover the inputs answered before the stop. |
 | `gave-up` | The engine abandoned an `exec` and reported "no match" (see below). Batch ops add `index` and `partial`. |
-| `error` | `busy`, `worker-unavailable`, `worker-crashed`, `exec-threw` or `closed`. |
+| `error` | `busy`, `aborted`, `worker-unavailable`, `worker-crashed`, `exec-threw` or `closed`. |
 
 `regexVerdict(outcome)` maps a `test` outcome to `"matched" | "not-matched" | "undetermined"`. How to surface `undetermined` depends on the kind of tool:
 
@@ -74,21 +87,27 @@ The only difference is cost. Every give-up measured took 0.4–3 s, while a genu
 
 ### The static screen: `screenUserRegex` and `compileUserRegex`
 
-Both are synchronous; the screen suits a zod `refine`. They check length, flags and syntax, then screen for the shapes that make backtracking exponential:
+Both are synchronous, so the screen suits a zod `refine`. They check length, flags and syntax, then screen every repeated group for the shapes that make backtracking exponential. A repeated group is accepted when each repetition ends in exactly one place and matches its text in exactly one way. Everything else is refused:
 
-- `nested-quantifier` flags a repeated group whose body can match a varying amount of text, with nothing that marks where one repetition ends. Examples: `(a+)+`, `(\w{1,})*`, `(\w+\s?)+`, `(.*a){12}`, `(a?){30}`. Safely delimited nesting is accepted: in `(\w+\.)+`, `(\d{1,3}\.){3}`, `(?:\r?\n)+` and `(<[^>]*>)*`, a character the varying parts cannot match ends each repetition.
-- `overlapping-alternation` flags a repeated group containing an alternation whose branches can start with the same character: `(a|a)*`, `(\w|\d)*`, `(a|ab)*`. Case folding under `i` is taken into account, including `ſ`/`s` and `K`/`k`. `(a|b)*` and `(foo|bar)+` are accepted.
+- `nested-quantifier`: a repetition can end in more than one place, or split its text more than one way. Examples: `(a+)+`, `(\w{1,})*`, `(\w+\s?)+`, `(.*a){12}`, `(a?){30}`, and `(?:,\d+\d*)*`. In the last one the delimiter fixes where each repetition ends, but `\d+\d*` can still split `12` two ways, and the splits multiply; the screen used to accept it, and JavaScriptCore gives up on it. Safe nesting is accepted: `(\w+\.)+`, `(\d{1,3}\.){3}`, `(?:\r?\n)+`, `(<[^>]*>)*`, `(?:\d+[a-z]+)*`.
+- `overlapping-alternation`: two branches of a repeated alternation can match the same text. Examples: `(a|a)*`, `(\w|\d)*`, `(?:\.(?:ab|a[bc]))*`. Branches that start alike but must differ are accepted: `(?:ab|ac)+`, `[0-9]|[1-9][0-9]` between delimiters, and semver's `0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*`. Case folding under `i` is taken into account, including `ſ`/`s` and `K`/`k`.
 
-**The screen is the second layer, never the first.** It recognises known shapes; it can't prove a pattern is fast. Polynomial patterns get through by design: `\s+$` on a long run of spaces is quadratic, and `(?:a|b)*(?:a|b)*(?:a|b)*(?:a|b)*!|x` passes the screen yet makes JavaScriptCore give up (see `run.test.ts`). The deadline and the give-up timing bound those. `compileUserRegex` returns a `RegExp` for callers that need one, but running it synchronously over untrusted, caller-sized text is still unbounded.
+A repetition with a small upper bound is accepted when the number of ways through it stays at 1 024 or fewer, however ambiguous each repetition is. The canonical IPv4 regex repeats `(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}`, which has 216. Unicode property escapes (`\p{L}`) and `v`-mode classes are modelled from what the engine matches over U+0000–U+00FF and the whitespace above it, so `^\p{L}+(?:[ '-]\p{L}+)*$` is seen as delimited. `screen.test.ts` holds the refused and must-accept batteries. A fuzzer over millions of generated patterns found no accepted pattern slow on pumped input.
+
+**The screen is the second layer, never the first.** It recognises exponential shapes; it can't prove a pattern is fast. Polynomial patterns get through by design: `\s+$` on a long run of spaces is quadratic. The deadline and the give-up timing bound those. `compileUserRegex` returns a `RegExp` for callers that need one, but running it synchronously over untrusted, caller-sized text is still unbounded.
+
+**The screen's own cost is bounded.** It runs on the caller's thread, not in the worker, so it charges every step to a work budget (`limits.maxScreenWork`, default 200 000 units). A pattern that exhausts the budget is refused as `unanalysable`. Measured on an Apple-silicon Mac, the worst 1 000-character patterns found take about 5 ms, where the old screen took up to 4.4 s under `i`. The engine's own compile also runs on the caller's thread, and a `v`-mode set operation over a property (`[\p{L}--[a-z]]`) costs it 1–3.5 ms. Those operations, and property escapes inside classes, are charged to the budget before anything is compiled. The first `i` screen in a process builds a case-folding index once, in about 13 ms. Verdicts are cached (512 entries, keyed by pattern, flags and limits), so a refine followed by a run, or the same rule on every call, costs a lookup. The many-pattern ops yield to the event loop between rules and stop at the deadline.
 
 ### Termination bounds the caller's thread, not the worker's CPU
 
 At the deadline the caller's event loop is free. The worker thread, though, can't be preempted inside the regex engine: it stops at the next termination check, which comes after the current `exec` returns.
 
 - For an exponential pattern, the backtracking budget ends the `exec` within about 0.4–3 s of one core.
-- For a polynomial pattern over a long input, it can take seconds to minutes. `\s+$|x` on 80 000 spaces takes 3.7 s.
+- For a polynomial pattern, it grows with the input. `\s+$` costs about 0.6 ns × n² here: 64 000 characters take 2.4 s, and 1 000 000 about ten minutes.
 
-`maxInputChars` (default 1 000 000) bounds this. `regexWorkerCounts()` reports such `runaway` threads. While `maxRunawayWorkers` (default 2) of them are still running, new runs are refused as `error`/`busy` instead of stacking more burning threads. Terminated workers are `unref`ed and never hold the process open.
+`regexWorkerCounts()` reports such `runaway` threads. While `maxRunawayWorkers` (default 2) of them are still running for the same `runawayKey`, new runs under that key are refused as `error`/`busy` instead of stacking more burning threads. Pass the session id as `runawayKey`, so one session's hostile patterns leave the others alone. Past `maxRunawayWorkersTotal` (8) across all keys, every run is `busy`. Terminated workers are `unref`ed and never hold the process open.
+
+**How long `busy` lasts** is how long the abandoned `exec` still has to run, so it is set by the size of one input. A batch runs one `exec` per input, so `maxItemChars` (default 65 536, about 2.5 s here for a quadratic pattern) bounds it. A single-input op is bounded by `maxInputChars` (default 1 000 000, up to ten minutes). Choose these per tool: 64 KiB per line or cell suits `Grep` and `TableQuery`, and a document-sized `test` or `replace` should cap its input at what the tool really needs.
 
 ### Why the worker is a string
 
@@ -215,7 +234,7 @@ A secret in a URL's PATH, such as a Slack webhook's, is not recognisable by shap
 
 | Finding(s) | Replace | With |
 |---|---|---|
-| flag-truth-1#5, security-1#2, security-2#1, security-6#6, security-8#9, security-8#12, security-9#7, security-12#1, flag-truth-2#6, security-5#20 | `new RegExp(callerPattern)` + synchronous `test`/`exec`/`replace` | `screenUserRegex` in the input schema, plus `runRegex`/a session with a batch op at run time. Surface non-`ok` as undetermined (see above). |
+| flag-truth-1#5, security-1#2, security-2#1, security-6#6, security-8#9, security-8#12, security-9#7, security-12#1, flag-truth-2#6, security-5#20 | `new RegExp(callerPattern)` + synchronous `test`/`exec`/`replace` | `screenUserRegex` in the input schema, plus `runRegex`/a session with a batch op at run time, passing `signal: ctx.signal` and `runawayKey`. A synchronous evaluator runs one `testMatrix` first and looks answers up (see above). Surface non-`ok` as undetermined. |
 | security-10#0 | a literal regex with an overlap (`\s+[^:]*`) | Fix the literal and cap line length. `runRegex({ op: "testEach" })` is the fallback if the pattern must stay. |
 | security-8#7, security-8#8, security-10#9 | `new Response(proc.stdout).text()` + `capText` | `spawnBounded`, reporting `outputComplete: false` as unreadable. |
 | security-6#8, security-12#4 | `collectStream` → `new Response(stream).text()` | `collectBounded` (with `onOverflow: "kill"` semantics where the output past the cap is worthless). |

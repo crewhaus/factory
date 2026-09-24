@@ -153,9 +153,16 @@ export function dot(dotAll: boolean): CharSet {
  * pattern that relies on those overlapping under `i` can slip past the
  * screen; the deadline still bounds it.
  */
-let foldClassOf: Map<number, number[]> | undefined;
+type FoldIndex = {
+  /** Every code point that has a case partner, ascending. */
+  readonly members: Int32Array;
+  /** For each entry of `members`, its whole class (itself included). */
+  readonly classes: ReadonlyArray<readonly number[]>;
+};
 
-function buildFoldClasses(): Map<number, number[]> {
+let foldIndex: FoldIndex | undefined;
+
+function buildFoldIndex(): FoldIndex {
   const parent = new Map<number, number>();
   const find = (x: number): number => {
     let root = x;
@@ -182,41 +189,85 @@ function buildFoldClasses(): Map<number, number[]> {
       join(cp, code);
     }
   }
-  const members = new Map<number, number[]>();
+  const byRoot = new Map<number, number[]>();
   for (const cp of parent.keys()) {
     const root = find(cp);
-    const list = members.get(root) ?? [];
+    const list = byRoot.get(root) ?? [];
     list.push(cp);
-    members.set(root, list);
+    byRoot.set(root, list);
   }
-  const byMember = new Map<number, number[]>();
-  for (const list of members.values()) {
+  const pairs: Array<[number, readonly number[]]> = [];
+  for (const list of byRoot.values()) {
     if (list.length < 2) continue;
-    for (const cp of list) byMember.set(cp, list);
+    list.sort((a, b) => a - b);
+    for (const cp of list) pairs.push([cp, list]);
   }
-  return byMember;
+  pairs.sort((a, b) => a[0] - b[0]);
+  return {
+    members: Int32Array.from(pairs, ([cp]) => cp),
+    classes: pairs.map(([, list]) => list),
+  };
 }
 
-/** Every class of case-equivalent characters, as lists. */
-function foldClasses(): Map<number, number[]> {
-  foldClassOf ??= buildFoldClasses();
-  return foldClassOf;
+/** Index of the first entry of `members` that is >= `cp`. */
+function lowerBound(members: Int32Array, cp: number): number {
+  let lo = 0;
+  let hi = members.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((members[mid] as number) < cp) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
+
+/** Recently folded sets. The screen folds the same few sets over and over. */
+const foldMemo = new Map<string, CharSet>();
+const FOLD_MEMO_ENTRIES = 512;
 
 /**
  * The set closed under case equivalence: if any member of a case class is in
- * the set, every member is. Exact for the BMP regardless of the set's size,
- * because it walks the (small) list of classes rather than the set.
+ * the set, every member is. Exact for the BMP.
+ *
+ * Its cost depends on how many case-paired characters the set holds, not on
+ * the number of classes: each range is located in a sorted index by binary
+ * search, so a single literal costs a few comparisons. Results are memoised;
+ * `charge` is told the cost of a result that was not.
  */
-export function fold(set: CharSet): CharSet {
+export function fold(set: CharSet, charge?: (units: number) => void): CharSet {
+  const key = set.join(",");
+  const hit = foldMemo.get(key);
+  if (hit !== undefined) return hit;
+  charge?.(foldCost(set));
+  foldIndex ??= buildFoldIndex();
+  const { members, classes } = foldIndex;
   const extra: Array<[number, number]> = [];
-  const seen = new Set<number[]>();
-  for (const list of foldClasses().values()) {
-    if (seen.has(list)) continue;
-    seen.add(list);
-    if (list.some((cp) => has(set, cp))) {
-      for (const cp of list) if (!has(set, cp)) extra.push([cp, cp]);
+  for (let r = 0; r + 1 < set.length; r += 2) {
+    const lo = set[r] as number;
+    const hi = set[r + 1] as number;
+    for (let i = lowerBound(members, lo); i < members.length; i++) {
+      if ((members[i] as number) > hi) break;
+      for (const cp of classes[i] as readonly number[]) if (!has(set, cp)) extra.push([cp, cp]);
     }
   }
-  return extra.length === 0 ? set : union(set, fromRanges(extra));
+  const out = extra.length === 0 ? set : union(set, fromRanges(extra));
+  if (foldMemo.size >= FOLD_MEMO_ENTRIES) foldMemo.clear();
+  foldMemo.set(key, out);
+  return out;
+}
+
+/**
+ * The cost {@link fold} pays for `set` when it is not memoised, in the
+ * screen's work units: one per range, plus one per case-paired member it
+ * visits. `fold` reports it through `charge` before doing the work.
+ */
+function foldCost(set: CharSet): number {
+  foldIndex ??= buildFoldIndex();
+  const { members } = foldIndex;
+  let cost = 1;
+  for (let r = 0; r + 1 < set.length; r += 2) {
+    cost +=
+      1 + lowerBound(members, (set[r + 1] as number) + 1) - lowerBound(members, set[r] as number);
+  }
+  return cost;
 }

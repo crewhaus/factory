@@ -349,6 +349,262 @@ describe("runRegex: never turns 'did not finish' into 'no match'", () => {
   }, 120_000);
 });
 
+describe("screening many patterns", () => {
+  /** A distinct, screen-accepted ~900-character pattern that takes real work to screen. */
+  function heavyPattern(n: number): string {
+    let nest = "x";
+    let cp = 0x4e00;
+    while (nest.length + 7 < 880) {
+      nest = `(?:${nest})+${String.fromCharCode(cp)}`;
+      cp += 2;
+    }
+    return `${nest}${n}`;
+  }
+
+  test("yields to the event loop, and counts against the deadline", async () => {
+    await settleWorkers(60_000);
+    const rules = Array.from({ length: 600 }, (_, i) => ({ pattern: heavyPattern(i), flags: "i" }));
+    let last = performance.now();
+    let maxGap = 0;
+    const tick = setInterval(() => {
+      const now = performance.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+    }, 1);
+    last = performance.now();
+    const before = regexWorkerCounts().live;
+    const outcome = await runRegex({
+      op: "firstMatchingRule",
+      rules,
+      inputs: ["x"],
+      deadlineMs: 50,
+      maxTotalPatternChars: 1_000_000,
+    });
+    // The stretch since the last tick counts too: a continuation runs
+    // before the interval can fire again.
+    maxGap = Math.max(maxGap, performance.now() - last);
+    clearInterval(tick);
+    // Screening all 600 takes far longer than 50 ms; it stopped at the deadline.
+    expect(outcome).toMatchObject({ status: "timeout", completed: 0 });
+    if (outcome.status === "timeout") expect(outcome.reason).toContain("screening");
+    // Before, this held the event loop for the whole screen (36 s at 1000 rules).
+    expect(maxGap).toBeLessThan(500);
+    // Nothing was run, so no worker was started.
+    expect(regexWorkerCounts().live).toBe(before);
+  }, 60_000);
+
+  test("the patterns' combined length is capped before any is screened", async () => {
+    const outcome = await runRegex({
+      op: "testMatrix",
+      patterns: [{ pattern: "a".repeat(60) }, { pattern: "b".repeat(60) }],
+      inputs: ["a"],
+      maxTotalPatternChars: 100,
+    });
+    expect(outcome).toMatchObject({ status: "input-too-large" });
+    if (outcome.status === "input-too-large") expect(outcome.reason).toContain("120");
+  });
+});
+
+describe("batch ops", () => {
+  const inputs = ["ERR: disk", "warn: cpu", "fine", "xx err", "warning", ""];
+  const patterns = [
+    { pattern: "err", flags: "i" },
+    { pattern: "^warn" },
+    { pattern: "x+" },
+    { pattern: "$" },
+  ];
+
+  test("testMatrix answers every pattern for every input, as a native loop would", async () => {
+    const outcome = await runRegex({ op: "testMatrix", patterns, inputs });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    const native = patterns.map(({ pattern, flags }) =>
+      inputs.flatMap((input, i) => (new RegExp(pattern, flags).test(input) ? [i] : [])),
+    );
+    expect(outcome.result.matched).toEqual(native);
+    expect(outcome.result.undetermined).toEqual(patterns.map(() => []));
+  });
+
+  test("replaceEach replaces in every input, as the built-in method does, under one output cap", async () => {
+    const outcome = await runRegex({
+      op: "replaceEach",
+      pattern: "(\\w)(\\w*)",
+      flags: "g",
+      inputs,
+      replacement: "$2$1",
+    });
+    expect(outcome.status).toBe("ok");
+    if (outcome.status !== "ok") return;
+    expect(outcome.result.outputs).toEqual(inputs.map((s) => s.replace(/(\w)(\w*)/g, "$2$1")));
+    expect(outcome.result.replacements).toBe(
+      inputs.reduce((n, s) => n + (s.match(/(\w)(\w*)/g)?.length ?? 0), 0),
+    );
+    const capped = await runRegex({
+      op: "replaceEach",
+      pattern: "x",
+      flags: "g",
+      inputs: ["x".repeat(50), "x".repeat(50)],
+      replacement: "yy",
+      maxOutputChars: 150,
+    });
+    expect(capped.status).toBe("output-too-large");
+  });
+
+  test("an input over maxItemChars stops the batch, or is skipped as undetermined", async () => {
+    const long = "a".repeat(101);
+    const stopped = await runRegex({
+      op: "testEach",
+      pattern: "a",
+      inputs: ["a", long, "a"],
+      maxItemChars: 100,
+    });
+    expect(stopped).toMatchObject({ status: "input-too-large", index: 1 });
+    const skipped = await runRegex({
+      op: "testEach",
+      pattern: "a",
+      inputs: ["a", long, "b", "a"],
+      maxItemChars: 100,
+      onGiveUp: "skip",
+    });
+    expect(skipped).toMatchObject({
+      status: "ok",
+      result: { matched: [0, 3], undetermined: [1], scanned: 4 },
+    });
+    const rules = await runRegex({
+      op: "firstMatchingRule",
+      rules: [{ pattern: "b" }, { pattern: "a" }],
+      inputs: ["a", long],
+      maxItemChars: 100,
+      onGiveUp: "skip",
+    });
+    expect(rules).toMatchObject({
+      status: "ok",
+      result: { ruleIndexes: [1, null], undetermined: [1] },
+    });
+  });
+
+  test('onGiveUp "skip" reports a give-up as undetermined and answers the inputs after it', async () => {
+    await settleWorkers(60_000);
+    const session = openRegexSession();
+    try {
+      const each = await session.run({
+        op: "testEach",
+        pattern: GIVES_UP.pattern,
+        inputs: ["x", GIVES_UP.input, "yx", "no"],
+        onGiveUp: "skip",
+        deadlineMs: 60_000,
+      });
+      expect(each).toMatchObject({
+        status: "ok",
+        result: { matched: [0, 2], undetermined: [1], scanned: 4 },
+      });
+      const first = await session.run({
+        op: "firstMatchingRule",
+        rules: [{ pattern: GIVES_UP.pattern }, { pattern: "a" }],
+        inputs: ["zzz", GIVES_UP.input, "a"],
+        onGiveUp: "skip",
+        deadlineMs: 60_000,
+      });
+      // Rule 0 could not be answered for input 1, so which rule matches
+      // first is undetermined there, although rule 1 would match.
+      expect(first).toMatchObject({
+        status: "ok",
+        result: { ruleIndexes: [-1, null, 1], undetermined: [1] },
+      });
+      const matrix = await session.run({
+        op: "testMatrix",
+        patterns: [{ pattern: GIVES_UP.pattern }, { pattern: "a" }],
+        inputs: ["zzz", GIVES_UP.input],
+        onGiveUp: "skip",
+        deadlineMs: 60_000,
+      });
+      expect(matrix).toMatchObject({
+        status: "ok",
+        result: { matched: [[], [1]], undetermined: [[1], []] },
+      });
+    } finally {
+      session.close();
+    }
+  }, 120_000);
+
+  test("a timed-out testMatrix reports its partial answers per pattern", async () => {
+    await settleWorkers(60_000);
+    const line = `${" ".repeat(3_000)}y`;
+    const outcome = await runRegex({
+      op: "testMatrix",
+      patterns: [{ pattern: "\\s+$" }, { pattern: "y" }],
+      inputs: new Array<string>(3_000).fill(line),
+      deadlineMs: 100,
+      maxInputChars: 20_000_000,
+    });
+    expect(outcome.status).toBe("timeout");
+    if (outcome.status !== "timeout") return;
+    const partial = outcome.partial as { matched: number[][]; undetermined: number[][] };
+    expect(partial.matched.length).toBe(2);
+    expect(partial.matched[0]).toEqual([]);
+    expect(partial.matched[1]?.length ?? 0).toBeLessThanOrEqual(outcome.completed ?? 0);
+    expect(await settleWorkers(30_000)).toEqual({ live: 0, runaway: 0 });
+  }, 90_000);
+});
+
+describe("abort and busy", () => {
+  test("a signal aborts before or during a run, and the verdict is undetermined", async () => {
+    await settleWorkers(60_000);
+    const early = await runRegex({
+      op: "test",
+      pattern: "a",
+      input: "a",
+      signal: AbortSignal.abort(),
+    });
+    expect(early).toMatchObject({ status: "error", code: "aborted" });
+    const controller = new AbortController();
+    const pending = runRegex({
+      op: "test",
+      pattern: "\\s+$|x",
+      input: `${" ".repeat(40_000)}x`,
+      deadlineMs: 60_000,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 30);
+    const outcome = await pending;
+    // ≈1 s of one core here, far longer on a slow runner: it cannot finish
+    // before the abort, so only an abort explains the outcome.
+    expect(outcome).toMatchObject({ status: "error", code: "aborted" });
+    expect(regexVerdict(outcome as RegexOutcome<TestResult>)).toBe("undetermined");
+    expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
+  }, 90_000);
+
+  test("abandoned workers make only their own runawayKey busy", async () => {
+    await settleWorkers(60_000);
+    const hostile = await runRegex({
+      op: "test",
+      pattern: "\\s+$|x",
+      input: `${" ".repeat(40_000)}x`,
+      deadlineMs: 20,
+      maxRunawayWorkers: 1,
+      runawayKey: "session-a",
+    });
+    expect(hostile.status).toBe("timeout");
+    const again = await runRegex({
+      op: "test",
+      pattern: "a",
+      input: "a",
+      maxRunawayWorkers: 1,
+      runawayKey: "session-a",
+    });
+    expect(again).toMatchObject({ status: "error", code: "busy" });
+    const neighbour = await runRegex({
+      op: "test",
+      pattern: "a",
+      input: "a",
+      maxRunawayWorkers: 1,
+      runawayKey: "session-b",
+    });
+    expect(neighbour).toMatchObject({ status: "ok", result: { matched: true } });
+    expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
+  }, 120_000);
+});
+
 describe("sessions", () => {
   test("one warm worker serves every run until the session closes", async () => {
     await settleWorkers(60_000);
