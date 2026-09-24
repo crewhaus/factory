@@ -211,7 +211,7 @@ The whole copy is planned before a byte is written. Every source entry is `lstat
 
 During the write, each entry is checked against the directory that was planned. If a directory is swapped for a link mid-copy, the copy stops, removes the entry it had just made through the swap, and reports how many entries were already copied.
 
-On Linux each file's bytes are copied by the kernel, between the two verified descriptors (`/proc/self/fd/<n>`): a clone on btrfs and XFS, `copy_file_range` on ext4. On macOS they are copied in 1 MiB chunks. There, copying between `/dev/fd` paths failed on 64 MiB and changed modes (measured on Bun 1.3.14), and a clone by path would re-walk the path the plan checked. A multi-gigabyte copy therefore blocks for as long as the disk takes, and it is synchronous.
+On Linux each file's bytes are copied by the kernel, between the two verified descriptors (`/proc/self/fd/<n>`): a clone on btrfs and XFS, `copy_file_range` on ext4. Elsewhere, macOS included, they are copied in 1 MiB chunks. On macOS, copying between `/dev/fd` paths failed on 64 MiB and changed modes (measured on Bun 1.3.14), and a clone by path would re-walk the path the plan checked. A multi-gigabyte copy therefore blocks for as long as the disk takes, and it is synchronous.
 
 ### Moving: `checkRelocatedLinks(srcRoot, src, dstRoot, dst, { maxLinks?, maxVisited? })`
 
@@ -295,5 +295,5 @@ A secret in a URL's PATH, such as a Slack webhook's, is not recognisable by shap
 | security-11#5 | a lexical `path.resolve(dir, linkTarget)` check of staged links | `walkContained(staging, ".")` and refuse any entry with `link.inside === false`. |
 | flag-truth-6#2, security-11#3 | `zip -r` without `-y` | Add `-y` to the argv. `walkContained` can refuse a source holding a link that leads out. |
 | security-10#2 | `mkdirSync(trash, { recursive: true })` | `ensureDirContained(root, trashRel, { symlinks: "refuse" })`. The owner check stays in the tool. |
-| config-delivery#4, flag-truth-3#1, flag-truth-4#2, flag-truth-2#0, security-8#4, security-10#8, flag-truth-5#11, security-8#20 | `process.env[input.envVar]`, `input.tokenEnv ?? cfg.tokenEnv` | `resolveCredentialEnv(name, { allowed: <tool_config list>, purpose, configKey })`, plus `redactKnownSecretsDeep` on everything returned. |
-| flag-truth-4#1, security-8#3, docs-claims#6 | `reveal` from tool input | `checkEnvReveal(name, { allowed: <tool_config list>, configKey })`. |
+| config-delivery#4, flag-truth-3#1, flag-truth-4#2, flag-truth-2#0, security-8#4, security-10#8, flag-truth-5#11, security-8#20 | `process.env[input.envVar]`, `input.tokenEnv ?? cfg.tokenEnv` | `resolveCredentialEnv(name, { allowed: <tool_config list>, purpose, configKey })`, plus `redactKnownSecretsDeep` on everything returned. Only in a package that tool_config reaches: config-delivery#0 comes first. |
+| flag-truth-4#1, security-8#3, docs-claims#6 | `reveal` from tool input | `checkEnvReveal(name, { allowed: <tool_config list>, configKey })`, together with a tool-proc config registration for `env_reveal`. |
