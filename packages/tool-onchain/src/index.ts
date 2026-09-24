@@ -20,7 +20,14 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { keccak256Hex } from "@crewhaus/tool-encode";
 import { z } from "zod";
-import { type AbiValue, decodeData, encodeCall, parseSignature, selectorOf } from "./lib/abi";
+import {
+  type AbiValue,
+  canonicalSignature,
+  decodeData,
+  encodeCall,
+  parseSignature,
+  selectorOf,
+} from "./lib/abi";
 import { formatUnits, parseUnits, validateAddress } from "./lib/address";
 import {
   healthFactorBps,
@@ -55,6 +62,22 @@ export {
   encodeAggregate3,
   parseMulticallMap,
 } from "./lib/multicall";
+
+/**
+ * The canonical form of a function signature, and its four-byte selector —
+ * the pair that tells two overloads of one name apart. `uint` is `uint256`
+ * here, as it is in the hash; a malformed signature throws, naming what is
+ * wrong. Library code for a package that builds tools from an ABI
+ * (`@crewhaus/tool-contract-gateway`); like everything here, it dials nothing.
+ */
+export function canonicalFunction(signature: string): {
+  readonly signature: string;
+  readonly selector: string;
+} {
+  const { name, types } = parseSignature(signature);
+  const canonical = canonicalSignature(name, types);
+  return { signature: canonical, selector: `0x${selectorOf(canonical)}` };
+}
 
 const json = (value: unknown): string => JSON.stringify(value);
 
