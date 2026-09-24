@@ -203,6 +203,15 @@ describe("GoldenCompare and GoldenUpdate", () => {
     },
   );
 
+  test.skipIf(process.platform === "win32")(
+    "GoldenCompare says a FIFO golden is not a file, not that it is missing",
+    async () => {
+      expect(Bun.spawnSync(["mkfifo", join(workspace, "g.txt")]).exitCode).toBe(0);
+      const out = await raw(goldenCompare, { actual: "x", golden: "g.txt" });
+      expect(out).toMatch(/could not read the golden "g\.txt".*not a regular file/);
+    },
+  );
+
   test("a missing directory is refused with a reason, and nothing is written", async () => {
     const out = await raw(goldenUpdate, { actual: "x\n", golden: "nodir/g.txt" });
     expect(out).toMatch(/^GoldenUpdate wrote nothing: .*nodir\/g\.txt/);

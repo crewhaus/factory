@@ -314,8 +314,12 @@ async function goldenCompareRun(
   let goldenText: string;
   try {
     goldenText = readCapped(goldenAt.real, goldenAt.rel).toString("utf-8");
-  } catch {
-    return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+    }
+    // A FIFO, a directory or an oversized file is not "missing"; say what it is.
+    return `GoldenCompare could not read the golden "${goldenAt.rel}", so this is not a verdict: ${(err as Error).message}`;
   }
   const actualRaw =
     input.actual ??
