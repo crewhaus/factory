@@ -177,6 +177,7 @@
         "@crewhaus/tool-pkgmgr": "workspace:*",
         "@crewhaus/tool-proc": "workspace:*",
         "@crewhaus/tool-registry": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
         "@crewhaus/tool-retrieve": "workspace:*",
         "@crewhaus/tool-routing": "workspace:*",
         "@crewhaus/tool-schema": "workspace:*",
@@ -200,9 +201,6 @@
         "@crewhaus/watchme-store": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
         "yaml": "^2.6.0",
-      },
-      "devDependencies": {
-        "@crewhaus/tool-registry-manifest": "workspace:*",
         "zod": "^3.23.8",
       },
       "optionalDependencies": {

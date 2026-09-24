@@ -151,6 +151,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `crewhaus` package declares everything it loads at startup.** It
+  loaded `@crewhaus/tool-registry-manifest` and `zod` without listing them as
+  dependencies, so it only started when another package happened to pull them
+  in. An install that lays packages out differently could fail with a
+  "cannot find package" error on every command.
 - **`crewhaus permissions suggest` proposes rules scoped to what was
   approved.** Three approvals of `RemovePath build/cache` used to become
   `alwaysAllow RemovePath` — delete anything — and three `git status` became
