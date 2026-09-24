@@ -948,15 +948,48 @@ describe("HttpBatch", () => {
     expect(result.results[2].error).toContain("not in allowed_origins");
   });
 
-  test("one failure never cancels the others", async () => {
+  // These two replace one test that raced a 200ms per-request deadline against
+  // a real request to /json. A contended CI runner took longer than 200ms to
+  // answer, so the healthy request failed on its own clock (main went red on
+  // two consecutive runs). It could also never catch what it was named for:
+  // /json finished in a few milliseconds, long before /slow failed, so nothing
+  // was left in flight for a failure to cancel.
+  //
+  // Neither test below races a deadline it needs to beat. Each keeps the
+  // healthy request exposed to the failure: still in flight when the failure
+  // lands, or not yet started when the deadline fires.
+
+  test("a failure never cancels a sibling that is still in flight", async () => {
+    // The refused origin fails before any I/O; /slow is then mid-request for
+    // two seconds. An abort that fanned out from the failure would reach it.
     const result = await run(httpBatch, {
-      requests: [{ url: `${origin}/slow` }, { url: `${origin}/json` }],
-      timeoutMs: 200,
+      requests: [{ url: "http://example.com/blocked" }, { url: `${origin}/slow` }],
+      timeoutMs: 15_000,
       concurrency: 2,
     });
     expect(result.results[0].ok).toBe(false);
+    expect(result.results[0].error).toContain("not in allowed_origins");
     expect(result.results[1].ok).toBe(true);
-  });
+    expect(result.results[1].body).toBe("late");
+  }, 30_000);
+
+  test("one request's deadline does not leak into the requests after it", async () => {
+    // One at a time, so /json is issued only after /slow's deadline has fired.
+    // If that abort reached the batch's own signal, /json would start already
+    // cancelled. /slow cannot win the race: its 2s sleep and this 1s deadline
+    // share one event loop, and the deadline expires first however late both
+    // run.
+    const result = await run(httpBatch, {
+      requests: [{ url: `${origin}/slow` }, { url: `${origin}/json` }],
+      timeoutMs: 1_000,
+      concurrency: 1,
+    });
+    expect(result.results[0].ok).toBe(false);
+    // The reason, not just the failure: a batch-wide abort is `ok: false` too.
+    expect(result.results[0].error).toContain("deadline");
+    expect(result.results[1].ok).toBe(true);
+    expect(result.results[1].status).toBe(200);
+  }, 30_000);
 
   test("bodies and headers are opt-out and opt-in respectively", async () => {
     const lean = await run(httpBatch, {
