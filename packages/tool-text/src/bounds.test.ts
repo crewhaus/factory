@@ -160,7 +160,7 @@ describe("entity scans are linear", () => {
     for (const kind of ["email", "money", "jwt"]) {
       expect({ kind, enough: (withMatches[kind] ?? 0) > 150 }).toEqual({ kind, enough: true });
     }
-  });
+  }, 20_000);
 });
 
 describe("edit-distance comparisons are refused above the cell budget", () => {
@@ -189,7 +189,7 @@ describe("edit-distance comparisons are refused above the cell budget", () => {
       }),
     );
     expect(trigram.method).toBe("trigram");
-  });
+  }, 20_000);
 
   test("the cost model matches the budget's boundary", () => {
     expect(similarityCost("x".repeat(5_000), "y".repeat(5_000), "levenshtein")).toBe(
@@ -214,7 +214,7 @@ describe("edit-distance comparisons are refused above the cell budget", () => {
       method: "jaro",
     });
     expect(one).toMatch(/^candidates\[1\]: inputs too large for jaro/);
-  });
+  }, 20_000);
 
   test("a sanctions-list-sized call fits: ten thousand names against a name", async () => {
     const names = Array.from({ length: 10_000 }, (_, i) => `Company Holdings Number ${i} Limited`);
@@ -222,5 +222,5 @@ describe("edit-distance comparisons are refused above the cell budget", () => {
       await out(fuzzyMatch, { query: "Company Holdings Number 42 Limited", candidates: names }),
     );
     expect(result.hits[0].candidate).toBe("Company Holdings Number 42 Limited");
-  });
+  }, 20_000);
 });

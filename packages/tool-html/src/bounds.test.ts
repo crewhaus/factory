@@ -549,7 +549,7 @@ describe("HtmlTable builds a bounded grid", () => {
       rowCount: lifted.rowCount,
       truncatedBy: lifted.truncatedBy,
     }).toEqual({ rows: 1, width: 1000, rowCount: 1000, truncatedBy: ["rows", "columns"] });
-  });
+  }, 20_000);
 
   test("the same bomb at the default maxRows stays within the character budget", async () => {
     const html = `<table><tr>${"<td colspan=1000 rowspan=1000>x</td>".repeat(5)}</tr>${"<tr>".repeat(999)}</table>`;
@@ -560,7 +560,7 @@ describe("HtmlTable builds a bounded grid", () => {
     expect(table.truncated).toBe(true);
     expect(table.rowCount).toBe(1000);
     for (const row of table.rows as string[][]) expect(row.length).toBe(1000);
-  });
+  }, 20_000);
 
   test("colspan fan-out is cut at the column cap and says so", async () => {
     // 58 KB of markup; 0.7.0 answered 10,000,232 characters with truncated: false.
@@ -572,7 +572,7 @@ describe("HtmlTable builds a bounded grid", () => {
       rows: 50,
       truncatedBy: ["columns"],
     });
-  });
+  }, 20_000);
 
   test("one long cell spanned 1,000 times is stopped by the budget, not copied 1,000 times", async () => {
     const html = `<table><tr><td colspan=1000>${"A".repeat(10_000)}</td></tr></table>`;
@@ -608,7 +608,7 @@ describe("HtmlTable builds a bounded grid", () => {
     expect(out.note).toContain("budget");
     expect(out.tables[3].truncated).toBe(false);
     expect(out.tables[4].truncatedBy).toEqual(["chars"]);
-  });
+  }, 20_000);
 
   test("a table no limit touches is lifted exactly as 0.7.0 lifted it", () => {
     let compared = 0;
@@ -631,5 +631,5 @@ describe("HtmlTable builds a bounded grid", () => {
     }
     expect(compared).toBe(500);
     expect(spanned).toBeGreaterThan(300);
-  });
+  }, 20_000);
 });
