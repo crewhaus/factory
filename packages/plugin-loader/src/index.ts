@@ -1307,15 +1307,14 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
         `plugin "${name}": ${providesProblem} — refusing to load the plugin`,
       );
     }
-    // Every tool is checked before any is kept: a malformed one refuses the
-    // whole plugin at boot, naming the tool and the field, instead of failing
-    // open on a flag or crashing the first turn. Then it is normalized through
-    // buildTool, the same fail-closed scope/justification inference as
-    // first-party tools. A plugin is signed, in-process code, so its
-    // descriptions are not boundary-classified the way a remote MCP
-    // server's are.
     // The host tools this plugin's tools may reach through ctx.bridge.
     const bridgeTools: ReadonlySet<string> = new Set(plugin.permissions.tools ?? []);
+    // Each tool is checked: a malformed one refuses the whole plugin at boot,
+    // naming the tool and the field, instead of failing open on a flag or
+    // crashing the first turn. Then it is normalized through buildTool, the
+    // same fail-closed scope/justification inference as first-party tools. A
+    // plugin is signed, in-process code, so its descriptions are not
+    // boundary-classified the way a remote MCP server's are.
     for (const [index, tool] of contributed.entries()) {
       const label =
         isPlainObject(tool) && typeof tool["name"] === "string"
