@@ -42,6 +42,10 @@
  *   bun scripts/publish-workspace.ts --filter @crewhaus/errors  # canary a leaf first
  *   bun scripts/publish-workspace.ts                            # full run
  *
+ * Every form, --dry-run included, needs `npm` and a registry that answers (the
+ * ownership guard below will not guess), and a tree already stamped by
+ * `release-prep.ts --for-publish` (an unstamped one fails the manifest check).
+ *
  * Brand-new package names can 404 on the registry for a few minutes after a
  * successful publish — poll before assuming failure or re-running.
  *
@@ -50,12 +54,32 @@
  * `repository` url+directory must match the local package.json's, else the
  * package is reported as a failure instead of published/skipped. This is
  * what catches two workspaces accidentally sharing one npm name. The guard
- * also runs under --dry-run, making it a usable pre-flight.
+ * also runs under --dry-run, making it a usable pre-flight. It fails CLOSED:
+ * only npm's E404 ("no such package") counts as a first publish; any other
+ * failure to read the registry refuses the package, because "could not ask"
+ * is not "nobody owns it". (npm already retries transient fetch errors itself.)
+ *
+ * Dependency gate: npm does not check at publish time that a package's
+ * dependencies exist, and neither does the registry (v0.1.0 went out pinned to
+ * @crewhaus/<dep>@0.0.0, which never existed). So a package is refused when an
+ * internal dependency (dependencies, peerDependencies or optionalDependencies)
+ * failed or was refused in this run, or — for a dependency outside this run,
+ * as under --filter — is not on the registry at this version. The refusal
+ * cascades: when a leaf fails, nothing that depends on it, the bare `crewhaus`
+ * CLI included, goes out pointing at a version that does not exist. Under
+ * --dry-run the plan shows the same cascade.
+ *
+ * Packed-contents check: before publishing (and under --dry-run), the package
+ * dir must hold what its tarball is supposed to carry — every entry point and
+ * literal `files` entry, plus README.md, LICENSE and NOTICE (release-prep
+ * --for-publish puts the last three there). npm packs a missing `files` entry
+ * as nothing, silently.
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
+import { preflight } from "../packages/tool-pkg/src/lib/preflight";
 
 type PkgInfo = {
   name: string;
@@ -121,9 +145,12 @@ function discoverPackages(): PkgInfo[] {
   }
 
   const pkgs: PkgInfo[] = raw.map(({ dir, pkg }) => {
+    // Optional deps too: npm installs a missing optional dependency as nothing,
+    // so a CLI whose provider adapter failed to publish would install without it.
     const allDeps = {
       ...((pkg.dependencies as Record<string, string>) ?? {}),
       ...((pkg.peerDependencies as Record<string, string>) ?? {}),
+      ...((pkg.optionalDependencies as Record<string, string>) ?? {}),
     };
     const repo = pkg.repository as { url?: string; directory?: string } | undefined;
     return {
@@ -182,13 +209,82 @@ function topoSort(pkgs: PkgInfo[]): PkgInfo[] {
   return out;
 }
 
-/** npm view <name>@<version> — returns true if already published. */
-function isPublished(name: string, version: string): boolean {
-  const r = spawnSync("npm", ["view", `${name}@${version}`, "version"], {
-    encoding: "utf-8",
-  });
-  if (r.status === 0 && r.stdout.trim().length > 0) return true;
-  return false;
+/** What a spawned `npm view` returned: the parts classification needs. */
+export type ViewResult = {
+  readonly status: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly error?: { readonly code?: string; readonly message: string } | undefined;
+  readonly signal?: string | null | undefined;
+};
+
+/**
+ * npm's error code for a failed command, e.g. "E404", "E429", "ECONNREFUSED".
+ * `--json` puts `{"error":{"code":…}}` on stdout (npm >= 7); every npm also
+ * prints `npm error code X` (npm >= 10) or `npm ERR! code X` (older) on stderr.
+ */
+export function npmErrorCode(stdout: string, stderr: string): string | undefined {
+  const trimmed = stdout.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const code = (JSON.parse(trimmed) as { error?: { code?: unknown } } | null)?.error?.code;
+      if (typeof code === "string" && code !== "") return code;
+    } catch {
+      // not JSON after all — fall through to stderr
+    }
+  }
+  return /^npm (?:error|ERR!) code (\S+)/m.exec(stderr)?.[1];
+}
+
+/**
+ * A failed `npm view`: either the registry said the thing does not exist (E404),
+ * or we could not find out. Only the first is an answer.
+ */
+export function classifyViewFailure(
+  r: ViewResult,
+): { readonly absent: true } | { readonly absent: false; readonly reason: string } {
+  if (r.status === null) {
+    const why = r.error
+      ? `npm could not be run (${r.error.code ?? r.error.message})`
+      : `npm was killed${r.signal ? ` by ${r.signal}` : ""}`;
+    return { absent: false, reason: why };
+  }
+  const code = npmErrorCode(r.stdout, r.stderr);
+  if (code === "E404") return { absent: true };
+  return {
+    absent: false,
+    reason: `npm view exited ${r.status} with ${code ? `code ${code}` : "no error code"}`,
+  };
+}
+
+export type RegistryState =
+  | { readonly kind: "published" }
+  | { readonly kind: "absent" }
+  | { readonly kind: "unknown"; readonly reason: string };
+
+/** Classify `npm view <name>@<version> version`. */
+export function versionState(r: ViewResult): RegistryState {
+  // Older npm exits 0 with nothing on stdout for a version that does not exist;
+  // npm 11 exits 1 with E404.
+  if (r.status === 0) return r.stdout.trim() !== "" ? { kind: "published" } : { kind: "absent" };
+  const c = classifyViewFailure(r);
+  return c.absent ? { kind: "absent" } : { kind: "unknown", reason: c.reason };
+}
+
+function npmView(args: string[]): ViewResult {
+  const r = spawnSync("npm", ["view", ...args], { encoding: "utf-8" });
+  return {
+    status: r.status,
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+    error: r.error as ViewResult["error"],
+    signal: r.signal,
+  };
+}
+
+/** Is <name>@<version> on the registry? Three answers, not two. */
+function registryState(name: string, version: string): RegistryState {
+  return versionState(npmView([`${name}@${version}`, "version"]));
 }
 
 /** Normalize a repository URL for comparison: lowercase, strip git+ / .git. */
@@ -200,19 +296,22 @@ function normRepoUrl(url: string | undefined): string {
 }
 
 /**
- * Ownership guard: if the name already exists on the registry, its
- * `repository` (url + directory) must match this local package. Two
- * different local packages publishing to one npm name is otherwise a
- * SILENT hijack — `@crewhaus/plugin-sdk` was two distinct packages
- * (factory §41 vs utilities Studio SDK) across 0.1.1→0.1.2 and nobody
- * was told. Returns null when ok (or name not on the registry yet),
- * else a human-readable mismatch description.
+ * Ownership verdict from `npm view <name> repository --json`: null when the name
+ * is free (E404) or the registry's repository matches this package, else why
+ * the package must not be published. Any failure other than E404 refuses: an
+ * unreachable, rate-limited or erroring registry says nothing about who owns
+ * the name, and treating it as "free" is exactly how the guard used to be
+ * switched off by a flaky network.
  */
-function ownershipMismatch(p: PkgInfo): string | null {
-  const r = spawnSync("npm", ["view", p.name, "repository", "--json"], {
-    encoding: "utf-8",
-  });
-  if (r.status !== 0) return null; // name not on the registry — first publish
+export function ownershipVerdict(
+  r: ViewResult,
+  p: Pick<PkgInfo, "name" | "repoUrl" | "repoDir">,
+): string | null {
+  if (r.status !== 0) {
+    const c = classifyViewFailure(r);
+    if (c.absent) return null; // name not on the registry — first publish
+    return `could not verify who owns this npm name (${c.reason}) — refusing to publish until the registry answers; re-run with --filter ${p.name}`;
+  }
   let repo: { url?: string; directory?: string };
   try {
     repo = JSON.parse(r.stdout || "{}") ?? {};
@@ -225,6 +324,19 @@ function ownershipMismatch(p: PkgInfo): string | null {
   return `registry says repository=${repo.url ?? "<none>"} dir=${repo.directory ?? "<none>"}, local says repository=${p.repoUrl ?? "<none>"} dir=${p.repoDir ?? "<none>"} — this npm name appears to belong to a DIFFERENT package; publishing would hijack it`;
 }
 
+/**
+ * Ownership guard: if the name already exists on the registry, its
+ * `repository` (url + directory) must match this local package. Two
+ * different local packages publishing to one npm name is otherwise a
+ * SILENT hijack — `@crewhaus/plugin-sdk` was two distinct packages
+ * (factory §41 vs utilities Studio SDK) across 0.1.1→0.1.2 and nobody
+ * was told. Returns null when ok (or name not on the registry yet),
+ * else a human-readable reason to refuse.
+ */
+function ownershipMismatch(p: PkgInfo): string | null {
+  return ownershipVerdict(npmView([p.name, "repository", "--json"]), p);
+}
+
 type PublishResult = "ok" | "already" | "failed";
 
 function publish(p: PkgInfo): PublishResult {
@@ -235,6 +347,14 @@ function publish(p: PkgInfo): PublishResult {
   const manifestErr = checkPublishableManifest(p);
   if (manifestErr !== undefined) {
     console.error(`✗ ${p.name}: ${manifestErr}`);
+    return "failed";
+  }
+  const packErrs = packedContentsProblems(
+    p.dir,
+    readJson<Record<string, unknown>>(join(p.dir, "package.json")),
+  );
+  if (packErrs.length > 0) {
+    for (const e of packErrs) console.error(`✗ ${p.name} (${relative(ROOT, p.dir)}): ${e}`);
     return "failed";
   }
   if (DRY) {
@@ -318,83 +438,240 @@ function checkPublishableManifest(p: PkgInfo): string | undefined {
   return undefined;
 }
 
-// ─── main ──────────────────────────────────────────────────────────────────
-// `npm whoami` is a TOKEN identity check and there is no equivalent under OIDC:
-// trusted publishing mints a short-lived, package-scoped credential during
-// `npm publish` itself, so there is no logged-in user to report and whoami
-// legitimately fails. Only demand it on the token path.
-if (!DRY && !OIDC_AVAILABLE) {
-  const whoamiResult = spawnSync("npm", ["whoami"], { encoding: "utf-8" });
-  if (whoamiResult.status !== 0) {
-    console.error("✗ npm whoami failed — no usable npm credential.");
-    console.error("  In CI this means the NPM_TOKEN secret is missing or revoked. Note that npm");
-    console.error("  permanently revoked ALL classic automation tokens on 2025-12-09; they cannot");
-    console.error(
-      "  be recreated. Mint a granular access token scoped to the @crewhaus scope plus",
-    );
-    console.error("  the unscoped `crewhaus` package, with bypass-2FA enabled.");
-    console.error(`  stderr: ${whoamiResult.stderr?.trim()}`);
-    process.exit(1);
+/** Files every published package carries. release-prep --for-publish puts them there. */
+const REQUIRED_FILES = ["README.md", "LICENSE", "NOTICE"] as const;
+
+function isRegularFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
   }
-  console.log(`✓ Logged in as: ${whoamiResult.stdout.trim()}`);
-} else if (!DRY) {
-  console.log("✓ OIDC trusted publishing detected (ACTIONS_ID_TOKEN_REQUEST_URL set)");
-  console.log("  publishing with --provenance; no npm token required");
 }
 
-// NOTE: this used to delete bun.lock and reinstall, so `bun publish` would resolve
-// `workspace:*` against current versions instead of whatever the lockfile last saw
-// (the bug that tombstoned v0.1.0). That workaround is gone because the cause is:
-// `release-prep.ts --for-publish` now resolves those ranges from the stamped
-// version, and checkPublishableManifest() refuses to publish if any survived.
-
-const pkgs = discoverPackages();
-for (const p of pkgs) INTERNAL_NAMES.add(p.name);
-console.log(`Discovered ${pkgs.length} publishable packages (crewhaus + @crewhaus/*) in ${ROOT}`);
-
-const sorted = topoSort(pkgs);
-const filtered = FILTER ? sorted.filter((p) => p.name === FILTER) : sorted;
-if (FILTER && filtered.length === 0) {
-  console.error(`No package matched --filter ${FILTER}`);
-  process.exit(1);
-}
-
-let published = 0;
-let skipped = 0;
-const failures: string[] = [];
-
-for (const p of filtered) {
-  // Ownership first, even on the would-skip path: a version-exists skip is
-  // exactly how a hijacked name hides ("already on registry" tells you
-  // nothing about WHOSE content that is). Runs in dry-run too.
-  const mismatch = ownershipMismatch(p);
-  if (mismatch) {
-    failures.push(`${p.name}@${p.version} (ownership)`);
-    console.error(`✗ ${p.name}: ${mismatch}`);
-    continue;
-  }
-  if (!DRY && isPublished(p.name, p.version)) {
-    console.log(`= ${p.name}@${p.version} already on registry — skipping`);
-    skipped++;
-    continue;
-  }
-  const result = publish(p);
-  if (result === "ok") {
-    published++;
-  } else if (result === "already") {
-    skipped++;
-  } else {
-    failures.push(`${p.name}@${p.version}`);
-    console.error(`✗ ${p.name}@${p.version} failed`);
-    if (!DRY) {
-      console.error(`  (continuing; re-run with --filter ${p.name} after fixing)`);
-      // Don't break — keep going. Dependents that need this package will fail
-      // their own publish if the registry can't resolve the dep, and we'll
-      // surface them in the failure list at the end.
+/**
+ * What the tarball of the package in `dir` would be missing, as messages; empty
+ * when it carries everything it declares. npm packs a missing `files` entry as
+ * nothing, without a word, so this is the only place it gets noticed.
+ *
+ * The rules shared with the PackagePreflight tool (entry points that do not exist
+ * or that `files` does not cover, unpublishable ranges, secrets that would ship)
+ * come from @crewhaus/tool-pkg's preflight(); its blocking findings block here.
+ * On top of that, every literal `files` entry must exist, and README.md, LICENSE
+ * and NOTICE must be regular files (npm leaves a symlink out) — NOTICE listed in
+ * `files` too, since npm adds README and LICENSE by itself but never NOTICE.
+ */
+export function packedContentsProblems(dir: string, manifest: Record<string, unknown>): string[] {
+  const report = preflight(manifest, {
+    exists: (rel) => existsSync(join(dir, rel)),
+    isDirectory: (rel) => {
+      try {
+        return statSync(join(dir, rel)).isDirectory();
+      } catch {
+        return false;
+      }
+    },
+  });
+  const problems = report.blocking.map((b) => b.message);
+  for (const f of REQUIRED_FILES) {
+    if (!isRegularFile(join(dir, f))) {
+      problems.push(
+        `${f} is missing or not a regular file — run \`release-prep.ts --for-publish\`, which puts README.md, LICENSE and NOTICE into every package`,
+      );
     }
   }
+  const files = Array.isArray(manifest.files)
+    ? (manifest.files as unknown[]).filter((f): f is string => typeof f === "string")
+    : null;
+  if (files !== null) {
+    const clean = (e: string) => e.replace(/^\.\//, "").replace(/\/+$/, "");
+    for (const entry of files) {
+      const e = clean(entry);
+      // Globs and negations are npm's to expand; the required files are checked above.
+      if (e === "" || /[*?[\]{}!]/.test(e) || (REQUIRED_FILES as readonly string[]).includes(e)) {
+        continue;
+      }
+      if (!existsSync(join(dir, e))) {
+        problems.push(
+          `"files" lists "${entry}", which is not there — npm would pack nothing for it`,
+        );
+      }
+    }
+    if (!files.some((e) => clean(e) === "NOTICE")) {
+      problems.push('"files" does not list NOTICE — npm packs NOTICE only when `files` names it');
+    }
+  }
+  return problems;
 }
 
-console.log("");
-console.log(`Published: ${published}  Skipped: ${skipped}  Failed: ${failures.length}`);
-if (failures.length) process.exit(1);
+/** What the dependency gate knows when it looks at a package. */
+export type DependencyGate = {
+  /** Names that failed, were refused, or are on the registry without their own deps. */
+  readonly unavailable: ReadonlySet<string>;
+  /** Names this run handles; in topological order, so a dependency is settled first. */
+  readonly inRun: ReadonlySet<string>;
+  /** Registry lookup for a dependency this run does not handle (e.g. under --filter). */
+  readonly registry: (name: string, version: string) => RegistryState;
+};
+
+/**
+ * The internal dependencies of `p` that would not install at `p.version`, each
+ * with the reason. Empty means every one is published, being published in this
+ * run, or (dry-run) would be. Internal deps are exact lockstep pins
+ * (checkPublishableManifest enforces it), so `<dep>@<p.version>` is the coordinate.
+ * A registry that cannot be read counts against the dependency: publishing onto
+ * a dependency nobody could confirm is the failure this gate exists to stop.
+ */
+export function unmetDependencies(
+  p: Pick<PkgInfo, "deps" | "version">,
+  gate: DependencyGate,
+): string[] {
+  const out: string[] = [];
+  for (const d of p.deps) {
+    if (gate.unavailable.has(d)) {
+      out.push(`${d} (failed or was refused in this run)`);
+      continue;
+    }
+    if (gate.inRun.has(d)) continue;
+    const state = gate.registry(d, p.version);
+    if (state.kind === "absent") out.push(`${d}@${p.version} (not on the registry)`);
+    else if (state.kind === "unknown") {
+      out.push(`${d}@${p.version} (could not check the registry: ${state.reason})`);
+    }
+  }
+  return out;
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+function main(): void {
+  // `npm whoami` is a TOKEN identity check and there is no equivalent under OIDC:
+  // trusted publishing mints a short-lived, package-scoped credential during
+  // `npm publish` itself, so there is no logged-in user to report and whoami
+  // legitimately fails. Only demand it on the token path.
+  if (!DRY && !OIDC_AVAILABLE) {
+    const whoamiResult = spawnSync("npm", ["whoami"], { encoding: "utf-8" });
+    if (whoamiResult.status !== 0) {
+      console.error("✗ npm whoami failed — no usable npm credential.");
+      console.error("  In CI this means the NPM_TOKEN secret is missing or revoked. Note that npm");
+      console.error(
+        "  permanently revoked ALL classic automation tokens on 2025-12-09; they cannot",
+      );
+      console.error(
+        "  be recreated. Mint a granular access token scoped to the @crewhaus scope plus",
+      );
+      console.error("  the unscoped `crewhaus` package, with bypass-2FA enabled.");
+      console.error(`  stderr: ${whoamiResult.stderr?.trim()}`);
+      process.exit(1);
+    }
+    console.log(`✓ Logged in as: ${whoamiResult.stdout.trim()}`);
+  } else if (!DRY) {
+    console.log("✓ OIDC trusted publishing detected (ACTIONS_ID_TOKEN_REQUEST_URL set)");
+    console.log("  publishing with --provenance; no npm token required");
+  }
+
+  // NOTE: this used to delete bun.lock and reinstall, so `bun publish` would resolve
+  // `workspace:*` against current versions instead of whatever the lockfile last saw
+  // (the bug that tombstoned v0.1.0). That workaround is gone because the cause is:
+  // `release-prep.ts --for-publish` now resolves those ranges from the stamped
+  // version, and checkPublishableManifest() refuses to publish if any survived.
+
+  const pkgs = discoverPackages();
+  for (const p of pkgs) INTERNAL_NAMES.add(p.name);
+  console.log(`Discovered ${pkgs.length} publishable packages (crewhaus + @crewhaus/*) in ${ROOT}`);
+
+  const sorted = topoSort(pkgs);
+  const filtered = FILTER ? sorted.filter((p) => p.name === FILTER) : sorted;
+  if (FILTER && filtered.length === 0) {
+    console.error(`No package matched --filter ${FILTER}`);
+    process.exit(1);
+  }
+
+  let published = 0;
+  let skipped = 0;
+  const failures: string[] = [];
+  const unavailable = new Set<string>();
+  const registryMemo = new Map<string, RegistryState>();
+  const gate: DependencyGate = {
+    unavailable,
+    inRun: new Set(filtered.map((p) => p.name)),
+    registry: (name, version) => {
+      const key = `${name}@${version}`;
+      let state = registryMemo.get(key);
+      if (state === undefined) {
+        state = registryState(name, version);
+        registryMemo.set(key, state);
+      }
+      return state;
+    },
+  };
+  const fail = (p: PkgInfo, entry: string) => {
+    failures.push(entry);
+    unavailable.add(p.name);
+  };
+
+  for (const p of filtered) {
+    // Ownership first, even on the would-skip path: a version-exists skip is
+    // exactly how a hijacked name hides ("already on registry" tells you
+    // nothing about WHOSE content that is). Runs in dry-run too.
+    const mismatch = ownershipMismatch(p);
+    if (mismatch) {
+      fail(p, `${p.name}@${p.version} (ownership)`);
+      console.error(`✗ ${p.name}: ${mismatch}`);
+      continue;
+    }
+    const unmet = unmetDependencies(p, gate);
+    if (!DRY) {
+      const state = registryState(p.name, p.version);
+      if (state.kind === "published") {
+        console.log(`= ${p.name}@${p.version} already on registry — skipping`);
+        skipped++;
+        if (unmet.length > 0) {
+          // Nothing to do for it, but what depends on it would not install either.
+          unavailable.add(p.name);
+          console.error(
+            `  ! it depends on ${unmet.join(", ")}; installs of it fail until that is published`,
+          );
+        }
+        continue;
+      }
+      if (state.kind === "unknown") {
+        // Ownership was just confirmed, and npm itself refuses a version that
+        // exists (EPUBLISHCONFLICT, handled as "already"), so trying is safe.
+        console.log(
+          `  (could not tell whether ${p.name}@${p.version} is already published: ${state.reason}; trying the publish)`,
+        );
+      }
+    }
+    if (unmet.length > 0) {
+      fail(p, `${p.name}@${p.version} (blocked: ${unmet.join(", ")})`);
+      console.error(
+        `✗ ${p.name}@${p.version} not published: it depends on ${unmet.join(", ")}, so it would install broken`,
+      );
+      continue;
+    }
+    const result = publish(p);
+    if (result === "ok") {
+      published++;
+    } else if (result === "already") {
+      skipped++;
+    } else {
+      fail(p, `${p.name}@${p.version}`);
+      console.error(`✗ ${p.name}@${p.version} failed`);
+      if (!DRY) {
+        // Keep going: packages that do not depend on this one can still ship.
+        // Those that do are refused by the dependency gate above — npm would
+        // otherwise publish them pointing at a version that does not exist.
+        console.error(`  (continuing; re-run with --filter ${p.name} after fixing)`);
+      }
+    }
+  }
+
+  console.log("");
+  console.log(`Published: ${published}  Skipped: ${skipped}  Failed: ${failures.length}`);
+  if (failures.length) {
+    for (const f of failures) console.error(`  ✗ ${f}`);
+    process.exit(1);
+  }
+}
+
+if (import.meta.main) main();
