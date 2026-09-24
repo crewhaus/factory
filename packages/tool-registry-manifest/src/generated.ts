@@ -6798,7 +6798,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "semverResolve",
     name: "SemverResolve",
     description:
-      "Resolve a version range against a list of versions: which satisfy it, and which one an install would pick. Use it to answer 'does the fix in 2.4.1 land inside our range?' or 'what would this upgrade actually install?' without a model guessing at caret and tilde semantics. Prereleases are excluded unless the range itself names one, matching npm, and a range the grammar does not understand is reported as such rather than as 'nothing matched'.",
+      "Resolve a version range against a list of versions: which satisfy it, and which one an install would pick. Use it to answer 'does the fix in 2.4.1 land inside our range?' or 'what would this upgrade actually install?' without a model guessing at caret and tilde semantics. A prerelease is considered only when the range names a prerelease of the same major.minor.patch, as npm does, and a range the grammar does not understand is reported as such rather than as 'nothing matched'.",
     readOnly: true,
     destructive: false,
     scope: "internal",

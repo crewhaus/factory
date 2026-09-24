@@ -133,7 +133,7 @@ function parseLock(name: string, text: string): LockedVersion[] {
 export const semverResolve: RegisteredTool = buildTool({
   name: "SemverResolve",
   description:
-    "Resolve a version range against a list of versions: which satisfy it, and which one an install would pick. Use it to answer 'does the fix in 2.4.1 land inside our range?' or 'what would this upgrade actually install?' without a model guessing at caret and tilde semantics. Prereleases are excluded unless the range itself names one, matching npm, and a range the grammar does not understand is reported as such rather than as 'nothing matched'.",
+    "Resolve a version range against a list of versions: which satisfy it, and which one an install would pick. Use it to answer 'does the fix in 2.4.1 land inside our range?' or 'what would this upgrade actually install?' without a model guessing at caret and tilde semantics. A prerelease is considered only when the range names a prerelease of the same major.minor.patch, as npm does, and a range the grammar does not understand is reported as such rather than as 'nothing matched'.",
   inputSchema: z.object({
     range: z.string().min(1).describe("a version range, e.g. ^1.2.0, ~2.1, >=3 <4, 1.x"),
     versions: z
@@ -156,6 +156,11 @@ export const semverResolve: RegisteredTool = buildTool({
     });
     if (!result.rangeUnderstood) {
       return `the range "${input.range}" was not understood as a version range — workspace:, file:, link:, git: and URL specifiers are not version ranges`;
+    }
+    if (result.versionsParsed === 0) {
+      // The range is fine; the list is not. Blaming the range would send the
+      // caller to fix the wrong input.
+      return `none of the ${input.versions.length} versions parsed as a version (e.g. ${JSON.stringify(input.versions[0])}), so nothing could be checked against "${input.range}"`;
     }
     return json(result);
   },

@@ -7,13 +7,21 @@
  * comparison come from `@crewhaus/tool-code`, so this agrees with
  * `DependencyOutdated` by construction rather than by coincidence.
  */
-import { type SemVer, compareSemver, parseSemver, satisfies } from "@crewhaus/tool-code";
+import {
+  type SemVer,
+  compareSemver,
+  parseSemver,
+  satisfies,
+  satisfiesInstallable,
+} from "@crewhaus/tool-code";
 
 export type ResolveOptions = {
   /**
-   * Consider prereleases. Off by default, matching npm: `^1.0.0` does not
-   * pick `2.0.0-rc.1`, and picking one silently would ship a release
-   * candidate to anybody who asked for a stable range.
+   * Consider every prerelease. Off by default, matching npm: a prerelease is
+   * then eligible only when the range names a prerelease of the same
+   * major.minor.patch in the same `||` alternative — `^1.2.3-beta.2` may pick
+   * 1.2.3-beta.4, never 1.9.0-rc.1. Picking one silently would ship a
+   * release candidate to anybody who asked for a stable range.
    */
   readonly includePrerelease?: boolean;
   /** `highest` (default) is what a fresh install picks; `lowest` is the floor. */
@@ -30,24 +38,26 @@ export type ResolveResult = {
   readonly rejected: ReadonlyArray<{ readonly version: string; readonly why: string }>;
   /** True when the range grammar was not understood at all. */
   readonly rangeUnderstood: boolean;
+  /** How many of the versions parsed as a version at all. */
+  readonly versionsParsed: number;
 };
-
-const isPrerelease = (v: SemVer): boolean => v.prerelease !== "";
 
 export function resolveRange(
   range: string,
   versions: ReadonlyArray<string>,
   options: ResolveOptions = {},
 ): ResolveResult {
-  const wantPrerelease = options.includePrerelease === true || /-/.test(range);
-
-  const satisfying: Array<{ raw: string; parsed: SemVer }> = [];
-  const rejected: Array<{ version: string; why: string }> = [];
   // `satisfies` answers undefined for a range it does not understand — a
   // workspace:, file: or git: specifier, or a typo. That is not the same as
   // "nothing matched", and reporting it as no-match would tell a caller the
-  // dependency is unsatisfiable when it was never a version range.
-  let understood = false;
+  // dependency is unsatisfiable when it was never a version range. Whether the
+  // RANGE is understood is asked of the range alone: learning it from the
+  // versions made a list of unparseable versions blame a valid range.
+  const understood = satisfies("0.0.0", range) !== undefined;
+
+  const satisfying: Array<{ raw: string; parsed: SemVer }> = [];
+  const rejected: Array<{ version: string; why: string }> = [];
+  let versionsParsed = 0;
 
   for (const raw of versions) {
     const parsed = parseSemver(raw);
@@ -55,17 +65,22 @@ export function resolveRange(
       rejected.push({ version: raw, why: "unparseable" });
       continue;
     }
-    const ok = satisfies(raw, range);
-    if (ok === undefined) {
+    versionsParsed += 1;
+    if (!understood) {
       rejected.push({ version: raw, why: "range not understood" });
       continue;
     }
-    understood = true;
-    if (!ok) {
+    if (satisfies(raw, range) !== true) {
       rejected.push({ version: raw, why: "out of range" });
       continue;
     }
-    if (isPrerelease(parsed) && !wantPrerelease) {
+    // In range, but an install would not pick it: a prerelease the range
+    // does not name on its own major.minor.patch.
+    if (
+      satisfiesInstallable(raw, range, {
+        includePrerelease: options.includePrerelease === true,
+      }) !== true
+    ) {
       rejected.push({ version: raw, why: "prerelease" });
       continue;
     }
@@ -81,5 +96,12 @@ export function resolveRange(
           ? ordered[ordered.length - 1]
           : ordered[0]) ?? null);
 
-  return { range, satisfying: ordered, best, rejected, rangeUnderstood: understood };
+  return {
+    range,
+    satisfying: ordered,
+    best,
+    rejected,
+    rangeUnderstood: understood,
+    versionsParsed,
+  };
 }

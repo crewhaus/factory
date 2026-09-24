@@ -32,6 +32,7 @@ import {
   parseYarnLock,
   parseYarnLockDetailed,
   satisfies,
+  satisfiesInstallable,
   stripJsonc,
 } from "./lib/deps";
 import {
@@ -1393,6 +1394,29 @@ describe("semver, the subset", () => {
     expect(satisfies("1.0.0", "^1.0.0 || ^2.0.0")).toBe(true);
     expect(satisfies("2.5.0", "^1.0.0 || ^2.0.0")).toBe(true);
     expect(satisfies("3.0.0", "^1.0.0 || ^2.0.0")).toBe(false);
+  });
+
+  test("satisfiesInstallable applies npm's prerelease rule on top of satisfies", () => {
+    // In range, and on the tuple the range names: eligible.
+    expect(satisfiesInstallable("1.2.3-beta.4", "^1.2.3-beta.2")).toBe(true);
+    // In range, but a prerelease of a later tuple: an install never picks it.
+    expect(satisfies("1.9.0-rc.1", "^1.2.3-beta.2")).toBe(true);
+    expect(satisfiesInstallable("1.9.0-rc.1", "^1.2.3-beta.2")).toBe(false);
+    expect(satisfiesInstallable("1.9.0-rc.1", "^1.2.3-beta.2", { includePrerelease: true })).toBe(
+      true,
+    );
+    // The named prerelease must be in the SAME alternative.
+    expect(satisfiesInstallable("2.5.0-rc.1", "1.2.3-beta.1 || ^2.0.0")).toBe(false);
+    expect(satisfiesInstallable("2.0.0-rc.2", "<2.0.0-rc.3 >=1.0.0")).toBe(true);
+    // Each of major, minor and patch must match the named prerelease's.
+    expect(satisfiesInstallable("1.2.4-rc.1", ">=1.2.3-rc.1 <1.3.0")).toBe(false);
+    expect(satisfiesInstallable("1.3.3-rc.1", ">=1.2.3-rc.1 <1.4.0")).toBe(false);
+    expect(satisfiesInstallable("2.2.3-rc.1", ">=1.2.3-rc.1 <3.0.0")).toBe(false);
+    // Releases are exactly `satisfies`; an unevaluable range stays unknown.
+    expect(satisfiesInstallable("1.5.0", "^1.2.3-beta.2")).toBe(true);
+    expect(satisfiesInstallable("3.0.0", "^1.2.3-beta.2")).toBe(false);
+    expect(satisfiesInstallable("1.0.0-rc.1", "workspace:*")).toBeUndefined();
+    expect(satisfiesInstallable("banana", "^1.0.0")).toBeUndefined();
   });
 
   test("a range it cannot evaluate says so instead of guessing", () => {

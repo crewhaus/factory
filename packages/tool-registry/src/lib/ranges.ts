@@ -27,7 +27,13 @@
  * and anything that does not translate exactly comes back as a refusal with a
  * reason. "Cannot tell" is a row in the table; a wrong answer is a bad upgrade.
  */
-import { type SemVer, compareSemver, parseSemver, satisfies } from "@crewhaus/tool-code";
+import {
+  type SemVer,
+  compareSemver,
+  parseSemver,
+  satisfies,
+  satisfiesInstallable,
+} from "@crewhaus/tool-code";
 import type { Ecosystem } from "./net";
 
 export type RangeTranslation =
@@ -365,23 +371,22 @@ export function versionSatisfies(version: string, npmRange: string): Satisfactio
  * The highest published version the declared range allows — what an install
  * into this manifest would pick, as opposed to what the registry calls latest.
  *
- * Prereleases are skipped unless the caller asks for them or the range itself
- * names one, which is npm's rule and the least surprising of the available
- * ones.
+ * Prereleases are skipped unless the caller asks for them or the range names
+ * a prerelease of the SAME major.minor.patch in the same `||` alternative,
+ * which is npm's rule: `^1.2.3-beta.2` may pick 1.2.3-beta.4, never
+ * 1.9.0-rc.1. The rule lives beside `satisfies` in @crewhaus/tool-code.
  */
 export function highestSatisfying(
   versions: readonly string[],
   npmRange: string,
   includePrerelease = false,
 ): string | undefined {
-  const rangeNamesPrerelease = /\d-[0-9A-Za-z]/.test(npmRange);
   let best: { raw: string; parsed: SemVer } | undefined;
   for (const raw of versions) {
     if (!isSemverShaped(raw)) continue;
     const parsed = parseSemver(raw);
     if (parsed === undefined) continue;
-    if (parsed.prerelease !== "" && !includePrerelease && !rangeNamesPrerelease) continue;
-    if (satisfies(raw, npmRange) !== true) continue;
+    if (satisfiesInstallable(raw, npmRange, { includePrerelease }) !== true) continue;
     if (best === undefined || compareSemver(parsed, best.parsed) > 0) best = { raw, parsed };
   }
   return best?.raw;

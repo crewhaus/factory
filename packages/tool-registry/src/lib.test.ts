@@ -184,6 +184,13 @@ describe("range dialects", () => {
     expect(highestSatisfying(versions, "^3")).toBeUndefined();
   });
 
+  test("a range naming a prerelease admits prereleases of that tuple only, as npm does (security-7#7)", () => {
+    // On 0.7.0 any `\d-x` in the range admitted every prerelease in range.
+    expect(highestSatisfying(["1.5.0", "1.9.0-rc.1"], "^1.2.3-beta.2")).toBe("1.5.0");
+    expect(highestSatisfying(["1.2.3-beta.4", "1.2.2"], "^1.2.3-beta.2")).toBe("1.2.3-beta.4");
+    expect(highestSatisfying(["1.5.0", "1.9.0-rc.1"], "^1.2.3-beta.2", true)).toBe("1.9.0-rc.1");
+  });
+
   test("newest-first is version order, not string order", () => {
     // `.sort()` would put 1.10.0 before 1.9.0 ascending, so a "newest first"
     // list built on it shows the OLDER release at the top of every package

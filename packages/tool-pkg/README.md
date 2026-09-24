@@ -93,7 +93,10 @@ The semver grammar, the comparison and the four lockfile parsers come from
 `DependencyOutdated`. Two implementations of "does this version satisfy this
 range?" would disagree at the edges — prerelease ordering, `^0.x`, wildcard
 forms — and a harness would get one answer from one tool and another from the
-next.
+next. The same goes for which prereleases an install may pick: `SemverResolve`
+and tool-registry's `RegistryPackageInfo`/`RegistryOutdated` both ask
+tool-code's `satisfiesInstallable`, which applies npm's rule (a prerelease only
+on the major.minor.patch the range itself names).
 
 ## What it does not do
 

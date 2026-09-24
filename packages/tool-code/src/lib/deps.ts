@@ -972,10 +972,13 @@ export function compareSemver(a: SemVer, b: SemVer): number {
   return a.prerelease < b.prerelease ? -1 : 1;
 }
 
+/** One comparator: an optional operator, then the version or wildcard it applies to. */
+const COMPARATOR_RE = /^(?<op>\^|~|>=|<=|>|<|=)?\s*(?<rest>.+)$/;
+
 function satisfiesComparator(version: SemVer, comparator: string): boolean | undefined {
   const text = comparator.trim();
   if (text === "" || text === "*" || text === "x" || text === "latest") return true;
-  const m = /^(?<op>\^|~|>=|<=|>|<|=)?\s*(?<rest>.+)$/.exec(text);
+  const m = COMPARATOR_RE.exec(text);
   if (m === null) return undefined;
   const op = m.groups?.["op"] ?? "";
   const restRaw = (m.groups?.["rest"] as string).trim();
@@ -1053,6 +1056,54 @@ export function satisfies(versionRaw: string, range: string): boolean | undefine
     if (all) return true;
   }
   return anyKnown ? false : undefined;
+}
+
+/**
+ * `satisfies`, plus the rule an npm install applies to prereleases: a version
+ * with a prerelease tag counts only when a comparator in the SAME `||`
+ * alternative names a prerelease of the same major.minor.patch, or when
+ * `includePrerelease` is set. So `^1.2.3-beta.2` admits 1.2.3-beta.4 and
+ * 1.5.0 but never 1.9.0-rc.1, and a prerelease named in one alternative
+ * admits nothing in another. `satisfies` itself answers the plain range
+ * question (DependencyOutdated asks that one); this answers "would an
+ * install pick it". `undefined` exactly when `satisfies` is.
+ */
+export function satisfiesInstallable(
+  versionRaw: string,
+  range: string,
+  options: { readonly includePrerelease?: boolean } = {},
+): boolean | undefined {
+  const version = parseSemver(versionRaw);
+  if (version === undefined) return undefined;
+  if (version.prerelease === "" || options.includePrerelease === true) {
+    return satisfies(versionRaw, range);
+  }
+  let anyKnown = false;
+  for (const alternative of range.split("||")) {
+    const result = satisfies(versionRaw, alternative);
+    if (result === undefined) continue;
+    anyKnown = true;
+    if (result && namesPrereleaseOf(alternative, version)) return true;
+  }
+  return anyKnown ? false : undefined;
+}
+
+/** Whether a comparator in `alternative` targets a prerelease on `version`'s tuple. */
+function namesPrereleaseOf(alternative: string, version: SemVer): boolean {
+  for (const comparator of alternative.trim().split(/\s+/)) {
+    const rest = COMPARATOR_RE.exec(comparator)?.groups?.["rest"];
+    const target = rest === undefined ? undefined : parseSemver(rest);
+    if (
+      target !== undefined &&
+      target.prerelease !== "" &&
+      target.major === version.major &&
+      target.minor === version.minor &&
+      target.patch === version.patch
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------

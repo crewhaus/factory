@@ -121,6 +121,23 @@ describe("SemverResolve", () => {
     const out = await callRaw(semverResolve, { range: "workspace:*", versions: ["1.0.0"] });
     expect(out).toContain("not understood");
   });
+
+  test("versions that do not parse are blamed, not the range", async () => {
+    const out = await callRaw(semverResolve, {
+      range: "^1.0.0",
+      versions: ["banana", "not-a-version"],
+    });
+    expect(out).not.toContain("not understood");
+    expect(out).toContain("none of the 2 versions parsed");
+  });
+
+  test("the pick is the one npm would install, not a prerelease of a later tuple", async () => {
+    const result = await call(semverResolve, {
+      range: "^1.2.3-beta.2",
+      versions: ["1.2.3-beta.4", "1.5.0", "1.9.0-rc.1"],
+    });
+    expect(result).toMatchObject({ best: "1.5.0" });
+  });
 });
 
 describe("LockfileDiff", () => {

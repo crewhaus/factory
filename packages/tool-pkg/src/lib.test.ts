@@ -44,6 +44,36 @@ describe("resolveRange", () => {
     expect(resolveRange(">=2.1.0-rc.0", versions).satisfying).toContain("2.1.0-rc.1");
   });
 
+  test("a prerelease is eligible only on the major.minor.patch the range names, as npm does (security-7#7)", () => {
+    // On 0.7.0 any "-" in the range admitted every prerelease in range.
+    const floor = resolveRange(">=1.0.0-beta.1 <3", ["1.5.0", "2.9.0-alpha.1"]);
+    expect(floor.best).toBe("1.5.0");
+    expect(floor.rejected).toContainEqual({ version: "2.9.0-alpha.1", why: "prerelease" });
+    expect(
+      resolveRange("^1.2.3-beta.2", ["1.2.3-beta.4", "1.5.0", "1.9.0-rc.1"]).satisfying,
+    ).toEqual(["1.2.3-beta.4", "1.5.0"]);
+    const rc = resolveRange("^1.2.0-rc.1", ["1.2.0-rc.2", "1.3.0-alpha.0", "1.2.5"]);
+    expect(rc.best).toBe("1.2.5");
+    expect(rc.satisfying).toEqual(["1.2.0-rc.2", "1.2.5"]);
+    // A prerelease named in one alternative admits nothing in another.
+    expect(
+      resolveRange("1.2.3-beta.1 || ^2.0.0", ["1.2.3-beta.1", "2.0.0", "2.5.0-rc.1"]).best,
+    ).toBe("2.0.0");
+    // includePrerelease still admits every prerelease in range.
+    expect(
+      resolveRange(">=1.0.0-beta.1 <3", ["1.5.0", "2.9.0-alpha.1"], { includePrerelease: true })
+        .best,
+    ).toBe("2.9.0-alpha.1");
+  });
+
+  test("a valid range over versions that do not parse is understood, and says so", () => {
+    // On 0.7.0 understanding was learned from the versions, so a list with no
+    // parseable version reported "^1.0.0" as a range nobody understood.
+    const result = resolveRange("^1.0.0", ["banana"]);
+    expect(result).toMatchObject({ rangeUnderstood: true, versionsParsed: 0, best: null });
+    expect(resolveRange("workspace:*", ["banana"]).rangeUnderstood).toBe(false);
+  });
+
   test("nothing satisfying is not the same as a range nobody understood", () => {
     const empty = resolveRange("^99.0.0", versions);
     expect(empty).toMatchObject({ best: null, rangeUnderstood: true });
