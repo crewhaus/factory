@@ -2605,7 +2605,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "exportCsv",
     name: "ExportCsv",
     description:
-      "Write a query's rows to a CSV file inside the workspace, streaming them rather than holding them in memory. Use to hand a result set to a spreadsheet or another tool without paying for the rows in context. NULL is written as an empty field, which CSV cannot tell from an empty string on the way back, and a BLOB is written as base64 with a marker; the query runs on a read-only connection.",
+      "Write a query's rows to a CSV file inside the workspace, streaming them rather than holding them in memory. Use to hand a result set to a spreadsheet or another tool without paying for the rows in context. NULL is written as an empty field, which CSV cannot tell from an empty string on the way back, and a BLOB is written as base64 with a marker; the query runs on a read-only connection. Cells are written verbatim, so text starting with =, +, - or @ opens as a formula in a spreadsheet: prefix such values with ' in the query when the data is untrusted.",
     readOnly: false,
     destructive: true,
     scope: "internal",

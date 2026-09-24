@@ -842,6 +842,42 @@ describe("export and backup", () => {
     );
   });
 
+  test("ExportCsv writes a formula-looking cell verbatim, says so, and the documented query neutralizes it", async () => {
+    // Cells are data, byte for byte, so the file round-trips through
+    // ImportCsv; the description and README say what that means for a
+    // spreadsheet, and give the query that makes the file safe to open.
+    expect(exportCsv.description).toContain("formula");
+    const readme = readFileSync(join(import.meta.dir, "..", "README.md"), "utf8");
+    const documented = /`(CASE WHEN substr\(t,1,1\) IN [^`]+)`/.exec(readme)?.[1];
+    expect(documented).toBeDefined();
+    const db = new Database(join(workspace, "app.db"));
+    db.exec("CREATE TABLE f(id INTEGER PRIMARY KEY, t TEXT, n INTEGER)");
+    db.exec(
+      "INSERT INTO f(t, n) VALUES('=1+2', -5), ('@SUM(1,2)', 3), ('+A1', 0), ('-2+3', 1), ('plain', 2)",
+    );
+    db.close();
+    const verbatim = await run(exportCsv, {
+      database: "app.db",
+      sql: "SELECT t, n FROM f ORDER BY id",
+      out: "raw.csv",
+    });
+    expect(verbatim.rows).toBe(5);
+    expect(readFileSync(join(workspace, "raw.csv"), "utf8")).toBe(
+      't,n\n=1+2,-5\n"@SUM(1,2)",3\n+A1,0\n-2+3,1\nplain,2\n',
+    );
+    const safe = await run(exportCsv, {
+      database: "app.db",
+      sql: `SELECT ${documented}, n FROM f ORDER BY id`,
+      out: "safe.csv",
+    });
+    expect(safe.rows).toBe(5);
+    // Every formula-leading TEXT cell is now text to a spreadsheet; the
+    // INTEGER -5 and the plain value are untouched.
+    expect(readFileSync(join(workspace, "safe.csv"), "utf8")).toBe(
+      "t,n\n'=1+2,-5\n\"'@SUM(1,2)\",3\n'+A1,0\n'-2+3,1\nplain,2\n",
+    );
+  });
+
   test("ExportCsv refuses to overwrite unless told to", async () => {
     writeFileSync(join(workspace, "users.csv"), "existing");
     const refused = await run(exportCsv, {
