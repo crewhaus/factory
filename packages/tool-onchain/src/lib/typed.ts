@@ -36,14 +36,26 @@ function referencedTypes(
   seen = new Set<string>(),
 ): Set<string> {
   if (seen.has(primary)) return seen;
-  const fields = types[primary];
+  const fields = structFields(types, primary);
   if (!fields) return seen;
   seen.add(primary);
   for (const field of fields) {
     const base = field.type.replace(/(\[\d*\])+$/, "");
-    if (types[base]) referencedTypes(base, types, seen);
+    if (structFields(types, base)) referencedTypes(base, types, seen);
   }
   return seen;
+}
+
+/**
+ * The fields of the struct `name`, when `types` DEFINES it — an own property.
+ *
+ * A plain lookup walks the prototype chain, so a type named `constructor` or
+ * `toString` "exists" in every types object: a field of that type was then
+ * hashed as a struct whose field list is a function, instead of being refused
+ * as a type nobody defined.
+ */
+function structFields(types: TypedTypes, name: string): ReadonlyArray<TypedField> | undefined {
+  return Object.hasOwn(types, name) ? types[name] : undefined;
 }
 
 /**
@@ -55,7 +67,7 @@ export function encodeType(primary: string, types: TypedTypes): string {
   const referenced = [...referencedTypes(primary, types)].filter((t) => t !== primary).sort();
   return [primary, ...referenced]
     .map((name) => {
-      const fields = types[name];
+      const fields = structFields(types, name);
       if (!fields) throw new Error(`the type "${name}" is referenced but not defined`);
       return `${name}(${fields.map((f) => `${f.type} ${f.name}`).join(",")})`;
     })
@@ -84,9 +96,16 @@ function encodeField(type: string, value: unknown, types: TypedTypes, what: stri
     return hash(concat(value.map((item, i) => encodeField(inner, item, types, `${what}[${i}]`))));
   }
 
-  if (types[type]) return hashStruct(type, value as Record<string, unknown>, types);
+  if (structFields(types, type)) return hashStruct(type, value, types);
 
-  if (type === "string") return hash(encoder.encode(String(value)));
+  if (type === "string") {
+    // A number or a boolean reads as the text it prints as. An object does
+    // not: String({}) is "[object Object]", a value nobody was shown.
+    if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+      throw new Error(`${what}: a string field takes text, not ${describeValue(value)}`);
+    }
+    return hash(encoder.encode(String(value)));
+  }
   // The coder's own strict decoder: an odd digit count is refused rather
   // than its last nibble dropped, which made 0xabc hash as 0xab.
   if (type === "bytes") return hash(bytesArg(value, what));
@@ -107,21 +126,32 @@ function encodeField(type: string, value: unknown, types: TypedTypes, what: stri
   return encodeTuple([parsed], [value as AbiValue], what);
 }
 
-export function hashStruct(
-  primary: string,
-  data: Record<string, unknown>,
-  types: TypedTypes,
-): Uint8Array {
-  const fields = types[primary];
+/** What a value is, for a refusal: "an array", "null", "a number". */
+function describeValue(value: unknown): string {
+  if (value === null || value === undefined) return String(value);
+  if (Array.isArray(value)) return "an array";
+  return typeof value === "object" ? "an object" : `a ${typeof value}`;
+}
+
+export function hashStruct(primary: string, data: unknown, types: TypedTypes): Uint8Array {
+  const fields = structFields(types, primary);
   if (!fields) throw new Error(`the type "${primary}" is not defined`);
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error(`"${primary}" expects an object for its fields, got ${describeValue(data)}`);
+  }
+  const record = data as Record<string, unknown>;
   const parts = [typeHash(primary, types)];
   for (const field of fields) {
-    if (!(field.name in data)) {
+    // An OWN field. `in` also sees what every object inherits, so a message
+    // missing "toString" was hashed over the source text of
+    // Object.prototype.toString — a digest of a value nobody was shown —
+    // instead of being refused like any other missing field.
+    if (!Object.hasOwn(record, field.name)) {
       throw new Error(
         `"${primary}" requires the field "${field.name}", which the message does not have`,
       );
     }
-    parts.push(encodeField(field.type, data[field.name], types, `${primary}.${field.name}`));
+    parts.push(encodeField(field.type, record[field.name], types, `${primary}.${field.name}`));
   }
   return hash(concat(parts));
 }

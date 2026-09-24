@@ -507,6 +507,65 @@ describe("EIP-712, against the specification's own example", () => {
   });
 });
 
+describe("EIP-712 reads only what the message and the types define (C210)", () => {
+  const domain = { name: "X", version: "1", chainId: 1 };
+  const INHERITED = ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"];
+
+  test("a field every object inherits is still a missing field", () => {
+    // 0.7.0 hashed Object.prototype.toString's source text for "toString".
+    for (const name of INHERITED) {
+      expect(() => typedDataDigest(domain, { M: [{ name, type: "string" }] }, "M", {})).toThrow(
+        `"M" requires the field "${name}", which the message does not have`,
+      );
+    }
+  });
+
+  test("the same field, present in the message, is hashed as written", () => {
+    const own = typedDataDigest(domain, { M: [{ name: "toString", type: "string" }] }, "M", {
+      toString: "hi",
+    });
+    const plain = typedDataDigest(domain, { M: [{ name: "note", type: "string" }] }, "M", {
+      note: "hi",
+    });
+    expect(own.digest).toMatch(/^0x[0-9a-f]{64}$/);
+    // Same value, different field name: the type hash differs, so the digest does.
+    expect(own.digest).not.toBe(plain.digest);
+  });
+
+  test("a type name every object inherits is not a struct nobody defined", () => {
+    expect(() =>
+      typedDataDigest(domain, { M: [{ name: "a", type: "constructor" }] }, "M", { a: {} }),
+    ).toThrow(/M\.a: "constructor" is neither a struct defined in types nor an ABI type/);
+    expect(() =>
+      typedDataDigest(domain, { M: [{ name: "a", type: "string" }] }, "toString", {}),
+    ).toThrow('the type "toString" is not defined');
+  });
+
+  test("a struct field whose value is not an object is refused by name", () => {
+    const nested = {
+      M: [{ name: "a", type: "P" }],
+      P: [{ name: "b", type: "string" }],
+    };
+    expect(() => typedDataDigest(domain, nested, "M", { a: "str" })).toThrow(
+      '"P" expects an object for its fields, got a string',
+    );
+    expect(() => typedDataDigest(domain, nested, "M", { a: null })).toThrow(/got null/);
+    expect(() => typedDataDigest(domain, nested, "M", { a: [] })).toThrow(/got an array/);
+  });
+
+  test("a string field takes text, not an object printed as [object Object]", () => {
+    expect(() =>
+      typedDataDigest(domain, { M: [{ name: "s", type: "string" }] }, "M", { s: { x: 1 } }),
+    ).toThrow("M.s: a string field takes text, not an object");
+    // A number still reads as the text it prints as.
+    expect(
+      typedDataDigest(domain, { M: [{ name: "s", type: "string" }] }, "M", { s: 42 }).digest,
+    ).toBe(
+      typedDataDigest(domain, { M: [{ name: "s", type: "string" }] }, "M", { s: "42" }).digest,
+    );
+  });
+});
+
 describe("EIP-191", () => {
   test("personal_sign matches the known vector", () => {
     expect(personalSignHash("Hello, world!")).toBe(

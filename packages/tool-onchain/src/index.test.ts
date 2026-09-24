@@ -203,6 +203,26 @@ describe("AddressCheck", () => {
 });
 
 describe("TypedDataHash", () => {
+  test("a field the message lacks is refused, even one every object inherits (C210)", async () => {
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"]) {
+      await expect(
+        raw(typedDataHash, {
+          domain: { name: "X", version: "1", chainId: 1 },
+          types: { M: [{ name, type: "string" }] },
+          primaryType: "M",
+          message: {},
+        }),
+      ).rejects.toThrow(`requires the field "${name}"`);
+    }
+    const out = await call<{ digest: string }>(typedDataHash, {
+      domain: { name: "X", version: "1", chainId: 1 },
+      types: { M: [{ name: "toString", type: "string" }] },
+      primaryType: "M",
+      message: { toString: "hi" },
+    });
+    expect(out.digest).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
   test("an odd-length bytes value is an error, not a digest of a shorter value (C133)", async () => {
     await expect(
       raw(typedDataHash, {
