@@ -21,7 +21,20 @@
  *
  * Determinism: low-temperature model call + a strict fenced-JSON
  * extractor matching the planner's pattern. One auto-retry on parse
- * failure.
+ * failure. A reply without a usable confidence is reported as
+ * `"unknown"`, with a note saying so, never as a made-up level.
+ *
+ * Safety (0.7.1):
+ *  - The grounding model reads a screenshot of a page an attacker may
+ *    control, so its reply is never quoted back: a failure is one of a few
+ *    fixed sentences, and the output classifier stays on.
+ *  - The call sends the screenshot and the model's `description` to the
+ *    grounding model's provider, so the tool is `scope: "external"` with
+ *    `ioCapability: "network"` (readOnly kept), like `ImageGenerate`.
+ *  - Each grounding request is published on the run's trace bus as a
+ *    `model_request` / `model_response` pair with role `"grounding"`, so
+ *    cost-tracker prices it and `budget:` counts it; it used to be spent
+ *    unseen.
  */
 import {
   type ProviderAdapter,
@@ -35,7 +48,7 @@ import { buildRequestParams } from "@crewhaus/model-plan";
 import type { ModelThinking } from "@crewhaus/model-plan";
 import { resolveModel } from "@crewhaus/model-router";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 
 export class VisionGroundingError extends CrewhausError {
@@ -52,11 +65,16 @@ export type Bbox = {
   readonly height: number;
 };
 
+export type GroundingConfidence = "high" | "medium" | "low" | "unknown";
+
 export type GroundingResult = {
   readonly bbox: Bbox;
   readonly centerX: number;
   readonly centerY: number;
-  readonly confidence: "high" | "medium" | "low";
+  /** `"unknown"` when the grounding model gave no valid confidence. */
+  readonly confidence: GroundingConfidence;
+  /** Why the confidence is `"unknown"`; absent otherwise. */
+  readonly note?: string;
 };
 
 const findElementSchema = z
@@ -114,6 +132,10 @@ Rules:
 
 const FENCE_RE = /```(?:json)?\s*([\s\S]*?)\s*```/;
 
+// Every message below is a fixed sentence. The reply comes from a model that
+// read an untrusted page, so no part of it is ever quoted into the result,
+// and the parser's own error (which quotes tokens) is not kept either.
+
 function extractJson(text: string): string {
   const m = FENCE_RE.exec(text);
   if (m?.[1]) return m[1].trim();
@@ -121,18 +143,20 @@ function extractJson(text: string): string {
   const end = text.lastIndexOf("}");
   if (start !== -1 && end > start) return text.slice(start, end + 1);
   throw new VisionGroundingError(
-    `could not locate JSON block in grounding output: ${text.slice(0, 200)}`,
+    `the grounding model's reply had no JSON block (${text.length} chars)`,
   );
 }
 
-function parseBbox(json: string): { bbox: Bbox; confidence: "high" | "medium" | "low" } {
+function parseBbox(json: string): {
+  bbox: Bbox;
+  confidence: GroundingConfidence;
+} {
   let parsed: unknown;
   try {
     parsed = JSON.parse(json);
-  } catch (err) {
+  } catch {
     throw new VisionGroundingError(
-      `grounding output is not valid JSON: ${json.slice(0, 120)}`,
-      err,
+      `the grounding model's JSON did not parse (${json.length} chars)`,
     );
   }
   if (typeof parsed !== "object" || parsed === null) {
@@ -149,10 +173,11 @@ function parseBbox(json: string): { bbox: Bbox; confidence: "high" | "medium" | 
   ) {
     throw new VisionGroundingError("grounding output bbox is missing numeric x/y/width/height");
   }
-  const confidence =
+  // A missing or unrecognised confidence is not evidence of any level.
+  const confidence: GroundingConfidence =
     obj.confidence === "high" || obj.confidence === "medium" || obj.confidence === "low"
       ? obj.confidence
-      : "medium";
+      : "unknown";
   return {
     bbox: {
       x: Math.round(b.x),
@@ -164,13 +189,25 @@ function parseBbox(json: string): { bbox: Bbox; confidence: "high" | "medium" | 
   };
 }
 
+/** The run's trace bus, as FindElement uses it. */
+type GroundingBus = NonNullable<NonNullable<ToolExecuteContext["runContext"]>["eventBus"]>;
+
+type GroundingCall = {
+  readonly adapter: ProviderAdapter;
+  /** Wire model id (what the provider is called with, and what pricing keys on). */
+  readonly modelId: string;
+  /** The model string as configured, when it differs from the wire id. */
+  readonly specModel?: string;
+  readonly bus?: GroundingBus;
+};
+
 async function callGrounding(
-  adapter: ProviderAdapter,
-  modelId: string,
+  call: GroundingCall,
   description: string,
   pngBytes: Uint8Array,
   params?: CreateFindElementToolOptions["params"],
 ): Promise<string> {
+  const { adapter, modelId, bus } = call;
   const b64 = Buffer.from(pngBytes).toString("base64");
   // 0.6.0 §4.2 — the grounding profile's pinned params over the call's own
   // 512-token ceiling; `effectiveMaxTokens` keeps a thinking budget from
@@ -201,7 +238,41 @@ async function callGrounding(
       },
     ],
   });
+  // Metered like compaction's side-call: a request/response pair on the run
+  // bus, sharing one span, so cost-tracker prices it and `budget:` counts
+  // it. The role is auxiliary (it serves the answer; it is not the answer).
+  const specModelField =
+    call.specModel !== undefined && call.specModel !== modelId ? { specModel: call.specModel } : {};
+  const startEnvelope = bus?.envelope();
+  if (bus !== undefined && startEnvelope !== undefined) {
+    bus.publish({
+      ...startEnvelope,
+      kind: "model_request",
+      model: modelId,
+      ...specModelField,
+      provider: adapter.providerId,
+      messageCount: 1,
+      toolCount: 0,
+      streaming: false,
+      role: "grounding",
+    });
+  }
+  const t0 = performance.now();
   const message = await consumeStream(stream);
+  if (bus !== undefined && startEnvelope !== undefined) {
+    bus.publish({
+      ...bus.envelope(),
+      spanId: startEnvelope.spanId,
+      kind: "model_response",
+      model: modelId,
+      ...specModelField,
+      provider: adapter.providerId,
+      stopReason: message.stopReason,
+      usage: message.usage,
+      durationMs: performance.now() - t0,
+      role: "grounding",
+    });
+  }
   const text = extractFirstText(message);
   if (text === undefined) {
     throw new VisionGroundingError("grounding model returned a non-text message");
@@ -218,8 +289,10 @@ export function createFindElementTool(opts: CreateFindElementToolOptions): Regis
     readOnly: true,
     destructive: false,
     concurrencySafe: false,
-    classifyOutput: false,
-    execute: async (input) => {
+    // The screenshot and the description go to the grounding provider.
+    scope: "external",
+    ioCapability: "network",
+    execute: async (input, ctx) => {
       const resolution = opts._adapter
         ? { adapter: opts._adapter, modelId: opts.model, providerId: opts._adapter.providerId }
         : await resolveModel(opts.model);
@@ -233,16 +306,17 @@ export function createFindElementTool(opts: CreateFindElementToolOptions): Regis
         );
       }
       const png = await opts.driver.screenshot();
+      const bus = ctx?.runContext?.eventBus;
+      const call: GroundingCall = {
+        adapter: resolution.adapter,
+        modelId: resolution.modelId,
+        specModel: opts.model,
+        ...(bus !== undefined ? { bus } : {}),
+      };
       let lastErr: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const text = await callGrounding(
-            resolution.adapter,
-            resolution.modelId,
-            input.description,
-            png,
-            opts.params,
-          );
+          const text = await callGrounding(call, input.description, png, opts.params);
           const json = extractJson(text);
           const { bbox, confidence } = parseBbox(json);
           const result: GroundingResult = {
@@ -250,13 +324,23 @@ export function createFindElementTool(opts: CreateFindElementToolOptions): Regis
             centerX: Math.round(bbox.x + bbox.width / 2),
             centerY: Math.round(bbox.y + bbox.height / 2),
             confidence,
+            ...(confidence === "unknown"
+              ? { note: "the grounding model gave no confidence for this box" }
+              : {}),
           };
           return JSON.stringify(result);
         } catch (err) {
           lastErr = err;
         }
       }
-      return `[FindElement error] ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`;
+      // Only this package's own fixed sentences are shown. Any other error
+      // (a provider's, which can quote a response body) is named, not quoted.
+      if (lastErr instanceof VisionGroundingError) {
+        return `[FindElement error] ${lastErr.message}`;
+      }
+      const name =
+        lastErr instanceof Error && /^[A-Za-z]{1,64}$/.test(lastErr.name) ? lastErr.name : "Error";
+      return `[FindElement error] the grounding call failed (${name})`;
     },
   });
 }

@@ -70,6 +70,7 @@ export type ProviderId = "anthropic" | "openai" | "gemini" | "bedrock";
  *   shadow      — an audition-lane replay whose text never reaches the user
  *   compaction  — a summarisation side call
  *   subagent    — a Task/sub-agent child's spend re-published on the parent
+ *   grounding   — a `FindElement` screenshot-to-box call (0.7.1)
  */
 export type ModelRole =
   | "primary"
@@ -82,13 +83,15 @@ export type ModelRole =
   | "committee"
   | "shadow"
   | "compaction"
-  | "subagent";
+  | "subagent"
+  | "grounding";
 
 /**
  * 0.6.0 (design §6.2, §7.12) — the AUXILIARY roles: model calls made in
  * service of the run's answer rather than as the answer itself. This is the
  * set `budget.judge_share` bounds (the sub-cap on judge, guide, classifier,
- * consult, committee, shadow and compaction spend inside `budget.usd`), and
+ * consult, committee, shadow, compaction and grounding spend inside
+ * `budget.usd`), and
  * the set the eval runner keeps OUT of `--budget-usd` (which bounds agent
  * spend). `primary`, `draft` and `escalation` are the answer's own rungs;
  * `subagent` is a child's re-published answer work — none of those is
@@ -103,6 +106,7 @@ export const AUXILIARY_MODEL_ROLES: ReadonlyArray<ModelRole> = Object.freeze([
   "committee",
   "shadow",
   "compaction",
+  "grounding",
 ]);
 
 /** True when `role` is one of {@link AUXILIARY_MODEL_ROLES}. An absent role
