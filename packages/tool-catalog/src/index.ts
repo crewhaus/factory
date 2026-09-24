@@ -178,7 +178,9 @@ export const TOOL_CONTRACT_VERSION = "1.1.0";
  *   before matching: `..` collapsed and symlinked directories followed, so a
  *   rule is checked against the file the tool will actually touch. A path
  *   that lands outside the workspace never satisfies an allow rule and always
- *   satisfies a deny or ask rule.
+ *   satisfies a deny or ask rule. (The edge worker has no filesystem to ask:
+ *   there `..` is collapsed as text and a path that climbs above its start
+ *   counts as outside.)
  * - `"url"` — a URL, compared in its parsed (WHATWG `href`) form, so
  *   `HTTP://Example.COM` and `http://example.com/` are one value.
  * - `"command"` — a command line. An array (an argv) is joined with single

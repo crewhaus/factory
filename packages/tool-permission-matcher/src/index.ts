@@ -418,10 +418,17 @@ function globIsAbsolute(argGlob: string): boolean {
 const DOT_DOT_SEGMENT = /(^|[\\/])\.\.([\\/]|$)/;
 
 /**
- * Collapse `.` and `..` segments without touching the filesystem.
- * `escapes` is true when a relative path climbs above its starting point.
+ * Collapse `.` and `..` segments without touching the filesystem, and write
+ * the result with `/` separators. `escapes` is true when a relative path
+ * climbs above its starting point.
+ *
+ * Exported for the runtimes that canonicalise a path-kind operative value
+ * where there is no filesystem to ask (the edge worker).
  */
-function lexicalNormalize(value: string): { readonly path: string; readonly escapes: boolean } {
+export function normalizePathLexically(value: string): {
+  readonly path: string;
+  readonly escapes: boolean;
+} {
   const absolute = value.startsWith("/");
   const out: string[] = [];
   let escapes = false;
@@ -447,7 +454,7 @@ function lexicalNormalize(value: string): { readonly path: string; readonly esca
  */
 function undeclaredValue(value: string): OperativeValue {
   if (!DOT_DOT_SEGMENT.test(value)) return { kind: "text", canonical: [value] };
-  const lexical = lexicalNormalize(value);
+  const lexical = normalizePathLexically(value);
   return {
     kind: "text",
     canonical: [],

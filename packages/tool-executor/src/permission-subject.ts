@@ -17,24 +17,26 @@
  * 2. When the tool declares `operativeArgs`, the values of those fields are
  *    read from the PARSED input (a declared `default` stands in for an
  *    omitted field) and canonicalised by kind:
- *    - a `path` is resolved against the workspace root, `..` collapsed, and
- *      its directories followed through symlinks (the deepest one that
- *      exists is realpath'd) — so it names the place the tool will actually
- *      touch — then written relative to the workspace. When the last
- *      component is itself a symlink, its target is a second value. A path
- *      that ends up outside the workspace, or whose destination cannot be
- *      worked out, is flagged, and the matcher never lets it satisfy an allow
- *      rule and always lets it satisfy a deny.
+ *    - a `path` goes through `canonicalizePath`. The Node runtime passes one
+ *      that resolves the path against the workspace root, collapses `..` and
+ *      follows symlinked directories, so the rule sees the place the tool
+ *      will actually touch (runtime-core's `workspacePathCanonicalizer`).
+ *      Without one — the edge worker has no filesystem to ask — `..` is
+ *      collapsed lexically and a relative path that climbs above its start
+ *      is flagged as outside, which no allow rule matches and every deny
+ *      does.
  *    - a `url` is parsed (WHATWG) and matched as its `href`.
  *    - a `command` held as an array (an argv) is joined with spaces.
  *
- * The matcher itself stays pure; everything that touches the filesystem is
- * here.
+ * Nothing here touches the filesystem or imports a `node:` builtin: this
+ * package is part of the worker runtime's import graph.
  */
-import { lstatSync, readlinkSync, realpathSync } from "node:fs";
-import * as path from "node:path";
 import type { OperativeArg, OperativeArgKind, RegisteredTool } from "@crewhaus/tool-catalog";
-import type { OperativeValue, OperativeValueKind } from "@crewhaus/tool-permission-matcher";
+import {
+  type OperativeValue,
+  type OperativeValueKind,
+  normalizePathLexically,
+} from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
 
 // The declaration kinds (tool-catalog) and the value kinds (matcher) are two
@@ -42,6 +44,9 @@ import { validateToolInput } from "@crewhaus/tool-validate";
 type SameUnion<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 const kindsAgree: SameUnion<OperativeArgKind, OperativeValueKind> = true;
 void kindsAgree;
+
+/** Turns one path-kind operative value into the value(s) a rule is matched against. */
+export type PathCanonicalizer = (raw: string) => ReadonlyArray<OperativeValue>;
 
 export type PermissionSubject =
   | {
@@ -58,8 +63,11 @@ export type PermissionSubject =
     };
 
 export type PermissionSubjectOptions = {
-  /** The directory a relative path is resolved against. Default: `process.cwd()`, the root every workspace tool resolves against. */
-  readonly workspaceRoot?: string;
+  /**
+   * How a path-kind value is canonicalised. Default: {@link lexicalPathValues}
+   * — `..` collapsed, no symlinks followed, no workspace root known.
+   */
+  readonly canonicalizePath?: PathCanonicalizer;
 };
 
 /**
@@ -93,11 +101,20 @@ export function operativeValuesFor(
   opts: PermissionSubjectOptions = {},
 ): ReadonlyArray<OperativeValue> | undefined {
   if (tool.operativeArgs === undefined) return undefined;
-  const root = opts.workspaceRoot ?? process.cwd();
+  const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
   for (const arg of tool.operativeArgs) {
     for (const raw of readOperativeField(parsedInput, arg)) {
-      values.push(...canonicalValues(arg.kind, raw, root));
+      switch (arg.kind) {
+        case "path":
+          values.push(...canonicalizePath(raw));
+          break;
+        case "url":
+          values.push(canonicalUrl(raw));
+          break;
+        default:
+          values.push({ kind: arg.kind, canonical: [raw] });
+      }
     }
   }
   return values;
@@ -143,133 +160,22 @@ export function readOperativeField(input: unknown, arg: OperativeArg): string[] 
   return out;
 }
 
-function canonicalValues(kind: OperativeArgKind, raw: string, root: string): OperativeValue[] {
-  switch (kind) {
-    case "path":
-      return canonicalPath(raw, root);
-    case "url":
-      return [canonicalUrl(raw)];
-    default:
-      return [{ kind, canonical: [raw] }];
-  }
-}
-
-function toPosix(p: string): string {
-  return path.sep === "\\" ? p.split(path.sep).join("/") : p;
-}
-
-/** A relative path that leaves its base: `..`, `../x`, or another drive. */
-function climbsOut(relative: string): boolean {
-  return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
-}
-
-/** True when the NAME exists, whether or not a symlink there leads anywhere. */
-function nameExists(p: string): boolean {
-  try {
-    lstatSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * Where `target` would land with every symlink on the way followed — the
- * deepest ancestor that exists is resolved, a dangling link is followed a hop
- * by hand (a missing target is still a door), and the parts that do not exist
- * yet are appended. Mirrors `resolveLocation` in `@crewhaus/tool-fs`, which is
- * what the file tools check containment against. Throws when the chain
- * cannot be resolved; the caller treats that as "cannot tell where it lands".
+ * The filesystem-free reading of a path: `..` and `.` collapsed, nothing
+ * followed. A relative path that climbs above its start is flagged as
+ * outside. Used where there is no workspace to ask (the edge worker); the
+ * Node runtime passes a canonicaliser that also follows symlinks.
  */
-function resolveLocation(target: string, depth = 0): string {
-  if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(path.basename(probe));
-    const parent = path.dirname(probe);
-    if (parent === probe) break;
-    probe = parent;
+export function lexicalPathValues(raw: string): OperativeValue[] {
+  const lexical = normalizePathLexically(raw);
+  if (lexical.escapes) {
+    return [
+      { kind: "path", canonical: [], spellings: [raw, lexical.path], outsideWorkspace: true },
+    ];
   }
-  let real: string;
-  try {
-    real = realpathSync(probe);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    const link = readlinkSync(probe);
-    real = resolveLocation(path.resolve(realpathSync(path.dirname(probe)), link), depth + 1);
-  }
-  return tail.length > 0 ? path.join(real, ...tail) : real;
-}
-
-function isSymlink(p: string): boolean {
-  try {
-    return lstatSync(p).isSymbolicLink();
-  } catch {
-    return false;
-  }
-}
-
-/**
- * The value(s) a path names. Parent directories are followed through
- * symlinks — `build/link/app.ts` with `build/link → ../src` IS `src/app.ts`
- * for every tool. The last component is kept as written, because a tool that
- * replaces or deletes it acts on the link itself; but when that last
- * component is a symlink, a tool that opens it acts on the target instead, so
- * the target is a second value. An allow then has to cover both, and a deny
- * fires on either.
- */
-function canonicalPath(raw: string, root: string): OperativeValue[] {
-  const rootAbs = path.resolve(root);
-  let rootReal: string;
-  try {
-    rootReal = realpathSync(rootAbs);
-  } catch {
-    rootReal = rootAbs;
-  }
-  // Lexical: `..` collapsed, symlinks untouched.
-  const lexicalAbs = path.resolve(rootAbs, raw);
-  const lexicalRel = path.relative(rootAbs, lexicalAbs);
-  const spellings = [raw, toPosix(lexicalRel === "" ? "." : lexicalRel), toPosix(lexicalAbs)];
-  const outside: OperativeValue = {
-    kind: "path",
-    canonical: [],
-    spellings,
-    outsideWorkspace: true,
-  };
-  const located = (real: string): OperativeValue => {
-    const rel = path.relative(rootReal, real);
-    if (climbsOut(rel)) return outside;
-    const relPosix = rel === "" ? "." : toPosix(rel);
-    return {
-      kind: "path",
-      canonical:
-        relPosix === "." ? [".", toPosix(real)] : [relPosix, `./${relPosix}`, toPosix(real)],
-      spellings,
-    };
-  };
-  if (climbsOut(lexicalRel)) return [outside];
-  let at: string;
-  try {
-    at =
-      lexicalAbs === rootAbs
-        ? rootReal
-        : path.join(resolveLocation(path.dirname(lexicalAbs)), path.basename(lexicalAbs));
-  } catch {
-    // Where it lands cannot be worked out: an allow must not guess.
-    return [outside];
-  }
-  const values = [located(at)];
-  if (isSymlink(at)) {
-    let target: string;
-    try {
-      target = resolveLocation(at);
-    } catch {
-      return [...values, outside];
-    }
-    if (target !== at) values.push(located(target));
-  }
-  return values;
+  const p = lexical.path;
+  const canonical = p.startsWith("/") || p === "." ? [p] : [p, `./${p}`];
+  return [{ kind: "path", canonical, spellings: [raw] }];
 }
 
 function canonicalUrl(raw: string): OperativeValue {

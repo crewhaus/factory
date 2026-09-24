@@ -1,34 +1,23 @@
 /**
  * 0.7.1 — a permission rule is checked against the call the tool will run,
  * not the call the model wrote. See `permission-subject.ts`.
+ *
+ * Everything here is filesystem-free, as the edge worker needs it to be. The
+ * canonicaliser that follows symlinks lives in runtime-core and is tested
+ * there (`path-canonical.test.ts`).
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import * as path from "node:path";
+import { describe, expect, test } from "bun:test";
 import { buildTool } from "@crewhaus/tool-builder";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { z } from "zod";
 import {
+  type PathCanonicalizer,
   executeTool,
+  lexicalPathValues,
   operativeValuesFor,
   preparePermissionSubject,
   readOperativeField,
 } from "./index";
-
-let ws: string;
-beforeEach(() => {
-  // realpath: on macOS the temp dir is itself behind a symlink (/var → /private/var).
-  ws = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-subject-")));
-  mkdirSync(path.join(ws, "src"));
-  mkdirSync(path.join(ws, "build"));
-  mkdirSync(path.join(ws, ".git", "hooks"), { recursive: true });
-  writeFileSync(path.join(ws, "src", "app.ts"), "app");
-  symlinkSync("../src", path.join(ws, "build", "link"));
-});
-afterEach(() => {
-  rmSync(ws, { recursive: true, force: true });
-});
 
 const writeLike = () =>
   buildTool({
@@ -42,22 +31,18 @@ const writeLike = () =>
 
 describe("preparePermissionSubject", () => {
   test("parses with the tool's schema: an unknown key is gone from what rules see", () => {
-    const s = preparePermissionSubject(
-      writeLike(),
-      { path: "src/a.ts", file_path: "docs/ok.md", content: "x" },
-      { workspaceRoot: ws },
-    );
+    const s = preparePermissionSubject(writeLike(), {
+      path: "src/a.ts",
+      file_path: "docs/ok.md",
+      content: "x",
+    });
     if (!s.ok) throw new Error(s.reason);
     expect(s.input).toEqual({ path: "src/a.ts", content: "x" });
     expect(s.operativeValues?.map((v) => v.canonical[0])).toEqual(["src/a.ts"]);
   });
 
   test("an input the schema rejects is refused with the schema's message", () => {
-    const s = preparePermissionSubject(
-      writeLike(),
-      { path: 7, content: "x" },
-      { workspaceRoot: ws },
-    );
+    const s = preparePermissionSubject(writeLike(), { path: 7, content: "x" });
     expect(s.ok).toBe(false);
     if (s.ok) return;
     expect(s.reason).toMatch(
@@ -77,71 +62,46 @@ describe("preparePermissionSubject", () => {
   });
 });
 
-describe("path canonicalisation (permission-integration#1)", () => {
-  const values = (p: string) =>
-    operativeValuesFor(writeLike(), { path: p, content: "" }, { workspaceRoot: ws }) ?? [];
+describe("path values without a filesystem (permission-integration#1)", () => {
+  const values = (p: string) => operativeValuesFor(writeLike(), { path: p, content: "" }) ?? [];
 
   test("`..` is collapsed before a rule sees the path", () => {
     const [v] = values("build/../src/app.ts");
-    expect(v?.canonical[0]).toBe("src/app.ts");
-    expect(v?.spellings).toContain("build/../src/app.ts");
+    expect(v?.canonical).toEqual(["src/app.ts", "./src/app.ts"]);
+    expect(v?.spellings).toEqual(["build/../src/app.ts"]);
     expect(v?.outsideWorkspace).toBeUndefined();
   });
 
-  test("a symlinked directory is followed to where the tool will act", () => {
-    const [v] = values("build/link/app.ts");
-    expect(v?.canonical[0]).toBe("src/app.ts");
-    // The name the model used is still a spelling a deny can catch.
-    expect(v?.spellings).toContain("build/link/app.ts");
+  test("a relative path that climbs above its start is flagged, with nothing to grant", () => {
+    const [v] = values("src/../../elsewhere");
+    expect(v).toEqual({
+      kind: "path",
+      canonical: [],
+      spellings: ["src/../../elsewhere", "elsewhere"],
+      outsideWorkspace: true,
+    });
   });
 
-  test("a file that does not exist yet resolves through its existing ancestors", () => {
-    const [v] = values("build/link/new/deep.ts");
-    expect(v?.canonical[0]).toBe("src/new/deep.ts");
+  test("the start itself is `.`; an absolute path stays absolute", () => {
+    expect(values(".")[0]?.canonical).toEqual(["."]);
+    expect(values("")[0]?.canonical).toEqual(["."]);
+    expect(values("/etc/../etc/passwd")[0]?.canonical).toEqual(["/etc/passwd"]);
   });
 
-  test("a symlink as the LAST component is two places: the link and its target", () => {
-    // A tool that replaces the file acts on `src/hook`; one that opens it
-    // acts on the hook. An allow must cover both; a deny fires on either.
-    // Dangling on purpose: a missing target is still a door.
-    symlinkSync("../.git/hooks/pre-commit", path.join(ws, "src", "hook"));
-    expect(values("src/hook").map((v) => v.canonical[0])).toEqual([
-      "src/hook",
-      ".git/hooks/pre-commit",
-    ]);
-    const deny = compilePattern("WriteLike(.git/**)");
-    const allow = compilePattern("WriteLike(src/**)");
-    const vs = values("src/hook");
-    expect(
-      matchesPattern(deny, "WriteLike", {}, { polarity: "restrict", operativeValues: vs }),
-    ).toBe(true);
-    expect(matchesPattern(allow, "WriteLike", {}, { polarity: "allow", operativeValues: vs })).toBe(
-      false,
+  test("the default is lexicalPathValues; a caller's canonicaliser replaces it", () => {
+    expect(values("a/./b/../c")).toEqual(lexicalPathValues("a/./b/../c"));
+    const seen: string[] = [];
+    const fake: PathCanonicalizer = (raw) => {
+      seen.push(raw);
+      return [{ kind: "path", canonical: ["elsewhere/x"] }];
+    };
+    const vs = operativeValuesFor(
+      writeLike(),
+      { path: "src/a", content: "" },
+      { canonicalizePath: fake },
     );
-    // A leaf link pointing out of the workspace brings an outside value.
-    symlinkSync(tmpdir(), path.join(ws, "src", "away"));
-    expect(values("src/away").map((v) => v.outsideWorkspace === true)).toEqual([false, true]);
-  });
-
-  test("an absolute path inside the workspace becomes workspace-relative", () => {
-    const [v] = values(path.join(ws, "src", "app.ts"));
-    expect(v?.canonical).toEqual(["src/app.ts", "./src/app.ts", path.join(ws, "src", "app.ts")]);
-  });
-
-  test("escaping the workspace — lexically or through a symlink — is flagged", () => {
-    expect(values("../elsewhere")[0]?.outsideWorkspace).toBe(true);
-    expect(values("/etc/passwd")[0]?.outsideWorkspace).toBe(true);
-    symlinkSync(tmpdir(), path.join(ws, "out"));
-    expect(values("out/x")[0]?.outsideWorkspace).toBe(true);
-    // Every path yields at least one value; only a symlinked leaf yields two.
-    expect(values("src/app.ts")).toHaveLength(1);
-    // Flagged values carry nothing canonical for an allow to match.
-    expect(values("../elsewhere")[0]?.canonical).toEqual([]);
-  });
-
-  test("the workspace root itself is `.`", () => {
-    expect(values(".")[0]?.canonical[0]).toBe(".");
-    expect(values("")[0]?.canonical[0]).toBe(".");
+    expect(seen).toEqual(["src/a"]);
+    expect(vs).toEqual([{ kind: "path", canonical: ["elsewhere/x"] }]);
   });
 });
 
@@ -189,15 +149,6 @@ describe("url, command and id values", () => {
 });
 
 describe("executeTool allowedPatterns match the parsed, canonical call (security-1#0)", () => {
-  let cwd: string;
-  beforeEach(() => {
-    cwd = process.cwd();
-    process.chdir(ws);
-  });
-  afterEach(() => {
-    process.chdir(cwd);
-  });
-
   test("a decoy key the schema strips does not satisfy an allow", async () => {
     const r = await executeTool(
       writeLike(),
@@ -208,30 +159,44 @@ describe("executeTool allowedPatterns match the parsed, canonical call (security
     expect(r.content).toBe('tool "WriteLike" is not permitted by the current permission set');
   });
 
-  test("traversal and symlinks are matched where they land", async () => {
-    for (const p of ["src/../.git/hooks/pre-commit", "build/link/app.ts"]) {
-      const r = await executeTool(
-        writeLike(),
-        { path: p, content: "x" },
-        { toolUseId: "t2", allowedPatterns: ["WriteLike(build/**)"] },
-      );
-      expect(r.isError).toBe(true);
-    }
+  test("`..` is matched where it lands", async () => {
+    const out = await executeTool(
+      writeLike(),
+      { path: "src/../.git/hooks/pre-commit", content: "x" },
+      { toolUseId: "t2", allowedPatterns: ["WriteLike(src/**)"] },
+    );
+    expect(out.isError).toBe(true);
+    const ok = await executeTool(
+      writeLike(),
+      { path: "build/../src/app.ts", content: "x" },
+      { toolUseId: "t3", allowedPatterns: ["WriteLike(src/**)"] },
+    );
+    expect(ok).toEqual({ toolUseId: "t3", content: "wrote build/../src/app.ts", isError: false });
+  });
+
+  test("a caller's canonicaliser decides where a path lands", async () => {
+    // What a Node caller with a workspace does: `build/link` is a symlink to
+    // src/, so a write through it is a write to src/.
+    const followLink: PathCanonicalizer = (raw) => [
+      { kind: "path", canonical: [raw.replace(/^build\/link\//, "src/")], spellings: [raw] },
+    ];
+    const refused = await executeTool(
+      writeLike(),
+      { path: "build/link/app.ts", content: "x" },
+      { toolUseId: "t4", allowedPatterns: ["WriteLike(build/**)"], canonicalizePath: followLink },
+    );
+    expect(refused.isError).toBe(true);
     const ok = await executeTool(
       writeLike(),
       { path: "build/link/app.ts", content: "x" },
-      { toolUseId: "t3", allowedPatterns: ["WriteLike(src/**)"] },
+      { toolUseId: "t5", allowedPatterns: ["WriteLike(src/**)"], canonicalizePath: followLink },
     );
-    expect(ok).toEqual({ toolUseId: "t3", content: "wrote build/link/app.ts", isError: false });
+    expect(ok).toEqual({ toolUseId: "t5", content: "wrote build/link/app.ts", isError: false });
   });
 
   test("the matcher is handed exactly these values", () => {
     const tool = writeLike();
-    const values = operativeValuesFor(
-      tool,
-      { path: "build/../src/a", content: "" },
-      { workspaceRoot: ws },
-    );
+    const values = operativeValuesFor(tool, { path: "build/../src/a", content: "" });
     const p = compilePattern("WriteLike(src/**)");
     expect(
       matchesPattern(

@@ -203,6 +203,7 @@ import {
   attachRoutingPersistence,
   attachWatchmeCapture,
 } from "./observability";
+import { workspacePathCanonicalizer } from "./path-canonical";
 import {
   type PreRouteArm,
   type PreRouteClassifierVerdict,
@@ -5752,8 +5753,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // input let a decoy key, an extra argument, an omitted default, a `..` or
     // a symlinked directory walk past a rule. An input the schema rejects
     // could not run anyway, so it is denied here with the schema's message,
-    // before any approval is asked for.
-    const subject = preparePermissionSubject(tool, operativeInput);
+    // before any approval is asked for. Paths are resolved against the
+    // current working directory, the root every workspace tool resolves
+    // against when it runs.
+    const subject = preparePermissionSubject(tool, operativeInput, {
+      canonicalizePath: workspacePathCanonicalizer(),
+    });
     if (!subject.ok) {
       bus.publish({
         ...bus.envelope(),
@@ -5888,7 +5893,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             // 0.7.1 — the recheck, like the first check, reads the PARSED
             // approved input and its canonical operative values; an approved
             // input that no longer parses is a denial, never a run.
-            const approvedSubject = preparePermissionSubject(tool, approvedOperative);
+            const approvedSubject = preparePermissionSubject(tool, approvedOperative, {
+              canonicalizePath: workspacePathCanonicalizer(),
+            });
             const recheck = approvedSubject.ok
               ? evaluateWithReason(
                   {

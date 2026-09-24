@@ -2,11 +2,13 @@ import { CrewhausError, isRunFailedError } from "@crewhaus/errors";
 import type { RegisteredTool, ToolExecuteModel, ToolExecuteResult } from "@crewhaus/tool-catalog";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
-import { operativeValuesFor } from "./permission-subject";
+import { type PathCanonicalizer, operativeValuesFor } from "./permission-subject";
 
 export {
+  type PathCanonicalizer,
   type PermissionSubject,
   type PermissionSubjectOptions,
+  lexicalPathValues,
   operativeValuesFor,
   preparePermissionSubject,
   readOperativeField,
@@ -32,6 +34,12 @@ export type ExecutionContext = {
    * argument glob. Absent = allow all.
    */
   readonly allowedPatterns?: ReadonlyArray<string>;
+  /**
+   * How a path-kind operative value is canonicalised for `allowedPatterns`.
+   * Default: {@link lexicalPathValues}, which needs no filesystem. A Node
+   * caller that has a workspace passes one that also follows symlinks.
+   */
+  readonly canonicalizePath?: PathCanonicalizer;
   /** Optional cooperative-cancellation signal forwarded to the tool. */
   readonly signal?: AbortSignal;
   /**
@@ -82,7 +90,11 @@ export async function executeTool(
     // values canonicalised — never the raw input, which can carry a decoy key
     // the schema strips (#145, security-1#0).
     const compiled = allowedPatterns.map(compilePattern);
-    const operativeValues = operativeValuesFor(tool, validation.value);
+    const operativeValues = operativeValuesFor(
+      tool,
+      validation.value,
+      context.canonicalizePath !== undefined ? { canonicalizePath: context.canonicalizePath } : {},
+    );
     const permitted = compiled.some((p) =>
       matchesPattern(p, tool.name, validation.value, {
         polarity: "allow",
