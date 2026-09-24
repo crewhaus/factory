@@ -39,8 +39,8 @@ import {
   dnfSaysNoMatch,
   dpkgSaysNoSuchPackage,
   dpkgStatusIsInstalled,
+  matchAptPolicy,
   pacmanSaysNoSuchPackage,
-  parseAptCachePolicy,
   parseBrewInfoJson,
   parseChocoList,
   parseChocoMajorVersion,
@@ -214,6 +214,13 @@ export type PackageFacts = {
   readonly outdated?: boolean;
   readonly kind?: "formula" | "cask";
   readonly notes: readonly string[];
+  /**
+   * apt only, and only when `apt-cache policy` answered with exactly one
+   * stanza for exactly this name: every version its version table lists.
+   * Absent means apt's answer was not about this exact name (or could not be
+   * read), which PackageInstall refuses to act on (C021).
+   */
+  readonly versionTable?: readonly string[];
 };
 
 /**
@@ -367,6 +374,7 @@ async function queryApt(
   let status: PackageFacts["status"] = "unknown";
   let installedVersions: string[] | null = null;
   let knownToManager: boolean | null = null;
+  let versionTable: readonly string[] | undefined;
   const notes: string[] = [];
 
   if (dpkg.missing || dpkg.timedOut || truncated(dpkg)) {
@@ -432,9 +440,29 @@ async function queryApt(
     } else if (policy.code !== 0 && !aptSaysNoSuchPackage(policy.stderr)) {
       unknowns.add("available.version", policyProbe, commandFailureReason(policy));
     } else {
-      const parsed = parseAptCachePolicy(policy.stdout);
-      if (parsed === undefined) {
-        if (policy.stdout.trim() === "" || aptSaysNoSuchPackage(policy.stderr)) {
+      const match = matchAptPolicy(policy.stdout, name);
+      if (match.kind === "not-exact") {
+        // apt read the name as a pattern (or the output answers about some
+        // other name). None of it is about THIS name, and the old parser
+        // reported the last stanza's candidate as this package's (C021).
+        const shown = match.headers.slice(0, 3).join(", ");
+        const reason = `apt-cache matched ${match.headers.length} package(s) as a pattern (${shown}${match.headers.length > 3 ? ", …" : ""}); none is named exactly ${JSON.stringify(name)}, so apt's answer is not about this name`;
+        // dpkg's own exact row, when it found one, still stands; anything
+        // else ("not installed" because dpkg matched nothing literally) is
+        // not an answer about a package name either.
+        if (status !== "installed") {
+          status = "unknown";
+          installedVersions = null;
+          knownToManager = null;
+          unknowns.add("status", policyProbe, reason);
+        }
+        available = null;
+        unknowns.add("available.version", policyProbe, reason);
+      } else if (match.kind === "none" || match.kind === "unlabelled") {
+        if (
+          match.kind === "none" &&
+          (policy.stdout.trim() === "" || aptSaysNoSuchPackage(policy.stderr))
+        ) {
           // apt-cache prints nothing at all for a name it does not know.
           if (knownToManager === null) knownToManager = false;
           available = null;
@@ -447,6 +475,8 @@ async function queryApt(
           );
         }
       } else {
+        const parsed = match.stanza;
+        versionTable = parsed.versions;
         knownToManager = true;
         available = parsed.candidate === null ? null : { version: parsed.candidate, source: "apt" };
         if (parsed.candidate === null) {
@@ -481,6 +511,7 @@ async function queryApt(
     knownToManager,
     available,
     notes,
+    ...(versionTable !== undefined ? { versionTable } : {}),
   };
 }
 

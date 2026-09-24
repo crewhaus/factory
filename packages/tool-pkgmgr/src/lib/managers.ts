@@ -94,9 +94,31 @@ export const PKGMGR_COMMANDS = Object.freeze({
     "-f=${binary:Package}\t${Version}\t${db:Status-Abbrev}\n",
     "--",
   ]),
-  aptCachePolicy: Object.freeze(["apt-cache", "policy", "--"]),
-  aptSimulate: Object.freeze(["apt-get", "install", "-s", "-y", "--"]),
-  aptInstall: Object.freeze(["apt-get", "install", "-y", "--"]),
+  // `-o APT::Cmd::Pattern-Only=true`: apt reads an operand as a package name
+  // or an explicit `?pattern`, never as the unanchored regex or glob it falls
+  // back to otherwise (`lib.+` matched 116 packages on Debian 12). The name
+  // gate already refuses pattern syntax; this is the belt. Older apt ignores
+  // a configuration key it does not know. `--no-remove` on the real install:
+  // apt aborts rather than remove anything, whatever the operand says.
+  aptCachePolicy: Object.freeze(["apt-cache", "policy", "-o", "APT::Cmd::Pattern-Only=true", "--"]),
+  aptSimulate: Object.freeze([
+    "apt-get",
+    "install",
+    "-s",
+    "-y",
+    "-o",
+    "APT::Cmd::Pattern-Only=true",
+    "--",
+  ]),
+  aptInstall: Object.freeze([
+    "apt-get",
+    "install",
+    "-y",
+    "--no-remove",
+    "-o",
+    "APT::Cmd::Pattern-Only=true",
+    "--",
+  ]),
 
   dnfVersion: Object.freeze(["dnf", "--version"]),
   rpmQuery: Object.freeze(["rpm", "-q", "--queryformat", "%{NAME}\t%{EVR}\t%{ARCH}\n", "--"]),

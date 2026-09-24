@@ -19,6 +19,7 @@
  *     by reading the source.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { APT_POLICY_CURL } from "./fixtures";
 import { _resetHostSeams, _setPlatform, _setUid } from "./host";
 import { packageInstall, packageQuery } from "./index";
 import { _setRunner } from "./run";
@@ -119,6 +120,14 @@ test("no schema accepts a password or an escalation flag", () => {
 test("apt refuses to install as an ordinary user and names the command to run", async () => {
   _setPlatform("linux");
   _setUid(1000);
+  // apt must first answer about exactly "curl" (C021), or the install is
+  // refused for that reason before the privilege gate is reached.
+  _setRunner(async (request: { readonly argv: readonly string[] }) => {
+    const [cmd = "", ...args] = request.argv;
+    argvSeen.push({ cmd, args });
+    const stdout = cmd === "apt-cache" ? APT_POLICY_CURL : "";
+    return { code: 0, stdout, stderr: "" } as never;
+  });
   const out = String(await packageInstall.execute({ manager: "apt", name: "curl" } as never));
   console.log(`APT_NONROOT ${out.slice(0, 260)}`);
   // The REASON, not merely a failure: an assertion that only checks "it did
