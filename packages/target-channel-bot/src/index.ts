@@ -2916,6 +2916,13 @@ function renderEvalEntry(ir: IrChannelV0): string {
           "// note: knowledge: declared but not ingested by the eval bridge entry in this slice — the Retrieve tool is absent from bridged channel evals",
         ]
       : []),
+    // C103 — the daemon activates plugins: at start; the bridge does not, so
+    // a bridged eval runs without the plugin's tools and skills. Say so.
+    ...(ir.plugins !== undefined && ir.plugins.length > 0
+      ? [
+          "// note: plugins: declared but not activated by the eval bridge entry — plugin tools and skills are absent from bridged channel evals (the daemon activates them at start)",
+        ]
+      : []),
     ...(thredzOn
       ? [
           "// note: thredz declared — the eval bridge entry passes thredz: null (wireMemory degrades to local files), so bridged evals never write to a live Thredz backend",
