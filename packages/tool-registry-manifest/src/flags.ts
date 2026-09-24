@@ -3445,11 +3445,11 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     key: "openExternal",
     name: "OpenExternal",
     readOnly: false,
-    destructive: false,
+    destructive: true,
     scope: "external",
     ioCapability: "process",
     requiresSandbox: false,
-    requireJustification: false,
+    requireJustification: true,
     operativeArgs: [{ field: "target", kind: "url" }],
   },
   oraclePriceRead: {

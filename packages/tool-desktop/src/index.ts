@@ -485,7 +485,7 @@ export const desktopNotify: RegisteredTool = buildTool({
 export const openExternal: RegisteredTool = buildTool({
   name: "OpenExternal",
   operativeArgs: [{ field: "target", kind: "url" }],
-  description: `Hand a URL or a local path to the operating system to open with whatever is registered for it. The scheme set is an ALLOW-LIST and it is short: ${OPENABLE_SCHEMES.join(", ")}. Everything else is refused by name — file: (it would bypass this tool's path containment), smb: and nfs: (they mount a remote share and can leak an authentication handshake to the host named in the URL), javascript:, data:, and the Windows ms-* shell handlers. The allowSchemes input can only NARROW that set, never widen it. What is checked is what is opened: an http(s) URL is handed to the desktop in its normalised form rather than as you typed it, a URL containing a backslash is refused (parsers disagree about whether that is a path separator, so the host checked here would not be the host opened there), a URL carrying credentials before the "@" is refused (they would sit in a process listing and in this transcript, and "google.com@evil.example" reads as the host it is not), and a mailto: may carry only the headers RFC 6068 calls safe — attach= is refused by name, because a mail client that honours it reads a local file into the message. A target with no scheme is treated as a filesystem path, resolved inside the workspace root with symlinks followed, and refused if it lands outside; an EXECUTABLE file is refused even inside the workspace, because "open this" and "run this" are the same gesture to a desktop. The result says "handedOff", not "opened": every opener returns as soon as the handler has been asked and none of them report what it then did.`,
+  description: `Hand a URL or a local path to the operating system to open with whatever is registered for it. The scheme set is an ALLOW-LIST and it is short: ${OPENABLE_SCHEMES.join(", ")}. Everything else is refused by name — file: (it would bypass this tool's path containment), smb: and nfs: (they mount a remote share and can leak an authentication handshake to the host named in the URL), javascript:, data:, and the Windows ms-* shell handlers. The allowSchemes input can only NARROW that set, never widen it. What is checked is what is opened: an http(s) URL is handed to the desktop in its normalised form rather than as you typed it, a URL containing a backslash is refused (parsers disagree about whether that is a path separator, so the host checked here would not be the host opened there), a URL carrying credentials before the "@" is refused (they would sit in a process listing and in this transcript, and "google.com@evil.example" reads as the host it is not), and a mailto: may carry only the headers RFC 6068 calls safe — attach= is refused by name, because a mail client that honours it reads a local file into the message. A target with no scheme is treated as a filesystem path, resolved inside the workspace root with symlinks followed, and refused if it lands outside; an EXECUTABLE file is refused even inside the workspace, because "open this" and "run this" are the same gesture to a desktop, and so is a file whose type the desktop runs, installs or follows without an execute bit — scripts, installers and configuration profiles (.jnlp, .mobileconfig, .msix, .py), and shortcut or location files that point somewhere else (.lnk, .url, .webloc, .fileloc, .library-ms). The result says "handedOff", not "opened": every opener returns as soon as the handler has been asked and none of them report what it then did. What it opens acts in the operator's own desktop session and outlives this call — a browser tab carries the operator's cookies, an app keeps running — so every call is gated like a change and carries a justification.`,
   inputSchema: z.object({
     target: z
       .string()
@@ -505,6 +505,14 @@ export const openExternal: RegisteredTool = buildTool({
     timeoutMs: timeoutSchema,
   }),
   readOnly: false,
+  // The effect outlives the call and the process — the package's own test for
+  // "destructive" (see PowerAssertion): an app is launched, a tab opens with
+  // the operator's cookies. As destructive:false it ran with no rule at all
+  // in auto mode, so a workspace .fileloc could launch any app unasked
+  // (flag-truth-5#6). A destructive tool that goes where the model points
+  // also carries a justification (apps/cli/src/flag-rules.test.ts, rule 1).
+  destructive: true,
+  requireJustification: true,
   concurrencySafe: false,
   scope: "external",
   ioCapability: "process",

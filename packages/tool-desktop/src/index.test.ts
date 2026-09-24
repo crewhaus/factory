@@ -46,6 +46,7 @@ import {
 } from "./index";
 import { POWERSHELL_FLAGS, osascriptProgramText, registeredPowerShellSources } from "./lib/escape";
 import { type HostFs, type PathFacts, _setFs } from "./lib/fsseam";
+import { extensionOf } from "./lib/open";
 import { type RunRequest, type RunResult, _resetRunSeams, _setDetacher, _setRunner } from "./run";
 
 type Recorded = { argv: readonly string[]; env?: Readonly<Record<string, string>>; stdin?: string };
@@ -519,6 +520,10 @@ test("every state-changing tool declares itself and every read-only one is marke
   expect(clipboardWrite.destructive).toBe(true);
   expect(printDocument.destructive).toBe(true);
   expect(powerAssertion.destructive).toBe(true);
+  // flag-truth-5#6: what OpenExternal opens acts in the operator's session
+  // and outlives the call, so auto mode asks and every call is justified.
+  expect(openExternal.destructive).toBe(true);
+  expect(openExternal.requireJustification).toBe(true);
   expect(windowList.readOnly).toBe(true);
   expect(userPresence.readOnly).toBe(true);
   // Every tool here spawns a process, so every one must lower external or the
@@ -1161,6 +1166,66 @@ test("OpenExternal refuses what a desktop would RUN, mode bit or no mode bit", a
     expect(out["outcome"]).toBe("refused");
     expect(argvSeen).toEqual([]);
   }
+
+  // flag-truth-5#6 / security-10#4: the rest of the location-file family,
+  // and what installs or runs on open with no execute bit. Each was
+  // "handedOff" in 0.7.0. Checked on every platform, dry run or not, and
+  // the runner must never be reached.
+  const RUN_ON_OPEN = [
+    "loc.fileloc",
+    "net.afploc",
+    "x.ftploc",
+    "app.jnlp",
+    "p.mobileconfig",
+    "p.configprofile",
+    "i.mpkg",
+    "s.py",
+    "s.pyw",
+    "c.msc",
+    "h.chm",
+    "a.appref-ms",
+    "a.application",
+    "s.settingcontent-ms",
+    "l.library-ms",
+    "s.search-ms",
+    "x.searchConnector-ms",
+    "e.scf",
+    "w.website",
+    "m.msix",
+    "r.rdp",
+    "t.theme",
+    "d.iso",
+    "x.prefPane",
+    "x.service",
+    "x.action",
+    "x.wflow",
+    "x.shortcut",
+    "p.appimage",
+    // Windows drops trailing dots and spaces when it opens a path.
+    "deploy.bat.",
+    "deploy.bat. .",
+  ];
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    _setPlatform(platform);
+    _setSessionEnv(platform === "linux" ? X11 : HEADLESS_ENV);
+    for (const name of RUN_ON_OPEN) {
+      for (const dryRun of [true, false]) {
+        argvSeen = [];
+        const out = JSON.parse(
+          String(await openExternal.execute({ target: name, dryRun } as never)),
+        ) as Record<string, unknown>;
+        expect({ name, platform, outcome: out["outcome"] }).toEqual({
+          name,
+          platform,
+          outcome: "refused",
+        });
+        expect(String(out["reason"])).toContain(`".${extensionOf(name)}"`);
+        expect(argvSeen).toEqual([]);
+      }
+    }
+  }
+  _setPlatform("darwin");
+  _setSessionEnv(HEADLESS_ENV);
 
   // ...and an ordinary document still opens.
   argvSeen = [];

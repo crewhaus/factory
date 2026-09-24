@@ -2241,6 +2241,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "openExternal",
     name: "OpenExternal",
     io: "process",
+    justify: true,
   },
   printDocument: {
     package: "@crewhaus/tool-desktop",

@@ -293,7 +293,20 @@ export function classifyTarget(target: string, allowed: readonly OpenableScheme[
  *   - `.desktop`, `.lnk`, `.url` and `.webloc` are INDIRECTION. They contain a
  *     target, and opening one reaches a program or a URL that never passed
  *     the scheme allow-list at the top of this file. A `.url` file holding
- *     `URL=file:///etc/passwd` walks straight around the gate.
+ *     `URL=file:///etc/passwd` walks straight around the gate. The macOS
+ *     location files are the same family: `.fileloc` is `.webloc`'s file:
+ *     twin, and Launch Services resolves it straight to its target — an app
+ *     outside the workspace, or a workspace `.command` this list refuses by
+ *     name, laundered through one level of indirection (flag-truth-5#6,
+ *     security-10#4). `.afploc`/`.ftploc` are schemes refused above.
+ *
+ * The list also names what INSTALLS or RUNS on open without an execute bit:
+ * configuration profiles, Java Web Start, ClickOnce and MSIX installers,
+ * scripts an interpreter's launcher is registered for, Automator and
+ * Shortcuts documents, macOS plug-in bundles, and disk images that mount.
+ * A deny-list always trails the handler table on a real machine; this one is
+ * the union of what the 0.7.0 review found, and an allow-list of document
+ * types for path opens is the structural fix still to be decided.
  */
 const DANGEROUS_EXTENSIONS = new Set([
   // runs directly
@@ -335,18 +348,96 @@ const DANGEROUS_EXTENSIONS = new Set([
   "scptd",
   "applescript",
   "terminal",
+  // more macOS bundles, installers and automation
+  "mpkg",
+  "prefpane",
+  "saver",
+  "service",
+  "osax",
+  "qlgenerator",
+  "kext",
+  "plugin",
+  "bundle",
+  "appex",
+  "action",
+  "caction",
+  "wflow",
+  "shortcut",
+  "mobileconfig",
+  "configprofile",
+  "provisionprofile",
+  // interpreters whose launcher is registered to RUN the file on open
+  "py",
+  "pyw",
+  "pyz",
+  "pyzw",
+  "pyc",
+  "jnlp",
+  // Windows: installers, shell and management documents that act on open
+  "appref-ms",
+  "application",
+  "appx",
+  "appxbundle",
+  "msix",
+  "msixbundle",
+  "appinstaller",
+  "msc",
+  "chm",
+  "gadget",
+  "ws",
+  "wsc",
+  "sct",
+  "diagcab",
+  "xll",
+  "rdp",
+  "theme",
+  "themepack",
+  // Linux packages and self-running images
+  "deb",
+  "rpm",
+  "flatpakref",
+  "appimage",
+  "snap",
+  // disk images that mount on open (and skip mark-of-the-web on Windows)
+  "iso",
+  "img",
+  "vhd",
+  "vhdx",
   // indirection — the target never passes the scheme gate
   "desktop",
   "lnk",
   "url",
   "webloc",
   "inetloc",
+  "fileloc",
+  "afploc",
+  "ftploc",
+  "mailloc",
+  "newsloc",
+  "atloc",
+  "telnetloc",
+  "website",
+  "scf",
+  "searchconnector-ms",
+  "library-ms",
+  "search-ms",
+  "settingcontent-ms",
   "inf",
 ]);
 
-/** The lowercase extension, or `""`. */
+/**
+ * The lowercase extension, or `""`.
+ *
+ * Trailing dots and spaces are dropped first: Windows strips them when it
+ * opens a path, so `x.bat.` and `x.bat ` run `x.bat`, and reading them as
+ * "no extension" let a refused type through by spelling.
+ */
 export function extensionOf(path: string): string {
-  const base = path.split(/[\\/]/).pop() ?? path;
+  const full = path.split(/[\\/]/).pop() ?? path;
+  // A loop, not /[. ]+$/, which rescans the run from every start (quadratic).
+  let end = full.length;
+  while (end > 0 && (full[end - 1] === "." || full[end - 1] === " ")) end--;
+  const base = full.slice(0, end);
   const dot = base.lastIndexOf(".");
   return dot <= 0 ? "" : base.slice(dot + 1).toLowerCase();
 }
