@@ -9,6 +9,7 @@ import {
   DEFAULT_PREVIEW_LINES,
   DEFAULT_THRESHOLD_BYTES,
   assertUnderRoot,
+  previewHead,
   resolveStoragePath,
   storeAndPreview,
 } from "./index";
@@ -110,6 +111,87 @@ describe("storeAndPreview — non-string content", () => {
   });
 });
 
+/** The part of a preview before the truncation marker. */
+function headOf(preview: unknown): string {
+  if (typeof preview !== "string") throw new Error("expected a string preview");
+  const at = preview.lastIndexOf("\n[truncated, full output at ");
+  if (at === -1) throw new Error("no truncation marker");
+  return preview.slice(0, at);
+}
+
+// flag-truth-6#4 / security-12#8 — the preview kept the first 100 LINES, so a
+// result on one line (every builtin that returns JSON.stringify'd output,
+// RunCommand's stdout included) reached the model whole, plus a marker.
+describe("storeAndPreview — the preview is capped by bytes, not only lines", () => {
+  test("a single long line is cut to the threshold, and the file keeps all of it", async () => {
+    const rootDir = newTempRoot();
+    const content = JSON.stringify(Array.from({ length: 20_000 }, (_, i) => ({ i, v: "x" })));
+    expect(content.includes("\n")).toBe(false);
+    const out = await storeAndPreview(makeResult(content), {
+      runId: "run_long",
+      toolUseId: "tu_1",
+      rootDir,
+    });
+    expect(out.persisted).toBe(true);
+    const head = headOf(out.previewContent);
+    expect(Buffer.byteLength(head, "utf8")).toBe(DEFAULT_THRESHOLD_BYTES);
+    expect(content.startsWith(head)).toBe(true);
+    expect(String(out.previewContent).endsWith(`full output at ${out.fullPath}]`)).toBe(true);
+    expect(readFileSync(out.fullPath as string, "utf8")).toBe(content);
+  });
+
+  test("wide multi-line output is capped too", async () => {
+    const rootDir = newTempRoot();
+    const content = Array.from({ length: 50 }, () => "w".repeat(4096)).join("\n");
+    const out = await storeAndPreview(makeResult(content), {
+      runId: "run_wide",
+      toolUseId: "tu_1",
+      rootDir,
+    });
+    const head = headOf(out.previewContent);
+    expect(Buffer.byteLength(head, "utf8")).toBeLessThanOrEqual(DEFAULT_THRESHOLD_BYTES);
+    expect(content.startsWith(head)).toBe(true);
+  });
+
+  test("the cut never splits a character", () => {
+    // Two-byte characters with an odd budget: the last one would be split.
+    expect(previewHead("é".repeat(20_000), 100, 10_001)).toBe("é".repeat(5_000));
+    // Three-byte characters: a whole number of them, no replacement char.
+    const euro = previewHead("€".repeat(20_000), 100, 10_240);
+    expect(Buffer.byteLength(euro, "utf8") % 3).toBe(0);
+    expect(euro).toBe("€".repeat(3_413));
+    // Surrogate pairs: neither half is left on its own, whichever way the
+    // budget falls.
+    for (const budget of [10, 11, 13]) {
+      const emoji = previewHead("😀".repeat(100), 100, budget);
+      expect(emoji).toBe("😀".repeat(Math.floor(budget / 4)));
+      expect(emoji).not.toContain("\ufffd");
+    }
+    // The window of `budget` code units ends between the two halves.
+    expect(previewHead("a😀b", 100, 2)).toBe("a");
+    expect(previewHead("a😀b", 100, 5)).toBe("a😀");
+  });
+
+  test("the line limit still applies first, and a caller's byte budget is honoured", () => {
+    const lines = Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\n");
+    expect(previewHead(lines, 3, 1_000)).toBe("line 0\nline 1\nline 2");
+    expect(previewHead(lines, 3, 10)).toBe("line 0\nlin");
+    expect(previewHead(lines, 0, 1_000)).toBe("");
+    expect(previewHead(lines, 3, 0)).toBe("");
+  });
+
+  test("the byte budget defaults to the threshold", async () => {
+    const rootDir = newTempRoot();
+    const out = await storeAndPreview(makeResult("y".repeat(500)), {
+      runId: "run_default",
+      toolUseId: "tu_1",
+      rootDir,
+      thresholdBytes: 100,
+    });
+    expect(headOf(out.previewContent)).toBe("y".repeat(100));
+  });
+});
+
 describe("storeAndPreview — over threshold", () => {
   test("large content is persisted; preview shows first N lines + marker", async () => {
     const rootDir = newTempRoot();
@@ -148,6 +230,7 @@ describe("storeAndPreview — over threshold", () => {
       rootDir,
       thresholdBytes: 5,
       previewLines: 2,
+      previewBytes: 100,
     });
     expect(out.persisted).toBe(true);
     expect(out.previewContent).toContain("line a\nline b\n[truncated, full output at ");

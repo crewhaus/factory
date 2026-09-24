@@ -1244,6 +1244,57 @@ describe("runChatLoop — Section 8 result store", () => {
   });
 });
 
+describe("runChatLoop — a one-line tool result reaches the model capped (flag-truth-6#4)", () => {
+  test("a 1 MB single-line result is sent as a preview of at most the threshold", async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmpRoot = mkdtempSync(join(tmpdir(), "crewhaus-runtime-oneline-"));
+    const oldCwd = process.cwd();
+    process.chdir(tmpRoot);
+    try {
+      // What a JSON-returning builtin produces: one line, however large.
+      const oneLine = JSON.stringify({ stdout: "z".repeat(1_000_000) });
+      const tool = buildTool({
+        name: "OneLine",
+        description: "one long line",
+        inputSchema: z.object({}),
+        readOnly: true,
+        execute: async () => oneLine,
+      });
+      const { adapter, capturedMessages } = makeScriptedClient([
+        [{ type: "tool_use", id: "tu_line", name: "OneLine", input: {} } as Anthropic.ToolUseBlock],
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      const input = new PassThrough();
+      input.write("go\n");
+      input.end();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        _adapter: adapter,
+        input,
+        tools: [tool],
+        permissionMode: "bypass",
+        stdout: () => {},
+      });
+      const secondCall = capturedMessages()[1] ?? [];
+      const userMsg = secondCall.find((m) => m.role === "user" && Array.isArray(m.content));
+      const content = (userMsg?.content as Anthropic.ToolResultBlockParam[])[0]?.content;
+      const preview = typeof content === "string" ? content : "";
+      const marker = preview.lastIndexOf("\n[truncated, full output at ");
+      expect(marker).toBeGreaterThan(0);
+      // Before the fix the whole megabyte went through, plus the marker.
+      expect(Buffer.byteLength(preview.slice(0, marker), "utf8")).toBeLessThanOrEqual(10_240);
+      const fullPath = preview.match(/full output at (.+?)\]$/)?.[1] ?? "";
+      expect(readFileSync(fullPath, "utf8")).toBe(oneLine);
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("runChatLoop — Section 8 streaming flag", () => {
   test("streaming: true dispatches tools mid-stream and round-trips results", async () => {
     const events: { id: string; phase: "started" | "finished" }[] = [];

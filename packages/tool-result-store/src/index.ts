@@ -8,7 +8,11 @@
  *   - Threshold: 10240 bytes (10 KB) of UTF-8.
  *   - Storage path: `<rootDir>/<runId>/<toolUseId>.txt`
  *     (rootDir defaults to `.crewhaus/tool-results` under cwd).
- *   - Preview: first 100 lines + `[truncated, full output at <fullPath>]`
+ *   - Preview: the first 100 lines, cut to at most `previewBytes` bytes
+ *     (default: the threshold) on a character boundary, then
+ *     `[truncated, full output at <fullPath>]`. The byte cap matters for
+ *     the common case of one long line — a JSON-encoded result — which the
+ *     line limit alone passed through whole.
  *
  * Idempotent writes: the file is created with `flag: "wx"` (write-
  * exclusive). If a previous run already wrote the same `(runId,
@@ -44,6 +48,12 @@ export type StoreOptions = {
   readonly toolUseId: string;
   readonly thresholdBytes?: number;
   readonly previewLines?: number;
+  /**
+   * The most UTF-8 bytes of the result the preview carries, before the
+   * marker. Defaults to `thresholdBytes`, so a persisted result's preview is
+   * never larger than a result small enough to go through whole.
+   */
+  readonly previewBytes?: number;
   readonly rootDir?: string;
 };
 
@@ -70,6 +80,7 @@ export async function storeAndPreview(
 ): Promise<StoredResult> {
   const thresholdBytes = opts.thresholdBytes ?? DEFAULT_THRESHOLD_BYTES;
   const previewLines = opts.previewLines ?? DEFAULT_PREVIEW_LINES;
+  const previewBytes = opts.previewBytes ?? thresholdBytes;
   const rootDir = opts.rootDir ?? DEFAULT_ROOT_DIR;
 
   // Section 14 — non-string content (image content arrays) bypasses
@@ -100,11 +111,43 @@ export async function storeAndPreview(
     // as success. The body is identical because tool_use_id is unique.
   }
 
-  const lines = result.content.split("\n");
-  const head = lines.slice(0, previewLines).join("\n");
+  const head = previewHead(result.content, previewLines, previewBytes);
   const previewContent = `${head}\n[truncated, full output at ${fullPath}]`;
 
   return { previewContent, fullPath, persisted: true };
+}
+
+/**
+ * The first `maxLines` lines of `content`, cut to at most `maxBytes` UTF-8
+ * bytes without splitting a character (flag-truth-6#4). Only the first
+ * `maxBytes` code units are ever looked at: every code unit is at least one
+ * byte, so nothing past them can fit.
+ */
+export function previewHead(content: string, maxLines: number, maxBytes: number): string {
+  const lines = Math.floor(maxLines);
+  const bytes = Math.floor(maxBytes);
+  if (!(lines > 0) || !(bytes > 0)) return "";
+  const scan = content.length > bytes ? content.slice(0, bytes) : content;
+  let end = scan.length;
+  let from = 0;
+  for (let n = 0; n < lines; n++) {
+    const newline = scan.indexOf("\n", from);
+    if (newline === -1) break;
+    if (n === lines - 1) {
+      end = newline;
+      break;
+    }
+    from = newline + 1;
+  }
+  const head = scan.slice(0, end);
+  const encoded = Buffer.from(head, "utf8");
+  if (encoded.length <= bytes) return head;
+  // Step back over continuation bytes (10xxxxxx) to the start of a character.
+  // A surrogate pair the window split in two encodes as a replacement
+  // character that starts at or past byte `bytes - 1`, so this drops it too.
+  let cut = bytes;
+  while (cut > 0 && ((encoded[cut] ?? 0) & 0xc0) === 0x80) cut--;
+  return encoded.subarray(0, cut).toString("utf8");
 }
 
 function rejectUnsafeSegment(label: string, value: string): void {
