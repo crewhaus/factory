@@ -40,12 +40,35 @@ export class CsvError extends Error {
   }
 }
 
+/**
+ * Why a delimiter/quote pair cannot describe a CSV file, or null when it can.
+ *
+ * One check for the reader and the writer, so neither accepts a dialect the
+ * other cannot honour. A line break cannot be the delimiter or the quote:
+ * rows are separated by line breaks, so a `\n` delimiter turns every field
+ * into a row (a writer's output read back as one header line of values and
+ * zero records), and a `\r` one splits CRLF rows into phantom columns. The
+ * quote character cannot be the delimiter, or a quoted field cannot be told
+ * from a field boundary.
+ */
+export function csvDialectError(delimiter: string, quote: string): string | null {
+  if (delimiter.length !== 1) return "delimiter must be a single character";
+  if (quote.length !== 1) return "quote must be a single character";
+  if (delimiter === "\r" || delimiter === "\n") {
+    return "delimiter cannot be a line break (CR or LF) — rows are separated by line breaks";
+  }
+  if (quote === "\r" || quote === "\n") {
+    return "quote cannot be a line break (CR or LF) — rows are separated by line breaks";
+  }
+  if (delimiter === quote) return "delimiter and quote must differ";
+  return null;
+}
+
 /** Split CSV text into rows of raw string fields. Throws `CsvError` on an unterminated quote. */
 export function parseCsv(text: string, options: CsvParseOptions): CsvParseResult {
   const { delimiter, quote } = options;
-  if (delimiter.length !== 1) throw new CsvError("delimiter must be a single character", 0);
-  if (quote.length !== 1) throw new CsvError("quote must be a single character", 0);
-  if (delimiter === quote) throw new CsvError("delimiter and quote must differ", 0);
+  const dialect = csvDialectError(delimiter, quote);
+  if (dialect !== null) throw new CsvError(dialect, 0);
 
   const src = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   const rows: string[][] = [];
@@ -239,14 +262,22 @@ export function cellToString(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "boolean") return String(value);
-  return JSON.stringify(value);
+  // JSON.stringify answers undefined for a function or a symbol, which no
+  // JSON value is; an empty field beats a crash in the quoting step.
+  return JSON.stringify(value) ?? "";
 }
 
-/** Serialize rows of already-stringified cells. */
+/**
+ * Serialize rows of already-stringified cells. Throws `CsvError` for a
+ * dialect `parseCsv` would refuse or misread (see `csvDialectError`), so
+ * nothing is written that this package cannot read back.
+ */
 export function writeCsvRows(
   rows: ReadonlyArray<ReadonlyArray<unknown>>,
   options: CsvWriteOptions,
 ): string {
+  const dialect = csvDialectError(options.delimiter, options.quote);
+  if (dialect !== null) throw new CsvError(dialect, 0);
   const lines: string[] = [];
   if (options.header !== null) {
     lines.push(options.header.map((h) => escapeCsvField(h, options)).join(options.delimiter));

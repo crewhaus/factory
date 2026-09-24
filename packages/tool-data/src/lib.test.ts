@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
 import {
   CsvError,
   cellToString,
+  csvDialectError,
   escapeCsvField,
   inferScalar,
   normalizeHeader,
@@ -728,6 +729,49 @@ describe("csv writing", () => {
     const rows = [["a,b", 'c"d', "e\nf"]];
     const text = writeCsvRows(rows, W);
     expect(parseCsv(text, CSV_DEFAULTS).rows).toEqual([["a,b", 'c"d', "e\nf"]]);
+  });
+
+  test("a line break or the quote character is refused as a delimiter, by reader and writer alike", () => {
+    // One rule for both sides: each of these wrote a file the reader then
+    // refused or misread (a "\n" delimiter read back as one header line of
+    // values and zero records).
+    const refused: Array<[string, string, RegExp]> = [
+      ["\n", '"', /line break/],
+      ["\r", '"', /line break/],
+      ['"', '"', /must differ/],
+      [",", "\n", /line break/],
+      [",", "\r", /line break/],
+      [",,", '"', /single character/],
+    ];
+    let hits = 0;
+    for (const [delimiter, quote, why] of refused) {
+      expect(csvDialectError(delimiter, quote)).toMatch(why);
+      expect(() => parseCsv("a\nb", { ...CSV_DEFAULTS, delimiter, quote })).toThrow(CsvError);
+      expect(() => writeCsvRows([["a"]], { ...W, delimiter, quote })).toThrow(why);
+      hits += 1;
+    }
+    expect(hits).toBe(6);
+    expect(csvDialectError(",", '"')).toBeNull();
+  });
+
+  test("for every usable delimiter, a written file reads back exactly, CRLF or not", () => {
+    const rows = [
+      ["plain", "has,comma", "has;semi", "has\ttab", "has|pipe", "has space"],
+      ['has"quote', "has\nlf", "has\rcr", "has\r\ncrlf", "", "x"],
+    ];
+    let checked = 0;
+    for (const delimiter of [",", ";", "\t", "|", " "]) {
+      for (const newline of ["\n", "\r\n"]) {
+        const text = writeCsvRows(rows, { ...W, delimiter, newline });
+        expect({
+          delimiter,
+          newline,
+          rows: parseCsv(text, { ...CSV_DEFAULTS, delimiter }).rows,
+        }).toEqual({ delimiter, newline, rows });
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(10);
   });
 });
 

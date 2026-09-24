@@ -422,9 +422,60 @@ describe("DataConvert", () => {
       false,
     );
   });
+
+  test("a CSV delimiter that cannot round-trip is refused on either side", async () => {
+    // 0.7.0: json->csv with "\n" wrote one field per line, and csv->json read
+    // that back as [] with every value turned into a column name.
+    const toCsv = await text(dataConvert, {
+      text: '[{"x":1}]',
+      from: "json",
+      to: "csv",
+      delimiter: "\n",
+    });
+    const fromCsv = await text(dataConvert, {
+      text: "x\ny\n1\nb",
+      from: "csv",
+      to: "json",
+      delimiter: "\n",
+    });
+    expect([toCsv, fromCsv].map((o) => /^cannot use delimiter.*line break/.test(o))).toEqual([
+      true,
+      true,
+    ]);
+    // Only CSV reads the delimiter; a JSON -> YAML call that happens to carry
+    // one is not refused.
+    expect(
+      await text(dataConvert, { text: '{"a":1}', from: "json", to: "yaml", delimiter: "\n" }),
+    ).toBe("a: 1");
+  });
+
+  test("a later record's key named like an Object.prototype member is written, not a crash", async () => {
+    // 0.7.0 read r["constructor"] off the first record's prototype and threw
+    // "undefined is not an object" in the quoting step.
+    const out = await text(dataConvert, {
+      text: '[{"a":1},{"constructor":2,"toString":"t"}]',
+      from: "json",
+      to: "csv",
+    });
+    expect(out).toBe("a,constructor,toString\n1,,\n,2,t");
+  });
 });
 
 describe("CsvParse", () => {
+  test("a line-break delimiter or quote is refused rather than misread", async () => {
+    // 0.7.0 answered {"rowCount":0,...} for the first: every value became a
+    // column name and no record came back.
+    const outs = await Promise.all([
+      text(csvParse, { text: "x\ny\n1\nb", delimiter: "\n" }),
+      text(csvParse, { text: "x\ry\r\n1\rb\r\n", delimiter: "\r" }),
+      text(csvParse, { text: "a,b\n", quote: "\n" }),
+      text(csvParse, { text: "a;b\n", delimiter: ";", quote: ";" }),
+    ]);
+    expect(outs.map((o) => o.startsWith("cannot use delimiter"))).toEqual([true, true, true, true]);
+    expect(outs.slice(0, 3).every((o) => o.includes("line break"))).toBe(true);
+    expect(outs[3]).toContain("must differ");
+  });
+
   test("reads a header and quoted fields into records", async () => {
     const out = await run(csvParse, { text: 'a,b\n1,"x,y"\n' });
     expect(out.columns).toEqual(["a", "b"]);
@@ -524,6 +575,29 @@ describe("CsvWrite", () => {
 
   test("the schema requires the records field", () => {
     expect(csvWrite.inputSchema.safeParse({}).success).toBe(false);
+  });
+
+  test("a delimiter the reader cannot read back is refused, and nothing is written", async () => {
+    // 0.7.0 wrote 'x"y\n1"b' for the quote and one field per line for LF.
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ records: [{ x: 1, y: "b" }], delimiter: '"' }, /delimiter "\\"".*must differ/],
+      [{ records: [{ x: 1, y: "b" }], delimiter: "\n" }, /line break/],
+      [{ records: [{ x: 1 }], delimiter: "\r", crlf: true }, /line break/],
+      [{ records: [[1, 2]], delimiter: "\n" }, /line break/],
+      [{ records: [], delimiter: "\n" }, /line break/],
+    ];
+    for (const [input, why] of cases) {
+      const out = await text(csvWrite, input);
+      expect(out).toMatch(/^cannot use delimiter/);
+      expect(out).toMatch(why);
+    }
+    expect(await text(csvWrite, { records: [{ a: 1, b: 2 }], delimiter: "\t" })).toBe("a\tb\n1\t2");
+  });
+
+  test("a caller column named like an Object.prototype member reads as absent, not as the inherited function", async () => {
+    expect(
+      await text(csvWrite, { records: [{ a: 1 }], columns: ["a", "constructor", "toString"] }),
+    ).toBe("a,constructor,toString\n1,,");
   });
 });
 

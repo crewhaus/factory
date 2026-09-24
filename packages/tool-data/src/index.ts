@@ -26,6 +26,7 @@ import {
   type CsvParseOptions,
   type CsvWriteOptions,
   cellToString,
+  csvDialectError,
   normalizeHeader,
   parseCsv,
   rowsToRecords,
@@ -161,6 +162,19 @@ function readJson(
 }
 
 const FORMATS = ["json", "yaml", "toml", "csv", "jsonl"] as const;
+
+/**
+ * The refusal for a CSV dialect the reader or writer cannot honour, or null.
+ * Checked before any work, so a bad delimiter is a plain sentence naming the
+ * choice, never a file that cannot be read back or a parse that silently
+ * turns every value into a column name.
+ */
+function csvDialectRefusal(delimiter: string, quote: string): string | null {
+  const why = csvDialectError(delimiter, quote);
+  return why === null
+    ? null
+    : `cannot use delimiter ${JSON.stringify(delimiter)} with quote ${JSON.stringify(quote)}: ${why}`;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -367,7 +381,11 @@ export const dataConvert: RegisteredTool = buildTool({
     from: z.enum(FORMATS),
     to: z.enum(FORMATS),
     indent: z.number().int().min(0).max(8).optional().describe("for JSON output"),
-    delimiter: z.string().length(1).optional().describe("for CSV, on either side; default ,"),
+    delimiter: z
+      .string()
+      .length(1)
+      .optional()
+      .describe("for CSV, on either side; default , — not a line break or a double quote"),
     header: z
       .boolean()
       .optional()
@@ -383,6 +401,10 @@ export const dataConvert: RegisteredTool = buildTool({
     const size = tooLarge(input.text, "text");
     if (size !== null) return size;
     const delimiter = input.delimiter ?? ",";
+    if (input.from === "csv" || input.to === "csv") {
+      const dialect = csvDialectRefusal(delimiter, '"');
+      if (dialect !== null) return dialect;
+    }
     const header = input.header ?? true;
     const doc = readDocument(input.text, input.from, {
       delimiter,
@@ -446,7 +468,7 @@ function writeDocument(
         header: options.header ? columns : null,
       };
       return writeCsvRows(
-        records.map((r) => columns.map((c) => r[c])),
+        records.map((r) => columns.map((c) => getOwn(r, c))),
         writeOptions,
       );
     }
@@ -459,8 +481,12 @@ export const csvParse: RegisteredTool = buildTool({
     "Parse RFC 4180 CSV into records or rows, handling quoted fields, embedded commas, newlines and doubled quotes, with a custom delimiter and optional type inference. Use to read a spreadsheet export correctly instead of splitting on commas and corrupting every quoted address.",
   inputSchema: z.object({
     text: z.string().describe("the CSV document"),
-    delimiter: z.string().length(1).optional().describe("default ,  — use \\t for TSV"),
-    quote: z.string().length(1).optional().describe('default "'),
+    delimiter: z
+      .string()
+      .length(1)
+      .optional()
+      .describe("default ,  — use \\t for TSV; not a line break or the quote character"),
+    quote: z.string().length(1).optional().describe('default " — not a line break'),
     header: z.boolean().optional().describe("treat the first row as a header; default true"),
     inferTypes: z
       .boolean()
@@ -478,6 +504,8 @@ export const csvParse: RegisteredTool = buildTool({
   execute: async (input) => {
     const size = tooLarge(input.text, "text");
     if (size !== null) return size;
+    const dialect = csvDialectRefusal(input.delimiter ?? ",", input.quote ?? '"');
+    if (dialect !== null) return dialect;
     const options: CsvParseOptions = {
       delimiter: input.delimiter ?? ",",
       quote: input.quote ?? '"',
@@ -528,7 +556,11 @@ export const csvWrite: RegisteredTool = buildTool({
       .array(z.string())
       .optional()
       .describe("column order; defaults to keys as first seen"),
-    delimiter: z.string().length(1).optional(),
+    delimiter: z
+      .string()
+      .length(1)
+      .optional()
+      .describe("default , — not a line break or a double quote"),
     header: z.boolean().optional().describe("write a header row; default true for records"),
     quoteAll: z.boolean().optional(),
     crlf: z.boolean().optional().describe("use CRLF line endings, as RFC 4180 specifies"),
@@ -536,6 +568,8 @@ export const csvWrite: RegisteredTool = buildTool({
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
+    const dialect = csvDialectRefusal(input.delimiter ?? ",", '"');
+    if (dialect !== null) return dialect;
     if (input.records.length === 0) return "";
     const rowMode = input.records.every((r) => Array.isArray(r));
     const options: CsvWriteOptions = {
@@ -557,7 +591,7 @@ export const csvWrite: RegisteredTool = buildTool({
     const records = input.records as Record_[];
     const columns = input.columns ?? unionKeys(records);
     return writeCsvRows(
-      records.map((r) => columns.map((c) => cellToString(r[c] ?? null))),
+      records.map((r) => columns.map((c) => cellToString(getOwn(r, c) ?? null))),
       { ...options, header: input.header === false ? null : columns },
     );
   },
