@@ -32,9 +32,19 @@
  * answer, so no `mcp__` name appears here and any reader must say so rather
  * than let its absence read as "there are none".
  *
+ * FLAGS WITHOUT PROSE. `@crewhaus/tool-registry-manifest/flags` exports
+ * `TOOL_FLAGS`: the same rows less descriptions, categories and keywords, for
+ * a bundle that only reasons about how a tool is gated.
+ *
  * DEPENDENCY-FREE on purpose, like `@crewhaus/tool-categories`: anything that
  * needs to describe a tool can depend on this without dragging a tool
  * implementation, the compiler or a network stack behind it.
  */
 export { REGISTRY_VERSION, TOOL_REGISTRY } from "./generated";
-export { type RegistryEntry, projectRegistryEntry } from "./types";
+export {
+  type RegistryEntry,
+  type RegistryOperativeArg,
+  type ToolFlags,
+  projectRegistryEntry,
+  projectToolFlags,
+} from "./types";

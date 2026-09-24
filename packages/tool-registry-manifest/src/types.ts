@@ -8,6 +8,19 @@
  * description of a tool that exists, so an operator can see what the agent
  * is missing.
  */
+/**
+ * One field a permission rule's argument pattern is checked against — a copy
+ * of `OperativeArg` from `@crewhaus/tool-catalog`, repeated here so this
+ * package stays dependency-free.
+ */
+export type RegistryOperativeArg = {
+  readonly field: string;
+  /** `path` | `url` | `command` | `recipient` | `text` | `id`. */
+  readonly kind: string;
+  readonly default?: string;
+  readonly within?: string;
+};
+
 export type RegistryEntry = {
   /** The camelCase key a spec writes in `tools:`. */
   readonly key: string;
@@ -22,6 +35,12 @@ export type RegistryEntry = {
   readonly ioCapability?: string;
   readonly requiresSandbox: boolean;
   readonly requireJustification: boolean;
+  /**
+   * The field(s) a permission rule's argument pattern is about. Absent when
+   * the tool declares none; `[]` when it says no argument decides where it
+   * acts.
+   */
+  readonly operativeArgs?: ReadonlyArray<RegistryOperativeArg>;
   /** Leaf category first, then every roll-up that reaches it. */
   readonly categories: ReadonlyArray<string>;
   /** The `@crewhaus/tool-*` package that exports it. */
@@ -53,6 +72,7 @@ export function projectRegistryEntry(args: {
     readonly ioCapability?: string;
     readonly requiresSandbox: boolean;
     readonly requireJustification: boolean;
+    readonly operativeArgs?: ReadonlyArray<RegistryOperativeArg>;
   };
   readonly categories: ReadonlyArray<string>;
   readonly package: string;
@@ -71,8 +91,55 @@ export function projectRegistryEntry(args: {
     ...(tool.ioCapability !== undefined ? { ioCapability: tool.ioCapability } : {}),
     requiresSandbox: tool.requiresSandbox,
     requireJustification: tool.requireJustification,
+    ...(tool.operativeArgs !== undefined
+      ? { operativeArgs: tool.operativeArgs.map(projectOperativeArg) }
+      : {}),
     categories: [...categories],
     package: args.package,
     keywords: [...keywords],
+  };
+}
+
+/** Fixed field order, so two projections compare byte for byte. */
+function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
+  return {
+    field: arg.field,
+    kind: arg.kind,
+    ...(arg.default !== undefined ? { default: arg.default } : {}),
+    ...(arg.within !== undefined ? { within: arg.within } : {}),
+  };
+}
+
+/**
+ * The part of a {@link RegistryEntry} that decides how a tool is gated: its
+ * names, its flags and what a permission rule reads. No description, so a
+ * bundle that only needs to reason about permissions (`PermissionAudit`,
+ * `crewhaus permissions suggest`) carries a small table rather than every
+ * tool's prose. `src/flags.ts` is generated from the same projection.
+ */
+export type ToolFlags = {
+  readonly key: string;
+  readonly name: string;
+  readonly readOnly: boolean;
+  readonly destructive: boolean;
+  readonly scope: string;
+  readonly ioCapability?: string;
+  readonly requiresSandbox: boolean;
+  readonly requireJustification: boolean;
+  readonly operativeArgs?: ReadonlyArray<RegistryOperativeArg>;
+};
+
+/** The {@link ToolFlags} of one manifest row. */
+export function projectToolFlags(entry: RegistryEntry): ToolFlags {
+  return {
+    key: entry.key,
+    name: entry.name,
+    readOnly: entry.readOnly,
+    destructive: entry.destructive,
+    scope: entry.scope,
+    ...(entry.ioCapability !== undefined ? { ioCapability: entry.ioCapability } : {}),
+    requiresSandbox: entry.requiresSandbox,
+    requireJustification: entry.requireJustification,
+    ...(entry.operativeArgs !== undefined ? { operativeArgs: entry.operativeArgs } : {}),
   };
 }

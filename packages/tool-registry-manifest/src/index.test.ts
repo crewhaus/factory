@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { REGISTRY_VERSION, TOOL_REGISTRY, projectRegistryEntry } from "./index";
+import { REGISTRY_VERSION, TOOL_REGISTRY, projectRegistryEntry, projectToolFlags } from "./index";
 
 /**
  * What this file can check, and what it cannot.
@@ -163,5 +163,31 @@ describe("projectRegistryEntry round-trips every row", () => {
       keywords: [],
     });
     expect("ioCapability" in projected).toBe(false);
+  });
+});
+
+describe("the flags table is the manifest without its prose", () => {
+  test("one row per manifest row, each the projection of its row", async () => {
+    const { TOOL_FLAGS, TOOL_FLAGS_BY_NAME } = await import("./flags");
+    const keys = Object.keys(TOOL_FLAGS);
+    // The hit count first: an emptied flags.ts must not pass by agreeing with nothing.
+    expect(keys.length).toBe(entries.length);
+    const drifted = entries
+      .filter(
+        ([key, entry]) =>
+          JSON.stringify(TOOL_FLAGS[key]) !== JSON.stringify(projectToolFlags(entry)),
+      )
+      .map(([key]) => key);
+    expect(drifted).toEqual([]);
+    expect(TOOL_FLAGS_BY_NAME.size).toBe(entries.length);
+    expect(TOOL_FLAGS_BY_NAME.get("HttpRequest")?.key).toBe("httpRequest");
+  });
+
+  test("operativeArgs are carried, including an empty declaration", () => {
+    expect(TOOL_REGISTRY["write"]?.operativeArgs).toEqual([{ field: "path", kind: "path" }]);
+    expect(TOOL_REGISTRY["clipboardWrite"]?.operativeArgs).toEqual([]);
+    expect(TOOL_REGISTRY["issueCreate"]?.operativeArgs).toEqual([
+      { field: "repo", kind: "recipient", within: "owner" },
+    ]);
   });
 });
