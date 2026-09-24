@@ -87,6 +87,7 @@ import {
   byString,
   describeFailure,
   destinationRefusal,
+  isDotSegment,
   json,
   ledgerLookup,
   ledgerRecord,
@@ -103,6 +104,7 @@ import {
   safeUrlLabel,
   sleep,
   startDeadline,
+  substituteIntoUrl,
 } from "./net";
 import type {
   AuthProfile,
@@ -507,7 +509,17 @@ function routeChat(
   if (typeof base === "string") return { ok: false, message: base };
   const token = resolveSecret(target.tokenEnv, "the bot token", allowed);
   if (!token.ok) return { ok: false, message: token.message };
-  const url = new URL(`${base.pathname.replace(/\/+$/, "")}/${apiPath.replace(/^\/+/, "")}`, base);
+  const literal = `${base.pathname.replace(/\/+$/, "")}/${apiPath.replace(/^\/+/, "")}`;
+  const url = new URL(literal, base);
+  // The path requested must be the path built: a segment the parser would
+  // resolve (a `..` channel, message id or emoji) addresses another endpoint.
+  if (url.pathname !== literal) {
+    return {
+      ok: false,
+      message:
+        "a channel, message id or emoji in this call would change which API endpoint is requested, not just name the item",
+    };
+  }
   return {
     ok: true,
     url,
@@ -540,6 +552,14 @@ function apiPathFor(
     return { path: "reactions.add", method: "POST" };
   }
   if (channel === undefined) return "discord addresses messages by channel id — set channel";
+  const dotted = [
+    ["channel", channel],
+    ["messageId", messageId],
+    ["emoji", emoji],
+  ].find(([, v]) => v !== undefined && isDotSegment(v));
+  if (dotted !== undefined) {
+    return `${dotted[0]} "${dotted[1]}" is a relative path segment, not a discord ${dotted[0] === "emoji" ? "emoji" : "id"} — substituted into the API path it would walk the request up to a different endpoint, such as the channel itself`;
+  }
   const base = `channels/${encodeURIComponent(channel)}/messages`;
   if (operation === "post") return { path: base, method: "POST" };
   if (messageId === undefined) return "set messageId — discord identifies a message by its id";
@@ -2191,11 +2211,16 @@ export const deliveryCheck: RegisteredTool = buildTool({
     if (!/^[A-Za-z0-9_.:-]+$/.test(args.messageId)) {
       return "messageId must be a plain identifier (letters, digits, dot, underscore, colon or hyphen) — anything else could rewrite the URL it is substituted into";
     }
-    const parsed = parseUrl(
-      profile.statusEndpoint.split("{id}").join(encodeURIComponent(args.messageId)),
-    );
-    if (typeof parsed === "string")
-      return `provider "${args.provider}" has an unusable statusEndpoint`;
+    if (isDotSegment(args.messageId)) {
+      return `messageId "${args.messageId}" is a relative path segment, not an id — substituted into the status URL it would read a different endpoint (a message list, or the API root), so nothing was sent`;
+    }
+    const substituted = substituteIntoUrl(profile.statusEndpoint, "{id}", args.messageId);
+    if (!substituted.ok) {
+      return substituted.why === "invalid"
+        ? `provider "${args.provider}" has an unusable statusEndpoint`
+        : `messageId "${args.messageId}" would change which endpoint the status URL addresses, not just name the message — nothing was sent`;
+    }
+    const parsed = substituted.url;
 
     const headers: Record<string, string> = {};
     const applied = applyAuth(headers, profile.auth, providerAuthEnvs(profile));

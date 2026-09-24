@@ -87,6 +87,11 @@ twice. In summary:
 - **The vetted IP is pinned** for the connection, so a rebinding resolver
   cannot swap in a private address between the check and the socket. The SMTP
   client pins the same way, and still presents and verifies the hostname.
+- **An id names an item; it never moves the request.** A Discord channel,
+  message id or emoji, and `DeliveryCheck`'s message id, are written into a
+  URL path. `.` and `..` survive percent-encoding and the URL parser resolves
+  them, so they are refused, and the path actually requested must be the path
+  built with the value written in.
 - **A send never follows a redirect.** Replaying a body at a new origin, or
   downgrading to a GET that delivers nothing, are both worse than stopping.
   Only `DeliveryCheck` follows, re-running the whole gate on every hop.

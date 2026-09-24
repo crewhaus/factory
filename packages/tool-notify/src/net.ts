@@ -1417,6 +1417,50 @@ export function parseUrl(raw: string): URL | string {
   }
 }
 
+/**
+ * True for a value made only of dots. `.` and `..` are the two values
+ * `encodeURIComponent` does NOT neutralise: they encode to themselves, and
+ * the URL parser then RESOLVES them, so a message id of `..` substituted
+ * into `/channels/1/messages/{id}` addresses `/channels/1/` — the channel,
+ * not a message. A dot segment is never an id.
+ */
+export function isDotSegment(value: string): boolean {
+  return /^\.+$/.test(value);
+}
+
+/**
+ * `template` with every `placeholder` replaced by `value`, percent-encoded,
+ * as the URL that will be requested — or why not: `invalid` when the
+ * template is not an absolute URL, `reshaped` when the parser would send
+ * the request anywhere but the template's own path with the value written
+ * in.
+ *
+ * The check is made on the URL the parser produced, not on the string it
+ * was built from: the template is also parsed with a sentinel in the
+ * value's place, and the two paths must match once the sentinel is the
+ * value. Whatever normalisation the parser applies (a dot segment today),
+ * a value that changes the shape of the path is refused.
+ */
+export function substituteIntoUrl(
+  template: string,
+  placeholder: string,
+  value: string,
+):
+  | { readonly ok: true; readonly url: URL }
+  | { readonly ok: false; readonly why: "invalid" | "reshaped" } {
+  const encoded = encodeURIComponent(value);
+  const parsed = parseUrl(template.split(placeholder).join(encoded));
+  const shape = parseUrl(template.split(placeholder).join(PATH_SENTINEL));
+  if (typeof parsed === "string" || typeof shape === "string") return { ok: false, why: "invalid" };
+  if (parsed.pathname !== shape.pathname.split(PATH_SENTINEL).join(encoded)) {
+    return { ok: false, why: "reshaped" };
+  }
+  return { ok: true, url: parsed };
+}
+
+/** A path segment no parser rewrites and no real value contains. */
+const PATH_SENTINEL = "crewhaus-substitution-4b1f0c";
+
 /** Read a dotted path out of a parsed JSON body. `undefined` when absent. */
 export function readPath(value: unknown, path: string): unknown {
   let current: unknown = value;
