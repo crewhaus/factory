@@ -213,12 +213,16 @@ function openRoot(
 /** The `metadata.source` histogram of a sample set — provenance at a glance,
  *  with sourceless samples counted rather than dropped. */
 function sourceHistogram(samples: ReadonlyArray<Sample>): Record<string, number> {
-  const out: Record<string, number> = {};
+  // Counted in a Map: the keys are sample metadata, and on a plain object a
+  // source named "__proto__" vanished and "constructor" became a string, so
+  // the histogram stopped summing to the sample count. Object.fromEntries
+  // defines each key as an own property, so "__proto__" survives the JSON.
+  const counts = new Map<string, number>();
   for (const s of samples) {
     const key = sampleSource(s) ?? "(none)";
-    out[key] = (out[key] ?? 0) + 1;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
   }
-  return out;
+  return Object.fromEntries(counts);
 }
 
 type AuditSummary =
