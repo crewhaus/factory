@@ -324,6 +324,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/barge-in-controller": {

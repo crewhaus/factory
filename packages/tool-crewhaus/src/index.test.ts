@@ -696,6 +696,66 @@ describe("AuditVerify", () => {
   test("a missing audit directory is a readable refusal", async () => {
     expect(await call(auditVerify, {})).toContain("does not exist");
   });
+
+  // 0.7.1 (security-5#2, flag-truth-3#6): only the directory was contained,
+  // and every *.jsonl in it was stat'ed and read through links.
+  test("a chain file linked out of the workspace is the break, and is never read", async () => {
+    await seedAudit();
+    const secretDir = outsideDir();
+    const token = ["gh", "p_", "AUDITLEAK".repeat(4)].join("");
+    writeFileSync(path.join(secretDir, "secret.txt"), `${token} rest\n`);
+    symlinkSync(
+      path.join(secretDir, "secret.txt"),
+      path.join(tmp, ".crewhaus", "audit", "0001.jsonl"),
+    );
+    const raw = await call(auditVerify, {});
+    expect(raw).not.toContain(token);
+    expect(raw).not.toContain(secretDir);
+    const result = JSON.parse(raw) as { ok: boolean; break: { file: string; reason: string } };
+    expect(result.ok).toBe(false);
+    expect(result.break.file).toBe("0001.jsonl");
+    expect(result.break.reason).toMatch(/not a regular file/);
+  });
+
+  test("a _chain-tail.json linked out is the break, and its hash is not quoted", async () => {
+    await seedAudit();
+    const secretDir = outsideDir();
+    const anchor = path.join(tmp, ".crewhaus", "audit", "_chain-tail.json");
+    rmSync(anchor);
+    writeFileSync(
+      path.join(secretDir, "tail.json"),
+      JSON.stringify({ day: "d", hash: "LEAKED_HASH_SENTINEL", seq: 0 }),
+    );
+    symlinkSync(path.join(secretDir, "tail.json"), anchor);
+    const raw = await call(auditVerify, {});
+    expect(raw).not.toContain("LEAKED_HASH_SENTINEL");
+    expect(JSON.parse(raw).ok).toBe(false);
+  });
+
+  // In a child process: before the fix a FIFO blocked the walk for ever, even
+  // with maxBytes 1 (it stat's as 0 bytes), and a blocked test hangs the suite.
+  test.skipIf(process.platform === "win32")(
+    "a FIFO chain file is refused promptly, before the walk",
+    async () => {
+      await seedAudit();
+      const fifo = path.join(tmp, ".crewhaus", "audit", "0001.jsonl");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      const script = `
+        process.chdir(${JSON.stringify(tmp)});
+        const { auditVerify } = await import(${JSON.stringify(path.join(import.meta.dir, "index.ts"))});
+        console.log(await auditVerify.execute({ maxBytes: 1_000_000 }));
+      `;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      const text = await new Response(child.stdout).text();
+      clearTimeout(killer);
+      expect(await child.exited).toBe(0);
+      const result = JSON.parse(text) as { ok: boolean; break: { reason: string } };
+      expect(result.ok).toBe(false);
+      expect(result.break.reason).toMatch(/is a fifo, not a regular file/);
+    },
+    20_000,
+  );
 });
 
 // ---------------------------------------------------------------------------

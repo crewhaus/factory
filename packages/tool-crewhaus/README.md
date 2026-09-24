@@ -59,6 +59,11 @@ package's gate never saw — so `PreflightRun` reads that file itself, through
 `resolveSafe` and under the size cap, and hands the text over as `specYaml`.
 A harness directory whose `crewhaus.yaml` is a symlink out of the workspace is
 refused, rather than read and reflected back through the report's findings.
+`AuditVerify` likewise checks every `*.jsonl` and `_chain-tail.json` in the
+audit directory with `lstat` before anything is opened: the log writer never
+creates a symbolic link, FIFO or device, so one there is reported as the break
+(tamper evidence), not followed or counted as zero bytes. `@crewhaus/audit-log`'s
+own `verify` makes the same check, so `crewhaus audit verify` agrees.
 
 Refusals are bounded too: the path a caller supplied is truncated and stripped
 of control characters before it is echoed, and no refusal splices in a node

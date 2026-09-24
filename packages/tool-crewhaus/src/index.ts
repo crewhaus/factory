@@ -38,7 +38,12 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
-import { type VerifyResult, verify as verifyAuditChain } from "@crewhaus/audit-log";
+import {
+  type ChainFiles,
+  type VerifyResult,
+  listChainFiles,
+  verify as verifyAuditChain,
+} from "@crewhaus/audit-log";
 import { type CompileWarning, compile, expandSpecToolCategories } from "@crewhaus/compiler";
 import {
   type PreflightItem,
@@ -875,30 +880,6 @@ export const bundleFreshness: RegisteredTool = buildTool({
   },
 });
 
-/**
- * Total bytes of the `*.jsonl` files directly under an audit directory, or
- * `undefined` when the directory cannot be listed. Not recursive, because
- * `verify` is not: it reads exactly this set.
- */
-function chainBytes(dirReal: string): number | undefined {
-  let total = 0;
-  let names: string[];
-  try {
-    names = readdirSync(dirReal);
-  } catch {
-    return undefined;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".jsonl")) continue;
-    try {
-      total += statSync(path.join(dirReal, name)).size;
-    } catch {
-      // Raced deletion — `verify` will skip it too.
-    }
-  }
-  return total;
-}
-
 export const auditVerify: RegisteredTool = buildTool({
   name: "AuditVerify",
   description:
@@ -924,23 +905,40 @@ export const auditVerify: RegisteredTool = buildTool({
     const dir = resolveDir("AuditVerify", rel);
     if (!dir.ok) return dir.message;
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_AUDIT_BYTES;
-    const size = chainBytes(dir.value.real);
-    if (size === undefined) {
+    // The same list `verify` walks, each entry checked (without opening it)
+    // to be a regular file: a chain file linked out of the directory, or a
+    // FIFO, is tamper evidence and is reported as the break — never read,
+    // never counted as zero bytes (security-5#2, flag-truth-3#6).
+    let chain: ChainFiles;
+    try {
+      chain = listChainFiles(dir.value.real);
+    } catch {
       return `audit log at "${renderPath(rel)}" could not be listed`;
     }
+    const dirShown = dir.value.rel === "" ? "." : dir.value.rel;
+    if (!chain.ok) {
+      return json({
+        ok: false,
+        dir: dirShown,
+        recordsChecked: 0,
+        break: { file: chain.file, line: 0, reason: chain.reason },
+      });
+    }
+    const size = chain.bytes + chain.tailBytes;
     if (size > maxBytes) {
-      return `audit log at "${renderPath(rel)}" is ${size} bytes across its *.jsonl files, over the ${maxBytes} limit — raise maxBytes to walk it anyway`;
+      return `audit log at "${renderPath(rel)}" is ${size} bytes across its *.jsonl files and anchor, over the ${maxBytes} limit — raise maxBytes to walk it anyway`;
     }
     let result: VerifyResult;
     try {
       result = await verifyAuditChain(dir.value.real);
-    } catch (err) {
-      return `audit log at "${renderPath(rel)}" could not be verified: ${(err as Error).message}`;
+    } catch {
+      // Not the error text: a node error carries the absolute path.
+      return `audit log at "${renderPath(rel)}" could not be verified (an entry could not be read)`;
     }
     if (result.ok) {
       return json({
         ok: true,
-        dir: dir.value.rel === "" ? "." : dir.value.rel,
+        dir: dirShown,
         recordsChecked: result.recordsChecked,
         anchorChecked: result.anchorChecked,
         externalAnchorChecked: result.externalAnchorChecked,
@@ -959,7 +957,7 @@ export const auditVerify: RegisteredTool = buildTool({
       : result.file;
     return json({
       ok: false,
-      dir: dir.value.rel === "" ? "." : dir.value.rel,
+      dir: dirShown,
       recordsChecked: result.recordsChecked,
       break: { file: broken, line: result.line, reason: result.reason },
     });
