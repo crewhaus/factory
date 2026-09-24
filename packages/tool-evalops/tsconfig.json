@@ -30,6 +30,9 @@
       "path": "../tool-math"
     },
     {
+      "path": "../tool-safety"
+    },
+    {
       "path": "../tool-executor"
     }
   ],

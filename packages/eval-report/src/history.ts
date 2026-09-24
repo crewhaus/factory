@@ -10,14 +10,31 @@
  * - `baselines.json` — map of `<specName>::<datasetName>` → the pinned
  *   baseline run for that key. Written atomically as a whole (small file).
  *
+ * Both are WRITTEN only as regular files at their own names. A symbolic link,
+ * FIFO or device where `baselines.json` or `index.jsonl` belongs is refused
+ * with a {@link HistoryWriteError}, never written through: a cloned repository
+ * can carry a committed link, and following it turned a routine re-pin into a
+ * write anywhere the user can write (0.7.1). The readers are unchanged; the
+ * text-level parsers ({@link parseRunIndex}, {@link parseBaselines},
+ * {@link lookupBaseline}) exist so a caller that contains the leaf itself —
+ * the agent-facing `tool-evalops` — can parse the bytes it read instead of
+ * handing this module a path to open a second time.
+ *
  * These helpers are deliberately dependency-free (node:fs + node:crypto)
  * so other features — auto-baseline diff in the CLI, the future dataset
  * drift sentinel — can reuse them without pulling in the renderer.
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
+import {
+  type SafeFsFailure,
+  appendContained,
+  openForReadSync,
+  probeKind,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 import { ReportError } from "./errors";
 
 /** Default location of the run index + baselines, relative to the cwd. */
@@ -298,7 +315,15 @@ export function resolveBaseline(
   lineage: BaselineLineage,
   evalsDir: string = DEFAULT_EVALS_DIR,
 ): BaselineLookup {
-  const baselines = readBaselines(evalsDir);
+  return lookupBaseline(readBaselines(evalsDir), lineage);
+}
+
+/**
+ * {@link resolveBaseline} over a baselines map the caller already holds — for
+ * a caller that read and contained `baselines.json` itself, so the file is not
+ * opened a second time by a path this module joins.
+ */
+export function lookupBaseline(baselines: BaselinesFile, lineage: BaselineLineage): BaselineLookup {
   const key = baselineKeyFor(lineage);
   const entry = baselines[key];
   if (entry !== undefined) return { key, entry, legacyPresent: false };
@@ -328,10 +353,60 @@ export function hashDatasetFile(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/** Append one run to `index.jsonl`, creating the directory/file on first use. */
+/**
+ * A history file this module refused to write: something other than a
+ * regular file sits at its name (a symbolic link, dangling or not, a FIFO, a
+ * device, a directory), or the write itself failed. Nothing was written.
+ *
+ * `file` is the bare file name and `reason` names only that name, never the
+ * directory it was joined onto or where a link leads: the message reaches
+ * terminals, Hangar and agent transcripts.
+ */
+export class HistoryWriteError extends ReportError {
+  readonly file: string;
+  /** Why, as `@crewhaus/tool-safety/fs` classifies it (`is-symlink`, …). */
+  readonly refusal: SafeFsFailure["code"];
+  readonly reason: string;
+  constructor(file: string, failure: Pick<SafeFsFailure, "code" | "reason">) {
+    super(`refusing to write ${file}: ${failure.reason}`);
+    this.file = file;
+    this.refusal = failure.code;
+    this.reason = failure.reason;
+  }
+}
+
+/**
+ * Refuse anything at `name` in `evalsDir` that is not a regular file, before
+ * it is read for a read-modify-write. The write below refuses the same things
+ * again, atomically; this check exists so a link's TARGET is never read
+ * (and quoted in a parse error) on the way to a refusal.
+ */
+function requireRegularOrAbsent(evalsDir: string, name: string): void {
+  const probe = probeKind(join(evalsDir, name), { given: name });
+  if (!probe.ok) {
+    if (probe.code === "not-found") return;
+    throw new HistoryWriteError(name, probe);
+  }
+  if (probe.kind === "file") return;
+  throw new HistoryWriteError(name, {
+    code: probe.kind === "symlink" ? "is-symlink" : "not-regular-file",
+    reason:
+      probe.kind === "symlink"
+        ? `"${name}" is a symbolic link; history files are written only as regular files, never through a link`
+        : `"${name}" is a ${probe.kind}, not a regular file`,
+  });
+}
+
+/**
+ * Append one run to `index.jsonl`, creating the directory/file on first use.
+ *
+ * The line is appended in place with `O_NOFOLLOW`; a link or special file at
+ * `index.jsonl` is refused with a {@link HistoryWriteError}.
+ */
 export function appendRunIndex(entry: RunIndexEntry, evalsDir: string = DEFAULT_EVALS_DIR): void {
   mkdirSync(evalsDir, { recursive: true });
-  appendFileSync(join(evalsDir, INDEX_FILENAME), `${JSON.stringify(entry)}\n`);
+  const appended = appendContained(evalsDir, INDEX_FILENAME, `${JSON.stringify(entry)}\n`);
+  if (!appended.ok) throw new HistoryWriteError(INDEX_FILENAME, appended);
 }
 
 /** Identity a run summary cannot supply on its own — see {@link recordEvalRun}. */
@@ -492,8 +567,17 @@ export function recordEvalRun(summary: EvalRunSummary, opts: RecordEvalRunOption
 export function readRunIndex(evalsDir: string = DEFAULT_EVALS_DIR): RunIndexEntry[] {
   const path = join(evalsDir, INDEX_FILENAME);
   if (!existsSync(path)) return [];
+  return parseRunIndex(readFileSync(path, "utf-8"));
+}
+
+/**
+ * The rows of an `index.jsonl` TEXT, with {@link readRunIndex}'s rules: torn
+ * lines and lines that parse as something other than a JSON object are
+ * skipped. For a caller that read the file itself.
+ */
+export function parseRunIndex(text: string): RunIndexEntry[] {
   const entries: RunIndexEntry[] = [];
-  for (const line of readFileSync(path, "utf-8").split("\n")) {
+  for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (trimmed === "") continue;
     let parsed: unknown;
@@ -530,7 +614,15 @@ export function readRunIndex(evalsDir: string = DEFAULT_EVALS_DIR): RunIndexEntr
  * histories read exactly as before.
  */
 export function readRunIndexLatest(evalsDir: string = DEFAULT_EVALS_DIR): RunIndexEntry[] {
-  const entries = readRunIndex(evalsDir);
+  return latestRunIndexEntries(readRunIndex(evalsDir));
+}
+
+/**
+ * {@link readRunIndexLatest}'s supersede collapse over rows the caller already
+ * holds (from {@link parseRunIndex}): one entry per `runId`, the newest by
+ * `ts`, later appends winning ties, in the log's order.
+ */
+export function latestRunIndexEntries(entries: RunIndexEntry[]): RunIndexEntry[] {
   const tsOf = (e: RunIndexEntry): number => {
     const t = Date.parse(e.ts);
     return Number.isNaN(t) ? Number.NEGATIVE_INFINITY : t;
@@ -558,6 +650,78 @@ export function readBaselines(evalsDir: string = DEFAULT_EVALS_DIR): BaselinesFi
   }
 }
 
+/**
+ * The baselines map in a `baselines.json` TEXT, or `undefined` when the text
+ * is not a JSON object. Nothing about the text is quoted back: a caller that
+ * wants to say why can say "not valid JSON" without echoing the file.
+ */
+export function parseBaselines(text: string): BaselinesFile | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as BaselinesFile)
+    : undefined;
+}
+
+/** Most bytes a read-modify-write of `baselines.json` loads. */
+const BASELINES_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The current map, for a read-modify-write: `{}` when there is no file, a
+ * {@link HistoryWriteError} for a link or special file at the name, a
+ * ReportError for a file that is not a JSON object (writing over it would
+ * destroy pins this call never named).
+ */
+function baselinesForUpdate(evalsDir: string): BaselinesFile {
+  requireRegularOrAbsent(evalsDir, BASELINES_FILENAME);
+  const read = openForReadSync(evalsDir, BASELINES_FILENAME, {
+    maxBytes: BASELINES_MAX_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok) {
+    if (read.code === "not-found") return {};
+    throw new HistoryWriteError(BASELINES_FILENAME, read);
+  }
+  if (read.truncated) {
+    throw new HistoryWriteError(BASELINES_FILENAME, {
+      code: "too-large",
+      reason: `"${BASELINES_FILENAME}" is over ${BASELINES_MAX_BYTES} bytes`,
+    });
+  }
+  const parsed = parseBaselines(read.text);
+  if (parsed === undefined) {
+    throw new ReportError(
+      `${BASELINES_FILENAME} is not a JSON object map of pins — refusing to write over it`,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Replace `baselines.json` with `baselines`, in the format every writer uses
+ * (two-space JSON, trailing newline), through an exclusively created temp in
+ * the same directory renamed into place. A link or special file at the name
+ * is refused, and the replaced file keeps its permission bits.
+ */
+export function writeBaselines(
+  baselines: BaselinesFile,
+  evalsDir: string = DEFAULT_EVALS_DIR,
+): void {
+  mkdirSync(evalsDir, { recursive: true });
+  requireRegularOrAbsent(evalsDir, BASELINES_FILENAME);
+  const written = writeFileSafe(
+    evalsDir,
+    BASELINES_FILENAME,
+    `${JSON.stringify(baselines, null, 2)}\n`,
+    { overwrite: true },
+  );
+  if (!written.ok) throw new HistoryWriteError(BASELINES_FILENAME, written);
+}
+
 /** The pinned baseline for a (spec, dataset) key, or undefined if none.
  *  The LEGACY lineage only — routed runs resolve through {@link resolveBaseline}. */
 export function getBaseline(
@@ -575,7 +739,20 @@ export function getBaseline(
  */
 export function setBaseline(entry: BaselineEntry, evalsDir: string = DEFAULT_EVALS_DIR): void {
   mkdirSync(evalsDir, { recursive: true });
-  const baselines = readBaselines(evalsDir);
+  const baselines = baselinesForUpdate(evalsDir);
   baselines[baselineKeyFor(lineageOfEntry(entry))] = entry;
-  writeFileSync(join(evalsDir, BASELINES_FILENAME), `${JSON.stringify(baselines, null, 2)}\n`);
+  writeBaselines(baselines, evalsDir);
+}
+
+/**
+ * Remove the pin stored under `key`. Returns false, writing nothing, when no
+ * pin is stored there. The same refusals as {@link setBaseline}.
+ */
+export function clearBaseline(key: string, evalsDir: string = DEFAULT_EVALS_DIR): boolean {
+  if (!existsSync(evalsDir)) return false;
+  const baselines = baselinesForUpdate(evalsDir);
+  if (!Object.hasOwn(baselines, key)) return false;
+  delete baselines[key];
+  writeBaselines(baselines, evalsDir);
+  return true;
 }

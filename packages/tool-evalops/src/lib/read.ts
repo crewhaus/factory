@@ -16,9 +16,10 @@
  * prevent. This module contains the path, bounds the bytes, counts the lines
  * the shared reader silently skipped, and hands the real reader a directory.
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
-import { type SafePath, ToolPermissionError, resolveSafe, toPosix } from "../paths";
+import { type SafeFsFailure, openForReadSync } from "@crewhaus/tool-safety/fs";
+import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot } from "../paths";
 
 /**
  * Why a read failed. Kept as a FIELD rather than sniffed out of the message,
@@ -98,43 +99,71 @@ export function containedDir(toolName: string, rel: string): Loaded<SafePath> {
   return safe;
 }
 
-export type ReadFile = { readonly safe: SafePath; readonly text: string; readonly bytes: number };
+export type ReadFile = { readonly text: string; readonly bytes: number };
 
 /**
  * Read a contained file as UTF-8, refusing anything over `maxBytes`.
  *
- * The cap is applied to the SIZE ON DISK, before a byte is read, so the
- * refusal costs no memory. A cap applied after the read would not be a cap.
+ * The cap bounds the read itself: at most `maxBytes` plus one byte is ever
+ * loaded, so an oversized file costs that and is refused.
  */
 export function readContained(toolName: string, rel: string, maxBytes: number): Loaded<ReadFile> {
   const safe = contain(toolName, rel);
   if (!safe.ok) return safe;
-  return readResolved(safe.value, rel, maxBytes);
+  return readLeaf(safe.value.rel, rel, maxBytes);
 }
 
-/** The half of {@link readContained} that runs once a path is already safe. */
-export function readResolved(safe: SafePath, shownAs: string, maxBytes: number): Loaded<ReadFile> {
+/**
+ * Read `rel` (workspace-relative) with the LEAF contained, not just the
+ * directory it was joined onto (security-7#0, security-7#12).
+ *
+ * A file a tool derives — `index.jsonl` and `baselines.json` under a contained
+ * evals directory, `results.json` under a contained run directory — used to be
+ * read by joining its name onto the directory's real path, which follows a
+ * link planted at that name out of the workspace: its size and line count
+ * were reported and the first token of a parse error was quoted. Here the
+ * whole path is resolved physically and must land inside the workspace, and
+ * the open refuses a FIFO or device before opening it (a FIFO would block the
+ * call) and re-checks the open descriptor. An in-workspace link is followed.
+ *
+ * `shownAs` is the caller's spelling for messages; nothing in a message says
+ * where an escaping path leads.
+ */
+export function readLeaf(rel: string, shownAs: string, maxBytes: number): Loaded<ReadFile> {
   const shown = renderPath(shownAs);
-  let bytes: number;
-  try {
-    const stat = statSync(safe.real);
-    if (!stat.isFile()) return fail("not-a-file", `"${shown}" is not a file`);
-    bytes = stat.size;
-  } catch {
-    return fail("missing", `"${shown}" does not exist or is unreadable`);
-  }
-  if (bytes > maxBytes) {
+  const read = openForReadSync(workspaceRoot(), rel, { maxBytes });
+  if (!read.ok) return leafFailure(read, shown);
+  if (read.truncated) {
     return fail(
       "too-large",
-      `"${shown}" is ${bytes} bytes, over this tool's ${maxBytes}-byte limit — raise maxBytes or narrow the query`,
+      `"${shown}" is ${read.size} bytes, over this tool's ${maxBytes}-byte limit — raise maxBytes or narrow the query`,
     );
   }
-  try {
-    return { ok: true, value: { safe, text: readFileSync(safe.real, "utf8"), bytes } };
-  } catch {
-    // The node error text carries the ABSOLUTE path, which is workspace layout
-    // the caller did not supply and does not need.
-    return fail("unreadable", `"${shown}" could not be read`);
+  return { ok: true, value: { text: read.text, bytes: read.bytes.length } };
+}
+
+/** A refusal from the contained reader, in this package's codes and words. */
+export function leafFailure<T>(failure: SafeFsFailure, shown: string): Loaded<T> {
+  switch (failure.code) {
+    case "escapes-root":
+      return fail(
+        "refused",
+        `"${shown}" resolves outside the workspace root (a symbolic link on its path leads out) — refused, and not read`,
+      );
+    case "is-symlink":
+      return fail("refused", `"${shown}" is a symbolic link, which is not followed here`);
+    case "not-regular-file":
+      return fail(
+        "not-a-file",
+        `"${shown}" is not a file${failure.kind !== undefined ? ` (it is a ${failure.kind})` : ""} — refused without opening it`,
+      );
+    case "not-found":
+    case "not-directory":
+      return fail("missing", `"${shown}" does not exist or is unreadable`);
+    default:
+      // The node error text carries the ABSOLUTE path, which is workspace
+      // layout the caller did not supply and does not need.
+      return fail("unreadable", `"${shown}" could not be read`);
   }
 }
 

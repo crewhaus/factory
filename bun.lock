@@ -868,6 +868,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/eval-runner": {
@@ -2634,6 +2635,7 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
