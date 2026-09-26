@@ -26,7 +26,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { MAX_OUTPUT_CHARS, failure, runGit } from "./git-run";
+import { MAX_OUTPUT_CHARS, failure, runGit, skippedPatchPaths, unquoteGitPath } from "./git-run";
 import {
   GIT_TOOLS,
   gitAdd,
@@ -1252,6 +1252,134 @@ describe("GitApplyPatch", () => {
     // The refusal is only worth anything if the file really is not there.
     expect(existsSync(join(workspace, "escape.txt"))).toBe(false);
     expect(existsSync(join(repo, "escape.txt"))).toBe(false);
+  });
+
+  test("git's quoted path names are read back to the file they name", () => {
+    expect(unquoteGitPath("plain.txt")).toBe("plain.txt");
+    expect(unquoteGitPath('"tab\\tname.txt"')).toBe("tab\tname.txt");
+    expect(unquoteGitPath('"say \\"hi\\".txt"')).toBe('say "hi".txt');
+    expect(unquoteGitPath('"back\\\\slash"')).toBe("back\\slash");
+    // An octal escape is a UTF-8 byte, whatever core.quotepath says.
+    expect(unquoteGitPath('"caf\\303\\251.txt"')).toBe("café.txt");
+    // Something git would never write is left as written, not guessed at.
+    expect(unquoteGitPath('"odd\\q"')).toBe('"odd\\q"');
+    expect(
+      skippedPatchPaths("Skipped patch 'a.txt'.\nChecking patch b...\nSkipped patch 'it'.'.\n"),
+    ).toEqual(["a.txt", "it'."]);
+  });
+
+  describe("a patch path outside cwd (C219)", () => {
+    // git applies only what lies under the directory it runs in, skips the
+    // rest in silence and exits 0. 0.7.0 read exit 0 as "applied".
+    const change = (file: string, from: string, to: string): string =>
+      [
+        `diff --git a/${file} b/${file}`,
+        `--- a/${file}`,
+        `+++ b/${file}`,
+        "@@ -1 +1 @@",
+        `-${from}`,
+        `+${to}`,
+        "",
+      ].join("\n");
+    const outside = change("outside.txt", "one", "two");
+    const inside = change("pkg/inside.txt", "alpha", "beta");
+    const read = (rel: string): string => readFileSync(join(repo, rel), "utf8");
+
+    beforeEach(() => {
+      mkdirSync(join(repo, "pkg"));
+      writeFileSync(join(repo, "pkg/inside.txt"), "alpha\n");
+      writeFileSync(join(repo, "outside.txt"), "one\n");
+      commitAll(repo, "pkg and outside", D3);
+    });
+
+    test("check: a skipped path is not 'would apply'", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: outside, check: true });
+      expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
+      expect(out.skipped).toEqual(["outside.txt"]);
+      expect(out.reason).toContain('outside "pkg"');
+    });
+
+    test("apply: a skipped path is not 'applied', and nothing changes", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: outside });
+      expect(out).toMatchObject({ applied: false, wouldApply: false, skipped: ["outside.txt"] });
+      expect(out.reason).toContain("Nothing was applied");
+      expect(read("outside.txt")).toBe("one\n");
+    });
+
+    test("a patch half in scope is refused whole, never half-applied", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: `${outside}${inside}` });
+      expect(out).toMatchObject({ applied: false, skipped: ["outside.txt"] });
+      expect(read("outside.txt")).toBe("one\n");
+      expect(read("pkg/inside.txt")).toBe("alpha\n");
+    });
+
+    test("a git-header patch written relative to cwd is refused, not a silent no-op", async () => {
+      // `diff --git` paths are relative to the repository root, so from
+      // cwd "pkg" this names repo/inside.txt — which git skips.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo/pkg",
+        patch: change("inside.txt", "alpha", "beta"),
+      });
+      expect(out).toMatchObject({ applied: false, skipped: ["inside.txt"] });
+      expect(read("pkg/inside.txt")).toBe("alpha\n");
+    });
+
+    test("a quoted path is reported as the file it names", async () => {
+      writeFileSync(join(repo, "tab\tname.txt"), "one\n");
+      commitAll(repo, "an awkward name", D3);
+      const patch = [
+        'diff --git "a/tab\\tname.txt" "b/tab\\tname.txt"',
+        '--- "a/tab\\tname.txt"',
+        '+++ "b/tab\\tname.txt"',
+        "@@ -1 +1 @@",
+        "-one",
+        "+two",
+        "",
+      ].join("\n");
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch, check: true });
+      expect(out.skipped).toEqual(["tab\tname.txt"]);
+    });
+
+    test("from the repository root the same patch applies whole", async () => {
+      const checked = await call(gitApplyPatch, { patch: `${outside}${inside}`, check: true });
+      expect(checked).toMatchObject({ checkedOnly: true, wouldApply: true });
+      expect(checked.skipped).toBeUndefined();
+      const out = await call(gitApplyPatch, { patch: `${outside}${inside}` });
+      expect(out).toMatchObject({ applied: true, wouldApply: true });
+      expect(read("outside.txt")).toBe("two\n");
+      expect(read("pkg/inside.txt")).toBe("beta\n");
+    });
+
+    test("a header-less patch from a subdirectory still applies there", async () => {
+      // Without `diff --git`, git reads the paths relative to cwd.
+      const plain = ["--- a/inside.txt", "+++ b/inside.txt", "@@ -1 +1 @@", "-alpha", "+beta", ""];
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: plain.join("\n") });
+      expect(out).toMatchObject({ applied: true });
+      expect(read("pkg/inside.txt")).toBe("beta\n");
+    });
+
+    test("a failure still leads with git's own error, not -v's progress lines", async () => {
+      const out = await call(gitApplyPatch, { patch: change("pkg/inside.txt", "WRONG", "beta") });
+      expect(out.applied).toBe(false);
+      expect(out.reason).toMatch(/^GitApplyPatch failed \(git exit 1\): error: /);
+      expect(out.reason).not.toContain("Checking patch");
+    });
+  });
+
+  test("check with threeWay says a conflicting merge would not apply cleanly", async () => {
+    // `git apply --check --3way` exits 0 here while the real apply leaves
+    // conflict markers and exits 1; the check has to agree with the apply.
+    writeFileSync(join(repo, "README.md"), "hello\nworld\npatched\n");
+    const diff = await call(gitDiff, { mode: "patch" });
+    git(["checkout", "--", "README.md"], repo);
+    writeFileSync(join(repo, "README.md"), "hello\nworld\nsomething else\n");
+    commitAll(repo, "diverge", D3);
+    const out = await call(gitApplyPatch, { patch: diff.patch, check: true, threeWay: true });
+    expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
+    expect(out.conflicts).toEqual(["README.md"]);
+    expect(readFileSync(join(repo, "README.md"), "utf8")).toBe("hello\nworld\nsomething else\n");
+    const real = await call(gitApplyPatch, { patch: diff.patch, threeWay: true });
+    expect(real.applied).toBe(false);
   });
 
   test("a conflicted file past the size cap is reported, not read into memory", async () => {

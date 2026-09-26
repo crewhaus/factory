@@ -3001,7 +3001,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "gitApplyPatch",
     name: "GitApplyPatch",
     description:
-      "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything.",
+      "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything. A patch naming any path outside `cwd` is refused whole, since git would skip that path without a word.",
     readOnly: false,
     destructive: true,
     scope: "external",

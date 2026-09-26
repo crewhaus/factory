@@ -772,6 +772,109 @@ export function failure(toolName: string, run: GitRun): string {
   );
 }
 
+// ---------------------------------------------------------------------------
+// what `git apply -v` says it did
+
+const C_ESCAPES: Readonly<Record<string, number>> = {
+  a: 7,
+  b: 8,
+  t: 9,
+  n: 10,
+  v: 11,
+  f: 12,
+  r: 13,
+  '"': 34,
+  "\\": 92,
+};
+
+/**
+ * A path as git prints it: bare, or C-quoted (`"tab\tname"`) when it holds a
+ * control character, a quote or a backslash. `core.quotepath=false` keeps
+ * other non-ASCII bytes unescaped; an octal escape is still decoded, as the
+ * UTF-8 bytes git wrote.
+ */
+export function unquoteGitPath(text: string): string {
+  if (text.length < 2 || !text.startsWith('"') || !text.endsWith('"')) return text;
+  const bytes: number[] = [];
+  const body = text.slice(1, -1);
+  for (let i = 0; i < body.length; i++) {
+    const ch = String.fromCodePoint(body.codePointAt(i) as number);
+    if (ch !== "\\") {
+      for (const byte of Buffer.from(ch, "utf8")) bytes.push(byte);
+      i += ch.length - 1;
+      continue;
+    }
+    const next = body[i + 1] ?? "";
+    const octal = /^[0-7]{3}/.exec(body.slice(i + 1, i + 4));
+    if (octal !== null) {
+      bytes.push(Number.parseInt(octal[0], 8) & 0xff);
+      i += 3;
+    } else if (C_ESCAPES[next] !== undefined) {
+      bytes.push(C_ESCAPES[next] as number);
+      i += 1;
+    } else {
+      // Not a quoting git does; keep it as written rather than guess.
+      return text;
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/** The name inside `<prefix>'NAME'<suffix>` on one line of `git apply` output. */
+function applyLineName(line: string, prefix: string, suffix: string): string | undefined {
+  if (!line.startsWith(prefix) || !line.endsWith(suffix)) return undefined;
+  if (line.length < prefix.length + suffix.length) return undefined;
+  return unquoteGitPath(line.slice(prefix.length, line.length - suffix.length));
+}
+
+/**
+ * The patch paths `git apply -v` skipped — every path outside the directory
+ * git runs in. Without `-v` git skips them in silence and exits 0, so a
+ * patch applied from a subdirectory can change nothing, or half of what it
+ * says, and still look applied (C219). Matched on git's English text, which
+ * `runGit` pins with LC_ALL=C; paths are relative to the repository root.
+ */
+export function skippedPatchPaths(stderr: string): string[] {
+  const out: string[] = [];
+  for (const line of stderr.split("\n")) {
+    const name = applyLineName(line.replace(/\r$/, ""), "Skipped patch '", "'.");
+    if (name !== undefined) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * The paths a `git apply --3way` merged WITH CONFLICTS. `--check --3way`
+ * prints this and still exits 0, while the real apply leaves conflict
+ * markers and exits 1 — so a check that ignored it said "would apply" to a
+ * patch the real call reports as failed.
+ */
+export function conflictedPatchPaths(stderr: string): string[] {
+  const out: string[] = [];
+  for (const line of stderr.split("\n")) {
+    const name = applyLineName(line.replace(/\r$/, ""), "Applied patch to '", "' with conflicts.");
+    if (name !== undefined) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * The run with the progress lines `-v` adds taken out of stderr, so a
+ * failure still reads as git's own error first. What git prints without
+ * `-v` — a three-way merge's "with conflicts" line and its `U path` list —
+ * stays.
+ */
+export function withoutApplyProgress(run: GitRun): GitRun {
+  const kept = run.stderr.split("\n").filter((raw) => {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("Checking patch ") && line.endsWith("...")) return false;
+    if (line.startsWith("Skipped patch '") && line.endsWith("'.")) return false;
+    if (line.startsWith("Applied patch ") && line.endsWith(" cleanly.")) return false;
+    return true;
+  });
+  return { ...run, stderr: kept.join("\n") };
+}
+
 /** Append a truncation note when a run's stdout hit the cap. */
 export function truncationNote(run: GitRun): string | undefined {
   return run.truncated

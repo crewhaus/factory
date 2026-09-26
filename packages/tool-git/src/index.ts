@@ -32,12 +32,15 @@ import {
   MAX_TIMEOUT_MS,
   checkPathspecs,
   checkRefArgs,
+  conflictedPatchPaths,
   failure,
   json,
   neutralisedNote,
   openRepo,
   resolveInsideRoot,
+  skippedPatchPaths,
   truncationNote,
+  withoutApplyProgress,
 } from "./git-run";
 import {
   COMMIT_FORMAT,
@@ -57,6 +60,7 @@ import {
   parseWorktrees,
   splitNul,
 } from "./lib/parse";
+import { realOrUndefined } from "./repo-bounds";
 
 // ---------------------------------------------------------------------------
 // shared schema fragments and flag sets
@@ -1092,7 +1096,7 @@ export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything.",
+    "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything. A patch naming any path outside `cwd` is refused whole, since git would skip that path without a word.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
@@ -1115,27 +1119,74 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     // model or a JSON field very often has had it stripped, and git answers
     // that with "corrupt patch at line N" rather than anything actionable.
     const patchText = input.patch.endsWith("\n") ? input.patch : `${input.patch}\n`;
-    const run = await repo.run(
-      [
-        "apply",
-        ...(input.check === true ? ["--check"] : []),
-        ...(input.index === true ? ["--index"] : []),
-        ...(input.threeWay === true ? ["--3way"] : []),
-        ...(input.strip !== undefined ? [`-p${input.strip}`] : []),
-        "-",
-      ],
-      { stdin: patchText },
-    );
+    const checkedOnly = input.check === true;
+    const strip = input.strip !== undefined ? [`-p${input.strip}`] : [];
+    // git applies only the paths under the directory it runs in and skips
+    // the rest in silence, exit 0 (C219). Which paths it skips depends on
+    // nothing but the path and `-p`, so a plain `--check -v` names them
+    // before anything is written — and a patch with any is refused whole,
+    // never half-applied. Running from the repository root with
+    // `--directory` instead would move the patch, not report it.
+    const preflight = await repo.run(["apply", "--check", "-v", ...strip, "-"], {
+      stdin: patchText,
+    });
+    const refuseSkipped = (skipped: readonly string[]): string => {
+      const here = nodePath.relative(repo.root, realOrUndefined(repo.cwd) ?? repo.cwd) || ".";
+      return json({
+        applied: false,
+        checkedOnly,
+        wouldApply: false,
+        skipped,
+        reason: `GitApplyPatch: ${skipped.length} path(s) in the patch lie outside "${here}", the directory git runs in, and git would skip them without a word. Nothing was applied. Paths in a patch with \`diff --git\` headers are relative to the repository root: run it with cwd at the repository root (or at a directory holding every path), or drop those files from the patch.`,
+      });
+    };
+    const skippedFirst = skippedPatchPaths(preflight.stderr);
+    if (skippedFirst.length > 0) return refuseSkipped(skippedFirst);
+
+    const args = [
+      "apply",
+      ...(checkedOnly ? ["--check"] : []),
+      ...(input.index === true ? ["--index"] : []),
+      ...(input.threeWay === true ? ["--3way"] : []),
+      ...strip,
+      "-v",
+      "-",
+    ];
+    const run = await repo.run(args, { stdin: patchText });
     if (run.code !== 0) {
       return json({
         applied: false,
-        checkedOnly: input.check === true,
-        reason: failure("GitApplyPatch", run),
+        checkedOnly,
+        reason: failure("GitApplyPatch", withoutApplyProgress(run)),
+      });
+    }
+    const skipped = skippedPatchPaths(run.stderr);
+    if (skipped.length > 0) {
+      // Only if the tree moved between the two runs; say exactly what landed.
+      if (checkedOnly) return refuseSkipped(skipped);
+      return json({
+        applied: true,
+        partial: true,
+        checkedOnly,
+        skipped,
+        reason: `GitApplyPatch: git skipped ${skipped.length} path(s) that lie outside the directory it ran in; the rest of the patch was applied.`,
+      });
+    }
+    const conflicted = checkedOnly ? conflictedPatchPaths(run.stderr) : [];
+    if (conflicted.length > 0) {
+      // `--check --3way` exits 0 here; the real apply would leave conflict
+      // markers and fail, so "would apply" is not the answer.
+      return json({
+        applied: false,
+        checkedOnly,
+        wouldApply: false,
+        conflicts: conflicted,
+        reason: `GitApplyPatch: the patch applies only as a three-way merge WITH CONFLICTS in ${conflicted.length} file(s); a real apply would leave conflict markers there.`,
       });
     }
     return json({
-      applied: input.check !== true,
-      checkedOnly: input.check === true,
+      applied: !checkedOnly,
+      checkedOnly,
       wouldApply: true,
     });
   },
