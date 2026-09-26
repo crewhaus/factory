@@ -247,6 +247,35 @@ describe("keys named like prototype members round-trip as data", () => {
   });
 });
 
+describe("an entity named like a prototype member is unknown, not decoded", () => {
+  test("XmlParse refuses &constructor;, &__proto__;, &valueOf; and &toString;", async () => {
+    // tool-data's entity table was a plain object: `&constructor;` decoded to
+    // "function Object() { [native code] }" and `&__proto__;` to "[object Object]".
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["constructor", { text: "<r>&constructor;</r>" }],
+      ["__proto__", { text: "<r>&__proto__;</r>" }],
+      ["valueOf", { text: '<r a="&valueOf;"/>' }],
+      ["toString", { text: "<p>&toString;</p>", mode: "html" }],
+      ["valueOf", { text: "<r>&valueOf;</r>", shape: "tree" }],
+    ];
+    let refused = 0;
+    for (const [name, input] of cases) {
+      const out = await call(xmlParse, input);
+      expect({ name, out }).toEqual({
+        name,
+        out: expect.stringContaining(`unknown entity &${name};`),
+      });
+      refused += 1;
+    }
+    expect(refused).toBe(5);
+    // The five predefined ones still decode.
+    expect(await call(xmlParse, { text: "<r>&amp;&lt;&gt;&quot;&apos;</r>" })).toBe(
+      JSON.stringify({ r: "&<>\"'" }),
+    );
+    expectPrototypeUntouched();
+  });
+});
+
 describe("inherited members are misses, not matches", () => {
   test("a JsonQuery filter on @.constructor matches only records that have one", async () => {
     const out = JSON.parse(

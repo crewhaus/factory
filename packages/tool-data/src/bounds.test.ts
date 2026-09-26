@@ -39,6 +39,7 @@ import {
 } from "./lib/json";
 import { type PathStep, parsePath, queryPath, renderPath, sliceIndices } from "./lib/jsonpath";
 import { applyMergePatch } from "./lib/patch";
+import { TomlTooDeepError, parseToml } from "./lib/toml";
 import { canWritePlain, stringifyYaml } from "./lib/yaml";
 
 // biome-ignore lint/suspicious/noExplicitAny: the tools take their own parsed input.
@@ -592,4 +593,66 @@ describe("the measurers agree with what they measure", () => {
     }
     expect(compared).toBe(10_000);
   }, 20_000);
+});
+
+describe("a TOML key costs its own length", () => {
+  const key = (parts: number): string => Array.from({ length: parts }, () => "a").join(".");
+
+  test("a key path longer than the cap is refused as it is read, for every place a key goes", async () => {
+    // 0.7.1's first cut named every prefix of a dotted key as a string before
+    // the depth check ran: 80 KB of `a.a.a…` took 5.9 s and 3.6 GB.
+    for (const doc of [
+      `${key(40_000)} = 1\n`,
+      `[${key(40_000)}]\nx = 1\n`,
+      `t = { ${key(40_000)} = 1 }\n`,
+    ]) {
+      expect(() => parseToml(doc)).toThrow(TomlTooDeepError);
+      expect(await text(dataConvert, { text: doc, from: "toml", to: "json" })).toMatch(
+        /^toml nests deeper than 256 levels/,
+      );
+    }
+  });
+
+  test("a dotted key builds no name per prefix", () => {
+    // Every prefix of every dotted key was joined into a name to remember:
+    // parts x keys joins. The tables are remembered as objects now.
+    const doc = Array.from({ length: 50 }, (_, i) => `${key(200)}.k${i} = ${i}`).join("\n");
+    const original = Array.prototype.join;
+    let joins = 0;
+    Array.prototype.join = function (this: unknown[], separator?: string) {
+      joins += 1;
+      return original.call(this, separator);
+    };
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = parseToml(doc);
+    } finally {
+      Array.prototype.join = original;
+    }
+    // 0.7.1's first cut: 50 x 200 = 10,000 joins.
+    expect(joins).toBeLessThanOrEqual(5);
+    let node: unknown = parsed;
+    for (let i = 0; i < 200; i++) node = (node as Record<string, unknown>)["a"];
+    expect(Object.keys(node as object)).toHaveLength(50);
+  });
+
+  test("the table rules hold, and each array element's sub-table is its own", () => {
+    // Still refused: redefining a table either way.
+    expect(() => parseToml("a.b = 1\n[a]\nc = 2\n")).toThrow(/dotted key/);
+    expect(() => parseToml("[a.b]\nx = 1\n[a]\nb.c = 2\n")).toThrow(
+      /already a table defined by \[a\.b\]/,
+    );
+    expect(() => parseToml("[a]\nx = 1\n[a]\n")).toThrow(/defined twice/);
+    expect(() => parseToml("a.b.c = 1\n[a.b]\n")).toThrow(/dotted key/);
+    // Now accepted, as the spec allows: a sub-table under each element of an
+    // array of tables (0.7.0 called the second one "defined twice"), and a
+    // quoted key containing a dot beside the dotted path it spells.
+    expect(parseToml("[[x]]\n[x.y]\na = 1\n[[x]]\n[x.y]\na = 2\n")).toEqual({
+      x: [{ y: { a: 1 } }, { y: { a: 2 } }],
+    });
+    expect(parseToml('["a.b"]\nv = 1\n[a.b]\nv = 2\n')).toEqual({
+      "a.b": { v: 1 },
+      a: { b: { v: 2 } },
+    });
+  });
 });

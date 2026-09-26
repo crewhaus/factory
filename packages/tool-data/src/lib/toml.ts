@@ -40,7 +40,7 @@
  * than pretending the output is complete.
  */
 
-import { OutputLimitError, getOwn, isPlainObject, setOwn } from "./json";
+import { MAX_NESTING_DEPTH, OutputLimitError, getOwn, isPlainObject, setOwn } from "./json";
 
 export class TomlError extends Error {
   readonly line: number;
@@ -50,6 +50,13 @@ export class TomlError extends Error {
   }
 }
 
+/**
+ * A key or table path with more parts than MAX_NESTING_DEPTH, refused as it
+ * is read: the value it builds would nest past the cap and be refused
+ * anyway, and building it first cost the square of the path's length.
+ */
+export class TomlTooDeepError extends TomlError {}
+
 type Cursor = { text: string; i: number; line: number };
 
 /** Parse a TOML document into JSON values. Throws `TomlError` with a line number. */
@@ -58,9 +65,13 @@ export function parseToml(text: string): Record<string, unknown> {
   const cur: Cursor = { text: text.replace(/\r\n?/g, "\n"), i: 0, line: 1 };
   // Tables created by a `[header]`, and tables brought into being implicitly
   // by a dotted key (`a.b = 1` creates `a`). The spec forbids each from
-  // redefining the other, so both have to be remembered.
-  const defined = new Set<string>();
-  const dotted = new Set<string>();
+  // redefining the other, so both have to be remembered. They are the table
+  // objects themselves, not their dotted names: a name per prefix of every
+  // dotted key cost the square of the key's length (80 KB took 3.6 GB), and
+  // the joined name confused a quoted "a.b" with a.b, and each element's
+  // sub-table in an array of tables with the first's.
+  const defined = new WeakSet<object>();
+  const dotted = new WeakSet<object>();
   let table: Record<string, unknown> = root;
   let tablePath: string[] = [];
 
@@ -71,22 +82,22 @@ export function parseToml(text: string): Record<string, unknown> {
       const isArray = cur.text[cur.i + 1] === "[";
       cur.i += isArray ? 2 : 1;
       const path = readKeyPath(cur, isArray ? "]]" : "]");
-      const key = path.join(".");
       if (isArray) {
         table = pushArrayTable(root, path, cur);
         tablePath = path;
       } else {
-        if (defined.has(key)) {
-          throw new TomlError(`table [${key}] is defined twice`, cur.line);
+        const target = descend(root, path, cur);
+        if (defined.has(target)) {
+          throw new TomlError(`table [${path.join(".")}] is defined twice`, cur.line);
         }
-        if (dotted.has(key)) {
+        if (dotted.has(target)) {
           throw new TomlError(
-            `table [${key}] was already created by a dotted key, so it cannot be defined again`,
+            `table [${path.join(".")}] was already created by a dotted key, so it cannot be defined again`,
             cur.line,
           );
         }
-        defined.add(key);
-        table = descend(root, path, cur);
+        defined.add(target);
+        table = target;
         tablePath = path;
       }
       expectLineEnd(cur);
@@ -143,6 +154,12 @@ const BARE_KEY = /[A-Za-z0-9_-]/;
 function readKeyPath(c: Cursor, terminator: string): string[] {
   const path: string[] = [];
   for (;;) {
+    if (path.length >= MAX_NESTING_DEPTH) {
+      throw new TomlTooDeepError(
+        `a key with more than ${MAX_NESTING_DEPTH} parts nests deeper than ${MAX_NESTING_DEPTH} levels`,
+        c.line,
+      );
+    }
     skipInlineSpace(c);
     const ch = c.text[c.i];
     if (ch === '"' || ch === "'") {
@@ -240,32 +257,33 @@ function assign(
   value: unknown,
   c: Cursor,
   tablePath: ReadonlyArray<string>,
-  tables?: { defined: Set<string>; dotted: Set<string> },
+  tables?: { defined: WeakSet<object>; dotted: WeakSet<object> },
 ): void {
   let node = table;
-  path.slice(0, -1).forEach((seg, idx) => {
-    const absolute = [...tablePath, ...path.slice(0, idx + 1)].join(".");
+  for (let idx = 0; idx < path.length - 1; idx++) {
+    const seg = path[idx] as string;
+    const existing = getOwn(node, seg);
+    let next: Record<string, unknown>;
+    if (existing === undefined) {
+      next = {};
+      setOwn(node, seg, next);
+    } else if (isPlainObject(existing)) {
+      next = existing as Record<string, unknown>;
+    } else {
+      throw new TomlError(`"${[...tablePath, ...path].join(".")}" collides with a value`, c.line);
+    }
     if (tables !== undefined) {
-      if (tables.defined.has(absolute)) {
+      if (tables.defined.has(next)) {
+        const absolute = [...tablePath, ...path.slice(0, idx + 1)].join(".");
         throw new TomlError(
           `"${absolute}" is already a table defined by [${absolute}], so a dotted key cannot extend it`,
           c.line,
         );
       }
-      tables.dotted.add(absolute);
+      tables.dotted.add(next);
     }
-    const existing = getOwn(node, seg);
-    if (existing === undefined) {
-      const fresh: Record<string, unknown> = {};
-      setOwn(node, seg, fresh);
-      node = fresh;
-      return;
-    }
-    if (!isPlainObject(existing)) {
-      throw new TomlError(`"${[...tablePath, ...path].join(".")}" collides with a value`, c.line);
-    }
-    node = existing as Record<string, unknown>;
-  });
+    node = next;
+  }
   const key = path[path.length - 1] as string;
   if (Object.hasOwn(node, key)) {
     throw new TomlError(`key "${[...tablePath, ...path].join(".")}" is defined twice`, c.line);

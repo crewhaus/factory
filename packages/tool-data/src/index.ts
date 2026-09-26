@@ -77,7 +77,7 @@ import {
   testPredicate,
   unflattenObject as unflattenObjectFn,
 } from "./lib/table";
-import { TomlError, parseToml, stringifyToml } from "./lib/toml";
+import { TomlError, TomlTooDeepError, parseToml, stringifyToml } from "./lib/toml";
 import { XmlError, parseXml, toCompact } from "./lib/xml";
 import { YamlError, parseYaml, stringifyYaml } from "./lib/yaml";
 
@@ -200,6 +200,7 @@ function readDocument(
   } catch (err) {
     if (err instanceof YamlError)
       return { ok: false, error: `invalid YAML on line ${err.line}: ${err.message}` };
+    if (err instanceof TomlTooDeepError) return { ok: false, error: tooDeep("toml") };
     if (err instanceof TomlError)
       return { ok: false, error: `invalid TOML on line ${err.line}: ${err.message}` };
     if (err instanceof CsvError)

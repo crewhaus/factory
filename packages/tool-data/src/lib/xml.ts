@@ -244,13 +244,21 @@ function readTag(
   }
 }
 
-const NAMED_ENTITIES: Readonly<Record<string, string>> = {
-  amp: "&",
-  lt: "<",
-  gt: ">",
-  quot: '"',
-  apos: "'",
-};
+/**
+ * A null prototype, and read with `Object.hasOwn`: the key is whatever name
+ * the document wrote between `&` and `;`, and on an object literal
+ * `&constructor;` decoded to "function Object() { [native code] }" and
+ * `&__proto__;` to "[object Object]" instead of being refused as unknown.
+ */
+const NAMED_ENTITIES: Readonly<Record<string, string>> = Object.freeze(
+  Object.assign(Object.create(null) as Record<string, string>, {
+    amp: "&",
+    lt: "<",
+    gt: ">",
+    quot: '"',
+    apos: "'",
+  }),
+);
 
 /** Expand the predefined entities and numeric references; anything else is an error. */
 export function decodeEntities(text: string, line: number): string {
@@ -276,7 +284,7 @@ export function decodeEntities(text: string, line: number): string {
       out += codePoint(body, Number.parseInt(body.slice(1), 10), line);
       continue;
     }
-    const named = NAMED_ENTITIES[body];
+    const named = Object.hasOwn(NAMED_ENTITIES, body) ? NAMED_ENTITIES[body] : undefined;
     if (named === undefined) {
       throw new XmlError(
         `unknown entity &${body}; — only the five predefined ones are known`,

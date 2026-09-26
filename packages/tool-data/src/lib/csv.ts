@@ -49,11 +49,16 @@ export class CsvError extends Error {
  * into a row (a writer's output read back as one header line of values and
  * zero records), and a `\r` one splits CRLF rows into phantom columns. The
  * quote character cannot be the delimiter, or a quoted field cannot be told
- * from a field boundary.
+ * from a field boundary. U+FEFF cannot be either: a reader drops it from the
+ * start of a file as a byte-order mark, so `["", "x"]` written with it as
+ * the delimiter read back as `["x"]`.
  */
 export function csvDialectError(delimiter: string, quote: string): string | null {
   if (delimiter.length !== 1) return "delimiter must be a single character";
   if (quote.length !== 1) return "quote must be a single character";
+  if (delimiter === "\ufeff" || quote === "\ufeff") {
+    return "neither delimiter nor quote can be U+FEFF — a reader drops it from the start of a file as a byte-order mark";
+  }
   if (delimiter === "\r" || delimiter === "\n") {
     return "delimiter cannot be a line break (CR or LF) — rows are separated by line breaks";
   }
@@ -293,14 +298,27 @@ export function writeCsvRows(
     if (chars > max) throw new OutputLimitError(max, "the CSV");
     lines.push(line);
   };
-  if (options.header !== null) {
-    push(options.header.map((h) => escapeCsvField(h, options)).join(options.delimiter));
-  }
+  const q = options.quote;
+  // Two cases a reader would otherwise misread, so both are quoted: a row
+  // whose only field is empty is a blank line, which a reader skips, and a
+  // leading U+FEFF in the file's first field is taken for a byte-order mark
+  // and dropped.
+  const encode = (cells: ReadonlyArray<string>): string => {
+    if (cells.length === 1 && cells[0] === "") return q + q;
+    return cells
+      .map((cell, i) =>
+        i === 0 && lines.length === 0 && cell.startsWith("\ufeff")
+          ? q + cell.split(q).join(q + q) + q
+          : escapeCsvField(cell, options),
+      )
+      .join(options.delimiter);
+  };
+  if (options.header !== null) push(encode(options.header));
   for (const row of rows) {
     // A row's cells are delimiter-separated at the least; checked before the
     // row is built, so one enormous row is not built to be refused.
     if (chars + row.length > max) throw new OutputLimitError(max, "the CSV");
-    push(row.map((cell) => escapeCsvField(cellToString(cell), options)).join(options.delimiter));
+    push(encode(row.map(cellToString)));
   }
   return lines.join(options.newline);
 }

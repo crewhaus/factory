@@ -731,6 +731,32 @@ describe("csv writing", () => {
     expect(parseCsv(text, CSV_DEFAULTS).rows).toEqual([["a,b", 'c"d', "e\nf"]]);
   });
 
+  test("a lone empty field and a leading U+FEFF are quoted, so they read back", () => {
+    // A row whose only field is empty was written as a blank line, which the
+    // reader skips; a first field starting with U+FEFF lost it to the
+    // reader's byte-order-mark strip.
+    const cases: Array<ReadonlyArray<ReadonlyArray<string>>> = [
+      [[""], ["x"], [""]],
+      [
+        ["\ufeffx", "y"],
+        ["a", "b"],
+      ],
+      [["\ufeff"], ["z"]],
+      [
+        ["", ""],
+        ["x", ""],
+      ],
+    ];
+    for (const rows of cases) {
+      const text = writeCsvRows(rows, W);
+      expect({ text, rows: parseCsv(text, CSV_DEFAULTS).rows }).toEqual({ text, rows });
+    }
+    expect(writeCsvRows([[""], ["x"]], W)).toBe('""\nx');
+    expect(writeCsvRows([["\ufeffx", "y"]], W)).toBe('"\ufeffx",y');
+    // Only the file's first field is at risk: later ones are written as before.
+    expect(writeCsvRows([["a"], ["\ufeffb"]], W)).toBe("a\n\ufeffb");
+  });
+
   test("a line break or the quote character is refused as a delimiter, by reader and writer alike", () => {
     // One rule for both sides: each of these wrote a file the reader then
     // refused or misread (a "\n" delimiter read back as one header line of
@@ -742,6 +768,10 @@ describe("csv writing", () => {
       [",", "\n", /line break/],
       [",", "\r", /line break/],
       [",,", '"', /single character/],
+      // The reader drops a leading U+FEFF as a byte-order mark, so as the
+      // delimiter `["", "x"]` read back as `["x"]`.
+      ["\ufeff", '"', /U\+FEFF/],
+      [",", "\ufeff", /U\+FEFF/],
     ];
     let hits = 0;
     for (const [delimiter, quote, why] of refused) {
@@ -750,7 +780,7 @@ describe("csv writing", () => {
       expect(() => writeCsvRows([["a"]], { ...W, delimiter, quote })).toThrow(why);
       hits += 1;
     }
-    expect(hits).toBe(6);
+    expect(hits).toBe(8);
     expect(csvDialectError(",", '"')).toBeNull();
   });
 
