@@ -27,13 +27,12 @@
  * (`thredz_quota` on the free plan's 3-goal cap — never a crash); the local
  * write has ALWAYS already succeeded by the time a mirror runs.
  */
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import type { ContinuityStore } from "@crewhaus/continuity-store";
 import type { McpHost } from "@crewhaus/mcp-host";
 import { createPiiRedactor } from "@crewhaus/pii-redactor";
 import type { ToolCatalog } from "@crewhaus/tool-catalog";
 import { type McpToolFlags, registerMcpToolAliases } from "@crewhaus/tool-mcp";
+import { openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { THREDZ_WIKI_TOOL_NAMES } from "@crewhaus/tool-wiki";
 
 /** The synthesized MCP server's name (compiler `THREDZ_MCP_SERVER_NAME`
@@ -441,9 +440,34 @@ export type ThredzGoalMirrorOptions = {
   readonly log?: (line: string) => void;
 };
 
-function readGoalMap(path: string): Record<string, string> {
+/** A goal map is a few ids per goal; anything past this is not one. */
+const GOAL_MAP_MAX_BYTES = 1024 * 1024;
+
+/**
+ * The map is read and written contained to the store's directory
+ * (`.crewhaus/…/<spec>/`, which any agent with a write tool can reach):
+ * never through a link planted at `thredz-goals.json`, never from a FIFO,
+ * and never past {@link GOAL_MAP_MAX_BYTES}. A plain `readFileSync` /
+ * `writeFileSync` used to follow a planted link, so a mirrored `goal_write`
+ * overwrote whatever file the link named. A refusal is logged once per
+ * reason and treated as an empty map: the local goal is authoritative, and
+ * the only cost is a later mirror update skipped (with its own warning).
+ */
+function readGoalMap(dir: string, onRefused: (why: string) => void): Record<string, string> {
+  const read = openForReadSync(dir, THREDZ_GOAL_MAP_FILE, {
+    maxBytes: GOAL_MAP_MAX_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok) {
+    if (read.code !== "not-found") onRefused(`not read: ${read.reason}`);
+    return {};
+  }
+  if (read.truncated) {
+    onRefused(`not read: it is larger than ${GOAL_MAP_MAX_BYTES} bytes`);
+    return {};
+  }
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as unknown;
+    const parsed = JSON.parse(read.text) as unknown;
     if (typeof parsed !== "object" || parsed === null) return {};
     const out: Record<string, string> = {};
     for (const [key, value] of Object.entries(parsed)) {
@@ -455,13 +479,18 @@ function readGoalMap(path: string): Record<string, string> {
   }
 }
 
-function writeGoalMap(path: string, map: Record<string, string>): void {
-  try {
-    writeFileSync(path, `${JSON.stringify(map, null, 2)}\n`);
-  } catch {
-    // Best-effort bookkeeping — a failed map write only costs a future
-    // mirror update (skip + warn), never the local goal.
-  }
+function writeGoalMap(
+  dir: string,
+  map: Record<string, string>,
+  onRefused: (why: string) => void,
+): void {
+  // Best-effort bookkeeping — a failed map write only costs a future
+  // mirror update (skip + warn), never the local goal.
+  const written = writeFileSafe(dir, THREDZ_GOAL_MAP_FILE, `${JSON.stringify(map, null, 2)}\n`, {
+    overwrite: true,
+    mode: 0o600,
+  });
+  if (!written.ok) onRefused(`not written: ${written.reason}`);
 }
 
 /** Pull the created goal's id out of a `goal_write` response body (Thredz
@@ -496,7 +525,13 @@ export function withThredzGoalMirror(
   store: ContinuityStore,
   opts: ThredzGoalMirrorOptions,
 ): ContinuityStore {
-  const mapPath = join(store.dir(), THREDZ_GOAL_MAP_FILE);
+  const mapDir = store.dir();
+  const refusals = new Set<string>();
+  const onMapRefused = (why: string): void => {
+    if (refusals.has(why)) return;
+    refusals.add(why);
+    opts.log?.(`[thredz] goal mirror map ${THREDZ_GOAL_MAP_FILE} ${why}\n`);
+  };
   const redactor = createPiiRedactor();
   const warn = (op: string, detail: string): void => {
     const klass = classifyThredzFailure(detail);
@@ -528,7 +563,11 @@ export function withThredzGoalMirror(
         } else {
           const remoteId = extractThredzGoalId(res.content);
           if (remoteId !== undefined) {
-            writeGoalMap(mapPath, { ...readGoalMap(mapPath), [goal.id]: remoteId });
+            writeGoalMap(
+              mapDir,
+              { ...readGoalMap(mapDir, onMapRefused), [goal.id]: remoteId },
+              onMapRefused,
+            );
           }
         }
       } catch (err) {
@@ -538,7 +577,7 @@ export function withThredzGoalMirror(
     },
     async updateGoal(goalId, patch) {
       const goal = await store.updateGoal(goalId, patch);
-      const remoteId = readGoalMap(mapPath)[goalId];
+      const remoteId = readGoalMap(mapDir, onMapRefused)[goalId];
       if (remoteId === undefined) {
         // The create mirror was skipped (offline/quota) — nothing to address.
         opts.log?.(
