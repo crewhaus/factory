@@ -567,18 +567,70 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
  * forwarding a sandboxed call.
  *
  * Pattern uses a minimal glob: `*` = any chars except `/`, `**` = any
- * chars including `/`. Matches the §31 plugin-sandbox `isFsAllowed` /
- * `isNetAllowed` semantics so behavior is consistent across the SDK.
+ * chars including `/` (but not a line break). Every other character,
+ * `?` included, stands for itself. Matches the §31 plugin-sandbox
+ * `isFsAllowed` / `isNetAllowed` semantics so behavior is consistent
+ * across the SDK.
+ *
+ * The pattern comes from a plugin's manifest, so it is matched in time
+ * proportional to the pattern's length times the target's — never by a
+ * backtracking regex, where `*a*a*a…` against a long run of `a` takes
+ * exponential time. `work`, when passed, has the number of positions
+ * visited added to `work.steps` (a count of the work that does not depend
+ * on how busy the machine is).
  */
-export function matchesGlob(target: string, pattern: string): boolean {
-  const re = new RegExp(
-    `^${pattern
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*\*/g, "::DOUBLESTAR::")
-      .replace(/\*/g, "[^/]*")
-      .replace(/::DOUBLESTAR::/g, ".*")}$`,
-  );
-  return re.test(target);
+export function matchesGlob(target: string, pattern: string, work?: { steps: number }): boolean {
+  const n = target.length;
+  // reach[j] is 1 when the pattern read so far matches target.slice(0, j).
+  let reach = new Uint8Array(n + 1);
+  let next = new Uint8Array(n + 1);
+  reach[0] = 1;
+  let steps = 0;
+  let i = 0;
+  while (i < pattern.length) {
+    next.fill(0);
+    let any = false;
+    if (pattern[i] === "*") {
+      const double = pattern[i + 1] === "*";
+      i += double ? 2 : 1;
+      // A match can start wherever the pattern so far ends, and runs on until
+      // a character the wildcard does not cover.
+      let open = false;
+      for (let j = 0; j <= n; j++) {
+        if (j > 0 && open) {
+          const c = target.charCodeAt(j - 1);
+          if (double ? isLineTerminator(c) : c === SLASH) open = false;
+        }
+        if (reach[j] === 1) open = true;
+        if (open) {
+          next[j] = 1;
+          any = true;
+        }
+      }
+      steps += n + 1;
+    } else {
+      const c = pattern.charCodeAt(i);
+      i += 1;
+      for (let j = 0; j < n; j++) {
+        if (reach[j] === 1 && target.charCodeAt(j) === c) {
+          next[j + 1] = 1;
+          any = true;
+        }
+      }
+      steps += n;
+    }
+    [reach, next] = [next, reach];
+    if (!any) break;
+  }
+  if (work !== undefined) work.steps += steps;
+  return reach[n] === 1;
+}
+
+const SLASH = 0x2f;
+
+/** The characters `**` does not cross: those a regex `.` does not match, as 0.7.0's `.*` did not. */
+function isLineTerminator(code: number): boolean {
+  return code === 0x0a || code === 0x0d || code === 0x2028 || code === 0x2029;
 }
 
 export function isFsAllowed(
