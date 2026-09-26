@@ -19,6 +19,7 @@ import {
   VERIFIER_SENTINEL,
   evalVerifierPayload,
   runVerifierInSandbox,
+  verifierOutputCap,
 } from "./sandboxed-eval";
 
 /**
@@ -441,11 +442,27 @@ describe("verifier output is capped", () => {
     stdoutDroppedBytes: dropped,
   });
 
-  test("every run asks the sandbox for a cap of at most 1 MiB", async () => {
+  test("every run asks the sandbox for a cap: 1 MiB for an ordinary sample set", async () => {
     const sandbox = new FakeDockerSandbox();
     await runVerifier("return true", evenSamples, { sandbox });
-    expect(VERIFIER_MAX_OUTPUT_BYTES).toBeLessThanOrEqual(1 << 20);
+    expect(VERIFIER_MAX_OUTPUT_BYTES).toBe(1 << 20);
     expect(sandbox.calls[0]?.maxOutputBytes).toBe(VERIFIER_MAX_OUTPUT_BYTES);
+  });
+
+  // A fixed 1 MiB cap kept 512 KiB of the end, and the result line of a
+  // quiet verifier over ~180 000 samples is longer than that: the line was
+  // cut and a run that flooded nothing failed.
+  test("the cap grows with the sample count, so the kept end always holds the longest result line", () => {
+    expect(verifierOutputCap(0)).toBe(VERIFIER_MAX_OUTPUT_BYTES);
+    expect(verifierOutputCap(50_000)).toBe(VERIFIER_MAX_OUTPUT_BYTES);
+    for (const n of [200_000, 1_000_000]) {
+      const longest = Buffer.byteLength(
+        `${VERIFIER_SENTINEL}${JSON.stringify({ verdicts: new Array(n).fill(false), errors: n })}`,
+      );
+      // The sandbox keeps floor(cap / 2) bytes of the end.
+      const keptEnd = Math.floor(verifierOutputCap(n) / 2);
+      expect({ n, fits: keptEnd >= longest + 60_000 }).toEqual({ n, fits: true });
+    }
   });
 
   test("the result line, written last, survives output dropped before it", async () => {
@@ -462,8 +479,64 @@ describe("verifier output is capped", () => {
     const stdout = `${"junk".repeat(1000)}\n[stdout truncated: 5000000 bytes dropped]\n${"junk".repeat(10)}`;
     await expect(
       runVerifierInSandbox(new ScriptedSandbox(scored(stdout, 5_000_000)), "x", ioSamples),
-    ).rejects.toThrow(/verifier output exceeded 1048576 bytes/);
+    ).rejects.toThrow(
+      /verifier output passed the 1048576-byte cap and the result line was not in the part kept/,
+    );
   });
+});
+
+/**
+ * The real sandbox's capped read, with no daemon: the noop backend runs the
+ * harness under this Bun (`bun -e` reads the same script `node -e` does),
+ * and reports `docker` so runVerifier's isolation gate lets it through. The
+ * verifier strings here are trusted.
+ */
+function hostRunSandbox(): Sandbox & { readonly caps: number[] } {
+  const inner = createSandbox({ backend: "noop" });
+  const caps: number[] = [];
+  return {
+    backend: "docker",
+    caps,
+    exec: (opts) => {
+      caps.push(opts.maxOutputBytes ?? -1);
+      return inner.exec({ ...opts, argv: [process.execPath, "-e", opts.argv[2] ?? ""] });
+    },
+    close: () => inner.close(),
+  };
+}
+
+describe.if(process.platform !== "win32")("a large sample set is scored whole", () => {
+  test("a quiet verifier over 250 000 samples, whose result line alone passes 512 KiB", async () => {
+    const samples = Array.from({ length: 250_000 }, (_, i) => ({
+      input: i,
+      output: i,
+      expected: i % 7 !== 0,
+    }));
+    const sandbox = hostRunSandbox();
+    const r = await runVerifier("return input % 7 !== 0;", samples, { sandbox, timeoutMs: 60_000 });
+    expect(sandbox.caps[0]).toBe(verifierOutputCap(250_000));
+    expect({ heuristic: r.heuristic, verdicts: r.verdicts.length }).toEqual({
+      heuristic: 1,
+      verdicts: 250_000,
+    });
+  }, 60_000);
+
+  test("a verifier that logs every sample before its result is scored too", async () => {
+    const samples = Array.from({ length: 120_000 }, (_, i) => ({
+      input: i,
+      output: i,
+      expected: false,
+    }));
+    const sandbox = hostRunSandbox();
+    const r = await runVerifier("console.log('checking sample', input); return false;", samples, {
+      sandbox,
+      timeoutMs: 60_000,
+    });
+    expect({ heuristic: r.heuristic, verdicts: r.verdicts.length }).toEqual({
+      heuristic: 1,
+      verdicts: 120_000,
+    });
+  }, 60_000);
 });
 
 /** Where a daemon and node:22-alpine are already here (never pulls). */
