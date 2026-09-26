@@ -58,7 +58,14 @@ mock.module("@crewhaus/boundary-classifier", () => ({
     flags.classifyCalls += 1;
     flags.classified.push({ text: typeof text === "string" ? text : "", origin: opts?.origin });
     if (flags.classifyFails) return Promise.reject(new Error("classifier offline"));
-    return Promise.resolve({ classification: "clean", hits: [] });
+    // A pass-shaped BoundaryResult, so callers that read the verdict work.
+    return Promise.resolve({
+      action: "pass",
+      original: text,
+      origin: opts?.origin,
+      verdict: { classification: "clean", score: 0, hits: [] },
+      fromCache: false,
+    });
   },
 }));
 
@@ -185,4 +192,41 @@ describe("auto-recall memory routes through classifyBoundary (#53 F1)", () => {
     const memoryCalls = flags.classified.filter((c) => c.origin === "memory");
     expect(memoryCalls.map((c) => c.text)).toEqual(lines);
   });
+
+  // A classifier rejection must never admit a recalled line unclassified: it
+  // propagates out of renderRecalledMemory, and both callers inject nothing.
+  for (const recallMode of ["session-start", "per-turn"] as const) {
+    test(`a classifier rejection fails closed: no recalled line reaches the prompt (${recallMode})`, async () => {
+      const { runChatLoop } = await import("./index");
+      const { adapter } = makeStubAdapter("done");
+      const stub = adapter as { stream: () => AsyncGenerator<unknown> };
+      const system: string[] = [];
+      const spyAdapter = {
+        ...stub,
+        stream: (req: { system?: ReadonlyArray<{ text: string }> }) => {
+          for (const b of req.system ?? []) system.push(b.text);
+          return stub.stream();
+        },
+      };
+      flags.classifyFails = true;
+      await runChatLoop({
+        model: "test-model",
+        instructions: "be helpful",
+        // biome-ignore lint/suspicious/noExplicitAny: test stub adapter
+        _adapter: spyAdapter as any,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "hi" }],
+        sessionRootDir: SESSION_ROOT,
+        memory: {
+          autoRecall: true,
+          recallMode,
+          recall: async () => ["a recalled fact the classifier never cleared"],
+        },
+        // biome-ignore lint/suspicious/noExplicitAny: partial opts for the test
+      } as any);
+      expect(flags.classified.some((c) => c.origin === "memory")).toBe(true);
+      expect(system.length).toBeGreaterThan(0);
+      expect(system.some((t) => t.includes("<recalled_memory>"))).toBe(false);
+    });
+  }
 });

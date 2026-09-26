@@ -9859,8 +9859,9 @@ async function curateActiveContext(
  * BEFORE it reaches the system prompt, because a fact, wiki article, or
  * session summary written in an earlier session may have absorbed attacker
  * text, and the system region has no post-tool classifier behind it. A
- * malicious line is replaced by the redaction notice; an admitted line is
- * lineage-tagged for the egress fabric. Each line then has any
+ * malicious line is replaced by the redaction notice; a suspicious one is kept
+ * and logged; an admitted line is lineage-tagged for the egress fabric. Each
+ * line then has any
  * `</recalled_memory>` breakout delimiter neutralized. A classifier rejection
  * propagates, so both callers fail closed. Returns `undefined` when there is
  * nothing to recall.
@@ -9873,12 +9874,16 @@ async function renderRecalledMemory(
   const rendered: string[] = [];
   for (const line of lines) {
     const boundary = await classifyBoundary(line, { origin: "memory" });
+    const rules = [...new Set(boundary.verdict.hits.map((h) => h.rule))];
     if (boundary.action === "redact") {
       runContext.logger.warn("recalled memory line redacted (prompt injection detected)", {
-        rules: [...new Set(boundary.verdict.hits.map((h) => h.rule))],
+        rules,
       });
       rendered.push(boundary.redacted ?? "");
       continue;
+    }
+    if (boundary.action === "warn") {
+      runContext.logger.warn("suspicious recalled memory line kept", { rules });
     }
     tagContent(runContext, line, "memory");
     rendered.push(line);
