@@ -518,6 +518,61 @@ describe("test output parsers", () => {
     expect(outcome.failures[0]?.name.length).toBe(100_002);
   });
 
+  test("pytest: the summary line is read in linear time, and its counts unchanged (C079)", () => {
+    // 0.7.0's two lazy groups and trailing `\s+` retried a run of spaces
+    // from every position: quadratic in a line the caller supplies.
+    const run = " ".repeat(60_000);
+    const digits = "1".repeat(60_000);
+    const started = performance.now();
+    const hostile = parsePytest(
+      `short test summary info\npassed${run}x\n${digits}a passed${run}in 1s\n`,
+    );
+    expect(performance.now() - started).toBeLessThan(1_500);
+    expect(hostile.passed).toBe(0);
+    // The same scan still reads every summary pytest prints.
+    const summary = parsePytest(
+      [
+        "==== 1 failed, 2 passed, 3 skipped, 1 xfailed, 2 errors in 0.12s ====",
+        "5 passed, 1 xpassed in 65.12s (0:01:05)",
+        "1 passed   in   0.5s",
+        "FAILED t.py::x - failed 9 passed in 0.1s",
+      ].join("\n"),
+    );
+    expect(summary).toMatchObject({ passed: 9, failed: 3, skipped: 4 });
+  });
+
+  test("go: a failed test's output is searched in linear time, blank lines or not (C079)", () => {
+    // The location search was one multiline pattern whose `^\s*` spanned
+    // newlines: 160k characters of blank output took over five seconds.
+    const event = (e: Record<string, unknown>) => JSON.stringify({ Package: "p", Test: "T", ...e });
+    const blank = [
+      event({ Action: "run" }),
+      event({ Action: "output", Output: "\n".repeat(120_000) }),
+      event({ Action: "fail" }),
+    ].join("\n");
+    const started = performance.now();
+    const outcome = parseGoTestJson(blank);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(outcome.failed).toBe(1);
+    // …and a location after leading space and blank lines is still found.
+    const located = parseGoTestJson(
+      [
+        event({ Action: "output", Output: "=== RUN   T\n\n\n" }),
+        event({ Action: "output", Output: "    sum_test.go:12: got 3, want 4\r\n" }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(located.failures[0]).toMatchObject({
+      file: "sum_test.go",
+      line: 12,
+      message: "got 3, want 4",
+    });
+    // Runner detection samples both ends, and a run of blank lines there is linear too.
+    const detectStarted = performance.now();
+    expect(detectRunnerFromOutput("\n".repeat(40_000))).toBeUndefined();
+    expect(performance.now() - detectStarted).toBeLessThan(500);
+  });
+
   test("bun: the timing suffix is cut, and any other bracket is part of the name", () => {
     const outcome = parseBunTest(
       [
@@ -1088,6 +1143,70 @@ describe("dependency manifests", () => {
       ["[tool.poetry.dependencies]", 'python = "^3.11"', 'httpx = "^0.27"'].join("\n"),
     );
     expect(poetry.map((d) => [d.name, d.range])).toEqual([["httpx", "^0.27"]]);
+  });
+
+  test("pyproject.toml: optional groups, comments, and a key read exactly", () => {
+    const deps = parsePyproject(
+      [
+        "[project]",
+        "dependencies = [",
+        '  "requests>=2",',
+        "]",
+        "[project.optional-dependencies]",
+        'dev = ["pytest>=8", "ruff"]',
+        "docs = [",
+        '  "mkdocs",  # the site',
+        "]",
+        "broken = [",
+        "[tool.poetry.dependencies]",
+        'httpx = "^0.27"   # pinned for now',
+        'rich = "^13"#glued is not a comment',
+      ].join("\n"),
+    );
+    // Sorted by name, as every manifest reader returns them.
+    expect(deps.map((d) => [d.name, d.range, d.scope])).toEqual([
+      ["httpx", "^0.27", "prod"],
+      ["mkdocs", "", "optional"],
+      ["pytest", ">=8", "optional"],
+      ["requests", ">=2", "prod"],
+      ["rich", '^13"#glued is not a comment', "prod"],
+      ["ruff", "", "optional"],
+    ]);
+    // A group key with a dot is matched as written: 0.7.0 built a pattern
+    // from it, so `my.group` read the array of `myxgroup` above it.
+    const dotted = parsePyproject(
+      '[project.optional-dependencies]\nmyxgroup = ["alpha"]\nmy.group = ["beta"]\n',
+    );
+    expect(dotted.map((d) => d.name)).toEqual(["alpha", "beta"]);
+  });
+
+  test("pyproject.toml is read in linear time, whatever the repository wrote", () => {
+    // 0.7.0 ran `^\s*` in multiline mode (it spans newlines), stripped
+    // comments with `\s+#.*$`, and re-scanned the body once per array key:
+    // each quadratic in a file up to the read cap, about two seconds each at
+    // these sizes.
+    const cases: ReadonlyArray<[string, string, string[]]> = [
+      ["blank lines", `[project.optional-dependencies]\n${"\n".repeat(50_000)}x\n`, []],
+      [
+        "spaces before no comment",
+        `[tool.poetry.dependencies]\nhttpx = "1"${" ".repeat(60_000)}x\n`,
+        ["httpx"],
+      ],
+      ["unclosed arrays", `[project.optional-dependencies]\n${"k = [\n".repeat(15_000)}`, []],
+    ];
+    let timed = 0;
+    for (const [label, text, names] of cases) {
+      const started = performance.now();
+      const deps = parsePyproject(text);
+      const ms = performance.now() - started;
+      expect({ label, fast: ms < 1_000, names: deps.map((d) => d.name) }).toEqual({
+        label,
+        fast: true,
+        names,
+      });
+      timed += 1;
+    }
+    expect(timed).toBe(3);
   });
 
   test("go.mod: require block and indirect markers", () => {

@@ -411,17 +411,10 @@ export function parsePytest(text: string): TestOutcome {
   let failed = 0;
   let skipped = 0;
   for (const raw of lines) {
-    const summary =
-      /^=*\s*(?<body>[\w\s,]*?(?:passed|failed|error|skipped)[\w\s,]*?)\s+in\s+[\d.]+s/.exec(
-        stripAnsi(raw).trim(),
-      );
-    if (summary === null) continue;
+    const counts = pytestSummaryCounts(stripAnsi(raw).trim());
+    if (counts === undefined) continue;
     sawAny = true;
-    for (const part of (summary.groups?.["body"] ?? "").split(",")) {
-      const c = /(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed)/.exec(part.trim());
-      if (c === null) continue;
-      const n = Number(c[1]);
-      const kind = c[2] as string;
+    for (const [kind, n] of counts) {
       if (kind === "passed" || kind === "xpassed") passed += n;
       else if (kind === "failed" || kind.startsWith("error")) failed += n;
       else skipped += n;
@@ -438,6 +431,95 @@ export function parsePytest(text: string): TestOutcome {
     failures,
     parsed: sawAny,
   };
+}
+
+/** The words a pytest summary line counts, in the order 0.7.0's pattern tried them. */
+const PYTEST_COUNT_WORDS = ["passed", "failed", "errors", "error", "skipped", "xfailed", "xpassed"];
+/** Any of them, for "is this a summary at all". */
+const PYTEST_SUMMARY_WORD_RE = /passed|failed|error|skipped/;
+/** What a summary line's body may hold: words, spaces and commas. */
+const PYTEST_BODY_RE = /^[\w\s,]*$/;
+/** The duration after ` in `, matched at a fixed position. */
+const PYTEST_DURATION_RE = /[\d.]+s/y;
+
+function isSpace(c: string | undefined): boolean {
+  return c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v";
+}
+
+/**
+ * The counts in pytest's final summary line — `=== 1 failed, 3 passed in
+ * 0.12s ===`, or `-q`'s bare `1 failed, 3 passed in 0.12s` — as
+ * `[word, n]` pairs, or undefined when the line is not one.
+ *
+ * A scan, not a pattern: 0.7.0 matched this with two lazy groups around the
+ * count word and a `\s+` after them, which retried a run of spaces from
+ * every position (C079) — quadratic in a line the caller supplies. The body
+ * is what precedes the first ` in <duration>s` after a count word, and must
+ * hold only words, spaces and commas, as before.
+ */
+export function pytestSummaryCounts(line: string): Array<[string, number]> | undefined {
+  let at = 0;
+  while (line[at] === "=") at += 1;
+  while (isSpace(line[at])) at += 1;
+  const text = line.slice(at);
+  const word = PYTEST_SUMMARY_WORD_RE.exec(text);
+  if (word === null) return undefined;
+  // The first ` in <duration>s` after the count word, preceded by space.
+  let from = word.index + word[0].length;
+  let bodyEnd = -1;
+  for (;;) {
+    const idx = text.indexOf("in", from);
+    if (idx < 0) break;
+    from = idx + 1;
+    if (!isSpace(text[idx - 1]) || !isSpace(text[idx + 2])) continue;
+    let after = idx + 2;
+    while (isSpace(text[after])) after += 1;
+    PYTEST_DURATION_RE.lastIndex = after;
+    if (!PYTEST_DURATION_RE.test(text)) continue;
+    let start = idx - 1;
+    while (start > 0 && isSpace(text[start - 1])) start -= 1;
+    bodyEnd = start;
+    break;
+  }
+  if (bodyEnd < word.index + word[0].length) return undefined;
+  const body = text.slice(0, bodyEnd);
+  if (!PYTEST_BODY_RE.test(body)) return undefined;
+  const counts: Array<[string, number]> = [];
+  for (const part of body.split(",")) {
+    const tokens = part.trim().split(/\s+/);
+    for (let i = 0; i + 1 < tokens.length; i++) {
+      // The digits the token ends with, found from the end (a `\d+$`
+      // pattern retries from every digit of a long run).
+      const token = tokens[i] as string;
+      let d = token.length;
+      while (d > 0 && (token[d - 1] as string) >= "0" && (token[d - 1] as string) <= "9") d -= 1;
+      if (d === token.length) continue;
+      const next = tokens[i + 1] as string;
+      const kind = PYTEST_COUNT_WORDS.find((w) => next.startsWith(w));
+      if (kind === undefined) continue;
+      counts.push([kind, Number(token.slice(d))]);
+      break;
+    }
+  }
+  return counts;
+}
+
+/**
+ * The first `file.go:12: message` line in a failed go test's output, or
+ * undefined. Line by line, each trimmed and matched anchored: 0.7.0 ran one
+ * multiline pattern whose `^\s*` spanned newlines, so a failed test that
+ * printed many blank lines took quadratic time (C079).
+ */
+function goFailureLocation(
+  blob: string,
+): { file: string; line: number; message: string } | undefined {
+  for (const raw of blob.split("\n")) {
+    const m = /^([\w./-]+\.go):(\d+):\s*(.*)/.exec(raw.trimStart());
+    if (m !== null) {
+      return { file: m[1] as string, line: Number(m[2]), message: (m[3] as string).trim() };
+    }
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -489,10 +571,10 @@ export function parseGoTestJson(text: string): TestOutcome {
       failed += 1;
       const blob = (buffers.get(key) ?? []).join("");
       // go prints `    file_test.go:12: message`, relative to the package dir.
-      const located = /^\s*([\w./-]+\.go):(\d+):\s*(.*)$/m.exec(blob);
+      const located = goFailureLocation(blob);
       const message =
-        located !== null
-          ? (located[3] as string).trim()
+        located !== undefined
+          ? located.message
           : blob
               .split("\n")
               .map((l) => l.trim())
@@ -501,9 +583,7 @@ export function parseGoTestJson(text: string): TestOutcome {
               .join(" ");
       failures.push({
         name: key,
-        ...(located === null
-          ? {}
-          : { file: toPosix(located[1] as string), line: Number(located[2]) }),
+        ...(located === undefined ? {} : { file: toPosix(located.file), line: located.line }),
         ...(message === "" ? {} : { message: cap(message) }),
       });
     }
@@ -622,7 +702,9 @@ function sampleForDetection(text: string): string {
  */
 export function detectRunnerFromOutput(text: string): RunnerName | undefined {
   const sample = sampleForDetection(text);
-  if (/^\s*\{"(Time|Action|Package)":/m.test(sample)) return "go";
+  // `[ \t]*`, not `\s*`: with the m flag `^\s*` spans newlines and retried a
+  // run of blank lines from every line start (C079).
+  if (/^[ \t]*\{"(Time|Action|Package)":/m.test(sample)) return "go";
   if (/"numTotalTests"|"assertionResults"/.test(sample)) return "jest";
   if (/^\((pass|fail|skip|todo)\)\s/m.test(sample) || /Ran \d+ tests? across/.test(sample)) {
     return "bun";

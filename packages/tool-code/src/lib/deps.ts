@@ -865,14 +865,27 @@ function tomlSections(text: string): Array<[string, string]> {
   return out;
 }
 
+/**
+ * A line with its trailing `# comment` cut: from the first `#` that follows
+ * whitespace. A scan, where `/\s+#.*$/` retried a long run of spaces from
+ * every position of it.
+ */
+function withoutTomlComment(line: string): string {
+  let from = 0;
+  for (;;) {
+    const hash = line.indexOf("#", from);
+    if (hash < 0) return line;
+    const before = line[hash - 1];
+    if (hash > 0 && (before === " " || before === "\t")) return line.slice(0, hash);
+    from = hash + 1;
+  }
+}
+
 /** `key = "value"` and `key = { version = "value", … }` pairs in a section body. */
 function tomlKeyValues(body: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
   for (const raw of body.split("\n")) {
-    const line = raw
-      .replace(/\r$/, "")
-      .replace(/\s+#.*$/, "")
-      .trim();
+    const line = withoutTomlComment(raw.replace(/\r$/, "")).trim();
     if (line === "" || line.startsWith("#")) continue;
     const m = /^(?<key>[A-Za-z0-9._-]+)\s*=\s*(?<value>.+)$/.exec(line);
     if (m === null) continue;
@@ -901,37 +914,97 @@ function tomlKeyValues(body: string): Array<[string, string]> {
   return out;
 }
 
-/** A `key = ["a", "b"]` array, possibly spanning lines. */
-function tomlStringArray(body: string, key: string): string[] {
-  const start = new RegExp(`^\\s*${key}\\s*=\\s*\\[`, "m").exec(body);
-  if (start === null) return [];
-  const from = (start.index as number) + start[0].length - 1;
+/**
+ * The `key = [` lines of a section body, in order, with the offset of each
+ * `[`. One line at a time, each matched anchored: the 0.7.0 patterns ran
+ * `^\s*` in multiline mode, which spans newlines and retried a run of blank
+ * lines from every line start (quadratic in a file the repository supplies),
+ * and built a pattern from the key unescaped.
+ */
+function tomlArrayStarts(body: string): Array<{ readonly key: string; readonly open: number }> {
+  const out: Array<{ key: string; open: number }> = [];
+  let lineStart = 0;
+  while (lineStart <= body.length) {
+    const nl = body.indexOf("\n", lineStart);
+    const lineEnd = nl < 0 ? body.length : nl;
+    const m = /^[ \t]*([A-Za-z0-9._-]+)[ \t]*=[ \t]*\[/.exec(body.slice(lineStart, lineEnd));
+    if (m !== null) out.push({ key: m[1] as string, open: lineStart + m[0].length - 1 });
+    if (nl < 0) break;
+    lineStart = nl + 1;
+  }
+  return out;
+}
+
+/** The index of the `]` closing the `[` at `open`, or undefined when none does. */
+function closingBracket(body: string, open: number): number | undefined {
   let depth = 0;
-  let end = from;
-  for (let i = from; i < body.length; i++) {
+  for (let i = open; i < body.length; i++) {
     if (body[i] === "[") depth += 1;
     else if (body[i] === "]") {
       depth -= 1;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
+      if (depth === 0) return i;
     }
   }
-  const inner = body.slice(from + 1, end);
+  return undefined;
+}
+
+/** The quoted strings between `open` and `close`. */
+function tomlQuotedItems(body: string, open: number, close: number): string[] {
   const out: string[] = [];
-  for (const m of inner.matchAll(/"([^"]*)"|'([^']*)'/g)) {
+  for (const m of body.slice(open + 1, close).matchAll(/"([^"]*)"|'([^']*)'/g)) {
     out.push((m[1] ?? m[2] ?? "").trim());
   }
   return out;
 }
 
-/** Every `key = [...]` array in a section body, for optional-dependency groups. */
+/** A `key = ["a", "b"]` array, possibly spanning lines. Unclosed reads as empty. */
+function tomlStringArray(body: string, key: string): string[] {
+  const start = tomlArrayStarts(body).find((s) => s.key === key);
+  if (start === undefined) return [];
+  const close = closingBracket(body, start.open);
+  return close === undefined ? [] : tomlQuotedItems(body, start.open, close);
+}
+
+/**
+ * For each offset in `opens`, the `]` that closes the `[` there, found in one
+ * pass with a stack: the same answer a depth count from each `[` gives, since
+ * brackets before it are matched or stay below it on the stack.
+ */
+function closingBrackets(body: string, opens: ReadonlySet<number>): Map<number, number> {
+  const out = new Map<number, number>();
+  const stack: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "[") stack.push(i);
+    else if (c === "]") {
+      const o = stack.pop();
+      if (o !== undefined && opens.has(o)) out.set(o, i);
+    }
+  }
+  return out;
+}
+
+/**
+ * Every `key = [...]` array in a section body, for optional-dependency
+ * groups. Each `[` is closed from one shared pass, and a `key = [` line
+ * inside an array already read is part of that array, not a key of its own,
+ * so the work is linear however the arrays nest or fail to close. An
+ * unclosed array reads as empty.
+ */
 function tomlAllStringArrays(body: string): Array<[string, string[]]> {
+  const starts = tomlArrayStarts(body);
+  const closes = closingBrackets(body, new Set(starts.map((s) => s.open)));
   const out: Array<[string, string[]]> = [];
-  for (const m of body.matchAll(/^\s*([A-Za-z0-9._-]+)\s*=\s*\[/gm)) {
-    const key = m[1] as string;
-    out.push([key, tomlStringArray(body, key)]);
+  let readUpTo = -1;
+  for (const { key, open } of starts) {
+    if (open <= readUpTo) continue;
+    const close = closes.get(open);
+    if (close === undefined) {
+      out.push([key, []]);
+      continue;
+    }
+    out.push([key, tomlQuotedItems(body, open, close)]);
+    readUpTo = close;
   }
   return out;
 }
