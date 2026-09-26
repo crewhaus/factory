@@ -83,6 +83,7 @@ import {
   MAX_MAX_BYTES,
   MAX_TIMEOUT_MS,
   type ObsConfig,
+  ObsCorruptBodyError,
   ObsPermissionError,
   ObsRefusedError,
   authHeaders,
@@ -103,6 +104,7 @@ import {
 import { type SafePath, ToolPermissionError, resolveSafe, toPosix } from "./paths";
 
 export {
+  ObsCorruptBodyError,
   ObsPermissionError,
   ObsRefusedError,
   ObsUnresolvedError,
@@ -1842,18 +1844,25 @@ export const healthProbe: RegisteredTool = buildTool({
         });
         // Drain under the cap rather than leaving the stream open: a probe
         // that never reads the body leaks a socket per endpoint. The probe
-        // judges the status, not the body, so a body the reader refuses to
-        // decode is released rather than reported as the endpoint failing.
+        // judges the status, not the body, so a body in codings the reader
+        // will not stack is released rather than reported as the endpoint
+        // failing. A CORRUPT body is the endpoint failing, as 0.7.0 said:
+        // every client reading that reply would fail too.
+        let corrupt: string | undefined;
         await readCapped(opened.res, maxBytes, deadline.signal).catch((err: unknown) => {
           if (err instanceof Error && err.name === "AbortError") throw err;
+          if (err instanceof ObsCorruptBodyError) corrupt = err.message;
         });
         const status = opened.res.status;
         results[index] = {
           url: redact(opened.finalUrl),
-          ok: expected !== undefined ? expected.has(status) : status >= 200 && status < 300,
+          ok:
+            corrupt === undefined &&
+            (expected !== undefined ? expected.has(status) : status >= 200 && status < 300),
           status,
           latencyMs: Date.now() - startedAt,
           ...(token.token === "" ? {} : { authenticated: carriesToken }),
+          ...(corrupt !== undefined ? { error: corrupt } : {}),
         };
       } catch (err) {
         if (err instanceof ObsRefusedError) {

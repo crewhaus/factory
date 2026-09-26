@@ -11,13 +11,16 @@
  * to its vetted address.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { brotliCompressSync, createGzip } from "node:zlib";
+import { brotliCompressSync, createGzip, gzipSync } from "node:zlib";
+import { rateLimitStatus } from "./index";
 import {
   __setPrivateHostsAllowedForTest,
+  _resetCodehostConfig,
   _setDnsLookup,
   buildCodehostConfig,
   openRequest,
   readCapped,
+  registerCodehostConfig,
 } from "./net";
 
 async function gzipBomb(mib: number): Promise<Uint8Array> {
@@ -35,6 +38,13 @@ async function gzipBomb(mib: number): Promise<Uint8Array> {
 }
 
 let bomb: Uint8Array;
+/** A gzip body with its middle bytes flipped: the decoder fails partway through. */
+const corrupt = (() => {
+  const gz = Uint8Array.from(gzipSync(JSON.stringify({ filler: "x ".repeat(20_000) })));
+  const mid = Math.floor(gz.length / 2);
+  for (let i = mid; i < mid + 8; i++) gz[i] = (gz[i] as number) ^ 0xff;
+  return gz;
+})();
 let server: ReturnType<typeof Bun.serve>;
 let port = 0;
 let acceptEncodings: Array<string | null> = [];
@@ -53,7 +63,22 @@ beforeAll(async () => {
           headers: { "content-encoding": "br" },
         });
       }
-      return new Response("not really compressed", { headers: { "content-encoding": "compress" } });
+      if (path === "/corrupt/rate_limit") {
+        // Corrupt in the middle: the runtime's zlib emits `error` there and
+        // never calls the write callback, which hung the reader (net review).
+        return new Response(corrupt, {
+          headers: { "content-encoding": "gzip", "content-type": "application/json" },
+        });
+      }
+      if (path === "/crlf/rate_limit") {
+        const gz = gzipSync(
+          JSON.stringify({ resources: { core: { limit: 5, remaining: 4, used: 1, reset: 1 } } }),
+        );
+        return new Response(new Uint8Array(Buffer.concat([gz, Buffer.from("\r\n")])), {
+          headers: { "content-encoding": "gzip", "content-type": "application/json" },
+        });
+      }
+      return new Response("not really compressed", { headers: { "content-encoding": "gzip, br" } });
     },
   });
   port = server.port ?? 0;
@@ -111,12 +136,39 @@ describe("a compressed body costs at most its cap", () => {
     expect(body).toEqual({ text: "hello br", bytes: 8, truncated: false });
   });
 
-  test("a coding the reader cannot bound is refused without quoting the body", async () => {
+  test("net-review#critical: a codehost read of a corrupt gzip reply fails at once, well inside its deadline", async () => {
+    const origin = `http://127.0.0.1:${port}`;
+    process.env["CREWHAUS_TEST_BOUNDED_TOKEN"] = ["tok", "en-for-a-local-server"].join("");
+    registerCodehostConfig({
+      allowed_origins: [origin],
+      base_url: origin,
+      token_env: "CREWHAUS_TEST_BOUNDED_TOKEN",
+    });
+    try {
+      // The deadline is the tool's own 30 s default: before the fix this call
+      // never returned at all.
+      const out = String(
+        await rateLimitStatus.execute({ baseUrl: `${origin}/corrupt` }, {} as never),
+      );
+      expect(out).toBe(
+        "the body is labelled as compressed but could not be decoded, so it was not read",
+      );
+      const padded = JSON.parse(
+        String(await rateLimitStatus.execute({ baseUrl: `${origin}/crlf` }, {} as never)),
+      );
+      expect(padded.resources.core).toMatchObject({ limit: 5, remaining: 4 });
+    } finally {
+      _resetCodehostConfig();
+      Reflect.deleteProperty(process.env, "CREWHAUS_TEST_BOUNDED_TOKEN");
+    }
+  }, 40_000);
+
+  test("a stack of codings the reader cannot bound is refused without quoting the body", async () => {
     const err = await get(`http://127.0.0.1:${port}`, "/odd", 1024).then(
       () => null,
       (e: unknown) => e as Error,
     );
-    expect(err?.message).toContain("content-encoding this tool cannot decode");
+    expect(err?.message).toContain("content-encodings this tool cannot decode");
     expect(err?.message).not.toContain("not really compressed");
   });
 });

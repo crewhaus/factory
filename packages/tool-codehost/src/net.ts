@@ -1149,7 +1149,7 @@ export async function readCapped(
     }
     case "unsupported-encoding":
       throw new CodehostPermissionError(
-        "the server sent the body in a content-encoding this tool cannot decode within its byte cap, so it was not read",
+        "the server sent the body in a stack of content-encodings this tool cannot decode within its byte cap, so it was not read",
       );
     case "decode-error":
     case "auto-decompressed":

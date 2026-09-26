@@ -148,7 +148,14 @@ Measured on Bun 1.3.14: unless a request passes `decompress: false`, `fetch` inf
 
 The bound therefore has to start at the request. Fetch with `fetchRaw(input, init)`, or with `withRawBody(init)` as the init of the **final** `fetch` call. Bun ignores `decompress` inside a `Request`'s own init, so `fetch(new Request(url, withRawBody({})))` is inflated anyway; a pinned-fetch helper that passes a `Request` should call `fetchRaw(request)`. This reader then decodes the body itself, stopping the decoder once `maxBytes` of decoded output exist. Against 1 GiB bombs it decoded the cap plus one 16 KiB chunk, with peak RSS up about 20–25 MB, in all four codings. Without the raw body, the same bombs cost +1.5 GB (gzip) and +3.5 GB (br) before any reader saw them.
 
-Every read is raced against `signal` and `idleTimeoutMs`, so a server that sends one chunk and stalls cannot hold the reader: it ends as `aborted` or `stalled`.
+Every read, and every decoder step, is raced against `signal` and `idleTimeoutMs`, so a server that sends one chunk and stalls cannot hold the reader: it ends as `aborted` or `stalled`. A corrupt compressed body ends as `decode-error`. The runtime's zlib emits `error` on corrupt input and never calls the write callback, so a decoder step settles on either.
+
+What counts as the body:
+
+- **gzip.** The first member. Its header and trailer are parsed here, and its CRC-32 and length are checked. Bytes after the member are not read: a stray CRLF, NUL padding or a second member. Bun's own fetch decoder, curl and browsers read a gzip body the same way.
+- **deflate, br and zstd.** The body ends where the encoded data ends.
+- **A label that names no coding** (`none`, `utf-8`, `binary`). The body is read as it arrived, under the same cap, and the label is reported in `undecodedEncoding`.
+- **A stack that includes a real compression** (`gzip, br`). Refused with `unsupported-encoding`.
 
 `decodeBody(res, options)` yields the decoded chunks as they are produced, at most `maxBytes` in all, and sets `outcome` when the iteration ends. Use it for a reader that works as bytes arrive: `SseRead` feeds each chunk to its event decoder, and a large `DownloadFile` writes each chunk to a `beginAtomicWrite` writer instead of holding the body. `readResponseBounded` is `decodeBody`, collected.
 

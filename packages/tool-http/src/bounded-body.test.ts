@@ -37,6 +37,15 @@ async function gzipBomb(mib: number): Promise<Uint8Array> {
 }
 
 let bomb: Uint8Array;
+/** A gzip body with its middle bytes flipped: the decoder fails partway through. */
+const corrupt = (() => {
+  const gz = Uint8Array.from(
+    gzipSync("data: a corrupt stream, long enough to corrupt\n\n".repeat(400)),
+  );
+  const mid = Math.floor(gz.length / 2);
+  for (let i = mid; i < mid + 8; i++) gz[i] = (gz[i] as number) ^ 0xff;
+  return gz;
+})();
 let server: ReturnType<typeof Bun.serve>;
 let port = 0;
 let acceptEncodings: Array<string | null> = [];
@@ -62,7 +71,26 @@ beforeAll(async () => {
           headers: { "content-encoding": "gzip", "content-type": "text/event-stream" },
         });
       }
-      return new Response("not really compressed", { headers: { "content-encoding": "compress" } });
+      if (path === "/corrupt" || path === "/sse-corrupt") {
+        // Corrupt in the middle: the runtime's zlib emits `error` there and
+        // never calls the write callback, which hung the reader (net review).
+        return new Response(corrupt, {
+          headers: {
+            "content-encoding": "gzip",
+            "content-type": path === "/corrupt" ? "application/json" : "text/event-stream",
+          },
+        });
+      }
+      if (path === "/gzip-crlf") {
+        const gz = gzipSync('{"ok":true}');
+        return new Response(new Uint8Array(Buffer.concat([gz, Buffer.from("\r\n")])), {
+          headers: { "content-encoding": "gzip", "content-type": "application/json" },
+        });
+      }
+      if (path === "/none") {
+        return new Response("labelled, not encoded", { headers: { "content-encoding": "none" } });
+      }
+      return new Response("not really compressed", { headers: { "content-encoding": "gzip, br" } });
     },
   });
   port = server.port ?? 0;
@@ -139,11 +167,49 @@ describe("a compressed body costs at most its cap", () => {
     expect(out.bytes).toBeLessThanOrEqual(4096);
   }, 20_000);
 
-  test("a coding the reader cannot bound is refused without quoting the body", async () => {
+  test("net-review#critical: a corrupt gzip body fails at once, well inside the deadline", async () => {
+    // The deadline is long on purpose: before the fix these calls never
+    // returned at all, and a deadline answer here would mean the read hung.
+    const origin = `http://127.0.0.1:${port}`;
+    registerHttpConfig({ allowed_origins: [origin] });
+    const request = String(
+      await httpRequest.execute({ url: `${origin}/corrupt`, timeoutMs: 10_000 }),
+    );
+    expect(request).toBe(
+      "the body is labelled as compressed but could not be decoded, so it was not read",
+    );
+    const sse = String(
+      await sseRead.execute({ url: `${origin}/sse-corrupt`, timeoutMs: 10_000, maxEvents: 1000 }),
+    );
+    expect(sse).toBe(
+      "the body is labelled as compressed but could not be decoded, so it was not read",
+    );
+  }, 30_000);
+
+  test("net-review: a gzip body followed by a stray CRLF is read, as 0.7.0 read it", async () => {
+    const origin = `http://127.0.0.1:${port}`;
+    registerHttpConfig({ allowed_origins: [origin] });
+    const out = JSON.parse(
+      String(await httpRequest.execute({ url: `${origin}/gzip-crlf`, parseJson: true })),
+    );
+    expect(out.json).toEqual({ ok: true });
+  });
+
+  test("net-review: a Content-Encoding that names no coding is read as it is, and reported", async () => {
+    const origin = `http://127.0.0.1:${port}`;
+    registerHttpConfig({ allowed_origins: [origin] });
+    const out = JSON.parse(String(await httpRequest.execute({ url: `${origin}/none` })));
+    expect(out).toMatchObject({ body: "labelled, not encoded", undecodedEncoding: "none" });
+    // A body with no such label carries no such field, as in 0.7.0.
+    const plain = JSON.parse(String(await httpRequest.execute({ url: `${origin}/br` })));
+    expect(Object.hasOwn(plain, "undecodedEncoding")).toBe(false);
+  });
+
+  test("a stack of codings the reader cannot bound is refused without quoting the body", async () => {
     const origin = `http://127.0.0.1:${port}`;
     registerHttpConfig({ allowed_origins: [origin] });
     const out = String(await httpRequest.execute({ url: `${origin}/odd` }));
-    expect(out).toContain("content-encoding this tool cannot decode");
+    expect(out).toContain("content-encodings this tool cannot decode");
     expect(out).not.toContain("not really compressed");
   });
 });

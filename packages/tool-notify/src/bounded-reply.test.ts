@@ -66,7 +66,7 @@ beforeAll(async () => {
       }
       if (path.startsWith("/compress")) {
         return new Response("not really compressed", {
-          headers: { "content-encoding": "compress" },
+          headers: { "content-encoding": "gzip, br" },
         });
       }
       return new Response(JSON.stringify({ ok: true }), {
@@ -152,13 +152,13 @@ describe("a compressed reply costs at most its cap (C086)", () => {
     expect(JSON.parse(String(out)).deliveryStatus).toBe("delivered");
   });
 
-  test("a coding the reader cannot bound is refused without quoting the reply", async () => {
+  test("a stack of codings the reader cannot bound is refused without quoting the reply", async () => {
     const out = String(
       await deliveryCheck.execute({ provider: "odd", messageId: "m1" }, {
         toolConfig: configFor(`http://127.0.0.1:${port}`),
       } as never),
     );
-    expect(out).toContain("content-encoding this tool cannot decode");
+    expect(out).toContain("content-encodings this tool cannot decode");
     expect(out).not.toContain("not really compressed");
   });
 });

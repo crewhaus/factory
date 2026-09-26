@@ -457,6 +457,8 @@ export const httpRequest: RegisteredTool = buildTool({
           headers: responseHeaders(opened.res),
           bytes: body.bytes,
           truncated: body.truncated,
+          // Only when the server labelled the body with a coding it is not in.
+          ...(body.undecodedEncoding !== null ? { undecodedEncoding: body.undecodedEncoding } : {}),
           requestHeaders: redactHeaders(prepared.headers, prepared.secretHeaders),
           elapsedMs: Date.now() - startedAt,
           ...(parsed !== undefined ? { json: parsed.value } : { body: body.text }),

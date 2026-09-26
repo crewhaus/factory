@@ -1233,6 +1233,11 @@ export type CappedBody = {
   readonly bytes: number;
   /** True when the cap cut the read short; `text` is the prefix that fit. */
   readonly truncated: boolean;
+  /**
+   * A `Content-Encoding` label that names no coding (`none`, `utf-8`): the
+   * body was read as it arrived rather than decoded. Null otherwise.
+   */
+  readonly undecodedEncoding: string | null;
 };
 
 /**
@@ -1247,20 +1252,35 @@ export async function readCapped(
   signal?: AbortSignal,
 ): Promise<CappedBody> {
   const raw = await readBytesCapped(res, maxBytes, signal);
-  return { text: raw.text, bytes: raw.bytes.byteLength, truncated: raw.truncated };
+  return {
+    text: raw.text,
+    bytes: raw.bytes.byteLength,
+    truncated: raw.truncated,
+    undecodedEncoding: raw.undecodedEncoding,
+  };
 }
 
 export async function readBytesCapped(
   res: Response,
   maxBytes: number,
   signal?: AbortSignal,
-): Promise<{ bytes: Uint8Array; text: string; truncated: boolean }> {
+): Promise<{
+  bytes: Uint8Array;
+  text: string;
+  truncated: boolean;
+  undecodedEncoding: string | null;
+}> {
   const read = await readResponseBounded(res, {
     maxBytes,
     ...(signal !== undefined ? { signal } : {}),
   });
   if (!read.ok) throw bodyFailure(read);
-  return { bytes: read.bytes, text: read.text, truncated: read.truncated };
+  return {
+    bytes: read.bytes,
+    text: read.text,
+    truncated: read.truncated,
+    undecodedEncoding: read.undecodedEncoding,
+  };
 }
 
 /**
@@ -1279,7 +1299,7 @@ export function bodyFailure(failure: ResponseReadFailure): Error {
     }
     case "unsupported-encoding":
       return new HttpPermissionError(
-        "the server sent the body in a content-encoding this tool cannot decode within its byte cap, so it was not read",
+        "the server sent the body in a stack of content-encodings this tool cannot decode within its byte cap, so it was not read",
       );
     case "decode-error":
     case "auto-decompressed":

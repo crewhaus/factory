@@ -1436,7 +1436,7 @@ export async function readCapped(
     }
     case "unsupported-encoding":
       throw new NotifyPermissionError(
-        "the endpoint sent its reply in a content-encoding this tool cannot decode within its byte cap, so the reply was not read",
+        "the endpoint sent its reply in a stack of content-encodings this tool cannot decode within its byte cap, so the reply was not read",
       );
     case "decode-error":
     case "auto-decompressed":

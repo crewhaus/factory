@@ -87,6 +87,13 @@ export class ObsRefusedError extends ObsPermissionError {
  */
 export class ObsUnresolvedError extends ObsPermissionError {}
 
+/**
+ * The body is labelled as compressed but is not: corrupt, cut short, or
+ * decoded once already. Unlike a refusal, this is a fact about the endpoint:
+ * any client reading that reply would fail too.
+ */
+export class ObsCorruptBodyError extends ObsPermissionError {}
+
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 600_000;
 export const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
@@ -1162,11 +1169,11 @@ export async function readCapped(
     }
     case "unsupported-encoding":
       throw new ObsPermissionError(
-        "the server sent the body in a content-encoding this tool cannot decode within its byte cap, so it was not read",
+        "the server sent the body in a stack of content-encodings this tool cannot decode within its byte cap, so it was not read",
       );
     case "decode-error":
     case "auto-decompressed":
-      throw new ObsPermissionError(
+      throw new ObsCorruptBodyError(
         "the body is labelled as compressed but could not be decoded, so it was not read",
       );
     default:

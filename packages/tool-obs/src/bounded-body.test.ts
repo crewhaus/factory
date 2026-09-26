@@ -11,13 +11,16 @@
  * to its vetted address.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { brotliCompressSync, createGzip } from "node:zlib";
+import { brotliCompressSync, createGzip, gzipSync } from "node:zlib";
+import { healthProbe } from "./index";
 import {
   __setPrivateHostsAllowedForTest,
+  _resetObsConfig,
   _setDnsLookup,
   buildObsConfig,
   openRequest,
   readCapped,
+  registerObsConfig,
 } from "./net";
 
 async function gzipBomb(mib: number): Promise<Uint8Array> {
@@ -35,6 +38,15 @@ async function gzipBomb(mib: number): Promise<Uint8Array> {
 }
 
 let bomb: Uint8Array;
+/**
+ * A gzip body corrupt early in its deflate data, so the decoder fails before
+ * HealthProbe's default 2 KiB cap would have stopped it.
+ */
+const corrupt = (() => {
+  const gz = Uint8Array.from(gzipSync("healthy ".repeat(2000)));
+  for (let i = 20; i < 40; i++) gz[i] = (gz[i] as number) ^ 0xff;
+  return gz;
+})();
 let server: ReturnType<typeof Bun.serve>;
 let port = 0;
 let acceptEncodings: Array<string | null> = [];
@@ -53,7 +65,22 @@ beforeAll(async () => {
           headers: { "content-encoding": "br" },
         });
       }
-      return new Response("not really compressed", { headers: { "content-encoding": "compress" } });
+      if (path === "/corrupt") {
+        return new Response(corrupt, {
+          headers: { "content-encoding": "gzip", "content-type": "text/plain" },
+        });
+      }
+      if (path === "/gzip-crlf") {
+        return new Response(
+          new Uint8Array(Buffer.concat([gzipSync("healthy"), Buffer.from("\r\n")])),
+          { headers: { "content-encoding": "gzip" } },
+        );
+      }
+      if (path === "/none") {
+        return new Response("labelled, not encoded", { headers: { "content-encoding": "none" } });
+      }
+      if (path === "/good") return new Response("ok");
+      return new Response("not really compressed", { headers: { "content-encoding": "gzip, br" } });
     },
   });
   port = server.port ?? 0;
@@ -111,12 +138,46 @@ describe("a compressed body costs at most its cap", () => {
     expect(body).toEqual({ text: "hello br", bytes: 8, truncated: false });
   });
 
-  test("a coding the reader cannot bound is refused without quoting the body", async () => {
+  test("net-review#critical: HealthProbe reports a corrupt gzip reply as unhealthy, well inside its deadline", async () => {
+    // Before the fix the corrupt body hung the reader past deadlineMs, which
+    // is meant to bound the WHOLE sweep. The deadline is long on purpose: a
+    // skipped or deadline answer here would mean the read hung.
+    const origin = `http://127.0.0.1:${port}`;
+    registerObsConfig({ allowed_origins: [origin] });
+    try {
+      const out = JSON.parse(
+        String(
+          await healthProbe.execute(
+            { urls: [`${origin}/good`, `${origin}/corrupt`], deadlineMs: 10_000, method: "GET" },
+            {} as never,
+          ),
+        ),
+      );
+      expect(out).toMatchObject({ probed: 2, healthy: 1, unhealthy: 1, skipped: 0 });
+      const bad = out.probes.find((p: { url: string }) => p.url.endsWith("/corrupt"));
+      expect(bad).toMatchObject({
+        ok: false,
+        status: 200,
+        error: "the body is labelled as compressed but could not be decoded, so it was not read",
+      });
+    } finally {
+      _resetObsConfig();
+    }
+  }, 30_000);
+
+  test("net-review: a gzip reply with a stray CRLF, or a label that names no coding, is read", async () => {
+    const crlf = await get(`http://127.0.0.1:${port}`, "/gzip-crlf", 1024);
+    expect(crlf).toEqual({ text: "healthy", bytes: 7, truncated: false });
+    const none = await get(`http://127.0.0.1:${port}`, "/none", 1024);
+    expect(none).toEqual({ text: "labelled, not encoded", bytes: 21, truncated: false });
+  });
+
+  test("a stack of codings the reader cannot bound is refused without quoting the body", async () => {
     const err = await get(`http://127.0.0.1:${port}`, "/odd", 1024).then(
       () => null,
       (e: unknown) => e as Error,
     );
-    expect(err?.message).toContain("content-encoding this tool cannot decode");
+    expect(err?.message).toContain("content-encodings this tool cannot decode");
     expect(err?.message).not.toContain("not really compressed");
   });
 });
