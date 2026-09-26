@@ -387,6 +387,26 @@ describe("lookup helpers", () => {
     expect(categoriesForTool("definitelyNotATool")).toEqual([]);
     expect(categoriesForTool("constructor")).toEqual([]);
   });
+
+  // docs-claims#14 — the docstrings said "leaf first", and the order was
+  // alphabetical: gitCommit read `code, git`.
+  test("categoriesForTool lists the owning leaf first, then the roll-ups alphabetically", () => {
+    expect(categoriesForTool("gitCommit")).toEqual(["git", "code"]);
+    expect(categoriesForTool("abiDecode")).toEqual(["onchain", "chain", "compute"]);
+    const leaves = new Set(leafCategories());
+    const all = allRegisteredTools();
+    expect(all.length).toBeGreaterThanOrEqual(500);
+    const bad = all.filter((k) => {
+      const cats = categoriesForTool(k);
+      const rollUps = cats.slice(1);
+      return (
+        !leaves.has(cats[0] ?? "") ||
+        rollUps.some((c) => leaves.has(c)) ||
+        rollUps.join() !== [...rollUps].sort().join()
+      );
+    });
+    expect(bad).toEqual([]);
+  });
 });
 
 // C038 — the `network` roll-up was titled "Everything that reaches the

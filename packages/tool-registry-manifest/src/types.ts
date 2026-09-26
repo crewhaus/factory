@@ -41,7 +41,11 @@ export type RegistryEntry = {
    * acts.
    */
   readonly operativeArgs?: ReadonlyArray<RegistryOperativeArg>;
-  /** Leaf category first, then every roll-up that reaches it. */
+  /**
+   * The leaf category that owns the tool first, then every roll-up that
+   * reaches it, alphabetically — so `categories[0]` is the narrowest
+   * `all-<category>` grant that includes it.
+   */
   readonly categories: ReadonlyArray<string>;
   /** The `@crewhaus/tool-*` package that exports it. */
   readonly package: string;

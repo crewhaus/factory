@@ -288,17 +288,19 @@ export function allRegisteredTools(): ReadonlyArray<string> {
   return [...out].sort();
 }
 
-/** Which categories own a given tool key. Leaves first, then roll-ups. */
+/**
+ * Which categories own a given tool key: the leaf that lists it first (a
+ * builtin is in exactly one leaf), then every roll-up that reaches it,
+ * alphabetically. So `categories[0]` is the narrowest grant — `tools show`
+ * and the tool manifest both print this order (docs-claims#14).
+ */
 export function categoriesForTool(key: string): ReadonlyArray<string> {
-  const out: string[] = [];
-  for (const name of Object.keys(CATEGORIES).sort()) {
-    let owns = false;
+  const owns = (name: string): boolean => {
     try {
-      owns = toolsInCategory(name).includes(key);
+      return toolsInCategory(name).includes(key);
     } catch {
-      owns = false;
+      return false;
     }
-    if (owns) out.push(name);
-  }
-  return out;
+  };
+  return [...leafCategories().filter(owns), ...rollUpCategories().filter(owns)];
 }

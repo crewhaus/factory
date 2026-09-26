@@ -5,6 +5,7 @@
  * than the real builtin set (which `tool-registry.test.ts` covers).
  */
 import { describe, expect, test } from "bun:test";
+import { categoriesForTool } from "@crewhaus/tool-categories";
 import { z } from "zod";
 import {
   type ToolLike,
@@ -175,6 +176,17 @@ describe("formatToolDetailLines", () => {
 
   test("a key the builtin table does not know says nothing about shapes", () => {
     expect(text).not.toContain("runs on");
+  });
+
+  // docs-claims#14 — the real resolver put the roll-up first (`all-code,
+  // all-git`); the tool's own category now leads.
+  test("the tool's own category comes first, then the roll-ups", () => {
+    const detail = buildToolDetail(
+      "gitCommit",
+      { gitCommit: TOOL_MAP.writeIt as ToolLike },
+      categoriesForTool,
+    ) as NonNullable<ReturnType<typeof buildToolDetail>>;
+    expect(formatToolDetailLines(detail)).toContain("  categories  all-git, all-code");
   });
 });
 
