@@ -8,6 +8,14 @@
  * payload, but the second pass is the §41 "double-classify when in
  * doubt" stance: zero-cost cache hit + defense in depth.
  *
+ * Permission rules scope these tools by chain AND contract, account or
+ * transaction: a rule's argument is `<chainId>/<address-or-hash>`, so
+ * `EvmCall(1/0xdAC17F…)` is USDT on mainnet, `EvmCall(**0xdAC17F…)` is that
+ * address on any chain, and `EvmGetLogs(1/*)` every log query on mainnet.
+ * A bare `EvmCall(0xdAC17F…)` or `EvmGetLogs(*)` matches nothing — `*` does
+ * not cross the `/`; write `**` for "any". A deny or ask ignores the letter
+ * case of the hex (EIP-55 case is only a checksum).
+ *
  * Read-only is not offline: every call sends its arguments (EvmCall's
  * calldata among them) to the chain's RPC endpoint. So every tool is
  * `scope: "external"` with `ioCapability: "network"`, which is what puts
@@ -146,7 +154,10 @@ const getLogsSchema = z.object({
 
 export const evmGetLogs: RegisteredTool = buildTool({
   name: "EvmGetLogs",
-  operativeArgs: [{ field: "address", kind: "id", within: "chainId" }],
+  // A call without `address` reads EVERY contract's logs, the broadest query
+  // there is, so it must carry a value a rule can see: it is matched as
+  // `<chainId>/*`, which `EvmGetLogs(1/*)` and `EvmGetLogs(**)` cover.
+  operativeArgs: [{ field: "address", kind: "id", within: "chainId", default: "*" }],
   description:
     "Fetch event logs matching the given filter. Returns an array of decoded log entries. The agent should normally request a bounded block range (≤ 5000 blocks) to avoid timeouts.",
   inputSchema: getLogsSchema,

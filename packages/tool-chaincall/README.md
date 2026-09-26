@@ -252,6 +252,15 @@ A tool that cannot say no is not finished. These say no, with the reason:
   lowercase address is answered, with `checksumVerified: false` attached,
   because EIP-55 can only verify a checksum that is there.
 
+## Permission rules
+
+A rule's argument for these tools is `<chainId>/<address>`, the chain first:
+`EvmMulticall(8453/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)` is one contract
+on Base, and `ContractInspect(**0x8335…)` that address on any chain. `*` does
+not cross the `/`, so a bare `ContractInspect(*)` or `ContractInspect(0x8335…)`
+matches nothing — write `**` for "any". A deny or ask ignores the letter case
+of the hex: an EIP-55 address and its lower-case spelling are one account.
+
 ## Numbers
 
 No chain quantity is ever a JS number. Wei, balances, gas and block numbers

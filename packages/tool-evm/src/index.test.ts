@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
 import { auditToolScopes } from "@crewhaus/tool-builder";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { preparePermissionSubject } from "@crewhaus/tool-executor";
+import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { EVM_TOOL_MAP, bindEvmChains, setEvmAdapterResolver } from "./index";
 
 type Call = { method: string; params: ReadonlyArray<unknown> };
@@ -295,5 +298,55 @@ describe("requireAdapter — unbound resolver branch", () => {
     await expect(EVM_TOOL_MAP.evmBlockNumber.execute({ chainId: "base-mainnet" })).rejects.toThrow(
       /EvmBlockNumber: no chain is configured\. Declare one in the spec — chains: \[/,
     );
+  });
+});
+
+describe("tool-evm: what a permission rule sees (review of 544b042d)", () => {
+  const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+  /** Would a deny or ask with `pattern` fire on this call, as the runtime prepares it? */
+  function restricts(tool: RegisteredTool, pattern: string, input: unknown): boolean {
+    const subject = preparePermissionSubject(tool, input);
+    if (!subject.ok) throw new Error(subject.reason);
+    return matchesPattern(compilePattern(pattern), tool.name, subject.input, {
+      polarity: "restrict",
+      ...(subject.operativeValues !== undefined
+        ? { operativeValues: subject.operativeValues }
+        : {}),
+    });
+  }
+
+  test("EvmGetLogs without an address carries <chainId>/*, so a chain-wide deny fires", () => {
+    const all = { chainId: "1", fromBlock: "0x1", toBlock: "0x2" };
+    // 544b042d left it with no value at all, which no argument-scoped rule of
+    // either polarity can match — the broadest query ran past every one.
+    for (const pattern of ["EvmGetLogs(1/*)", "EvmGetLogs(**)", "EvmGetLogs(*/*)"]) {
+      expect({ pattern, fires: restricts(EVM_TOOL_MAP.evmGetLogs, pattern, all) }).toEqual({
+        pattern,
+        fires: true,
+      });
+    }
+    expect(restricts(EVM_TOOL_MAP.evmGetLogs, "EvmGetLogs(8453/*)", all)).toBe(false);
+    // A rule about one contract is about that contract.
+    expect(restricts(EVM_TOOL_MAP.evmGetLogs, `EvmGetLogs(1/${USDT})`, all)).toBe(false);
+    expect(
+      restricts(EVM_TOOL_MAP.evmGetLogs, `EvmGetLogs(1/${USDT})`, { ...all, address: USDT }),
+    ).toBe(true);
+  });
+
+  test("the hex in a rule and in a call may differ in case", () => {
+    const call = (to: string) => ({ chainId: "1", to, data: "0x18160ddd" });
+    expect(restricts(EVM_TOOL_MAP.evmCall, `EvmCall(1/${USDT})`, call(USDT.toLowerCase()))).toBe(
+      true,
+    );
+    expect(restricts(EVM_TOOL_MAP.evmCall, `EvmCall(**${USDT.toLowerCase()})`, call(USDT))).toBe(
+      true,
+    );
+    const hash = `0x${"Ab".repeat(32)}`;
+    expect(
+      restricts(EVM_TOOL_MAP.evmGetTransaction, `EvmGetTransaction(1/${hash.toLowerCase()})`, {
+        chainId: "1",
+        txHash: hash,
+      }),
+    ).toBe(true);
   });
 });

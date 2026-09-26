@@ -420,6 +420,34 @@ describe("declared operative values", () => {
     expect(matchesPattern(p, "CopyPath", {}, { ...restrict, operativeValues: [b, a] })).toBe(true);
   });
 
+  test("a case-insensitive id fires a deny in any letter case; an allow still matches as written", () => {
+    // An address's EIP-55 mixed case is only a checksum: lower case is the
+    // same account, and must not dodge a deny written from a block explorer.
+    const lower: OperativeValue = {
+      kind: "id",
+      canonical: ["1/0xdac17f958d2ee523a2206206994597c13d831ec7"],
+      caseInsensitive: true,
+    };
+    const deny = compilePattern("EvmCall(*/0xdAC17F958D2ee523a2206206994597C13D831ec7)");
+    expect(matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [lower] })).toBe(
+      true,
+    );
+    expect(matchesPattern(deny, "EvmCall", {}, { ...allow, operativeValues: [lower] })).toBe(false);
+    // Without the mark, an id is compared as written, as before.
+    const plain: OperativeValue = { kind: "id", canonical: lower.canonical };
+    expect(matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [plain] })).toBe(
+      false,
+    );
+    // Folding widens only what a deny or ask catches, never what it names.
+    const other: OperativeValue = {
+      ...lower,
+      canonical: ["1/0xdac17f958d2ee523a2206206994597c13d831ec8"],
+    };
+    expect(matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [other] })).toBe(
+      false,
+    );
+  });
+
   test("non-path values are not filtered by absoluteness", () => {
     const cmd: OperativeValue = { kind: "command", canonical: ["/bin/ls -la"] };
     expect(

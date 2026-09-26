@@ -173,6 +173,40 @@ describe("url, command and id values", () => {
     expect(readOperativeField({ repo: "factory" }, repo)).toEqual(["factory"]);
   });
 
+  test("a 0x hex id is marked case-insensitive; other ids and commands are not", () => {
+    const tool = buildTool({
+      name: "Read0x",
+      description: "d",
+      inputSchema: z.object({
+        chainId: z.string(),
+        to: z.string(),
+        label: z.string(),
+        argv: z.array(z.string()),
+      }),
+      operativeArgs: [
+        { field: "to", kind: "id", within: "chainId" },
+        { field: "label", kind: "recipient" },
+        { field: "argv", kind: "command" },
+      ],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    const hex = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+    const values = operativeValuesFor(tool, { chainId: "1", to: hex, label: hex, argv: [hex] });
+    expect(values?.map((v) => [v.kind, v.caseInsensitive === true])).toEqual([
+      ["id", true],
+      ["recipient", true],
+      ["command", false],
+    ]);
+    const words = operativeValuesFor(tool, {
+      chainId: "1",
+      to: "USDC",
+      label: "0xnothex",
+      argv: [],
+    });
+    expect(words?.map((v) => v.caseInsensitive === true)).toEqual([false, false]);
+  });
+
   test("a path within a directory field is resolved from that directory", () => {
     const tool = buildTool({
       name: "Stage",

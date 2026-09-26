@@ -2657,6 +2657,10 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
+      },
     },
     "packages/tool-evm-tx": {
       "name": "@crewhaus/tool-evm-tx",

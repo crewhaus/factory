@@ -30,6 +30,9 @@
  *      word is kept as another spelling, so a deny or ask rule naming one
  *      word (`RunCommand(rm)`) still fires on the whole argv.
  *    - a field declared `within` another is written `<qualifier>/<value>`.
+ *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
+ *      hash) is marked `caseInsensitive`: its letter case is at most an
+ *      EIP-55 checksum, so a deny or ask rule must not be dodged by it.
  *    A tool that declares `[]` has no field that decides where it acts, and
  *    is matched on its string values like a tool that declares nothing.
  *
@@ -136,12 +139,16 @@ export function operativeValuesOf(
             kind: arg.kind,
             canonical: [raw],
             ...(words !== undefined ? { spellings: words } : {}),
+            ...(arg.kind !== "command" && HEX_ID.test(raw) ? { caseInsensitive: true } : {}),
           });
       }
     }
   }
   return values;
 }
+
+/** A value that ends in a `0x` hex id, after any `<qualifier>/`. */
+const HEX_ID = /(?:^|\/)0x[0-9a-fA-F]+$/;
 
 /** One value of a declared field; `words` is the argv it was joined from. */
 type FieldReading = { readonly value: string; readonly words?: ReadonlyArray<string> };
