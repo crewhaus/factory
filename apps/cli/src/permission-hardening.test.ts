@@ -311,6 +311,50 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
     expect(await gate("Read", { path: "./src/app.ts" }, readRules)).toBe("allow");
   }, 30_000);
 
+  test("a URL or recipient deny fires on every spelling of its destination (C004)", async () => {
+    // WebFetch is read-only, so auto mode runs it unasked: only the rule stands
+    // between the model and the host. Every spelling below is fetched from
+    // evil.example (or api.example/admin) by the tool.
+    const hostDeny = rules(["alwaysDeny", "WebFetch(https://evil.example/**)"]);
+    for (const url of [
+      "https://evil.example/exfil",
+      "https://x@evil.example/exfil",
+      "https://evil.example./exfil",
+      "http://evil.example:8080/exfil",
+    ]) {
+      expect({ url, decision: await gate("WebFetch", { url }, hostDeny, "auto") }).toEqual({
+        url,
+        decision: "deny",
+      });
+    }
+    const pathDeny = rules(["alwaysDeny", "WebFetch(https://api.example/admin/**)"]);
+    for (const url of ["https://api.example/%61dmin/users", "https://api.example//admin/users"]) {
+      expect({ url, decision: await gate("WebFetch", { url }, pathDeny, "auto") }).toEqual({
+        url,
+        decision: "deny",
+      });
+    }
+    const mailDeny = rules(["alwaysDeny", "EmailSend(ceo@corp.example)"]);
+    const mail = {
+      from: { address: "bot@corp.example" },
+      host: "smtp.corp.example",
+      subject: "s",
+      text: "t",
+      date: "2026-09-24T09:00:00Z",
+    };
+    for (const address of ["CEO@corp.example", "ceo@CORP.EXAMPLE", "ceo@corp.example."]) {
+      const input = { ...mail, to: [{ address }] };
+      expect({ address, decision: await gate("EmailSend", input, mailDeny) }).toEqual({
+        address,
+        decision: "deny",
+      });
+    }
+    // Control: a recipient the rule does not name is asked, not denied.
+    expect(
+      await gate("EmailSend", { ...mail, to: [{ address: "cfo@corp.example" }] }, mailDeny),
+    ).toBe("ask");
+  }, 30_000);
+
   test("Grep(src/**) is not satisfied by a regex that names src/", async () => {
     expect(
       await gate(

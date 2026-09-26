@@ -413,6 +413,14 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * deny or ask rule also compares a path in Unicode normal form C, so a name
  * spelled with a combining accent (`cafe` + U+0301) is the name spelled with
  * the precomposed one (`café`), as it is on macOS.
+ *
+ * A deny or ask rule is not dodged by another spelling of a URL, a
+ * recipient, an id or a command either: it also compares them folded, as
+ * the destination treats them (`restrictFolds`) — a URL without userinfo,
+ * root dot, fragment, port or percent-escapes, over http and https; an
+ * address in lower case without a `+tag`; an id or a program name in lower
+ * case. An allow rule reads only `canonical`, and never grants a URL that
+ * carries userinfo or an escaped `..`.
  */
 export type OperativeValue = {
   readonly kind: OperativeValueKind;
@@ -514,21 +522,189 @@ function foldPath(value: string, ignoreCase: boolean): string {
   return ignoreCase ? nfc.toLowerCase() : nfc;
 }
 
-/** Argument globs compiled in folded form, per pattern, built on first use. */
-const foldedArgGlobs = new WeakMap<CompiledPattern, Map<boolean, GlobMatcher>>();
+/**
+ * How a deny or ask rule's glob is folded before it is compared with a
+ * value's folded spellings: `nfc` keeps letter case (a path on a filesystem
+ * that tells case apart), `lower` also lower-cases.
+ */
+type GlobFold = "nfc" | "lower";
 
-function foldedArgMatcher(compiled: CompiledPattern, ignoreCase: boolean): GlobMatcher {
+/** Argument globs compiled in folded form, per pattern, built on first use. */
+const foldedArgGlobs = new WeakMap<CompiledPattern, Map<GlobFold, GlobMatcher>>();
+
+function foldedArgMatcher(compiled: CompiledPattern, fold: GlobFold): GlobMatcher {
   let byMode = foldedArgGlobs.get(compiled);
   if (byMode === undefined) {
     byMode = new Map();
     foldedArgGlobs.set(compiled, byMode);
   }
-  let matcher = byMode.get(ignoreCase);
+  let matcher = byMode.get(fold);
   if (matcher === undefined) {
-    matcher = compileGlob(foldPath(compiled.argGlob ?? "", ignoreCase));
-    byMode.set(ignoreCase, matcher);
+    matcher = compileGlob(foldPath(compiled.argGlob ?? "", fold === "lower"));
+    byMode.set(fold, matcher);
   }
   return matcher;
+}
+
+/** The escapes a server may decode into a path separator or a dot. */
+const SEPARATOR_OR_DOT_ESCAPE = /%(2[eEfF]|5[cC])/g;
+const UNRESERVED = /^[A-Za-z0-9\-._~]$/;
+
+/**
+ * The URL a request really goes to, spelled the one way: no userinfo, no
+ * root dot on the host, no fragment (it is never sent), unreserved `%XX`
+ * decoded, an escaped `/`, `\` or `.` decoded, repeated slashes collapsed and
+ * dot segments resolved. `undefined` when the value is not a URL.
+ */
+function requestUrl(raw: string): URL | undefined {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return undefined;
+  }
+  url.username = "";
+  url.password = "";
+  url.hash = "";
+  const host = url.hostname;
+  if (host.endsWith(".") && !host.startsWith("[")) {
+    const bare = host.replace(/\.+$/, "");
+    if (bare !== "") url.hostname = bare;
+  }
+  const path = url.pathname
+    .replace(/%([0-9A-Fa-f]{2})/g, (pct, hex: string) => {
+      const ch = String.fromCharCode(Number.parseInt(hex, 16));
+      return UNRESERVED.test(ch) ? ch : pct.toUpperCase();
+    })
+    .replace(SEPARATOR_OR_DOT_ESCAPE, (pct) => (pct.toUpperCase() === "%2E" ? "." : "/"))
+    .replace(/\/{2,}/g, "/");
+  // The setter parses the path again, so `a/../b` collapses to `b`.
+  url.pathname = path;
+  return url;
+}
+
+/** `href`, plus the slash-less spelling of a bare origin. */
+function hrefSpellings(url: URL): string[] {
+  const href = url.href;
+  const out = [href];
+  if (url.pathname === "/" && url.search === "" && href.endsWith("/")) out.push(href.slice(0, -1));
+  return out;
+}
+
+/**
+ * The spellings of one URL a deny or ask rule compares, lower-cased: as
+ * written, then as the request that is really made (see {@link requestUrl}),
+ * on any port, and over either of http and https — `https://evil.example/**`
+ * names a host, and the same host on another port or scheme is still it.
+ */
+function restrictUrlSpellings(raw: string): string[] {
+  const out = [raw];
+  const url = requestUrl(raw);
+  if (url !== undefined) {
+    out.push(...hrefSpellings(url));
+    if (url.port !== "") {
+      url.port = "";
+      out.push(...hrefSpellings(url));
+    }
+    const other =
+      url.protocol === "https:" ? "http:" : url.protocol === "http:" ? "https:" : undefined;
+    if (other !== undefined) {
+      url.protocol = other;
+      out.push(...hrefSpellings(url));
+    }
+  }
+  return out.map((s) => s.normalize("NFC").toLowerCase());
+}
+
+/**
+ * Can this URL satisfy an allow rule? Not when it carries userinfo (a
+ * credential the model put in an argument, and a way to make a URL read as
+ * another host), nor when an escaped separator or dot would climb out of
+ * the path a rule granted once a server decodes it (`/public/..%2Fadmin`).
+ */
+function urlGrantable(candidate: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(candidate);
+  } catch {
+    return true;
+  }
+  if (url.username !== "" || url.password !== "") return false;
+  const decoded = url.pathname.replace(SEPARATOR_OR_DOT_ESCAPE, (pct) =>
+    pct.toUpperCase() === "%2E" ? "." : "/",
+  );
+  return !decoded.split("/").some((segment) => segment === ".." || segment === ".");
+}
+
+const PHONE_SHAPED = /^\+?[\d\s().-]+$/;
+
+/**
+ * The spellings of one recipient a deny or ask rule compares, lower-cased: a
+ * host or an email domain names the same place with a root dot or in
+ * capitals, an address with a `+tag` reaches the mailbox without it at most
+ * providers, and a phone number is the same number with or without spaces,
+ * dashes and brackets.
+ */
+function restrictRecipientSpellings(raw: string): string[] {
+  const written = raw.normalize("NFC").toLowerCase().trim();
+  // `Name <addr>` is delivered to addr.
+  const bracketed = /<([^<>]*)>/.exec(written)?.[1]?.trim();
+  const out = [written];
+  if (bracketed !== undefined && bracketed !== "") out.push(bracketed);
+  const value = bracketed !== undefined && bracketed !== "" ? bracketed : written;
+  const at = value.lastIndexOf("@");
+  if (at > 0) {
+    const local = value.slice(0, at);
+    const domain = value.slice(at + 1).replace(/\.+$/, "");
+    out.push(`${local}@${domain}`);
+    const plus = local.indexOf("+");
+    if (plus > 0) out.push(`${local.slice(0, plus)}@${domain}`);
+  } else if (PHONE_SHAPED.test(value)) {
+    const digits = value.replace(/\D/g, "");
+    if (digits.length >= 5) out.push(`${value.startsWith("+") ? "+" : ""}${digits}`);
+  } else if (value.endsWith(".")) {
+    out.push(value.replace(/\.+$/, ""));
+  }
+  return out;
+}
+
+/**
+ * The folded spellings a deny or ask rule also compares for a value of this
+ * kind, with how the rule's glob is folded to meet them; `undefined` for a
+ * kind that is compared only as written.
+ *
+ * - `url`: see {@link restrictUrlSpellings}.
+ * - `recipient`: see {@link restrictRecipientSpellings}.
+ * - `id`: letter case ignored — an owner or repository on a code host, a
+ *   hex address on a chain, are the same whatever the case.
+ * - `command`: letter case ignored — a program named `RM` runs `rm` on a
+ *   filesystem that ignores case, which macOS's does by default.
+ */
+/** Each value's folds, worked out once however many rules read them. */
+const restrictFoldCache = new WeakMap<OperativeValue, string[] | undefined>();
+
+function restrictFoldsOf(value: OperativeValue): string[] | undefined {
+  if (restrictFoldCache.has(value)) return restrictFoldCache.get(value);
+  const folds = restrictFolds(value.kind, [...value.canonical, ...(value.spellings ?? [])]);
+  restrictFoldCache.set(value, folds);
+  return folds;
+}
+
+function restrictFolds(
+  kind: OperativeValueKind,
+  candidates: ReadonlyArray<string>,
+): string[] | undefined {
+  switch (kind) {
+    case "url":
+      return candidates.flatMap(restrictUrlSpellings);
+    case "recipient":
+      return candidates.flatMap(restrictRecipientSpellings);
+    case "id":
+    case "command":
+      return candidates.map((c) => c.normalize("NFC").toLowerCase());
+    default:
+      return undefined;
+  }
 }
 
 function valueMatches(
@@ -540,23 +716,34 @@ function valueMatches(
 ): boolean {
   if (value.outsideWorkspace === true) return polarity === "restrict";
   const candidates =
-    polarity === "allow" ? value.canonical : [...value.canonical, ...(value.spellings ?? [])];
+    polarity === "allow"
+      ? value.kind === "url"
+        ? value.canonical.filter(urlGrantable)
+        : value.canonical
+      : [...value.canonical, ...(value.spellings ?? [])];
   for (const candidate of candidates) {
     if (value.kind === "path" && isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
     if (argRe.test(candidate)) return true;
   }
+  if (polarity !== "restrict") return false;
   // A deny or ask on a path is not dodged by spelling the name another way
   // the filesystem treats as the same: another Unicode normal form always,
   // and another letter case where the filesystem ignores case.
-  if (polarity === "restrict" && value.kind === "path") {
+  if (value.kind === "path") {
     const ignoreCase = value.caseInsensitive === true;
-    const folded = foldedArgMatcher(compiled, ignoreCase);
+    const folded = foldedArgMatcher(compiled, ignoreCase ? "lower" : "nfc");
     for (const candidate of candidates) {
       if (isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
       if (folded.test(foldPath(candidate, ignoreCase))) return true;
     }
+    return false;
   }
-  return false;
+  // Nor is a deny or ask on a URL, a recipient, an id or a command dodged by
+  // another spelling of the same destination.
+  const folds = restrictFoldsOf(value);
+  if (folds === undefined) return false;
+  const folded = foldedArgMatcher(compiled, "lower");
+  return folds.some((candidate) => folded.test(candidate));
 }
 
 /**

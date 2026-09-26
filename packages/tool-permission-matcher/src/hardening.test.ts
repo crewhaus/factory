@@ -452,6 +452,108 @@ describe("declared operative values", () => {
 });
 
 // ---------------------------------------------------------------------------
+// C004 — a deny or ask on a URL, a recipient, an id or a command is not
+// dodged by another spelling of the same destination
+// ---------------------------------------------------------------------------
+
+describe("a restrict rule reads every spelling of a destination", () => {
+  // What the runtime hands the matcher for a URL: the WHATWG href.
+  const url = (raw: string): OperativeValue => ({
+    kind: "url",
+    canonical: [new URL(raw).href],
+    spellings: [raw],
+  });
+  const fires = (
+    pattern: string,
+    value: OperativeValue,
+    opts: { readonly polarity: "allow" | "restrict" } = restrict,
+  ) => matchesPattern(compilePattern(pattern), "T", {}, { ...opts, operativeValues: [value] });
+
+  test("a host deny fires on userinfo, a root dot, a port and the other scheme", () => {
+    const rule = "T(https://evil.example/**)";
+    const spellings = [
+      "https://evil.example/exfil",
+      "https://x@evil.example/exfil",
+      "https://user:pw@evil.example/exfil",
+      "https://evil.example./exfil",
+      "https://evil.example../exfil",
+      "https://evil.example:8443/exfil",
+      "http://evil.example/exfil",
+      "https://EVIL.Example/exfil#frag",
+    ];
+    const hits = spellings.filter((s) => fires(rule, url(s)));
+    expect(hits).toEqual(spellings);
+    // Control: another host is not caught by the folding.
+    expect(fires(rule, url("https://evil.example.org/exfil"))).toBe(false);
+    expect(fires(rule, url("https://good.example/evil.example/"))).toBe(false);
+  });
+
+  test("a path deny fires on an escaped letter, a doubled slash, a dot segment and case", () => {
+    const rule = "T(https://api.example/admin/**)";
+    const spellings = [
+      "https://api.example/admin/users",
+      "https://api.example/%61dmin/users",
+      "https://api.example//admin/users",
+      "https://api.example/public/..%2Fadmin/users",
+      "https://api.example/public/..%5cadmin/users",
+      "https://api.example/ADMIN/users",
+    ];
+    const hits = spellings.filter((s) => fires(rule, url(s)));
+    expect(hits).toEqual(spellings);
+    expect(fires(rule, url("https://api.example/administrator"))).toBe(false);
+    // A rule written in capitals meets the lower-case href too.
+    expect(fires("T(https://API.example/**)", url("https://api.example/x"))).toBe(true);
+  });
+
+  test("an allow never grants a URL with userinfo or an escaped climb out", () => {
+    expect(fires("T(https://*.example/**)", url("https://a.example/x"), allow)).toBe(true);
+    expect(fires("T(https://*/**)", url("https://u:p@a.example/x"), allow)).toBe(false);
+    expect(fires("T(https://a.example/public/**)", url("https://a.example/public/x"), allow)).toBe(
+      true,
+    );
+    expect(
+      fires("T(https://a.example/public/**)", url("https://a.example/public/..%2Fadmin"), allow),
+    ).toBe(false);
+    // An allow is not widened by the folding: a capitalised or dotted host is not granted.
+    expect(fires("T(https://a.example/**)", url("https://a.example./x"), allow)).toBe(false);
+  });
+
+  test("a recipient deny fires on case, a root dot, a +tag, a display name and phone punctuation", () => {
+    const mail = (raw: string): OperativeValue => ({ kind: "recipient", canonical: [raw] });
+    const rule = "T(ceo@corp.example)";
+    const spellings = [
+      "ceo@corp.example",
+      "CEO@corp.example",
+      "ceo@CORP.EXAMPLE",
+      "ceo@corp.example.",
+      "ceo+board@corp.example",
+      "The CEO <ceo@corp.example>",
+    ];
+    expect(spellings.filter((s) => fires(rule, mail(s)))).toEqual(spellings);
+    expect(fires(rule, mail("cfo@corp.example"))).toBe(false);
+    expect(fires(rule, mail("ceo@corp.example.org"))).toBe(false);
+    const phones = ["+15551234567", "+1 (555) 123-4567", "+1.555.123.4567"];
+    expect(phones.filter((s) => fires("T(+15551234567)", mail(s)))).toEqual(phones);
+    expect(fires("T(+15551234567)", mail("+15551234568"))).toBe(false);
+    expect(fires("T(db.corp.example)", mail("DB.Corp.Example."))).toBe(true);
+    // An allow compares only what was written.
+    expect(fires("T(*@corp.example)", mail("ops@CORP.example"), allow)).toBe(false);
+  });
+
+  test("an id or a program name is compared ignoring case", () => {
+    const id: OperativeValue = { kind: "id", canonical: ["CrewHaus/Factory"] };
+    expect(fires("T(crewhaus/factory)", id)).toBe(true);
+    expect(fires("T(crewhaus/factory)", id, allow)).toBe(false);
+    const cmd: OperativeValue = { kind: "command", canonical: ["RM -rf src"], spellings: ["RM"] };
+    expect(fires("T(rm)", cmd)).toBe(true);
+    expect(fires("T(rm)", cmd, allow)).toBe(false);
+    // `text` keeps its case: nothing says what reads it.
+    const text: OperativeValue = { kind: "text", canonical: ["Hello"] };
+    expect(fires("T(hello)", text)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // MCP names (flag-truth-1#1)
 // ---------------------------------------------------------------------------
 
