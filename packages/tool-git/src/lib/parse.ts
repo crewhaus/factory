@@ -492,8 +492,31 @@ const SSH_SCHEMES: ReadonlySet<string> = new Set(["ssh", "git+ssh", "ssh+git", "
  * scheme. scp-style `user@host:path`, local paths and `file://` carry no
  * credential and are left alone. Text surgery only: the host and path are
  * returned exactly as written.
+ *
+ * The whole userinfo of an http(s) URL goes, a plain user name included
+ * (`https://myorg@dev.azure.com/…` comes back as `https://***@…`): a bare
+ * token in the user position has no reliable shape (a classic 40-hex GitHub
+ * token, an Azure DevOps PAT), and hiding a user name costs a reader less
+ * than showing a token.
+ *
+ * git's remote-helper syntax, `<transport>::<address>`
+ * (`persistent-https::https://…`, `gcrypt::…`, `codecommit::…`), hands the
+ * address to `git-remote-<transport>`; the address is masked as a URL of
+ * its own and the prefix kept.
  */
 export function redactRemoteUrl(url: string): { readonly url: string; readonly redacted: boolean } {
+  const helper = REMOTE_HELPER_PREFIX.exec(url);
+  if (helper !== null) {
+    const inner = redactAddress(url.slice(helper[0].length));
+    return { url: `${helper[0]}${inner.url}`, redacted: inner.redacted };
+  }
+  return redactAddress(url);
+}
+
+/** `<transport>::` at the start of a remote URL, as git's transport layer reads it. */
+const REMOTE_HELPER_PREFIX = /^[A-Za-z0-9][A-Za-z0-9+.-]*::/;
+
+function redactAddress(url: string): { readonly url: string; readonly redacted: boolean } {
   const schemeEnd = url.indexOf("://");
   if (schemeEnd <= 0 || !/^[A-Za-z][A-Za-z0-9+.-]*$/.test(url.slice(0, schemeEnd))) {
     return { url, redacted: false };

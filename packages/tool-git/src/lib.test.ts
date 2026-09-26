@@ -363,6 +363,20 @@ describe("parseRemotes", () => {
       ["file:///x/r.git", "file:///x/r.git"],
       // An @ in the PATH is not userinfo.
       ["https://registry.example/@scope/pkg.git", "https://registry.example/@scope/pkg.git"],
+      // A plain user name goes too: a bare token in that position has no
+      // reliable shape (a classic 40-hex GitHub token, an Azure PAT).
+      ["https://myorg@dev.azure.com/myorg/p/_git/r", "https://***@dev.azure.com/myorg/p/_git/r"],
+      [`https://${"a1b2c3d4e5".repeat(4)}@github.com/o/r.git`, "https://***@github.com/o/r.git"],
+      // git's `<transport>::<address>` remote-helper syntax: the address is
+      // masked as a URL of its own, the prefix kept.
+      [
+        `persistent-https::https://oauth2:${glpat}@gitlab.com/o/r.git`,
+        "persistent-https::https://***@gitlab.com/o/r.git",
+      ],
+      [`gcrypt::https://u:pw@h.example/r.git`, "gcrypt::https://***@h.example/r.git"],
+      [`codecommit::https://${tok}@h.example/r`, "codecommit::https://***@h.example/r"],
+      ["gcrypt::rsync://h.example/r", "gcrypt::rsync://h.example/r"],
+      ["persistent-https::https://h.example/r.git", "persistent-https::https://h.example/r.git"],
     ];
     let masked = 0;
     for (const [input, want] of cases) {
@@ -374,7 +388,7 @@ describe("parseRemotes", () => {
       });
       if (want !== input) masked += 1;
     }
-    expect(masked).toBe(7);
+    expect(masked).toBe(12);
   });
 });
 

@@ -496,7 +496,7 @@ export const gitRemoteList: RegisteredTool = buildTool({
   name: "GitRemoteList",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote. A credential in a URL (a token or password before the @, a token query parameter) is replaced with ***, and that remote is marked credentialsRedacted, so a masked URL is not usable as-is.",
+    "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote. Everything before the @ in an http(s) URL (a user name, token or password: a bare token often sits in the user name) and a token query parameter are replaced with ***, an ssh URL keeps its login and loses only a password or token, and that remote is marked credentialsRedacted, so a masked URL is not usable as-is.",
   inputSchema: z.object({ cwd: cwdField, timeout: timeoutField }),
   ...READ_FLAGS,
   execute: async (input, ctx) => {
