@@ -208,6 +208,12 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     label: "ObjectPresign's credential profiles",
     keys: ["objectstore"],
   },
+  // Named only by the five rows that read a key (SignPayload, VerifyPayload,
+  // Pseudonymize, PiiRedact, RedactForExport). A block under another secure
+  // tool's key configures nothing and is reported unused, as on 0.7.0; when
+  // every row named it, `tool_config.piiScan` and `tool_config.secretScan`
+  // blocks that differed stopped compile, and `crewhaus tools show secretScan`
+  // said tool_config.secure configures it.
   registerSecureConfig: {
     package: "@crewhaus/tool-secure",
     source: "tool_config",
@@ -1404,7 +1410,6 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-secure",
     export: "piiScan",
     name: "PiiScan",
-    initSymbol: "registerSecureConfig",
   },
   piiRedact: {
     package: "@crewhaus/tool-secure",
@@ -1422,61 +1427,51 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-secure",
     export: "depseudonymize",
     name: "Depseudonymize",
-    initSymbol: "registerSecureConfig",
   },
   secretScan: {
     package: "@crewhaus/tool-secure",
     export: "secretScan",
     name: "SecretScan",
-    initSymbol: "registerSecureConfig",
   },
   entropyScore: {
     package: "@crewhaus/tool-secure",
     export: "entropyScore",
     name: "EntropyScore",
-    initSymbol: "registerSecureConfig",
   },
   promptInjectionScan: {
     package: "@crewhaus/tool-secure",
     export: "promptInjectionScan",
     name: "PromptInjectionScan",
-    initSymbol: "registerSecureConfig",
   },
   invisibleCharScan: {
     package: "@crewhaus/tool-secure",
     export: "invisibleCharScan",
     name: "InvisibleCharScan",
-    initSymbol: "registerSecureConfig",
   },
   homoglyphNormalize: {
     package: "@crewhaus/tool-secure",
     export: "homoglyphNormalize",
     name: "HomoglyphNormalize",
-    initSymbol: "registerSecureConfig",
   },
   urlSafetyCheck: {
     package: "@crewhaus/tool-secure",
     export: "urlSafetyCheck",
     name: "UrlSafetyCheck",
-    initSymbol: "registerSecureConfig",
   },
   allowlistCheck: {
     package: "@crewhaus/tool-secure",
     export: "allowlistCheck",
     name: "AllowlistCheck",
-    initSymbol: "registerSecureConfig",
   },
   contentPolicyCheck: {
     package: "@crewhaus/tool-secure",
     export: "contentPolicyCheck",
     name: "ContentPolicyCheck",
-    initSymbol: "registerSecureConfig",
   },
   hashChainVerify: {
     package: "@crewhaus/tool-secure",
     export: "hashChainVerify",
     name: "HashChainVerify",
-    initSymbol: "registerSecureConfig",
   },
   signPayload: {
     package: "@crewhaus/tool-secure",

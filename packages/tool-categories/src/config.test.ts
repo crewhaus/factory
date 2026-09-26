@@ -12,6 +12,7 @@ import {
   resolveToolConfigEnv,
   toolConfigBlockFor,
   toolConfigEnvRefs,
+  toolConfigHint,
   toolConfigProblems,
 } from "./config";
 import { BuiltinToolError } from "./error";
@@ -42,10 +43,54 @@ describe("every configurable package is in the registrar table", () => {
     expect([...named].sort()).toEqual(Object.keys(TOOL_BOOT_REGISTRARS).sort());
   });
 
+  /**
+   * A registrar only SOME rows of its package name, on purpose. Each entry
+   * lists exactly the rows that name it and says why the others do not; the
+   * guard below holds the list to the table, so it cannot drift either way.
+   */
+  const PARTIAL_REGISTRARS: Readonly<
+    Record<string, { readonly rows: ReadonlyArray<string>; readonly why: string }>
+  > = {
+    registerSecureConfig: {
+      rows: ["piiRedact", "pseudonymize", "redactForExport", "signPayload", "verifyPayload"],
+      why: "only these five read an HMAC key, and key_env_vars is all the block sets; naming it from every tool-secure row made two differing blocks under unkeyed tools (piiScan, secretScan) a compile error and told `tools show` those tools read tool_config.secure",
+    },
+  };
+
+  test("a partial registrar is named by exactly the rows its exemption lists", () => {
+    for (const [symbol, { rows, why }] of Object.entries(PARTIAL_REGISTRARS)) {
+      expect(why.length).toBeGreaterThan(40);
+      const named = Object.entries(BUILTIN_TOOLS)
+        .filter(([, e]) => e.initSymbol === symbol || e.chainSymbol === symbol)
+        .map(([key]) => key)
+        .sort();
+      expect({ symbol, named }).toEqual({ symbol, named: [...rows].sort() });
+    }
+  });
+
+  test("differing blocks under two unkeyed secure tools are unused, as on 0.7.0, not a conflict", () => {
+    const check = checkToolConfigs([
+      {
+        tools: ["piiScan", "secretScan", "signPayload"],
+        toolConfigs: { piiScan: { note: "a" }, secretScan: { note: "b" } },
+      },
+    ]);
+    expect(check.conflicts).toEqual([]);
+    expect(check.inits).toEqual([]);
+    expect(check.unused.map((u) => u.path).sort()).toEqual([
+      "tool_config.piiScan",
+      "tool_config.secretScan",
+    ]);
+    expect(toolConfigHint("secretScan")).toBeUndefined();
+    expect(toolConfigHint("entropyScore")).toBeUndefined();
+    expect(toolConfigHint("signPayload")).toBe("tool_config.secure");
+  });
+
   test("a registrar more than one row of a package names is named by every row of it", () => {
     // Derived, not listed: a package-wide registrar (registerHttpConfig for
     // tool-http) must reach every tool the package's block configures, so a
-    // new tool that forgot it fails here.
+    // new tool that forgot it fails here. PARTIAL_REGISTRARS names the
+    // exceptions, and the test above holds them to the table.
     const byPackage = new Map<string, Array<{ key: string; init?: string; chain?: string }>>();
     for (const [key, e] of Object.entries(BUILTIN_TOOLS)) {
       const rows = byPackage.get(e.package) ?? [];
@@ -57,12 +102,17 @@ describe("every configurable package is in the registrar table", () => {
       byPackage.set(e.package, rows);
     }
     let packageWide = 0;
+    let partial = 0;
     for (const [pkg, rows] of byPackage) {
       for (const field of ["init", "chain"] as const) {
         const named = rows.filter((r) => r[field] !== undefined);
         if (named.length < 2) continue;
-        packageWide += 1;
         const symbol = named[0]?.[field];
+        if (symbol !== undefined && Object.hasOwn(PARTIAL_REGISTRARS, symbol)) {
+          partial += 1;
+          continue;
+        }
+        packageWide += 1;
         expect({ pkg, missing: rows.filter((r) => r[field] !== symbol).map((r) => r.key) }).toEqual(
           {
             pkg,
@@ -74,6 +124,8 @@ describe("every configurable package is in the registrar table", () => {
     // http, codehost, notify, obs, defi, chainread, token (x2), chaincall,
     // evm, evm-tx and code-execution today.
     expect(packageWide).toBeGreaterThanOrEqual(12);
+    // Every exemption was met: tool-secure.
+    expect(partial).toBe(Object.keys(PARTIAL_REGISTRARS).length);
   });
 });
 
