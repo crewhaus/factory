@@ -30,6 +30,7 @@ import { statSync } from "node:fs";
 import * as path from "node:path";
 import {
   bareRefusal,
+  inheritedIndexEnv,
   locateRepository,
   neutralisedNote,
   probeRepositoryFilters,
@@ -219,11 +220,16 @@ export async function collectDiff(
     ...(signal !== undefined ? { signal } : {}),
   });
   if (!filters.ok) return refuse(filters.message);
+  // Run from a pre-commit or prepare-commit-msg hook, the index being
+  // committed is the one git named in GIT_INDEX_FILE: keep it when it is this
+  // repository's, so a staged lint sees what is about to be committed.
+  const indexEnv = inheritedIndexEnv(located.value);
   const run = await runGit(args, {
     cwd,
     timeoutMs,
     readOnly: true,
     maxOutputChars: MAX_DIFF_CHARS,
+    ...(Object.keys(indexEnv).length > 0 ? { env: indexEnv } : {}),
     ...(filters.value.configArgs.length > 0 ? { configArgs: filters.value.configArgs } : {}),
     ...(signal !== undefined ? { signal } : {}),
   });

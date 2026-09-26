@@ -437,6 +437,75 @@ describe("a read's environment", () => {
   }, 20_000);
 });
 
+describe("the index a commit hook is handed", () => {
+  function cleanRepo(name: string): string {
+    const dir = join(workspace, name);
+    mkdirSync(dir);
+    git(["init", "-q", "-b", "main"], dir);
+    git(["config", "user.name", "A"], dir);
+    git(["config", "user.email", "a@example.com"], dir);
+    git(["config", "commit.gpgsign", "false"], dir);
+    writeFileSync(join(dir, "a.txt"), "a\n");
+    writeFileSync(join(dir, "b.txt"), "b\n");
+    git(["add", "-A"], dir);
+    git(["commit", "-q", "-m", "init"], dir);
+    return dir;
+  }
+
+  test("a harness run from prepare-commit-msg sees what `git commit -a` is committing", async () => {
+    // git hands the hook GIT_INDEX_FILE=.git/index.lock: the index being
+    // committed. Dropping it read .git/index, where nothing is staged, and
+    // reported the commit as empty.
+    const dir = cleanRepo("hooked");
+    const out = join(workspace, "seen.json");
+    const agent = join(workspace, "hook-agent.ts");
+    writeFileSync(
+      agent,
+      [
+        `import { gitDiff } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+        `process.chdir(${JSON.stringify(workspace)});`,
+        `const text = String(await gitDiff.execute({ cwd: "hooked", staged: true, mode: "nameOnly" }));`,
+        `await Bun.write(${JSON.stringify(out)}, JSON.stringify({ index: process.env.GIT_INDEX_FILE ?? null, text }));`,
+      ].join("\n"),
+    );
+    const hookFile = join(dir, ".git", "hooks", "prepare-commit-msg");
+    writeFileSync(
+      hookFile,
+      `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(agent)}\n`,
+    );
+    chmodSync(hookFile, 0o755);
+    writeFileSync(join(dir, "a.txt"), "a\na2\n"); // tracked, NOT staged
+    expect(git(["commit", "-q", "-a", "-m", "commit -a"], dir).code).toBe(0);
+    const seen = JSON.parse(readFileSync(out, "utf8")) as { index: string | null; text: string };
+    // Live: git really handed the hook an index other than .git/index.
+    expect(seen.index).not.toBeNull();
+    expect(String(seen.index).endsWith(join(".git", "index"))).toBe(false);
+    expect(JSON.parse(seen.text)).toEqual({ mode: "nameOnly", files: 1, paths: ["a.txt"] });
+  }, 30_000);
+
+  test("an inherited GIT_INDEX_FILE that is another repository's is not read", async () => {
+    const mine = cleanRepo("mine");
+    const other = cleanRepo("other");
+    writeFileSync(join(other, "b.txt"), "b\nstaged elsewhere\n");
+    git(["add", "b.txt"], other);
+    const prior = process.env["GIT_INDEX_FILE"];
+    process.env["GIT_INDEX_FILE"] = join(other, ".git", "index");
+    try {
+      const text = String(await gitDiff.execute({ cwd: "mine", staged: true, mode: "nameOnly" }));
+      expect(JSON.parse(text)).toEqual({ mode: "nameOnly", files: 0, paths: [] });
+      // The same variable IS honoured for the repository it belongs to.
+      const theirs = String(
+        await gitDiff.execute({ cwd: "other", staged: true, mode: "nameOnly" }),
+      );
+      expect(JSON.parse(theirs)).toEqual({ mode: "nameOnly", files: 1, paths: ["b.txt"] });
+    } finally {
+      if (prior === undefined) Reflect.deleteProperty(process.env, "GIT_INDEX_FILE");
+      else process.env["GIT_INDEX_FILE"] = prior;
+    }
+    expect(mine).not.toBe(other);
+  }, 20_000);
+});
+
 describe("git config passed through the environment", () => {
   test("GIT_CONFIG_COUNT with safe.directory still reaches every read and write", async () => {
     // `KEY` marks a credential-shaped name, so the read environment dropped

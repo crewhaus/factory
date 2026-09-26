@@ -372,8 +372,10 @@ async function drain(
 
 /**
  * Environment variables that tell git which repository, work tree, index or
- * object store to use instead of the one it discovers. None of them is ever
- * passed on: the repository is the one openRepo checked.
+ * object store to use instead of the one it discovers. None of them is
+ * passed on — the repository is the one openRepo checked — except an
+ * inherited GIT_INDEX_FILE that {@link inheritedIndexEnv} proves is that
+ * repository's own (the index a commit hook is handed).
  */
 export const REPOSITORY_LOCATOR_ENV: readonly string[] = Object.freeze([
   "GIT_DIR",
@@ -551,6 +553,7 @@ export async function openRepo(
   });
   if (!located.ok) return located;
   const root = located.value.root;
+  const indexEnv = inheritedIndexEnv(located.value);
 
   const filters = await probeRepositoryFilters(toolName, cwd, {
     timeoutMs,
@@ -573,12 +576,55 @@ export async function openRepo(
           timeoutMs,
           ...(signal !== undefined ? { signal } : {}),
           ...opts,
+          env: { ...indexEnv, ...opts?.env },
           // Only a read loses the repository's filters: a write that skipped
           // a clean filter would store the wrong bytes.
           ...(opts?.readOnly === true && configArgs.length > 0 ? { configArgs } : {}),
         }),
     },
   };
+}
+
+/** Where a proved repository keeps its working tree and history, all real paths. */
+export type LocatedRepository = {
+  readonly root: string;
+  readonly gitDir: string;
+  readonly commonDir: string;
+};
+
+/**
+ * The inherited GIT_INDEX_FILE to keep for a run in `repo`, as an absolute
+ * path, or nothing.
+ *
+ * Every other variable naming a repository is dropped (REPOSITORY_LOCATOR_ENV),
+ * and so is this one by default. But git hands a hook the index it is
+ * COMMITTING: during `git commit -a`, `git commit <paths>` or `--only`, that
+ * is `index.lock` or a `next-index-*.lock` in the git dir, not the index
+ * file. A harness started from prepare-commit-msg or pre-commit that asks
+ * "what is staged?" must read that one, or it reports the commit as empty.
+ * So an inherited GIT_INDEX_FILE is kept when it lies inside the git dir or
+ * common dir that locateRepository proved for this very repository, and
+ * dropped when it points anywhere else (another repository's hook, a
+ * planted value).
+ */
+export function inheritedIndexEnv(repo: LocatedRepository): Record<string, string> {
+  const raw = process.env["GIT_INDEX_FILE"];
+  if (raw === undefined || raw === "") return {};
+  // git resolves a relative GIT_INDEX_FILE against where it runs; a hook
+  // runs at the top level of the working tree.
+  const candidates = path.isAbsolute(raw)
+    ? [raw]
+    : [path.resolve(process.cwd(), raw), path.resolve(repo.root, raw)];
+  for (const candidate of candidates) {
+    const leaf = realOrUndefined(candidate);
+    const dir = realOrUndefined(path.dirname(candidate));
+    const abs = leaf ?? (dir === undefined ? undefined : path.join(dir, path.basename(candidate)));
+    if (abs === undefined) continue;
+    if (isInside(repo.gitDir, abs) || isInside(repo.commonDir, abs)) {
+      return { GIT_INDEX_FILE: abs };
+    }
+  }
+  return {};
 }
 
 /**
@@ -595,7 +641,7 @@ export async function locateRepository(
   requested: string,
   cwd: string,
   opts: { readonly timeoutMs: number; readonly signal?: AbortSignal },
-): Promise<Resolved<{ root: string }>> {
+): Promise<Resolved<LocatedRepository>> {
   const probe = await runGit(
     ["rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"],
     {
@@ -676,12 +722,13 @@ export async function locateRepository(
         "its object store borrows from a repository outside the workspace (objects/info/alternates)",
       );
     }
-    return { ok: true, value: { root: top } };
+    return { ok: true, value: { root: top, gitDir, commonDir } };
   }
 
   // The git dir is outside. Only git's own bookkeeping in that directory,
   // which nothing inside the workspace can write, may tie it to this tree.
-  if (isWorktreeOf(gitDir, commonDir, top)) return { ok: true, value: { root: top } };
+  if (isWorktreeOf(gitDir, commonDir, top))
+    return { ok: true, value: { root: top, gitDir, commonDir } };
   if (commonDir === gitDir) {
     const wt = await runGit(
       ["config", "--file", path.join(gitDir, "config"), "--get", "core.worktree"],
@@ -694,7 +741,7 @@ export async function locateRepository(
     );
     const value = wt.code === 0 ? wt.stdout.trim() : "";
     if (value !== "" && realOrUndefined(path.resolve(gitDir, value)) === top) {
-      return { ok: true, value: { root: top } };
+      return { ok: true, value: { root: top, gitDir, commonDir } };
     }
   }
   return outside(

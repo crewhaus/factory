@@ -180,6 +180,44 @@ describe("DiffLint runs no program a submodule's config names", () => {
   }, 30_000);
 });
 
+describe("DiffLint staged reads the index a commit hook is handed", () => {
+  test("GIT_INDEX_FILE inside this repository's git dir is read; one elsewhere is not", async () => {
+    // During `git commit -a` a pre-commit hook gets GIT_INDEX_FILE naming a
+    // lock file in the git dir: the index being committed. Simulated here
+    // with a second index in the same git dir holding a staged line.
+    const who = ["-c", "user.name=A", "-c", "user.email=a@example.com"];
+    const clean = join(workspace, "clean");
+    mkdirSync(clean);
+    git(["init", "-q", "-b", "main"], clean);
+    writeFileSync(join(clean, "c.js"), "const a = 1;\n");
+    git([...who, "add", "c.js"], clean);
+    git([...who, "commit", "-q", "-m", "one"], clean);
+    writeFileSync(join(clean, "c.js"), "const a = 1;\nconsole.log(a);\n");
+    const lockIndex = join(clean, ".git", "next-index-42.lock");
+    const staged = Bun.spawnSync(["git", "add", "c.js"], {
+      cwd: clean,
+      env: { ...process.env, GIT_INDEX_FILE: lockIndex },
+    });
+    expect(staged.exitCode).toBe(0);
+    const prior = process.env["GIT_INDEX_FILE"];
+    try {
+      process.env["GIT_INDEX_FILE"] = lockIndex;
+      const hooked = JSON.parse(String(await diffLint.execute({ cwd: "clean", staged: true })));
+      expect(hooked.addedLinesScanned).toBe(1);
+      // A GIT_INDEX_FILE outside this repository's git dir is dropped: the
+      // repository's own index has nothing staged.
+      const elsewhere = join(workspace, "planted-index");
+      writeFileSync(elsewhere, readFileSync(lockIndex));
+      process.env["GIT_INDEX_FILE"] = elsewhere;
+      const planted = JSON.parse(String(await diffLint.execute({ cwd: "clean", staged: true })));
+      expect(planted.addedLinesScanned).toBe(0);
+    } finally {
+      if (prior === undefined) Reflect.deleteProperty(process.env, "GIT_INDEX_FILE");
+      else process.env["GIT_INDEX_FILE"] = prior;
+    }
+  }, 20_000);
+});
+
 describe("an embedded repository directory is refused", () => {
   test("a bare repository committed as plain files, then cloned, runs nothing", async () => {
     // The clone-only vector: a real bare repository with two commits, whose
