@@ -18,6 +18,8 @@ import {
 import { readFileBoundedSync, readOpenedFileSync } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { renderEditDiff } from "./diff";
+import { requiredLiterals } from "./literals";
+import { BASE_LINE_CAP, REFUSED_CHAIN, lineCapForChain, repeatChainLength } from "./repeat-chain";
 
 /**
  * Built-in filesystem tools, sandboxed to the process's current working
@@ -343,16 +345,32 @@ const grepSchema = z.object({
 //     which refuses nested quantifiers AND overlapping alternation, plus
 //     this package's older nested-quantifier check, which is stricter about
 //     bounded repeats such as `(.*a){10}`);
-//  2. the match runs in tool-safety's regex worker, one `testEach` per file,
-//     under the call's deadline and abort signal: at the deadline the worker
-//     is terminated and the caller's thread is free;
-//  3. an answer the engine gave up on (a slow "no match") is UNDETERMINED,
+//  2. the match runs in tool-safety's regex worker, under the call's deadline
+//     and abort signal: at the deadline the worker is terminated and the
+//     caller's thread is free. Lines go to the worker in batches of up to
+//     GREP_BATCH_CHARS, gathered across files and split inside a big one, so
+//     neither a thousand small files nor one lockfile over the worker's
+//     input limit changes what is searched (one call per file cost a round
+//     trip each, and a file over the limit ended the whole scan). A line
+//     without any of the literals every match must contain (`./literals`)
+//     is a definite miss and never goes to the worker, which keeps a search
+//     for a word as fast as 0.7.0's;
+//  3. one match attempt cannot be interrupted, so the longest line a pattern
+//     runs on is chosen from how many of its repeats can split the same text
+//     (`./repeat-chain`), which bounds how long an abandoned worker keeps a
+//     core busy; a pattern with too many is refused;
+//  4. an answer the engine gave up on (a slow "no match") is UNDETERMINED,
 //     and so is a line too long to run: the result lists what it could not
 //     search and never says a bare "no matches" when anything went unsearched.
-const GREP_MAX_LINE_LENGTH = 10_000;
+const GREP_MAX_LINE_LENGTH = BASE_LINE_CAP;
 const GREP_MAX_PATTERN_LENGTH = 1_000;
 const GREP_DEADLINE_MS = 2_000;
 const GREP_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+/**
+ * Characters (plus one per line) sent to the regex worker in one batch: its
+ * own default input limit, passed explicitly so the two cannot drift apart.
+ */
+const GREP_BATCH_CHARS = 1_000_000;
 /** Examples of unsearched lines named in the note; the rest are counted. */
 const GREP_UNSEARCHED_EXAMPLES = 5;
 
@@ -360,19 +378,26 @@ type GrepLimits = {
   readonly deadlineMs: number;
   readonly giveUpMs: number | undefined;
   readonly now: () => number;
+  /** Characters (plus one per line) gathered before a batch goes to the worker. */
+  readonly batchChars: number;
+  /** The input limit the worker is told; equal to `batchChars` except in a test. */
+  readonly workerInputChars: number;
 };
 const GREP_DEFAULT_LIMITS: GrepLimits = {
   deadlineMs: GREP_DEADLINE_MS,
   giveUpMs: undefined,
   now: () => Date.now(),
+  batchChars: GREP_BATCH_CHARS,
+  workerInputChars: GREP_BATCH_CHARS,
 };
 let grepLimits: GrepLimits = GREP_DEFAULT_LIMITS;
 
 /**
  * Test seam: the deadline, the regex worker's give-up threshold (a no-match
  * slower than this is undetermined; 0 makes every no-match undetermined, to
- * exercise that path without a pathological pattern) and the clock. Pass
- * `undefined` to restore.
+ * exercise that path without a pathological pattern), the clock, and the
+ * batch size and worker input limit (set apart only to exercise a refusal
+ * that cannot otherwise happen). Pass `undefined` to restore.
  */
 export function _setGrepLimitsForTest(limits: Partial<GrepLimits> | undefined): void {
   grepLimits = { ...GREP_DEFAULT_LIMITS, ...limits };
@@ -387,10 +412,11 @@ const REJECTION_LABELS: Partial<Record<RegexRejectCode, string>> = {
 };
 
 /**
- * Refuse a pattern that could backtrack catastrophically, with the reason.
- * Throws the tool's usual "invalid regex pattern" error.
+ * Refuse a pattern that could backtrack catastrophically, with the reason,
+ * and say how long a line the rest may run on. Throws the tool's usual
+ * "invalid regex pattern" error.
  */
-function screenGrepPattern(pattern: string): void {
+function screenGrepPattern(pattern: string): { lineCap: number; chain: number } {
   if (pattern.length > GREP_MAX_PATTERN_LENGTH) {
     throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
   }
@@ -404,6 +430,13 @@ function screenGrepPattern(pattern: string): void {
       "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
     );
   }
+  const chain = repeatChainLength(pattern);
+  if (chain >= REFUSED_CHAIN) {
+    throw new Error(
+      `invalid regex pattern: stacked repeats — ${chain} repeats (such as \\w* or .*) can split the same text one after another, which backtracks for minutes on an ordinary line; put something between them that they cannot both match, or use a negated class such as [^,]*`,
+    );
+  }
+  return { lineCap: lineCapForChain(chain), chain };
 }
 
 /**
@@ -496,17 +529,19 @@ export function hasNestedQuantifier(pattern: string): boolean {
 type Unsearched = {
   /** Lines the engine gave up on: they may or may not match. */
   gaveUp: number;
-  /** Lines longer than GREP_MAX_LINE_LENGTH, not run at all. */
+  /** Lines longer than the pattern's line cap, not run at all. */
   tooLong: number;
   /** Files that could not be read (not symlinks, which are skipped by design). */
   unreadable: number;
+  /** Lines the worker refused to take, and why (it should never happen: see GREP_BATCH_CHARS). */
+  refused: { lines: number; reason: string } | undefined;
   /** A few `path:line` examples of undetermined lines. */
   examples: string[];
   /** Why the scan stopped before the end, when it did. */
   stopped: string | undefined;
 };
 
-function unsearchedNote(u: Unsearched): string {
+function unsearchedNote(u: Unsearched, lineCap: number, chain: number): string {
   const parts: string[] = [];
   if (u.gaveUp > 0) {
     const shown = u.examples.slice(0, GREP_UNSEARCHED_EXAMPLES).join(", ");
@@ -515,15 +550,38 @@ function unsearchedNote(u: Unsearched): string {
     );
   }
   if (u.tooLong > 0) {
+    const why =
+      lineCap < GREP_MAX_LINE_LENGTH
+        ? ` — this pattern has ${chain} repeats that can split the same text one after another, which is too slow to run on longer lines; put something between them that they cannot both match to search up to ${GREP_MAX_LINE_LENGTH}`
+        : "";
     parts.push(
-      `\n[grep: ${u.tooLong} line(s) longer than ${GREP_MAX_LINE_LENGTH} characters were not searched]`,
+      `\n[grep: ${u.tooLong} line(s) longer than ${lineCap} characters were not searched${why}]`,
     );
   }
   if (u.unreadable > 0) {
     parts.push(`\n[grep: ${u.unreadable} file(s) could not be read and were not searched]`);
   }
+  if (u.refused !== undefined) {
+    parts.push(`\n[grep: ${u.refused.lines} line(s) were not searched: ${u.refused.reason}]`);
+  }
   if (u.stopped !== undefined) parts.push(`\n[grep: scan stopped early — ${u.stopped}]`);
   return parts.join("");
+}
+
+/** Lines waiting to go to the regex worker, and where each came from. */
+type GrepBatch = {
+  inputs: string[];
+  /** Per input: its index in `files`. */
+  fileOf: number[];
+  /** Per input: its 1-based line number. */
+  lineOf: number[];
+  files: string[];
+  /** Characters plus one per input, as the worker counts them. */
+  chars: number;
+};
+
+function emptyBatch(): GrepBatch {
+  return { inputs: [], fileOf: [], lineOf: [], files: [], chars: 0 };
 }
 
 export const grep: RegisteredTool = buildTool({
@@ -549,7 +607,8 @@ export const grep: RegisteredTool = buildTool({
       baseAbs = resolveSafe("Grep", input.path, root);
       baseRel = path.relative(root, baseAbs);
     }
-    screenGrepPattern(input.pattern);
+    const { lineCap, chain } = screenGrepPattern(input.pattern);
+    const literals = requiredLiterals(input.pattern);
 
     const limits = grepLimits;
     const deadline = limits.now() + limits.deadlineMs;
@@ -558,6 +617,7 @@ export const grep: RegisteredTool = buildTool({
       gaveUp: 0,
       tooLong: 0,
       unreadable: 0,
+      refused: undefined,
       examples: [],
       stopped: undefined,
     };
@@ -569,21 +629,100 @@ export const grep: RegisteredTool = buildTool({
     const hiddenDirs = new Set<string>();
     let hidden = 0;
     const session = openRegexSession();
+    let batch = emptyBatch();
+    const where = (b: GrepBatch, index: number): string =>
+      `${b.files[b.fileOf[index] as number]}:${b.lineOf[index]}`;
+
+    /**
+     * Run the pending lines. True to keep scanning; false when the scan must
+     * stop (the deadline, an abort, a worker that cannot run), with
+     * `unsearched.stopped` saying why and from where.
+     */
+    const flush = async (): Promise<boolean> => {
+      const b = batch;
+      batch = emptyBatch();
+      if (b.inputs.length === 0) return true;
+      const remainingMs = deadline - limits.now();
+      if (remainingMs <= 0) {
+        unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed before ${where(b, 0)} was searched; it and everything after it were not searched`;
+        return false;
+      }
+      const outcome = await session.run({
+        op: "testEach",
+        pattern: input.pattern,
+        inputs: b.inputs,
+        onGiveUp: "skip",
+        maxItemChars: lineCap,
+        maxInputChars: limits.workerInputChars,
+        maxMatches: b.inputs.length,
+        deadlineMs: remainingMs,
+        ...(limits.giveUpMs !== undefined ? { giveUpMs: limits.giveUpMs } : {}),
+        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        ...(ctx?.runContext?.sessionId !== undefined
+          ? { runawayKey: ctx.runContext.sessionId }
+          : {}),
+      });
+      const answered = outcome.status === "ok" ? outcome.result : undefined;
+      const partial =
+        answered ??
+        (outcome.status === "timeout" || outcome.status === "gave-up"
+          ? outcome.partial
+          : undefined);
+      for (const index of partial?.matched ?? []) {
+        hits.push(`${where(b, index)}:${b.inputs[index] ?? ""}`);
+      }
+      for (const index of partial?.undetermined ?? []) {
+        unsearched.gaveUp++;
+        if (unsearched.examples.length < GREP_UNSEARCHED_EXAMPLES) {
+          unsearched.examples.push(where(b, index));
+        }
+      }
+      if (answered !== undefined) return true;
+      if (outcome.status === "input-too-large") {
+        // Cannot happen while GREP_BATCH_CHARS and the line cap are what the
+        // worker is told; if it ever does, these lines are named as
+        // unsearched and the scan goes on, rather than ending at them.
+        unsearched.refused = {
+          lines: (unsearched.refused?.lines ?? 0) + b.inputs.length,
+          reason: outcome.reason,
+        };
+        return true;
+      }
+      // Anything else ends the scan: the deadline, an abort, a worker that
+      // could not run. The lines not answered and every file after them
+      // were not searched, and the note says so.
+      const first =
+        outcome.status === "timeout"
+          ? (outcome.completed ?? outcome.partial?.scanned ?? 0)
+          : outcome.status === "gave-up"
+            ? (outcome.partial?.scanned ?? 0)
+            : 0;
+      const from = where(b, Math.min(first, b.inputs.length - 1));
+      unsearched.stopped =
+        outcome.status === "timeout"
+          ? `the ${limits.deadlineMs} ms deadline passed while searching ${from}; it and everything after it were not searched`
+          : `${describeRegexOutcome(outcome)} (at ${from}); it and everything after it were not searched`;
+      return false;
+    };
+
     try {
-      for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
+      scan: for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
         const skippedBy = ignoredSegmentOf(rel, ignored);
         if (skippedBy !== undefined) {
           hidden++;
           hiddenDirs.add(skippedBy);
           continue;
         }
-        const remainingMs = deadline - limits.now();
-        if (remainingMs <= 0) {
-          unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed; files after this point were not searched`;
+        const display = baseRel === "" ? rel : path.join(baseRel, rel);
+        if (deadline - limits.now() <= 0) {
+          // Lines read but not yet searched are named by flush(), which
+          // finds the deadline passed; with none pending, this file is.
+          if (await flush()) {
+            unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed; ${display} and the files after it were not searched`;
+          }
           break;
         }
         const fileAbs = path.join(baseAbs, rel);
-        const display = baseRel === "" ? rel : path.join(baseRel, rel);
         // Bounded by what is left of the byte budget, never following a
         // link, and refusing a FIFO before it is opened (it would block).
         const budget = GREP_MAX_TOTAL_BYTES - scannedBytes;
@@ -595,54 +734,31 @@ export const grep: RegisteredTool = buildTool({
           continue;
         }
         if (read.truncated) {
-          unsearched.stopped = `the ${GREP_MAX_TOTAL_BYTES / (1024 * 1024)} MiB scan budget ran out at ${display}; it and the files after it were not searched`;
+          if (await flush()) {
+            unsearched.stopped = `the ${GREP_MAX_TOTAL_BYTES / (1024 * 1024)} MiB scan budget ran out at ${display}; it and the files after it were not searched`;
+          }
           break;
         }
         scannedBytes += read.bytes.length;
         const lines = read.text.split("\n");
-        const outcome = await session.run({
-          op: "testEach",
-          pattern: input.pattern,
-          inputs: lines,
-          onGiveUp: "skip",
-          maxItemChars: GREP_MAX_LINE_LENGTH,
-          maxMatches: lines.length,
-          deadlineMs: remainingMs,
-          ...(limits.giveUpMs !== undefined ? { giveUpMs: limits.giveUpMs } : {}),
-          ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-          ...(ctx?.runContext?.sessionId !== undefined
-            ? { runawayKey: ctx.runContext.sessionId }
-            : {}),
-        });
-        const answered = outcome.status === "ok" ? outcome.result : undefined;
-        const partial =
-          answered ??
-          (outcome.status === "timeout" || outcome.status === "gave-up"
-            ? outcome.partial
-            : undefined);
-        for (const index of partial?.matched ?? []) {
-          hits.push(`${display}:${index + 1}:${lines[index] ?? ""}`);
-        }
-        for (const index of partial?.undetermined ?? []) {
-          if ((lines[index] ?? "").length > GREP_MAX_LINE_LENGTH) {
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i] as string;
+          // A line holding none of the pattern's required literals cannot
+          // match: a definite answer, however long the line, with no worker.
+          if (literals !== undefined && !literals.some((l) => line.includes(l))) continue;
+          if (line.length > lineCap) {
             unsearched.tooLong++;
-          } else {
-            unsearched.gaveUp++;
-            if (unsearched.examples.length < GREP_UNSEARCHED_EXAMPLES) {
-              unsearched.examples.push(`${display}:${index + 1}`);
-            }
+            continue;
           }
+          if (batch.chars + line.length + 1 > limits.batchChars && !(await flush())) break scan;
+          if (batch.files[batch.files.length - 1] !== display) batch.files.push(display);
+          batch.inputs.push(line);
+          batch.fileOf.push(batch.files.length - 1);
+          batch.lineOf.push(i + 1);
+          batch.chars += line.length + 1;
         }
-        if (answered !== undefined) continue;
-        // Anything else ends the scan: the deadline, an abort, a worker that
-        // could not run. The rest of this file and every file after it were
-        // not searched, and the note says so.
-        unsearched.stopped =
-          outcome.status === "timeout"
-            ? `the ${limits.deadlineMs} ms deadline passed while searching ${display}; the rest of it and the files after it were not searched`
-            : `${describeRegexOutcome(outcome)} (at ${display}); it and the files after it were not searched`;
-        break;
       }
+      if (unsearched.stopped === undefined) await flush();
     } finally {
       session.close();
     }
@@ -650,6 +766,7 @@ export const grep: RegisteredTool = buildTool({
       unsearched.gaveUp > 0 ||
       unsearched.tooLong > 0 ||
       unsearched.unreadable > 0 ||
+      unsearched.refused !== undefined ||
       unsearched.stopped !== undefined;
     const body =
       hits.length > 0
@@ -657,7 +774,9 @@ export const grep: RegisteredTool = buildTool({
         : incomplete
           ? "no matches in the lines searched"
           : "no matches";
-    return body + unsearchedNote(unsearched) + hiddenNote("Grep", hidden, hiddenDirs);
+    return (
+      body + unsearchedNote(unsearched, lineCap, chain) + hiddenNote("Grep", hidden, hiddenDirs)
+    );
   },
 });
 

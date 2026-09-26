@@ -15,6 +15,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
+import { regexWorkerCounts } from "@crewhaus/tool-safety/regex";
 import {
   DEFAULT_IGNORED_DIRS,
   READ_MAX_BYTES,
@@ -29,6 +30,8 @@ import {
   read,
   write,
 } from "./index";
+import { requiredLiterals } from "./literals";
+import { REFUSED_CHAIN, lineCapForChain, repeatChainLength } from "./repeat-chain";
 
 let tmp: string;
 let originalCwd: string;
@@ -497,7 +500,9 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
     // JavaScriptCore gives up silently, as a slow "no match". With the
     // give-up threshold at 1 ms, a cubic pattern's no-match on 70 digits (a
     // few ms) takes that path, bounded, with no pathological pattern needed.
-    const slow = "1".repeat(70);
+    // The " x" keeps the line past the literal pre-filter (every match
+    // holds an "x"), so it really goes to the engine.
+    const slow = `${"1".repeat(70)} x`;
     await writeFile(path.join(tmp, "f.txt"), `${slow}\nbeta\n${slow}\n`);
     _setGrepLimitsForTest({ giveUpMs: 1 });
     const hit = String(await grep.execute({ pattern: "\\d+\\d+\\d+x|beta" }));
@@ -540,15 +545,19 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
   });
 
   test("a deadline reached inside a file keeps the hits found and names the rest as unsearched", async () => {
-    // Cubic in the line length: about 20 ms a line here, so forty of them
+    // Quartic in the digit run: about 20 ms a line here, so forty of them
     // outlast a 100 ms deadline many times over, and the worker abandoned
-    // at the deadline finishes its line within milliseconds.
-    const slow = "1".repeat(100);
-    await writeFile(path.join(tmp, "a.txt"), `1x\n${Array(40).fill(slow).join("\n")}\n`);
+    // at the deadline finishes its line within milliseconds. Line 1 is a
+    // hit found before the deadline, and it must survive it.
+    const slow = `${"1".repeat(100)} x`;
+    await writeFile(path.join(tmp, "a.txt"), `111x\n${Array(40).fill(slow).join("\n")}\n`);
     _setGrepLimitsForTest({ deadlineMs: 100 });
     const result = String(await grep.execute({ pattern: "\\d+\\d+\\d+x" }));
-    expect(result).toContain("scan stopped early — the 100 ms deadline passed");
-    expect(result).not.toBe("no matches");
+    expect(result.split("\n")[0]).toBe("a.txt:1:111x");
+    expect(result).toContain(
+      "scan stopped early — the 100 ms deadline passed while searching a.txt:",
+    );
+    expect(result).toContain("it and everything after it were not searched");
   }, 20_000);
 
   test("a line too long to search is named, not silently skipped", async () => {
@@ -585,6 +594,292 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
     expect(hasNestedQuantifier("(=|=)*x")).toBe(true);
     expect(hasNestedQuantifier("(foo|bar)+")).toBe(false);
     expect(hasNestedQuantifier("(get|set)Value")).toBe(false);
+  });
+});
+
+describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
+  /** About 1.2 M characters of ordinary log lines: over the regex worker's 1 M input limit. */
+  function bigLog(): string {
+    const lines = Array.from(
+      { length: 24_000 },
+      (_, i) => `2026-09-26T12:00:00Z INFO request ${i} ok`,
+    );
+    lines[1] = "the NEEDLE is on line 2";
+    lines.push("and the NEEDLE is on the last line");
+    return `${lines.join("\n")}\n`;
+  }
+
+  test("a file over the worker's input limit is searched to its end, and so are the files after it", async () => {
+    // 0.7.1 before this fix sent each file to the worker whole: this one
+    // came back input-too-large and ENDED the scan, so neither it nor
+    // src/main.ts was searched ("no matches in the lines searched").
+    await writeFile(path.join(tmp, "app.log"), bigLog());
+    expect(readFileSync(path.join(tmp, "app.log"), "utf8").length).toBeGreaterThan(1_000_000);
+    await mkdir(path.join(tmp, "src"));
+    await writeFile(path.join(tmp, "src", "main.ts"), "export const x = 'NEEDLE';\n");
+    const result = String(await grep.execute({ pattern: "NEEDLE" }));
+    expect(result.split("\n").sort()).toEqual(
+      [
+        "app.log:2:the NEEDLE is on line 2",
+        "app.log:24001:and the NEEDLE is on the last line",
+        "src/main.ts:1:export const x = 'NEEDLE';",
+      ].sort(),
+    );
+  });
+
+  test("with no literal to pre-filter on, every line goes to the worker, in batches", async () => {
+    // [N][E]… names no plain character, so no line is skipped before the
+    // worker: the 1.2 M characters cross it in more than one batch.
+    await writeFile(path.join(tmp, "app.log"), bigLog());
+    await writeFile(path.join(tmp, "z.txt"), "NEEDLE\n");
+    const result = String(await grep.execute({ pattern: "[N][E][E][D][L][E]" }));
+    expect(result.split("\n").sort()).toEqual(
+      [
+        "app.log:2:the NEEDLE is on line 2",
+        "app.log:24001:and the NEEDLE is on the last line",
+        "z.txt:1:NEEDLE",
+      ].sort(),
+    );
+  });
+
+  test("a hit past a batch boundary keeps its own file and line number", async () => {
+    await writeFile(path.join(tmp, "a.txt"), `${"filler line\n".repeat(90_000)}NEEDLE a\n`);
+    await writeFile(path.join(tmp, "b.txt"), "NEEDLE b\n");
+    const lines = String(await grep.execute({ pattern: "[N]EEDLE" })).split("\n");
+    expect(lines).toHaveLength(2);
+    expect(new Set(lines)).toEqual(new Set(["a.txt:90001:NEEDLE a", "b.txt:1:NEEDLE b"]));
+  });
+  test("a batch the worker refuses is named as unsearched, and the scan goes on", async () => {
+    // Unreachable with the real limits (the batch size IS the worker's
+    // limit); held apart here to prove a refusal never ends the scan.
+    // Line 1 fills a batch the worker refuses; line 2 is the next batch.
+    await writeFile(path.join(tmp, "f.txt"), `${"x".repeat(45)}\nNEEDLE\n`);
+    _setGrepLimitsForTest({ batchChars: 50, workerInputChars: 30 });
+    const result = String(await grep.execute({ pattern: "[N]EEDLE|x" }));
+    expect(result.split("\n")[0]).toBe("f.txt:2:NEEDLE");
+    expect(result).toContain("[grep: 1 line(s) were not searched: the input is 46 characters");
+    expect(result).not.toContain("scan stopped early");
+  });
+});
+
+describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 review)", () => {
+  test("a pattern whose repeats split the same text one after another is refused before it runs", async () => {
+    await writeFile(path.join(tmp, "a.txt"), `${"a".repeat(9_000)}\n`);
+    await writeFile(path.join(tmp, "b.txt"), "has NEEDLE\n");
+    const ctx = { runContext: { sessionId: "grep-runaway" } } as never;
+    const before = regexWorkerCounts().runaway;
+    // 0.7.1 before this fix ran it: two calls left two workers spinning for
+    // minutes, and the session's next Grep answered "busy".
+    for (let i = 0; i < 2; i++) {
+      await expect(grep.execute({ pattern: "\\w*\\w*\\w*\\w*\\w*\\w*!|zzz" }, ctx)).rejects.toThrow(
+        /invalid regex pattern: stacked repeats — 6 repeats/,
+      );
+    }
+    expect(regexWorkerCounts().runaway).toBe(before);
+    expect(String(await grep.execute({ pattern: "NEEDLE" }, ctx))).toBe("b.txt:1:has NEEDLE");
+  });
+
+  test("a chained pattern runs only on lines short enough to finish, and names the rest", async () => {
+    // `z\w*\w*!` links two repeats (chain 2): a 9 000-character line is not
+    // run at all, a short one is, and the note says why and how to widen it.
+    await writeFile(
+      path.join(tmp, "f.txt"),
+      `z${"a".repeat(9_000)}\nzab!\nz${"a".repeat(1_998)}!\n`,
+    );
+    const result = String(await grep.execute({ pattern: "z\\w*\\w*!" }));
+    const lines = result.split("\n");
+    // Line 3 is exactly 2 000 characters: at the cap, so it is run.
+    expect(lines.slice(0, 2)).toEqual(["f.txt:2:zab!", `f.txt:3:z${"a".repeat(1_998)}!`]);
+    expect(result).toContain(
+      "[grep: 1 line(s) longer than 2000 characters were not searched — this pattern has 2 repeats that can split the same text one after another",
+    );
+  });
+
+  test("a line without the pattern's literal is a definite miss, however long", async () => {
+    // Decided by the pre-filter: no worker, no "not searched" note.
+    await writeFile(path.join(tmp, "min.js"), `${"x".repeat(50_000)}\nneedle here\n`);
+    expect(String(await grep.execute({ pattern: "needle" }))).toBe("min.js:2:needle here");
+  });
+
+  test("the line cap follows the chain length, and a chain of four is refused", () => {
+    expect(lineCapForChain(0)).toBe(10_000);
+    expect(lineCapForChain(1)).toBe(10_000);
+    expect(lineCapForChain(2)).toBe(2_000);
+    expect(lineCapForChain(3)).toBe(400);
+    expect(REFUSED_CHAIN).toBe(4);
+  });
+});
+
+describe("repeatChainLength", () => {
+  test.each([
+    ["TODO", 0],
+    ["foo.*bar", 1],
+    [".*foo.*", 1],
+    ["\\w+\\s+\\w+!", 1],
+    ["\\s+$", 1],
+    ["TODO.*:.*", 1],
+    [".*.*", 0],
+    ["\\d+\\.\\d+", 1],
+    ["(foo|bar).*baz", 1],
+    ["[A-Z][a-z]+[A-Z][a-z]+", 1],
+    ["(\\w+)\\s+\\1", 1],
+    ["(?=.*a)(?=.*b).*c", 1],
+    // A lookaround is atomic: nothing after its own end can fail inside it.
+    ["(?=\\w+\\s*\\w+)x", 1],
+    [".*a.*!", 2],
+    ["\\w+\\s*\\w+!", 2],
+    ["\\w*a\\w*!", 2],
+    ["(\\w*)(\\w*)!", 2],
+    ["(?:\\w*)?\\w*!", 2],
+    ["x{0,100}x{0,100}!", 2],
+    ["it\\(.*,.*\\)", 2],
+    // A plain group is its contents: "a-b" breaks the link, as it would unwrapped.
+    ["\\w*(a-b)\\w*!", 1],
+    ["(?:\\s*\\w+){2}!", 2],
+    // A character outside the fixed sample is compared through the pattern's own.
+    ["\u1234+\u1234+!", 2],
+    ["\u1234+\u1235+!", 1],
+    ["a.*b.*c.*d", 3],
+    ["\\d+\\d+\\d+x", 3],
+    ["\\w*\\w*\\w*\\w*\\w*\\w*!|zzz", 6],
+  ] as const)("%p has chain %p", (pattern, chain) => {
+    expect(repeatChainLength(pattern)).toBe(chain);
+  });
+
+  test("a chain that nothing after it can fail is not counted", () => {
+    expect(repeatChainLength("\\w+\\s*\\w+")).toBe(1);
+    expect(repeatChainLength("\\w+\\s*\\w+$")).toBe(2);
+  });
+
+  test("a 1 000-character pattern is analysed in bounded time", () => {
+    const started = performance.now();
+    expect(repeatChainLength(`${"a*".repeat(499)}!`)).toBe(499);
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
+});
+
+describe("requiredLiterals (Grep's pre-filter)", () => {
+  test.each([
+    ["TODO|FIXME", ["TODO", "FIXME"]],
+    ["foo.*bar", ["foo"]],
+    ["\\w+Error", ["Error"]],
+    ["^import", ["import"]],
+    ["ab+c", ["a"]],
+    ["(foo|bar)baz", ["baz"]],
+    ["x\\.y", ["x.y"]],
+    ["a{2}b", ["b"]],
+    ["\\u0041BC", ["ABC"]],
+    ["\\cAb", ["b"]],
+    ["\\012z", ["z"]],
+  ] as const)("%p requires one of %p", (pattern, literals) => {
+    expect(requiredLiterals(pattern)).toEqual([...literals]);
+  });
+
+  test.each([
+    "\\d+",
+    "a|",
+    "[N][E]",
+    "(TODO)",
+    `${Array.from({ length: 9 }, (_, i) => `w${i}`).join("|")}`,
+  ])("%p gets no filter", (pattern) => {
+    expect(requiredLiterals(pattern)).toBeUndefined();
+  });
+
+  test("never claims a literal a real match lacks (generated patterns against the engine)", () => {
+    // xorshift, seeded: the same patterns on every run.
+    let seed = 0x2545f491;
+    const rnd = (n: number): number => {
+      seed ^= seed << 13;
+      seed ^= seed >>> 17;
+      seed ^= seed << 5;
+      return (seed >>> 0) % n;
+    };
+    const atoms = [
+      "a",
+      "b",
+      "ab",
+      "\\.",
+      ".",
+      "\\d",
+      "\\w",
+      "[ab]",
+      "[^a]",
+      "(a|b)",
+      "(?:ab)",
+      "\\b",
+      "^",
+      "$",
+      "\\1",
+      "\\x61",
+      "\\u0062",
+      "\\t",
+      "(?=a)",
+      "(?!b)",
+      "\\k<n>",
+      "\\01",
+      "\\c",
+      "\\cA",
+      "\\ca",
+      "{",
+      "}",
+      "]",
+      "-",
+      " ",
+      "\\-",
+      "(?<n>a)",
+      "\\k",
+      "\\u{41}",
+      "\\p{L}",
+      "\\x6",
+      "\\c1",
+      "\\08",
+      "\\18",
+      "\\_",
+      "é",
+      "u",
+      "A",
+      "p",
+      "{L}",
+      "8",
+      "[\\]a]",
+      "[]a",
+      "[^]",
+    ];
+    const quantifiers = ["", "", "", "*", "+", "?", "{2}", "{1,}", "{0,2}", "*?", "+?"];
+    const alphabet = "abc.1 \t-{}]\u0001<>nkb\\uApLé8_AA";
+    let filtered = 0;
+    let checked = 0;
+    for (let p = 0; p < 16_000; p++) {
+      let pattern = "";
+      const n = 1 + rnd(6);
+      for (let i = 0; i < n; i++) {
+        pattern += `${atoms[rnd(atoms.length)]}${quantifiers[rnd(quantifiers.length)]}`;
+        if (rnd(20) === 0) pattern += "|";
+      }
+      let re: RegExp;
+      try {
+        re = new RegExp(pattern);
+      } catch {
+        continue;
+      }
+      const literals = requiredLiterals(pattern);
+      if (literals === undefined) continue;
+      filtered++;
+      for (let l = 0; l < 60; l++) {
+        let line = "";
+        for (let k = rnd(12); k > 0; k--) line += alphabet[rnd(alphabet.length)];
+        if (!re.test(line)) continue;
+        checked++;
+        if (!literals.some((lit) => line.includes(lit))) {
+          throw new Error(
+            `${JSON.stringify(pattern)} matched ${JSON.stringify(line)} without ${JSON.stringify(literals)}`,
+          );
+        }
+      }
+    }
+    // The battery really exercised the filter.
+    expect(filtered).toBeGreaterThan(3_000);
+    expect(checked).toBeGreaterThan(3_000);
   });
 });
 
