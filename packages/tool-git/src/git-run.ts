@@ -37,6 +37,7 @@ import {
   FILTER_PROBE_ARGS,
   FILTER_PROBE_ARGS_LEGACY,
   HARDENED_CONFIG_ARGS,
+  READ_CONFIG_ARGS,
   hardenReadArgs,
   neutraliseRepositoryFilters,
 } from "./hardening";
@@ -411,6 +412,7 @@ export async function runGit(args: readonly string[], opts: RunOptions): Promise
   const argv = [
     "git",
     ...GLOBAL_ARGS,
+    ...(readOnly ? READ_CONFIG_ARGS : []),
     ...(opts.configArgs ?? []),
     ...(readOnly ? hardenReadArgs(args) : args),
   ];

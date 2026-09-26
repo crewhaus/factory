@@ -138,7 +138,9 @@ That `git diff` goes through `@crewhaus/tool-git`'s runner, so it is a read
 in the strong sense: no program the repository's own config names runs. The
 fsmonitor hook, external diff drivers, textconv and the repository's own
 filter drivers are switched off (a result says `repoConfigNote` when a filter
-was skipped), a repository directory committed inside another one is refused
+was skipped), a submodule's change is shown as its pointer (`Subproject
+commit …`) rather than by running git inside the submodule under the
+submodule's own config, a repository directory committed inside another one is refused
 rather than run in, and git gets the environment without the harness's
 credentials.
 

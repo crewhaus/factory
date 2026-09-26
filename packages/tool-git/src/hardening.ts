@@ -38,6 +38,24 @@
  *     submodule's own config; that is another repository, whose filters this
  *     read did not vet. A submodule's new commits are still reported; point
  *     `cwd` at the submodule to see its working tree.
+ *   - Every invocation: `diff.submodule=short`. With the repository's own
+ *     `diff.submodule=diff`, a diff, show or log that crosses a submodule
+ *     pointer runs a child `git diff` INSIDE the submodule, under the
+ *     submodule's config, and git passes that child neither `--no-ext-diff`
+ *     nor `--no-textconv`: the submodule's `diff.external` or textconv ran
+ *     from a read. `short` prints the pointer change (`Submodule sub
+ *     abc..def`) and spawns nothing.
+ *   - blame reads: `--no-ignore-revs-file`. `blame.ignoreRevsFile` names a
+ *     file anywhere on the disk, and git quotes a line it cannot parse back
+ *     in its error: a repository's config could have a read echo the first
+ *     line of a file outside the workspace. `-c blame.ignoreRevsFile=` does
+ *     not clear it (git applies the reset before the repository's value);
+ *     the flag does. A reader who wants those revisions skipped passes them
+ *     as `ref` ranges instead.
+ *   - Every read: `mailmap.file=` (empty). blame maps each author through
+ *     the mailmap, and `mailmap.file` names a file anywhere on the disk, so
+ *     a line of it shaped `Name <email>` would come back as an author name.
+ *     The repository's committed `.mailmap` is still honoured.
  *   - Filters have no global off switch, so each read first lists the
  *     `filter.*` keys the repository's own config sets (`--show-scope`:
  *     `local` and `worktree`; the operator's global and system config are
@@ -60,7 +78,12 @@ export const HARDENED_CONFIG_ARGS: readonly string[] = Object.freeze([
   "log.showSignature=false",
   "-c",
   "safe.bareRepository=explicit",
+  "-c",
+  "diff.submodule=short",
 ]);
+
+/** `-c` pairs applied to every read-only invocation, after the global ones. */
+export const READ_CONFIG_ARGS: readonly string[] = Object.freeze(["-c", "mailmap.file="]);
 
 /** Subcommands whose read-only runs get `--no-ext-diff --no-textconv`. */
 const DIFF_PRODUCING: ReadonlySet<string> = new Set(["diff", "show", "log", "blame"]);
@@ -78,6 +101,7 @@ export function hardenReadArgs(args: readonly string[]): string[] {
   const extra: string[] = [];
   if (DIFF_PRODUCING.has(sub)) extra.push("--no-ext-diff", "--no-textconv");
   if (SUBMODULE_RECURSING.has(sub)) extra.push("--ignore-submodules=dirty");
+  if (sub === "blame") extra.push("--no-ignore-revs-file");
   const missing = extra.filter((flag) => !rest.includes(flag));
   return [sub, ...missing, ...rest];
 }

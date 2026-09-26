@@ -291,6 +291,127 @@ describe("an embedded repository directory is not a place a read runs git", () =
   }, 30_000);
 });
 
+/**
+ * A superproject whose own config says `diff.submodule=diff`, over a
+ * submodule whose config (`.git/modules/sub/config`, the submodule's, not
+ * the superproject's) names an external diff program and a textconv. git
+ * renders that inline submodule diff by running a child `git diff` inside the
+ * submodule, and passes it neither `--no-ext-diff` nor `--no-textconv`.
+ */
+function plantSubmodule(): string {
+  const who = ["-c", "user.name=A", "-c", "user.email=a@example.com"];
+  const src = join(workspace, "subsrc");
+  const sup = join(workspace, "sup");
+  mkdirSync(src);
+  mkdirSync(sup);
+  git(["init", "-q", "-b", "main"], src);
+  writeFileSync(join(src, "f.txt"), "one\n");
+  git([...who, "add", "f.txt"], src);
+  git([...who, "commit", "-q", "-m", "one"], src);
+  git(["init", "-q", "-b", "main"], sup);
+  writeFileSync(join(sup, "top.txt"), "top\n");
+  git([...who, "add", "top.txt"], sup);
+  git([...who, "commit", "-q", "-m", "top"], sup);
+  git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub"], sup);
+  git([...who, "commit", "-q", "-m", "add sub"], sup);
+  writeFileSync(join(sup, "sub", "f.txt"), "two\n");
+  git([...who, "commit", "-q", "-am", "two"], join(sup, "sub"));
+  git([...who, "commit", "-q", "-am", "bump sub"], sup);
+  git(["config", "diff.submodule", "diff"], sup);
+  const subConfig = join(sup, ".git", "modules", "sub", "config");
+  git(["config", "-f", subConfig, "diff.external", hook("subext", "sub-extdiff", "exit 0")], sup);
+  git(
+    ["config", "-f", subConfig, "diff.x.textconv", hook("subconv", "sub-textconv", 'cat "$1"')],
+    sup,
+  );
+  mkdirSync(join(sup, ".git", "modules", "sub", "info"), { recursive: true });
+  writeFileSync(join(sup, ".git", "modules", "sub", "info", "attributes"), "* diff=x\n");
+  return sup;
+}
+
+describe("a submodule's config cannot make a read run a program", () => {
+  test("the fixture is live: plain git show and diff run the submodule's programs", () => {
+    const sup = plantSubmodule();
+    rmSync(marker, { force: true });
+    git(["show", "HEAD"], sup);
+    expect(ran().some((line) => line.startsWith("sub-extdiff"))).toBe(true);
+    // With the external driver unset, the textconv is what runs.
+    git(
+      ["config", "-f", join(sup, ".git", "modules", "sub", "config"), "--unset", "diff.external"],
+      sup,
+    );
+    rmSync(marker, { force: true });
+    git(["diff", "HEAD~1..HEAD"], sup);
+    expect(ran().some((line) => line.startsWith("sub-textconv"))).toBe(true);
+  }, 20_000);
+
+  test("GitShow, GitDiff and GitLog cross the submodule pointer and run nothing", async () => {
+    plantSubmodule();
+    const reads: ReadonlyArray<[RegisteredTool, Record<string, unknown>]> = [
+      [gitShow, { cwd: "sup", ref: "HEAD" }],
+      [gitDiff, { cwd: "sup", range: "HEAD~1..HEAD", mode: "patch" }],
+      [gitDiff, { cwd: "sup", ref: "HEAD~1", mode: "patch" }],
+      [gitDiff, { cwd: "sup", range: "HEAD~1..HEAD", mode: "stat" }],
+      [gitLog, { cwd: "sup" }],
+    ];
+    let checked = 0;
+    for (const [tool, input] of reads) {
+      rmSync(marker, { force: true });
+      const text = String(await tool.execute(input));
+      const label = `${tool.name} ${JSON.stringify(input)}`;
+      expect({ label, ran: ran() }).toEqual({ label, ran: [] });
+      expect({ label, json: text.startsWith("{") }).toEqual({ label, json: true });
+      checked += 1;
+    }
+    expect(checked).toBe(5);
+    // The pointer change is still reported, in git's default short form.
+    const patch = JSON.parse(
+      String(await gitDiff.execute({ cwd: "sup", range: "HEAD~1..HEAD", mode: "patch" })),
+    ) as Record<string, unknown>;
+    expect(String(patch["patch"])).toContain("+Subproject commit ");
+  }, 30_000);
+});
+
+describe("a read does not open a file the repository's config names outside it", () => {
+  test("GitBlame echoes neither blame.ignoreRevsFile nor a mailmap.file", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "crewhaus-tool-git-outside-"));
+    try {
+      const secret = join(outside, "netrc-like");
+      writeFileSync(secret, "machine api.example.com login bot password hunter2-SECRET\n");
+      const mailmap = join(outside, "mailmap");
+      writeFileSync(mailmap, "Leaked Mailmap Line <author@example.com>\n");
+      git(["config", "--unset", "filter.pwn.clean"], repo);
+      git(["config", "--unset", "filter.pwn.smudge"], repo);
+      // Live: plain git echoes the first file's line and maps through the second.
+      git(["config", "blame.ignoreRevsFile", secret], repo);
+      const plain = Bun.spawnSync(["git", "blame", "--line-porcelain", "a.txt"], {
+        cwd: repo,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(plain.stderr.toString()).toContain("hunter2-SECRET");
+
+      const refused = String(await gitBlame.execute({ cwd: "repo", path: "a.txt" }));
+      expect(refused).not.toContain("hunter2");
+      expect(refused.startsWith("{")).toBe(true);
+
+      git(["config", "--unset", "blame.ignoreRevsFile"], repo);
+      git(["config", "mailmap.file", mailmap], repo);
+      const mapped = Bun.spawnSync(["git", "blame", "--line-porcelain", "a.txt"], {
+        cwd: repo,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(mapped.stdout.toString()).toContain("Leaked Mailmap Line");
+      const blamed = String(await gitBlame.execute({ cwd: "repo", path: "a.txt" }));
+      expect(blamed).not.toContain("Leaked Mailmap Line");
+      expect(blamed).toContain("A U Thor");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
 describe("a read's environment", () => {
   test("carries none of the harness's credentials; a write's keeps them", async () => {
     // An alias is the one program a test can make git run on purpose; it
@@ -326,6 +447,7 @@ describe("the hardening, piece by piece", () => {
       "core.fsmonitor=false",
       "log.showSignature=false",
       "safe.bareRepository=explicit",
+      "diff.submodule=short",
     ]) {
       expect(pairs.has(want)).toBe(true);
     }
@@ -351,6 +473,7 @@ describe("the hardening, piece by piece", () => {
       "blame",
       "--no-ext-diff",
       "--no-textconv",
+      "--no-ignore-revs-file",
       "--line-porcelain",
       "--",
       "a",

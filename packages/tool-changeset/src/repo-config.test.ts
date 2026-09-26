@@ -133,6 +133,53 @@ describe("DiffLint runs no program the repository's config names", () => {
   }, 30_000);
 });
 
+describe("DiffLint runs no program a submodule's config names", () => {
+  test("diff.submodule=diff over a submodule with its own diff.external", async () => {
+    // The superproject's config asks for inline submodule diffs; git renders
+    // one by running a child `git diff` inside the submodule under the
+    // submodule's own config, without --no-ext-diff or --no-textconv.
+    const who = ["-c", "user.name=A", "-c", "user.email=a@example.com"];
+    const src = join(workspace, "subsrc");
+    const sup = join(workspace, "sup");
+    mkdirSync(src);
+    mkdirSync(sup);
+    git(["init", "-q", "-b", "main"], src);
+    writeFileSync(join(src, "f.txt"), "one\n");
+    git([...who, "add", "f.txt"], src);
+    git([...who, "commit", "-q", "-m", "one"], src);
+    git(["init", "-q", "-b", "main"], sup);
+    writeFileSync(join(sup, "top.txt"), "top\n");
+    git([...who, "add", "top.txt"], sup);
+    git([...who, "commit", "-q", "-m", "top"], sup);
+    git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub"], sup);
+    git([...who, "commit", "-q", "-m", "add sub"], sup);
+    writeFileSync(join(sup, "sub", "f.txt"), "two\n");
+    git([...who, "commit", "-q", "-am", "two"], join(sup, "sub"));
+    git([...who, "commit", "-q", "-am", "bump sub"], sup);
+    git(["config", "diff.submodule", "diff"], sup);
+    const subConfig = join(sup, ".git", "modules", "sub", "config");
+    git(["config", "-f", subConfig, "diff.external", hook("subext", "exit 0")], sup);
+
+    // Live: plain git runs the submodule's program.
+    git(["diff", "HEAD~1..HEAD"], sup);
+    expect(ran().some((line) => line.startsWith("subext"))).toBe(true);
+
+    let checked = 0;
+    for (const input of [
+      { cwd: "sup", range: "HEAD~1..HEAD" },
+      { cwd: "sup", ref: "HEAD~1" },
+    ]) {
+      rmSync(marker, { force: true });
+      const out = JSON.parse(String(await diffLint.execute(input))) as Record<string, unknown>;
+      const label = JSON.stringify(input);
+      expect({ label, ran: ran() }).toEqual({ label, ran: [] });
+      expect({ label, files: out["filesScanned"] }).toEqual({ label, files: 1 });
+      checked += 1;
+    }
+    expect(checked).toBe(2);
+  }, 30_000);
+});
+
 describe("an embedded repository directory is refused", () => {
   test("a bare repository committed as plain files, then cloned, runs nothing", async () => {
     // The clone-only vector: a real bare repository with two commits, whose
