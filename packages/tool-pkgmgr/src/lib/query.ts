@@ -33,6 +33,7 @@ import {
 import {
   type BrewEntry,
   WINGET_NO_PACKAGES_FOUND,
+  WINGET_SOURCE_AGREEMENTS_NOT_ACCEPTED,
   aptSaysNoSuchPackage,
   brewSaysNoSuchPackage,
   dnfSaysNoCache,
@@ -695,7 +696,17 @@ async function queryWinget(
     unknowns.add("status", probe, commandFailureReason(result));
     return unknownFacts("winget", name);
   }
-  if (result.code === WINGET_NO_PACKAGES_FOUND) {
+  // winget's codes are HRESULTs; a runtime may hand the DWORD back unsigned.
+  const code = result.code | 0;
+  if (code === WINGET_SOURCE_AGREEMENTS_NOT_ACCEPTED) {
+    unknowns.add(
+      "status",
+      probe,
+      "winget refused to list because a configured source's agreements have not been accepted on this host. Accepting a licence is the operator's decision, never a side effect of a read: run `winget list` once yourself and accept them (or remove that source), then ask again",
+    );
+    return unknownFacts("winget", name);
+  }
+  if (code === WINGET_NO_PACKAGES_FOUND) {
     // The one part of winget's answer that is neither localised nor
     // column-aligned: its documented "no installed package matched" code.
     return {

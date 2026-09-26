@@ -757,14 +757,25 @@ export function parseWingetList(stdout: string): WingetRow[] {
 }
 
 /**
- * winget's "no installed package matched" exit code, 0x8A15002B as a signed
+ * winget's "no installed package matched" exit code:
+ * APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND, 0x8A150014, as a signed
  * 32-bit integer.
  *
  * `winget list` exits with this rather than 0-and-empty, which makes presence
  * decidable from the EXIT CODE alone — the one part of winget's answer that
- * is neither localised nor column-aligned.
+ * is neither localised nor column-aligned. 0.7.0 had 0x8A15002B here, which
+ * is APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (`winget upgrade` with
+ * nothing to do), so a package that was not installed came back unknown.
+ * Compare against `code | 0`: a runtime may report the DWORD unsigned.
  */
-export const WINGET_NO_PACKAGES_FOUND = -1978335189;
+export const WINGET_NO_PACKAGES_FOUND = -1978335212;
+
+/**
+ * APPINSTALLER_CLI_ERROR_SOURCE_AGREEMENTS_NOT_ACCEPTED, 0x8A150046: with
+ * `--disable-interactivity`, a configured source whose agreement nobody has
+ * accepted makes `winget list` refuse outright instead of prompting.
+ */
+export const WINGET_SOURCE_AGREEMENTS_NOT_ACCEPTED = -1978335162;
 
 // ---------------------------------------------------------------------------
 // chocolatey

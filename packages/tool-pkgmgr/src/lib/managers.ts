@@ -71,10 +71,14 @@ export const MANAGER_IDS: readonly ManagerId[] = Object.freeze([
  *   - `pacman -S --print --print-format '%r/%n %v'` is pacman's dry run. It
  *     prints every target INCLUDING dependencies, with versions, and needs no
  *     root — the best dry run of the six.
- *   - `winget list --exact --query` with `--disable-interactivity` and
- *     `--accept-source-agreements`: without those two, winget can sit waiting
- *     for a keypress or for an agreement to be accepted, which on a pipe is a
- *     command that never exits.
+ *   - `winget list --exact --query` with `--disable-interactivity`, which is
+ *     what stops winget waiting on a pipe for a keypress: with it, a source
+ *     agreement nobody has accepted makes winget REFUSE (exit 0x8A150046)
+ *     instead of prompting. `--accept-source-agreements` is deliberately
+ *     absent. winget records that acceptance permanently — for msstore it is
+ *     consent to send the machine's region — and accepting a licence is the
+ *     operator's decision, never a side effect of a read. The refusal is
+ *     reported as unknown, with the command to run once by hand.
  *   - `choco list --limit-output` is chocolatey's documented machine-readable
  *     mode: `name|version`, one per line, no headers, no colour. The v1/v2
  *     split is real — `--local-only` was removed in Chocolatey 2.0 — so the
@@ -133,14 +137,7 @@ export const PKGMGR_COMMANDS = Object.freeze({
   pacmanInstall: Object.freeze(["pacman", "-S", "--noconfirm", "--"]),
 
   wingetVersion: Object.freeze(["winget", "--version"]),
-  wingetList: Object.freeze([
-    "winget",
-    "list",
-    "--exact",
-    "--disable-interactivity",
-    "--accept-source-agreements",
-    "--query",
-  ]),
+  wingetList: Object.freeze(["winget", "list", "--exact", "--disable-interactivity", "--query"]),
 
   chocoVersion: Object.freeze(["choco", "--version"]),
   /** Chocolatey 2.x: `choco list` is local by default. */

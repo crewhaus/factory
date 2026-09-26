@@ -229,6 +229,27 @@ describe("the manager table", () => {
     }
   });
 
+  test("no query command accepts an agreement or licence on the operator's behalf (C193)", () => {
+    let checked = 0;
+    for (const [key, argv] of Object.entries(PKGMGR_COMMANDS)) {
+      if (key.endsWith("Install")) continue;
+      checked++;
+      for (const element of argv) {
+        expect({ key, element, accepts: /^--accept-/i.test(element) }).toEqual({
+          key,
+          element,
+          accepts: false,
+        });
+      }
+    }
+    // The scan covered the whole query side of the table, not a slice of it.
+    expect(checked).toBe(
+      Object.keys(PKGMGR_COMMANDS).filter((key) => !key.endsWith("Install")).length,
+    );
+    expect(checked).toBeGreaterThan(20);
+    expect(PKGMGR_COMMANDS.wingetList).toContain("--disable-interactivity");
+  });
+
   test("no command anywhere in the table is a shell", () => {
     const shells = /^(sh|bash|zsh|cmd|cmd\.exe|powershell|powershell\.exe|pwsh)$/i;
     for (const argv of ALL_PKGMGR_COMMANDS) {
