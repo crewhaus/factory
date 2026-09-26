@@ -1446,6 +1446,7 @@
         "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-registry-manifest": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.25.0",

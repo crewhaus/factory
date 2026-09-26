@@ -135,10 +135,14 @@ export interface PluginTargetEmitter {
  * (`plugin-loader`), not by these declarations.
  *
  * - `tools` IS applied. A plugin tool finds on `ctx.bridge` only
- *   `runContext` and the host tools listed here (none when it is absent).
- *   A host tool called that way runs directly: the permission engine, the
- *   justification gate and the egress check that guard a model's call do
- *   not run for it. List only tools the plugin may drive unchecked.
+ *   `runContext` and the host tools listed here (none when it is absent),
+ *   and its `concurrencyClassifier` is shown only those, with an `execute`
+ *   that runs nothing. A listed host tool the plugin calls runs with the
+ *   runtime's context for that call, so `Task` still reaches its sub-agent
+ *   spawner, which the plugin cannot see. It runs directly: the permission
+ *   engine, the justification gate and the egress check that guard a
+ *   model's call do not run for it. List only tools the plugin may drive
+ *   unchecked.
  * - `fs`, `net` and `secrets` are NOT enforced on plugin code. The Hangar
  *   console evaluates `fs` and `net` for the panes it serves, whose code runs
  *   in a sandboxed browser iframe rather than in crewhaus; everywhere else

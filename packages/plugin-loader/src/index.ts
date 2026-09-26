@@ -34,6 +34,7 @@ import {
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
 import { auditToolScopes, buildTool } from "@crewhaus/tool-builder";
+import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { RUNTIME_TOOL_NAMES, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import {
   createExclusive,
@@ -874,43 +875,82 @@ export function createBootPluginRuntime(
   return { registry, loader, warn };
 }
 
+/** The host tools in `tools` that `allowedTools` names. */
+function declaredHostTools(tools: unknown, allowedTools: ReadonlySet<string>): RegisteredTool[] {
+  if (!Array.isArray(tools)) return [];
+  return tools.filter(
+    (t): t is RegisteredTool =>
+      t !== null &&
+      typeof t === "object" &&
+      typeof (t as { name?: unknown }).name === "string" &&
+      allowedTools.has((t as { name: string }).name),
+  );
+}
+
 /**
  * What a plugin tool sees as `ctx.bridge`. The runtime hands every tool the
  * same bridge — the whole tool catalog (each tool's raw `execute`), the
  * permission rules, the approvals store, the sub-agent spawner, the run
  * state — which first-party tools like `Task` need. A plugin tool gets
  * `runContext` (boundary tagging reads it) and only the host tools its
- * manifest's `permissions.tools` names, each a frozen copy. A host tool
- * reached this way runs directly: the permission engine, the justification
- * gate and the egress check that guard a model's call do not run for it, so
- * name only tools the plugin may drive unchecked.
+ * manifest's `permissions.tools` names, each a frozen copy.
+ *
+ * A declared host tool runs with `hostCtx`, the context the runtime gave the
+ * plugin tool's own call, whatever context the plugin passes it: so `Task`
+ * still finds the sub-agent spawner, and the plan tools the run state, that
+ * the plugin itself cannot see. It runs directly: the permission engine, the
+ * justification gate and the egress check that guard a model's call do not
+ * run for it, so name only tools the plugin may drive unchecked.
  *
  * This bounds what the bridge hands a plugin; it is not a sandbox. Plugin
  * code runs in this process and can import anything itself.
  */
-export function pluginBridgeView(bridge: unknown, allowedTools: ReadonlySet<string>): unknown {
+export function pluginBridgeView(
+  bridge: unknown,
+  allowedTools: ReadonlySet<string>,
+  hostCtx?: ToolExecuteContext,
+): unknown {
   if (bridge === null || typeof bridge !== "object") return undefined;
   const { runContext, tools } = bridge as { runContext?: unknown; tools?: unknown };
-  const visible = Array.isArray(tools)
-    ? tools
-        .filter(
-          (t): t is RegisteredTool =>
-            t !== null &&
-            typeof t === "object" &&
-            typeof (t as { name?: unknown }).name === "string" &&
-            allowedTools.has((t as { name: string }).name),
-        )
-        .map((t) => Object.freeze({ ...t }))
-    : [];
+  const visible = declaredHostTools(tools, allowedTools).map((t) =>
+    Object.freeze({ ...t, execute: (input: unknown) => t.execute(input, hostCtx) }),
+  );
   return Object.freeze({
     ...(runContext !== undefined ? { runContext } : {}),
     tools: Object.freeze(visible),
   });
 }
 
-/** `tool`, whose `execute` sees {@link pluginBridgeView} in place of the runtime's bridge. */
+/**
+ * The catalog a plugin tool's `concurrencyClassifier` is shown: the host
+ * tools its manifest names, as frozen copies whose `execute` runs nothing. A
+ * classifier reads flags; it runs before the permission engine has decided
+ * the call — even for a call it will deny — so it must not be a way to run a
+ * tool.
+ */
+function pluginClassifierCatalog(
+  catalog: ReadonlyArray<RegisteredTool>,
+  allowedTools: ReadonlySet<string>,
+): ReadonlyArray<RegisteredTool> {
+  return Object.freeze(
+    declaredHostTools(catalog, allowedTools).map((t) =>
+      Object.freeze({
+        ...t,
+        execute: async () =>
+          `[refused] ${t.name} cannot be run from a concurrency classifier; it only decides whether a call may run alongside others.`,
+      }),
+    ),
+  );
+}
+
+/**
+ * `tool`, whose `execute` sees {@link pluginBridgeView} in place of the
+ * runtime's bridge, and whose `concurrencyClassifier`, if it has one, sees
+ * {@link pluginClassifierCatalog} in place of the runtime's catalog.
+ */
 function withPluginBridge(tool: RegisteredTool, allowedTools: ReadonlySet<string>): RegisteredTool {
   const run = tool.execute;
+  const classify = tool.concurrencyClassifier;
   return {
     ...tool,
     execute: (input, ctx) =>
@@ -918,8 +958,14 @@ function withPluginBridge(tool: RegisteredTool, allowedTools: ReadonlySet<string
         input,
         ctx?.bridge === undefined
           ? ctx
-          : { ...ctx, bridge: pluginBridgeView(ctx.bridge, allowedTools) },
+          : { ...ctx, bridge: pluginBridgeView(ctx.bridge, allowedTools, ctx) },
       ),
+    ...(classify !== undefined
+      ? {
+          concurrencyClassifier: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) =>
+            classify(input, pluginClassifierCatalog(catalog, allowedTools)),
+        }
+      : {}),
   };
 }
 

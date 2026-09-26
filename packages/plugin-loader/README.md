@@ -96,10 +96,15 @@ after that contains it.
 
 Of the manifest's `permissions`, only `tools` is applied: a plugin tool's
 `ctx.bridge` shows `runContext` and the host tools `permissions.tools` names,
-and nothing else — not the permission rules, the approvals store or the other
-tools. A host tool a plugin calls that way runs directly, without the
-permission engine, the justification gate or the egress check, so name only
-tools the plugin may drive unchecked. `fs`, `net` and `secrets` are not
+and nothing else — not the permission rules, the approvals store, the
+sub-agent spawner or the other tools. A tool's `concurrencyClassifier` is
+shown the same host tools, and calling one from there runs nothing: a
+classifier runs before the permission engine decides the call.
+
+A host tool a plugin calls through the bridge runs with the runtime's context
+for that call, so `Task` still starts its sub-agent. It runs directly, without
+the permission engine, the justification gate or the egress check, so name
+only tools the plugin may drive unchecked. `fs`, `net` and `secrets` are not
 enforced on plugin code.
 
 A manifest that declares `permissions.fs`, `net` or `secrets` gets a boot note
