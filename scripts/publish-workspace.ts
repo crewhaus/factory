@@ -43,10 +43,15 @@
  *   bun scripts/publish-workspace.ts                            # full run
  *   bun scripts/publish-workspace.ts --dry-run --no-registry    # offline pack check (CI)
  *
- * Every form except --no-registry needs `npm` and a registry that answers (the
- * ownership guard below will not guess), and every form needs a tree already
- * stamped by `release-prep.ts --for-publish` (an unstamped one fails the
- * manifest check).
+ * Every form except --no-registry needs `npm` on PATH (checked once, up front)
+ * and a registry that answers (the ownership guard below will not guess), and
+ * every form needs a tree already stamped by `release-prep.ts --for-publish` (an
+ * unstamped one fails the manifest check).
+ *
+ * After a failed run, fix the cause and re-run WITHOUT --filter: versions already
+ * on the registry are skipped and everything the failure held back goes out.
+ * `--filter <leaf>` would publish the leaf alone and exit 0 with its dependents
+ * still missing. The summary of a failed run says this.
  *
  * Brand-new package names can 404 on the registry for a few minutes after a
  * successful publish — poll before assuming failure or re-running.
@@ -66,10 +71,12 @@
  * @crewhaus/<dep>@0.0.0, which never existed). So a package is refused when an
  * internal dependency (dependencies, peerDependencies or optionalDependencies)
  * failed or was refused in this run, or — for a dependency outside this run,
- * as under --filter — is not on the registry at this version. The refusal
- * cascades: when a leaf fails, nothing that depends on it, the bare `crewhaus`
- * CLI included, goes out pointing at a version that does not exist. Under
- * --dry-run the plan shows the same cascade.
+ * as under --filter — is not on the registry at this version, or pins something
+ * that is not (its whole closure is checked). The refusal cascades: when a leaf
+ * fails, nothing that depends on it, the bare `crewhaus` CLI included, goes out
+ * pointing at a version that does not exist. A package already on the registry
+ * whose dependency is not is reported as not installable and fails the run.
+ * Under --dry-run the plan shows the same cascade.
  *
  * Packed-contents check: before publishing (and under --dry-run), the package
  * dir must hold what its tarball is supposed to carry — every entry point and
@@ -101,7 +108,10 @@ const flag = (name: string) => {
 const has = (name: string) => args.includes(`--${name}`);
 
 const DRY = has("dry-run");
-const FILTER = flag("filter"); // exact package name to publish, useful for retries
+// Exact package name to publish, e.g. a canary leaf. Not the way to finish a
+// failed run: it publishes that one package and nothing that depends on it —
+// a full re-run skips what is already out and publishes the rest.
+const FILTER = flag("filter");
 // --dry-run only: leave the registry out entirely, so CI can run the packed-contents
 // and dependency-plan checks on every PR without a network. Ownership is then NOT
 // checked, and a dependency outside the run cannot be confirmed (so it blocks).
@@ -216,14 +226,42 @@ function topoSort(pkgs: PkgInfo[]): PkgInfo[] {
   return out;
 }
 
-/** What a spawned `npm view` returned: the parts classification needs. */
+/**
+ * What a spawned `npm view` returned: the parts classification needs. `status`
+ * is not a number when npm did not exit normally — Node says null, and Bun's
+ * node:child_process says undefined for a command it could not start.
+ */
 export type ViewResult = {
-  readonly status: number | null;
+  readonly status: number | null | undefined;
   readonly stdout: string;
   readonly stderr: string;
   readonly error?: { readonly code?: string; readonly message: string } | undefined;
   readonly signal?: string | null | undefined;
 };
+
+/** The parts of a spawnSync result a {@link ViewResult} keeps. */
+export function toViewResult(r: {
+  readonly status: number | null | undefined;
+  readonly stdout?: string | null;
+  readonly stderr?: string | null;
+  readonly error?: unknown;
+  readonly signal?: string | null;
+}): ViewResult {
+  return {
+    status: r.status,
+    stdout: r.stdout ?? "",
+    stderr: r.stderr ?? "",
+    error: (r.error ?? undefined) as ViewResult["error"],
+    signal: r.signal,
+  };
+}
+
+/** Why npm did not run to an exit code (not found, killed), or undefined when it did. */
+export function spawnProblem(r: ViewResult): string | undefined {
+  if (r.error !== undefined) return `npm could not be run (${r.error.code ?? r.error.message})`;
+  if (typeof r.status !== "number") return `npm was killed${r.signal ? ` by ${r.signal}` : ""}`;
+  return undefined;
+}
 
 /**
  * npm's error code for a failed command, e.g. "E404", "E429", "ECONNREFUSED".
@@ -250,12 +288,8 @@ export function npmErrorCode(stdout: string, stderr: string): string | undefined
 export function classifyViewFailure(
   r: ViewResult,
 ): { readonly absent: true } | { readonly absent: false; readonly reason: string } {
-  if (r.status === null) {
-    const why = r.error
-      ? `npm could not be run (${r.error.code ?? r.error.message})`
-      : `npm was killed${r.signal ? ` by ${r.signal}` : ""}`;
-    return { absent: false, reason: why };
-  }
+  const spawn = spawnProblem(r);
+  if (spawn !== undefined) return { absent: false, reason: spawn };
   const code = npmErrorCode(r.stdout, r.stderr);
   if (code === "E404") return { absent: true };
   return {
@@ -279,14 +313,7 @@ export function versionState(r: ViewResult): RegistryState {
 }
 
 function npmView(args: string[]): ViewResult {
-  const r = spawnSync("npm", ["view", ...args], { encoding: "utf-8" });
-  return {
-    status: r.status,
-    stdout: r.stdout ?? "",
-    stderr: r.stderr ?? "",
-    error: r.error as ViewResult["error"],
-    signal: r.signal,
-  };
+  return toViewResult(spawnSync("npm", ["view", ...args], { encoding: "utf-8" }));
 }
 
 /** Is <name>@<version> on the registry? Three answers, not two. */
@@ -317,7 +344,9 @@ export function ownershipVerdict(
   if (r.status !== 0) {
     const c = classifyViewFailure(r);
     if (c.absent) return null; // name not on the registry — first publish
-    return `could not verify who owns this npm name (${c.reason}) — refusing to publish until the registry answers; re-run with --filter ${p.name}`;
+    // No retry advice here: `--filter <this>` would publish this package alone and
+    // leave what depends on it behind. The run's summary says how to re-run.
+    return `could not verify who owns this npm name (${c.reason}) — refusing to publish until the registry answers`;
   }
   let repo: { url?: string; directory?: string };
   try {
@@ -543,6 +572,8 @@ export type DependencyGate = {
   readonly inRun: ReadonlySet<string>;
   /** Registry lookup for a dependency this run does not handle (e.g. under --filter). */
   readonly registry: (name: string, version: string) => RegistryState;
+  /** A workspace package's internal dependencies, from the discovered graph. */
+  readonly depsOf: (name: string) => readonly string[];
 };
 
 /**
@@ -552,25 +583,57 @@ export type DependencyGate = {
  * (checkPublishableManifest enforces it), so `<dep>@<p.version>` is the coordinate.
  * A registry that cannot be read counts against the dependency: publishing onto
  * a dependency nobody could confirm is the failure this gate exists to stop.
+ *
+ * A dependency outside the run is walked down to its own dependencies: it being
+ * on the registry says nothing about whether what IT pins is (a 0.7.0-era run
+ * or a hand `npm publish` can leave a package there without its dependencies),
+ * and npm installs the whole closure. Its dependencies are read from the
+ * workspace graph, which is the same source at the same lockstep version. A
+ * dependency this run settled is not walked: its own check covered its closure,
+ * and one whose closure was unmet was refused and is in `unavailable`.
  */
 export function unmetDependencies(
   p: Pick<PkgInfo, "deps" | "version">,
   gate: DependencyGate,
 ): string[] {
   const out: string[] = [];
-  for (const d of p.deps) {
+  const seen = new Set<string>();
+  const visit = (d: string, via: string | undefined): void => {
+    if (seen.has(d)) return;
+    seen.add(d);
+    const through = via === undefined ? "" : `; needed through ${via}`;
     if (gate.unavailable.has(d)) {
-      out.push(`${d} (failed or was refused in this run)`);
-      continue;
+      out.push(`${d} (failed or was refused in this run${through})`);
+      return;
     }
-    if (gate.inRun.has(d)) continue;
+    if (gate.inRun.has(d)) return;
     const state = gate.registry(d, p.version);
-    if (state.kind === "absent") out.push(`${d}@${p.version} (not on the registry)`);
-    else if (state.kind === "unknown") {
-      out.push(`${d}@${p.version} (could not check the registry: ${state.reason})`);
+    if (state.kind === "absent") {
+      out.push(`${d}@${p.version} (not on the registry${through})`);
+      return;
     }
-  }
+    if (state.kind === "unknown") {
+      out.push(`${d}@${p.version} (could not check the registry: ${state.reason}${through})`);
+      return;
+    }
+    for (const next of gate.depsOf(d)) visit(next, via ?? d);
+  };
+  for (const d of p.deps) visit(d, undefined);
   return out;
+}
+
+/**
+ * What to do after a failed run. A full re-run is what finishes a release: it
+ * skips every version already on the registry and publishes what the failure
+ * held back. `--filter <name>` publishes that one package and nothing that
+ * depends on it, so on its own it can exit 0 with most of the release missing.
+ */
+export function rerunAdvice(filter: string | undefined): string {
+  const all =
+    "re-run without --filter: versions already on the registry are skipped, and the rest go out";
+  return filter === undefined
+    ? `After fixing, ${all}.`
+    : `After fixing, re-run with --filter ${filter} to retry that package alone, or ${all}.`;
 }
 
 // ─── main ──────────────────────────────────────────────────────────────────
@@ -583,6 +646,17 @@ function main(): void {
       process.exit(1);
     }
     console.log("Registry not consulted (--no-registry): ownership is NOT checked.");
+  } else {
+    // Once, up front: without a working npm every package below would be refused
+    // with a registry complaint that is not the reason.
+    const probe = toViewResult(spawnSync("npm", ["--version"], { encoding: "utf-8" }));
+    const why =
+      spawnProblem(probe) ??
+      (probe.status === 0 ? undefined : `npm --version exited ${probe.status}`);
+    if (why !== undefined) {
+      console.error(`✗ ${why}. Every run except --dry-run --no-registry needs npm on PATH.`);
+      process.exit(1);
+    }
   }
   // `npm whoami` is a TOKEN identity check and there is no equivalent under OIDC:
   // trusted publishing mints a short-lived, package-scoped credential during
@@ -620,6 +694,7 @@ function main(): void {
   console.log(`Discovered ${pkgs.length} publishable packages (crewhaus + @crewhaus/*) in ${ROOT}`);
 
   const sorted = topoSort(pkgs);
+  const byName = new Map(pkgs.map((p) => [p.name, p]));
   const filtered = FILTER ? sorted.filter((p) => p.name === FILTER) : sorted;
   if (FILTER && filtered.length === 0) {
     console.error(`No package matched --filter ${FILTER}`);
@@ -629,6 +704,9 @@ function main(): void {
   let published = 0;
   let skipped = 0;
   const failures: string[] = [];
+  // Already on the registry, so nothing to publish, but pinned to a dependency
+  // that is not: installs of it fail. That is not a finished release either.
+  const notInstallable: string[] = [];
   const unavailable = new Set<string>();
   const registryMemo = new Map<string, RegistryState>();
   const gate: DependencyGate = {
@@ -644,6 +722,7 @@ function main(): void {
       }
       return state;
     },
+    depsOf: (name) => byName.get(name)?.deps ?? [],
   };
   const fail = (p: PkgInfo, entry: string) => {
     failures.push(entry);
@@ -669,6 +748,7 @@ function main(): void {
         if (unmet.length > 0) {
           // Nothing to do for it, but what depends on it would not install either.
           unavailable.add(p.name);
+          notInstallable.push(`${p.name}@${p.version} (depends on ${unmet.join(", ")})`);
           console.error(
             `  ! it depends on ${unmet.join(", ")}; installs of it fail until that is published`,
           );
@@ -702,15 +782,17 @@ function main(): void {
         // Keep going: packages that do not depend on this one can still ship.
         // Those that do are refused by the dependency gate above — npm would
         // otherwise publish them pointing at a version that does not exist.
-        console.error(`  (continuing; re-run with --filter ${p.name} after fixing)`);
+        console.error("  (continuing; what depends on it is held back)");
       }
     }
   }
 
   console.log("");
   console.log(`Published: ${published}  Skipped: ${skipped}  Failed: ${failures.length}`);
-  if (failures.length) {
-    for (const f of failures) console.error(`  ✗ ${f}`);
+  for (const f of failures) console.error(`  ✗ ${f}`);
+  for (const b of notInstallable) console.error(`On the registry but not installable: ${b}`);
+  if (failures.length > 0 || notInstallable.length > 0) {
+    if (!DRY) console.error(rerunAdvice(FILTER));
     process.exit(1);
   }
 }

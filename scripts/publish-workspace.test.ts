@@ -10,6 +10,7 @@
  * port, and every fixture manifest's publishConfig.registry points there too.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
@@ -27,6 +28,8 @@ import {
   npmErrorCode,
   ownershipVerdict,
   packedContentsProblems,
+  rerunAdvice,
+  toViewResult,
   unmetDependencies,
   versionState,
 } from "./publish-workspace";
@@ -39,7 +42,12 @@ const V = "0.7.1";
 // ─── npm output classification (unit) ─────────────────────────────────────────
 
 const E404_JSON = '{"error":{"code":"E404","summary":"Not Found"}}';
-const view = (status: number | null, stdout = "", stderr = "", extra = {}): ViewResult => ({
+const view = (
+  status: number | null | undefined,
+  stdout = "",
+  stderr = "",
+  extra = {},
+): ViewResult => ({
   status,
   stdout,
   stderr,
@@ -62,7 +70,7 @@ test("only E404 counts as 'not on the registry'; every other failure is unknown"
     view(1, "", "npm error code E429"),
     view(1, "", "npm error code E500"),
     view(1, "", ""),
-    view(null, "", "", { error: { code: "ENOENT", message: "spawn npm ENOENT" } }),
+    view(undefined, "", "", { error: { code: "ENOENT", message: "spawn npm ENOENT" } }),
     view(null, "", "", { signal: "SIGKILL" }),
   ]) {
     const c = classifyViewFailure(r);
@@ -72,9 +80,27 @@ test("only E404 counts as 'not on the registry'; every other failure is unknown"
     absent: false,
     reason: "npm view exited 1 with code E429",
   });
-  expect(
-    classifyViewFailure(view(null, "", "", { error: { code: "ENOENT", message: "x" } })),
-  ).toEqual({ absent: false, reason: "npm could not be run (ENOENT)" });
+  expect(classifyViewFailure(view(null, "", "", { signal: "SIGKILL" }))).toEqual({
+    absent: false,
+    reason: "npm was killed by SIGKILL",
+  });
+});
+
+test("a command that is not on PATH is reported as that, in the shape Bun's spawnSync really returns", () => {
+  // Bun reports a missing executable with status undefined (Node says null); the
+  // classifier used to test `=== null` and so called it "exited undefined".
+  const missing = toViewResult(
+    spawnSync("crewhaus-no-such-command-e2b7", ["view"], { encoding: "utf-8" }),
+  );
+  expect(missing.error?.code).toBe("ENOENT");
+  expect(classifyViewFailure(missing)).toEqual({
+    absent: false,
+    reason: "npm could not be run (ENOENT)",
+  });
+  expect(versionState(missing)).toEqual({
+    kind: "unknown",
+    reason: "npm could not be run (ENOENT)",
+  });
 });
 
 test("versionState: published, absent (npm 11's E404 and older npm's empty exit 0), or unknown", () => {
@@ -106,12 +132,22 @@ test("the ownership guard passes a free name or a matching repository, and refus
     view(1, '{"error":{"code":"ECONNREFUSED"}}'),
     view(1, '{"error":{"code":"E429"}}'),
     view(1, "", "npm error code E500"),
-    view(null, "", "", { error: { code: "ENOENT", message: "spawn npm ENOENT" } }),
+    view(undefined, "", "", { error: { code: "ENOENT", message: "spawn npm ENOENT" } }),
   ]) {
     const verdict = ownershipVerdict(r, p);
     expect(verdict).toStartWith("could not verify who owns this npm name");
-    expect(verdict).toContain("--filter @crewhaus/tool-fs");
+    // No retry advice here: `--filter <this>` would publish it alone and leave
+    // everything that depends on it unpublished. The run's summary says how.
+    expect(verdict).not.toContain("--filter");
   }
+  expect(
+    ownershipVerdict(
+      view(undefined, "", "", { error: { code: "ENOENT", message: "spawn npm ENOENT" } }),
+      p,
+    ),
+  ).toBe(
+    "could not verify who owns this npm name (npm could not be run (ENOENT)) — refusing to publish until the registry answers",
+  );
 });
 
 test("unmetDependencies: failed in this run, missing from the registry, or unknown — each named", () => {
@@ -126,6 +162,7 @@ test("unmetDependencies: failed in this run, missing from the registry, or unkno
     unavailable: new Set(["@crewhaus/failed"]),
     inRun: new Set(["@crewhaus/failed", "@crewhaus/ok-in-run"]),
     registry,
+    depsOf: () => [],
   };
   const unmet = unmetDependencies(
     {
@@ -150,18 +187,62 @@ test("unmetDependencies: failed in this run, missing from the registry, or unkno
   expect(asked).toEqual([`@crewhaus/there@${V}`, `@crewhaus/missing@${V}`, `@crewhaus/flaky@${V}`]);
 });
 
+test("unmetDependencies walks a dependency outside the run down to its own dependencies", () => {
+  // cli -> b -> {a, c}, c -> a. b and c are on the registry; a is not. Before,
+  // only b was asked about, and the CLI went out onto a closure with a hole.
+  const graph: Record<string, string[]> = {
+    "@crewhaus/b": ["@crewhaus/a", "@crewhaus/c"],
+    "@crewhaus/c": ["@crewhaus/a"],
+    "@crewhaus/a": [],
+  };
+  const asked: string[] = [];
+  const gate = {
+    unavailable: new Set<string>(),
+    inRun: new Set(["crewhaus"]),
+    registry: (name: string, version: string) => {
+      asked.push(`${name}@${version}`);
+      return name === "@crewhaus/a"
+        ? ({ kind: "absent" } as const)
+        : ({ kind: "published" } as const);
+    },
+    depsOf: (name: string) => graph[name] ?? [],
+  };
+  expect(unmetDependencies({ version: V, deps: ["@crewhaus/b"] }, gate)).toEqual([
+    `@crewhaus/a@${V} (not on the registry; needed through @crewhaus/b)`,
+  ]);
+  // Each member is asked about once, even when two paths reach it.
+  expect(asked).toEqual([`@crewhaus/b@${V}`, `@crewhaus/a@${V}`, `@crewhaus/c@${V}`]);
+
+  // A member the run settled is not walked into: its own check covered it.
+  asked.length = 0;
+  const settled = { ...gate, inRun: new Set(["crewhaus", "@crewhaus/c"]) };
+  graph["@crewhaus/b"] = ["@crewhaus/c"];
+  expect(unmetDependencies({ version: V, deps: ["@crewhaus/b"] }, settled)).toEqual([]);
+  expect(asked).toEqual([`@crewhaus/b@${V}`]);
+
+  // One that failed in the run is named, with the path to it.
+  asked.length = 0;
+  const failed = { ...settled, unavailable: new Set(["@crewhaus/c"]) };
+  expect(unmetDependencies({ version: V, deps: ["@crewhaus/b"] }, failed)).toEqual([
+    "@crewhaus/c (failed or was refused in this run; needed through @crewhaus/b)",
+  ]);
+});
+
 // ─── fixtures ─────────────────────────────────────────────────────────────────
 
 let TMP = "";
 let FAKE_BIN = "";
 
 // The fake npm. Reads its behaviour from $FAKE_NPM_CONFIG, appends every call to
-// $FAKE_NPM_LOG, and never opens a socket.
+// $FAKE_NPM_LOG, and never opens a socket. With `persist`, it is a registry that
+// remembers: a publish is recorded in the config file, so a later run sees it,
+// and a `viewErrorOnce` entry fires once and is then gone.
 const FAKE_NPM_SOURCE = `
-const { appendFileSync, readFileSync } = require("node:fs");
+const { appendFileSync, readFileSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const args = process.argv.slice(2);
 const cfg = JSON.parse(readFileSync(process.env.FAKE_NPM_CONFIG, "utf8"));
+const save = () => writeFileSync(process.env.FAKE_NPM_CONFIG, JSON.stringify(cfg));
 appendFileSync(process.env.FAKE_NPM_LOG, JSON.stringify(args) + "\\n");
 const fail = (code) => {
   if (args.includes("--json")) process.stdout.write(JSON.stringify({ error: { code, summary: code } }));
@@ -169,10 +250,14 @@ const fail = (code) => {
   process.exit(1);
 };
 if (args[0] === "--fake-probe") { process.stdout.write("FAKE-NPM"); process.exit(0); }
+if (args[0] === "--version") { process.stdout.write("11.0.0-fake\\n"); process.exit(0); }
 if (args[0] === "whoami") { process.stdout.write("fake-user\\n"); process.exit(0); }
 if (args[0] === "view") {
   const spec = args[1];
   if (cfg.viewError) fail(cfg.viewError);
+  const onceKey = spec + " " + args[2];
+  const once = (cfg.viewErrorOnce || {})[onceKey];
+  if (once) { delete cfg.viewErrorOnce[onceKey]; save(); fail(once); }
   if (args[2] === "repository") {
     const repo = (cfg.repos || {})[spec];
     if (repo) { process.stdout.write(JSON.stringify(repo)); process.exit(0); }
@@ -184,8 +269,14 @@ if (args[0] === "view") {
   }
 }
 if (args[0] === "publish") {
-  const name = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")).name;
+  const pj = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8"));
+  const name = pj.name;
   if ((cfg.failPublish || []).includes(name)) fail("E403");
+  if (cfg.persist) {
+    cfg.published = [...(cfg.published || []), name + "@" + pj.version];
+    cfg.repos = { ...(cfg.repos || {}), [name]: { url: pj.repository.url, directory: pj.repository.directory } };
+    save();
+  }
   process.stdout.write("+ " + name + "\\n");
   process.exit(0);
 }
@@ -213,6 +304,10 @@ type FakeNpm = {
   failPublish?: string[];
   viewError?: string;
   versionError?: Record<string, string>;
+  /** "<spec> <field>" → an error code returned once, e.g. a transient E429. */
+  viewErrorOnce?: Record<string, string>;
+  /** Record publishes in the config, so the next run sees them on the registry. */
+  persist?: boolean;
 };
 
 type PkgSpec = {
@@ -275,9 +370,10 @@ function isolatedNpmConfig(root: string): Record<string, string> {
   };
 }
 
-function childEnv(root: string, cfg: FakeNpm): Record<string, string> {
+/** `cfg: null` keeps the fake registry's state from the previous run. */
+function childEnv(root: string, cfg: FakeNpm | null): Record<string, string> {
   const cfgPath = join(root, "fake-npm.json");
-  writeFileSync(cfgPath, JSON.stringify(cfg));
+  if (cfg !== null) writeFileSync(cfgPath, JSON.stringify(cfg));
   const log = join(root, "npm-calls.log");
   writeFileSync(log, "");
   // Built from scratch: no NPM_TOKEN, no ACTIONS_ID_TOKEN_REQUEST_URL, no
@@ -292,7 +388,7 @@ function childEnv(root: string, cfg: FakeNpm): Record<string, string> {
   };
 }
 
-function run(root: string, cfg: FakeNpm, ...flags: string[]) {
+function run(root: string, cfg: FakeNpm | null, ...flags: string[]) {
   const env = childEnv(root, cfg);
   // Lock 1: the npm the script will spawn is the fake.
   const probe = Bun.spawnSync(["npm", "--fake-probe"], { env, cwd: root });
@@ -310,6 +406,10 @@ function run(root: string, cfg: FakeNpm, ...flags: string[]) {
     calls,
   };
 }
+
+/** The fake registry's state as the last run left it. */
+const fakeState = (root: string): FakeNpm =>
+  JSON.parse(readFileSync(join(root, "fake-npm.json"), "utf8")) as FakeNpm;
 
 /** Names `npm publish` was run for, in order (the fake prints "+ <name>"). */
 const publishedNames = (stdout: string) =>
@@ -388,10 +488,53 @@ test("--filter checks a dependency outside the run on the registry: absent or un
   expect(flaky.calls.filter((a) => a[0] === "publish")).toEqual([]);
   expect(flaky.stderr).toContain("could not check the registry: npm view exited 1 with code E500");
 
-  const present = run(root, { published: [`@crewhaus/zz-b@${V}`] }, "--filter", "crewhaus");
+  const present = run(
+    root,
+    { published: [`@crewhaus/zz-b@${V}`, `@crewhaus/zz-a@${V}`] },
+    "--filter",
+    "crewhaus",
+  );
   expect(present.stderr).toBe("");
   expect(present.exitCode).toBe(0);
   expect(publishedNames(present.stdout)).toEqual(["crewhaus"]);
+}, 30_000);
+
+test("--filter checks the whole closure: a dependency's own dependency missing from the registry refuses the package", () => {
+  // crewhaus -> zz-b -> zz-a; zz-b is on the registry, zz-a is not. The full run
+  // holds crewhaus back in this state; --filter used to publish it.
+  const root = makeWorkspace([A, B, CLI]);
+  const r = run(root, { published: [`@crewhaus/zz-b@${V}`] }, "--filter", "crewhaus");
+  expect(r.exitCode).toBe(1);
+  expect(r.calls.filter((a) => a[0] === "publish")).toEqual([]);
+  expect(r.stderr).toContain(
+    `crewhaus@${V} not published: it depends on @crewhaus/zz-a@${V} (not on the registry; needed through @crewhaus/zz-b)`,
+  );
+  expect(r.calls.filter((a) => a[0] === "view" && a[2] === "version").map((a) => a[1])).toEqual([
+    `@crewhaus/zz-b@${V}`,
+    `@crewhaus/zz-a@${V}`,
+    `crewhaus@${V}`,
+  ]);
+  expect(r.stdout).toContain("Published: 0  Skipped: 0  Failed: 1");
+}, 30_000);
+
+test("--filter on a package already on the registry whose dependency is not says so, and fails", () => {
+  const root = makeWorkspace([A, B, CLI]);
+  const r = run(
+    root,
+    {
+      published: [`@crewhaus/zz-b@${V}`],
+      repos: { "@crewhaus/zz-b": { url: REPO_URL, directory: "packages/zz-b" } },
+    },
+    "--filter",
+    "@crewhaus/zz-b",
+  );
+  expect(r.exitCode).toBe(1);
+  expect(publishedNames(r.stdout)).toEqual([]);
+  expect(r.stdout).toContain(`= @crewhaus/zz-b@${V} already on registry — skipping`);
+  expect(r.stdout).toContain("Published: 0  Skipped: 1  Failed: 0");
+  expect(r.stderr).toContain(
+    `On the registry but not installable: @crewhaus/zz-b@${V} (depends on @crewhaus/zz-a@${V} (not on the registry))`,
+  );
 }, 30_000);
 
 test("a package already on the registry whose dependency failed still holds back its dependents", () => {
@@ -407,6 +550,89 @@ test("a package already on the registry whose dependency failed still holds back
   expect(r.stderr).toContain("installs of it fail until that is published");
   expect(r.stderr).toContain(`crewhaus@${V} (blocked: @crewhaus/zz-b`);
   expect(r.stdout).toContain("Published: 0  Skipped: 1  Failed: 2");
+  expect(r.stderr).toContain(
+    `On the registry but not installable: @crewhaus/zz-b@${V} (depends on @crewhaus/zz-a (failed or was refused in this run))`,
+  );
+}, 30_000);
+
+// ─── recovering from a failed run ─────────────────────────────────────────────
+// What the script tells an operator to do after a failure must finish the
+// release. It used to say `re-run with --filter <leaf>`, which publishes the
+// leaf alone and exits 0 with everything the leaf had held back unpublished.
+
+/** Run again the way the previous run's summary says to finish the release. */
+function followAdvice(root: string, previous: { stderr: string }, flags: string[]) {
+  const filter = flags.includes("--filter") ? flags[flags.indexOf("--filter") + 1] : undefined;
+  const advice = rerunAdvice(filter);
+  expect(previous.stderr).toContain(advice);
+  expect(advice).toContain(
+    "re-run without --filter: versions already on the registry are skipped, and the rest go out",
+  );
+  const next = flags.filter((f, i) => f !== "--filter" && flags[i - 1] !== "--filter");
+  return run(root, null, ...next);
+}
+
+test("after a leaf's publish fails, doing what the summary says publishes everything it held back", () => {
+  const root = makeWorkspace([A, B, CLI]);
+  const first = run(root, { persist: true, failPublish: ["@crewhaus/zz-a"] });
+  expect(first.exitCode).toBe(1);
+  expect(first.stderr).not.toContain("re-run with --filter");
+  // The operator fixes zz-a (say, its trusted publisher) and follows the advice.
+  writeFileSync(
+    join(root, "fake-npm.json"),
+    JSON.stringify({ ...fakeState(root), failPublish: [] }),
+  );
+  const second = followAdvice(root, first, []);
+  expect(second.stderr).toBe("");
+  expect(second.exitCode).toBe(0);
+  expect(fakeState(root).published?.sort()).toEqual([
+    `@crewhaus/zz-a@${V}`,
+    `@crewhaus/zz-b@${V}`,
+    `crewhaus@${V}`,
+  ]);
+}, 30_000);
+
+test("after the registry could not confirm a leaf's owner, doing what the summary says finishes the release", () => {
+  const root = makeWorkspace([A, B, CLI]);
+  const first = run(root, {
+    persist: true,
+    viewErrorOnce: { "@crewhaus/zz-a repository": "E429" },
+  });
+  expect(first.exitCode).toBe(1);
+  expect(first.stdout).toContain("Published: 0  Skipped: 0  Failed: 3");
+  const second = followAdvice(root, first, []);
+  expect(second.exitCode).toBe(0);
+  expect(second.stdout).toContain("Published: 3  Skipped: 0  Failed: 0");
+  expect(fakeState(root).published?.sort()).toEqual([
+    `@crewhaus/zz-a@${V}`,
+    `@crewhaus/zz-b@${V}`,
+    `crewhaus@${V}`,
+  ]);
+}, 30_000);
+
+test("a failed --filter run says what --filter will and will not publish, and the full re-run finishes it", () => {
+  const root = makeWorkspace([A, B, CLI]);
+  const first = run(
+    root,
+    { persist: true, failPublish: ["@crewhaus/zz-a"] },
+    "--filter",
+    "@crewhaus/zz-a",
+  );
+  expect(first.exitCode).toBe(1);
+  expect(rerunAdvice("@crewhaus/zz-a")).toContain(
+    "re-run with --filter @crewhaus/zz-a to retry that package alone",
+  );
+  writeFileSync(
+    join(root, "fake-npm.json"),
+    JSON.stringify({ ...fakeState(root), failPublish: [] }),
+  );
+  const second = followAdvice(root, first, ["--filter", "@crewhaus/zz-a"]);
+  expect(second.exitCode).toBe(0);
+  expect(fakeState(root).published?.sort()).toEqual([
+    `@crewhaus/zz-a@${V}`,
+    `@crewhaus/zz-b@${V}`,
+    `crewhaus@${V}`,
+  ]);
 }, 30_000);
 
 test("a registry that cannot say whether a version exists does not skip it: the publish is tried", () => {
@@ -608,6 +834,36 @@ test("--dry-run --no-registry never runs npm, still checks packed contents and t
   expect(real.exitCode).toBe(1);
   expect(real.stderr).toContain("--no-registry is a --dry-run option");
   expect(real.calls).toEqual([]);
+}, 30_000);
+
+test("with no npm on PATH the script stops once and says so; --dry-run --no-registry still runs", () => {
+  const root = makeWorkspace([A, B]);
+  // A PATH with nothing on it: the script itself is started by absolute path.
+  const env = {
+    PATH: mkdtempSync(join(TMP, "empty-bin-")),
+    HOME: root,
+    ...isolatedNpmConfig(root),
+  };
+  const go = (...flags: string[]) => {
+    const r = Bun.spawnSync([process.execPath, SCRIPT, "--root", root, ...flags], {
+      env,
+      cwd: root,
+    });
+    return { exitCode: r.exitCode, stdout: r.stdout.toString(), stderr: r.stderr.toString() };
+  };
+  const noNpm =
+    "✗ npm could not be run (ENOENT). Every run except --dry-run --no-registry needs npm on PATH.\n";
+  for (const flags of [["--dry-run"], []]) {
+    const r = go(...flags);
+    expect(r.exitCode).toBe(1);
+    // Once, before any package — not a registry complaint per package.
+    expect(r.stderr).toBe(noNpm);
+    expect(r.stdout).not.toContain("→ publishing");
+  }
+  const offline = go("--dry-run", "--no-registry");
+  expect(offline.stderr).toBe("");
+  expect(offline.exitCode).toBe(0);
+  expect(offline.stdout).toContain("Published: 2  Skipped: 0  Failed: 0");
 }, 30_000);
 
 // ─── the real npm CLI against a local registry ────────────────────────────────
