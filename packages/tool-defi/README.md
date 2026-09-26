@@ -138,10 +138,15 @@ a holding goes to `unpriced[]` — never to zero, never to absence — when:
 included (20 s by default; 60 s for `PortfolioValuation`, which reads
 holding by holding; 120 s at most). Once it passes, nothing more is asked of
 anybody: the holdings not yet priced are listed with that reason, and a note
-says how many. One call also sends at most 256 requests to the public price
-providers (16 for a single `PriceQuote`, which needs at most 15), and a pair
-or a leg it has already fetched is reused rather than asked for again, so
-twenty holdings of BTC cost one quote.
+says how many. A `PortfolioValuation` also sends at most four requests to the
+public price providers per holding priced from one (what an asset nobody lists
+costs in a fiat currency), between 16 and 512 for the call; a single
+`PriceQuote` sends at most 16. A pair or a leg already fetched is reused rather
+than asked for again, so twenty holdings of BTC cost one quote, and every
+holding not yet reached keeps one request in reserve, so a run of tokens no
+provider lists cannot leave a later holding unasked. A route the budget did not
+ask is named as "not asked" in its row — never as something the provider does
+not publish — and a note counts those rows.
 
 `weightBps` is a share of the **priced** total, which is stated in the payload
 too — the weights of an incomplete portfolio still sum to 10000, and that is

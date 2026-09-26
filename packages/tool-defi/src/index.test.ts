@@ -1662,6 +1662,63 @@ describe("timeoutMs is one deadline for the whole call, and a call's requests ar
     );
   });
 
+  test("unlisted assets cannot spend the budget before a listed one is asked", async () => {
+    // 128 tokens no provider lists, then BTC and ETH, valued in EUR: each
+    // unlisted one costs four requests, 512 in all — the whole budget. 0.7.1's
+    // first cut had no reserve (and 256 for the call), so 64 were enough to
+    // spend it on the dust and say coinbase "publishes neither BTC-EUR nor
+    // its inverse" — which nobody had asked.
+    install({
+      http: {
+        [coinbaseUrl("BTC", "EUR")]: coinbaseSpot("BTC", "EUR", "50000.00"),
+        [coinbaseUrl("ETH", "EUR")]: coinbaseSpot("ETH", "EUR", "3000.00"),
+      },
+    });
+    const dust = Array.from({ length: 128 }, (_, i) => ({
+      asset: `DUST${i}`,
+      amount: "1",
+      quotePair: { base: `DUST${i}` },
+    }));
+    const out = await call(portfolioValuation, {
+      quoteCurrency: "EUR",
+      holdings: [
+        ...dust,
+        { asset: "BTC", amount: "0.5", quotePair: { base: "BTC" } },
+        { asset: "ETH", amount: "2", quotePair: { base: "ETH" } },
+      ],
+    });
+    const priced = (out["priced"] as Array<Record<string, unknown>>).map((r) => r["asset"]);
+    expect(priced).toEqual(["BTC", "ETH"]);
+    expect((out["unpriced"] as unknown[]).length).toBe(128);
+  });
+
+  test("a route the budget did not ask is named as not asked, and a note counts them", async () => {
+    // XYZ is listed against USD only. After 255 unlisted holdings it has one
+    // request left: its direct pair (404), and nothing for the rest.
+    install({ http: { [coinbaseUrl("XYZ", "USD")]: coinbaseSpot("XYZ", "USD", "2") } });
+    const holdings = [
+      ...Array.from({ length: 255 }, (_, i) => ({
+        asset: `T${i}`,
+        amount: "1",
+        quotePair: { base: `T${i}` },
+      })),
+      { asset: "XYZ", amount: "1", quotePair: { base: "XYZ" } },
+    ];
+    const out = await call(portfolioValuation, { quoteCurrency: "EUR", holdings });
+    const xyz = (out["unpriced"] as Array<Record<string, unknown>>).find(
+      (r) => r["asset"] === "XYZ",
+    );
+    const reason = String(xyz?.["reason"]);
+    expect(reason).toContain(
+      "its inverse EUR-XYZ was not asked: this call has already sent the 512",
+    );
+    expect(reason).toContain("coinbase was not asked for XYZ-USD");
+    expect(reason).not.toContain("publishes neither XYZ-EUR");
+    expect((out["notes"] as string[]).join(" ")).toMatch(
+      /^.*\d+ unpriced holding\(s\) had a price route that was not asked, because this call's 512 price-provider requests were spent or held for later holdings/,
+    );
+  });
+
   test("the same pair across many holdings is asked for once", async () => {
     const { recorded } = install({
       http: { [coinbaseUrl("BTC", "USD")]: coinbaseSpot("BTC", "USD", "60000.00") },

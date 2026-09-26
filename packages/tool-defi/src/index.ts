@@ -125,12 +125,26 @@ export const PORTFOLIO_DEFAULT_TIMEOUT_MS = 60_000;
 /**
  * How many requests one call may send to the public price providers. A single
  * PriceQuote needs at most fifteen (direct, inverted, then crossed through two
- * intermediates), so its budget is a backstop. PortfolioValuation's is one per
- * holding it may carry; an answer already fetched in the same call is reused,
- * not counted again.
+ * intermediates), so its budget is a backstop. PortfolioValuation's is four
+ * per holding priced from a provider — what an asset no provider lists costs
+ * in a fiat quote currency: direct, inverse, and both via USD — between
+ * PriceQuote's sixteen and {@link PORTFOLIO_PROVIDER_REQUESTS}; an answer
+ * already fetched in the same call is reused, not counted again. And each
+ * holding not yet reached keeps one request in reserve, so listed assets
+ * after a run of unlisted ones are still asked (see ProviderLedger.reserve).
  */
 export const PRICE_QUOTE_PROVIDER_REQUESTS = 16;
-export const PORTFOLIO_PROVIDER_REQUESTS = 256;
+export const PORTFOLIO_PROVIDER_REQUESTS = 512;
+const PROVIDER_REQUESTS_PER_HOLDING = 4;
+
+/** PortfolioValuation's provider budget for these holdings. */
+function portfolioProviderRequests(holdings: ReadonlyArray<{ quotePair?: unknown }>): number {
+  const quoting = holdings.filter((h) => h.quotePair !== undefined).length;
+  return Math.min(
+    PORTFOLIO_PROVIDER_REQUESTS,
+    Math.max(PRICE_QUOTE_PROVIDER_REQUESTS, quoting * PROVIDER_REQUESTS_PER_HOLDING),
+  );
+}
 
 function timeoutFieldWithDefault(defaultMs: number) {
   return z
@@ -618,7 +632,7 @@ export const portfolioValuation: RegisteredTool = buildTool({
       input.timeoutMs ?? PORTFOLIO_DEFAULT_TIMEOUT_MS,
       {
         ...(input.chainId === undefined ? {} : { chainId: input.chainId }),
-        providerRequests: PORTFOLIO_PROVIDER_REQUESTS,
+        providerRequests: portfolioProviderRequests(input.holdings),
       },
       (call) => valuePortfolio(input, ctx, call),
     ),
@@ -722,6 +736,17 @@ async function valuePortfolio(
   let total: Fixed = ZERO;
   let exactSum: Fixed = ZERO;
   let outOfTime = 0;
+  // The provider budget: how many holdings after each one will quote, so
+  // each keeps a request in reserve for them; and how many unpriced
+  // holdings had a route that was not asked for want of budget.
+  const ledger = options.providers;
+  const quotingAfter = input.holdings.map(
+    (_, i) =>
+      input.holdings.filter(
+        (h, j) => j > i && h.quotePair !== undefined && sourceErrors[j] === undefined,
+      ).length,
+  );
+  let budgetShort = 0;
 
   for (let index = 0; index < input.holdings.length; index++) {
     const holding = input.holdings[index] as Holding;
@@ -756,6 +781,8 @@ async function valuePortfolio(
       continue;
     }
     let price: { value: Fixed; provenance: unknown };
+    const refusedBefore = ledger?.refused ?? 0;
+    if (ledger !== undefined) ledger.reserve = quotingAfter[index] as number;
     try {
       price = await priceFor(holding, {
         quoteCurrency,
@@ -770,6 +797,7 @@ async function valuePortfolio(
       // A holding that could not be priced is a ROW, not a thrown error: the
       // other forty-nine assets still have values, and the whole point of the
       // unpriced bucket is that it is visible rather than absent.
+      if ((ledger?.refused ?? 0) > refusedBefore) budgetShort++;
       unpriced.push({
         asset: holding.asset,
         amount: toDecimalString(trim(amount.value)),
@@ -831,6 +859,11 @@ async function valuePortfolio(
   if (outOfTime > 0) {
     notes.push(
       `${outOfTime} holding(s) were not priced because the call ran out of time; a larger timeoutMs (up to ${MAX_TIMEOUT_MS}) or fewer holdings per call would price them`,
+    );
+  }
+  if (budgetShort > 0) {
+    notes.push(
+      `${budgetShort} unpriced holding(s) had a price route that was not asked, because this call's ${ledger?.limit} price-provider requests were spent or held for later holdings; fewer distinct assets per call would try them`,
     );
   }
   if (!isPositive(total) && priced.length > 0) {

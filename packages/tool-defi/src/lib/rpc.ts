@@ -315,7 +315,19 @@ export const DEFI_RPC_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 export type TransportFailure = {
-  readonly kind: "transport" | "status" | "rateLimited" | "malformed" | "rpcError" | "refused";
+  /**
+   * `budget`: not sent, because the call's price-provider requests are spent
+   * or held for the holdings after this one — nothing was asked, so nothing
+   * is known about what the provider publishes.
+   */
+  readonly kind:
+    | "transport"
+    | "status"
+    | "rateLimited"
+    | "malformed"
+    | "rpcError"
+    | "refused"
+    | "budget";
   readonly message: string;
   readonly status?: number;
   /** The JSON-RPC error code, when the node answered with one. */
@@ -355,11 +367,19 @@ export type RpcOptions = {
 export type ProviderLedger = {
   readonly limit: number;
   made: number;
+  /**
+   * Requests held back for work still to come — one per holding a valuation
+   * has not reached — so assets that no provider lists cannot spend the
+   * budget before a later holding has been asked at all.
+   */
+  reserve: number;
+  /** How many requests were refused for budget, so a caller can say so. */
+  refused: number;
   readonly answers: Map<string, Promise<RpcOutcome<unknown>>>;
 };
 
 export function newProviderLedger(limit: number): ProviderLedger {
-  return { limit, made: 0, answers: new Map() };
+  return { limit, made: 0, reserve: 0, refused: 0, answers: new Map() };
 }
 
 /** Why nothing was dialled: the call's signal had already fired. */
@@ -545,11 +565,15 @@ export async function getJson(
   const key = `${options.accept ?? "application/json"} ${url}`;
   const known = ledger.answers.get(key);
   if (known !== undefined) return known;
-  if (ledger.made >= ledger.limit) {
+  if (ledger.made >= ledger.limit - ledger.reserve) {
+    ledger.refused++;
     return {
       ok: false,
-      kind: "refused",
-      message: `this call has already sent the ${ledger.limit} price-provider requests it may send, so ${label} was not asked — price fewer distinct assets per call`,
+      kind: "budget",
+      message:
+        ledger.made >= ledger.limit
+          ? `this call has already sent the ${ledger.limit} price-provider requests it may send, so ${label} was not asked — price fewer distinct assets per call`
+          : `${label} was not asked: the rest of this call's ${ledger.limit} price-provider requests is held for the ${ledger.reserve} holding(s) after this one — price fewer distinct assets per call`,
     };
   }
   ledger.made++;
