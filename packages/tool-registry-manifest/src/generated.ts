@@ -644,7 +644,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "checksumVerify",
     name: "ChecksumVerify",
     description:
-      "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included; symlinks are reported, never followed out of the workspace; a walk that stops early is not ok.",
+      "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that with no directory given, the workspace root's .git and node_modules are left out and listed as excluded; symlinks are reported, never followed out of the workspace; a walk that stops early is not ok.",
     readOnly: true,
     destructive: false,
     scope: "internal",

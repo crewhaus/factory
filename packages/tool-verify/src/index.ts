@@ -29,7 +29,11 @@ import {
   textOf,
 } from "@crewhaus/tool-html";
 import { joinRel, openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
-import { describeRegexOutcome, openRegexSession, runRegex } from "@crewhaus/tool-safety/regex";
+import {
+  type RegexSession,
+  describeRegexOutcome,
+  openRegexSession,
+} from "@crewhaus/tool-safety/regex";
 import { textSimilarity } from "@crewhaus/tool-text";
 import { z } from "zod";
 import { integrityLimits, integrityWalk } from "./integrity";
@@ -419,10 +423,20 @@ function manifestKey(rel: string): string {
   return rel === "" ? rel : posix.normalize(rel);
 }
 
+/**
+ * What ChecksumVerify leaves out when it is given neither a directory nor an
+ * exclude list, and so walks the whole workspace: the version-control store
+ * and the installed dependencies. At a project root they are nearly every
+ * entry (a repo's 400 files became 13,000 entries and a 2 MB manifest), and
+ * neither is what "has this project changed" means. Always echoed back in
+ * `excluded`; `exclude: []` walks everything.
+ */
+const DEFAULT_ROOT_EXCLUDE: ReadonlyArray<string> = [".git", "node_modules"];
+
 export const checksumVerify: RegisteredTool = buildTool({
   name: "ChecksumVerify",
   description:
-    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included; symlinks are reported, never followed out of the workspace; a walk that stops early is not ok.",
+    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that with no directory given, the workspace root's .git and node_modules are left out and listed as excluded; symlinks are reported, never followed out of the workspace; a walk that stops early is not ok.",
   inputSchema: z
     .object({
       directory: z.string().optional().describe("what to hash; defaults to the workspace root"),
@@ -442,7 +456,7 @@ export const checksumVerify: RegisteredTool = buildTool({
         .max(64)
         .optional()
         .describe(
-          "paths under the directory to leave out with everything below them, e.g. .git; listed back as excluded",
+          "paths under the directory to leave out with everything below them, e.g. .git; listed back as excluded. With no directory and no exclude, .git and node_modules at the workspace root are left out",
         ),
       write: z
         .boolean()
@@ -473,6 +487,12 @@ export const checksumVerify: RegisteredTool = buildTool({
     const absent = new Set<string>();
     const symlinks: Array<{ path: string; target: string }> = [];
     let truncated = false;
+    const exclude =
+      input.exclude ??
+      (input.directory === undefined && input.files === undefined
+        ? DEFAULT_ROOT_EXCLUDE
+        : undefined);
+    const excludedByDefault = input.exclude === undefined && exclude !== undefined;
 
     const hash = (rel: string): void => {
       const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
@@ -508,10 +528,22 @@ export const checksumVerify: RegisteredTool = buildTool({
       }
     } else {
       const walk = integrityWalk(root, base.rel, {
-        ...(input.exclude === undefined ? {} : { exclude: input.exclude }),
+        ...(exclude === undefined ? {} : { exclude }),
       });
       if (!walk.ok) return `ChecksumVerify could not walk "${base.rel || "."}": ${walk.reason}`;
       truncated = walk.truncated;
+      if (truncated) {
+        // Refused before any file is hashed: a partial manifest would later
+        // verify a partial tree, and a check of a partial walk is not ok
+        // whatever the hashes say, so hashing it all first only cost time.
+        return json({
+          directory: base.rel,
+          ...(writing ? { manifest: null } : { manifest: manifestAt?.rel, ok: false }),
+          truncated: true,
+          ...(exclude !== undefined && exclude.length > 0 ? { excluded: exclude } : {}),
+          reason: `the directory holds more than the ${integrityLimits().maxEntries} entries (or ${integrityLimits().maxDepth} levels) one walk covers, so ${writing ? "no manifest was written" : "it could not be checked"} and nothing was hashed; narrow the directory or exclude part of it`,
+        });
+      }
       for (const dir of walk.unreadableDirs)
         unreadable.push(`${dir} (a directory that could not be listed)`);
       // The manifest itself, when it sits inside the directory it describes,
@@ -551,23 +583,17 @@ export const checksumVerify: RegisteredTool = buildTool({
     const walkReport = {
       truncated,
       ...(symlinks.length > 0 ? { symlinks } : {}),
-      ...(input.exclude !== undefined && input.exclude.length > 0
-        ? { excluded: input.exclude }
+      ...(exclude !== undefined && exclude.length > 0 ? { excluded: exclude } : {}),
+      ...(excludedByDefault
+        ? {
+            excludedNote:
+              "no directory was given, so the workspace root was walked without .git and node_modules; pass directory, or exclude: [] to walk everything",
+          }
         : {}),
     };
 
     if (writing) {
       for (const rel of absent) unreadable.push(`${rel}: does not exist`);
-      if (truncated) {
-        // A partial manifest would later verify a partial tree.
-        return json({
-          directory: base.rel,
-          ...walkReport,
-          unreadable,
-          manifest: null,
-          reason: `the directory holds more than the ${integrityLimits().maxEntries} entries (or ${integrityLimits().maxDepth} levels) one walk covers, so no manifest was written; narrow the directory or exclude part of it`,
-        });
-      }
       const body = [...digests.entries()].map(([rel, hash]) => `${hash}  ${rel}`).join("\n");
       return json({
         directory: base.rel,
@@ -681,9 +707,18 @@ export const acceptanceCheck: RegisteredTool = buildTool({
       detail: string;
       undetermined?: true;
     };
+    // One worker for every pattern in the call: a one-shot run starts its
+    // own, about 2 ms each, which made 150 checks take half a second.
+    const session = input.checks.some((c) => c.kind === "fileMatches")
+      ? openRegexSession()
+      : undefined;
     const results: CheckResult[] = [];
-    for (const [index, check] of input.checks.entries()) {
-      results.push(await runCheck(check, index));
+    try {
+      for (const [index, check] of input.checks.entries()) {
+        results.push(await runCheck(check, index));
+      }
+    } finally {
+      session?.close();
     }
 
     async function runCheck(
@@ -751,7 +786,7 @@ export const acceptanceCheck: RegisteredTool = buildTool({
               detail: `could not verify: the file has ${body.length} characters, more than the ${MATCH_INPUT_CHARS} a pattern is run over`,
             };
           }
-          const outcome = await runRegex({
+          const outcome = await (session as RegexSession).run({
             op: "test",
             pattern: check.pattern,
             flags: check.flags ?? "",

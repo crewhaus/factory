@@ -318,6 +318,43 @@ describe("ChecksumVerify", () => {
     expect(await raw(checksumVerify, { manifest: "nope" })).toContain("write:true");
   });
 
+  test("with no directory, .git and node_modules at the root are left out, and say so", async () => {
+    // 0.7.1's first cut walked both: a repo's 407 files became 13,016
+    // entries and a 2 MB manifest, and a larger root hashed 50,000 files.
+    mkdirSync(join(workspace, ".git/objects"), { recursive: true });
+    writeFileSync(join(workspace, ".git/objects/ab"), "blob");
+    mkdirSync(join(workspace, "node_modules/dep"), { recursive: true });
+    writeFileSync(join(workspace, "node_modules/dep/index.js"), "x");
+    mkdirSync(join(workspace, "src"));
+    writeFileSync(join(workspace, "src/a.txt"), "a");
+    writeFileSync(join(workspace, ".env.example"), "K=");
+    type Written = { manifest: string; excluded?: string[]; excludedNote?: string };
+    const byDefault = await call<Written>(checksumVerify, { write: true });
+    const listed = (w: Written): string[] =>
+      w.manifest
+        .trim()
+        .split("\n")
+        .map((line) => line.slice(66))
+        .sort();
+    expect(listed(byDefault)).toEqual([".env.example", "src/a.txt"]);
+    expect(byDefault.excluded).toEqual([".git", "node_modules"]);
+    expect(byDefault.excludedNote).toMatch(/exclude: \[\] to walk everything/);
+    // Asked for, the whole root is walked; an explicit exclude replaces the default.
+    for (const input of [
+      { write: true, exclude: [] },
+      { write: true, directory: "." },
+    ]) {
+      const all = await call<Written>(checksumVerify, input);
+      expect(listed(all)).toEqual([
+        ".env.example",
+        ".git/objects/ab",
+        "node_modules/dep/index.js",
+        "src/a.txt",
+      ]);
+      expect(all.excluded).toBeUndefined();
+    }
+  });
+
   describe("files checks just those entries of the manifest", () => {
     type Subset = {
       ok: boolean;
@@ -600,7 +637,11 @@ describe("ChecksumVerify", () => {
             { directory: "art", write: true },
           );
           expect({ limits, w }).toMatchObject({ limits, w: { manifest: null, truncated: true } });
-          expect(w.reason).toMatch(/no manifest was written/);
+          expect(w.reason).toMatch(/no manifest was written and nothing was hashed/);
+          // Refused before hashing: 0.7.1's first cut hashed every walked file
+          // and only then refused, which at a large root took 20 s.
+          expect(w).not.toHaveProperty("unreadable");
+          expect(w).not.toHaveProperty("fileCount");
           const r = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
           expect({ limits, truncated: r.truncated, ok: r.ok }).toEqual({
             limits,
@@ -673,6 +714,34 @@ describe("AcceptanceCheck", () => {
     );
     expect(result.results[0]?.ok).toBe(false);
     expect(result.results[0]?.detail).toContain("escapes the workspace");
+  });
+
+  test("every pattern in a call runs on one worker", async () => {
+    // A one-shot run starts its own worker (about 2 ms); 150 checks took
+    // 461 ms where 0.7.0 took 9.
+    writeFileSync(join(workspace, "f.txt"), "hello world\n");
+    const Original = globalThis.Worker;
+    let started = 0;
+    globalThis.Worker = class extends Original {
+      constructor(...args: ConstructorParameters<typeof Worker>) {
+        super(...args);
+        started += 1;
+      }
+    } as typeof Worker;
+    let result: { ok: boolean; checked: number };
+    try {
+      result = await call<{ ok: boolean; checked: number }>(acceptanceCheck, {
+        checks: Array.from({ length: 20 }, (_, i) => ({
+          kind: "fileMatches" as const,
+          path: "f.txt",
+          pattern: `^hello|never${i}`,
+        })),
+      });
+    } finally {
+      globalThis.Worker = Original;
+    }
+    expect(result).toMatchObject({ ok: true, checked: 20 });
+    expect(started).toBe(1);
   });
 
   test("an invalid pattern fails that check alone", async () => {
