@@ -87,7 +87,10 @@ function alphaValue(text: string | undefined): number {
  */
 export function parseColor(input: string): Rgb {
   const text = input.trim();
-  const keyword = KEYWORDS[text.toLowerCase()];
+  // Own entries only: `constructor` read Object, and the recursion below
+  // failed with "input.trim is not a function" instead of "not a colour".
+  const name = text.toLowerCase();
+  const keyword = Object.hasOwn(KEYWORDS, name) ? KEYWORDS[name] : undefined;
   if (keyword !== undefined) return parseColor(keyword);
 
   const hex8 = HEX8.exec(text);

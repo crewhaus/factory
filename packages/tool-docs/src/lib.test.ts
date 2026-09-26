@@ -605,6 +605,17 @@ describe("pdf reading", () => {
     expect(map.get(0x43)).toBe("c");
   });
 
+  test("a glyph name is looked up in its own table only", () => {
+    // GLYPH_CODES["constructor"] read Object, and String.fromCodePoint threw
+    // a RangeError out of the page's text extraction.
+    const map = parseToUnicodeCMap(
+      "beginbfchar\n<0041> /constructor\n<0042> /toString\n<0043> /bullet\nendbfchar",
+    );
+    expect(map.has(0x41)).toBe(false);
+    expect(map.has(0x42)).toBe(false);
+    expect(map.get(0x43)).toBe("\u2022");
+  });
+
   test("a bfrange with an explicit list maps each code in turn", () => {
     const map = parseToUnicodeCMap("beginbfrange\n<0030> <0031> [<0058> <0059>]\nendbfrange");
     expect(map.get(0x30)).toBe("X");
