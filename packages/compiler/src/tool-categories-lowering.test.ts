@@ -152,6 +152,20 @@ describe("compile errors", () => {
 
   test("a dead exclusion fails the compile rather than passing silently", () => {
     expect(() => irOf(`${CLI_HEAD}tools: [all-fs, -gitPush]\n`)).toThrow(/nothing includes/);
+    expect(() => irOf(`${CLI_HEAD}tools: [all-fs, -all-chain]\n`)).toThrow(
+      '"-all-chain" excludes a category none of whose tools is included',
+    );
+  });
+
+  // flag-truth-6#10 — on 0.7.0 this failed with "exclude tools that nothing
+  // includes", naming every network tool outside all-code.
+  test("a category exclusion that overlaps the includes only in part compiles", () => {
+    const ir = irOf(`${CLI_HEAD}tools: [all-code, -all-network]\n`);
+    const tools = ir.tools as string[];
+    expect(tools).toContain("read");
+    for (const gone of ["registrySearch", "dependencyAudit", "containerImageInspect"]) {
+      expect(tools).not.toContain(gone);
+    }
   });
 
   test("an Object.prototype name is an unknown category, not an empty one", () => {

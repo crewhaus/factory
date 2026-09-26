@@ -235,6 +235,61 @@ describe("expandToolSelectors — errors", () => {
   });
 });
 
+// flag-truth-6#10 — inertness was judged per KEY: every key an exclusion
+// named had to be included, so `-all-network` failed after `all-code` because
+// most network tools are not code tools, although it removed eight that are.
+describe("expandToolSelectors — each exclusion is judged on its own", () => {
+  const code = toolsInCategory("code");
+  const network = new Set(toolsInCategory("network"));
+
+  test("-all-<category> that only partly overlaps the includes subtracts the overlap", () => {
+    const overlap = code.filter((k) => network.has(k));
+    // The case is only this one while the overlap is partial on both sides.
+    expect(overlap.length).toBeGreaterThanOrEqual(8);
+    expect([...network].some((k) => !code.includes(k))).toBe(true);
+    const out = expandToolSelectors(["all-code", "-all-network"]);
+    expect(out.tools).toEqual(code.filter((k) => !network.has(k)));
+    expect(out.tools).toContain("read");
+    expect(out.tools).not.toContain("registrySearch");
+    expect(out.tools).not.toContain("dependencyAudit");
+  });
+
+  test("a roll-up minus a leaf set it only half holds", () => {
+    const filesystem = new Set(toolsInCategory("filesystem"));
+    const fsx = toolsInCategory("fsx");
+    expect(fsx.filter((k) => filesystem.has(k)).length).toBeGreaterThan(0);
+    expect([...filesystem].some((k) => !fsx.includes(k))).toBe(true);
+    expect(expandToolSelectors(["all-fsx", "-all-filesystem"]).tools).toEqual(
+      fsx.filter((k) => !filesystem.has(k)),
+    );
+  });
+
+  test("a category exclusion that removes nothing is still refused, by its own name", () => {
+    expect(toolsInCategory("chain").filter((k) => toolsInCategory("fs").includes(k))).toEqual([]);
+    expect(() => expandToolSelectors(["all-fs", "-all-chain"])).toThrow(
+      'tools: "-all-chain" excludes a category none of whose tools is included.',
+    );
+  });
+
+  test("a bare exclusion is judged alone, beside a category exclusion that does remove something", () => {
+    expect(code).not.toContain("dnsLookup");
+    let message = "";
+    try {
+      expandToolSelectors(["all-code", "-all-network", "-dnsLookup"]);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toStartWith('tools: "-dnsLookup" excludes a tool that nothing includes.');
+    expect(message).not.toContain('"-all-network"');
+  });
+
+  test("both kinds of inert exclusion are reported together", () => {
+    expect(() => expandToolSelectors(["all-fs", "-gitPush", "-all-chain"])).toThrow(
+      'tools: "-gitPush" excludes a tool that nothing includes; "-all-chain" excludes a category none of whose tools is included.',
+    );
+  });
+});
+
 // security-12#14 — `CATEGORIES` is an object literal, so a category named
 // after an Object.prototype member resolved to that member: `all-constructor`
 // expanded to no tools and `-all-hasOwnProperty` was a silent no-op, where

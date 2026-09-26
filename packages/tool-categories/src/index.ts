@@ -196,6 +196,12 @@ export type ExpandResult = {
  * that removes nothing — a `-gitPush` that matches no included tool is
  * almost always a typo or a stale copy-paste, and silently ignoring it would
  * leave the author believing a tool is gated when it is not.
+ *
+ * Each exclusion is judged on its own. A `-<tool>` removes nothing unless
+ * that tool is included. A `-all-<category>` removes nothing only when none
+ * of its tools is included: it need not be a subset of the includes, so
+ * `[all-code, -all-network]` keeps the code tools that do not touch the
+ * network (flag-truth-6#10).
  */
 export function expandToolSelectors(
   selectors: ReadonlyArray<string>,
@@ -213,32 +219,59 @@ export function expandToolSelectors(
   const parsed = selectors.map(parseSelector);
   const included = new Set<string>();
   const excluded = new Set<string>();
+  // Every exclusion as written, with the keys it removes, so an inert one is
+  // judged per selector rather than per key.
+  const exclusions: Array<{
+    readonly kind: Selector["kind"];
+    readonly label: string;
+    readonly keys: ReadonlyArray<string>;
+  }> = [];
   const categoryErrors: string[] = [];
 
   for (const sel of parsed) {
     const sink = sel.exclude ? excluded : included;
     if (sel.kind === "category") {
       try {
-        for (const key of toolsInCategory(sel.name)) sink.add(key);
+        const keys = toolsInCategory(sel.name);
+        for (const key of keys) sink.add(key);
+        if (sel.exclude) exclusions.push({ kind: "category", label: `-all-${sel.name}`, keys });
       } catch (err) {
         categoryErrors.push(err instanceof Error ? err.message : String(err));
       }
       continue;
     }
     sink.add(sel.key);
+    if (sel.exclude) exclusions.push({ kind: "tool", label: `-${sel.key}`, keys: [sel.key] });
   }
 
   if (categoryErrors.length > 0) {
     throw new ToolCategoryError(`${path}: ${categoryErrors.join("; ")}`);
   }
 
-  const inert = [...excluded].filter((key) => !included.has(key)).sort();
+  const inert = exclusions.filter((x) => !x.keys.some((key) => included.has(key)));
   if (inert.length > 0) {
-    const names = inert.map((k) => `"-${k}"`).join(", ");
-    const verb = inert.length === 1 ? "excludes a tool that" : "exclude tools that";
+    const listed = (xs: ReadonlyArray<{ readonly label: string }>): string =>
+      [...new Set(xs.map((x) => `"${x.label}"`))].sort().join(", ");
+    const tools = inert.filter((x) => x.kind === "tool");
+    const categories = inert.filter((x) => x.kind === "category");
+    const parts: string[] = [];
+    if (tools.length > 0) {
+      const verb =
+        new Set(tools.map((x) => x.label)).size === 1
+          ? "excludes a tool that"
+          : "exclude tools that";
+      parts.push(`${listed(tools)} ${verb} nothing includes`);
+    }
+    if (categories.length > 0) {
+      const verb =
+        new Set(categories.map((x) => x.label)).size === 1
+          ? "excludes a category none of whose tools is included"
+          : "exclude categories none of whose tools is included";
+      parts.push(`${listed(categories)} ${verb}`);
+    }
     const have = [...included].sort().join(", ") || "(nothing)";
     throw new ToolCategoryError(
-      `${path}: ${names} ${verb} nothing includes. Remove the exclusion, or add the category that provides it. Currently included: ${have}`,
+      `${path}: ${parts.join("; ")}. Remove the exclusion, or add the category that provides it. Currently included: ${have}`,
     );
   }
 
