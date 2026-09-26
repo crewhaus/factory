@@ -168,6 +168,22 @@ describe("EvmMulticall", () => {
     });
   });
 
+  test("outputs: [] decodes to no values, not to a decodeError", async () => {
+    // AbiDecode's own schema wants at least one type; an empty list never
+    // reaches it, and decodes to [] as it did on 0.7.0.
+    const blob = await aggregate3Return([
+      [true, word(7n)],
+      [true, word(19n)],
+    ]);
+    use({ eth_call: () => blob });
+    const out = await run(evmMulticall, {
+      chainId: CHAIN,
+      calls: [{ ...balanceCall(ADDR.token), outputs: [] }],
+    });
+    expect(out.results[0].decoded).toEqual([]);
+    expect(out.results[0].decodeError).toBeUndefined();
+  });
+
   test("outputs whose types read no bytes cannot multiply a row's return data (C085)", async () => {
     const items = 64;
     const returnData = `0x${word(32n).slice(2)}${word(BigInt(items)).slice(2)}${word(1n).slice(2).repeat(items)}`;

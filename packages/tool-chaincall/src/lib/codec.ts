@@ -63,12 +63,17 @@ export async function encodeCallData(
   return encoded;
 }
 
-/** Decode return data against a list of ABI types. */
+/**
+ * Decode return data against a list of ABI types. An empty list decodes to
+ * no values, as it always has: EvmMulticall accepts `outputs: []`, and
+ * AbiDecode's own schema (which wants at least one type) is not asked.
+ */
 export async function decodeValues(
   types: ReadonlyArray<string>,
   hex: string,
   what: string,
 ): Promise<unknown[]> {
+  if (types.length === 0) return [];
   const out = await toolJson(abiDecode, { data: hex, types }, what);
   const values = out["values"];
   if (!Array.isArray(values)) throw new ChainCallError(`${what}: could not decode the result`);
