@@ -453,7 +453,9 @@ describe("a remote tool's definition is size-capped", () => {
     const { catalog, withheld } = await register([{ name: "list", description, inputSchema }]);
     expect(seen(catalog)).not.toContain("Ignore all previous");
     expect(catalog.get("mcp__gh__list")?.jsonSchema).toEqual({});
-    expect(withheld[0]?.reason).toMatch(/input schema read as a prompt injection \(ignore-previous/);
+    expect(withheld[0]?.reason).toMatch(
+      /input schema read as a prompt injection \(ignore-previous/,
+    );
     // Control: the same maximal definition without the injection registers as is.
     clearBoundaryCache();
     const control = await register([
