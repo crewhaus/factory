@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -318,7 +321,8 @@ describe("docker backend (no daemon required for argv assembly)", () => {
 // the real CLI does where it matters here: `run` starts the "container" in a
 // session of its own — a real container is outside the CLI's process group,
 // so killing the CLI does not stop it — and waits for it, holding the pipes;
-// `kill NAME` and `rm -f NAME` stop it by the --name it was given.
+// `kill NAME…` and `rm -f NAME…` stop it by the --name it was given
+// (FAKE_CLI_KILL_DELAY makes `kill` slow, as a busy daemon is).
 const posix = process.platform !== "win32";
 const hasPerl = posix && Bun.spawnSync(["perl", "-e", "exit 0"]).exitCode === 0;
 
@@ -364,7 +368,7 @@ case "$verb" in
     while [ $# -gt 0 ]; do
       case "$1" in
         --name) name="$2"; shift 2 ;;
-        --tmpfs|--security-opt|-v|-e) shift 2 ;;
+        --tmpfs|--security-opt|--ulimit|-v|-e) shift 2 ;;
         -*) shift ;;
         *) break ;;
       esac
@@ -379,10 +383,15 @@ case "$verb" in
     ;;
   kill|rm)
     [ "$1" = "-f" ] && shift
-    pid=$(cat "$D/container-$1" 2>/dev/null)
-    if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null; exit 0; fi
-    echo "Error: No such container: $1" >&2
-    exit 1
+    [ "$verb" = kill ] && [ -n "$FAKE_CLI_KILL_DELAY" ] && sleep "$FAKE_CLI_KILL_DELAY"
+    status=0
+    for n in "$@"; do
+      pid=$(cat "$D/container-$n" 2>/dev/null)
+      if [ -n "$pid" ]; then kill -9 "$pid" 2>/dev/null
+      else echo "Error: No such container: $n" >&2; status=1
+      fi
+    done
+    exit $status
     ;;
 esac
 exit 125
@@ -674,6 +683,172 @@ exit 125
     const verbs = calls.map((c) => `${c.argv[0]} ${c.argv[1]}`);
     expect(verbs).toEqual(["podman run", "podman kill", "podman rm"]);
   }, 20_000);
+
+  // The backstop for a host killed outright: the kernel, not the host, ends
+  // a program that has used its timeout's worth of CPU (at the --cpus cap).
+  test("every run carries a CPU-time limit the kernel enforces: its timeout's worth plus a grace", async () => {
+    const ulimitOf = (i: number): string | undefined => {
+      const argv = calls[i]?.argv ?? [];
+      const at = argv.indexOf("--ulimit");
+      return at === -1 ? undefined : argv[at + 1];
+    };
+    await runExec(createSandbox({ backend: "docker" }), {
+      image: "alpine:3.19",
+      argv: ["true"],
+      timeoutMs: 1_000,
+    });
+    await runExec(createSandbox({ backend: "docker" }), { image: "alpine:3.19", argv: ["true"] });
+    await runExec(createSandbox({ backend: "docker", cpus: "2.5" }), {
+      image: "alpine:3.19",
+      argv: ["true"],
+      timeoutMs: 1_000,
+    });
+    await runExec(createSandbox({ backend: "docker" }), {
+      image: "alpine:3.19",
+      argv: ["true"],
+      timeoutMs: 1_500,
+    });
+    await runExec(createSandbox({ backend: "docker" }), {
+      image: "alpine:3.19",
+      argv: ["true"],
+      timeoutMs: Number.POSITIVE_INFINITY,
+    });
+    expect([0, 1, 2, 3, 4].map(ulimitOf)).toEqual([
+      "cpu=11:11",
+      "cpu=70:70",
+      "cpu=13:13",
+      "cpu=12:12",
+      undefined, // no timeout, no limit
+    ]);
+  }, 20_000);
+
+  // C012: the timeout and the abort live in the host. A host that went away
+  // mid-run — process.exit, a SIGINT or SIGTERM it does not handle, a second
+  // Ctrl-C right after the first one's abort — left the container running
+  // with no limit at all. The host here is a separate process whose `docker`
+  // is the fake CLI.
+  describe("when the host goes away mid-run", () => {
+    const sandboxModule = join(import.meta.dir, "index.ts");
+
+    type HostMode = "exit" | "abort-exit" | "unhandled" | "once";
+    let hosts: Array<ReturnType<typeof Bun.spawn>> = [];
+
+    afterEach(() => {
+      // A host left behind by a failed assertion, with its group.
+      for (const h of hosts) {
+        if (h.exitCode !== null || h.signalCode !== null) continue;
+        try {
+          process.kill(-(h.pid as number), "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+      hosts = [];
+    });
+
+    function startHost(mode: HostMode, env: Record<string, string> = {}) {
+      const bin = join(dir, "bin");
+      mkdirSync(bin, { recursive: true });
+      if (!existsSync(join(bin, "docker"))) symlinkSync(fake, join(bin, "docker"));
+      const script = join(dir, `host-${mode}.ts`);
+      writeFileSync(
+        script,
+        [
+          `import { readdirSync, readFileSync } from "node:fs";`,
+          `import { createSandbox } from ${JSON.stringify(sandboxModule)};`,
+          `const dir = ${JSON.stringify(dir)};`,
+          `const mode = ${JSON.stringify(mode)};`,
+          `if (mode === "once") process.once("SIGINT", () => console.log("host handled SIGINT"));`,
+          "const controller = new AbortController();",
+          "const run = createSandbox({ backend: 'docker' }).exec({",
+          "  image: 'alpine:3.19',",
+          "  argv: mode === 'once' ? ['sh', '-c', 'sleep 1; echo finished'] : ['sleep', '60'],",
+          "  timeoutMs: 120_000,",
+          "  signal: controller.signal,",
+          "});",
+          "const poll = setInterval(() => {",
+          "  const f = readdirSync(dir).find((n) => n.startsWith('container-'));",
+          "  if (f === undefined || readFileSync(`${dir}/${f}`, 'utf8').trim() === '') return;",
+          "  clearInterval(poll);",
+          "  if (mode === 'exit') process.exit(0);",
+          // The second Ctrl-C of a REPL: exit while the first one's kill runs.
+          "  if (mode === 'abort-exit') { controller.abort(); process.exit(130); }",
+          "}, 10);",
+          "const r = await run;",
+          "console.log(`exec returned ${r.exitCode} ${r.stdout.trim()}`);",
+        ].join("\n"),
+      );
+      const h = Bun.spawn([process.execPath, script], {
+        env: { ...process.env, PATH: `${bin}:${process.env["PATH"] ?? ""}`, ...env },
+        stdout: "pipe",
+        stderr: "pipe",
+        // Its own process group, so a Ctrl-C can be sent to the whole of it.
+        detached: true,
+      });
+      hosts.push(h);
+      return h;
+    }
+
+    async function stoppedContainer(): Promise<{ name: string; gone: boolean }> {
+      const name = nameOf(log().find((l) => l.startsWith("run ")));
+      return { name, gone: await waitGone(containerPid(name), 5_000) };
+    }
+
+    test("process.exit stops the container by name before the host is gone", async () => {
+      const h = startHost("exit");
+      await h.exited;
+      expect(h.exitCode).toBe(0);
+      const { name, gone } = await stoppedContainer();
+      expect(gone).toBe(true);
+      expect(log().slice(1)).toEqual([`kill ${name}`, `rm -f ${name}`]);
+    }, 30_000);
+
+    test("an exit right after an abort still stops it, though the abort's own kill is cut off", async () => {
+      // The abort's `docker kill` is still running when the host exits, and
+      // the exit kills it; the host's own stop must not depend on it.
+      const h = startHost("abort-exit", { FAKE_CLI_KILL_DELAY: "1" });
+      await h.exited;
+      expect(h.exitCode).toBe(130);
+      const { name, gone } = await stoppedContainer();
+      expect(gone).toBe(true);
+      expect(log()).toContain(`rm -f ${name}`);
+    }, 30_000);
+
+    for (const sig of ["SIGINT", "SIGTERM"] as const) {
+      test(`a ${sig} the host does not handle stops the container, and the host dies of it`, async () => {
+        const h = startHost("unhandled");
+        await containerStarted(15_000);
+        // SIGINT to the whole group, as a terminal's Ctrl-C; SIGTERM to the
+        // host, as a supervisor's stop. The CLI and the container are in
+        // groups of their own, so neither reaches them.
+        if (sig === "SIGINT") process.kill(-(h.pid as number), sig);
+        else h.kill(sig);
+        await h.exited;
+        expect(h.signalCode).toBe(sig);
+        const { name, gone } = await stoppedContainer();
+        expect(gone).toBe(true);
+        expect(log()).toContain(`kill ${name}`);
+      }, 30_000);
+    }
+
+    // eval-runner's pattern: `process.once("SIGINT", …)` lets in-flight work
+    // finish. The once-wrapper removes itself before later listeners run, so
+    // the host looked handler-less and was killed with 130 mid-run.
+    test("a host whose SIGINT handler is process.once keeps its policy: the run finishes", async () => {
+      const h = startHost("once");
+      await containerStarted(15_000);
+      h.kill("SIGINT");
+      await h.exited;
+      const out = await new Response(h.stdout).text();
+      expect({ exitCode: h.exitCode, signal: h.signalCode }).toEqual({
+        exitCode: 0,
+        signal: null,
+      });
+      expect(out).toContain("host handled SIGINT");
+      expect(out).toContain("exec returned 0 finished");
+      expect(log().filter((l) => !l.startsWith("run "))).toEqual([]);
+    }, 30_000);
+  });
 });
 
 describe.if(posix)("noop backend: a timeout or abort takes down what the program started", () => {
@@ -949,6 +1124,88 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
     expect(result.aborted).toBe(true);
     expect(left(names[0] as string)).toBe("");
   }, 30_000);
+
+  /** The containers, running or not, whose command carries `token`. */
+  function withToken(token: string): string[] {
+    const ps = Bun.spawnSync(
+      ["docker", "ps", "-a", "--no-trunc", "--format", "{{.Names}} {{.Command}}"],
+      { timeout: 10_000 },
+    );
+    return new TextDecoder()
+      .decode(ps.stdout)
+      .split("\n")
+      .filter((l) => l.includes(token))
+      .map((l) => l.split(" ")[0] as string);
+  }
+
+  /**
+   * A host process that starts a busy loop in a container and says so once
+   * the loop runs. `exit`: it then calls process.exit. `wait`: it waits for
+   * the test to kill it.
+   */
+  function busyHost(mode: "exit" | "wait", token: string, timeoutMs: number) {
+    const script = join(tmpdir(), `sandbox-live-host-${token}.ts`);
+    writeFileSync(
+      script,
+      [
+        `import { createSandbox } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+        "await createSandbox({ backend: 'docker' }).exec({",
+        "  image: 'alpine:3.19',",
+        `  argv: ['sh', '-c', ${JSON.stringify(`echo started; : ${token}; while :; do :; done`)}],`,
+        `  timeoutMs: ${timeoutMs},`,
+        "  onStdoutChunk: (c) => {",
+        "    if (!c.includes('started')) return;",
+        "    console.log('running');",
+        `    if (${JSON.stringify(mode)} === 'exit') process.exit(0);`,
+        "  },",
+        "});",
+      ].join("\n"),
+    );
+    const h = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "ignore" });
+    const running = (async () => {
+      const reader = (h.stdout as ReadableStream<Uint8Array>).getReader();
+      let seen = "";
+      while (!seen.includes("running")) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        seen += new TextDecoder().decode(value);
+      }
+      reader.releaseLock();
+      rmSync(script, { force: true });
+    })();
+    return { h, running };
+  }
+
+  test("a host that exits mid-run leaves no container behind", async () => {
+    const token = `exit-${randomUUID()}`;
+    const { h, running } = busyHost("exit", token, 120_000);
+    try {
+      await running;
+      await h.exited;
+      expect(h.exitCode).toBe(0);
+      expect(withToken(token)).toEqual([]);
+    } finally {
+      for (const name of withToken(token)) names.push(name);
+    }
+  }, 60_000);
+
+  // Nothing on the host can run after a SIGKILL: the CPU-time limit inside
+  // the container is what ends the loop (1 s timeout → 11 s of CPU).
+  test("a host killed outright: the kernel ends the orphaned busy loop", async () => {
+    const token = `sigkill-${randomUUID()}`;
+    const { h, running } = busyHost("wait", token, 1_000);
+    try {
+      await running;
+      h.kill("SIGKILL");
+      await h.exited;
+      expect(withToken(token)).toHaveLength(1);
+      const until = performance.now() + 45_000;
+      while (withToken(token).length > 0 && performance.now() < until) await Bun.sleep(500);
+      expect(withToken(token)).toEqual([]);
+    } finally {
+      for (const name of withToken(token)) names.push(name);
+    }
+  }, 60_000);
 
   test("a flood from the container is capped on the host", async () => {
     const result = await createSandbox({ backend: "docker" }).exec({

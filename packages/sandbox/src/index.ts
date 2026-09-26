@@ -1,7 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { constants as osConstants } from "node:os";
 import { CrewhausError } from "@crewhaus/errors";
-import { type SpawnBoundedResult, spawnBounded } from "@crewhaus/tool-safety/streams";
+import {
+  type SpawnBoundedResult,
+  addHostExitHook,
+  spawnBounded,
+} from "@crewhaus/tool-safety/streams";
 
 /**
  * Catalog R8 `sandbox` — containerised exec environment.
@@ -9,10 +13,14 @@ import { type SpawnBoundedResult, spawnBounded } from "@crewhaus/tool-safety/str
  * Backends:
  *   docker  — production default; assumes `docker` daemon reachable.
  *   podman  — drop-in replacement that swaps the CLI binary.
- *   noop    — in-process exec (NOT a security boundary). Test-only;
- *             must be opted in via `CREWHAUS_SANDBOX=noop`. The
- *             permission engine refuses to satisfy `requiresSandbox`
- *             tools when this backend is active.
+ *   noop    — in-process exec (NOT a security boundary). For tests and
+ *             trusted callers that pick it themselves:
+ *             `createSandbox({ backend: "noop" })`.
+ *             `CREWHAUS_SANDBOX=noop` also selects it here, but to the
+ *             code-execution tools that value means "code execution off":
+ *             the permission engine refuses `requiresSandbox` tools, and
+ *             `@crewhaus/tool-code-execution` refuses to run on a noop
+ *             backend it did not choose itself.
  *
  * Defaults applied to every container:
  *   --network none
@@ -21,6 +29,9 @@ import { type SpawnBoundedResult, spawnBounded } from "@crewhaus/tool-safety/str
  *   --read-only
  *   --tmpfs /tmp:rw,size=64m,mode=1777,exec
  *   --name crewhaus-sbx-<random>, so the run can be stopped by name
+ *   --ulimit cpu=<the timeout's worth of CPU time, plus a grace>, a limit
+ *     the kernel enforces inside the container even if nothing on the host
+ *     is left to (see below)
  *   60 second default wall-clock timeout (a caller may pass its own)
  *   1 MiB of stdout and 1 MiB of stderr kept (head and tail), the rest
  *   counted and dropped as it arrives
@@ -32,6 +43,17 @@ import { type SpawnBoundedResult, spawnBounded } from "@crewhaus/tool-safety/str
  * container running — its PID 1 ignores the SIGTERM the CLI proxies — and
  * under Docker Desktop's wrapper the call waited for the program to end on
  * its own (security-6#0, security-12#5, flag-truth-3#0).
+ *
+ * If the HOST goes away mid-run, the containers still running are stopped
+ * too: on `process.exit`, and on a SIGINT, SIGTERM or SIGHUP the host does
+ * not handle itself (a terminal Ctrl-C, a supervisor's stop), the sandbox
+ * runs `<cli> kill` and `<cli> rm -f` for them synchronously before the host
+ * is gone. The CLI leads its own process group, so a terminal Ctrl-C no
+ * longer reaches it, and the timeout lived in the host. For a host killed
+ * outright (SIGKILL, a crash), `--ulimit cpu` is the backstop: the kernel
+ * kills a program that has used its timeout's worth of CPU, so an orphaned
+ * busy loop does not burn a CPU forever. It assumes `--cpus` is enforced,
+ * which the safety floor already does.
  *
  * Image allowlist: any image string requested by `exec()` must appear
  * in the constructor's `allowedImages` set OR in
@@ -196,6 +218,18 @@ const KILL_GRACE_MS = 1_000;
 const DRAIN_GRACE_MS = 750;
 /** Bound on each `<cli> kill` / `<cli> rm -f` the sandbox runs itself. */
 const CONTAINER_CONTROL_TIMEOUT_MS = 5_000;
+/**
+ * Bound on each `<cli> kill` / `<cli> rm -f` run while the host is exiting.
+ * These block the exit, so they are shorter; a daemon that has taken the
+ * request finishes it after the CLI is gone.
+ */
+const HOST_EXIT_CONTROL_TIMEOUT_MS = 3_000;
+/**
+ * CPU seconds past the run's own timeout (scaled by `cpus`) before the
+ * kernel kills the program. Only an orphan reaches it: while the host lives
+ * its timeout fires first, and `--cpus` holds CPU time to wall time × cpus.
+ */
+const CPU_LIMIT_GRACE_S = 10;
 
 /**
  * Image strings must be `repository[:tag][@digest]`. We disallow leading
@@ -404,6 +438,66 @@ function signalExitCode(signal: string | null): number | undefined {
   return n === undefined ? undefined : 128 + n;
 }
 
+/**
+ * The `--ulimit cpu` value, in whole seconds, for a run with this timeout
+ * and CPU cap: its timeout's worth of CPU time at the cap, plus
+ * {@link CPU_LIMIT_GRACE_S}. Undefined — no limit — for a run with no
+ * timeout, or a `cpus` value that is not a positive number.
+ */
+function cpuTimeLimitSeconds(timeoutMs: number, cpus: string): number | undefined {
+  if (!Number.isFinite(timeoutMs)) return undefined;
+  const n = Number(cpus);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.ceil((timeoutMs / 1000) * Math.max(1, n)) + CPU_LIMIT_GRACE_S;
+}
+
+/**
+ * Containers of runs in flight — started, or being stopped — by name, with
+ * the CLI that owns them. While any is registered, a host-exit hook stops
+ * them if the host goes away: the run's own timeout and abort live in the
+ * host and die with it.
+ */
+const liveContainers = new Map<string, string>();
+let removeExitHook: (() => void) | undefined;
+
+function stopLiveContainersNow(): void {
+  removeExitHook = undefined;
+  const byCli = new Map<string, string[]>();
+  for (const [name, cli] of liveContainers) byCli.set(cli, [...(byCli.get(cli) ?? []), name]);
+  liveContainers.clear();
+  for (const [cli, names] of byCli) {
+    // `kill` first (SIGKILL at once; podman's `rm -f` would wait 10 s on a
+    // PID 1 that ignores SIGTERM), then `rm -f` for one created but never
+    // started. Synchronous, because the host is exiting; detached, so a
+    // supervisor that SIGKILLs the host's group does not cut it short.
+    for (const verb of [["kill"], ["rm", "-f"]]) {
+      try {
+        Bun.spawnSync([cli, ...verb, ...names], {
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+          timeout: HOST_EXIT_CONTROL_TIMEOUT_MS,
+          detached: true,
+        });
+      } catch {
+        // The host is going away; there is nothing else to try.
+      }
+    }
+  }
+}
+
+function trackContainer(name: string, cli: string): void {
+  liveContainers.set(name, cli);
+  removeExitHook ??= addHostExitHook(stopLiveContainersNow);
+}
+
+function untrackContainer(name: string): void {
+  liveContainers.delete(name);
+  if (liveContainers.size > 0 || removeExitHook === undefined) return;
+  removeExitHook();
+  removeExitHook = undefined;
+}
+
 type SuperviseOptions = {
   readonly cmd: ReadonlyArray<string>;
   readonly env?: Readonly<Record<string, string | undefined>>;
@@ -563,6 +657,8 @@ class DockerLikeSandbox implements Sandbox {
       "--security-opt",
       "no-new-privileges",
     ];
+    const cpuLimit = cpuTimeLimitSeconds(timeoutMs, this.cpus);
+    if (cpuLimit !== undefined) cliArgs.push("--ulimit", `cpu=${cpuLimit}:${cpuLimit}`);
     for (const m of mounts) {
       const ro = m.readonly !== false;
       cliArgs.push("-v", `${m.src}:${m.dst}${ro ? ":ro" : ""}`);
@@ -588,17 +684,24 @@ class DockerLikeSandbox implements Sandbox {
         maxStderrBytes: 4_096,
       });
     };
-    return superviseExec({
-      cmd: [this.cli, ...cliArgs],
-      ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
-      timeoutMs,
-      maxOutputBytes,
-      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
-      ...(opts.onStdoutChunk !== undefined ? { onStdoutChunk: opts.onStdoutChunk } : {}),
-      ...(opts.onStderrChunk !== undefined ? { onStderrChunk: opts.onStderrChunk } : {}),
-      stopRemote: () => control(["kill"]),
-      afterKill: () => control(["rm", "-f"]),
-    });
+    // Registered before the CLI starts and until every stop has finished, so
+    // a host that exits at any point in between stops the container too.
+    trackContainer(name, this.cli);
+    try {
+      return await superviseExec({
+        cmd: [this.cli, ...cliArgs],
+        ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
+        timeoutMs,
+        maxOutputBytes,
+        ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+        ...(opts.onStdoutChunk !== undefined ? { onStdoutChunk: opts.onStdoutChunk } : {}),
+        ...(opts.onStderrChunk !== undefined ? { onStderrChunk: opts.onStderrChunk } : {}),
+        stopRemote: () => control(["kill"]),
+        afterKill: () => control(["rm", "-f"]),
+      });
+    } finally {
+      untrackContainer(name);
+    }
   }
 
   async close(): Promise<void> {
