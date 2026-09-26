@@ -244,6 +244,24 @@ describe("PurchaseOrderMatch", () => {
     expect(result.ok).toBe(false);
     expect(result.pairs[0]?.status).toBe("over-receipt");
   });
+
+  test("a fractional quantityAbsolute on whole quantities is a verdict, not a crash", async () => {
+    const input = (quantityAbsolute: number) => ({
+      invoiceLines: [{ id: "inv-1", poLineId: "po-1", quantity: 10, unitPriceMinor: 1250 }],
+      poLines: [{ id: "po-1", quantity: 11, unitPriceMinor: 1250 }],
+      tolerance: { quantityAbsolute, pricePercentBps: 100 },
+    });
+    const matched = await call<{ pairs: Array<{ status: string }> }>(
+      purchaseOrderMatch,
+      input(1.5),
+    );
+    expect(matched.pairs[0]?.status).toBe("matched");
+    const variance = await call<{ pairs: Array<{ status: string }> }>(
+      purchaseOrderMatch,
+      input(0.5),
+    );
+    expect(variance.pairs[0]?.status).toBe("quantity-variance");
+  });
 });
 
 describe("CostBasisCompute", () => {

@@ -80,6 +80,17 @@ function normalizeDescription(text: string): string {
     .trim();
 }
 
+/**
+ * `delta <= bound`, exactly, for a whole-number delta and ANY bound — a
+ * quantity tolerance may be fractional (half a unit), and a whole number is
+ * at most 1.5 exactly when it is at most 1.
+ */
+function atMost(delta: bigint, bound: number): boolean {
+  if (Number.isNaN(bound)) return false;
+  if (bound === Number.POSITIVE_INFINITY) return true;
+  return delta <= BigInt(Math.floor(bound));
+}
+
 function withinTolerance(
   actual: number,
   expected: number,
@@ -91,12 +102,17 @@ function withinTolerance(
   // an absolute alone is useless on an expensive one.
   if (Number.isSafeInteger(actual) && Number.isSafeInteger(expected)) {
     // Prices are integers, and their products with a rate pass 2^53 on
-    // ordinary amounts: compared exactly.
+    // ordinary amounts: compared exactly. Integer quantities come this way
+    // too, and their absolute tolerance may be fractional.
     const abs = (v: bigint): bigint => (v < 0n ? -v : v);
     const delta = abs(BigInt(actual) - BigInt(expected));
     const base = abs(BigInt(expected));
-    const byPercent = percentBps !== undefined && base * BigInt(percentBps) >= delta * 10_000n;
-    const byAbsolute = absolute !== undefined && delta <= BigInt(absolute);
+    const byPercent =
+      percentBps !== undefined &&
+      (Number.isInteger(percentBps)
+        ? base * BigInt(percentBps) >= delta * 10_000n
+        : Math.abs(expected) * percentBps >= Math.abs(actual - expected) * 10_000);
+    const byAbsolute = absolute !== undefined && atMost(delta, absolute);
     return byPercent || byAbsolute;
   }
   const delta = Math.abs(actual - expected);

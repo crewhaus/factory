@@ -350,6 +350,24 @@ describe("three-way match", () => {
     ).toBe("matched");
   });
 
+  test("a fractional quantity tolerance applies to whole quantities, without throwing", () => {
+    // 10 invoiced against 11 ordered: the exact comparison for whole numbers
+    // made BigInt(1.5) and threw "Not an integer".
+    const order = [{ id: "p", sku: "S", quantity: 11, unitPriceMinor: 1250 }];
+    const invoice = [{ id: "i", poLineId: "p", quantity: 10, unitPriceMinor: 1250 }];
+    const status = (quantityAbsolute: number) =>
+      matchInvoiceToPurchaseOrder(invoice, order, [], { quantityAbsolute }).pairs[0]?.status;
+    expect(status(1.5)).toBe("matched");
+    expect(status(1)).toBe("matched");
+    expect(status(0.5)).toBe("quantity-variance");
+    expect(status(0.999_999)).toBe("quantity-variance");
+    // Fractional quantities keep the float comparison they always had.
+    const kilos = [{ id: "i", poLineId: "p", quantity: 10.25, unitPriceMinor: 1250 }];
+    expect(
+      matchInvoiceToPurchaseOrder(kilos, order, [], { quantityAbsolute: 0.75 }).pairs[0]?.status,
+    ).toBe("matched");
+  });
+
   test("billing for more than arrived is caught only by the third leg", () => {
     const invoice = [{ id: "i1", poLineId: "po1", quantity: 100, unitPriceMinor: 4750 }];
     expect(matchInvoiceToPurchaseOrder(invoice, po).pairs[0]?.status).toBe("matched");
