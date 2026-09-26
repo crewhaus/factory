@@ -31,7 +31,12 @@ import { type Embedder, createEmbedder } from "@crewhaus/embedder";
 import { ConfigError } from "@crewhaus/errors";
 import type { IrKnowledge, IrKnowledgeSource } from "@crewhaus/ir";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { registerRetrieveConfig, retrieve } from "@crewhaus/tool-retrieve";
+import {
+  fetchFailureName,
+  knowledgeSourceLabel,
+  registerRetrieveConfig,
+  retrieve,
+} from "@crewhaus/tool-retrieve";
 import { createVectorStore } from "@crewhaus/vector-store";
 
 /** The target's default embedder model — the last rung of the G76 resolution
@@ -120,18 +125,26 @@ function loadGlobSource(
   });
 }
 
-/** Fetch one url source as text, failing with the url on a non-2xx/network error. */
+/**
+ * Fetch one url source as text, failing on a non-2xx/network error. The URL
+ * is fetched as written but named by tool-retrieve's `knowledgeSourceLabel`
+ * everywhere it can be seen (the document id, so every chunk id and hit, and
+ * both boot errors): a private source is often reached with a credential in
+ * its URL. A fetch failure is named by its code, never its message, which
+ * quotes the URL.
+ */
 async function loadUrlSource(url: string, fetchImpl: typeof fetch): Promise<KnowledgeDocument> {
+  const label = knowledgeSourceLabel(url);
   let res: Response;
   try {
     res = await fetchImpl(url);
   } catch (err) {
-    throw new ConfigError(`could not fetch knowledge source ${url}: ${(err as Error).message}`);
+    throw new ConfigError(`could not fetch knowledge source ${label}: ${fetchFailureName(err)}`);
   }
   if (!res.ok) {
-    throw new ConfigError(`knowledge source ${url} returned HTTP ${res.status}`);
+    throw new ConfigError(`knowledge source ${label} returned HTTP ${res.status}`);
   }
-  return { id: url, text: await res.text() };
+  return { id: label, text: await res.text() };
 }
 
 /**

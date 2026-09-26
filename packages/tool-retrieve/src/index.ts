@@ -421,8 +421,9 @@ export function knowledgeSourceLabel(raw: string): string {
 }
 
 /** The error code or name of a failed fetch, never its message or `path`:
- *  Bun's fetch errors carry the full URL in both. */
-function fetchFailureName(cause: unknown): string {
+ *  Bun's fetch errors carry the full URL in both. Exported for the CLI's
+ *  `crewhaus run` knowledge loader, which names its failures the same way. */
+export function fetchFailureName(cause: unknown): string {
   if (typeof cause === "object" && cause !== null) {
     const code = (cause as { code?: unknown }).code;
     if (typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code)) return code;
