@@ -5,17 +5,19 @@
  * than the real builtin set (which `tool-registry.test.ts` covers).
  */
 import { describe, expect, test } from "bun:test";
-import { categoriesForTool } from "@crewhaus/tool-categories";
+import { BUILTIN_TOOLS, categoriesForTool } from "@crewhaus/tool-categories";
 import { z } from "zod";
 import {
   type ToolLike,
   buildCategoryRows,
   buildToolDetail,
+  exactToolKey,
   formatCategoryLines,
   formatSearchLines,
   formatToolDetailLines,
   inputFieldNames,
   nearestToolKeys,
+  resolveToolKey,
   searchTools,
   shapesRunning,
 } from "./tools-cli";
@@ -132,6 +134,58 @@ describe("buildToolDetail", () => {
 
   test("an unknown key returns undefined so the caller can suggest", () => {
     expect(buildToolDetail("nope", TOOL_MAP, catsFor)).toBeUndefined();
+  });
+
+  test("an Object.prototype member is not a tool", () => {
+    // It returned { key: "constructor", name: "Object" } and advised
+    // `tools: [constructor]`.
+    expect(buildToolDetail("constructor", TOOL_MAP, catsFor)).toBeUndefined();
+    expect(buildToolDetail("toString", TOOL_MAP, catsFor)).toBeUndefined();
+  });
+});
+
+// docs-claims#12 — `tools show GitCommit` (the name a session log records)
+// and `tools show gitcommit` both said "no builtin tool named".
+describe("resolveToolKey", () => {
+  test("the spec key, the registered name, or either in any case", () => {
+    expect(resolveToolKey("writeIt", TOOL_MAP)).toBe("writeIt");
+    expect(resolveToolKey("WriteIt", TOOL_MAP)).toBe("writeIt");
+    expect(resolveToolKey("writeit", TOOL_MAP)).toBe("writeIt");
+    expect(resolveToolKey("WRITEIT", TOOL_MAP)).toBe("writeIt");
+  });
+
+  test("no match, an ambiguous match and a prototype member resolve to nothing", () => {
+    expect(resolveToolKey("nope", TOOL_MAP)).toBeUndefined();
+    expect(resolveToolKey("constructor", TOOL_MAP)).toBeUndefined();
+    expect(resolveToolKey("__proto__", TOOL_MAP)).toBeUndefined();
+    const twins = { aB: { name: "X" }, ab: { name: "Y" } };
+    expect(resolveToolKey("AB", twins)).toBeUndefined();
+    // An exact spelling still picks its own.
+    expect(resolveToolKey("ab", twins)).toBe("ab");
+  });
+
+  test("lint's resolver takes the exact key or registered name only", () => {
+    // `crewhaus lint` resolves through exactToolKey, so a wrong-case key is
+    // still reported (compile rejects it) and --fix still offers the key.
+    expect(exactToolKey("writeIt", TOOL_MAP)).toBe("writeIt");
+    expect(exactToolKey("WriteIt", TOOL_MAP)).toBe("writeIt");
+    expect(exactToolKey("writeit", TOOL_MAP)).toBeUndefined();
+    expect(exactToolKey("constructor", TOOL_MAP)).toBeUndefined();
+  });
+
+  test("over the real table, every builtin answers to its key and name in any case", () => {
+    const entries = Object.entries(BUILTIN_TOOLS);
+    expect(entries.length).toBeGreaterThanOrEqual(550);
+    const wrong: string[] = [];
+    for (const [key, entry] of entries) {
+      for (const spelling of [key, entry.name, key.toLowerCase(), entry.name.toUpperCase()]) {
+        const got = resolveToolKey(spelling, BUILTIN_TOOLS);
+        if (got !== key) wrong.push(`${spelling} -> ${got}`);
+      }
+    }
+    expect(wrong).toEqual([]);
+    expect(resolveToolKey("GitCommit", BUILTIN_TOOLS)).toBe("gitCommit");
+    expect(resolveToolKey("gitcommit", BUILTIN_TOOLS)).toBe("gitCommit");
   });
 });
 
@@ -304,5 +358,19 @@ describe("nearestToolKeys", () => {
 
   test("respects the limit", () => {
     expect(nearestToolKeys("it", Object.keys(TOOL_MAP), 2).length).toBeLessThanOrEqual(2);
+  });
+
+  // docs-claims#12 — it kept table order and took the first three loose
+  // hits, so `gitcommit` was offered gitStatus, gitDiff, gitLog.
+  test("a same-letters match ranks first, then a prefix, then a substring", () => {
+    const git = ["gitStatus", "gitDiff", "gitLog", "gitCommit"];
+    expect(nearestToolKeys("gitcommit", git)[0]).toBe("gitCommit");
+    expect(nearestToolKeys("GitCommit", git)[0]).toBe("gitCommit");
+    expect(nearestToolKeys("gitc", git)).toEqual(["gitCommit", "gitDiff", "gitLog"]);
+    expect(nearestToolKeys("readit", ["xreaditx", "readItNow", "rea"])).toEqual([
+      "readItNow",
+      "rea",
+      "xreaditx",
+    ]);
   });
 });

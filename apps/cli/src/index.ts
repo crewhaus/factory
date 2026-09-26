@@ -480,6 +480,7 @@ import {
   CATEGORIES,
   SHAPE_TOOL_PROFILES,
   type SpecChainBlocks,
+  ToolCategoryError,
   type ToolShape,
   builtinKeyForName,
   builtinToolsFor,
@@ -1540,6 +1541,7 @@ import {
   buildToolDetail,
   buildToolList,
   buildToolUsage,
+  exactToolKey,
   formatAuditLines,
   formatCategoryLines,
   formatSearchLines,
@@ -1548,6 +1550,7 @@ import {
   formatToolListLines,
   literalToolKeys,
   nearestToolKeys,
+  resolveToolKey,
   searchTools,
   suggestTools,
 } from "./tools-cli";
@@ -2352,9 +2355,14 @@ async function buildToolResolver(): Promise<{
   resolve: (name: string) => RegisteredTool | undefined;
 }> {
   const toolMap = await loadToolMap();
-  const byRegisteredName: Record<string, RegisteredTool> = {};
-  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
-  return { resolve: (name) => toolMap[name] ?? byRegisteredName[name] };
+  // The spec key or the registered name, exactly, and own keys only:
+  // `constructor` is no tool, so lint treats it as the unknown name it is.
+  return {
+    resolve: (name) => {
+      const key = exactToolKey(name, toolMap);
+      return key === undefined ? undefined : toolMap[key];
+    },
+  };
 }
 
 /**
@@ -14570,7 +14578,8 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
         "\n" +
         "  categories               every tool category + what it turns on\n" +
         "  show <tool>              one tool in full: flags, categories, inputs,\n" +
-        "                           and the shapes that run it\n" +
+        "                           and the shapes that run it (by spec key or\n" +
+        "                           registered name, in any case)\n" +
         "  search <query>           find a tool by name, description or category\n" +
         "  list [--category NAME]   print every builtin tool + its metadata\n" +
         "  suggest [spec.yaml]      rank the builtins the spec's shape runs against\n" +
@@ -14600,8 +14609,17 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
   }
 
   if (action === "show") {
-    const key = args.positional[0];
-    if (key === undefined) die("usage: crewhaus tools show <tool>");
+    const query = args.positional[0];
+    if (query === undefined) die("usage: crewhaus tools show <tool>");
+    // docs-claims#12 — the spec key, the registered name session logs and
+    // rules record (`GitCommit`), or either in any case; the detail names
+    // the spec key a tools: list takes.
+    const key = resolveToolKey(query, BUILTIN_TOOLS);
+    if (key === undefined) {
+      const near = nearestToolKeys(query, Object.keys(BUILTIN_TOOLS));
+      const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
+      die(`no builtin tool named "${query}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+    }
     const detail = buildToolDetail(key, toolMap, categoriesForTool);
     const shapeOnly = BUILTIN_TOOLS[key];
     if (detail === undefined && shapeOnly !== undefined) {
@@ -14622,9 +14640,7 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       return;
     }
     if (detail === undefined) {
-      const near = nearestToolKeys(key, Object.keys(toolMap));
-      const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
-      die(`no builtin tool named "${key}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+      die(`no builtin tool named "${query}"\nrun \`crewhaus tools list\` to see them all`);
     }
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
@@ -14652,7 +14668,15 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     const category = args.flags["category"];
     let map = toolMap;
     if (typeof category === "string") {
-      const wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      let wanted: ReadonlySet<string>;
+      try {
+        wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      } catch (err) {
+        // docs-claims#12 — an unknown category is a usage error, said in one
+        // line like every other bad argument here, not a stack trace.
+        if (err instanceof ToolCategoryError) die(err.message);
+        throw err;
+      }
       map = Object.fromEntries(Object.entries(toolMap).filter(([k]) => wanted.has(k)));
     }
     const rows = buildToolList(map);

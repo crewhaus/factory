@@ -53,6 +53,8 @@ export type ToolListRow = {
   readonly scope: string;
   readonly ioCapability?: string;
   readonly requiresSandbox: boolean;
+  /** Every call carries a justification the intent gate judges. */
+  readonly requireJustification: boolean;
 };
 
 /** Project a tool map (key → RegisteredTool) into sorted list rows. */
@@ -67,6 +69,7 @@ export function buildToolList(toolMap: Readonly<Record<string, RegisteredTool>>)
       scope: t.scope,
       ...(t.ioCapability !== undefined ? { ioCapability: t.ioCapability } : {}),
       requiresSandbox: t.requiresSandbox,
+      requireJustification: t.requireJustification === true,
     }))
     .sort((a, b) => a.key.localeCompare(b.key));
 }
@@ -81,6 +84,8 @@ export function formatToolListLines(rows: ReadonlyArray<ToolListRow>): string[] 
       r.scope === "external" ? "external" : undefined,
       r.ioCapability !== undefined ? `io:${r.ioCapability}` : undefined,
       r.requiresSandbox ? "sandbox" : undefined,
+      // docs-claims#12 — `show` printed it and `list` dropped it.
+      r.requireJustification ? "justification-gated" : undefined,
     ].filter((f): f is string => f !== undefined);
     const tags = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
     lines.push(`${r.key} (${r.name})${tags}`);
@@ -1605,7 +1610,8 @@ export function buildToolDetail(
   toolMap: Readonly<Record<string, ToolLike>>,
   categoriesFor: (key: string) => ReadonlyArray<string>,
 ): ToolDetail | undefined {
-  const tool = toolMap[key];
+  // An own key only: `toolMap.constructor` is Object, which is no tool.
+  const tool = Object.hasOwn(toolMap, key) ? toolMap[key] : undefined;
   if (tool === undefined) return undefined;
   return {
     key,
@@ -1759,8 +1765,45 @@ export function formatSearchLines(query: string, hits: ReadonlyArray<SearchHit>)
 }
 
 /**
+ * The builtin a name means exactly: its spec key (`gitCommit`), or the
+ * registered name session logs and permission rules record (`GitCommit`).
+ * Own keys only, so `constructor` names nothing. Undefined when no builtin,
+ * or more than one, answers to it.
+ */
+export function exactToolKey(
+  query: string,
+  tools: Readonly<Record<string, { readonly name: string }>>,
+): string | undefined {
+  if (Object.hasOwn(tools, query)) return query;
+  const byName = Object.keys(tools).filter((k) => tools[k]?.name === query);
+  return byName.length === 1 ? byName[0] : undefined;
+}
+
+/**
+ * The spec key a `tools show` argument names: the key or the registered
+ * name exactly, or else either one in any case (`gitcommit`), as long as
+ * exactly one builtin answers to it. Undefined otherwise, so the caller can
+ * suggest near misses (docs-claims#12).
+ */
+export function resolveToolKey(
+  query: string,
+  tools: Readonly<Record<string, { readonly name: string }>>,
+): string | undefined {
+  const exact = exactToolKey(query, tools);
+  if (exact !== undefined) return exact;
+  const lower = query.toLowerCase();
+  const hits = Object.keys(tools).filter(
+    (k) => k.toLowerCase() === lower || tools[k]?.name.toLowerCase() === lower,
+  );
+  return hits.length === 1 ? hits[0] : undefined;
+}
+
+/**
  * Suggest near-miss keys for an unknown `tools show` argument, so a typo
- * gets a pointer instead of a bare "not found".
+ * gets a pointer instead of a bare "not found". Ranked before the limit is
+ * applied — a same-letters match, then a prefix, then a substring either
+ * way, then a shared first three letters; ties alphabetical — so the likely
+ * tool is offered first rather than whichever the table lists first.
  */
 export function nearestToolKeys(
   key: string,
@@ -1768,10 +1811,20 @@ export function nearestToolKeys(
   limit = 3,
 ): ReadonlyArray<string> {
   const k = key.toLowerCase();
+  const rank = (candidate: string): number | undefined => {
+    const c = candidate.toLowerCase();
+    if (c === k) return 0;
+    if (c.startsWith(k)) return 1;
+    if (c.includes(k) || k.includes(c)) return 2;
+    if (c.startsWith(k.slice(0, 3))) return 3;
+    return undefined;
+  };
   return known
-    .filter((candidate) => {
-      const c = candidate.toLowerCase();
-      return c.includes(k) || k.includes(c) || c.startsWith(k.slice(0, 3));
+    .flatMap((candidate) => {
+      const r = rank(candidate);
+      return r === undefined ? [] : [{ candidate, r }];
     })
-    .slice(0, limit);
+    .sort((a, b) => a.r - b.r || a.candidate.localeCompare(b.candidate))
+    .slice(0, limit)
+    .map((x) => x.candidate);
 }

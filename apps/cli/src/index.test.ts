@@ -3899,6 +3899,53 @@ describe("crewhaus tools suggest — reads grants the way compile does", () => {
   });
 });
 
+// docs-claims#12 / security-12#14 — the discovery commands on the paths the
+// tools reference recommends: `show` took only the camelCase key (a session
+// log's `GitCommit` was "no builtin tool named"), and `list --category` with a
+// bad name threw a ToolCategoryError with a stack trace — or, for
+// `constructor`, printed "0 builtin tool(s)".
+describe("crewhaus tools show / list — names and bad categories", () => {
+  test("show takes the registered name and any casing, and names the spec key", async () => {
+    for (const spelling of ["GitCommit", "gitcommit"]) {
+      const r = await runCli(["tools", "show", spelling]);
+      expect({ spelling, exit: r.exitCode }).toEqual({ spelling, exit: 0 });
+      expect(r.stdout.split("\n")[0]).toBe("gitCommit  (GitCommit)");
+      expect(r.stdout).toContain("enable with  tools: [gitCommit]");
+    }
+  }, 30_000);
+
+  test("show refuses a prototype member instead of printing a fake tool", async () => {
+    const r = await runCli(["tools", "show", "constructor"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toStartWith('crewhaus: no builtin tool named "constructor"');
+    expect(r.stdout).toBe("");
+  }, 20_000);
+
+  test("list --category with an unknown name exits 1 with one line, no stack", async () => {
+    for (const args of [
+      ["--category", "nope"],
+      ["--category", "nope", "--json"],
+      ["--category", "constructor"],
+    ]) {
+      const r = await runCli(["tools", "list", ...args]);
+      const name = args[1];
+      expect({ args, exit: r.exitCode }).toEqual({ args, exit: 1 });
+      expect(r.stderr).toStartWith(`crewhaus: unknown tool category "all-${name}"`);
+      expect(r.stderr).not.toContain("ToolCategoryError");
+      expect(r.stderr).not.toMatch(/\n\s+at /);
+      expect(r.stdout).toBe("");
+    }
+  }, 40_000);
+
+  test("list prints the justification gate", async () => {
+    const r = await runCli(["tools", "list", "--category", "pkgmgr"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain(
+      "packageInstall (PackageInstall) [destructive, external, io:process, justification-gated]",
+    );
+  }, 20_000);
+});
+
 // C123 (docs-claims#1) — `tools audit` read the top-level `tools:` raw, so on
 // `[all-git, -gitCommit]` it called both entries "never called ... drop it
 // from tools:" although GitStatus (in all-git) was called, and dropping the
