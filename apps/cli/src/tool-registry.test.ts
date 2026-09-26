@@ -498,12 +498,13 @@ describe("the CLI can actually load every tool package it names", () => {
 
 describe("every copy of the private-address classifier is the same classifier", () => {
   /**
-   * Ten packages guard an outbound request against a private destination, and
-   * each carries the classifier as a byte-identical block rather than importing
-   * it — these are otherwise independent per-package networking layers, and a
-   * guard proving the copies are identical is cheaper than the import graph a
-   * shared package would need across `crawler`, `computer-use-driver` and eight
-   * tools.
+   * The packages in CLASSIFIER_PACKAGES guard an outbound request against a
+   * private destination, and each carries the classifier as a byte-identical
+   * block rather than importing it — these are otherwise independent
+   * per-package networking layers, and a guard proving the copies are
+   * identical is cheaper than the import graph a shared package would need
+   * across `crawler`, `computer-use-driver` and the tools (FederationDiscover's
+   * peer dialing among them).
    *
    * That only works if something checks. On 2026-09-18 an audit of the copies
    * found SIX confirmed exploitable — each with a runnable proof — because they
@@ -518,15 +519,30 @@ describe("every copy of the private-address classifier is the same classifier", 
   const MARKER_END = "// END SYNCHRONISED BLOCK";
 
   /**
-   * RECURSIVE on purpose. The sibling resolver guard above walks only
-   * `packages/<pkg>/src/*.ts`, and this block also lives at
-   * `tool-chainread/src/lib/endpoint.ts` — one level deeper. A sweep that
-   * stops at the first level would miss it and still report green, which is
-   * how the resolver guard went vacuous twice.
+   * Every package that carries a copy, exactly. A copy lost (markers renamed,
+   * file moved), a copy added, or a second copy in one package each fails
+   * until this list is edited. tool-discovery's copy arrived after the list
+   * was first written and was missing from it, so its markers could vanish
+   * with every assertion here still green (security-7#10).
    */
-  function classifierCopies(): Array<{ pkg: string; file: string; block: string }> {
+  const CLASSIFIER_PACKAGES = [
+    "computer-use-driver",
+    "crawler",
+    "tool-chainread",
+    "tool-codehost",
+    "tool-discovery",
+    "tool-fetch",
+    "tool-http",
+    "tool-navigate",
+    "tool-notify",
+    "tool-obs",
+    "tool-web",
+  ];
+
+  /** Every non-test `.ts` under `packages/<pkg>/src`, at any depth. */
+  function sourceFiles(): Array<{ pkg: string; file: string; text: string }> {
     const pkgDir = join(import.meta.dir, "..", "..", "..", "packages");
-    const found: Array<{ pkg: string; file: string; block: string }> = [];
+    const out: Array<{ pkg: string; file: string; text: string }> = [];
     const walk = (pkg: string, dir: string): void => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
         if (entry.name === "node_modules" || entry.name === "dist") continue;
@@ -536,45 +552,62 @@ describe("every copy of the private-address classifier is the same classifier", 
           continue;
         }
         if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) continue;
-        const text = readFileSync(full, "utf-8");
-        const from = text.indexOf(MARKER_START);
-        if (from === -1) continue;
-        const to = text.indexOf(MARKER_END, from);
-        // A start marker with no end is a truncated block, not an absent one.
-        expect(to).toBeGreaterThan(from);
-        found.push({ pkg, file: full, block: text.slice(from, to + MARKER_END.length) });
+        out.push({ pkg, file: full, text: readFileSync(full, "utf-8") });
       }
     };
     for (const pkg of readdirSync(pkgDir)) {
       const src = join(pkgDir, pkg, "src");
       if (existsSync(src)) walk(pkg, src);
     }
+    return out;
+  }
+
+  /**
+   * RECURSIVE on purpose. The sibling resolver guard above walks only
+   * `packages/<pkg>/src/*.ts`, and this block also lives at
+   * `tool-chainread/src/lib/endpoint.ts` — one level deeper. A sweep that
+   * stops at the first level would miss it and still report green, which is
+   * how the resolver guard went vacuous twice.
+   */
+  function classifierCopies(): Array<{ pkg: string; file: string; block: string }> {
+    const found: Array<{ pkg: string; file: string; block: string }> = [];
+    for (const { pkg, file, text } of sourceFiles()) {
+      const from = text.indexOf(MARKER_START);
+      if (from === -1) continue;
+      const to = text.indexOf(MARKER_END, from);
+      // A start marker with no end is a truncated block, not an absent one.
+      expect(to).toBeGreaterThan(from);
+      found.push({ pkg, file, block: text.slice(from, to + MARKER_END.length) });
+    }
     return found;
   }
 
-  test("the sweep finds every copy it is meant to guard", () => {
+  test("the sweep finds every copy it is meant to guard, and no other", () => {
     const copies = classifierCopies();
-    // The count assertion is the line that turns "passed" into "actually
-    // looked". Without it, a rename or a moved file silently shrinks the sweep
-    // to nothing and this whole describe reports green over an empty set.
-    expect(copies.length).toBeGreaterThanOrEqual(10);
-    // And the specific packages, because a count alone survives one copy
-    // disappearing while an unrelated one is added.
-    const pkgs = new Set(copies.map((c) => c.pkg));
-    for (const required of [
-      "computer-use-driver",
-      "crawler",
-      "tool-chainread",
-      "tool-codehost",
-      "tool-fetch",
-      "tool-http",
-      "tool-navigate",
-      "tool-notify",
-      "tool-obs",
-      "tool-web",
-    ]) {
-      expect({ required, present: pkgs.has(required) }).toEqual({ required, present: true });
-    }
+    // Exact, both ways: the package list, and one copy per package. Without
+    // the count a rename or a moved file silently shrinks the sweep, and the
+    // byte-identical test below then reports green over fewer copies.
+    expect(copies.map((c) => c.pkg).sort()).toEqual(CLASSIFIER_PACKAGES);
+    expect(copies.length).toBe(CLASSIFIER_PACKAGES.length);
+  });
+
+  test("no classifier lives outside the markers", () => {
+    // The NAT64 arm (`g[1] === 0xff9b`) is the classifier's fingerprint. A
+    // package that pastes the classifier without the markers, or a file that
+    // keeps a second copy beside its marked one, is invisible to the sweep
+    // above; this finds it by the arm instead.
+    const nat64 = /0xff9b/i;
+    const carriers = sourceFiles().filter(({ text }) => nat64.test(text));
+    expect(carriers.map((c) => c.pkg).sort()).toEqual(CLASSIFIER_PACKAGES);
+    const outside = carriers
+      .filter(({ text }) => {
+        const from = text.indexOf(MARKER_START);
+        const to = text.indexOf(MARKER_END, from);
+        if (from === -1 || to === -1) return true;
+        return nat64.test(text.slice(0, from) + text.slice(to));
+      })
+      .map((c) => c.file);
+    expect(outside).toEqual([]);
   });
 
   test("every copy is byte-identical", () => {
@@ -599,8 +632,8 @@ describe("every copy of the private-address classifier is the same classifier", 
    * it showed that was worthless: narrowing the NAT64 arm to
    * `g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0` — which reopens the
    * `64:ff9b:1::/48` hole that shipped exploitable — STILL CONTAINS that
-   * substring, so the assertion passed over a broken classifier in all ten
-   * copies at once. Matching on text was the original bug; asserting on text
+   * substring, so the assertion passed over a broken classifier in every
+   * copy at once. Matching on text was the original bug; asserting on text
    * reproduced it in the guard.
    *
    * Executing one copy plus proving the copies identical covers all of them.
