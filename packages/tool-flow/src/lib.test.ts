@@ -453,7 +453,9 @@ describe("classifyError", () => {
         "Wed, 31 Nov 2026 10:00:00 GMT", // a day November does not have
         "Foo, 23 Sep 2026 10:00:00 GMT", // not a weekday
         "Wed, 23 Sep 2026 24:00:00 GMT", // not an hour
-        "Wed, 23 Sep 2026 10:00:00 PST", // HTTP-dates are GMT only
+        "Wed, 23 Sep 2026 10:00:00 A", // a military zone: RFC 5322 says its sign is unknown
+        "Wed, 23 Sep 2026 10:00:00 +2400", // not an offset
+        "23 Sep 26 10:00:00 GMT", // a two-digit year outside rfc850's form
       ];
       for (const text of refused) {
         expect({ text, got: inZone("Asia/Tokyo", () => parseRetryAfter(text, now)) }).toEqual({
@@ -461,6 +463,37 @@ describe("classifyError", () => {
           got: { waitMs: null, retryAt: null },
         });
       }
+    });
+
+    test("an RFC 5322 date with its zone written is read as 0.7.0 read it, on every host", () => {
+      // 0.7.1's first cut dropped these, and a 429 fell back to the client's
+      // own backoff instead of the wait the server asked for.
+      const forms = [
+        "Wed, 23 Sep 2026 10:00:00 UTC",
+        "Wed, 23 Sep 2026 10:00:00 UT",
+        "Wed, 23 Sep 2026 10:00:00 +0000",
+        "Wed, 23 Sep 2026 12:00:00 +0200",
+        "Wed, 23 Sep 2026 06:00:00 -0400",
+        "Wed, 23 Sep 2026 10:00:00 -0000", // what Python's email.utils.formatdate writes
+        "23 Sep 2026 10:00:00 GMT", // no weekday
+        "Wed, 23 Sep 2026 10:00 GMT", // no seconds
+        "Wed, 23 Sep 2026 03:00:00 PDT", // an RFC 5322 named zone, a fixed -0700
+      ];
+      const seen: Array<{ tz: string; form: string; waitMs: number | null }> = [];
+      for (const tz of ZONES) {
+        for (const form of forms) {
+          seen.push({ tz, form, waitMs: inZone(tz, () => parseRetryAfter(form, now).waitMs) });
+        }
+      }
+      expect(seen.filter((s) => s.waitMs !== 3_600_000)).toEqual([]);
+      expect(seen).toHaveLength(ZONES.length * forms.length);
+      // A single-digit day.
+      expect(parseRetryAfter("Thu, 1 Oct 2026 10:00:00 GMT", now).retryAt).toBe(
+        "2026-10-01T10:00:00.000Z",
+      );
+      // Still refused without the zone, and the weekday must be one.
+      expect(parseRetryAfter("23 Sep 2026 10:00:00", now)).toEqual({ waitMs: null, retryAt: null });
+      expect(parseRetryAfter("Xyz, 23 Sep 2026 10:00:00 UTC", now).waitMs).toBeNull();
     });
 
     test("an ISO instant that carries its own offset is still read", () => {

@@ -9,6 +9,9 @@
  * the operator's timezone. This reads exactly the three forms the RFC
  * defines, all of which are GMT by definition, builds the instant with
  * `Date.UTC`, and answers undefined for anything else — never a guess.
+ * Two unambiguous non-HTTP forms that 0.7.0 read correctly are read too,
+ * each only with its zone written: an RFC 5322 date-time and an ISO-8601
+ * instant with an offset.
  */
 
 const DAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
@@ -98,6 +101,62 @@ export function parseHttpDate(text: string, nowMs?: number): number | undefined 
     );
   }
   return undefined;
+}
+
+/**
+ * RFC 5322 date-time: optional weekday, a one- or two-digit day, a
+ * four-digit year, optional seconds, and a zone that is WRITTEN — GMT, UT,
+ * UTC, Z, `±hhmm`, or one of the eight North American names RFC 5322 gives
+ * fixed offsets. Mail libraries write these (`… 07:28:00 -0000`, `… +0200`),
+ * and `Date.parse` read them correctly on 0.7.0 on every host, because the
+ * zone is in the text. Military one-letter zones are refused: RFC 5322 says
+ * their signs were botched in practice and to treat them as unknown.
+ */
+const RFC5322_DATE =
+  /^(?:([A-Za-z]{3}),\s*)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?\s+(GMT|UTC|UT|Z|[+-]\d{4}|[ECMP][SD]T)$/i;
+
+/** RFC 5322's named zones, as offsets in minutes east of UTC. */
+const NAMED_ZONES: ReadonlyMap<string, number> = new Map([
+  ["gmt", 0],
+  ["utc", 0],
+  ["ut", 0],
+  ["z", 0],
+  ["est", -300],
+  ["edt", -240],
+  ["cst", -360],
+  ["cdt", -300],
+  ["mst", -420],
+  ["mdt", -360],
+  ["pst", -480],
+  ["pdt", -420],
+]);
+
+/** The epoch milliseconds an RFC 5322 date-time with a written zone names, or undefined. */
+export function parseRfc5322WithZone(text: string): number | undefined {
+  const m = RFC5322_DATE.exec(text.trim());
+  if (m === null) return undefined;
+  if (m[1] !== undefined && !DAY_NAMES.includes(m[1].toLowerCase())) return undefined;
+  const zone = (m[8] as string).toLowerCase();
+  let offsetMinutes: number;
+  if (zone.startsWith("+") || zone.startsWith("-")) {
+    const hours = Number(zone.slice(1, 3));
+    const minutes = Number(zone.slice(3, 5));
+    if (hours > 23 || minutes > 59) return undefined;
+    offsetMinutes = (zone.startsWith("-") ? -1 : 1) * (hours * 60 + minutes);
+  } else {
+    const named = NAMED_ZONES.get(zone);
+    if (named === undefined) return undefined;
+    offsetMinutes = named;
+  }
+  const ms = instant(
+    Number(m[4]),
+    m[3] as string,
+    Number(m[2]),
+    Number(m[5]),
+    Number(m[6]),
+    Number(m[7] ?? "0"),
+  );
+  return ms === undefined ? undefined : ms - offsetMinutes * 60_000;
 }
 
 /**

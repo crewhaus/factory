@@ -14,7 +14,7 @@
  * called `Date.now()` would return a different answer every second, which is
  * exactly what this package promises not to do.
  */
-import { parseHttpDate, parseIsoInstantWithOffset } from "./http-date";
+import { parseHttpDate, parseIsoInstantWithOffset, parseRfc5322WithZone } from "./http-date";
 
 export const ERROR_CLASSES = [
   "ok",
@@ -315,10 +315,11 @@ const MAX_MESSAGE_CHARS = 64_000;
 /**
  * Parse `Retry-After`. Two forms are legal: delta-seconds, and an HTTP-date
  * (RFC 9110: IMF-fixdate, or the obsolete rfc850 and asctime forms, all
- * GMT). An ISO-8601 instant with an explicit offset is read too, because it
- * is unambiguous. Anything else — a date with no zone, an offset-less ISO
- * string, prose — answers nulls rather than being read as the host's local
- * time. The date form needs a reference point to become a duration, so
+ * GMT). An RFC 5322 date-time with its zone written (`+0200`, `UTC`,
+ * `-0000`), and an ISO-8601 instant with an explicit offset, are read too,
+ * because each is unambiguous and 0.7.0 read them. Anything else — a date
+ * with no zone, an offset-less ISO string, prose — answers nulls rather than
+ * being read as the host's local time. The date form needs a reference point to become a duration, so
  * without `nowMs` it is returned as a date and `waitMs` stays null.
  */
 export function parseRetryAfter(
@@ -331,7 +332,8 @@ export function parseRetryAfter(
     const seconds = Number.parseInt(text, 10);
     return { waitMs: seconds * 1000, retryAt: null };
   }
-  const parsed = parseHttpDate(text, nowMs) ?? parseIsoInstantWithOffset(text);
+  const parsed =
+    parseHttpDate(text, nowMs) ?? parseRfc5322WithZone(text) ?? parseIsoInstantWithOffset(text);
   if (parsed === undefined) return { waitMs: null, retryAt: null };
   const retryAt = new Date(parsed).toISOString();
   if (nowMs === undefined) return { waitMs: null, retryAt };
