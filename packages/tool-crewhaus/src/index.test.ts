@@ -1303,6 +1303,49 @@ describe("secret hygiene", () => {
     expect(diff).toContain("https://mcp.example.com/sse?token=(redacted)");
   });
 
+  test("a header in mcp-proxy's two-entry form, or after supergateway's --oauth2Bearer, reaches neither tool", async () => {
+    // On the first 0.7.1 cut both tools printed these argv verbatim: only a
+    // one-entry `Name: value` header and a separator-then-word credential
+    // flag were recognised. Built from parts: no secret-shaped literal.
+    const secret = ["S3CRET", "value", "42"].join("");
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const spec = [
+      ...base,
+      "mcp_servers:",
+      "  proxy:",
+      "    transport: stdio",
+      "    command: uvx",
+      `    args: [mcp-proxy, --headers, X-Api-Key, "${secret}", "https://example.io/sse"]`,
+      "  gw:",
+      "    transport: stdio",
+      "    command: npx",
+      `    args: [-y, supergateway, --sse, "https://example.io/sse", --oauth2Bearer, "${secret}"]`,
+    ].join("\n");
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, { before: { spec: base.join("\n") }, after: { spec } });
+    expect({ summary: summary.includes(secret), diff: diff.includes(secret) }).toEqual({
+      summary: false,
+      diff: false,
+    });
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; redactedArgs?: number }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.args, s.redactedArgs])).toEqual([
+      [
+        "gw",
+        ["-y", "supergateway", "--sse", "https://example.io/sse", "--oauth2Bearer", "(redacted)"],
+        1,
+      ],
+      ["proxy", ["mcp-proxy", "--headers", "X-Api-Key", "(redacted)", "https://example.io/sse"], 1],
+    ]);
+  });
+
   test("an sse endpoint keeps neither its query string nor its userinfo", async () => {
     const spec = [
       "name: remote",

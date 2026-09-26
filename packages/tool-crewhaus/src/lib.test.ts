@@ -1195,6 +1195,123 @@ describe("redactArgs", () => {
     });
   });
 
+  test("a header's two-entry form keeps the name and withholds the value (mcp-proxy's -H KEY VALUE)", () => {
+    expect(redactArgs(["--headers", "X-Api-Key", hdr, "https://example.io/sse"])).toEqual({
+      args: ["--headers", "X-Api-Key", "(redacted)", "https://example.io/sse"],
+      redacted: 1,
+    });
+    expect(redactArgs(["-H", "Authorization", `Token ${hdr}`]).args).toEqual([
+      "-H",
+      "Authorization",
+      "(redacted)",
+    ]);
+    expect(redactArgs(["-H", "Cookie", `session=${hdr}`]).args).toEqual([
+      "-H",
+      "Cookie",
+      "(redacted)",
+    ]);
+    // Withheld whatever the name, as the one-entry form is.
+    expect(redactArgs(["--header", "X-Tenant", hdr]).args).toEqual([
+      "--header",
+      "X-Tenant",
+      "(redacted)",
+    ]);
+    // An env reference is still a reference.
+    expect(redactArgs(["--headers", "Authorization", "Bearer ${API_TOKEN}"]).redacted).toBe(0);
+  });
+
+  test("a credential flag is found by its last word, in any case convention", () => {
+    for (const flag of [
+      "--oauth2Bearer",
+      "--accessToken",
+      "--client-secret",
+      "--cookie",
+      "--APIKEY",
+    ]) {
+      expect({ flag, args: redactArgs([flag, tok]).args }).toEqual({
+        flag,
+        args: [flag, "(redacted)"],
+      });
+      expect({ flag, args: redactArgs([`${flag}=${tok}`]).args }).toEqual({
+        flag,
+        args: [`${flag}=(redacted)`],
+      });
+    }
+    // A connection string is a credential flag's value too.
+    expect(redactArgs(["--connection-string", `Server=db;Password=${pw}`]).args).toEqual([
+      "--connection-string",
+      "(redacted)",
+    ]);
+    // A URL after a credential flag keeps what it points at.
+    expect(redactArgs(["--dsn", `postgresql://u:${pw}@db/prod`]).args).toEqual([
+      "--dsn",
+      "postgresql://(redacted)@db/prod",
+    ]);
+  });
+
+  test("a flag that only STARTS with a credential word, or negates one, names something else", () => {
+    const args = [
+      "--token-file",
+      "/run/secrets/token",
+      "--key-id",
+      "k1",
+      "--secret-name",
+      "prod",
+      "--password-stdin",
+      "run",
+      "--no-auth",
+      "serve",
+    ];
+    expect(redactArgs(args)).toEqual({ args: [...args], redacted: 0 });
+  });
+
+  test("a credential-named NAME=value, connection-string parameter or JSON member loses its value", () => {
+    expect(redactArgs(["run", "-e", `POSTGRES_PASSWORD=${tok}`, "mcp/postgres"]).args).toEqual([
+      "run",
+      "-e",
+      "POSTGRES_PASSWORD=(redacted)",
+      "mcp/postgres",
+    ]);
+    expect(redactArgs([`jdbc:sqlserver://db:1433;user=sa;password=${pw}`]).args).toEqual([
+      "jdbc:sqlserver://db:1433;user=sa;password=(redacted)",
+    ]);
+    expect(redactArgs(["-c", `export TOKEN=${tok}; exec server`]).args).toEqual([
+      "-c",
+      "export TOKEN=(redacted); exec server",
+    ]);
+    expect(redactArgs(["--config", `{"apiKey":"${tok}","region":"us"}`]).args).toEqual([
+      "--config",
+      '{"apiKey":"(redacted)","region":"us"}',
+    ]);
+    // A passthrough, an env reference and a harmless pair stay as written.
+    const kept = [
+      "-e",
+      "API_KEY",
+      "-e",
+      "API_KEY=$API_KEY",
+      "--label=tier=gold",
+      '{"apiKey":"${KEY}"}',
+    ];
+    expect(redactArgs(kept)).toEqual({ args: [...kept], redacted: 0 });
+  });
+
+  test("docker's -H HOST is not a header: a URL, a host:port or a dotted host stays readable", () => {
+    for (const host of [
+      "tcp://build-host:2375",
+      "unix:///var/run/docker.sock",
+      "localhost:5432",
+      "10.0.0.5",
+    ]) {
+      const args = ["-H", host, "run", "-i", "--rm", "mcp/fetch"];
+      expect({ host, out: redactArgs(args) }).toEqual({ host, out: { args, redacted: 0 } });
+    }
+    // A URL still loses its userinfo, by the embedded rule.
+    expect(redactArgs(["-H", `ssh://deploy:${pw}@build-host`]).args).toEqual([
+      "-H",
+      "ssh://(redacted)@build-host",
+    ]);
+  });
+
   test("an env reference in a header, and a URL with nothing to hide, stay as written", () => {
     const args = [
       "mcp-remote",

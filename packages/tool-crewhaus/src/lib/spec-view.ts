@@ -27,7 +27,12 @@
 
 import { createHash } from "node:crypto";
 import { ENV_REF_RE, UNPARSED_ENV_REF_RE } from "@crewhaus/preflight";
-import { isCredentialShapedName, redactUrlCredentialsInText } from "@crewhaus/tool-safety/env";
+import {
+  credentialShapeOf,
+  isCredentialShapedName,
+  nameWords,
+  redactUrlCredentialsInText,
+} from "@crewhaus/tool-safety/env";
 
 export type LooseRecord = Record<string, unknown>;
 
@@ -223,14 +228,6 @@ function safeEndpoint(raw: unknown): string | undefined {
 export const REDACTED = "(redacted)";
 
 /**
- * A flag name (dashes already stripped) whose VALUE is a credential.
- * Deliberately narrow: over-redacting an argv makes the report useless, so
- * only the words operators actually use for a secret are matched.
- */
-const CREDENTIAL_FLAG_RE =
-  /(^|[-_.])(api[-_.]?key|key|token|secret|password|passwd|auth|bearer|credentials?|pat)s?$/i;
-
-/**
  * A value that is a credential on its own evidence: a vendor-prefixed key, a
  * JWT, or a long opaque run of token characters. Path-like and URL-like
  * strings are excluded — `/usr/local/bin/server` and `https://host/x` are
@@ -250,29 +247,75 @@ function looksLikeSecretValue(value: string): boolean {
   return OPAQUE_TOKEN_RE.test(value) && /[A-Za-z]/.test(value) && /\d/.test(value);
 }
 
-function isCredentialFlag(arg: string): boolean {
-  if (!arg.startsWith("-")) return false;
-  return CREDENTIAL_FLAG_RE.test(arg.replace(/^-+/, ""));
+/** `scheme://…` — a value whose credential PARTS can be cut out, keeping what it points at. */
+const URL_VALUE_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+
+/**
+ * Whether `word` ENDS in a credential word (`KEY`, `APIKEY`, `GHTOKEN`,
+ * `BEARER`, `COOKIE`, `SECRETS`, `CONNECTIONSTRING`), by tool-safety's one
+ * table of credential words. A word that only STARTS with one —
+ * `TOKENFILE`, `PASSWORDLESS`, `SECRETNAME` — names something else: a path,
+ * a switch, a name.
+ */
+function endsInCredentialWord(word: string): boolean {
+  const shape = credentialShapeOf(word);
+  return shape !== undefined && (word.endsWith(shape) || word.endsWith(`${shape}S`));
 }
 
 /**
- * Flags whose value is an HTTP header, `Name: value` — `mcp-remote`'s
- * `--header`, curl's `-H`. The value is withheld whatever the name: an
- * `sse` server's headers are reported by key only, and this is the same
- * data reached through a stdio bridge.
+ * A flag whose VALUE is a credential: its last word, or its last two words
+ * run together, end in a credential word — `--api-key`, `--apiKey`,
+ * `--oauth2Bearer`, `--accessToken`, `--client-secret`, `--cookie`, `--dsn`,
+ * `--connection-string`. Words come from tool-safety's `nameWords`, so a
+ * camelCase flag splits the way a separated one does. `--token-file`,
+ * `--key-id` and `--secret-name` name something else, and a `--no-…` flag
+ * is a switch that takes no value.
+ */
+function isCredentialFlag(arg: string): boolean {
+  if (!arg.startsWith("-")) return false;
+  const words = nameWords(arg);
+  const last = words[words.length - 1];
+  if (last === undefined || words[0] === "NO") return false;
+  const lastTwo = words.length > 1 ? `${words[words.length - 2]}${last}` : undefined;
+  return endsInCredentialWord(last) || (lastTwo !== undefined && endsInCredentialWord(lastTwo));
+}
+
+/**
+ * Flags whose value is an HTTP header — `mcp-remote`'s `--header`, curl's
+ * `-H`, `mcp-proxy`'s `--headers`/`-H`. Two spellings: one entry,
+ * `Name: value`, or two, `Name` then `value` (the form `mcp-proxy`
+ * documents). The value is withheld whatever the name: an `sse` server's
+ * headers are reported by key only, and this is the same data reached
+ * through a stdio bridge.
  */
 const HEADER_FLAGS: ReadonlySet<string> = new Set(["--header", "--headers", "-H"]);
 
 /** An HTTP header name (RFC 9110 `token`). */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
-/** `Name: value`, or undefined when the text is not header-shaped. */
+/**
+ * `Name: value`, or undefined when the text is not header-shaped. A URL
+ * (`tcp://build-host:2375`, `ssh://deploy@host`) and a `host:port`
+ * (`localhost:5432`) have a colon too, and docker spells ITS host flag
+ * `-H`: neither is a header.
+ */
 function splitHeader(text: string): { name: string; value: string } | undefined {
   const colon = text.indexOf(":");
   if (colon <= 0) return undefined;
   const name = text.slice(0, colon).trim();
   if (!HEADER_NAME_RE.test(name)) return undefined;
-  return { name, value: text.slice(colon + 1) };
+  const value = text.slice(colon + 1);
+  if (value.startsWith("//") || /^\d{1,5}(?:[/?#]|$)/.test(value)) return undefined;
+  return { name, value };
+}
+
+/**
+ * The first half of the two-entry header form: a header NAME with no value
+ * of its own. A dotted name (`0.0.0.0`, `build.internal`) and `localhost`
+ * are docker's `-H HOST`, not a header — no real header name has a dot.
+ */
+function isBareHeaderName(arg: string): boolean {
+  return HEADER_NAME_RE.test(arg) && !arg.includes(".") && arg.toLowerCase() !== "localhost";
 }
 
 /**
@@ -294,6 +337,11 @@ function redactHeader(text: string): string {
   return `${header.name}: ${REDACTED}`;
 }
 
+/** A header value given as its own entry: withheld unless empty or an env reference. */
+function redactHeaderValue(value: string): string {
+  return value.trim() === "" || isEnvRefHeaderValue(value) ? value : REDACTED;
+}
+
 /**
  * A bearer credential anywhere in an entry: `Bearer eyJ…` inside a JSON
  * blob or a `KEY=Bearer …` pair. (`Basic` is not matched outside a header:
@@ -303,18 +351,70 @@ function redactHeader(text: string): string {
 const BEARER_TOKEN_RE = /\bBearer(\s+)(?!\$)[A-Za-z0-9._~+/=-]{8,}/g;
 
 /**
+ * `NAME=value` inside an entry: an env assignment handed to a wrapper
+ * (`docker run -e POSTGRES_PASSWORD=…`, `sh -c "API_KEY=… server"`) or one
+ * parameter of a connection string (`Server=db;Password=…`,
+ * `jdbc:sqlserver://db:1433;user=sa;password=…`). The name starts the entry
+ * or follows whitespace, `;`, `&`, `?`, a quote, `{` or `,`, and the value
+ * runs to the next of those. Every class is disjoint from the one after it,
+ * so a match is linear.
+ */
+const ASSIGNMENT_RE = /(^|[\s;&?"'{,])([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)([^\s;&"',}]+)/g;
+
+/**
+ * `"name": "value"` inside a JSON entry — `--config '{"apiKey":"…"}'`, the
+ * form Smithery's CLI takes. Keys are capped at 128 characters and the
+ * value's two alternatives are disjoint, so a match is linear.
+ */
+const JSON_STRING_MEMBER_RE = /"([A-Za-z_$][\w$.-]{0,127})"(\s*:\s*)"((?:[^"\\]|\\.)*)"/g;
+
+/** A value an earlier rule already cut down to `Bearer (redacted)` or `(redacted)`. */
+const ALREADY_REDACTED_RE = /^(?:(?:Bearer|Basic|Token)\s+)?\(redacted\)$/;
+
+function keepsNothingSecret(value: string): boolean {
+  return (
+    value.trim() === "" ||
+    ALREADY_REDACTED_RE.test(value) ||
+    ENV_REF_RE.test(value) ||
+    isEnvRefHeaderValue(value)
+  );
+}
+
+/**
  * The credential-carrying PARTS of an entry that is not itself a secret:
  * a URL's userinfo and credential-named query or fragment parameters
  * (`postgresql://admin:…@db/prod`, `https://host/sse?token=…` — the scheme,
  * host and path stay, so the report still says what the server is), a
  * credential header written as one entry (`Authorization: Bearer …`,
- * `X-Api-Key: …`, `Cookie: …`), and a `Bearer` credential inside any text.
+ * `X-Api-Key: …`, `Cookie: …`), a `Bearer` credential inside any text, and
+ * a credential-named `NAME=value` or JSON `"name": "value"` member.
  */
 function redactEmbedded(text: string): string {
   let out = redactUrlCredentialsInText(text, REDACTED);
   const header = splitHeader(out);
   if (header !== undefined && isCredentialShapedName(header.name)) out = redactHeader(out);
-  return out.replace(BEARER_TOKEN_RE, (_m, gap: string) => `Bearer${gap}${REDACTED}`);
+  out = out.replace(BEARER_TOKEN_RE, (_m, gap: string) => `Bearer${gap}${REDACTED}`);
+  out = out.replace(
+    ASSIGNMENT_RE,
+    (whole, lead: string, name: string, eq: string, value: string) =>
+      isCredentialShapedName(name) && !keepsNothingSecret(value)
+        ? `${lead}${name}${eq}${REDACTED}`
+        : whole,
+  );
+  return out.replace(JSON_STRING_MEMBER_RE, (whole, name: string, colon: string, value: string) =>
+    isCredentialShapedName(name) && !keepsNothingSecret(value)
+      ? `"${name}"${colon}"${REDACTED}"`
+      : whole,
+  );
+}
+
+/**
+ * The value after a credential flag: a URL keeps what it points at and
+ * loses its credential parts (`--dsn postgresql://u:…@db/prod`); anything
+ * else is withheld whole.
+ */
+function redactCredentialValue(value: string): string {
+  return URL_VALUE_RE.test(value) ? redactEmbedded(value) : REDACTED;
 }
 
 /**
@@ -322,15 +422,18 @@ function redactEmbedded(text: string): string {
  *
  * Caught, and only these:
  *
- * - `--api-key VALUE` (the entry AFTER a credential-named flag) and
- *   `--api-key=VALUE` (the half after the `=`);
+ * - `--api-key VALUE` (the entry AFTER a credential flag) and
+ *   `--api-key=VALUE` (the half after the `=`); a URL value keeps its
+ *   scheme, host and path;
  * - a bare value that is a credential on its own evidence (a vendor-prefixed
  *   key, a JWT, a long opaque token);
- * - `--header VALUE`, `-H VALUE` and `--header=VALUE`: the header keeps its
- *   name and loses its value, unless the value is only an env reference;
+ * - `--header VALUE`, `-H VALUE`, `--header=VALUE` and the two-entry
+ *   `--headers NAME VALUE`: the header keeps its name and loses its value,
+ *   unless the value is only an env reference;
  * - inside any other entry, or the value half of any `--flag=VALUE`: a
  *   URL's userinfo and its credential-named query or fragment parameters, a
- *   credential header written as one entry, and a `Bearer` credential.
+ *   credential header written as one entry, a `Bearer` credential, and a
+ *   credential-named `NAME=value` or JSON string member.
  *
  * A `$NAME` env reference is shown as written wherever a whole value is
  * one. Exported because the honest thing to do with a redaction rule is
@@ -339,7 +442,7 @@ function redactEmbedded(text: string): string {
 export function redactArgs(args: readonly string[]): { args: string[]; redacted: number } {
   const out: string[] = [];
   let redacted = 0;
-  let previous: "credential-flag" | "header-flag" | undefined;
+  let previous: "credential-flag" | "header-flag" | "header-name" | undefined;
   const push = (value: string, original: string): void => {
     out.push(value);
     if (value !== original) redacted += 1;
@@ -351,24 +454,36 @@ export function redactArgs(args: readonly string[]): { args: string[]; redacted:
     // A `$UPPER_SNAKE` value is an env REFERENCE, not a credential: hiding it
     // costs the reader the variable name and protects nothing.
     if (after === "credential-flag" && !arg.startsWith("-") && !ENV_REF_RE.test(arg)) {
-      push(REDACTED, arg);
+      push(redactCredentialValue(arg), arg);
+      continue;
+    }
+    if (after === "header-name" && !arg.startsWith("-")) {
+      push(redactHeaderValue(arg), arg);
       continue;
     }
     if (after === "header-flag" && !arg.startsWith("-")) {
-      // Not `Name: value` (curl-style CLIs also spell a HOST flag `-H`):
-      // only the embedded rules apply.
-      push(splitHeader(arg) === undefined ? redactEmbedded(arg) : redactHeader(arg), arg);
+      if (splitHeader(arg) !== undefined) {
+        push(redactHeader(arg), arg);
+      } else if (isBareHeaderName(arg)) {
+        // `--headers X-Api-Key VALUE`: the name now, the value next.
+        push(arg, arg);
+        previous = "header-name";
+      } else {
+        // Not a header at all (docker spells its HOST flag `-H`): only the
+        // embedded rules apply.
+        push(redactEmbedded(arg), arg);
+      }
       continue;
     }
     if (eq > 0) {
       const flag = arg.slice(0, eq);
       const value = arg.slice(eq + 1);
-      if (isCredentialFlag(flag) && value.length > 0 && !ENV_REF_RE.test(value)) {
-        push(`${flag}=${REDACTED}`, arg);
-        continue;
-      }
       if (HEADER_FLAGS.has(flag)) {
         push(`${flag}=${redactHeader(value)}`, arg);
+        continue;
+      }
+      if (isCredentialFlag(flag) && value.length > 0 && !ENV_REF_RE.test(value)) {
+        push(`${flag}=${redactCredentialValue(value)}`, arg);
         continue;
       }
       push(`${flag}=${redactEmbedded(value)}`, arg);
