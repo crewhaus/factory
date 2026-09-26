@@ -167,13 +167,41 @@ describe("the token goes only where it was configured for (C155)", () => {
     expect(seen).toEqual([]);
   });
 
-  test("with no base_url configured, token_env may go to any allowed origin, as before", async () => {
+  test("net-review: with no base_url, token_env belongs to the host's default API, not to any allowed origin", async () => {
+    // The common configuration: token_env alone, the GitHub API implied. The
+    // first 0.7.1 cut bound the token only when base_url was set, so a
+    // call's own baseUrl sent the operator's GitHub token to server B.
+    let checked = 0;
+    for (const input of [{ baseUrl: originB }, { baseUrl: originA }, { host: "gitlab" as const }]) {
+      const out = await call(input, {
+        allowed_origins: [originA, originB, "https://gitlab.com"],
+        token_env: TOKEN_VAR,
+      });
+      expect({
+        input,
+        refused: out.includes("may be sent only to https://api.github.com"),
+      }).toEqual({ input, refused: true });
+      checked += 1;
+    }
+    expect(checked).toBe(3);
+    expect(seen).toEqual([]);
+  });
+
+  test("with no base_url and host gitlab, token_env belongs to gitlab.com's API", async () => {
     const out = await call(
       { baseUrl: originB },
-      { allowed_origins: [originA, originB], token_env: TOKEN_VAR },
+      { allowed_origins: [originB], token_env: TOKEN_VAR, host: "gitlab" },
     );
-    expect(out).not.toContain("may be sent only");
-    expect(seen).toEqual([{ server: "B", path: "/rate_limit", auth: `Bearer ${TOKEN}` }]);
+    expect(out).toContain("may be sent only to https://gitlab.com");
+    expect(seen).toEqual([]);
+  });
+
+  test("a token_envs list entry, which names no origins, may still go to any allowed origin", async () => {
+    await call(
+      { baseUrl: originB, tokenEnv: OTHER_VAR },
+      { allowed_origins: [originA, originB], token_env: TOKEN_VAR, token_envs: [OTHER_VAR] },
+    );
+    expect(seen).toEqual([{ server: "B", path: "/rate_limit", auth: `Bearer ${OTHER}` }]);
   });
 
   test("a next-page link naming another allowed origin is followed without the token", async () => {

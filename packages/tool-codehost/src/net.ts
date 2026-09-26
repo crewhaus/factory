@@ -826,9 +826,13 @@ export function resolveToken(
  *
  * The token is also held to the origins it was configured for, checked
  * against the origin of the API root this call will use: a `token_envs` map
- * entry names them, and `token_env` belongs to `base_url`'s origin when the
- * operator set one. So a call cannot point a self-hosted instance's token
- * at another allowed host by passing its own `baseUrl`.
+ * entry names them, and `token_env` belongs to `base_url`'s origin, or,
+ * when the operator set none, to the default API of the config's `host`
+ * (https://api.github.com unless `host: gitlab`). So a call cannot point
+ * the operator's token at another allowed host by passing its own
+ * `baseUrl` or `host`: the first 0.7.1 cut bound it only when `base_url`
+ * was set, and in the common configuration (token_env alone) a call's
+ * baseUrl sent the GitHub token to any allowed origin (net review, C155).
  */
 export function resolveCallToken(
   inputName: string | undefined,
@@ -859,13 +863,13 @@ export function resolveCallToken(
   }
   const bound = cfg.tokenEnvs.has(name)
     ? (cfg.tokenEnvs.get(name) ?? null)
-    : name === cfg.tokenEnv && cfg.baseUrl !== undefined
-      ? new Set([originOfBase(cfg.baseUrl)])
+    : name === cfg.tokenEnv
+      ? new Set([originOfBase(cfg.baseUrl ?? DEFAULT_BASE_URL[cfg.host ?? "github"])])
       : null;
   if (bound !== null && !bound.has(baseOrigin)) {
     return {
       ok: false,
-      message: `the token in "${name}" may be sent only to ${[...bound].sort().join(", ")} (token_env belongs to the codehost tool_config's base_url; a ${TOKEN_ENVS_KEY} map entry names the origins for its variable), and this call's baseUrl is ${baseOrigin} — nothing was sent`,
+      message: `the token in "${name}" may be sent only to ${[...bound].sort().join(", ")} (token_env belongs to the codehost tool_config's base_url, or when it has none to its host's default API; a ${TOKEN_ENVS_KEY} map entry names the origins for its variable), and this call's baseUrl is ${baseOrigin} — nothing was sent`,
     };
   }
   return { ok: true, token: resolved.value };

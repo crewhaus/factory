@@ -94,6 +94,7 @@ import {
   type HostKind,
   MAX_MAX_BYTES,
   MAX_TIMEOUT_MS,
+  assertOriginAllowed,
   byString,
   describeFailure,
   json,
@@ -229,6 +230,14 @@ async function withCall(
   // is a mistake to report, not a reason to go looking for a secret.
   const baseProblem = baseUrlProblem(baseUrl);
   if (baseProblem !== null) return baseProblem;
+  // An origin the operator did not list is refused as that, first: it says
+  // what is actually wrong, and no token question arises for a host that
+  // will never be reached.
+  try {
+    assertOriginAllowed(new URL(baseUrl), cfg);
+  } catch (err) {
+    return describeFailure(err);
+  }
   const tokenOrigin = originOfBase(baseUrl);
   const token = resolveCallToken(input.tokenEnv, cfg, tokenOrigin);
   if (!token.ok) return token.message;

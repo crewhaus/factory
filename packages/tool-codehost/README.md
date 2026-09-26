@@ -56,9 +56,10 @@ the answer — and it is an `order` option, spelled out in the description.
 }
 ```
 
-`token_env` is the variable every call uses unless it names another, and when `base_url` is set
-its token goes only to `base_url`'s origin: a call that passes its own `baseUrl` for another host
-is refused rather than handed that token. `token_envs` lists the other variables a call may name
+`token_env` is the variable every call uses unless it names another. Its token goes only to
+`base_url`'s origin, or, when `base_url` is not set, to the default API of `host`
+(`https://api.github.com`, or `https://gitlab.com` with `host: "gitlab"`). A call that passes its
+own `baseUrl` or `host` for another origin is refused rather than handed that token. `token_envs` lists the other variables a call may name
 in `tokenEnv` — as a list, whose tokens may go to any allowed origin, or as a map from a name to
 the origins its token may go to, which is how a spec that reaches github.com and a self-hosted
 instance keeps each token with its own host. A call can choose among these names and never add
