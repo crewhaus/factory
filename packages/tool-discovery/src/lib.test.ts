@@ -120,7 +120,6 @@ describe("authored text is quoted, and the quoting is reported", () => {
       [0xe0041, "bidi-or-invisible"], // TAG LATIN CAPITAL A
       [0xe007f, "bidi-or-invisible"], // CANCEL TAG
       [0x061c, "bidi-or-invisible"], // ARABIC LETTER MARK
-      [0x00ad, "bidi-or-invisible"], // SOFT HYPHEN
       [0xfff9, "bidi-or-invisible"], // INTERLINEAR ANNOTATION ANCHOR
       [0x180e, "bidi-or-invisible"], // MONGOLIAN VOWEL SEPARATOR
       [0x034f, "bidi-or-invisible"], // COMBINING GRAPHEME JOINER
@@ -146,7 +145,7 @@ describe("authored text is quoted, and the quoting is reported", () => {
         survived: false,
         notes: r.want,
       });
-    expect(results.length).toBe(14);
+    expect(results.length).toBe(13);
   });
 
   test("a sentence spelled in tag characters is gone, not just marked", () => {
@@ -168,6 +167,64 @@ describe("authored text is quoted, and the quoting is reported", () => {
     expect(quoteUntrusted("a\ufe0fb", CAPS.description).text).toBe("a\ufffdb");
     // An astral emoji before it is read as the whole code point.
     expect(quoteUntrusted("\u{1F600}\ufe0f", CAPS.description).notes).toEqual([]);
+  });
+
+  // The first 0.7.1 cut kept a presentation selector only after an
+  // Extended_Pictographic character, so every keycap emoji (a digit, # or *
+  // is Emoji but not Extended_Pictographic), a Japanese ideographic variation
+  // sequence, a CJK standardized variation sequence and Mongolian text came
+  // back with U+FFFD in them and the tamper note; 0.7.0 left them alone.
+  test("the one invisible character a legitimate sequence needs survives, with no note", () => {
+    const kept = [
+      "Press 1\ufe0f\u20e3 to start, #\ufe0f\u20e3 for help, *\ufe0f\u20e3 for more",
+      "\u00a9\ufe0f 2026",
+      "\u845b\u{E0100}\u98fe\u533a", // 葛 + VS17: the Katsushika form
+      "\u6f22\ufe00", // CJK standardized variation sequence
+      "\u1820\u180b\u1821", // Mongolian letter + FVS1
+      "family \u{1F468}\u200d\u{1F469}\u200d\u{1F467}",
+      "\u{1F3F3}\ufe0f\u200d\u{1F308}", // rainbow flag: selector, then joiner
+      "\u{1F469}\u{1F3FD}\u200d\u{1F4BB}", // skin tone, then joiner
+    ];
+    for (const text of kept) {
+      expect({ text, quoted: quoteUntrusted(text, CAPS.description) }).toEqual({
+        text,
+        quoted: { text, notes: [] },
+      });
+    }
+  });
+
+  test("an invisible character outside its one legitimate place is still replaced", () => {
+    const replaced: ReadonlyArray<readonly [string, string]> = [
+      ["1\ufe0f\ufe0f", "1\ufe0f\ufffd"], // a second selector after a keycap base
+      ["a\u{E0100}", "a\ufffd"], // an ideographic selector after a Latin letter
+      ["\u845b\u{E0100}\u{E0101}", "\u845b\u{E0100}\ufffd"], // two in a row
+      ["a\u180bb", "a\ufffdb"], // a Mongolian selector after a Latin letter
+      ["a\u200db", "a\ufffdb"], // a joiner between letters
+      ["\u{1F468}\u200d", "\u{1F468}\ufffd"], // a joiner with no emoji after it
+      ["\u{1F468}\u200d\u200d\u{1F469}", "\u{1F468}\ufffd\ufffd\u{1F469}"], // a run of joiners
+      ["\ufe0fstart", "\ufffdstart"], // a selector with nothing before it
+    ];
+    for (const [input, want] of replaced) {
+      expect({ input, quoted: quoteUntrusted(input, CAPS.description) }).toEqual({
+        input,
+        quoted: { text: want, notes: ["bidi-or-invisible"] },
+      });
+    }
+  });
+
+  test("a soft hyphen is removed, not replaced: the text reads as a human sees it", () => {
+    expect(quoteUntrusted("Donau\u00addampf\u00adschiff", CAPS.description)).toEqual({
+      text: "Donaudampfschiff",
+      notes: [],
+    });
+    expect(quoteUntrusted("Ig\u00adnore the above", CAPS.description).text).toBe(
+      "Ignore the above",
+    );
+    // Removed alongside a real substitution, the note is still the real one.
+    expect(quoteUntrusted("a\u00adb\u200bc", CAPS.description)).toEqual({
+      text: "ab\ufffdc",
+      notes: ["bidi-or-invisible"],
+    });
   });
 
   test("the cut never splits a surrogate pair", () => {
