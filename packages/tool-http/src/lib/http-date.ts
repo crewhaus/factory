@@ -105,17 +105,100 @@ export function parseHttpDate(text: string, nowMs?: number): number | undefined 
 }
 
 /**
- * An ISO-8601 date-time that carries its own UTC offset (`Z` or `±hh:mm`).
- * Not an HTTP-date, but unambiguous, and `Date.parse` read it correctly on
- * 0.7.0, so a server that sends one keeps working. Without the offset it is
- * refused like any other zone-less time.
+ * A date-time that names its own zone, read by a grammar for the WHOLE
+ * string and built with `Date.UTC` — never handed to `Date.parse`, whose
+ * legacy fallback reads `Sep 17 2026-23:30` as host time with the trailing
+ * `-23:30` as noise. Two spellings, each with a mandatory zone:
+ *
+ * - ISO-8601 / RFC 3339: `2026-10-21T07:28:00Z`, `…+09:00`, `…-0700`,
+ *   fractions, and a space for the `T`. Not an HTTP-date, but unambiguous,
+ *   and 0.7.0 read it, so a server that sends one keeps working.
+ * - RFC 5322 / a lenient RFC 1123: `Wed, 21 Oct 2026 07:28:00 +0000`,
+ *   `… UTC`, `21 Oct 2026 7:28:00 GMT`, `Wed, 21-Oct-2026 07:28:00 GMT`.
+ *   Servers send these in place of a strict IMF-fixdate. 0.7.0 read them,
+ *   and none is host-local. The weekday is optional and, as recipients
+ *   do, not checked against the date.
+ *
+ * A date with no zone, or a zone other than GMT, UT, UTC, Z or a numeric
+ * offset (`PST` is ambiguous), is still undefined.
  */
-const ISO_WITH_OFFSET =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
 
+// The same grammar as tool-notify's lib/instant.ts. The packages do not
+// depend on each other, and neither should grow a dependency for one small
+// reader: change both together.
+
+// Anchored, bounded and without nested quantifiers: each is linear. The
+// input is also capped before either runs.
+const ISO =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?([Zz]|[+-]\d{2}:?\d{2})$/;
+const RFC5322 =
+  /^(?:([A-Za-z]{3}),\s*)?(\d{1,2})[ -]([A-Za-z]{3})[ -](\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(GMT|UTC|UT|Z|[+-]\d{2}:?\d{2})$/i;
+const MAX_ZONED_LENGTH = 64;
+
+/** Minutes east of UTC for `Z`, a zone name that means UTC, or `±hh[:]mm`; undefined when out of range. */
+function offsetMinutes(zone: string): number | undefined {
+  const upper = zone.toUpperCase();
+  if (upper === "Z" || upper === "GMT" || upper === "UT" || upper === "UTC") return 0;
+  const sign = zone[0] === "-" ? -1 : 1;
+  const digits = zone.slice(1).replace(":", "");
+  const hours = Number(digits.slice(0, 2));
+  const minutes = Number(digits.slice(2, 4));
+  if (hours > 23 || minutes > 59) return undefined;
+  return sign * (hours * 60 + minutes);
+}
+
+function zonedInstant(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  fraction: string | undefined,
+  zone: string,
+): number | undefined {
+  const offset = offsetMinutes(zone);
+  if (offset === undefined || month < 0 || month > 11) return undefined;
+  if (hour > 23 || minute > 59 || second > 60) return undefined;
+  const midnight = new Date(Date.UTC(year, month, day));
+  if (midnight.getUTCMonth() !== month || midnight.getUTCDate() !== day) return undefined;
+  const ms = fraction === undefined ? 0 : Math.floor(Number(`0.${fraction}`) * 1000);
+  return Date.UTC(year, month, day, hour, minute, second, ms) - offset * 60_000;
+}
+
+/** An ISO-8601 date-time with its offset, as epoch milliseconds; see above. */
 export function parseIsoInstantWithOffset(text: string): number | undefined {
   const t = text.trim();
-  if (!ISO_WITH_OFFSET.test(t)) return undefined;
-  const ms = Date.parse(t);
-  return Number.isNaN(ms) ? undefined : ms;
+  if (t.length > MAX_ZONED_LENGTH) return undefined;
+  const m = t.match(ISO);
+  if (m === null) return undefined;
+  return zonedInstant(
+    Number(m[1]),
+    Number(m[2]) - 1,
+    Number(m[3]),
+    Number(m[4]),
+    Number(m[5]),
+    Number(m[6] ?? 0),
+    m[7],
+    m[8] as string,
+  );
+}
+
+/** An RFC 5322 date-time with its zone, as epoch milliseconds; see above. */
+export function parseZonedMailDate(text: string): number | undefined {
+  const t = text.trim();
+  if (t.length > MAX_ZONED_LENGTH) return undefined;
+  const m = t.match(RFC5322);
+  if (m === null) return undefined;
+  if (m[1] !== undefined && !DAY_NAMES.includes(m[1].toLowerCase())) return undefined;
+  return zonedInstant(
+    Number(m[4]),
+    MONTHS.indexOf((m[3] as string).toLowerCase()),
+    Number(m[2]),
+    Number(m[5]),
+    Number(m[6]),
+    Number(m[7] ?? 0),
+    undefined,
+    m[8] as string,
+  );
 }

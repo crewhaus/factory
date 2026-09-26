@@ -482,12 +482,22 @@ describe("retry arithmetic", () => {
       "Wed Sep 23 10:00:00 2026", // asctime-date: GMT, with no zone written
       "2026-09-23T10:00:00Z", // not an HTTP-date, but it carries its offset
       "2026-09-23T19:00:00+09:00",
+      // Not strict IMF-fixdate, but each names its zone, and 0.7.0 read it
+      // (net review): the first 0.7.1 cut returned null and retried early.
+      "Wed, 23 Sep 2026 10:00:00 +0000",
+      "Wed, 23 Sep 2026 10:00:00 UTC",
+      "Wed, 23 Sep 2026 19:00:00 +09:00",
+      "Wed, 23 Sep 2026 10:00 GMT",
+      "23 Sep 2026 10:00:00 GMT",
+      "Wed, 23-Sep-2026 10:00:00 GMT",
     ];
     const unread = [
       "2026-09-23T10:00:00", // offset-less ISO: host-local per ECMAScript
       "Wed, 23 Sep 2026 10:00:00", // RFC 1123 with the zone left off
       "Wed, 23 Sep 2026 10:00:00 PST", // an HTTP-date is GMT only
       "Wed, 31 Sep 2026 10:00:00 GMT", // a day September does not have
+      "Sep 23 2026-10:00", // offset-shaped tail, host time to Date.parse
+      "Wed, 23 Sep 2026 10:00:00", // no zone at all
     ];
     const seen: Array<{ tz: string; text: string; ms: number | null }> = [];
     for (const tz of ["UTC", "Asia/Tokyo", "America/Los_Angeles"]) {
@@ -502,7 +512,7 @@ describe("retry arithmetic", () => {
     // Asia/Tokyo and eight hours under America/Los_Angeles.
     expect(seen.filter((s) => read.includes(s.text) && s.ms !== 3_600_000)).toEqual([]);
     expect(seen.filter((s) => unread.includes(s.text) && s.ms !== null)).toEqual([]);
-    expect(seen).toHaveLength(27);
+    expect(seen).toHaveLength(51);
   });
 
   test("the server's Retry-After wins over the curve", () => {
