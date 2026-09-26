@@ -82,7 +82,7 @@ describe("the store writes nothing through a planted link", () => {
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(WikiStoreError);
     expect((err as Error).message).toContain("refusing to write versions/notes/1.md");
-    expect((err as Error).message).toContain("outside");
+    expect((err as Error).message).toContain("resolves outside the wiki store");
     expect(readdirSync(join(outside, "d"))).toEqual([]);
     expect((await wiki.get("notes"))?.version).toBe(1);
   });
@@ -126,6 +126,53 @@ describe("the store writes nothing through a planted link", () => {
     const wiki = makeStore(linkedRoot);
     await wiki.write({ slug: "notes", title: "N", body: "hello" });
     expect(lstatSync(join(real, "spec", "articles", "notes.md")).isFile()).toBe(true);
+    expect((await wiki.get("notes"))?.body).toBe("hello");
+  });
+
+  test("an articles/ directory linked out of the store is refused by every operation, naming the store", async () => {
+    const wiki0 = makeStore();
+    await wiki0.write({ slug: "alpha", title: "Alpha", body: "widgets are blue" });
+    // Move the articles out and link them back in, as a store written by
+    // 0.7.0 with articles/ linked to a tracked folder would look.
+    rmSync(join(store, "articles"), { recursive: true, force: true });
+    mkdirSync(join(outside, "docs"));
+    writeFileSync(
+      join(outside, "docs", "alpha.md"),
+      "---\nslug: alpha\ntitle: Alpha\nversion: 1\n---\nwidgets are blue\n",
+    );
+    symlinkSync(join(outside, "docs"), join(store, "articles"));
+    const wiki = makeStore();
+    const outcomes: Record<string, string> = {};
+    for (const [name, op] of Object.entries({
+      list: () => wiki.list(),
+      search: () => wiki.search("widgets"),
+      recall: () => wiki.recall("widgets"),
+      stats: () => wiki.stats(),
+      get: () => wiki.get("alpha"),
+      write: () => wiki.write({ slug: "beta", title: "B", body: "x" }),
+    })) {
+      const err = await (op as () => Promise<unknown>)().catch((e: unknown) => e);
+      outcomes[name] = err instanceof WikiStoreError ? err.message : "did not refuse";
+    }
+    for (const [name, message] of Object.entries(outcomes)) {
+      expect(`${name}: ${message.includes("resolves outside the wiki store")}`).toBe(
+        `${name}: true`,
+      );
+      expect(message).not.toContain("workspace");
+      expect(message).toContain("link the store's own directory instead");
+    }
+    expect(readdirSync(join(outside, "docs"))).toEqual(["alpha.md"]);
+  });
+
+  test("an articles/ directory linked to a directory inside the store keeps working", async () => {
+    rmSync(join(store, "articles"), { recursive: true, force: true });
+    // A name that starts with two dots is still inside.
+    mkdirSync(join(store, "..kept"));
+    symlinkSync(join(store, "..kept"), join(store, "articles"));
+    const wiki = makeStore();
+    await wiki.write({ slug: "notes", title: "N", body: "hello" });
+    expect(lstatSync(join(store, "..kept", "notes.md")).isFile()).toBe(true);
+    expect((await wiki.list()).map((r) => r.slug)).toEqual(["notes"]);
     expect((await wiki.get("notes"))?.body).toBe("hello");
   });
 

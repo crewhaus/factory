@@ -74,9 +74,9 @@
  * option), any resolved path outside the tenant's root throws before any
  * IO happens. The default root under a tenant is `<tenantRoot>/wiki`.
  */
-import { lstatSync, unlinkSync } from "node:fs";
+import { lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { mkdir, readdir } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Tenant, assertSamePath, currentTenantContext } from "@crewhaus/tenancy";
 import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
@@ -105,6 +105,37 @@ const SPEC_NAME_REGEX = /^[a-zA-Z0-9_\-.]+$/;
 /** Slugs are kebab-case AND double as file names — fail-closed on anything
  *  that could traverse (`..`, `/`, uppercase, spaces). */
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,127}$/;
+
+/** What a missing or unreadable timestamp reads as. */
+const EPOCH = "1970-01-01T00:00:00.000Z";
+
+/** A calendar date: ECMAScript reads a date-only form as UTC midnight. */
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+/**
+ * A date-time as `Date#toISOString` writes it, or by hand, with or without
+ * an offset (group 1). Linear: no quantifier is nested or overlapping.
+ */
+const ISO_DATE_TIME =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})?$/;
+
+/**
+ * `value` when it is a real ISO-8601 timestamp, else {@link EPOCH}. A
+ * timestamp is printed in list rows and sorted on, and a file on disk (which
+ * any agent with a write tool can edit) could put any text there. A
+ * date-time without an offset is read as UTC — a `Z` is appended — never as
+ * the host's local time, which is what `Date.parse` would do with it.
+ */
+function isoTimestampOr(value: unknown): string {
+  if (typeof value !== "string") return EPOCH;
+  let iso: string | undefined;
+  if (ISO_DATE.test(value)) iso = value;
+  else {
+    const m = ISO_DATE_TIME.exec(value);
+    if (m !== null) iso = m[1] === undefined ? `${value}Z` : value;
+  }
+  return iso !== undefined && !Number.isNaN(Date.parse(iso)) ? iso : EPOCH;
+}
+
 const WIKILINK_REGEX = /\[\[([^\]]+)\]\]/g;
 /**
  * The most of one article file the store reads or writes. Reads are capped
@@ -457,8 +488,8 @@ export function parseArticle(raw: string): WikiArticle {
     ...(typeof v["supersedes"] === "number" ? { supersedes: v["supersedes"] } : {}),
     ...(createdBy !== undefined ? { createdBy } : {}),
     status,
-    createdAt: typeof v["createdAt"] === "string" ? v["createdAt"] : "1970-01-01T00:00:00.000Z",
-    updatedAt: typeof v["updatedAt"] === "string" ? v["updatedAt"] : "1970-01-01T00:00:00.000Z",
+    createdAt: isoTimestampOr(v["createdAt"]),
+    updatedAt: isoTimestampOr(v["updatedAt"]),
     body,
   };
 }
@@ -627,8 +658,40 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
       mode: 0o600,
     });
     if (!written.ok) {
-      throw new WikiStoreError(`refusing to write ${rel} in the wiki store: ${written.reason}`);
+      throw new WikiStoreError(
+        written.code === "escapes-root"
+          ? outsideStoreMessage("write", rel)
+          : `refusing to write ${rel} in the wiki store: ${written.reason}`,
+      );
     }
+  }
+
+  /**
+   * The refusal for a store path that resolves outside the store: a
+   * symlinked `articles/` or `versions/` directory (or file) leading out.
+   * tool-safety's own reason says "the workspace", which is the store here.
+   */
+  function outsideStoreMessage(op: "read" | "write", rel: string): string {
+    return `refusing to ${op} ${rel}: it resolves outside the wiki store, through a symlinked file or a symlinked articles/ or versions/ directory. Keep articles/ and versions/ as directories inside the store; to keep the wiki somewhere else, link the store's own directory instead.`;
+  }
+
+  /**
+   * Whether an existing store subdirectory resolves outside the store. The
+   * store root itself may be a link (it is resolved first); a subdirectory
+   * leading out is refused for every operation, so list() does not name
+   * articles that get() and search() would refuse to read.
+   */
+  function subdirLeavesStore(dir: string): boolean {
+    let realStore: string;
+    let realDir: string;
+    try {
+      realStore = realpathSync(storeDir);
+      realDir = realpathSync(dir);
+    } catch {
+      return false; // not there (yet): nothing leads anywhere
+    }
+    const rel = relative(realStore, realDir);
+    return rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
   }
 
   /**
@@ -642,7 +705,11 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
     const read = await openForRead(storeDir, rel, { maxBytes, followLeafSymlink: false });
     if (!read.ok) {
       if (read.code === "not-found") return null;
-      throw new WikiStoreError(`refusing to read ${rel} in the wiki store: ${read.reason}`);
+      throw new WikiStoreError(
+        read.code === "escapes-root"
+          ? outsideStoreMessage("read", rel)
+          : `refusing to read ${rel} in the wiki store: ${read.reason}`,
+      );
     }
     if (read.truncated) {
       throw new WikiStoreError(
@@ -706,13 +773,28 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
   function isIndexFile(value: unknown): value is WikiIndexFile {
     if (typeof value !== "object" || value === null) return false;
     const v = value as Record<string, unknown>;
-    return v["version"] === 1 && typeof v["articles"] === "object" && v["articles"] !== null;
+    if (v["version"] !== 1 || typeof v["articles"] !== "object" || v["articles"] === null) {
+      return false;
+    }
+    // An entry whose timestamp is not one (a planted or hand-edited
+    // index.json) sends the load to a rebuild from the articles, which
+    // parseArticle validates.
+    return Object.values(v["articles"] as Record<string, unknown>).every(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        isoTimestampOr((entry as Record<string, unknown>)["updatedAt"]) ===
+          (entry as Record<string, unknown>)["updatedAt"],
+    );
   }
 
   /** Load index.json; on a missing/corrupt file, rebuild from the articles
    *  (the crash-safe guarantee: the index is always derivable). */
   async function loadIndex(): Promise<WikiIndexFile> {
     fence(indexPath);
+    if (subdirLeavesStore(articlesDir)) {
+      throw new WikiStoreError(outsideStoreMessage("read", "articles/"));
+    }
     try {
       const raw = await readStoreFile(indexPath, INDEX_MAX_BYTES);
       if (raw !== null) {
