@@ -11,10 +11,12 @@
  * (`createMemoryTools(specName)`) or downstream consumers can wire
  * it through their own catalog initialization.
  *
- * Pillar 3: memory writes carry `origin: "user"` semantics (the user
- * is the one who decided what to remember). The runtime's session-
- * start hook reads recalled memories with the same origin so cached
- * verdicts apply correctly. No cross-origin lateral movement: a
+ * Pillar 3: a memory is re-verified when it is read back, because a fact
+ * written in an earlier session may have absorbed attacker text. The
+ * runtime's auto-recall classifies each recalled line at TrustOrigin
+ * "memory" in both recall modes, and a `Recall` result crosses the
+ * runtime's post-tool classifier like any tool output. No cross-origin
+ * lateral movement: a
  * memory written by one user cannot influence another user's session.
  * `MemoryForget` is destructive AND justification-gated (Pillar 3
  * intent gate): erasing memory is exactly the kind of side effect an

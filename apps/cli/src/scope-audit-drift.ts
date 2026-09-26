@@ -290,6 +290,18 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
     anchor: "text: `<guide>",
     window: 2500,
   },
+  // Auto-recall: fact, wiki, and session-summary lines recalled from earlier
+  // sessions are rendered into the system region as `<recalled_memory>`; each
+  // line is classified at TrustOrigin "memory" and lineage-tagged right before.
+  {
+    name: "runtime-core-recalled-memory",
+    path: "packages/runtime-core/src/index.ts",
+    requireTag: true,
+    // The template literal that builds the block — the bare tag also appears
+    // in doc comments elsewhere in the file.
+    anchor: "`<recalled_memory>\\nRelevant facts",
+    window: 1500,
+  },
   // 0.6.0 §7.3 / §10.1 — the VERIFIER reply path: on a failing in-loop grade
   // the judge's rationale (a model output) is interpolated into a synthetic
   // user message ("Grader feedback: …"). The cascade PR (9c) owns this seam.

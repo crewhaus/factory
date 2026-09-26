@@ -1266,9 +1266,10 @@ export async function wireMemory(
     // (`wiki.autoRecall: true`), mirroring the fact store's autoRecall
     // semantics. Backend-invariant: `wiki.recall` renders the same line
     // shape from the local store or through the Thredz MCP client (§4.3).
-    // The runtime classifies + delimiter-escapes the assembled block (the
-    // same path fact lines take), so recalled wiki bodies still flow
-    // through the boundary classifier before any model call.
+    // This seam does not classify: runtime-core's `renderRecalledMemory`
+    // classifies each recalled line at TrustOrigin "memory" (redacting a
+    // malicious one) and delimiter-escapes it before any model call, the
+    // same path fact lines take.
     const wikiFrag = fragment.memory?.wiki;
     if (wikiFrag?.autoRecall === true) {
       const wikiK = wikiFrag.recallK ?? DEFAULT_WIKI_RECALL_K;

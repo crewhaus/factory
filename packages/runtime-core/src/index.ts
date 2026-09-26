@@ -4856,11 +4856,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const seed = opts.memory.recallSeed ?? opts.instructions;
       const k = opts.memory.recallK ?? 5;
       // Pillar 3 — a recalled memory can embed content shaped by untrusted
-      // tool output from an earlier session; `renderRecalledMemory` applies
-      // the same delimiter-safety + boundary-classification defenses the
-      // security fabric uses for every other prompt-bound source (#53).
+      // tool output from an earlier session; `renderRecalledMemory` classifies
+      // each line at TrustOrigin "memory" (redacting a malicious one),
+      // lineage-tags the admitted lines, and neutralizes breakout delimiters.
       const lines = await opts.memory.recall(seed, k);
-      const text = await renderRecalledMemory(lines);
+      const text = await renderRecalledMemory(lines, runContext);
       if (text !== undefined) {
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
         out.write(`[memory] recalled ${lines.length} memory(ies) into the prompt\n`);
@@ -4893,7 +4893,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     const k = opts.memory?.recallK ?? 5;
     try {
       const lines = await recall(query, k);
-      const text = await renderRecalledMemory(lines);
+      const text = await renderRecalledMemory(lines, runContext);
       volatileRecallBlocks = text !== undefined ? [{ type: "text", text }] : [];
       if (lines.length > 0) {
         out.write(`[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`);
@@ -9854,19 +9854,42 @@ async function curateActiveContext(
 }
 
 /**
- * Item 2 / G21 — render the recalled-memory system block body with the SAME
- * two defenses the session-start recall uses (#53): neutralize any
- * `</recalled_memory>` breakout delimiter inside a recalled line, and run the
- * assembled block through `classifyBoundary` with origin `"user"` (recalled
- * lines may embed content shaped by untrusted tool output in an earlier
- * session). Returns `undefined` when there is nothing to recall.
+ * Item 2 / G21 — render the recalled-memory system block for both recall
+ * modes (#53). Pillar 3: every line is classified at TrustOrigin `"memory"`
+ * BEFORE it reaches the system prompt, because a fact, wiki article, or
+ * session summary written in an earlier session may have absorbed attacker
+ * text, and the system region has no post-tool classifier behind it. A
+ * malicious line is replaced by the redaction notice; a suspicious one is kept
+ * and logged; an admitted line is lineage-tagged for the egress fabric. Each
+ * line then has any
+ * `</recalled_memory>` breakout delimiter neutralized. A classifier rejection
+ * propagates, so both callers fail closed. Returns `undefined` when there is
+ * nothing to recall.
  */
-async function renderRecalledMemory(lines: readonly string[]): Promise<string | undefined> {
+async function renderRecalledMemory(
+  lines: readonly string[],
+  runContext: RunContext,
+): Promise<string | undefined> {
   if (lines.length === 0) return undefined;
-  const body = lines.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
-  const text = `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
-  await classifyBoundary(text, { origin: "user" }).catch(() => undefined);
-  return text;
+  const rendered: string[] = [];
+  for (const line of lines) {
+    const boundary = await classifyBoundary(line, { origin: "memory" });
+    const rules = [...new Set(boundary.verdict.hits.map((h) => h.rule))];
+    if (boundary.action === "redact") {
+      runContext.logger.warn("recalled memory line redacted (prompt injection detected)", {
+        rules,
+      });
+      rendered.push(boundary.redacted ?? "");
+      continue;
+    }
+    if (boundary.action === "warn") {
+      runContext.logger.warn("suspicious recalled memory line kept", { rules });
+    }
+    tagContent(runContext, line, "memory");
+    rendered.push(line);
+  }
+  const body = rendered.map((l) => `- ${escapeBoundaryDelimiter(l, "recalled_memory")}`).join("\n");
+  return `<recalled_memory>\nRelevant facts remembered from earlier sessions:\n${body}\n</recalled_memory>`;
 }
 
 /**

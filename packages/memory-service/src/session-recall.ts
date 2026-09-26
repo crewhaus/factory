@@ -12,10 +12,11 @@
  * semantic surface (`outcome` + `keyFacts` + `toolsUsed`) — zero deps, offline,
  * and the same formula `memory-store` uses so the three rankers agree on what
  * "relevant" means. The recall line mirrors the wiki bundle shape
- * (`[session:<id> · <date>] <outcome> — <keyFacts>`); the runtime classifies +
- * delimiter-escapes the assembled block, so recalled session bodies flow
- * through the boundary classifier before any model call, exactly like the
- * fact/wiki lines they sit beside.
+ * (`[session:<id> · <date>] <outcome> — <keyFacts>`); the runtime classifies
+ * each recalled line at TrustOrigin "memory" (redacting a malicious one) and
+ * delimiter-escapes it, so recalled session bodies cross the boundary
+ * classifier before any model call, exactly like the fact/wiki lines they sit
+ * beside.
  */
 
 import { readFile, readdir } from "node:fs/promises";
