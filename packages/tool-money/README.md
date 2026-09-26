@@ -35,7 +35,10 @@ products get — a tax rate times an amount passes 2^53 long before the amount
 does — and a total that would itself pass the limit is refused by name
 rather than reported a unit off. `PurchaseOrderMatch` takes fractional
 quantities (kilograms, hours); its exposure figures are rounded to whole
-minor units, half away from zero.
+minor units, half away from zero. `StatementParse` reads amounts out of a
+file, so an amount there past the limit is a rejected row that says so, and a
+total past it comes back `null` with `totalsUnavailable` saying which; the
+transactions themselves are unaffected.
 
 Splitting is largest-remainder, so the parts always sum to the whole. 100
 cents three ways is 34, 33, 33 — never 33, 33, 33 with a cent unaccounted

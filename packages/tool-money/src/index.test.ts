@@ -414,6 +414,32 @@ describe("StatementParse", () => {
     expect(result.rejectedTruncated).toBe(true);
   });
 
+  test("an amount or a total past 2^53 − 1 comes back refused by name, never rounded (C218)", async () => {
+    writeFileSync(
+      join(workspace, "big.ofx"),
+      "<OFX>\n<STMTTRN><DTPOSTED>20240101<TRNAMT>90071992547409.93<FITID>A</STMTTRN>\n",
+    );
+    const one = await call<{ count: number; rejectedCount: number; rejected: unknown[] }>(
+      statementParse,
+      { file: "big.ofx" },
+    );
+    expect(one.count).toBe(0);
+    expect(one.rejectedCount).toBe(1);
+    expect(JSON.stringify(one.rejected)).toContain("is more than 2^53 − 1");
+    writeFileSync(
+      join(workspace, "sum.csv"),
+      "date,amount\n2024-01-01,90071992547409.91\n2024-01-02,0.01\n2024-01-03,0.01\n",
+    );
+    const sum = await call<{
+      totalMinor: number | null;
+      creditMinor: number | null;
+      totalsUnavailable?: string;
+    }>(statementParse, { file: "sum.csv" });
+    expect(sum.totalMinor).toBeNull();
+    expect(sum.creditMinor).toBeNull();
+    expect(sum.totalsUnavailable).toContain("total comes to 9007199254740993 minor units");
+  });
+
   test("a path outside the workspace is refused", async () => {
     await expect(raw(statementParse, { file: "../outside.csv" })).rejects.toThrow(
       /escapes the workspace/,

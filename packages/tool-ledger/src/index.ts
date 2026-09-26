@@ -486,15 +486,27 @@ const sideSchema = z
 
 type Side = z.infer<typeof sideSchema>;
 
+/** How many of a statement's unreadable rows a reconciliation lists by name. */
+const UNREADABLE_ROWS_SHOWN = 50;
+
+/** One side's rows, and — for a statement — the rows the file had that could not be read. */
+type LoadedSide = {
+  readonly rows: ReadonlyArray<Transaction>;
+  readonly unreadable?: {
+    readonly count: number;
+    readonly rows: ReadonlyArray<{ readonly row: number; readonly reason: string }>;
+  };
+};
+
 function loadSide(
   side: Side,
   label: string,
   input: { dbPath?: string; busyTimeoutMs?: number },
-): Transaction[] {
+): LoadedSide {
   if (side.kind === "lines") {
     if (side.lines === undefined)
       throw new LedgerError(`${label}.kind is "lines" but no lines were given`);
-    return side.lines;
+    return { rows: side.lines };
   }
   if (side.kind === "statement") {
     if (side.file === undefined)
@@ -508,21 +520,35 @@ function loadSide(
     }
     // tool-money's parser, not a second one: it is the thing that refuses a
     // file whose dates could be day-first or month-first, and a reconciliation
-    // run on months guessed the wrong way balances to twice the error.
-    return [
-      ...parseStatement(readTextFile(at.real), {
-        dateOrder: side.dateOrder,
-        decimalComma: side.decimalComma,
-        decimals: side.decimals,
-      }).transactions,
-    ];
+    // run on months guessed the wrong way balances to twice the error. It
+    // holds one row past the side limit, so an over-long file is refused by
+    // its true count without every row of it in memory first.
+    const parsed = parseStatement(readTextFile(at.real), {
+      dateOrder: side.dateOrder,
+      decimalComma: side.decimalComma,
+      decimals: side.decimals,
+      keep: { transactions: RECONCILE_LIMITS.rowsPerSide + 1, rejected: UNREADABLE_ROWS_SHOWN },
+    });
+    if (parsed.count > RECONCILE_LIMITS.rowsPerSide) {
+      throw new LedgerError(
+        `the ${label} side has ${parsed.count} rows, over the ${RECONCILE_LIMITS.rowsPerSide} limit`,
+      );
+    }
+    // A row the parser could not read is not in the reconciliation, so it is
+    // named beside it rather than silently missing from both sides.
+    return {
+      rows: parsed.transactions,
+      ...(parsed.rejectedCount === 0
+        ? {}
+        : { unreadable: { count: parsed.rejectedCount, rows: parsed.rejected } }),
+    };
   }
   if (side.account === undefined) {
     throw new LedgerError(`${label}.kind is "ledger" but no account was given`);
   }
   const opened = open("LedgerReconcile", input, "read");
   try {
-    return ledgerAsTransactions(opened.db, side.account, side.from, side.to);
+    return { rows: ledgerAsTransactions(opened.db, side.account, side.from, side.to) };
   } finally {
     opened.db.close();
   }
@@ -659,23 +685,35 @@ export const ledgerReconcile: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const currency = (input.currency ?? "USD").toUpperCase();
-    const result = reconcile(
-      loadSide(input.left, "left", input),
-      loadSide(input.right, "right", input),
-      {
-        toleranceMinor: BigInt(input.toleranceMinor ?? 0),
-        windowDays: input.windowDays ?? 3,
-        allowManyToOne: input.allowManyToOne !== false,
-        maxSubsetSize: input.maxSubsetSize ?? 6,
-        maxCombinations: RECONCILE_LIMITS.maxCombinations,
-        feeToleranceMinor: BigInt(input.feeToleranceMinor ?? 0),
-        requireReferenceMatch: input.requireReferenceMatch === true,
-        exponent: exponentFor(currency, input.exponent),
-        currency,
-        propose: input.propose,
-      },
+    const left = loadSide(input.left, "left", input);
+    const right = loadSide(input.right, "right", input);
+    const result = reconcile(left.rows, right.rows, {
+      toleranceMinor: BigInt(input.toleranceMinor ?? 0),
+      windowDays: input.windowDays ?? 3,
+      allowManyToOne: input.allowManyToOne !== false,
+      maxSubsetSize: input.maxSubsetSize ?? 6,
+      maxCombinations: RECONCILE_LIMITS.maxCombinations,
+      feeToleranceMinor: BigInt(input.feeToleranceMinor ?? 0),
+      requireReferenceMatch: input.requireReferenceMatch === true,
+      exponent: exponentFor(currency, input.exponent),
+      currency,
+      propose: input.propose,
+    });
+    const unreadable = {
+      ...(left.unreadable === undefined ? {} : { left: left.unreadable }),
+      ...(right.unreadable === undefined ? {} : { right: right.unreadable }),
+    };
+    return json(
+      Object.keys(unreadable).length === 0
+        ? result
+        : {
+            ...result,
+            // Statement rows that could not be read, and so are in neither
+            // the matched nor the unmatched lists: the reconciliation does
+            // not cover them.
+            unreadableStatementRows: unreadable,
+          },
     );
-    return json(result);
   },
 });
 

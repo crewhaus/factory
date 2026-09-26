@@ -488,8 +488,14 @@ export const statementParse: RegisteredTool = buildTool({
     if (size > LIMITS.statementBytes) {
       throw new Error(`${at.rel} is ${size} bytes, over the ${LIMITS.statementBytes}-byte limit`);
     }
-    const result = parseStatement(readFileSync(at.real, "utf-8"), input);
     const limit = input.limit ?? 500;
+    // Only what is returned is held: the counts and the totals still cover
+    // every row, but a file of a million unreadable blocks is not a million
+    // objects in memory on the way to showing five hundred of them.
+    const result = parseStatement(readFileSync(at.real, "utf-8"), {
+      ...input,
+      keep: { transactions: limit, rejected: limit },
+    });
     return json({
       file: at.rel,
       format: result.format,
@@ -498,12 +504,14 @@ export const statementParse: RegisteredTool = buildTool({
       totalMinor: result.totalMinor,
       debitMinor: result.debitMinor,
       creditMinor: result.creditMinor,
+      // Set, with the reason, when a total is past what a number holds exactly.
+      ...(result.totalsUnavailable === null ? {} : { totalsUnavailable: result.totalsUnavailable }),
       // Capped like the transactions: a file of nothing but unreadable rows
       // would otherwise come back as one reason per row, whatever its size.
-      rejected: result.rejected.slice(0, limit),
-      rejectedCount: result.rejected.length,
-      rejectedTruncated: result.rejected.length > limit,
-      transactions: result.transactions.slice(0, limit),
+      rejected: result.rejected,
+      rejectedCount: result.rejectedCount,
+      rejectedTruncated: result.rejectedCount > limit,
+      transactions: result.transactions,
       truncated: result.count > limit,
     });
   },

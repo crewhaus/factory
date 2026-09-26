@@ -10,6 +10,7 @@ import { createHmac } from "node:crypto";
 import { allocateProportional, computeRefund } from "./lib/allocate";
 import { codeLines } from "./lib/coding";
 import { checkSpendLimit, refundAbuseSignals } from "./lib/controls";
+import { InexactAmountError } from "./lib/exact";
 import {
   detectKind,
   luhnOk,
@@ -834,6 +835,85 @@ describe("statement parsing", () => {
 
   test("the CSV reader handles a trailing newline and blank lines", () => {
     expect(parseCsvRows("a,b\n1,2\n\n").length).toBe(2);
+  });
+
+  test("an amount past 2^53 − 1 minor units is refused, not rounded (C218)", () => {
+    expect(parseMoneyMinor("90071992547409.91", 2, false)).toBe(Number.MAX_SAFE_INTEGER);
+    expect(parseMoneyMinor("-90071992547409.91", 2, false)).toBe(-Number.MAX_SAFE_INTEGER);
+    expect(parseMoneyMinor("0000000000000000000001.00", 2, false)).toBe(100);
+    // 9007199254740993 cents: 0.7.1's first cut read it as ...992.
+    expect(() => parseMoneyMinor("90071992547409.93", 2, false)).toThrow(InexactAmountError);
+    expect(() => parseMoneyMinor("90,071,992,547,409.92", 2, false)).toThrow(
+      /"90,071,992,547,409.92" is more than 2\^53 − 1 \(9007199254740991\) minor units/,
+    );
+    // A megabyte of digits is refused by its length, and not echoed back.
+    const huge = "9".repeat(1_000_000);
+    expect(() => parseMoneyMinor(huge, 2, false)).toThrow(/^"9{40}…" is more than/);
+  });
+
+  test("a row whose amount is past 2^53 − 1 is rejected by name, in OFX and CSV (C218)", () => {
+    const ofx = parseStatement(
+      "<OFX>\n<STMTTRN><DTPOSTED>20240101<TRNAMT>90071992547409.93<FITID>A</STMTTRN>\n<STMTTRN><DTPOSTED>20240102<TRNAMT>1.00<FITID>B</STMTTRN>\n",
+    );
+    expect(ofx.transactions.map((t) => t.id)).toEqual(["B"]);
+    expect(ofx.rejectedCount).toBe(1);
+    expect(ofx.rejected[0]?.row).toBe(1);
+    expect(ofx.rejected[0]?.reason).toStartWith(
+      'the amount "90071992547409.93" is more than 2^53 − 1',
+    );
+    const csv = parseStatement(
+      "Date,Amount,Balance\n2024-01-01,1.00,90071992547409.93\n2024-01-02,2.00,3.00\n",
+    );
+    expect(csv.transactions.map((t) => t.amountMinor)).toEqual([200]);
+    expect(csv.rejected).toEqual([
+      {
+        row: 2,
+        reason:
+          'the balance "90071992547409.93" is more than 2^53 − 1 (9007199254740991) minor units, the largest amount this reads exactly, so it is left out rather than rounded',
+      },
+    ]);
+  });
+
+  test("a total that crosses 2^53 − 1 is left out by name, not rounded (C218)", () => {
+    const result = parseStatement(
+      "Date,Amount\n2024-01-01,90071992547409.91\n2024-01-02,0.01\n2024-01-03,0.01\n2024-01-04,-5.00\n",
+    );
+    expect(result.transactions.map((t) => t.amountMinor)).toEqual([
+      Number.MAX_SAFE_INTEGER,
+      1,
+      1,
+      -500,
+    ]);
+    // The debit total fits and is reported; the other two do not.
+    expect(result.debitMinor).toBe(-500);
+    expect(result.creditMinor).toBeNull();
+    expect(result.totalMinor).toBe(Number.MAX_SAFE_INTEGER - 498);
+    expect(result.totalsUnavailable).toBe(
+      "the statement's credit total comes to 9007199254740993 minor units, past ±2^53 − 1 (9007199254740991), so it is left out rather than rounded; every transaction's own amount is exact",
+    );
+    const fits = parseStatement("Date,Amount\n2024-01-01,1.00\n2024-01-02,-0.25\n");
+    expect([fits.totalMinor, fits.debitMinor, fits.creditMinor]).toEqual([75, -25, 100]);
+    expect(fits.totalsUnavailable).toBeNull();
+  });
+
+  test("keep holds only what will be shown; the counts and totals still cover every row (C092)", () => {
+    const blocks = 50_000;
+    const ofx = `<OFX>\n${"<STMTTRN>\n".repeat(blocks)}<STMTTRN><DTPOSTED>20240101<TRNAMT>1.00</STMTTRN><STMTTRN><DTPOSTED>20240102<TRNAMT>2.00</STMTTRN>`;
+    const result = parseStatement(ofx, { keep: { transactions: 1, rejected: 3 } });
+    expect(result.rejected.length).toBe(3);
+    expect(result.rejectedCount).toBe(blocks);
+    expect(result.transactions.map((t) => t.amountMinor)).toEqual([100]);
+    expect(result.count).toBe(2);
+    expect(result.totalMinor).toBe(300);
+    // Held in file order: the first rows, not a sample.
+    expect(result.rejected.map((r) => r.row)).toEqual([1, 2, 3]);
+    const csv = parseStatement("Date,Amount\n2024-01-01,1.00\nbad,2.00\n2024-01-03,4.00\n", {
+      keep: { transactions: 0, rejected: 0 },
+    });
+    expect([csv.transactions.length, csv.count, csv.rejected.length, csv.rejectedCount]).toEqual([
+      0, 2, 0, 1,
+    ]);
+    expect(csv.totalMinor).toBe(500);
   });
 });
 
