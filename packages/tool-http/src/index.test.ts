@@ -1585,10 +1585,10 @@ describe("DnsLookup / TlsInspect", () => {
     });
     _setDnsRecordResolver(undefined);
     // The budget is spent by the first type, so the other five are never
-    // issued. Giving each type its own copy of the timeout — which is what a
-    // per-call `withTimeout` does — would instead have run all six, and the
-    // "whole lookup" deadline in the description would be six times what it
-    // says. The distinction is visible in WHICH error each type reports.
+    // issued. Giving each type its own copy of the timeout would instead have
+    // run all six, and the "whole lookup" deadline in the description would
+    // be six times what it says. The distinction is visible in WHICH error
+    // each type reports.
     expect(result.records).toEqual({});
     expect(Object.keys(result.errors).sort()).toEqual(["A", "AAAA", "CNAME", "MX", "NS", "TXT"]);
 
@@ -1645,6 +1645,81 @@ describe("DnsLookup / TlsInspect", () => {
         "the 1ms lookup budget elapsed before this record type was asked for",
       );
     }
+  });
+
+  test("DnsLookup keeps answers that arrive inside the budget, and one type's error does not stop the rest", async () => {
+    // Every other budget test spends the budget on the first type, so none of
+    // them would notice a deadline that fires at once, a race that drops the
+    // answer it won, or a loop that gives up after the first error.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (type === "A") return ["192.0.2.1"];
+      throw Object.assign(new Error(`no ${type} records`), { code: "ENODATA" });
+    });
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["MX", "A", "AAAA"],
+      timeoutMs: 2000,
+    }).finally(() => _setDnsRecordResolver(undefined));
+    expect(issued).toEqual(["A", "AAAA", "MX"]);
+    expect(result.records).toEqual({ A: ["192.0.2.1"] });
+    expect(result.errors).toEqual({ AAAA: "ENODATA", MX: "ENODATA" });
+  });
+
+  test("DnsLookup gives a type issued late only what is left of the budget", async () => {
+    // A answers at 100ms of a 150ms budget, and AAAA never answers. One shared
+    // budget ends the lookup at 150ms; a fresh budget per type would let AAAA
+    // run until 250ms. The sentinel at 200ms tells the two apart without
+    // reading a clock: timers in one heap fire in the order they fall due, so
+    // this holds however late a loaded runner services them.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      if (type !== "A") return await new Promise(() => {});
+      return await new Promise((resolve) => setTimeout(() => resolve(["192.0.2.1"]), 100));
+    });
+    let settled = false;
+    const pending = run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["A", "AAAA", "MX"],
+      timeoutMs: 150,
+    })
+      .then((r) => {
+        settled = true;
+        return r;
+      })
+      .finally(() => _setDnsRecordResolver(undefined));
+    const settledBySentinel = await new Promise<boolean>((resolve) =>
+      setTimeout(() => resolve(settled), 200),
+    );
+    const result = await pending;
+    expect(settledBySentinel).toBe(true);
+    expect(issued).toEqual(["A", "AAAA"]);
+    expect(result.records).toEqual({ A: ["192.0.2.1"] });
+    expect(result.errors).toEqual({
+      AAAA: "AAAA lookup exceeded the 150ms lookup budget",
+      MX: "the 150ms lookup budget elapsed before this record type was asked for",
+    });
+  });
+
+  test("DnsLookup asks for a repeated record type once", async () => {
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      return [`${type}-answer`];
+    });
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["MX", "A", "MX", "A"],
+    }).finally(() => _setDnsRecordResolver(undefined));
+    expect(issued).toEqual(["A", "MX"]);
+    expect(result.records).toEqual({ A: ["A-answer"], MX: ["MX-answer"] });
+    expect(result.errors).toBeUndefined();
   });
 
   test("TlsInspect refuses a host no allow-listed origin names", async () => {

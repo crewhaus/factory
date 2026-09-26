@@ -1631,7 +1631,9 @@ export const dnsLookup: RegisteredTool = buildTool({
     const errors: Record<string, string> = {};
 
     try {
-      for (const type of [...wanted].sort(byString)) {
+      // Each type once: a repeat would be looked up again and overwrite its
+      // own answer, and could land in `records` and `errors` both.
+      for (const type of [...new Set(wanted)].sort(byString)) {
         if (deadline.signal.aborted) {
           errors[type] =
             `the ${budget}ms lookup budget elapsed before this record type was asked for`;
