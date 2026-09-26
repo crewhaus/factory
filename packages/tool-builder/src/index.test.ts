@@ -13,7 +13,7 @@ const echoDef: ToolDefinition<EchoInput> = {
   execute: async (input) => input.message,
 };
 
-describe("buildTool — fail-closed defaults", () => {
+describe("buildTool — defaults for unset flags", () => {
   test("concurrencySafe defaults to false", () => {
     const tool = buildTool(echoDef);
     expect(tool.concurrencySafe).toBe(false);
@@ -53,7 +53,7 @@ describe("buildTool — fail-closed defaults", () => {
     expect(tool.destructive).toBe(false);
   });
 
-  test("requiresSandbox defaults to false (fail-closed)", () => {
+  test("requiresSandbox defaults to false (the sandbox floor is opt-in)", () => {
     const tool = buildTool(echoDef);
     expect(tool.requiresSandbox).toBe(false);
   });
@@ -73,7 +73,7 @@ describe("buildTool — fail-closed defaults", () => {
     expect(tool.classifyOutput).toBe(false);
   });
 
-  test("scope defaults to 'internal' (Pillar 3 sink-side, fail-closed)", () => {
+  test("scope defaults to 'internal' (Pillar 3 sink-side: not scanned)", () => {
     const tool = buildTool(echoDef);
     expect(tool.scope).toBe("internal");
   });
@@ -83,7 +83,7 @@ describe("buildTool — fail-closed defaults", () => {
     expect(tool.scope).toBe("external");
   });
 
-  test("requireJustification defaults to false (Pillar 3 intent gate, fail-closed)", () => {
+  test("requireJustification defaults to false (Pillar 3 intent gate is opt-in)", () => {
     const tool = buildTool(echoDef);
     expect(tool.requireJustification).toBe(false);
   });
@@ -116,7 +116,7 @@ describe("buildTool — fail-closed defaults", () => {
     // ioCapability is the *fact*; scope is the *policy*. buildTool does not
     // infer scope from ioCapability — the compile-time audit is what couples
     // them. A custom io-capable tool that forgets scope still defaults to
-    // "internal" here (fail-closed), which is exactly what --strict then flags.
+    // "internal" here (unscanned), which is exactly what --strict then flags.
     const tool = buildTool({ ...echoDef, name: "CustomSocket", ioCapability: "network" });
     expect(tool.scope).toBe("internal");
   });
@@ -216,7 +216,7 @@ describe("auditToolScopes — FR-002 pure scope gate", () => {
   // auditToolScopes reads `.name`, `.scope`, and `.ioCapability` only; minimal
   // doubles let us express the exact triples under audit — including the
   // dangerous "outward name / io-capable but forced internal" cases that the
-  // fail-closed buildTool default plus an explicit scope override can produce.
+  // "internal" buildTool default plus an explicit scope override can produce.
   function mkTool(
     name: string,
     scope: "internal" | "external",

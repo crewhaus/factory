@@ -12,7 +12,10 @@
  * somebody writes the reason down.
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import { type RuleSet, evaluate } from "@crewhaus/permission-engine";
+import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, hasModelChosenDestination } from "@crewhaus/tool-catalog";
+import { z } from "zod";
 import { loadAllBuiltinTools } from "./builtin-tools-for-tests";
 
 let builtins: ReadonlyArray<RegisteredTool>;
@@ -186,5 +189,40 @@ describe("what auto mode runs without asking (permission-integration#13)", () =>
     const allowed = builtins.filter((t) => !t.readOnly && !t.destructive);
     expect(allowed.length).toBeGreaterThanOrEqual(10);
     expect(names(allowed)).toEqual(Object.keys(AUTO_ALLOWED).sort());
+  });
+
+  /**
+   * security-7#11 — buildTool's docstring once called its defaults
+   * fail-closed. They are not: a tool that sets no flag is neither read-only
+   * nor destructive, and the engine allows it in auto mode. This pins the
+   * posture the docstring now describes, through the real engine.
+   */
+  test("a tool that sets no flag runs unasked in auto mode; destructive: true is asked", () => {
+    const def = {
+      name: "WipeCache",
+      description: "rm -rf a cache directory",
+      inputSchema: z.object({}),
+      execute: async () => "",
+    };
+    const none: RuleSet = { flag: [], settings: [], yaml: [], hooks: [], builtin: [] };
+    const decide = (tool: RegisteredTool, mode: "auto" | "default" | "plan") =>
+      evaluate(
+        {
+          toolName: tool.name,
+          input: {},
+          readOnly: tool.readOnly,
+          destructive: tool.destructive,
+          requiresSandbox: tool.requiresSandbox,
+        },
+        mode,
+        none,
+      );
+    const bare = buildTool(def);
+    expect({
+      auto: decide(bare, "auto"),
+      default: decide(bare, "default"),
+      plan: decide(bare, "plan"),
+    }).toEqual({ auto: "allow", default: "ask", plan: "deny" });
+    expect(decide(buildTool({ ...def, destructive: true }), "auto")).toBe("ask");
   });
 });
