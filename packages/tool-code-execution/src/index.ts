@@ -36,16 +36,22 @@ import { z } from "zod";
  *
  * Timeout: 60 s unless the operator's `default_timeout_ms` says otherwise.
  * The model may ask for its own `timeout` (up to 10 minutes) — unless the
- * operator sets `max_timeout_ms`, which caps every call, the model's and the
- * default alike; a serving candidate's tool_config may lower that cap, never
- * raise it (security-6#15).
+ * operator sets `max_timeout_ms`, which caps every call: the model's
+ * timeout, the default, and an injected sandbox's own default alike
+ * (security-6#15). A model pool candidate's block may lower the cap, never
+ * raise it, and — as every candidate block does since 0.6.0 — it applies
+ * per tool: under `python` it caps Python calls, under `codeExecution` all
+ * three, and compile warns when a candidate caps one of them while the
+ * others are listed. (At boot a block under any of those keys configures
+ * all three, because there is one registration.)
  *
  * `CREWHAUS_SANDBOX=noop` turns code execution OFF: the permission floor
  * denies these tools, and if a call reaches them anyway (bypass mode, or a
  * caller that told the loop a sandbox exists) they refuse rather than run
  * model code on the host. The in-process noop backend runs only when trusted
  * code chose it — `registerCodeExecutionConfig({ backend: "noop" })` or an
- * injected `sandbox` — which is how tests use it.
+ * injected `sandbox` — which is how tests use it. (Until 0.7.0 a test could
+ * set `CREWHAUS_SANDBOX=noop` instead; that now refuses.)
  *
  * Output is streamed line-by-line via `ctx.onStreamChunk` so runtime-core
  * can publish `tool_stream_chunk` trace events.
@@ -61,8 +67,9 @@ export type CodeExecutionConfig = {
   readonly defaultTimeoutMs?: number;
   /**
    * The longest timeout any call may run with, in ms. The model's `timeout`,
-   * the default and a serving candidate's default are all clamped to it.
-   * Unset: the model may ask for up to 600 000 (the input schema's limit).
+   * the default, a serving candidate's default and an injected sandbox's
+   * default are all clamped to it. Unset: the model may ask for up to
+   * 600 000 (the input schema's limit).
    */
   readonly maxTimeoutMs?: number;
   /** Optional warm pool size per language. Reserved for v1; v0 ignores. */
@@ -220,7 +227,7 @@ const codeSchema = z.object({
     .max(MODEL_TIMEOUT_LIMIT_MS)
     .optional()
     .describe(
-      "Milliseconds before the program is killed (default 60000, at most 600000). The operator may cap it lower.",
+      "Milliseconds before the program is killed, at most 600000. Omitted, the operator's default applies (60000 unless configured). The operator may cap it lower.",
     ),
 });
 
@@ -303,9 +310,10 @@ function readPositiveMs(override: unknown, camel: string, snake: string): number
  * (`max_timeout_ms`, lowered further by a candidate's own) bounds all of
  * them. With no cap configured anywhere this is exactly the 0.7.0 rule.
  *
- * `timeoutMs` undefined means "the sandbox's own default", which is only
- * left to the sandbox when no cap applies or that default is not known here
- * (an injected sandbox with no `default_timeout_ms` registered).
+ * `timeoutMs` undefined means "the sandbox's own default", which is left to
+ * the sandbox only when no cap applies. With a cap, the default is read from
+ * the config or the sandbox (`Sandbox.defaultTimeoutMs`); an injected
+ * sandbox that does not say its default runs such a call with the cap.
  */
 export function resolveEffectiveTimeout(
   input: { readonly timeout?: number },
@@ -320,9 +328,11 @@ export function resolveEffectiveTimeout(
   const cap = Math.min(...caps);
   const knownDefault =
     config.defaultTimeoutMs ??
-    (config.sandbox === undefined ? SANDBOX_DEFAULT_TIMEOUT_MS : undefined);
+    (config.sandbox === undefined ? SANDBOX_DEFAULT_TIMEOUT_MS : config.sandbox.defaultTimeoutMs);
   const base = requested ?? knownDefault;
-  if (base === undefined) return { timeoutMs: undefined };
+  // A default nobody can read here may be longer than the cap: the cap is
+  // the most the call may run, so it is the timeout.
+  if (base === undefined) return { timeoutMs: cap };
   if (base <= cap) return { timeoutMs: base };
   return {
     timeoutMs: cap,
@@ -347,7 +357,7 @@ function refuseEnvironmentNoop(sandbox: Sandbox, toolName: string): void {
   if (activeConfig.sandbox !== undefined || activeConfig.backend === "noop") return;
   throw new CrewhausError(
     "tool",
-    `${toolName} refused: CREWHAUS_SANDBOX=noop turns code execution off (the noop backend would run this code on the host with no isolation). Set CREWHAUS_SANDBOX=docker or podman to run it in a container.`,
+    `${toolName} refused: CREWHAUS_SANDBOX=noop turns code execution off (the noop backend would run this code on the host with no isolation). Set CREWHAUS_SANDBOX=docker or podman to run it in a container. A test that wants the in-process backend registers it instead: registerCodeExecutionConfig({ backend: "noop" }).`,
   );
 }
 

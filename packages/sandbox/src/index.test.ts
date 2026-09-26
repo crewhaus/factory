@@ -722,6 +722,16 @@ exit 125
     ]);
   }, 20_000);
 
+  test("a sandbox says the default timeout a call without one runs with", () => {
+    expect(createSandbox({ backend: "docker" }).defaultTimeoutMs).toBe(60_000);
+    expect(createSandbox({ backend: "podman", defaultTimeoutMs: 5_000 }).defaultTimeoutMs).toBe(
+      5_000,
+    );
+    expect(createSandbox({ backend: "noop", defaultTimeoutMs: 7_000 }).defaultTimeoutMs).toBe(
+      7_000,
+    );
+  });
+
   // C012: the timeout and the abort live in the host. A host that went away
   // mid-run — process.exit, a SIGINT or SIGTERM it does not handle, a second
   // Ctrl-C right after the first one's abort — left the container running

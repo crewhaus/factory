@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Sandbox, SandboxExecOptions, SandboxExecResult } from "@crewhaus/sandbox";
+import {
+  type Sandbox,
+  type SandboxExecOptions,
+  type SandboxExecResult,
+  createSandbox,
+} from "@crewhaus/sandbox";
 import {
   _resetCodeExecutionConfig,
   allCodeExecutionTools,
@@ -16,8 +21,10 @@ class StubSandbox implements Sandbox {
   readonly backend = "noop" as const;
   readonly calls: SandboxExecOptions[] = [];
   result: Partial<SandboxExecResult> = {};
-  constructor(opts: Partial<SandboxExecResult> = {}) {
+  readonly defaultTimeoutMs: number | undefined;
+  constructor(opts: Partial<SandboxExecResult> = {}, defaultTimeoutMs?: number) {
     this.result = opts;
+    this.defaultTimeoutMs = defaultTimeoutMs;
   }
   async exec(opts: SandboxExecOptions): Promise<SandboxExecResult> {
     this.calls.push(opts);
@@ -271,9 +278,13 @@ describe("CREWHAUS_SANDBOX=noop turns code execution off", () => {
         const marker = join(dir, "ran");
         process.env["CREWHAUS_SANDBOX"] = value;
         registerCodeExecutionConfig({});
-        await expect(shell.execute({ code: `touch ${marker}` })).rejects.toThrow(
+        const refusal = shell.execute({ code: `touch ${marker}` });
+        await expect(refusal).rejects.toThrow(
           /Shell refused: CREWHAUS_SANDBOX=noop turns code execution off/,
         );
+        // A test suite that set the variable to run code in-process (0.7.0
+        // allowed it) is told what to do instead.
+        await expect(refusal).rejects.toThrow('registerCodeExecutionConfig({ backend: "noop" })');
         expect(existsSync(marker)).toBe(false);
       } finally {
         rmSync(dir, { recursive: true, force: true });
@@ -374,4 +385,58 @@ describe("max_timeout_ms caps every call", () => {
     ).shape;
     expect(shape["timeout"]?.description).toContain("The operator may cap it lower.");
   });
+
+  // The description said "default 60000" whatever default_timeout_ms was set
+  // to, so a model could plan on 60 s and be killed at 5.
+  test("the model is not promised a default the operator may have changed", () => {
+    for (const tool of allCodeExecutionTools) {
+      const shape = (
+        tool.inputSchema as unknown as { shape: Record<string, { description?: string }> }
+      ).shape;
+      const description = shape["timeout"]?.description ?? "";
+      expect({ tool: tool.name, fixedDefault: /\(default \d+/.test(description) }).toEqual({
+        tool: tool.name,
+        fixedDefault: false,
+      });
+      expect(description).toContain("the operator's default applies (60000 unless configured)");
+    }
+  });
+
+  // An injected sandbox's own default (60 s for the built-in backends) ran a
+  // call with no timeout of its own past the cap: a 500 ms cap let `sleep 2`
+  // finish after 2 s.
+  test("a call with no timeout on an injected sandbox is capped at the sandbox's own default", async () => {
+    const stub = new StubSandbox({}, 60_000);
+    registerCodeExecutionConfig({ sandbox: stub, max_timeout_ms: 500 });
+    await shell.execute({ code: "x" });
+    expect(stub.calls[0]?.timeoutMs).toBe(500);
+  });
+
+  test("an injected sandbox whose default is under the cap keeps it", async () => {
+    const stub = new StubSandbox({}, 200);
+    registerCodeExecutionConfig({ sandbox: stub, max_timeout_ms: 500 });
+    await shell.execute({ code: "x" });
+    expect(stub.calls[0]?.timeoutMs).toBe(200);
+  });
+
+  test("an injected sandbox that does not say its default runs a capped call at the cap", async () => {
+    const stub = new StubSandbox({});
+    registerCodeExecutionConfig({ sandbox: stub, max_timeout_ms: 500 });
+    await shell.execute({ code: "x" });
+    expect(stub.calls[0]?.timeoutMs).toBe(500);
+  });
+
+  test.if(process.platform !== "win32")(
+    "a real injected sandbox: sleep 5 under a 500 ms cap is stopped by the cap",
+    async () => {
+      registerCodeExecutionConfig({
+        sandbox: createSandbox({ backend: "noop" }),
+        max_timeout_ms: 500,
+      });
+      const out = String(await shell.execute({ code: "sleep 5; echo done" }));
+      expect(out).not.toContain("done");
+      expect(out).toMatch(/^\[exit\] -?\d+ \(timed out after \d+ms\)$/);
+    },
+    20_000,
+  );
 });
