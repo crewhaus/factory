@@ -124,6 +124,7 @@ export {
   rowsToJsonl,
 } from "./export";
 export { ReportError } from "./errors";
+export { jsonSyntaxProblem } from "./json-problem";
 export {
   BASELINE_KEY_V2_PREFIX,
   BASELINES_FILENAME,

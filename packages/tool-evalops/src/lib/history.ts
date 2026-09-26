@@ -29,6 +29,7 @@ import {
   INDEX_FILENAME,
   type RunIndexEntry,
   baselineKeyFor,
+  jsonSyntaxProblem,
   latestRunIndexEntries,
   lineageOfEntry,
   parseRunIndex,
@@ -275,12 +276,12 @@ export function readPins(dir: SafePath, dirRel: string): Loaded<BaselinesRead> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(read.value.text);
-  } catch {
+  } catch (err) {
     // A malformed pin file is NOT "no baseline is pinned": every gate that
     // reads it is currently broken, and saying "none" here would hide that.
     return fail(
       "malformed",
-      `"${shown}" could not be parsed (it is not valid JSON) — the pins cannot be read, which is not the same as none being pinned`,
+      `"${shown}" could not be parsed (it is not valid JSON: ${jsonSyntaxProblem(err)}) — the pins cannot be read, which is not the same as none being pinned`,
     );
   }
   if (!isBaselinesMap(parsed)) {

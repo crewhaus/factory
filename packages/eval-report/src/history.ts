@@ -40,6 +40,7 @@ import {
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 import { ReportError } from "./errors";
+import { jsonSyntaxProblem } from "./json-problem";
 
 /** Default location of the run index + baselines, relative to the cwd. */
 export const DEFAULT_EVALS_DIR = join(".crewhaus", "evals");
@@ -725,13 +726,22 @@ function baselinesForUpdate(evalsDir: string): BaselinesFile {
       reason: `"${BASELINES_FILENAME}" is over ${BASELINES_MAX_BYTES} bytes`,
     });
   }
-  const parsed = parseBaselines(read.text);
-  if (parsed === undefined) {
+  let json: unknown;
+  try {
+    json = JSON.parse(read.text);
+  } catch (err) {
+    // The leaf is contained, so this is workspace text; the parser's words
+    // are kept and the token it quotes is not (see jsonSyntaxProblem).
+    throw new ReportError(
+      `${BASELINES_FILENAME} is not valid JSON (${jsonSyntaxProblem(err)}) — refusing to write over it`,
+    );
+  }
+  if (typeof json !== "object" || json === null || Array.isArray(json)) {
     throw new ReportError(
       `${BASELINES_FILENAME} is not a JSON object map of pins — refusing to write over it`,
     );
   }
-  return parsed;
+  return json as BaselinesFile;
 }
 
 /**

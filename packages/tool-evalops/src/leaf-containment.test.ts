@@ -177,8 +177,14 @@ describe("the read side follows no link out of the workspace", () => {
     writeFileSync(join(runDir, "results.json"), `${TOKEN} not json`);
     const { out, raw } = await call(evalAggregate, { run: "runs/r3" });
     expect(out["code"]).toBe("malformed");
-    expect(String(out["error"])).toMatch(/runs\/r3\/results\.json" is not valid JSON/);
+    expect(String(out["error"])).toMatch(
+      /runs\/r3\/results\.json" is not valid JSON \(Unexpected identifier\)$/,
+    );
     expect(raw).not.toContain(TOKEN);
+    // A truncated file says what the parser saw, as 0.7.0 did.
+    writeFileSync(join(runDir, "results.json"), '{"samples": [');
+    const truncated = await call(evalAggregate, { run: "runs/r3" });
+    expect(String(truncated.out["error"])).toMatch(/is not valid JSON \(Unexpected EOF\)$/);
   });
 
   // In a child process: a regression here BLOCKS on the FIFO, and a blocked

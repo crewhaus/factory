@@ -21,6 +21,7 @@
  *     pass@k over a handful of samples is exactly where that matters.
  */
 import { statSync } from "node:fs";
+import { jsonSyntaxProblem } from "@crewhaus/eval-report";
 import type { EvalAggregates, EvalRunSummary, SampleResult } from "@crewhaus/eval-runner";
 import { aggregate } from "@crewhaus/eval-runner";
 import { statsKernel } from "@crewhaus/tool-math";
@@ -82,9 +83,12 @@ export function readRunDoc(toolName: string, rel: string, maxBytes: number): Loa
   let parsed: unknown;
   try {
     parsed = JSON.parse(read.value.text);
-  } catch {
-    // Not the parser's message: it quotes the file's first token.
-    return fail("malformed", `"${renderPath(shown)}" is not valid JSON`);
+  } catch (err) {
+    // The parser's words, never the token it quotes (jsonSyntaxProblem).
+    return fail(
+      "malformed",
+      `"${renderPath(shown)}" is not valid JSON (${jsonSyntaxProblem(err)})`,
+    );
   }
   if (!isRecord(parsed)) {
     return fail("malformed", `"${renderPath(shown)}" is not a JSON object`);

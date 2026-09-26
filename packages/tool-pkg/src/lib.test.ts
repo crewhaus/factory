@@ -11,6 +11,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
+import { jsonSyntaxProblem } from "./lib/json-problem";
 import { declaredLicense, isDisjunctive, splitExpression, summarize } from "./lib/license";
 import { classifyBump, diffLocks } from "./lib/lockdiff";
 import { entryPoints, preflight, wouldInclude } from "./lib/preflight";
@@ -487,5 +488,26 @@ describe("listTar, against archives real tools produced", () => {
     const listing = listTar(new Uint8Array(readFileSync(join(dir, "real.tgz"))), { maxEntries: 2 });
     expect(listing.capped).toBe(true);
     expect(listing.entries).toHaveLength(2);
+  });
+});
+
+describe("jsonSyntaxProblem", () => {
+  test("keeps the parser's words and drops everything it quotes", () => {
+    const problem = (text: string): string => {
+      try {
+        JSON.parse(text);
+      } catch (err) {
+        return jsonSyntaxProblem(err);
+      }
+      return "parsed";
+    };
+    expect(["", '{"a": 1,}', "secretword"].map(problem)).toEqual([
+      "Unexpected EOF",
+      "Property name must be a string literal",
+      "Unexpected identifier",
+    ]);
+    expect(
+      jsonSyntaxProblem(new SyntaxError(`Unexpected token 's', "secretword" is not valid JSON`)),
+    ).toBe("Unexpected token 's'");
   });
 });

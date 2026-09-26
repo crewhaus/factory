@@ -43,6 +43,7 @@ import {
   readRunIndexLatest,
   setBaseline,
 } from "./history";
+import { jsonSyntaxProblem } from "./json-problem";
 
 const ROOTS: string[] = [];
 function tmp(prefix: string): string {
@@ -334,5 +335,45 @@ describe("the text-level readers agree with the path readers", () => {
     expect(
       lookupBaseline(parsed ?? {}, { specName: "concierge", datasetName: "smoke" }).entry?.runId,
     ).toBe("run_a");
+  });
+});
+
+describe("a baselines.json that does not parse is named with the parser's words, not its text", () => {
+  test("a token in the file is not quoted; what is wrong with it is", () => {
+    const { evalsDir } = layout();
+    const token = ["gh", "p_", "LEAKTEST".repeat(4)].join("");
+    writeFileSync(join(evalsDir, BASELINES_FILENAME), `${token}\n`);
+    let message = "";
+    try {
+      setBaseline(pin("run_a"), evalsDir);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("baselines.json is not valid JSON (Unexpected identifier)");
+    expect(message).not.toContain(token);
+    expect(readFileSync(join(evalsDir, BASELINES_FILENAME), "utf8")).toBe(`${token}\n`);
+  });
+
+  test("jsonSyntaxProblem keeps the parser's words and drops everything it quotes", () => {
+    const problem = (text: string): string => {
+      try {
+        JSON.parse(text);
+      } catch (err) {
+        return jsonSyntaxProblem(err);
+      }
+      return "parsed";
+    };
+    expect(["", '{"a": 1', '{"a": 1,}', "secretword", "{'a':1}"].map(problem)).toEqual([
+      "Unexpected EOF",
+      "Expected '}'",
+      "Property name must be a string literal",
+      "Unexpected identifier",
+      "Single quotes (') are not allowed in JSON",
+    ]);
+    // A V8-shaped message: the quoted slice of the input goes.
+    expect(
+      jsonSyntaxProblem(new SyntaxError(`Unexpected token 's', "secretword" is not valid JSON`)),
+    ).toBe("Unexpected token 's'");
+    expect(jsonSyntaxProblem("not an error")).toBe("a syntax error");
   });
 });

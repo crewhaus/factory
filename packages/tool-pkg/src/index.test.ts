@@ -537,7 +537,13 @@ describe("a package.json linked out of the workspace", () => {
   test("a malformed manifest inside the workspace is named without quoting it", async () => {
     writeFileSync(join(workspace, "package.json"), `${TOKEN} not json`);
     const out = await callRaw(packagePublishPreflight, {});
-    expect(out).toBe("package.json is not valid JSON");
+    // The parser's words stay; the token it quoted does not.
+    expect(out).toBe("package.json is not valid JSON (Unexpected identifier)");
+    // A trailing comma is named as what it is, as 0.7.0 named it.
+    writeFileSync(join(workspace, "package.json"), '{"name": "x",}');
+    expect(await callRaw(packagePublishPreflight, {})).toBe(
+      "package.json is not valid JSON (Property name must be a string literal)",
+    );
   });
 
   // In a child process: before the fix the read BLOCKED on the FIFO, and a

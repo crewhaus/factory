@@ -26,6 +26,7 @@ import {
   openForReadSync,
 } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
+import { jsonSyntaxProblem } from "./lib/json-problem";
 import { type LicenseFinding, declaredLicense, splitExpression, summarize } from "./lib/license";
 import { diffLocks } from "./lib/lockdiff";
 import { type PreflightProbe, preflight } from "./lib/preflight";
@@ -413,9 +414,9 @@ export const packagePublishPreflight: RegisteredTool = buildTool({
     let manifest: Record<string, unknown>;
     try {
       manifest = JSON.parse(new TextDecoder().decode(raw)) as Record<string, unknown>;
-    } catch {
-      // Not the parser's message: it quotes the file's first token.
-      return `${manifestRel} is not valid JSON`;
+    } catch (err) {
+      // The parser's words, never the token it quotes (jsonSyntaxProblem).
+      return `${manifestRel} is not valid JSON (${jsonSyntaxProblem(err)})`;
     }
 
     const probe: PreflightProbe = {
