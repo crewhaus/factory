@@ -1163,6 +1163,84 @@ describe("amounts are exact, or refused — never silently rounded (C218)", () =
     expect(result.remainingQuantity).toBe(0);
     expect(result.remainingCostMinor).toBe(0);
     expect(result.disposals.reduce((s, d) => s + d.costMinor, 0)).toBe(1001);
+    // Each take is the decimal asked for, not a binary remainder.
+    expect(result.disposals.map((d) => d.consumed[0]?.quantity)).toEqual(new Array(10).fill(0.1));
+  });
+
+  test("whole units left of a large lot stay open (a share-of-lot dust rule ate them)", () => {
+    const lot = {
+      id: "pepe-buy",
+      acquiredAt: "2024-01-01T00:00:00Z",
+      quantity: 10_000_000_000,
+      costMinor: 1_000_000,
+    };
+    const most = {
+      id: "sell-most",
+      disposedAt: "2024-03-01T00:00:00Z",
+      quantity: 9_999_999_995,
+      proceedsMinor: 2_000_000,
+    };
+    const after = computeCostBasis([lot], [most], "fifo");
+    expect(after.remainingQuantity).toBe(5);
+    expect(after.remainingLots).toEqual([
+      { id: "pepe-buy", acquiredAt: "2024-01-01T00:00:00Z", quantity: 5, costMinor: 0 },
+    ]);
+    const both = computeCostBasis(
+      [lot],
+      [
+        most,
+        { id: "sell-rest", disposedAt: "2024-04-01T00:00:00Z", quantity: 5, proceedsMinor: 1 },
+      ],
+      "fifo",
+    );
+    expect(both.disposals.map((d) => d.consumed.map((c) => c.quantity))).toEqual([
+      [9_999_999_995],
+      [5],
+    ]);
+    expect(both.remainingLots).toEqual([]);
+  });
+
+  test("a remaining quantity is exact where doubles are not, and a real shortfall is refused", () => {
+    // 0.1 + 0.2 lots, a disposal of 0.3: in doubles the second lot kept 2.8e-17.
+    const lots = [
+      { id: "a", acquiredAt: "2024-01-01T00:00:00Z", quantity: 0.1, costMinor: 100 },
+      { id: "b", acquiredAt: "2024-01-02T00:00:00Z", quantity: 0.2, costMinor: 200 },
+    ];
+    const exact = computeCostBasis(
+      lots,
+      [{ id: "d", disposedAt: "2024-02-01T00:00:00Z", quantity: 0.3, proceedsMinor: 0 }],
+      "fifo",
+    );
+    expect(exact.remainingLots).toEqual([]);
+    expect(exact.disposals[0]?.costMinor).toBe(300);
+    // A caller's own float sum is not a claim to more than was bought ...
+    const floatSum = computeCostBasis(
+      lots,
+      [{ id: "d", disposedAt: "2024-02-01T00:00:00Z", quantity: 0.1 + 0.2, proceedsMinor: 0 }],
+      "fifo",
+    );
+    expect(floatSum.remainingLots).toEqual([]);
+    // ... but a real shortfall is, and the message says what was open.
+    expect(() =>
+      computeCostBasis(
+        lots,
+        [{ id: "d", disposedAt: "2024-02-01T00:00:00Z", quantity: 0.3001, proceedsMinor: 0 }],
+        "fifo",
+      ),
+    ).toThrow('disposal "d" needs 0.3001 but only 0.3 was open');
+    // A take's cost is rounded from the exact share: 477981 × 0.0375 / 0.225 is
+    // 79663.5, which rounds up, where the double came to 79663.49999999999.
+    const tie = computeCostBasis(
+      [{ id: "l", acquiredAt: "2023-03-12T00:00:00Z", quantity: 0.3, costMinor: 637308 }],
+      [1, 2, 3].map((n) => ({
+        id: `d${n}`,
+        disposedAt: `2024-02-1${n}T00:00:00Z`,
+        quantity: 0.0375,
+        proceedsMinor: 0,
+      })),
+      "fifo",
+    );
+    expect(tie.disposals.map((d) => d.costMinor)).toEqual([79664, 79663, 79664]);
   });
 
   test("a refund's per-unit split is computed, not allocated unit by unit", () => {
