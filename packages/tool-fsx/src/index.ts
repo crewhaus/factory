@@ -1807,6 +1807,14 @@ function declaredBytes(entries: ReadonlyArray<ArchiveEntry>): number {
   return total;
 }
 
+/**
+ * `name (fifo)` for a member that would be made as a FIFO, device or
+ * socket; nothing for any other.
+ */
+function describeSpecial(entry: ArchiveEntry): string[] {
+  return entry.special === undefined ? [] : [`${entry.name} (${entry.special})`];
+}
+
 /** `name -> target (why)`, the form every link refusal takes. */
 function describeUnsafeLink(link: UnsafeLink): string {
   return link.linkTarget === ""
@@ -1837,6 +1845,7 @@ export const archiveList: RegisteredTool = buildTool({
     const sorted = [...read.entries].sort((a, b) => compareStrings(a.name, b.name));
     const unsafe = sorted.filter((entry) => archiveEntryEscapes(entry.name)).map((e) => e.name);
     const unsafeLinks = unsafeArchiveLinks(sorted).map(describeUnsafeLink);
+    const special = sorted.flatMap(describeSpecial);
     const limit = input.limit ?? 500;
     return json({
       path: target.rel,
@@ -1848,11 +1857,14 @@ export const archiveList: RegisteredTool = buildTool({
       truncated: sorted.length > limit,
       unsafeEntries: unsafe.slice(0, 50),
       unsafeLinks: unsafeLinks.slice(0, 50),
+      // FIFOs, devices and sockets: ArchiveExtract refuses an archive that has any.
+      ...(special.length > 0 ? { specialEntries: special.slice(0, 50) } : {}),
       entries: sorted.slice(0, limit).map((entry) => ({
         name: entry.name,
         kind: entry.kind,
         size: entry.size,
         ...(entry.linkTarget !== undefined ? { linkTarget: entry.linkTarget } : {}),
+        ...(entry.special !== undefined ? { special: entry.special } : {}),
       })),
     });
   },
@@ -2071,15 +2083,27 @@ export const archiveExtract: RegisteredTool = buildTool({
       }
     }
     for (const link of unsafeArchiveLinks(entries)) refusals.push(describeUnsafeLink(link));
-    if (refusals.length > 0) {
+    // A FIFO, device or socket member: tar makes a FIFO without privilege,
+    // and the next tool to open it (a table reader on `data.csv`) blocks
+    // until a writer appears. Refused here, so ArchiveList and dryRun show
+    // it, and again in the staged tree below in case an extractor makes one
+    // the index did not describe.
+    const special = entries.flatMap(describeSpecial);
+    if (refusals.length > 0 || special.length > 0) {
+      const all = [
+        ...refusals,
+        ...special.map((s) => `${s}: only files, directories and links are extracted`),
+      ];
       return json({
         extracted: false,
         reason: "unsafe archive",
         archive: archive.rel,
         detail:
-          "one or more members would be written outside the destination; nothing was extracted",
-        refused: refusals.slice(0, 50),
-        refusedCount: refusals.length,
+          refusals.length > 0
+            ? "one or more members would be written outside the destination; nothing was extracted"
+            : "one or more members are FIFOs, devices or sockets, which are never extracted; nothing was extracted",
+        refused: all.slice(0, 50),
+        refusedCount: all.length,
       });
     }
     if (totalBytes > maxBytes) {
@@ -2189,6 +2213,7 @@ export const archiveExtract: RegisteredTool = buildTool({
     if (
       scan.escaping.length > 0 ||
       scan.linkedOut.length > 0 ||
+      scan.special.length > 0 ||
       scan.incomplete ||
       unlisted.length > 0
     ) {
@@ -2202,10 +2227,12 @@ export const archiveExtract: RegisteredTool = buildTool({
             ? "the extracted tree contains symlinks pointing outside it; it was discarded"
             : scan.linkedOut.length > 0
               ? "the extracted tree contains files hard-linked to something outside it; it was discarded"
-              : unlisted.length > 0
-                ? "the extractor produced top-level entries the archive's index does not list; it was discarded"
-                : "the extracted tree could not be fully checked; it was discarded",
-        refused: [...scan.escaping, ...scan.linkedOut, ...unlisted].slice(0, 50),
+              : scan.special.length > 0
+                ? "the extracted tree contains FIFOs, devices or sockets, which are never extracted; it was discarded"
+                : unlisted.length > 0
+                  ? "the extractor produced top-level entries the archive's index does not list; it was discarded"
+                  : "the extracted tree could not be fully checked; it was discarded",
+        refused: [...scan.escaping, ...scan.linkedOut, ...scan.special, ...unlisted].slice(0, 50),
       });
     }
     if (scan.bytes > maxBytes || understated) {

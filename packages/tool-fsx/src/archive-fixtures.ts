@@ -18,8 +18,11 @@ import { deflateRawSync } from "node:zlib";
 export type FixtureEntry = {
   readonly name: string;
   readonly data?: string;
-  /** "file" (default), "dir", or "symlink"/"hardlink" (tar only) with `linkTarget`. */
-  readonly kind?: "file" | "dir" | "symlink" | "hardlink";
+  /**
+   * "file" (default), "dir", "symlink" (with `linkTarget`), "hardlink" (tar
+   * only, with `linkTarget`), or "fifo" (tar typeflag 6; a zip's unix mode).
+   */
+  readonly kind?: "file" | "dir" | "symlink" | "hardlink" | "fifo";
   readonly linkTarget?: string;
   /** zip only: store the data deflated (method 8) rather than stored. */
   readonly deflate?: boolean;
@@ -43,7 +46,9 @@ function tarHeader(entry: FixtureEntry, size: number): Buffer {
         ? "2"
         : entry.kind === "hardlink"
           ? "1"
-          : "0";
+          : entry.kind === "fifo"
+            ? "6"
+            : "0";
   block.write(entry.name.slice(0, 100), 0, "ascii");
   writeOctal(block, entry.kind === "dir" ? 0o755 : 0o644, 100, 8);
   writeOctal(block, 0, 108, 8);
@@ -141,7 +146,14 @@ export function buildZip(entries: ReadonlyArray<FixtureEntry>): Buffer {
     name.copy(local, 30);
     locals.push(local, stored);
 
-    const mode = entry.kind === "symlink" ? 0o120777 : isDir ? 0o040755 : 0o100644;
+    const mode =
+      entry.kind === "symlink"
+        ? 0o120777
+        : entry.kind === "fifo"
+          ? 0o010644
+          : isDir
+            ? 0o040755
+            : 0o100644;
     const central = Buffer.alloc(46 + name.length);
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(0x031e, 4); // made on unix

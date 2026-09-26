@@ -537,3 +537,77 @@ describe("the staged tree decides, whatever the index said", () => {
     },
   );
 });
+
+describe("a FIFO, device or socket member is never extracted (0.7.1 review)", () => {
+  // 0.7.1 before this listed `pkg/data.csv` as kind "other" with nothing
+  // flagged, dryRun found no problem, and the extraction promoted a real
+  // FIFO: the next tool to open data.csv blocked until a writer appeared.
+  const fifoTar = (): void => {
+    writeFileSync(
+      path.join(ws, "evil.tar"),
+      buildTar([
+        entry("pkg/README.md", { data: "hello" }),
+        entry("pkg/data.csv", { kind: "fifo" }),
+      ]),
+    );
+  };
+
+  test("ArchiveList flags it", async () => {
+    fifoTar();
+    const listed = await run(archiveList, { path: "evil.tar" });
+    expect(listed.specialEntries).toEqual(["pkg/data.csv (fifo)"]);
+    expect(listed.entries).toContainEqual({
+      name: "pkg/data.csv",
+      kind: "other",
+      size: 0,
+      special: "fifo",
+    });
+    expect(listed.unsafeEntries).toEqual([]);
+  });
+
+  test("an ordinary archive lists no specialEntries at all", async () => {
+    writeFileSync(path.join(ws, "plain.tar"), buildTar([entry("pkg/a.txt", { data: "A" })]));
+    expect("specialEntries" in (await run(archiveList, { path: "plain.tar" }))).toBe(false);
+  });
+
+  test("a zip whose unix mode says FIFO is flagged the same way", async () => {
+    writeFileSync(
+      path.join(ws, "evil.zip"),
+      buildZip([entry("pkg/a.txt", { data: "A" }), entry("pkg/pipe", { kind: "fifo" })]),
+    );
+    const listed = await run(archiveList, { path: "evil.zip" });
+    expect(listed.specialEntries).toEqual(["pkg/pipe (fifo)"]);
+  });
+
+  test("dryRun and the real call refuse it before anything is written", async () => {
+    fifoTar();
+    for (const dryRun of [true, false]) {
+      const result = await run(archiveExtract, { archive: "evil.tar", destination: "out", dryRun });
+      expect(result).toMatchObject({ extracted: false, reason: "unsafe archive", refusedCount: 1 });
+      expect(result.refused).toEqual([
+        "pkg/data.csv (fifo): only files, directories and links are extracted",
+      ]);
+    }
+    expect(existsSync(path.join(ws, "out"))).toBe(false);
+  });
+
+  test.if(hasTar)(
+    "one the extractor makes although the index did not list it is refused too",
+    async () => {
+      writeFileSync(path.join(ws, "plain.tar"), buildTar([entry("pkg/a.txt", { data: "A" })]));
+      if (Bun.spawnSync(["which", "mkfifo"]).exitCode !== 0) return;
+      _setExtractCommandForTest((argv, staging) => [
+        "sh",
+        "-c",
+        `"$@" && cd "${staging}" && mkfifo pkg/pipe`,
+        "sh",
+        ...argv,
+      ]);
+      const result = await run(archiveExtract, { archive: "plain.tar", destination: "dest" });
+      expect(result).toMatchObject({ extracted: false, reason: "unsafe archive" });
+      expect(result.detail).toContain("FIFOs, devices or sockets");
+      expect(result.refused).toEqual(["pkg/pipe (fifo)"]);
+      expect(existsSync(path.join(ws, "dest/pkg"))).toBe(false);
+    },
+  );
+});

@@ -18,12 +18,22 @@ import { gunzipSync } from "node:zlib";
 
 export type ArchiveEntryKind = "file" | "dir" | "symlink" | "hardlink" | "other";
 
+/** A member an extractor would create as something other than a file, directory or link. */
+export type ArchiveSpecialKind = "fifo" | "character-device" | "block-device" | "socket";
+
 export type ArchiveEntry = {
   readonly name: string;
   readonly size: number;
   readonly kind: ArchiveEntryKind;
   /** For a symlink or hard link member, the target recorded in the archive. */
   readonly linkTarget?: string;
+  /**
+   * Set when the member is a FIFO, device or socket. `tar` makes a FIFO
+   * member as a real FIFO (no privilege needed), and opening one blocks
+   * until a writer appears: a planted `data.csv` FIFO freezes the next tool
+   * that reads it.
+   */
+  readonly special?: ArchiveSpecialKind;
 };
 
 export class ArchiveFormatError extends Error {
@@ -64,6 +74,23 @@ function tarNumber(bytes: Uint8Array): number {
   if (text === "") return 0;
   const parsed = Number.parseInt(text, 8);
   return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function specialFromTypeflag(flag: string): ArchiveSpecialKind | undefined {
+  if (flag === "6") return "fifo";
+  if (flag === "3") return "character-device";
+  if (flag === "4") return "block-device";
+  return undefined;
+}
+
+/** The special kind a zip member's unix mode (the high half of its external attributes) names. */
+function specialFromUnixMode(mode: number): ArchiveSpecialKind | undefined {
+  const type = mode & 0xf000;
+  if (type === 0x1000) return "fifo";
+  if (type === 0x2000) return "character-device";
+  if (type === 0x6000) return "block-device";
+  if (type === 0xc000) return "socket";
+  return undefined;
 }
 
 function kindFromTypeflag(flag: string): ArchiveEntryKind {
@@ -171,11 +198,13 @@ export function readTarEntries(data: Uint8Array): ArchiveEntry[] {
       const name = pendingName ?? (prefix === "" ? shortName : `${prefix}/${shortName}`);
       const linkTarget = pendingLink ?? cString(header.subarray(157, 257));
       const kind = kindFromTypeflag(typeflag);
+      const special = specialFromTypeflag(typeflag);
       entries.push({
         name,
         size: kind === "dir" ? 0 : size,
         kind,
         ...(linkTarget !== "" ? { linkTarget } : {}),
+        ...(special !== undefined ? { special } : {}),
       });
       pendingName = undefined;
       pendingLink = undefined;
@@ -291,11 +320,13 @@ export function readZipEntries(data: Uint8Array): ArchiveEntry[] {
     const linkTarget = isSymlink
       ? readZipLinkTarget(data, view, localOffset, compressedSize, method)
       : undefined;
+    const special = specialFromUnixMode(unixMode);
     entries.push({
       name,
       size: kind === "dir" ? 0 : size,
       kind,
       ...(linkTarget !== undefined ? { linkTarget } : {}),
+      ...(special !== undefined ? { special } : {}),
     });
     offset = nameStart + nameLength + extraLength + commentLength;
   }

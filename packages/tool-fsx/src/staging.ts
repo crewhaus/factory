@@ -13,6 +13,9 @@
  *   - a regular file with more hard links than the staged tree holds names
  *     for has a name OUTSIDE it: an extractor talked into linking a file from
  *     elsewhere on the same filesystem;
+ *   - anything that is not a regular file, a directory or a link (a FIFO,
+ *     a socket, a device) is refused: opening a FIFO blocks until a writer
+ *     appears, so one planted as `data.csv` freezes the next tool to read it;
  *   - the bytes written are measured, each inode once, because a zip's
  *     declared sizes are not what `unzip` writes (a 65 KB archive whose
  *     headers both claim 1000 bytes wrote 64 MiB).
@@ -34,6 +37,12 @@ export type StagingScan = {
   readonly escaping: string[];
   /** Regular files that also have a name outside the staged tree. */
   readonly linkedOut: string[];
+  /**
+   * Entries that are neither a regular file, a directory nor a link: a FIFO,
+   * a socket or a device, `name (kind)`. Refused, never promoted: opening a
+   * FIFO blocks until a writer appears.
+   */
+  readonly special: string[];
   /** Apparent bytes of regular files, each inode counted once. */
   readonly bytes: number;
   /**
@@ -54,9 +63,10 @@ export function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): Stag
     maxDepth: STAGING_MAX_DEPTH,
     maxVisited: budget + 1,
   });
-  if (!walked.ok) return { escaping: [], linkedOut: [], bytes: 0, incomplete: true };
+  if (!walked.ok) return { escaping: [], linkedOut: [], special: [], bytes: 0, incomplete: true };
   let incomplete = walked.truncated || walked.unreadable.length > 0;
   const escaping: string[] = [];
+  const special: string[] = [];
   const inodes = new Map<string, { names: number; nlink: number; size: number; rel: string }>();
   for (const entry of walked.entries) {
     if (entry.kind === "symlink") {
@@ -65,7 +75,10 @@ export function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): Stag
       }
       continue;
     }
-    if (entry.kind !== "file") continue;
+    if (entry.kind !== "file") {
+      if (entry.kind !== "directory") special.push(`${entry.rel} (${entry.kind})`);
+      continue;
+    }
     let stats: ReturnType<typeof lstatSync>;
     try {
       stats = lstatSync(entry.real);
@@ -88,7 +101,13 @@ export function scanStagedTree(root: string, budget = STAGING_SCAN_BUDGET): Stag
     if (inode.nlink > inode.names) linkedOut.push(inode.rel);
   }
   const sort = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
-  return { escaping: escaping.sort(sort), linkedOut: linkedOut.sort(sort), bytes, incomplete };
+  return {
+    escaping: escaping.sort(sort),
+    linkedOut: linkedOut.sort(sort),
+    special: special.sort(sort),
+    bytes,
+    incomplete,
+  };
 }
 
 /**
