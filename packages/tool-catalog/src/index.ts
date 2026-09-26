@@ -331,9 +331,12 @@ export interface ToolDefinition<TInput = unknown> {
    * that acts only inside the workspace (Write, RemovePath, Bash) is not
    * required to: the permission gate already asks, and without an LLM judge
    * a justification fails closed in production, so gating every write would
-   * stop every write. apps/cli/src/flag-rules.test.ts holds the rule over
-   * every builtin and lists the gated set, so a change either way is
-   * deliberate.
+   * stop every write. That includes workspace loss that cannot be undone
+   * (RemovePath with `recursive`, GitWorktreeRemove and GitBranchDelete with
+   * `force`) and standing automation (HooksManage): reviewed and left ungated
+   * in 0.7.x, and an 0.8 decision. apps/cli/src/flag-rules.test.ts holds the
+   * rule over every builtin and lists the gated set and those four, so a
+   * change either way is deliberate.
    */
   requireJustification?: boolean;
   /**

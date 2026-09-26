@@ -104,6 +104,42 @@ describe("requireJustification (permission-integration#11)", () => {
   test("the gated set is exactly the reviewed one", () => {
     expect(names(builtins.filter((t) => t.requireJustification))).toEqual(JUSTIFICATION_GATED);
   });
+
+  /**
+   * Destructive tools whose loss cannot be undone from inside the workspace,
+   * or that install standing automation, but which the rule does not reach
+   * because they act in the workspace. Reviewed for 0.7.1 and deliberately
+   * left ungated — the permission gate asks for each of them, and gating
+   * them would deny every call on a harness without an LLM judge. Whether
+   * they join the gated set is an 0.8 decision (permission-integration#11).
+   */
+  const UNGATED_FOR_NOW: Readonly<Record<string, string>> = {
+    GitBranchDelete: "force deletes an unmerged branch",
+    GitWorktreeRemove: "force discards a worktree's uncommitted work",
+    HooksManage: "writes argv the supervisor later runs, like the gated CronDelete's schedules",
+    RemovePath: "recursive unlinks a tree rather than moving it to the trash",
+  };
+
+  test("the reviewed irreversible workspace tools stay destructive and ungated", () => {
+    const byName = new Map(builtins.map((t) => [t.name, t]));
+    const got = Object.keys(UNGATED_FOR_NOW).map((name) => {
+      const t = byName.get(name);
+      return {
+        name,
+        destructive: t?.destructive,
+        gated: t?.requireJustification,
+        ruleApplies: t !== undefined && hasModelChosenDestination(t),
+      };
+    });
+    expect(got).toEqual(
+      Object.keys(UNGATED_FOR_NOW).map((name) => ({
+        name,
+        destructive: true,
+        gated: false,
+        ruleApplies: false,
+      })),
+    );
+  });
 });
 
 describe("readOnly (permission-integration#7)", () => {
