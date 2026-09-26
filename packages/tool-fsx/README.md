@@ -53,9 +53,11 @@ planned before a byte is written, an existing symlink anywhere under the
 destination is refused (even one that stays inside the workspace, as GNU
 `cp -R` refuses to merge a directory into a link), a file never replaces a
 directory, and FIFOs, sockets and devices in the source are refused. Links
-are copied as links, and only when they still lead inside the workspace from
-where the copy puts them. `MovePath` judges every link in the tree from its new
-place before it renames anything, so `a/b/up -> ../..` cannot be moved one
+are copied as links, and only when, from where the copy puts them, they lead
+inside the workspace or exactly where the original leads (an absolute link
+out, such as a virtualenv's interpreter, reaches nothing new and is listed in
+the result's `outsideLinks`). `MovePath` judges every link in the tree from its
+new place before it renames anything, so `a/b/up -> ../..` cannot be moved one
 level up to point out of the workspace. `SplitFile` and `ConcatFiles` write
 each file through a temp created with `O_EXCL|O_NOFOLLOW` and renamed into
 place, and refuse a part or destination name that is a symlink, with or

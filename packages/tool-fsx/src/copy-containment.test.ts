@@ -188,6 +188,77 @@ describe("the verifiers' C068 cases, as they wrote them", () => {
   });
 });
 
+describe("a link that leads out exactly where it did adds no reach, so it copies and moves as on 0.7.0", () => {
+  // A virtualenv's interpreter is an absolute link out of the workspace.
+  beforeEach(() => {
+    writeFileSync(path.join(out, "python3"), "#!interpreter\n");
+    write("proj/main.py", "print(1)\n");
+    mkdirSync(path.join(ws, "proj/.venv/bin"), { recursive: true });
+    symlinkSync(path.join(out, "python3"), path.join(ws, "proj/.venv/bin/python"));
+  });
+
+  test("CopyPath copies the tree, keeps the link's text, and names it", async () => {
+    const r = JSON.parse(await call(copyPath, { source: "proj", destination: "proj-copy" }));
+    expect(r).toMatchObject({
+      copied: true,
+      files: 1,
+      symlinks: 1,
+      outsideLinks: ["proj-copy/.venv/bin/python"],
+      outsideLinkCount: 1,
+    });
+    expect(r.outsideLinkNote).toContain("exactly where the originals do");
+    expect(lstatSync(path.join(ws, "proj-copy/.venv/bin/python")).isSymbolicLink()).toBe(true);
+    // The interpreter's bytes were never copied in.
+    expect(readdirSync(path.join(ws, "proj-copy/.venv/bin"))).toEqual(["python"]);
+  });
+
+  test("MovePath renames the tree, dryRun first, and names the link both times", async () => {
+    const dry = JSON.parse(
+      await call(movePath, { source: "proj", destination: "apps/proj", dryRun: true }),
+    );
+    expect(dry).toMatchObject({ dryRun: true, outsideLinks: ["apps/proj/.venv/bin/python"] });
+    mkdirSync(path.join(ws, "apps"));
+    const moved = JSON.parse(await call(movePath, { source: "proj", destination: "apps/proj" }));
+    expect(moved).toMatchObject({ moved: true, outsideLinks: ["apps/proj/.venv/bin/python"] });
+    expect(existsSync(path.join(ws, "proj"))).toBe(false);
+    expect(readFileSync(path.join(ws, "apps/proj/main.py"), "utf8")).toBe("print(1)\n");
+  });
+
+  test("across a filesystem boundary the fallback copy keeps it too", async () => {
+    _setMoveRenameForTest(() => {
+      throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
+    });
+    const moved = JSON.parse(await call(movePath, { source: "proj", destination: "proj2" }));
+    expect(moved).toMatchObject({ moved: true, outsideLinks: ["proj2/.venv/bin/python"] });
+    expect(existsSync(path.join(ws, "proj"))).toBe(false);
+    expect(lstatSync(path.join(ws, "proj2/.venv/bin/python")).isSymbolicLink()).toBe(true);
+  });
+
+  test("a relative link that already led out is refused where it would lead further out", async () => {
+    // a/esc/up -> ../../.. leads to the workspace's parent; with a/esc moved
+    // or copied to the root, it would lead one level above that.
+    mkdirSync(path.join(ws, "a/esc"), { recursive: true });
+    symlinkSync("../../..", path.join(ws, "a/esc/up"));
+    for (const tool of [copyPath, movePath]) {
+      const r = JSON.parse(await call(tool, { source: "a/esc", destination: "esc" }));
+      expect(r).toMatchObject({ code: "escapes-root" });
+      expect(r.reason).toContain('"a/esc/up"');
+    }
+    expect(lstatSync(path.join(ws, "a/esc/up")).isSymbolicLink()).toBe(true);
+    expect(existsSync(path.join(ws, "esc"))).toBe(false);
+    // At the same depth elsewhere it leads exactly where it did: kept.
+    mkdirSync(path.join(ws, "b"));
+    const same = JSON.parse(await call(copyPath, { source: "a/esc", destination: "b/esc" }));
+    expect(same).toMatchObject({ copied: true, outsideLinks: ["b/esc/up"] });
+  });
+
+  test("an ordinary copy reports no outside links at all", async () => {
+    const r = JSON.parse(await call(copyPath, { source: "src", destination: "plain" }));
+    expect(r.copied).toBe(true);
+    expect("outsideLinks" in r).toBe(false);
+  });
+});
+
 describe("the EXDEV fallback of MovePath is the contained copy, then the delete", () => {
   const exdev = (): void => {
     throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });

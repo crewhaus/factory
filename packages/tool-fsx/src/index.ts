@@ -1023,6 +1023,21 @@ function refusal(flag: "copied" | "moved", failure: SafeFsFailure, note = ""): s
   return json({ [flag]: false, code: failure.code, reason: `${failure.reason}${note}` });
 }
 
+/**
+ * Links a copy or move leaves leading outside the workspace, each exactly
+ * where the original led (a virtualenv's interpreter, say), so the caller
+ * is told rather than left to find them. Empty when there are none.
+ */
+function outsideLinkFields(paths: readonly string[]): Record<string, unknown> {
+  if (paths.length === 0) return {};
+  const sorted = [...paths].sort(compareStrings);
+  return {
+    outsideLinks: sorted.slice(0, 50),
+    outsideLinkCount: sorted.length,
+    outsideLinkNote: "these symlinks lead outside the workspace, exactly where the originals do",
+  };
+}
+
 const copyMoveSchema = {
   source: z.string().min(1),
   destination: z.string().min(1),
@@ -1043,9 +1058,10 @@ const copyMoveSchema = {
  * Every destination path is checked, not only the destination root: an
  * existing symlink anywhere under it is refused, whatever it points at, so
  * a planted `dst/sub -> ~/.ssh` is never written through. Links in the
- * source are copied as links only when they still lead inside the
- * workspace from their NEW place (`a/b/up -> ../..` copied one level up
- * would lead out). Files are created with `O_EXCL|O_NOFOLLOW`, and a
+ * source are copied as links only when, from their NEW place, they lead
+ * inside the workspace (`a/b/up -> ../..` copied one level up would lead
+ * out) or exactly where the original leads (an absolute link out, such as
+ * a virtualenv's interpreter: the copy reaches nothing the source did not). Files are created with `O_EXCL|O_NOFOLLOW`, and a
  * replaced file goes through a temp and a rename. FIFOs, sockets and
  * devices are refused, since opening one to copy it can block for ever.
  */
@@ -1056,7 +1072,7 @@ function copyContained(
 ): CopyResult {
   const root = workspaceRoot();
   return copyTreeSafe(root, relArg(source), root, relArg(destination), {
-    symlinks: "copy-contained",
+    symlinks: "copy-no-new-reach",
     specials: "refuse",
     maxEntries: options.maxEntries,
     overwrite: options.overwrite,
@@ -1072,7 +1088,7 @@ export const copyPath: RegisteredTool = buildTool({
     { field: "destination", kind: "path" },
   ],
   description:
-    "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when they still point inside the workspace from where the copy puts them; an existing symlink under the destination is never written through.",
+    "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when, from where the copy puts them, they point inside the workspace or exactly where the original points; an existing symlink under the destination is never written through.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
   execute: async (input) => {
@@ -1115,6 +1131,7 @@ export const copyPath: RegisteredTool = buildTool({
       bytes: result.bytes,
       size: formatBytes(result.bytes),
       overwrites: replaced.length,
+      ...outsideLinkFields(result.outsideLinks),
     };
     if (result.dryRun) {
       return json({
@@ -1146,7 +1163,7 @@ export const movePath: RegisteredTool = buildTool({
     { field: "destination", kind: "path" },
   ],
   description:
-    "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move that would leave a relative symlink pointing outside the workspace from its new place is refused.",
+    "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move is refused when it would leave a symlink pointing outside the workspace somewhere it did not point before.",
   inputSchema: z.object(copyMoveSchema),
   destructive: true,
   execute: async (input) => {
@@ -1171,9 +1188,13 @@ export const movePath: RegisteredTool = buildTool({
     // A rename moves every link in the tree to a new depth, where a relative
     // target means something else: `a/b/up -> ../..` is the workspace root
     // where it is, and the workspace's parent once `a/b` moves one level up.
-    // Judged before anything moves, so dryRun gives the same verdict.
+    // Judged before anything moves, so dryRun gives the same verdict. A link
+    // that leads out exactly where it led before (an absolute link to an
+    // interpreter) is moved as 0.7.0 moved it: the move adds no reach.
     const root = workspaceRoot();
-    const relocated = checkRelocatedLinks(root, relArg(source), root, relArg(destination));
+    const relocated = checkRelocatedLinks(root, relArg(source), root, relArg(destination), {
+      outsideLinks: "keep-unchanged",
+    });
     if (!relocated.ok) return refusal("moved", relocated, "; nothing was moved");
     if (input.dryRun === true) {
       return json({
@@ -1182,6 +1203,7 @@ export const movePath: RegisteredTool = buildTool({
         dryRun: true,
         moved: false,
         wouldOverwrite: destExisting !== undefined,
+        ...outsideLinkFields(relocated.outsideLinks),
       });
     }
     const parent = ensureDirContained(root, path.posix.dirname(relArg(destination)));
@@ -1222,6 +1244,7 @@ export const movePath: RegisteredTool = buildTool({
       dryRun: false,
       moved: true,
       overwrote: destExisting !== undefined,
+      ...outsideLinkFields(relocated.outsideLinks),
     });
   },
 });
