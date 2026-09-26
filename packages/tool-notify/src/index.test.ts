@@ -1724,6 +1724,25 @@ describe("NotifyDigest, QuietHours, RateLimitGate and MessageTemplate", () => {
     );
     expect(result).toContain("{{b}}");
     expect(result).toContain("does not supply");
+    // An inherited property is not a value the data supplies (net review):
+    // `{{__proto__}}` rendered Object.prototype as "{}".
+    let checked = 0;
+    for (const placeholder of ["__proto__", "constructor", "toString", "a.__proto__"]) {
+      const inherited = String(
+        await messageTemplate.execute({
+          templates: { t: `x={{${placeholder}}}` },
+          name: "t",
+          data: { a: { b: 1 } },
+          platform: "slack",
+        }),
+      );
+      expect({ placeholder, missing: inherited.includes("does not supply") }).toEqual({
+        placeholder,
+        missing: true,
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(4);
   });
 
   test("the pure tools are deterministic — the same call twice gives the same bytes", async () => {
