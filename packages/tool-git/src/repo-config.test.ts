@@ -437,6 +437,68 @@ describe("a read's environment", () => {
   }, 20_000);
 });
 
+describe("git config passed through the environment", () => {
+  test("GIT_CONFIG_COUNT with safe.directory still reaches every read and write", async () => {
+    // `KEY` marks a credential-shaped name, so the read environment dropped
+    // GIT_CONFIG_KEY_0, kept the count, and git refused to start: every git
+    // tool answered "not a git repository".
+    const names = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
+    const prior = names.map((n) => process.env[n]);
+    process.env["GIT_CONFIG_COUNT"] = "1";
+    process.env["GIT_CONFIG_KEY_0"] = "safe.directory";
+    process.env["GIT_CONFIG_VALUE_0"] = "*";
+    try {
+      const { gitBranchCreate } = await import("./index");
+      let answered = 0;
+      for (const [tool, input] of [
+        [gitStatus, {}],
+        [gitLog, {}],
+        [gitDiff, { mode: "stat" }],
+        [gitBranchCreate, { name: "via-env-config" }],
+      ] as ReadonlyArray<[RegisteredTool, Record<string, unknown>]>) {
+        const text = await call(tool, input);
+        expect({ tool: tool.name, text: text.slice(0, 1) }).toEqual({ tool: tool.name, text: "{" });
+        answered += 1;
+      }
+      expect(answered).toBe(4);
+      // …and the env config really reached git: a read shows the value.
+      const shown = await runGit(["config", "--get", "safe.directory"], {
+        cwd: repo,
+        timeoutMs: 10_000,
+        readOnly: true,
+      });
+      expect(shown.stdout.trim()).toBe("*");
+    } finally {
+      names.forEach((n, i) => {
+        const value = prior[i];
+        if (value === undefined) Reflect.deleteProperty(process.env, n);
+        else process.env[n] = value;
+      });
+    }
+  }, 30_000);
+
+  test("a git failure that is not 'no repository' is reported as git's own error", async () => {
+    const names = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
+    const prior = names.map((n) => process.env[n]);
+    // A count git rejects outright: the harness's environment is broken,
+    // and saying "not a git repository" would send the caller elsewhere.
+    process.env["GIT_CONFIG_COUNT"] = "1";
+    process.env["GIT_CONFIG_KEY_0"] = "no-dot-so-invalid";
+    process.env["GIT_CONFIG_VALUE_0"] = "x";
+    try {
+      const text = await call(gitStatus, {});
+      expect(text).not.toContain("not a git repository");
+      expect(text).toContain("GitStatus failed (git exit");
+    } finally {
+      names.forEach((n, i) => {
+        const value = prior[i];
+        if (value === undefined) Reflect.deleteProperty(process.env, n);
+        else process.env[n] = value;
+      });
+    }
+  }, 20_000);
+});
+
 describe("the hardening, piece by piece", () => {
   test("every invocation switches off fsmonitor, signatures and implicit bare repositories", () => {
     const pairs = new Set<string>();

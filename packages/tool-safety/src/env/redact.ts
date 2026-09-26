@@ -274,6 +274,14 @@ function isScheme(s: string): boolean {
   return true;
 }
 
+function isAsciiLetter(c: string): boolean {
+  return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z");
+}
+
+function isSchemeChar(c: string): boolean {
+  return isAsciiLetter(c) || (c >= "0" && c <= "9") || c === "+" || c === "." || c === "-";
+}
+
 /** Characters that end a URL embedded in prose, logs or a quoted error. */
 function endsUrl(c: string): boolean {
   return (
@@ -302,8 +310,12 @@ export function redactUrlCredentialsInText(text: string, placeholder = REDACTED_
   for (;;) {
     const sep = text.indexOf("://", from);
     if (sep < 0) break;
+    // Back over the characters a scheme may hold, then forward to its first
+    // letter: growing the scheme one character at a time and testing each
+    // suffix stopped at a digit, so `socks5://` and `h2://` went unseen.
     let start = sep;
-    while (start > 0 && sep - start < 32 && isScheme(text.slice(start - 1, sep))) start -= 1;
+    while (start > 0 && sep - start < 32 && isSchemeChar(text[start - 1] as string)) start -= 1;
+    while (start < sep && !isAsciiLetter(text[start] as string)) start += 1;
     let end = sep + 3;
     while (end < text.length && !endsUrl(text[end] as string)) end += 1;
     if (start < sep && start >= copied) {

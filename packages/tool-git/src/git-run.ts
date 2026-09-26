@@ -614,9 +614,15 @@ export async function locateRepository(
     if (probe.timedOut) return refuse(failure(toolName, probe));
     if (/cannot use bare repository/i.test(probe.stderr))
       return refuse(bareRefusal(toolName, requested));
-    return refuse(
-      `${toolName} refused "${requested}": it is not a git repository (no .git found from there). git said: ${firstLine(probe.stderr)}`,
-    );
+    // "Not a git repository" only when git says so: any other failure (a
+    // config git cannot read, a dubious-ownership refusal) is passed on as
+    // git's own words, so the caller looks for the right problem.
+    if (/not a git repository/i.test(probe.stderr)) {
+      return refuse(
+        `${toolName} refused "${requested}": it is not a git repository (no .git found from there). git said: ${firstLine(probe.stderr)}`,
+      );
+    }
+    return refuse(failure(toolName, probe));
   }
   const lines = probe.stdout.split("\n").map((l) => l.trim());
   const [topRaw, gitDirRaw, commonRaw] = lines;
