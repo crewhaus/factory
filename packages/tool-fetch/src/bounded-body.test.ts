@@ -222,7 +222,7 @@ describe("the decoder (C093)", () => {
     expect(out.endsWith(`\n${"a".repeat(CAP)}`)).toBe(true);
   });
 
-  for (const coding of ["compress", "gzip, br", "gzip, gzip"]) {
+  for (const coding of ["gzip, br", "gzip, gzip", "gzip, none"]) {
     test(`content-encoding "${coding}" is refused without quoting the body`, async () => {
       serve("SECRET-BODY-TEXT", coding);
       const err = await fetch.execute({ url: "https://api.example.com/x" }, {} as never).then(
@@ -254,5 +254,74 @@ describe("the decoder (C093)", () => {
     const out = String(await fetch.execute({ url: "https://api.example.com/x" }, {} as never));
     expect(out).toContain("content-encoding: identity");
     expect(out.endsWith("\nplain")).toBe(true);
+  });
+
+  test("net-review: a label that names no coding is read as the bytes it is, and the label is shown", async () => {
+    let checked = 0;
+    for (const label of ["none", "utf-8", "UTF-8", "binary", "compress"]) {
+      serve("plain body", label);
+      const out = String(await fetch.execute({ url: "https://api.example.com/x" }, {} as never));
+      expect({ label, head: out.split("\n")[0], tail: out.endsWith("\nplain body") }).toEqual({
+        label,
+        head: "HTTP 200",
+        tail: true,
+      });
+      // Not decoded here, so the wire header still describes the body.
+      expect(out).toContain(`content-encoding: ${label}`);
+      checked += 1;
+    }
+    expect(checked).toBe(5);
+  });
+
+  test("an unknown label on a body larger than the cap is still refused as too large", async () => {
+    serve("x".repeat(CAP + 1), "none");
+    await expect(fetch.execute({ url: "https://api.example.com/x" }, {} as never)).rejects.toThrow(
+      /exceeded 5242880 bytes/,
+    );
+  });
+
+  test("net-review: bytes after a gzip member are not part of the body, as 0.7.0 read it", async () => {
+    const gz = gzipSync('{"hello":"world"}');
+    let checked = 0;
+    for (const [name, tail] of [
+      ["CRLF", Buffer.from("\r\n")],
+      ["xx", Buffer.from("xx")],
+      ["NUL padding", Buffer.alloc(8)],
+      ["a second member", gzipSync("second")],
+    ] as const) {
+      serve(new Uint8Array(Buffer.concat([gz, tail])), "gzip");
+      const out = String(await fetch.execute({ url: "https://api.example.com/x" }, {} as never));
+      expect({ name, ok: out.endsWith('\n{"hello":"world"}') }).toEqual({ name, ok: true });
+      checked += 1;
+    }
+    expect(checked).toBe(4);
+  });
+
+  test("a gzip body that is cut short, or whose trailer does not match, is still refused", async () => {
+    const gz = gzipSync("hello world, long enough to cut");
+    const badCrc = Buffer.from(gz);
+    badCrc[badCrc.length - 8] = (badCrc[badCrc.length - 8] as number) ^ 1;
+    const badSize = Buffer.from(gz);
+    badSize[badSize.length - 1] = (badSize[badSize.length - 1] as number) ^ 1;
+    let checked = 0;
+    for (const [name, body] of [
+      ["cut in the data", gz.subarray(0, 20)],
+      ["no trailer", gz.subarray(0, gz.length - 8)],
+      ["cut header", gz.subarray(0, 6)],
+      ["bad CRC", badCrc],
+      ["bad size", badSize],
+    ] as const) {
+      serve(new Uint8Array(body), "gzip");
+      const err = await fetch.execute({ url: "https://api.example.com/x" }, {} as never).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect({ name, message: err?.message }).toEqual({
+        name,
+        message: "response body is not valid gzip data, though its content-encoding says it is",
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(5);
   });
 });

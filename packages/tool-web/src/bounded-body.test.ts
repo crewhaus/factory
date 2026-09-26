@@ -65,6 +65,18 @@ describe("WebFetch through the production fetcher (C093)", () => {
             headers: { "content-encoding": "gzip", "content-type": "text/html" },
           });
         }
+        if (path === "/page-crlf") {
+          // A gzip page followed by a stray CRLF, as output after a PHP `?>` leaves it.
+          const gz = gzipSync("<html><body><main><h1>Padded</h1></main></body></html>");
+          return new Response(new Uint8Array(Buffer.concat([gz, Buffer.from("\r\n")])), {
+            headers: { "content-encoding": "gzip", "content-type": "text/html" },
+          });
+        }
+        if (path === "/none") {
+          return new Response("<html><body><main><h1>Labelled</h1></main></body></html>", {
+            headers: { "content-encoding": "none", "content-type": "text/html" },
+          });
+        }
         if (path === "/drip") {
           // The head at once, one chunk of body, then nothing, for ever.
           return new Response(
@@ -129,6 +141,23 @@ describe("WebFetch through the production fetcher (C093)", () => {
       await webFetch.execute({ url: `http://site.example.test:${server.port}/page` }, {} as never),
     );
     expect(out).toContain("# Hi");
+  });
+
+  test("net-review: a gzip page followed by stray bytes is read as 0.7.0 read it", async () => {
+    const out = String(
+      await webFetch.execute(
+        { url: `http://site.example.test:${server.port}/page-crlf` },
+        {} as never,
+      ),
+    );
+    expect(out).toContain("# Padded");
+  });
+
+  test("net-review: a page labelled with a Content-Encoding that names no coding is read as it is", async () => {
+    const out = String(
+      await webFetch.execute({ url: `http://site.example.test:${server.port}/none` }, {} as never),
+    );
+    expect(out).toContain("# Labelled");
   });
 
   test("the deadline covers the body: a server that sends the head and stalls is stopped", async () => {

@@ -26,6 +26,15 @@ import * as zlib from "node:zlib";
  * 256 MiB bombs in all four codings: the decode throws with RSS up at most
  * a few MB).
  *
+ * WHAT COUNTS AS THE BODY (as Bun's own decoder, which 0.7.0 used, reads
+ * it). A gzip body is its FIRST member: the header and trailer are parsed
+ * here, the CRC-32 and length checked, and bytes after the member (a stray
+ * CRLF, padding, a second member) ignored. `gunzipSync` would read them as
+ * the start of another member and fail. A `Content-Encoding` label that
+ * names no coding (`none`, `utf-8`, `binary`) is read as the bytes it is,
+ * under the same raw cap, and `decodedFrom` stays null so the caller shows
+ * the label; only a stack that includes a real compression is refused.
+ *
  * WORKERD. `decompress` is a Bun option. workerd has no equivalent and
  * applies its own handling to an encoded body, inside the isolate's memory
  * limit, so outside Bun the body is read exactly as 0.7.0 read it: counted
@@ -75,19 +84,31 @@ export type BoundedBody =
 
 type Coding = "gzip" | "deflate" | "br" | "zstd";
 
+/** The content codings this reader decodes. */
+const DECODABLE: Readonly<Record<string, Coding>> = {
+  gzip: "gzip",
+  "x-gzip": "gzip",
+  deflate: "deflate",
+  br: "br",
+  zstd: "zstd",
+};
+
+/**
+ * The coding to undo, null for a body to read as it is (no label, or a
+ * label that names no coding), or the stack this reader refuses.
+ */
 function codingOf(header: string | null): Coding | null | { readonly unsupported: string } {
   if (header === null) return null;
   const codings = header
     .split(",")
     .map((c) => c.trim().toLowerCase())
     .filter((c) => c !== "" && c !== "identity");
-  if (codings.length === 0) return null;
+  // `none`, `utf-8`, `binary`: misconfigured servers send them, and the raw
+  // read is capped, so reading the bytes as they are costs nothing.
+  if (!codings.some((c) => Object.hasOwn(DECODABLE, c))) return null;
   // A stack ("gzip, br") would need a bound on every intermediate stage.
   if (codings.length > 1) return { unsupported: codings.join(", ") };
-  const only = codings[0] as string;
-  if (only === "gzip" || only === "x-gzip") return "gzip";
-  if (only === "deflate" || only === "br" || only === "zstd") return only;
-  return { unsupported: only };
+  return DECODABLE[codings[0] as string] as Coding;
 }
 
 type SyncDecoder = (raw: Uint8Array, options: { maxOutputLength: number }) => Uint8Array;
@@ -95,7 +116,7 @@ type SyncDecoder = (raw: Uint8Array, options: { maxOutputLength: number }) => Ui
 function decoderFor(coding: Coding, raw: Uint8Array): SyncDecoder | undefined {
   switch (coding) {
     case "gzip":
-      return zlib.gunzipSync;
+      return gunzipFirstMember;
     case "deflate": {
       // RFC 9110 "deflate" is zlib-wrapped; some servers send it raw.
       const b0 = raw[0] ?? 0;
@@ -110,6 +131,83 @@ function decoderFor(coding: Coding, raw: Uint8Array): SyncDecoder | undefined {
       return typeof zstd === "function" ? zstd : undefined;
     }
   }
+}
+
+class GzipFormatError extends Error {}
+
+const CRC_TABLE: Int32Array = (() => {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
+  }
+  return table;
+})();
+
+/** CRC-32 (gzip's). The runtime's `zlib.crc32` is not on every runtime these tools run on. */
+function crc32(bytes: Uint8Array): number {
+  let c = -1;
+  for (let i = 0; i < bytes.length; i++) {
+    c = (CRC_TABLE[(c ^ (bytes[i] as number)) & 0xff] as number) ^ (c >>> 8);
+  }
+  return ~c >>> 0;
+}
+
+/**
+ * The first gzip member of `raw` (RFC 1952), decoded with its output
+ * bounded and its trailer checked; whatever follows the member is ignored.
+ */
+function gunzipFirstMember(raw: Uint8Array, options: { maxOutputLength: number }): Uint8Array {
+  const byte = (at: number): number => {
+    if (at >= raw.length) throw new GzipFormatError("the body ends inside its gzip header");
+    return raw[at] as number;
+  };
+  if (byte(0) !== 0x1f || byte(1) !== 0x8b || byte(2) !== 8) {
+    throw new GzipFormatError("the body does not start with a gzip deflate header");
+  }
+  const flags = byte(3);
+  if ((flags & 0xe0) !== 0) throw new GzipFormatError("its gzip header sets reserved flags");
+  let at = 10;
+  if ((flags & 0x04) !== 0) at += 2 + (byte(at) | (byte(at + 1) << 8)); // FEXTRA
+  for (const flag of [0x08, 0x10]) {
+    // FNAME, FCOMMENT: zero-terminated.
+    if ((flags & flag) === 0) continue;
+    while (byte(at) !== 0) at += 1;
+    at += 1;
+  }
+  if ((flags & 0x02) !== 0) {
+    const stored = byte(at) | (byte(at + 1) << 8);
+    if (stored !== (crc32(raw.subarray(0, at)) & 0xffff)) {
+      throw new GzipFormatError("its gzip header checksum is wrong");
+    }
+    at += 2;
+  }
+  if (at > raw.length) throw new GzipFormatError("the body ends inside its gzip header");
+  // `info` reports how much input the deflate data used, which is where the
+  // trailer starts; the engine stops at the end of the data by itself.
+  const inflated = (
+    zlib.inflateRawSync as unknown as (
+      buf: Uint8Array,
+      opts: { maxOutputLength: number; info: true },
+    ) => { buffer: Uint8Array; engine: { bytesWritten: number } }
+  )(raw.subarray(at), { maxOutputLength: options.maxOutputLength, info: true });
+  const trailerAt = at + inflated.engine.bytesWritten;
+  if (trailerAt + 8 > raw.length)
+    throw new GzipFormatError("the body ends before its gzip trailer");
+  const word = (i: number): number =>
+    ((raw[i] as number) |
+      ((raw[i + 1] as number) << 8) |
+      ((raw[i + 2] as number) << 16) |
+      ((raw[i + 3] as number) << 24)) >>>
+    0;
+  if (word(trailerAt) !== crc32(inflated.buffer)) {
+    throw new GzipFormatError("the gzip trailer's CRC-32 does not match the data");
+  }
+  if (word(trailerAt + 4) !== inflated.buffer.length >>> 0) {
+    throw new GzipFormatError("the gzip trailer's size does not match the data");
+  }
+  return inflated.buffer;
 }
 
 /**
