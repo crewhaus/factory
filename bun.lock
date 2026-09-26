@@ -3231,6 +3231,9 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/model-plan": "workspace:*",
+      },
     },
     "packages/tool-secrets": {
       "name": "@crewhaus/tool-secrets",
