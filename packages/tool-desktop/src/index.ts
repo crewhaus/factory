@@ -511,7 +511,14 @@ export const openExternal: RegisteredTool = buildTool({
   // the operator's cookies. As destructive:false it ran with no rule at all
   // in auto mode, so a workspace .fileloc could launch any app unasked
   // (flag-truth-5#6). A destructive tool that goes where the model points
-  // also carries a justification (apps/cli/src/flag-rules.test.ts, rule 1).
+  // also carries a justification (apps/cli/src/flag-rules.test.ts, rule 1):
+  // opening `https://host/?q=<secret>` in the operator's browser is an
+  // outbound request like HttpRequest's. The justification gate runs AFTER
+  // the permission decision, so an `alwaysAllow` OpenExternal rule no longer
+  // skips it: every call is scored by `security.justification.judge`, or,
+  // when a spec sets none, by the rule-based judge (with its one-time
+  // stderr warning), which denies a justification that shares no salient
+  // word with the instructions.
   destructive: true,
   requireJustification: true,
   concurrencySafe: false,
