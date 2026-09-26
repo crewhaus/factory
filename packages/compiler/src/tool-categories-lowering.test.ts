@@ -154,6 +154,12 @@ describe("compile errors", () => {
     expect(() => irOf(`${CLI_HEAD}tools: [all-fs, -gitPush]\n`)).toThrow(/nothing includes/);
   });
 
+  test("an Object.prototype name is an unknown category, not an empty one", () => {
+    expect(() => irOf(`${CLI_HEAD}tools: [all-constructor]\n`)).toThrow(
+      'unknown tool category "all-constructor"',
+    );
+  });
+
   test("the error names the offending path so a big spec is navigable", () => {
     expect(() =>
       irOf(`

@@ -142,7 +142,13 @@ export function toolsInCategory(name: string): ReadonlyArray<string> {
   const walk = (cat: string, trail: ReadonlyArray<string>): void => {
     if (seen.has(cat)) return;
     seen.add(cat);
-    const def: CategoryDef | undefined = CATEGORIES[cat];
+    // An own key only: `CATEGORIES` is an object literal, so `constructor`,
+    // `__proto__` or `toString` would otherwise resolve to an Object.prototype
+    // member — no tools, no includes — and `all-constructor` would expand to
+    // nothing instead of being refused (security-12#14).
+    const def: CategoryDef | undefined = Object.hasOwn(CATEGORIES, cat)
+      ? CATEGORIES[cat]
+      : undefined;
     if (def === undefined) {
       throw new ToolCategoryError(unknownCategoryMessage(cat, trail));
     }

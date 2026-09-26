@@ -235,6 +235,33 @@ describe("expandToolSelectors — errors", () => {
   });
 });
 
+// security-12#14 — `CATEGORIES` is an object literal, so a category named
+// after an Object.prototype member resolved to that member: `all-constructor`
+// expanded to no tools and `-all-hasOwnProperty` was a silent no-op, where
+// every other unknown name is refused.
+describe("a category name is never an Object.prototype member", () => {
+  const inherited = Object.getOwnPropertyNames(Object.prototype);
+
+  test("each one is an unknown category, as an include and as an exclusion", () => {
+    expect(inherited).toContain("constructor");
+    expect(inherited).toContain("__proto__");
+    expect(inherited.length).toBeGreaterThanOrEqual(12);
+    for (const name of inherited) {
+      expect(() => toolsInCategory(name)).toThrow(ToolCategoryError);
+      expect(() => expandToolSelectors([`all-${name}`])).toThrow(
+        `tools: unknown tool category "all-${name}"`,
+      );
+      expect(() => expandToolSelectors(["read", `-all-${name}`])).toThrow(
+        `tools: unknown tool category "all-${name}"`,
+      );
+    }
+  });
+
+  test("a real category still resolves", () => {
+    expect(toolsInCategory("git")).toContain("gitCommit");
+  });
+});
+
 describe("registry shape", () => {
   test("every category is either a leaf or a roll-up, never both and never neither", () => {
     for (const [name, def] of Object.entries(CATEGORIES)) {
@@ -303,6 +330,7 @@ describe("lookup helpers", () => {
 
   test("categoriesForTool is empty for an unknown key", () => {
     expect(categoriesForTool("definitelyNotATool")).toEqual([]);
+    expect(categoriesForTool("constructor")).toEqual([]);
   });
 });
 
