@@ -305,11 +305,25 @@ export const secretLookup: RegisteredTool = buildTool({
         });
         continue;
       }
-      const report = await lookupOne(parsed.value, {
-        toolName: "SecretLookup",
-        timeoutMs,
-        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-      });
+      let report: LookupReport;
+      try {
+        report = await lookupOne(parsed.value, {
+          toolName: "SecretLookup",
+          timeoutMs,
+          ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        });
+      } catch (err) {
+        // One reference that breaks must not discard the answers for the
+        // others. Only the error's class is reported: a message can carry
+        // whatever the failing step was holding, and here that is a secret.
+        report = {
+          ref: formatRef(parsed.value),
+          backend: parsed.value.kind,
+          status: "error",
+          resolved: false,
+          reason: `looking this reference up failed unexpectedly (${err instanceof Error ? err.name : typeof err}); the other references were still checked.`,
+        };
+      }
       const rotated = lastRotation(journal.entries, formatRef(parsed.value));
       reports.push({
         ...report,
