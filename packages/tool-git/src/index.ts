@@ -1092,6 +1092,16 @@ export const gitTagCreate: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * A name `git apply -R -v` printed, put back the way the patch wrote it:
+ * git shows a rename or copy as `old => new`, and reversed that is the
+ * patch's `new => old`.
+ */
+function unreverseRename(shown: string): string {
+  const parts = shown.split(" => ");
+  return parts.length === 2 ? `${parts[1]} => ${parts[0]}` : shown;
+}
+
 export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
@@ -1142,6 +1152,24 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     };
     const skippedFirst = skippedPatchPaths(preflight.stderr);
     if (skippedFirst.length > 0) return refuseSkipped(skippedFirst);
+    // git decides "outside cwd" on a file's NEW name only, so a rename or
+    // copy whose SOURCE lies outside is never skipped: renaming `top.txt`
+    // into cwd deleted `top.txt`. Reversed, a patch's old names are its new
+    // ones, so the same parse run with `-R` makes git name every source
+    // outside cwd the same way. `--numstat` only parses; it reads no file.
+    const sources = await repo.run(["apply", "--numstat", "-R", "-v", ...strip, "-"], {
+      stdin: patchText,
+      readOnly: true,
+    });
+    if (sources.code !== 0) {
+      return json({
+        applied: false,
+        checkedOnly,
+        reason: failure("GitApplyPatch", withoutApplyProgress(sources)),
+      });
+    }
+    const skippedSources = skippedPatchPaths(sources.stderr).map(unreverseRename);
+    if (skippedSources.length > 0) return refuseSkipped(skippedSources);
 
     const args = [
       "apply",

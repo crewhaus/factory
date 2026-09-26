@@ -1340,6 +1340,45 @@ describe("GitApplyPatch", () => {
       expect(out.skipped).toEqual(["tab\tname.txt"]);
     });
 
+    test("a rename or copy whose SOURCE lies outside cwd is refused, and moves nothing", async () => {
+      // git checks only a renamed file's new name against cwd, so this patch
+      // was applied from "pkg" and deleted outside.txt.
+      const rename = [
+        "diff --git a/outside.txt b/pkg/outside.txt",
+        "similarity index 100%",
+        "rename from outside.txt",
+        "rename to pkg/outside.txt",
+        "",
+      ].join("\n");
+      for (const check of [true, false]) {
+        const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: rename, check });
+        expect(out).toMatchObject({ applied: false, wouldApply: false });
+        expect(out.skipped).toEqual(["outside.txt => pkg/outside.txt"]);
+        expect(out.reason).toContain('outside "pkg"');
+      }
+      expect(read("outside.txt")).toBe("one\n");
+      expect(existsSync(join(repo, "pkg", "outside.txt"))).toBe(false);
+
+      const copy = rename.replace("rename from", "copy from").replace("rename to", "copy to");
+      const copied = await call(gitApplyPatch, { cwd: "repo/pkg", patch: copy });
+      expect(copied).toMatchObject({ applied: false, skipped: ["outside.txt => pkg/outside.txt"] });
+      expect(existsSync(join(repo, "pkg", "outside.txt"))).toBe(false);
+    });
+
+    test("a rename wholly inside cwd still applies from there", async () => {
+      const rename = [
+        "diff --git a/pkg/inside.txt b/pkg/moved.txt",
+        "similarity index 100%",
+        "rename from pkg/inside.txt",
+        "rename to pkg/moved.txt",
+        "",
+      ].join("\n");
+      const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: rename });
+      expect(out).toMatchObject({ applied: true });
+      expect(read("pkg/moved.txt")).toBe("alpha\n");
+      expect(existsSync(join(repo, "pkg", "inside.txt"))).toBe(false);
+    });
+
     test("from the repository root the same patch applies whole", async () => {
       const checked = await call(gitApplyPatch, { patch: `${outside}${inside}`, check: true });
       expect(checked).toMatchObject({ checkedOnly: true, wouldApply: true });
