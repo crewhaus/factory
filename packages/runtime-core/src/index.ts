@@ -2893,6 +2893,32 @@ function bestEffortWireModelId(modelString: string): string {
 }
 
 /**
+ * 0.7.1 — every model string the run was configured with, for the bridge's
+ * `specModels` (the Task tool's allow-list for a `.crewhaus/sub-agents`
+ * definition's models). Exact strings, in first-seen order, no duplicates.
+ */
+export function specModelsOf(
+  opts: Pick<
+    RunChatLoopOptions,
+    "model" | "modelFallbacks" | "modelTiers" | "modelPool" | "compactionModel" | "budget"
+  >,
+): ReadonlyArray<string> {
+  const out = new Set<string>([opts.model]);
+  for (const m of opts.modelFallbacks ?? []) out.add(m);
+  if (opts.modelTiers !== undefined) {
+    out.add(opts.modelTiers.fast);
+    out.add(opts.modelTiers.default);
+  }
+  for (const c of opts.modelPool?.candidates ?? []) {
+    out.add(c.model);
+    for (const m of c.fallbacks ?? []) out.add(m);
+  }
+  if (opts.compactionModel !== undefined) out.add(opts.compactionModel);
+  if (opts.budget?.onExceed.kind === "degrade") out.add(opts.budget.onExceed.model);
+  return [...out];
+}
+
+/**
  * A short, stable fingerprint of a `model_pool` config, stamped on every
  * `model_route` event as `policyVersion` so a learned decision can be tied back
  * to the exact policy that made it. Deterministic — no clock, no randomness.
@@ -4874,6 +4900,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       : undefined;
   const bridgeContinuitySeam =
     opts.continuity !== undefined ? { loadPlan: opts.continuity.loadPlan } : undefined;
+  // 0.7.1 — the models this run may name, so a sub-agent read from disk can
+  // run on the parent's fallback or tier model, and on nothing unnamed.
+  const bridgeSpecModels = specModelsOf(opts);
   // M3.1 — auto-load project memory files (AGENTS.md / CLAUDE.md /
   // CODE-COMPANION.md / AGENT.md) from cwd at session start. Follows the
   // vendor-neutral agents.md convention; compatible with Claude Code's
@@ -6402,6 +6431,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // `"pause"` default — identical resolution, no double-defaulting.
       ...(opts.askMode !== undefined ? { askMode: opts.askMode } : {}),
       ...(opts.approvals !== undefined ? { approvals: opts.approvals } : {}),
+      specModels: bridgeSpecModels,
     };
     // Spin "running <tool>…" for exactly the execution window — started after
     // every gate (permission/justification/egress) so it never overlaps the
