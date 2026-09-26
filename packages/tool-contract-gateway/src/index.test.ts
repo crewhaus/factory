@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { auditToolScopes } from "@crewhaus/tool-builder";
-import { ToolCatalog } from "@crewhaus/tool-catalog";
+import { JUSTIFICATION_INPUT_FIELD, ToolCatalog } from "@crewhaus/tool-catalog";
 import { evmCall } from "@crewhaus/tool-evm";
 import { evmSendTransaction } from "@crewhaus/tool-evm-tx";
 import { canonicalFunction } from "@crewhaus/tool-onchain";
@@ -472,16 +472,33 @@ describe("an ABI either becomes tools that each mean one thing, or is refused (C
     ).toThrow(
       /input 0 is named "walletId", which the generated write tool already takes as the signing wallet's id/,
     );
+    // A write tool is justification-gated, and the gate reads the call's own
+    // `justification`: as an ABI input it would be judged AND broadcast.
+    for (const stateMutability of ["nonpayable", "payable"] as const) {
+      expect(
+        refuse({
+          type: "function",
+          name: "record",
+          inputs: [{ name: JUSTIFICATION_INPUT_FIELD, type: "string" }],
+          outputs: [],
+          stateMutability,
+        }),
+      ).toThrow(
+        'usdc: record(string): input 0 is named "justification", which the generated write tool already takes as the reason the intent gate judges before it runs, so one field would carry both',
+      );
+    }
     // A view function has no injected fields, so the same names are fine there.
-    expect(
-      refuse({
-        type: "function",
-        name: "quote",
-        inputs: [{ name: "value", type: "uint256" }],
-        outputs: [{ name: "", type: "uint256" }],
-        stateMutability: "view",
-      })(),
-    ).toHaveLength(1);
+    for (const name of ["value", "walletId", JUSTIFICATION_INPUT_FIELD]) {
+      expect(
+        refuse({
+          type: "function",
+          name: "quote",
+          inputs: [{ name, type: "uint256" }],
+          outputs: [{ name: "", type: "uint256" }],
+          stateMutability: "view",
+        })(),
+      ).toHaveLength(1);
+    }
   });
 
   test("an unnamed input and an input named for its position do not share a key", () => {

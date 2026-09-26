@@ -32,12 +32,12 @@
  * generated, with a {@link ContractToolError} naming the function, rather
  * than when a model first calls one: two functions whose tools would share
  * a name, an input whose name a write tool already uses for its own fields
- * (`walletId`, and `value` on a payable function), and two inputs of one
- * function that would share a key.
+ * (`walletId`, `justification` — the intent gate's — and `value` on a
+ * payable function), and two inputs of one function that would share a key.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { JUSTIFICATION_INPUT_FIELD, type RegisteredTool } from "@crewhaus/tool-catalog";
 import { canonicalFunction } from "@crewhaus/tool-onchain";
 import { z } from "zod";
 
@@ -227,12 +227,15 @@ function typeString(param: AbiParam): string {
  * amount would be sent as a contract argument, or the other way round.
  */
 function inputKeys(contract: ContractBinding, fn: AbiFunction, signature: string): string[] {
+  // A write tool is justification-gated, and the gate reads its text from
+  // the call's own `justification` field: an ABI input of that name would be
+  // both what the judge reads and what is signed and broadcast.
   const reserved = new Set<string>(
     fn.stateMutability === "view" || fn.stateMutability === "pure"
       ? []
       : fn.stateMutability === "payable"
-        ? ["walletId", "value"]
-        : ["walletId"],
+        ? ["walletId", JUSTIFICATION_INPUT_FIELD, "value"]
+        : ["walletId", JUSTIFICATION_INPUT_FIELD],
   );
   const where = `${contract.id}: ${signature}`;
   const seen = new Map<string, number>();
@@ -246,7 +249,11 @@ function inputKeys(contract: ContractBinding, fn: AbiFunction, signature: string
     if (reserved.has(key)) {
       throw new ContractToolError(
         `${where}: input ${i} is named "${key}", which the generated write tool already takes as ${
-          key === "walletId" ? "the signing wallet's id" : "the native-token amount to send"
+          key === "walletId"
+            ? "the signing wallet's id"
+            : key === JUSTIFICATION_INPUT_FIELD
+              ? "the reason the intent gate judges before it runs"
+              : "the native-token amount to send"
         }, so one field would carry both — leave this function out of the ABI passed to generateContractTools, or rename the input there`,
       );
     }
