@@ -150,6 +150,16 @@ export const THREDZ_ALIAS_TOOL_FLAGS: Readonly<Record<string, McpToolFlags>> = {
   // (`message_ack` seek with `allowRegression`), and `thread_get` reads a
   // thread without touching it.
   //
+  // Decided, not overlooked (0.7.1 review): auto mode therefore also runs
+  // `inbox_poll`'s `ack` unasked. The server clamps it to the newest seq and
+  // only moves the cursor forward, so one call can mark messages the agent
+  // never saw as read, where `consume` only passes what it returned.
+  // `message_ack` stays destructive because its `seek` can move the cursor
+  // BACK (a replay); that gate is not what stops a forward commit. An
+  // operator who wants every poll to ask adds
+  // `{ type: alwaysAsk, pattern: inbox_poll }`; the forwarded arguments are
+  // the server's own, so they are left untouched.
+  //
   // `message_send` additionally carries the Pillar 3 intent gate, exactly as
   // the built-in `SendMessage` does and exactly as the spec's own
   // `thredz.messaging` docblock promises ("the send-side tools are
