@@ -82,14 +82,8 @@ import { closeSync, createReadStream, existsSync, mkdirSync, readdirSync } from 
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { CrewhausError, RuntimeError } from "@crewhaus/errors";
-import {
-  type FileKind,
-  appendContained,
-  openForReadFd,
-  openForReadSync,
-  probeKind,
-  writeFileSafe,
-} from "@crewhaus/tool-safety/fs";
+import { type FileKind, openForReadFd, probeKind } from "@crewhaus/tool-safety/fs";
+import { LeafError, appendLeaf, overwriteLeaf, readLeaf } from "./leaf";
 
 export const GENESIS_HASH = "GENESIS";
 
@@ -347,40 +341,53 @@ function notRegularReason(name: string, kind: FileKind): string {
 }
 
 /**
+ * Why a leaf operation on `name` was refused, for a message: never the
+ * directory's path, and never where a link leads.
+ */
+function leafReason(name: string, err: unknown): string {
+  if (!(err instanceof LeafError)) throw err;
+  const refusal = err.refusal;
+  if (refusal.code === "not-regular") return notRegularReason(name, refusal.kind);
+  if (refusal.code === "too-large") {
+    return `"${name}" is over ${refusal.bytes} bytes, which no anchor is`;
+  }
+  // `EACCES: permission denied, open '/abs/…'` → `EACCES: permission denied`.
+  const message = refusal.error instanceof Error ? refusal.error.message : String(refusal.error);
+  return `"${name}": ${message.split(",")[0]}`;
+}
+
+/**
  * The anchor, or `undefined` when there is none. A link or special file at
  * its name, or one too large to be an anchor, throws without being read.
  */
 function readChainTail(rootDir: string): ChainTail | undefined {
-  const read = openForReadSync(rootDir, CHAIN_TAIL_FILENAME, {
-    maxBytes: MAX_CHAIN_TAIL_BYTES,
-    followLeafSymlink: false,
-  });
-  if (!read.ok) {
-    if (read.code === "not-found") return undefined;
-    throw new AuditLogError(
-      read.code === "is-symlink" || read.code === "not-regular-file"
-        ? notRegularReason(CHAIN_TAIL_FILENAME, read.kind ?? "symlink")
-        : read.reason,
-    );
+  let text: string | undefined;
+  try {
+    text = readLeaf(rootDir, CHAIN_TAIL_FILENAME, MAX_CHAIN_TAIL_BYTES);
+  } catch (err) {
+    throw new AuditLogError(leafReason(CHAIN_TAIL_FILENAME, err));
   }
-  if (read.truncated) {
-    throw new AuditLogError(
-      `"${CHAIN_TAIL_FILENAME}" is over ${MAX_CHAIN_TAIL_BYTES} bytes, which no anchor is`,
-    );
-  }
-  return JSON.parse(read.text) as ChainTail;
+  return text === undefined ? undefined : (JSON.parse(text) as ChainTail);
 }
 
-function writeChainTail(rootDir: string, day: string, hash: string, seq: number): void {
-  // Through a temp renamed into place: a link at the name is refused rather
-  // than written through, and a crash never leaves a half-written anchor.
-  const written = writeFileSafe(rootDir, CHAIN_TAIL_FILENAME, JSON.stringify({ day, hash, seq }), {
-    overwrite: true,
-    mode: 0o600,
-  });
-  if (!written.ok) {
-    throw new AuditLogError(`could not write ${CHAIN_TAIL_FILENAME}: ${written.reason}`);
+/**
+ * Rewrite the anchor IN PLACE (see `./leaf`): a link or special file at the
+ * name is refused, and an append-only directory, where an entry can never be
+ * replaced by a rename, keeps working as it did on 0.7.0.
+ */
+function writeChainTail(rootDir: string, tail: ChainTail): void {
+  try {
+    overwriteLeaf(rootDir, CHAIN_TAIL_FILENAME, JSON.stringify(tail), 0o600);
+  } catch (err) {
+    throw new AuditLogError(
+      `could not write ${CHAIN_TAIL_FILENAME}: ${leafReason(CHAIN_TAIL_FILENAME, err)}`,
+    );
   }
+}
+
+function sameTail(a: ChainTail | undefined, b: ChainTail | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.day === b.day && a.hash === b.hash && a.seq === b.seq;
 }
 
 /** The chain files {@link verify} walks, each checked to be a regular file. */
@@ -478,9 +485,18 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
   const anchorStore = opts.anchorStore;
   const logId = opts.logId ?? opts.rootDir;
 
+  // A record this log appended whose anchor write then failed: `basedOn` is
+  // the anchor as it was read for that append, `wrote` the record's own
+  // tail. While the anchor on disk still says `basedOn`, the chain's real tip
+  // is `wrote` — reading the stale anchor instead would give the next record
+  // the same seq and prevHash, forking the chain for good.
+  let lagging: { readonly basedOn: ChainTail | undefined; readonly wrote: ChainTail } | undefined;
+
   return {
     async append(input: AppendInput): Promise<AuditRecord> {
-      const tail = readChainTail(opts.rootDir);
+      const anchored = readChainTail(opts.rootDir);
+      const tail =
+        lagging !== undefined && sameTail(anchored, lagging.basedOn) ? lagging.wrote : anchored;
       const prevHash = tail?.hash ?? GENESIS_HASH;
       // First record gets seq 0; thereafter strictly increment the tail's
       // seq. A pre-`seq` anchor (`seq` absent) is treated as -1 so the next
@@ -502,16 +518,22 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
       const today = day();
       // One O_APPEND write to a regular file at exactly this name: a link or
       // special file there is refused, never appended through.
-      const appended = appendContained(
-        opts.rootDir,
-        `${today}.jsonl`,
-        `${JSON.stringify(record)}\n`,
-        { mode: 0o600 },
-      );
-      if (!appended.ok) {
-        throw new AuditLogError(`could not append to ${today}.jsonl: ${appended.reason}`);
+      const dayFile = `${today}.jsonl`;
+      try {
+        appendLeaf(opts.rootDir, dayFile, `${JSON.stringify(record)}\n`, 0o600);
+      } catch (err) {
+        throw new AuditLogError(`could not append to ${dayFile}: ${leafReason(dayFile, err)}`);
       }
-      writeChainTail(opts.rootDir, today, hash, seq);
+      const wrote: ChainTail = { day: today, hash, seq };
+      try {
+        writeChainTail(opts.rootDir, wrote);
+        lagging = undefined;
+      } catch (err) {
+        lagging = { basedOn: anchored, wrote };
+        throw new AuditLogError(
+          `the record was appended to ${dayFile} (seq ${seq}), but the anchor was not updated — ${(err as Error).message}. The next append continues the chain from this record.`,
+        );
+      }
       // Best-effort: mirror the new tail to the off-host anchor. A failure
       // here (network/WORM hiccup) must NOT fail the durable local append —
       // the chain remains internally verifiable, and a lagging external
