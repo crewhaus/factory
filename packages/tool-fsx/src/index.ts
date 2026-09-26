@@ -47,11 +47,13 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   type CopyResult,
+  RELOCATE_DEFAULTS,
   type SafeFsFailure,
   beginAtomicWrite,
   checkRelocatedLinks,
   copyTreeSafe,
   ensureDirContained,
+  resolveContained,
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 import { openRegularFile } from "@crewhaus/tool-safety/streams";
@@ -1156,6 +1158,85 @@ export function _setMoveRenameForTest(fn: ((from: string, to: string) => void) |
   renameForMove = fn ?? renameSync;
 }
 
+/**
+ * Whether renaming `srcTop` into the directory `dstDir` (or, when that does
+ * not exist yet, its nearest existing ancestor) crosses a filesystem: the
+ * device numbers differ, which is when rename(2) answers EXDEV.
+ */
+function defaultCrossesFilesystem(srcTop: string, dstDir: string): boolean {
+  try {
+    const src = lstatSync(srcTop).dev;
+    let dir = dstDir;
+    for (;;) {
+      try {
+        return lstatSync(dir).dev !== src;
+      } catch {
+        const up = path.dirname(dir);
+        if (up === dir) return false;
+        dir = up;
+      }
+    }
+  } catch {
+    return false;
+  }
+}
+
+let crossesFilesystem: (srcTop: string, dstDir: string) => boolean = defaultCrossesFilesystem;
+
+/**
+ * Test seam: whether MovePath predicts that its rename will cross a
+ * filesystem, so a dry run can be shown to plan the copy it would fall back
+ * to. Pass `undefined` to restore.
+ */
+export function _setMoveCrossesFilesystemForTest(
+  fn: ((srcTop: string, dstDir: string) => boolean) | undefined,
+): void {
+  crossesFilesystem = fn ?? defaultCrossesFilesystem;
+}
+
+/**
+ * The name MovePath parks an existing destination under while it moves:
+ * beside it, so on its filesystem, and short, so it fits whatever the
+ * destination's own name is.
+ */
+function asideBase(): string {
+  return `.crewhaus-move-${randomBytes(6).toString("hex")}`;
+}
+
+/** An errno failure, by the caller's path, never the absolute one. */
+function errnoOf(err: unknown): string {
+  return (err as NodeJS.ErrnoException).code ?? "an error";
+}
+
+const MOVE_LINK_CAP_BASE = {
+  maxLinks: RELOCATE_DEFAULTS.maxLinks,
+  maxVisited: RELOCATE_DEFAULTS.maxVisited,
+};
+let moveLinkCapBase: { maxLinks: number; maxVisited: number } = MOVE_LINK_CAP_BASE;
+
+/**
+ * Test seam: the link check's base caps, so the way maxEntries raises them
+ * is exercised without a tree of 100 000 links. `undefined` restores.
+ */
+export function _setMoveLinkCapsForTest(
+  caps: { maxLinks: number; maxVisited: number } | undefined,
+): void {
+  moveLinkCapBase = caps ?? MOVE_LINK_CAP_BASE;
+}
+
+/**
+ * The caps on MovePath's link check: tool-safety's defaults (which bound a
+ * walk that reads nothing but link text), raised by the caller's maxEntries.
+ */
+function moveLinkCaps(maxEntries: number | undefined): { maxLinks: number; maxVisited: number } {
+  return {
+    maxLinks: Math.max(moveLinkCapBase.maxLinks, maxEntries ?? 0),
+    maxVisited: Math.max(moveLinkCapBase.maxVisited, (maxEntries ?? 0) * 20),
+  };
+}
+
+const MOVE_TOO_LARGE_HINT = "raise maxEntries (up to 500000), or move subdirectories one at a time";
+
 export const movePath: RegisteredTool = buildTool({
   name: "MovePath",
   operativeArgs: [
@@ -1175,7 +1256,31 @@ export const movePath: RegisteredTool = buildTool({
     }
     const existing = peek(source.abs);
     if (existing === undefined) return `no such path: ${source.rel}`;
-    const destExisting = peek(destination.abs);
+    const root = workspaceRoot();
+    // Where each really is: its directory resolved, its own name not
+    // followed (a link is moved as the link). The lexical checks above miss
+    // a symlinked spelling, and the one that matters here is the reverse
+    // overlap: a destination that holds the source. With overwrite, 0.7.0
+    // deleted the destination first — and the source with it, since it was
+    // inside — and then failed ENOENT (`MovePath proj/src -> proj`, or
+    // `pl/q -> p` with `pl -> p`). CopyPath refuses the same pair.
+    const srcAt = resolveContained(root, relArg(source), { followLeaf: false });
+    const dstAt = resolveContained(root, relArg(destination), { followLeaf: false });
+    if (!srcAt.ok) return refusal("moved", srcAt, "; nothing was moved");
+    if (!dstAt.ok) return refusal("moved", dstAt, "; nothing was moved");
+    const srcTop = srcAt.real;
+    const dstTop = dstAt.real;
+    if (srcTop === dstTop) return "source and destination are the same path";
+    // The workspace root holds everything; the link check below names that
+    // case ("names the workspace root") better than an overlap would.
+    if (destination.rel !== "" && isInside(dstTop, srcTop)) {
+      return json({
+        moved: false,
+        code: "overlaps-source",
+        reason: `${JSON.stringify(destination.rel)} holds ${JSON.stringify(source.rel)}: moving onto it would delete the source with it; nothing was moved`,
+      });
+    }
+    const destExisting = peek(dstTop);
     if (destExisting !== undefined && input.overwrite !== true) {
       return json({
         moved: false,
@@ -1190,12 +1295,42 @@ export const movePath: RegisteredTool = buildTool({
     // where it is, and the workspace's parent once `a/b` moves one level up.
     // Judged before anything moves, so dryRun gives the same verdict. A link
     // that leads out exactly where it led before (an absolute link to an
-    // interpreter) is moved as 0.7.0 moved it: the move adds no reach.
-    const root = workspaceRoot();
+    // interpreter) is moved as 0.7.0 moved it: the move adds no reach. The
+    // walk reads only link text, so its caps are far above a copy's; the
+    // caller's maxEntries raises them for a tree with more links still
+    // (a large pnpm node_modules), where fixed caps refused a rename 0.7.0
+    // made with no way through.
+    const maxEntries = input.maxEntries ?? 50_000;
     const relocated = checkRelocatedLinks(root, relArg(source), root, relArg(destination), {
       outsideLinks: "keep-unchanged",
+      ...moveLinkCaps(input.maxEntries),
     });
-    if (!relocated.ok) return refusal("moved", relocated, "; nothing was moved");
+    if (!relocated.ok) {
+      const hint = relocated.code === "too-large" ? `; ${MOVE_TOO_LARGE_HINT}` : "";
+      return refusal("moved", relocated, `; nothing was moved${hint}`);
+    }
+
+    // A rename that will cross a filesystem becomes a copy, and a copy can
+    // refuse what a rename would not (a FIFO, an unreadable file, more
+    // entries than maxEntries). Planned now, before anything is touched, so
+    // a dry run gives the verdict the real call will: 0.7.1 before this said
+    // "wouldOverwrite" and then refused mid-move. The plan is made against a
+    // name beside the destination when the destination exists, because the
+    // real copy goes into a destination the move has set aside.
+    const dstDir = path.dirname(dstTop);
+    const crossing = crossesFilesystem(srcTop, dstDir);
+    const copyOptions = (dryRun: boolean) => ({ maxEntries, overwrite: false, dryRun });
+    if (crossing) {
+      const planTarget =
+        destExisting === undefined
+          ? destination
+          : resolveSafe(
+              "MovePath",
+              path.posix.join(path.posix.dirname(relArg(destination)), asideBase()),
+            );
+      const plan = copyContained(source, planTarget, copyOptions(true));
+      if (!plan.ok) return crossRefusal(source, plan);
+    }
     if (input.dryRun === true) {
       return json({
         source: source.rel,
@@ -1203,41 +1338,57 @@ export const movePath: RegisteredTool = buildTool({
         dryRun: true,
         moved: false,
         wouldOverwrite: destExisting !== undefined,
+        ...(crossing ? { crossesFilesystem: true } : {}),
         ...outsideLinkFields(relocated.outsideLinks),
       });
     }
     const parent = ensureDirContained(root, path.posix.dirname(relArg(destination)));
     if (!parent.ok) return refusal("moved", parent, "; nothing was moved");
-    if (destExisting !== undefined) rmSync(destination.abs, { recursive: true, force: true });
+
+    // An existing destination is set aside, not deleted, until the move has
+    // succeeded: a copy that refuses, or a rename that fails, puts it back.
+    // 0.7.0 deleted it first, so a move that then failed lost it.
+    let aside: string | undefined;
+    if (destExisting !== undefined) {
+      aside = path.join(dstDir, asideBase());
+      try {
+        renameSync(dstTop, aside);
+      } catch (err) {
+        return `could not move ${source.rel}: the existing ${destination.rel} could not be set aside (${errnoOf(err)}); nothing was moved`;
+      }
+    }
+    const putBack = (): string => {
+      if (aside === undefined) return "";
+      try {
+        renameSync(aside, dstTop);
+        return `; ${destination.rel} was left as it was`;
+      } catch (err) {
+        return `; the existing ${destination.rel} could not be put back (${errnoOf(err)}) and is at ${path.posix.join(path.posix.dirname(relArg(destination)), path.basename(aside))}`;
+      }
+    };
     try {
-      renameForMove(source.abs, destination.abs);
+      renameForMove(srcTop, dstTop);
     } catch (err) {
       // A workspace can straddle mount points (a bind-mounted cache, a
       // container volume), and rename(2) cannot cross one. Fall back to
       // copy-then-delete, which is what `mv` does in the same situation.
-      if ((err as NodeJS.ErrnoException).code !== "EXDEV") {
-        return `could not move ${source.rel}: ${(err as Error).message}`;
+      if (errnoOf(err) !== "EXDEV") {
+        return `could not move ${source.rel} to ${destination.rel}: ${errnoOf(err)}${putBack()}`;
       }
-      const copied = copyContained(source, destination, {
-        maxEntries: input.maxEntries ?? 50_000,
-        overwrite: false,
-        dryRun: false,
-      });
+      const copied = copyContained(source, destination, copyOptions(false));
       if (!copied.ok) {
-        if (copied.code === "too-large") {
-          // The copy half of copy-then-delete would be partial, and the
-          // delete half would then destroy the only complete copy. Nothing
-          // was written, and the source is untouched.
-          return `${source.rel} has more entries than the cap allows, and this move has to cross a filesystem boundary — raise maxEntries, or move subdirectories one at a time`;
+        // Whatever the copy wrote before it failed is its own: the
+        // destination was set aside (or absent), and a copy that found
+        // something there refuses as "exists" without writing.
+        if (copied.code !== "exists" && peek(dstTop) !== undefined) {
+          rmSync(dstTop, { recursive: true, force: true });
         }
-        return refusal(
-          "moved",
-          copied,
-          `; the move had to cross a filesystem boundary, and ${source.rel} was left where it is`,
-        );
+        const restored = putBack();
+        return crossRefusal(source, copied, restored);
       }
-      rmSync(source.abs, { recursive: true, force: true });
+      rmSync(srcTop, { recursive: true, force: true });
     }
+    if (aside !== undefined) rmSync(aside, { recursive: true, force: true });
     return json({
       source: source.rel,
       destination: destination.rel,
@@ -1248,6 +1399,20 @@ export const movePath: RegisteredTool = buildTool({
     });
   },
 });
+
+/** A copy MovePath had to fall back to (or planned) refused: nothing moved, nothing lost. */
+function crossRefusal(source: SafePath, copied: SafeFsFailure, restored = ""): string {
+  if (copied.code === "too-large") {
+    // The copy half of copy-then-delete would be partial, and the delete
+    // half would then destroy the only complete copy.
+    return `${source.rel} has more entries than the cap allows, and this move has to cross a filesystem boundary — ${MOVE_TOO_LARGE_HINT}${restored}`;
+  }
+  return refusal(
+    "moved",
+    copied,
+    `; the move has to cross a filesystem boundary, and ${source.rel} was left where it is${restored}`,
+  );
+}
 
 export const removePath: RegisteredTool = buildTool({
   name: "RemovePath",
