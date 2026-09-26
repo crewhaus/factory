@@ -945,6 +945,9 @@ function checkToolConfigDelivery(ir: IrNode): {
       for (const u of c.unused) {
         warnings.push({ code: "tool-config-unused", path: u.path, message: u.message });
       }
+      for (const p of c.partialCaps) {
+        warnings.push({ code: "tool-config-partial-cap", path: p.path, message: p.message });
+      }
       for (const bad of malformedToolConfigRefs(blocks, candidate.path)) errors.push(bad);
     }
   }

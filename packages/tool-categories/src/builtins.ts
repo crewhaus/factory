@@ -94,6 +94,14 @@ export type BootRegistrar = {
    * registrar over probes and fails when it and these checks disagree.
    */
   readonly checks?: RegistrarChecks;
+  /**
+   * `tool_config` only: keys that bound what the model may do with every
+   * tool of this registration (a timeout cap). At boot one block configures
+   * all of them; a model pool candidate's block applies per tool, so compile
+   * warns when a candidate sets one of these under one tool's key and other
+   * tools of the registration are listed without it.
+   */
+  readonly capKeys?: ReadonlyArray<string>;
 };
 
 /** The data-only half of a registrar's validation. See {@link BootRegistrar.checks}. */
@@ -145,6 +153,7 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     source: "tool_config",
     label: "code execution (python, javascript, shell)",
     keys: ["codeExecution", "code_execution"],
+    capKeys: ["max_timeout_ms", "maxTimeoutMs"],
   },
   registerImageGenerationConfig: {
     package: "@crewhaus/tool-image-generation",

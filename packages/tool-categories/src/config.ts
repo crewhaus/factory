@@ -301,6 +301,8 @@ export function checkCandidateToolConfigs(
 ): {
   readonly conflicts: ReadonlyArray<ToolConfigNotice>;
   readonly unused: ReadonlyArray<ToolConfigNotice>;
+  /** A cap set for one tool of a registration that other listed tools share: see {@link BootRegistrar.capKeys}. */
+  readonly partialCaps: ReadonlyArray<ToolConfigNotice>;
 } {
   const conflicts: ToolConfigNotice[] = [];
   const unused: ToolConfigNotice[] = [];
@@ -335,7 +337,58 @@ export function checkCandidateToolConfigs(
       message: unusedMessage(key, { tools, path }),
     });
   }
-  return { conflicts, unused };
+  return { conflicts, unused, partialCaps: partialCandidateCaps(tools, entries, path) };
+}
+
+/**
+ * A candidate's block reaches one tool per call (see
+ * {@link toolConfigBlockFor}). A cap under one tool's own key therefore
+ * leaves the registration's other listed tools uncapped for that candidate,
+ * though at boot the same block caps them all. One notice per such key.
+ */
+function partialCandidateCaps(
+  tools: ReadonlyArray<string>,
+  entries: ReadonlyArray<readonly [string, unknown]>,
+  path: string,
+): ToolConfigNotice[] {
+  const out: ToolConfigNotice[] = [];
+  const listedBySymbol = new Map<string, Array<{ key: string; entry: BuiltinToolEntry }>>();
+  for (const key of new Set(tools)) {
+    const entry = entryOf(key);
+    if (entry?.initSymbol === undefined) continue;
+    listedBySymbol.set(entry.initSymbol, [
+      ...(listedBySymbol.get(entry.initSymbol) ?? []),
+      { key, entry },
+    ]);
+  }
+  for (const [symbol, listed] of listedBySymbol) {
+    const reg = TOOL_BOOT_REGISTRARS[symbol];
+    const caps = (reg?.capKeys ?? []).map((k) => k.toLowerCase());
+    if (caps.length === 0) continue;
+    const setsCap = (block: unknown): boolean =>
+      typeof block === "object" &&
+      block !== null &&
+      Object.keys(block).some((k) => caps.includes(k.toLowerCase()));
+    const familyKeys = (reg?.keys ?? []).map((k) => k.toLowerCase());
+    // A cap under the registration's own key reaches every tool of it.
+    if (entries.some(([k, v]) => familyKeys.includes(k.toLowerCase()) && setsCap(v))) continue;
+    const ownBlock = (t: { key: string; entry: BuiltinToolEntry }) => {
+      const own = new Set([t.key.toLowerCase(), t.entry.name.toLowerCase()]);
+      return entries.find(([k]) => own.has(k.toLowerCase()));
+    };
+    const capped = listed.filter((t) => setsCap(ownBlock(t)?.[1]));
+    const uncapped = listed.filter((t) => !capped.includes(t));
+    if (capped.length === 0 || uncapped.length === 0) continue;
+    const others = uncapped.map((t) => t.entry.name).join(", ");
+    for (const t of capped) {
+      const key = ownBlock(t)?.[0] ?? t.key;
+      out.push({
+        path: `${path}.${key}`,
+        message: `caps ${t.entry.name} only: a model pool candidate's block applies to the tool it is written under, so ${others} keep${uncapped.length === 1 ? "s" : ""} the boot cap for this candidate. To cap all of them, write it under ${path}.${documentedKey(symbol)}.`,
+      });
+    }
+  }
+  return out;
 }
 
 /**
