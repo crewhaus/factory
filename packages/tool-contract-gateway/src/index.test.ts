@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import { ToolCatalog } from "@crewhaus/tool-catalog";
+import { evmCall } from "@crewhaus/tool-evm";
+import { evmSendTransaction } from "@crewhaus/tool-evm-tx";
 import { canonicalFunction } from "@crewhaus/tool-onchain";
 import {
   type AbiItem,
@@ -298,6 +300,27 @@ describe("generated tools say they cross the network, and writes are intent-gate
     };
     expect(flags("usdc__transfer")).toEqual(send);
     expect(flags("usdc__deposit")).toEqual(send);
+  });
+
+  test("the flags stay those of EvmCall and EvmSendTransaction, the tools they stand in for", () => {
+    // Read from the tools themselves, not restated: if either builtin's flags
+    // move, the generated tools must move with them.
+    const of = (t: {
+      scope?: string;
+      ioCapability?: string;
+      requireJustification?: boolean;
+      destructive?: boolean;
+      readOnly?: boolean;
+    }) => ({
+      scope: t.scope,
+      ioCapability: t.ioCapability,
+      requireJustification: t.requireJustification,
+      destructive: t.destructive,
+      readOnly: t.readOnly,
+    });
+    expect(flags("usdc__balanceOf")).toEqual(of(evmCall));
+    expect(flags("usdc__transfer")).toEqual(of(evmSendTransaction));
+    expect(flags("usdc__deposit")).toEqual(of(evmSendTransaction));
   });
 
   test("the strict scope audit has nothing to report", () => {

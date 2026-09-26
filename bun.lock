@@ -2418,6 +2418,10 @@
         "@crewhaus/tool-onchain": "workspace:*",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/tool-evm": "workspace:*",
+        "@crewhaus/tool-evm-tx": "workspace:*",
+      },
     },
     "packages/tool-crewhaus": {
       "name": "@crewhaus/tool-crewhaus",
