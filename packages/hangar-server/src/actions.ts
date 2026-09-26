@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { loadRetentionConfig } from "@crewhaus/data-retention-engine";
 import {
   type BaselineEntry,
+  ReportError,
   readBaselines,
   readRunIndex,
   setBaseline,
@@ -182,7 +183,15 @@ export function pinBaseline(args: {
     ...(run.armsDigest !== undefined ? { armsDigest: run.armsDigest } : {}),
     ts: args.nowIso,
   };
-  setBaseline(entry, evalsDir);
+  try {
+    setBaseline(entry, evalsDir);
+  } catch (err) {
+    // eval-report refuses a pin file that is a link, a FIFO or not a JSON
+    // object, by name and reason: that is the operator's answer (a 409), not
+    // a server fault (a 500 whose reason only reached the server log).
+    if (err instanceof ReportError) return { outcome: "rejected", reason: err.message };
+    throw err;
+  }
   return { outcome: "ok", baseline: entry };
 }
 
