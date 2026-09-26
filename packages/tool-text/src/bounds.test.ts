@@ -9,7 +9,7 @@
  * The comparisons are refused above a cell budget, before any work.
  */
 import { describe, expect, test } from "bun:test";
-import { fuzzyMatch, textSimilarity } from "./index";
+import { fuzzyMatch, textDiff, textSimilarity } from "./index";
 import { ENTITY_PATTERNS, extractEntities, matchesOf } from "./lib/entities";
 import { MAX_SIMILARITY_CELLS, similarityCost } from "./lib/similarity";
 
@@ -215,6 +215,22 @@ describe("edit-distance comparisons are refused above the cell budget", () => {
     });
     expect(one).toMatch(/^candidates\[1\]: inputs too large for jaro/);
   }, 20_000);
+
+  test("TextDiff's line table is held to the same shared budget, before any of it is built", async () => {
+    // The ceiling TextDiff has had since 0.7.0, now the shared constant: one
+    // line more than a 5,000 x 5,000 table is refused by name, and a diff
+    // well inside it still runs.
+    const lines = (prefix: string, n: number): string =>
+      Array.from({ length: n }, (_, i) => `${prefix}${i}`).join("\n");
+    expect((5_000 + 1) * (5_000 + 1)).toBeGreaterThan(MAX_SIMILARITY_CELLS);
+    expect(await out(textDiff, { a: lines("a", 5_000), b: lines("b", 5_000) })).toBe(
+      "inputs too large to diff (5000 x 5000 lines) — diff a narrower region",
+    );
+    const small = JSON.parse(
+      await out(textDiff, { a: lines("a", 3), b: lines("a", 4), statsOnly: true }),
+    );
+    expect(small).toEqual({ added: 1, removed: 0, same: 3, identical: false });
+  });
 
   test("a sanctions-list-sized call fits: ten thousand names against a name", async () => {
     const names = Array.from({ length: 10_000 }, (_, i) => `Company Holdings Number ${i} Limited`);
