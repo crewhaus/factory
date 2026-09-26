@@ -104,8 +104,8 @@ async function register(
   return { catalog, skipped, withheld };
 }
 
-const WITHHELD_DESCRIPTION = (full: string) =>
-  `MCP tool ${full} (its description was withheld by crewhaus).`;
+const WITHHELD_DESCRIPTION = (server: string, tool: string) =>
+  `Tool "${tool}" of MCP server "${server}" (its description was withheld by crewhaus).`;
 
 const clean: McpToolDefinition = {
   name: "list_issues",
@@ -122,7 +122,7 @@ describe("a remote tool's definition is screened before the model sees it", () =
       { name: "bad", description: `Lists issues. ${INJ}`, inputSchema: { type: "object" } },
     ]);
     expect(catalog.list().map((t) => t.name)).toEqual(["mcp__gh__list_issues", "mcp__gh__bad"]);
-    expect(catalog.get("mcp__gh__bad")?.description).toBe(WITHHELD_DESCRIPTION("mcp__gh__bad"));
+    expect(catalog.get("mcp__gh__bad")?.description).toBe(WITHHELD_DESCRIPTION("gh", "bad"));
     expect(seen(catalog)).not.toContain("Ignore all previous");
     expect(skipped).toEqual([]);
     expect(withheld).toHaveLength(1);
@@ -235,7 +235,7 @@ describe("a remote tool's definition is screened before the model sees it", () =
       },
     ]);
     expect(skipped).toEqual([]);
-    expect(catalog.get("mcp__gh__split")?.description).toBe(WITHHELD_DESCRIPTION("mcp__gh__split"));
+    expect(catalog.get("mcp__gh__split")?.description).toBe(WITHHELD_DESCRIPTION("gh", "split"));
     expect(catalog.get("mcp__gh__split")?.jsonSchema).toEqual({
       type: "object",
       properties: { q: { type: "string" } },
@@ -387,9 +387,7 @@ describe("a remote tool's definition is size-capped", () => {
     const head = await register([
       { name: "list", description: `${pad.slice(0, 2_000)} ${INJ} ${pad}`, inputSchema: {} },
     ]);
-    expect(head.catalog.get("mcp__gh__list")?.description).toBe(
-      WITHHELD_DESCRIPTION("mcp__gh__list"),
-    );
+    expect(head.catalog.get("mcp__gh__list")?.description).toBe(WITHHELD_DESCRIPTION("gh", "list"));
     expect(head.withheld[0]?.reason).toMatch(/reads as a prompt injection/);
   });
 
@@ -578,7 +576,7 @@ describe("every registration path screens", () => {
       refused: ["wiki_search"],
     });
     expect(catalog.get("wiki_recall")?.description).toBe(
-      WITHHELD_DESCRIPTION("mcp__thredz__wiki_recall"),
+      WITHHELD_DESCRIPTION("thredz", "wiki_recall"),
     );
     expect(catalog.has("wiki_search")).toBe(false);
     expect(skipped).toEqual(["wiki_search"]);

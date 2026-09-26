@@ -264,7 +264,9 @@ export async function screenMcpToolDefinition(
     ...remote,
     ...(withholdDesc
       ? {
-          description: `MCP tool ${namespacedToolName(serverName, name)} (its description was withheld by crewhaus).`,
+          // Names the server's own tool, not a catalog name: an alias is
+          // registered under the bare name, so this reads true either way.
+          description: `Tool "${name}" of MCP server "${serverName}" (its description was withheld by crewhaus).`,
         }
       : {}),
     ...(withholdProse ? { inputSchema: withoutProse(remote.inputSchema) } : {}),
