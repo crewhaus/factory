@@ -276,6 +276,8 @@ One heuristic for "this name holds a credential": KEY, TOKEN, SECRET, PASSWORD, 
 ### Redaction
 
 - `redactKnownSecrets(text, values)` and `createSecretRedactor(values)` replace each known secret in text. They also catch its URL-encoded, base64, base64url and JSON-escaped spellings and a trimmed copy. A composite, such as a Basic header's `base64(user:secret)`, cannot be derived from the secret alone, so pass it as a value of its own.
+- **A cut can split a secret.** A byte cap, a preview or a window can leave a prefix of an echoed credential that no whole form matches, and it can be every character but the last. So these functions also replace a run at a string's end that is the start of a form, or a run at its start that is the end of one, when that run is at least `minLength` characters long.
+- `trimSecretTail(text, values)` is for a caller that cut a text itself. It removes a partial run of any length from the end, and should be applied at the cut.
 - `redactKnownSecretsDeep(value, values)` redacts every string in a result object, keys included, and the result still round-trips through JSON.
 - `redactUrlCredentials(url)` replaces the whole userinfo and the value of each query or fragment parameter whose name is credential-shaped (`token`, `api_key`, `X-Amz-Signature`, `access_token` …) or whose value looks like a token. Everything else is left as written. `redactUrlCredentialsInText(text)` does this for every URL in an error message or a log line.
 

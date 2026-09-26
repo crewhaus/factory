@@ -13,7 +13,9 @@
  *   and must not be quoted back.
  * - {@link redactKnownSecrets} / {@link createSecretRedactor} /
  *   {@link redactKnownSecretsDeep}: known secret values out of text and
- *   results, in their encoded spellings too.
+ *   results, in their encoded spellings too, and the part of one a cut
+ *   left at a string's edge. {@link trimSecretTail}: for a caller that
+ *   cut a text itself, the start of a secret removed from its end.
  * - {@link redactUrlCredentials} / {@link redactUrlCredentialsInText}:
  *   userinfo and credential-named parameters out of URLs.
  */
@@ -46,4 +48,5 @@ export {
   redactUrlCredentials,
   redactUrlCredentialsInText,
   secretForms,
+  trimSecretTail,
 } from "./redact";

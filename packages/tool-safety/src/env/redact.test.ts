@@ -7,9 +7,52 @@ import {
   redactUrlCredentials,
   redactUrlCredentialsInText,
   secretForms,
+  trimSecretTail,
 } from "./redact";
 
 const SECRET = "sk-ant-CANARY-000111222333";
+
+describe("a secret a cut left at a string's edge (C050, net review)", () => {
+  test("the start of a secret at the end of a string is replaced, down to minLength characters", () => {
+    let checked = 0;
+    for (const keep of [SECRET.length - 1, SECRET.length - 10, 6]) {
+      const text = `Authorization: Bearer ${SECRET.slice(0, keep)}`;
+      expect({ keep, out: redactKnownSecrets(text, [SECRET]) }).toEqual({
+        keep,
+        out: `Authorization: Bearer ${REDACTED}`,
+      });
+      checked += 1;
+    }
+    expect(checked).toBe(3);
+    // Below minLength it is not worth shredding text for.
+    expect(redactKnownSecrets("end sk-an", [SECRET])).toBe("end sk-an");
+  });
+
+  test("the end of a secret at the start of a string, and an encoded form cut, are replaced too", () => {
+    expect(redactKnownSecrets(`${SECRET.slice(8)} rest`, [SECRET])).toBe(`${REDACTED} rest`);
+    const b64 = Buffer.from(SECRET).toString("base64");
+    expect(redactKnownSecrets(`x ${b64.slice(0, -3)}`, [SECRET])).toBe(`x ${REDACTED}`);
+    // A string that is nothing but part of a secret becomes one placeholder.
+    expect(redactKnownSecrets(SECRET.slice(0, -1), [SECRET])).toBe(REDACTED);
+    expect(redactKnownSecrets(SECRET.slice(1), [SECRET])).toBe(REDACTED);
+    // Unrelated text is left alone.
+    expect(redactKnownSecrets("nothing like it", [SECRET])).toBe("nothing like it");
+  });
+
+  test("a JSON result's cut value is redacted value by value", () => {
+    const out = redactKnownSecretsDeep({ body: `echo ${SECRET.slice(0, -1)}`, n: 1 }, [SECRET]);
+    expect(out).toEqual({ body: `echo ${REDACTED}`, n: 1 });
+  });
+
+  test("trimSecretTail removes any partial run from text the caller cut, and nothing else", () => {
+    expect(trimSecretTail(`body ${SECRET.slice(0, 3)}`, [SECRET])).toBe("body ");
+    expect(trimSecretTail(`body ${SECRET.slice(0, -1)}`, [SECRET])).toBe("body ");
+    // A whole form is the redactor's job, and plain text is untouched.
+    expect(trimSecretTail(`body ${SECRET}`, [SECRET])).toBe(`body ${SECRET}`);
+    expect(trimSecretTail("body text", [SECRET])).toBe("body text");
+    expect(trimSecretTail("body text", [])).toBe("body text");
+  });
+});
 
 describe("redactKnownSecrets", () => {
   test("a secret echoed in a response body is replaced (config-delivery#4, security-8#4)", () => {

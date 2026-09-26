@@ -43,7 +43,12 @@
 import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
-import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
+import {
+  isEnvName,
+  looksLikePastedSecret,
+  resolveCredentialEnv,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
 import {
   type ResponseReadFailure,
   fetchRaw,
@@ -1245,15 +1250,20 @@ export type CappedBody = {
  * (see `pinnedFetch`), a gzip, deflate, br or zstd body is decoded here in
  * small steps, and the decoder stops once `maxBytes` exist, so a hostile
  * server cannot pin memory with a compressed reply.
+ *
+ * `secrets` are the call's credential values. When the cap cuts the body,
+ * the cut can fall inside an echoed credential, and what is left at the end
+ * is a prefix no whole-form redaction matches (C050): it is trimmed here.
  */
 export async function readCapped(
   res: Response,
   maxBytes: number,
   signal?: AbortSignal,
+  secrets: readonly string[] = [],
 ): Promise<CappedBody> {
   const raw = await readBytesCapped(res, maxBytes, signal);
   return {
-    text: raw.text,
+    text: raw.truncated && secrets.length > 0 ? trimSecretTail(raw.text, secrets) : raw.text,
     bytes: raw.bytes.byteLength,
     truncated: raw.truncated,
     undecodedEncoding: raw.undecodedEncoding,

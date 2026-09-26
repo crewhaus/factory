@@ -1983,7 +1983,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "downloadFile",
     name: "DownloadFile",
     description:
-      "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination.",
+      "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination. A body that contains the credential the call sent (a server echoing it) is refused, because a file is not scrubbed the way a result is.",
     readOnly: false,
     destructive: true,
     scope: "external",

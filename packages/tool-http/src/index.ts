@@ -51,7 +51,12 @@ import { connect as tlsConnect } from "node:tls";
 import type { DetailedPeerCertificate } from "node:tls";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
-import { redactKnownSecrets, redactKnownSecretsDeep } from "@crewhaus/tool-safety/env";
+import {
+  redactKnownSecrets,
+  redactKnownSecretsDeep,
+  secretForms,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
 import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { decodeBody } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
@@ -268,19 +273,42 @@ function setDefaultHeader(headers: Record<string, string>, name: string, value: 
   headers[name] = value;
 }
 
-/** Parse a body as JSON, or say why it is not JSON without dumping it all back. */
+/**
+ * Parse a body as JSON, or say why it is not JSON without dumping it all
+ * back. The preview is a cut, and a cut can fall inside a credential the
+ * server echoed (C050): whatever part of one it leaves at the end is
+ * trimmed, so the scrubber, which matches whole forms, is not relied on.
+ */
 function parseJsonBody(
   text: string,
+  secrets: readonly string[],
 ): { ok: true; value: unknown } | { ok: false; message: string } {
   try {
     return { ok: true, value: JSON.parse(text) };
   } catch (err) {
-    const preview = text.slice(0, 200);
+    const preview = text.length > 200 ? trimSecretTail(text.slice(0, 200), secrets) : text;
     return {
       ok: false,
       message: `response body is not JSON (${(err as Error).message}); first 200 characters: ${preview}`,
     };
   }
+}
+
+/**
+ * Whether `bytes` hold any spelling of a credential this call sent, at the
+ * length the scrubber redacts (six characters and up). A result is
+ * scrubbed on its way out; a file written to the workspace is not, and any
+ * later Read would return it whole (C050).
+ */
+function holdsSecret(bytes: Uint8Array, secrets: readonly string[]): boolean {
+  const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (const value of secrets) {
+    if (value.trim().length < 6) continue;
+    for (const form of secretForms(value)) {
+      if (form.length >= 6 && buf.includes(form)) return true;
+    }
+  }
+  return false;
 }
 
 /** Run `fn` over `items` with at most `limit` in flight, results in input order. */
@@ -443,8 +471,8 @@ export const httpRequest: RegisteredTool = buildTool({
             continue;
           }
         }
-        const body = await readCapped(opened.res, maxBytes, deadline.signal);
-        const parsed = input.parseJson === true ? parseJsonBody(body.text) : undefined;
+        const body = await readCapped(opened.res, maxBytes, deadline.signal, secrets);
+        const parsed = input.parseJson === true ? parseJsonBody(body.text, secrets) : undefined;
         if (parsed !== undefined && !parsed.ok) return parsed.message;
         return json({
           status,
@@ -602,7 +630,7 @@ export const httpPaginate: RegisteredTool = buildTool({
           credentialOrigin,
         });
         if (opened.credentialsDropped) credentialsDropped = true;
-        const body = await readCapped(opened.res, maxBytes, deadline.signal);
+        const body = await readCapped(opened.res, maxBytes, deadline.signal, secrets);
         pages++;
         totalBytes += body.bytes;
         if (opened.res.status < 200 || opened.res.status >= 300) {
@@ -628,7 +656,7 @@ export const httpPaginate: RegisteredTool = buildTool({
             note: `page ${pages} exceeded the ${maxBytes}-byte cap, so it could not be parsed; raise maxBytes or request a smaller page size`,
           });
         }
-        const parsed = parseJsonBody(body.text);
+        const parsed = parseJsonBody(body.text, secrets);
         if (!parsed.ok) return `page ${pages}: ${parsed.message}`;
 
         const rawItems =
@@ -769,11 +797,12 @@ export const graphqlQuery: RegisteredTool = buildTool({
         opened.res,
         input.maxBytes ?? DEFAULT_MAX_BYTES,
         deadline.signal,
+        secrets,
       );
       if (body.truncated) {
         return `the GraphQL response exceeded the ${input.maxBytes ?? DEFAULT_MAX_BYTES}-byte cap and could not be parsed — narrow the selection set or raise maxBytes`;
       }
-      const parsed = parseJsonBody(body.text);
+      const parsed = parseJsonBody(body.text, secrets);
       if (!parsed.ok) {
         return `HTTP ${opened.res.status}: ${parsed.message}`;
       }
@@ -884,7 +913,7 @@ export const httpBatch: RegisteredTool = buildTool({
               credentialHeaders: prepared.secretHeaders,
               credentialOrigins: prepared.credentialOrigins,
             });
-            const body = await readCapped(opened.res, maxBytes, deadline.signal);
+            const body = await readCapped(opened.res, maxBytes, deadline.signal, secrets);
             return {
               index,
               url: req.url,
@@ -926,7 +955,7 @@ export const downloadFile: RegisteredTool = buildTool({
     { field: "path", kind: "path" },
   ],
   description:
-    "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination.",
+    "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination. A body that contains the credential the call sent (a server echoing it) is refused, because a file is not scrubbed the way a result is.",
   inputSchema: z.object({
     url: urlSchema,
     path: z
@@ -1010,6 +1039,9 @@ export const downloadFile: RegisteredTool = buildTool({
       const raw = await readBytesCapped(opened.res, maxBytes + 1, deadline.signal);
       if (raw.truncated || raw.bytes.byteLength > maxBytes) {
         return `the response is larger than the ${maxBytes}-byte cap — nothing was written; raise maxBytes if the file really is that big`;
+      }
+      if (holdsSecret(raw.bytes, secrets)) {
+        return "the response body contains the credential this call sent (the server echoed it back), so nothing was written: a file in the workspace is not scrubbed the way a result is";
       }
       const digest = createHash("sha256").update(raw.bytes).digest("hex");
       if (input.expectedSha256 !== undefined && digest !== input.expectedSha256.toLowerCase()) {
@@ -1405,8 +1437,9 @@ export const httpWaitFor: RegisteredTool = buildTool({
               opened.res,
               input.maxBytes ?? DEFAULT_MAX_BYTES,
               deadline.signal,
+              secrets,
             );
-            const parsed = parseJsonBody(body.text);
+            const parsed = parseJsonBody(body.text, secrets);
             if (parsed.ok) {
               jsonOk = matchesPredicateSafely(parsed.value, predicate);
               lastError = undefined;

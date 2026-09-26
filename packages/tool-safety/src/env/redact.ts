@@ -57,12 +57,53 @@ export function secretForms(value: string): string[] {
   return [...forms];
 }
 
+/** The forms a redactor looks for: every {@link secretForms} spelling at least `minLength` long. */
+function formsOf(values: Iterable<string | undefined>, minLength: number): string[] {
+  const forms = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string" || value.trim().length < minLength) continue;
+    for (const form of secretForms(value)) if (form.length >= minLength) forms.add(form);
+  }
+  return [...forms].sort((a, b) => b.length - a.length);
+}
+
+/**
+ * How many characters at the end of `text` are the START of `form` (a
+ * proper prefix, at least `min` long), or 0. Checked from the longest
+ * candidate down, and only where the first character matches, so the cost
+ * is one pass over the form's length.
+ */
+function partialAtEnd(text: string, form: string, min: number): number {
+  const first = form.charCodeAt(0);
+  for (let p = Math.max(0, text.length - form.length + 1); p <= text.length - min; p++) {
+    if (text.charCodeAt(p) === first && form.startsWith(text.slice(p))) return text.length - p;
+  }
+  return 0;
+}
+
+/** How many characters at the start of `text` are the END of `form` (a proper suffix, at least `min` long), or 0. */
+function partialAtStart(text: string, form: string, min: number): number {
+  const last = form.charCodeAt(form.length - 1);
+  for (let n = Math.min(form.length - 1, text.length); n >= min; n--) {
+    if (text.charCodeAt(n - 1) === last && form.endsWith(text.slice(0, n))) return n;
+  }
+  return 0;
+}
+
 /**
  * A function that replaces every known secret value, in each of its
  * {@link secretForms}, with the placeholder. Built once, applied to many
  * strings. Longest forms first, so a secret that contains another is
  * replaced whole. Matching is literal (`split`/`join`): a secret full of
  * regex metacharacters is matched as written.
+ *
+ * A cut can split a secret: a byte cap, a preview, a window. What is left at
+ * the edge is a prefix (or suffix) that no whole form matches, and it can be
+ * every character of the secret but one. So, as a backstop, a string that
+ * ENDS with the start of a form, or STARTS with the end of one, has that run
+ * replaced too, when it is at least `minLength` long. A caller that knows it
+ * cut a string should also trim it with {@link trimSecretTail}, which
+ * removes a partial run of any length.
  */
 export function createSecretRedactor(
   values: Iterable<string | undefined>,
@@ -70,18 +111,41 @@ export function createSecretRedactor(
 ): (text: string) => string {
   const minLength = options.minLength ?? DEFAULT_MIN_LENGTH;
   const placeholder = options.placeholder ?? REDACTED;
-  const forms = new Set<string>();
-  for (const value of values) {
-    if (typeof value !== "string" || value.trim().length < minLength) continue;
-    for (const form of secretForms(value)) if (form.length >= minLength) forms.add(form);
-  }
-  const ordered = [...forms].sort((a, b) => b.length - a.length);
+  const ordered = formsOf(values, minLength);
   if (ordered.length === 0) return (text) => text;
   return (text: string): string => {
     let out = text;
     for (const form of ordered) if (out.includes(form)) out = out.split(form).join(placeholder);
-    return out;
+    let tail = 0;
+    let head = 0;
+    for (const form of ordered) {
+      tail = Math.max(tail, partialAtEnd(out, form, minLength));
+      head = Math.max(head, partialAtStart(out, form, minLength));
+    }
+    if (head === 0 && tail === 0) return out;
+    if (head + tail >= out.length) return placeholder;
+    return `${head > 0 ? placeholder : ""}${out.slice(head, out.length - tail)}${tail > 0 ? placeholder : ""}`;
   };
+}
+
+/**
+ * `text`, which the caller has just CUT (a byte cap, a preview), without a
+ * trailing run that is the start of a known secret form — what a cut
+ * through an echoed credential leaves behind. Any run of at least
+ * `minPartial` characters (default 1) is removed: the caller knows the text
+ * was cut, so a partial match is the secret, not a coincidence. Whole forms
+ * are left for {@link createSecretRedactor}.
+ */
+export function trimSecretTail(
+  text: string,
+  values: Iterable<string | undefined>,
+  options: { readonly minLength?: number; readonly minPartial?: number } = {},
+): string {
+  const forms = formsOf(values, options.minLength ?? DEFAULT_MIN_LENGTH);
+  let tail = 0;
+  for (const form of forms)
+    tail = Math.max(tail, partialAtEnd(text, form, options.minPartial ?? 1));
+  return tail > 0 ? text.slice(0, text.length - tail) : text;
 }
 
 /** `text` with every known secret value replaced. See {@link createSecretRedactor}. */
