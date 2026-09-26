@@ -234,16 +234,16 @@ describe("isCredentialShapedName covers every other copy in the repo", () => {
 
   test("the sweep finds the copies it is meant to check", () => {
     // compiler + preflight CREDENTIAL_SHAPED_KEY_RE, tool-secrets
-    // SECRETISH_KEY_RE, tool-crewhaus's CLI-flag CREDENTIAL_FLAG_RE, and
-    // tool-categories' CREDENTIAL_KEY_RE (which tool_config keys must carry a
-    // well-formed $ENV reference).
+    // SECRETISH_KEY_RE, and tool-categories' CREDENTIAL_KEY_RE (which
+    // tool_config keys must carry a well-formed $ENV reference).
+    // tool-crewhaus's CLI-flag CREDENTIAL_FLAG_RE is gone: its spec view now
+    // asks nameWords + credentialShapeOf from here, so it is not a copy.
     expect(copies.regexes.map((c) => c.file).sort()).toEqual([
       "packages/compiler/src/index.ts",
       "packages/preflight/src/secret-grammar.ts",
       // Two here: the separator/compound form and the camelCase form.
       "packages/tool-categories/src/config.ts",
       "packages/tool-categories/src/config.ts",
-      "packages/tool-crewhaus/src/lib/spec-view.ts",
       "packages/tool-secrets/src/index.ts",
     ]);
     // run-context's SECRET_ASSIGNMENT and tool-secure's CREDENTIAL_CONTEXT
@@ -262,7 +262,23 @@ describe("isCredentialShapedName covers every other copy in the repo", () => {
     for (const { re } of copies.regexes) {
       for (const w of re.source.match(/[A-Za-z]{2,}/g) ?? []) words.add(w.toUpperCase());
     }
-    for (const w of ["key", "token", "secret", "password", "passwd", "pwd", "auth"]) words.add(w);
+    // The words the retired tool-crewhaus flag copy contributed stay in the
+    // corpus, so its names are still exercised against the copies that remain.
+    for (const w of [
+      "key",
+      "token",
+      "secret",
+      "password",
+      "passwd",
+      "pwd",
+      "auth",
+      "bearer",
+      "credentials",
+      "pat",
+      "api",
+    ]) {
+      words.add(w);
+    }
     const out = new Set<string>();
     for (const w of words) {
       const lower = w.toLowerCase();
@@ -331,7 +347,8 @@ describe("isCredentialShapedName covers every other copy in the repo", () => {
       if (!isCredentialShapedName(name)) missed.push(name);
     }
     expect(missed).toEqual([]);
-    // The corpus exercises the copies, not just this function.
-    expect(flaggedByCopies).toBeGreaterThan(100);
+    // The corpus exercises the copies, not just this function. (93 with the
+    // tool-crewhaus flag copy retired, from 100+ while it was one.)
+    expect(flaggedByCopies).toBeGreaterThan(90);
   });
 });
