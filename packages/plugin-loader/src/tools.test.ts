@@ -67,7 +67,7 @@ describe("a malformed plugin tool refuses the plugin at boot, naming the field (
     ],
     ["destructive", 0, "destructive is number 0, not true or false"],
     ["concurrencySafe", "yes", 'concurrencySafe is the string "yes", not true or false'],
-    ["classifyOutput", null, "classifyOutput is null, not true or false"],
+    ["classifyOutput", "no", 'classifyOutput is the string "no", not true or false'],
     ["scope", "External", 'scope is the string "External", not "internal" or "external"'],
     ["ioCapability", "net", 'ioCapability is the string "net", not "network" or "process"'],
     ["description", 42, "description is number 42, not a string"],
@@ -85,6 +85,58 @@ describe("a malformed plugin tool refuses the plugin at boot, naming the field (
     await expect(run).rejects.toThrow(
       `plugin "maker" tool "wipe": ${why} — refusing to load the plugin`,
     );
+  });
+
+  test("null is not set, as buildTool always read it: the tool loads with the same defaults", async () => {
+    const nulls = {
+      description: null,
+      concurrencySafe: null,
+      readOnly: null,
+      destructive: null,
+      requiresSandbox: null,
+      classifyOutput: null,
+      requireJustification: null,
+      scope: null,
+      ioCapability: null,
+      jsonSchema: null,
+      concurrencyClassifier: null,
+      requiresModelFeatures: null,
+      operativeArgs: null,
+    };
+    const inputSchema = z.object({ path: z.string() });
+    const activated = await activate({ maker: [good({ ...nulls, inputSchema })] });
+    const { execute: _a, ...got } = activated.tools[0] as ReturnType<typeof buildTool>;
+    const { execute: _b, ...want } = buildTool(good({ description: undefined, inputSchema }));
+    expect(got).toEqual(want);
+    expect(got).toMatchObject({
+      readOnly: false,
+      destructive: false,
+      requiresSandbox: false,
+      requireJustification: false,
+      classifyOutput: true,
+      scope: "internal",
+    });
+    for (const field of Object.keys(nulls)) {
+      expect({ field, value: (got as Record<string, unknown>)[field] }).not.toEqual({
+        field,
+        value: null,
+      });
+    }
+    expect(Object.keys(nulls)).toHaveLength(13);
+  });
+
+  test("a tool that inherits its fields keeps them when a null is dropped", async () => {
+    class Wipe {
+      name = "wipe";
+      readOnly = null;
+      inputSchema = z.object({ path: z.string() });
+      async execute() {
+        return "ran from the prototype";
+      }
+    }
+    const activated = await activate({ maker: [new Wipe()] });
+    expect(activated.tools[0]?.readOnly).toBe(false);
+    expect(await activated.tools[0]?.execute({ path: "/x" })).toBe("ran from the prototype");
   });
 
   test("a schema crewhaus cannot validate or describe is refused at boot, not on the first turn", async () => {

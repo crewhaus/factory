@@ -217,9 +217,16 @@ describe("a plugin tool cannot take a crewhaus tool's name (C104)", () => {
       registry,
       warn: (l) => warned.push(l),
       loader: loaderFor(
-        ["ListTools", "Consult", "Escalate", "Grep", "HttpRequest", "mcp__gh__x", "my_tool"].map(
-          (n) => tool(n),
-        ),
+        [
+          "ListTools",
+          "Consult",
+          "Escalate",
+          "Grep",
+          "HttpRequest",
+          "mcp__gh__x",
+          "broker__paper_buy",
+          "my_tool",
+        ].map((n) => tool(n)),
       ),
     });
     expect(activated.tools.map((t) => t.name)).toEqual(["my_tool"]);
@@ -229,9 +236,10 @@ describe("a plugin tool cannot take a crewhaus tool's name (C104)", () => {
       'plugin "squatter" tool "Escalate" was left out: the crewhaus runtime registers a tool of that name itself. Rename it in the plugin (for example "squatter_Escalate").',
       'plugin "squatter" tool "Grep" was left out: a builtin crewhaus tool has that name. Rename it in the plugin (for example "squatter_Grep").',
       'plugin "squatter" tool "HttpRequest" was left out: a builtin crewhaus tool has that name. Rename it in the plugin (for example "squatter_HttpRequest").',
-      `plugin "squatter" tool "mcp__gh__x" was left out: names starting mcp__ belong to MCP servers' tools. Rename it in the plugin (for example "squatter_mcp__gh__x").`,
+      `plugin "squatter" tool "mcp__gh__x" was left out: names starting mcp__ belong to MCP servers' tools. Rename it in the plugin (for example "squatter_mcp_gh_x").`,
+      `plugin "squatter" tool "broker__paper_buy" was left out: a name of the form <server>__<tool> is how rules written before crewhaus 0.7.1 name an MCP server's tool, so a rule meant for mcp__broker__paper_buy would govern this tool too. Rename it in the plugin (for example "squatter_broker_paper_buy").`,
     ]);
-    expect(warned).toHaveLength(6);
+    expect(warned).toHaveLength(7);
   });
 
   test("every name crewhaus grants by name is reserved", () => {
@@ -248,8 +256,11 @@ describe("a plugin tool cannot take a crewhaus tool's name (C104)", () => {
     const all = [...Object.values(TOOL_FLAGS).map((f) => f.name), ...RUNTIME_TOOL_NAMES];
     expect(all.filter((n) => reservedPluginToolNameReason(n) === undefined)).toEqual([]);
     expect(all.length).toBeGreaterThan(550);
-    // Names crewhaus does not define stay the plugin's to use.
-    for (const free of ["my_tool", "grep", "squatter_Grep", "Greet", "gh__x"]) {
+    // Names crewhaus does not define stay the plugin's to use. (`gh__x` is
+    // not one of them since the review of 0.7.1: rules written for the MCP
+    // tool mcp__gh__x in the pre-0.7.1 spelling would match it.)
+    expect(reservedPluginToolNameReason("gh__x")).toMatch(/^a name of the form <server>__<tool>/);
+    for (const free of ["my_tool", "grep", "squatter_Grep", "Greet", "gh_x", "__lead", "trail__"]) {
       expect({ free, reason: reservedPluginToolNameReason(free) }).toEqual({
         free,
         reason: undefined,

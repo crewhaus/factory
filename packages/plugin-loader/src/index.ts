@@ -36,7 +36,7 @@ import {
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
 import { auditToolScopes, buildTool } from "@crewhaus/tool-builder";
-import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { type ToolExecuteContext, legacyMcpToolName } from "@crewhaus/tool-catalog";
 import { RUNTIME_TOOL_NAMES, TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 import {
   createExclusive,
@@ -1148,7 +1148,12 @@ export type ActivatePluginsOptions = {
  * - a tool the runtime registers itself (`ListTools`, `Skill`, `Task`, the
  *   Focus/Plan/Goal and memory tools, `Consult`, `Escalate`, …): a plugin one
  *   would displace it, and inherit its builtin alwaysAllow where it has one;
- * - an `mcp__` name, which everything reads as an MCP server's tool.
+ * - an `mcp__` name, which everything reads as an MCP server's tool;
+ * - a `<server>__<tool>` name, how an MCP server's tool was named before
+ *   0.7.1: permission rules, skill and sub-agent tool lists and rate limits
+ *   written that way still match `mcp__<server>__<tool>`, so a rule meant
+ *   for the MCP tool (`alwaysAllow: broker__paper_buy`) would grant a plugin
+ *   tool of that name too.
  *
  * Names come from `@crewhaus/tool-registry-manifest/flags`, the generated
  * list every builtin and runtime tool is checked against, so a tool added
@@ -1160,7 +1165,15 @@ export function reservedPluginToolNameReason(name: string): string | undefined {
     return "the crewhaus runtime registers a tool of that name itself";
   }
   if (name.startsWith("mcp__")) return "names starting mcp__ belong to MCP servers' tools";
+  if (legacyMcpToolName(`mcp__${name}`) !== undefined) {
+    return `a name of the form <server>__<tool> is how rules written before crewhaus 0.7.1 name an MCP server's tool, so a rule meant for mcp__${name} would govern this tool too`;
+  }
   return undefined;
+}
+
+/** A name a reserved plugin tool could take instead: prefixed with its plugin's, with no `__`. */
+function suggestedPluginToolName(pluginName: string, toolName: string): string {
+  return `${pluginName}_${toolName}`.replace(/_{2,}/g, "_");
 }
 
 /** A zod 4 schema carries `_zod`; a zod 3 one carries `_def.typeName`. */
@@ -1200,6 +1213,43 @@ const TOOL_FLAG_FIELDS = [
   "requireJustification",
 ] as const;
 
+/**
+ * The optional fields of a tool definition in which `null` means "not set".
+ * buildTool reads each with `??` or `!== undefined`, so on 0.7.0 a null flag
+ * or scope took the same default as a missing one (and a null schema fell
+ * back to the zod one); a plugin written that way keeps loading.
+ */
+const NULL_MEANS_UNSET = [
+  "description",
+  ...TOOL_FLAG_FIELDS,
+  "scope",
+  "ioCapability",
+  "jsonSchema",
+  "concurrencyClassifier",
+  "requiresModelFeatures",
+  "operativeArgs",
+] as const;
+
+/** Every field a tool definition can have, read through its prototype too. */
+const TOOL_DEFINITION_FIELDS = ["name", "inputSchema", "execute", ...NULL_MEANS_UNSET] as const;
+
+/**
+ * `tool` with each field of {@link NULL_MEANS_UNSET} that is `null` left out,
+ * or `tool` itself when none is. The copy keeps every other field, including
+ * one the definition inherits.
+ */
+function withNullsUnset(tool: Record<string, unknown>): Record<string, unknown> {
+  if (!NULL_MEANS_UNSET.some((field) => tool[field] === null)) return tool;
+  const copy: Record<string, unknown> = {};
+  for (const field of new Set<string>([...TOOL_DEFINITION_FIELDS, ...Object.keys(tool)])) {
+    const value = tool[field];
+    if (value === undefined) continue;
+    if (value === null && (NULL_MEANS_UNSET as ReadonlyArray<string>).includes(field)) continue;
+    copy[field] = value;
+  }
+  return copy;
+}
+
 /** Why a contributed tool has no usable name, or undefined when it has one. */
 function pluginToolNameProblem(tool: unknown): string | undefined {
   if (!isPlainObject(tool)) return `is ${shown(tool)}, not a tool definition`;
@@ -1219,7 +1269,9 @@ function pluginToolNameProblem(tool: unknown): string | undefined {
  * truthy, so plan mode would run the tool; `requiresSandbox: "true"` is not
  * `true`, so the sandbox floor would skip it. A schema crewhaus cannot read
  * would crash every run that lists the tool, whether or not the model calls
- * it. So each field must be what the tool contract says, or absent.
+ * it. So each field must be what the tool contract says, or absent — and
+ * `null`, which buildTool always read as absent, is absent here too (see
+ * {@link withNullsUnset}, applied first).
  */
 function pluginToolDefinitionProblem(tool: unknown): string | undefined {
   const unnamed = pluginToolNameProblem(tool);
@@ -1494,15 +1546,16 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
         );
       const unnamed = pluginToolNameProblem(tool);
       if (unnamed !== undefined) throw refuse(unnamed);
-      const def = tool as ToolDefinition<unknown>;
+      const normalized = withNullsUnset(tool as Record<string, unknown>);
+      const def = normalized as unknown as ToolDefinition<unknown>;
       const reserved = reservedPluginToolNameReason(def.name);
       if (reserved !== undefined) {
         note(
-          `plugin "${name}" tool "${def.name}" was left out: ${reserved}. Rename it in the plugin (for example "${name}_${def.name}").`,
+          `plugin "${name}" tool "${def.name}" was left out: ${reserved}. Rename it in the plugin (for example "${suggestedPluginToolName(name, def.name)}").`,
         );
         continue;
       }
-      const malformed = pluginToolDefinitionProblem(tool);
+      const malformed = pluginToolDefinitionProblem(normalized);
       if (malformed !== undefined) throw refuse(malformed);
       const owner = toolOwners.get(def.name);
       if (owner !== undefined) {

@@ -90,10 +90,13 @@ release (`0.7.1`).
 
 A plugin adds tools; it cannot take the name of one crewhaus defines. A plugin
 tool named like a builtin (`Grep`, `HttpRequest`, …), like a tool the runtime
-registers itself (`ListTools`, `Skill`, `Consult`, …), or starting `mcp__` is
-left out with a warning, and the plugin's other tools load. Permission rules
-and crewhaus's own grants key on tool names, so a plugin `Grep` would otherwise
-run under the grant crewhaus gives the builtin one.
+registers itself (`ListTools`, `Skill`, `Consult`, …), starting `mcp__`, or
+shaped `<server>__<tool>` is left out with a warning, and the plugin's other
+tools load. Permission rules and crewhaus's own grants key on tool names, so a
+plugin `Grep` would otherwise run under the grant crewhaus gives the builtin
+one — and rules written before 0.7.1 name an MCP tool `broker__paper_buy`, so
+a plugin tool of that name would run under a rule meant for the MCP one. Use
+single underscores (`acme_paper_buy`).
 
 ## What a plugin can reach
 
@@ -148,7 +151,8 @@ naming the tool and the field:
 - `readOnly`, `destructive`, `requiresSandbox`, `requireJustification`,
   `concurrencySafe`, `classifyOutput`: `true`, `false` or absent. A string
   such as `"false"` is refused: plan mode reads it as set, and the sandbox and
-  justification checks read it as unset.
+  justification checks read it as unset. `null` counts as absent, here and in
+  every other optional field.
 - `scope`: `"internal"` or `"external"`; `ioCapability`: `"network"` or
   `"process"`.
 - `inputSchema`: a zod schema (it validates every call). `jsonSchema`, when
