@@ -193,9 +193,10 @@ describe("crewhaus datasets CLI (item 12)", () => {
     expect((await runCli(["datasets", "list"], root)).exitCode).toBe(0);
   });
 
-  // This test does 6 sequential CLI cold-starts; under CI contention the
-  // default 5000ms/test budget is too tight (narrower still with this
-  // branch's +3 import deps), so it gets extra headroom (15000ms, 3rd arg).
+  // This test does seven sequential CLI cold-starts; under CI contention the
+  // default 5000ms/test budget is too tight, and in a full `bun run test`
+  // (every package's suite at once) 15000ms was too (it timed out asserting
+  // nothing wrong), so it declares 60_000 like the other many-spawn CLI tests.
   test("get resolves the latest version / an explicit split; failures exit 1", async () => {
     const root = newTempRoot();
     const file = writeDatasetFile(root, 10);
@@ -208,7 +209,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
       1,
     );
     expect((await runCli(["datasets", "get"], root)).exitCode).toBe(1);
-  }, 15000);
+  }, 60_000);
 
   // B16 — `datasets get` keeps emitting test rows (inspection, not
   // consumption) but discloses it on stderr; test-free output stays silent.
@@ -225,7 +226,7 @@ describe("crewhaus datasets CLI (item 12)", () => {
     const trainOnly = await runCliStderr(["datasets", "get", "g", "--split", "train"], root);
     expect(trainOnly.exitCode).toBe(0);
     expect(trainOnly.stderr).not.toContain("test-split");
-  }, 15000);
+  }, 30_000);
 });
 
 describe("crewhaus distill --register (item 12)", () => {

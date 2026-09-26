@@ -3227,7 +3227,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     );
     expect(slackOnly.exitCode).toBe(0);
     expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(true);
-  });
+  }, 20_000);
 });
 
 // F2 (pre-merge fix) — `onchain tune`'s add-vs-replace op must be decided
@@ -3939,7 +3939,7 @@ describe("crewhaus tools audit — reads grants the way compile does", () => {
     const text = await runCli(["tools", "audit"]);
     expect(text.stdout).toContain("add -gitLog to tools: to exclude it");
     expect(text.stdout).not.toContain("drop it from tools:");
-  });
+  }, 20_000);
 
   test("a spec that names its tools literally keeps the 0.7.0 advice", async () => {
     seedAudit(sandboxCwd, "[gitStatus, gitLog]");
