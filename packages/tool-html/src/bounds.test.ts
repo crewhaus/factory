@@ -15,10 +15,21 @@
  * answers to the old algorithms, kept here as oracles.
  */
 import { describe, expect, test } from "bun:test";
-import { htmlTable } from "./index";
-import { extractTable } from "./lib/extract";
-import { type Element, normalizeText, parseHtml, textOf, walk } from "./lib/parse";
-import { MAX_SELECTOR_GROUP, MAX_SELECTOR_STEPS, parseSelectorGroup, queryAll } from "./lib/select";
+import { htmlForms, htmlLinks, htmlQuery, htmlRecords, htmlTable, htmlText } from "./index";
+import { extractForms, extractRecords, extractTable } from "./lib/extract";
+import { type Element, boundedText, normalizeText, parseHtml, textOf, walk } from "./lib/parse";
+import {
+  MATCH_WORK_LIMIT,
+  MAX_COMPOUND_TESTS,
+  MAX_SELECTOR_CHARS,
+  MAX_SELECTOR_GROUP,
+  MAX_SELECTOR_STEPS,
+  createMatchContext,
+  firstMatchIn,
+  matches,
+  parseSelectorGroup,
+  queryAll,
+} from "./lib/select";
 
 /** Give every element a counting `attrs`, and return the counter. */
 function countClassReads(root: Element): { reads: number; nodes: number } {
@@ -97,6 +108,98 @@ describe("the selector engine answers each (element, step) question once", () =>
           .join(", "),
       ),
     ).toThrow(/33 selectors; at most 32/);
+  });
+
+  test("a compound making more tests than the cap is refused, naming the cap", () => {
+    // 0.7.1's first matcher took 47 s on `div` + 800 `:not(.q)` against a
+    // 3.2 MB page: the tests in one compound had no bound.
+    const root = parseHtml("<div class=x></div>");
+    expect(MAX_COMPOUND_TESTS).toBe(32);
+    // `div` is 1 test and each `:not(.q)` is 2, so 15 of them make 31.
+    expect(queryAll(root, `div${":not(.q)".repeat(15)}`)).toHaveLength(1);
+    expect(() => queryAll(root, `div${":not(.q)".repeat(16)}`)).toThrow(
+      /makes 33 tests on one element; at most 32/,
+    );
+    expect(() => queryAll(root, `.a${".b".repeat(32)}`)).toThrow(/at most 32/);
+    expect(() => queryAll(root, `div[x]${":not([y])".repeat(16)}`)).toThrow(/at most 32/);
+  });
+
+  test("a selector longer than the character cap is refused before it is parsed", () => {
+    const root = parseHtml("<div></div>");
+    expect(MAX_SELECTOR_CHARS).toBe(8_192);
+    const long = `div${" ".repeat(MAX_SELECTOR_CHARS)}`;
+    expect(() => queryAll(root, long)).toThrow(/8195 characters; at most 8192/);
+    expect(queryAll(root, `div${" ".repeat(MAX_SELECTOR_CHARS - 3)}`)).toHaveLength(1);
+  });
+
+  test("an element's class list is split once per query, however many class tests it meets", () => {
+    const root = parseHtml(`<section>${'<div class="a b c d e"></div>'.repeat(300)}</section>`);
+    const counter = countClassReads(root);
+    // Eleven class tests on each div, across two selectors of the group.
+    const selector = "div.a.b:not(.q):not(.r):not(.s), section > div.c.d:not(.t):not(.u).e";
+    expect(queryAll(root, selector)).toHaveLength(300);
+    expect(counter.nodes).toBe(301);
+    // 0.7.1's first matcher split it once per test: 11 reads per div.
+    expect(counter.reads).toBeLessThanOrEqual(counter.nodes);
+  });
+
+  test("the queries of one context keep nothing per element", () => {
+    // 0.7.1's first matcher memoised a row per element per selector in the
+    // context, and HtmlRecords kept one context for all its fields: a 64 KB
+    // page with 64 fields of 32 selectors took 2.7 GB. What a context holds
+    // after the same queries must not grow with the page.
+    const retained = (elements: number): number => {
+      const root = parseHtml(`<body>${"<b><i></i></b>".repeat(elements)}</body>`);
+      const ctx = createMatchContext();
+      for (let f = 0; f < 8; f++) {
+        const group = Array.from({ length: 8 }, (_, i) => `q${f}x${i} > b, b > i${i}`).join(", ");
+        queryAll(root, group, Number.POSITIVE_INFINITY, ctx);
+        firstMatchIn(root, queryAll(root, "b", 50, ctx), group, ctx);
+      }
+      const seen = new Set<unknown>();
+      let entries = 0;
+      const count = (value: unknown): void => {
+        if (value === null || typeof value !== "object" || seen.has(value)) return;
+        seen.add(value);
+        if (value instanceof Map) {
+          entries += value.size;
+          for (const [k, v] of value) {
+            count(k);
+            count(v);
+          }
+        } else if (Array.isArray(value)) {
+          entries += value.length;
+          for (const v of value) count(v);
+        } else if (ArrayBuffer.isView(value)) {
+          entries += (value as unknown as { length: number }).length;
+        } else if (value instanceof WeakMap || value instanceof WeakSet) {
+          entries += 1_000_000; // opaque, and per-element by nature
+        } else {
+          for (const v of Object.values(value)) count(v);
+        }
+      };
+      count(ctx);
+      return entries;
+    };
+    const small = retained(100);
+    expect(small).toBeGreaterThan(0);
+    expect(retained(5_000)).toBe(small);
+  }, 20_000);
+
+  test("work past the context's budget is refused with the selector named, not run", () => {
+    expect(MATCH_WORK_LIMIT).toBe(200_000_000);
+    const root = parseHtml(`<div>${"<p></p>".repeat(2_000)}</div>`);
+    const ctx = createMatchContext(5_000);
+    expect(() => queryAll(root, "div p ~ p", Number.POSITIVE_INFINITY, ctx)).toThrow(
+      /matching "div p ~ p" on this page needs more than the 5000 units of work one call may spend/,
+    );
+    // The budget is spent, not merely checked per query: a second query in
+    // the same context is refused too.
+    expect(() => queryAll(root, "p", 1, ctx)).toThrow(/units of work/);
+    // The same query with room to spare answers.
+    const roomy = createMatchContext(100_000);
+    expect(queryAll(root, "div p ~ p", Number.POSITIVE_INFINITY, roomy)).toHaveLength(1_999);
+    expect(roomy.limit - roomy.work).toBeGreaterThan(5_000);
   });
 });
 
@@ -222,13 +325,16 @@ function randomSelector(rand: () => number): string {
   return rand() < 0.2 ? `${out}, ${simples[Math.floor(rand() * simples.length)]}` : out;
 }
 
-describe("the memoised matcher gives the 0.7.0 matcher's answers", () => {
+describe("the matcher gives the 0.7.0 matcher's answers", () => {
   test("random trees and selectors over all four combinators and the pseudo-classes", () => {
     let compared = 0;
     let nonEmpty = 0;
+    let underContainer = 0;
+    let containerHits = 0;
     for (let seed = 1; seed <= 400; seed++) {
       const rand = prng(seed);
       const root = parseHtml(randomTree(rand, 4));
+      const elements = [...walk(root)];
       for (let k = 0; k < 5; k++) {
         const selector = randomSelector(rand);
         const expected = naiveQueryAll(root, selector);
@@ -236,12 +342,51 @@ describe("the memoised matcher gives the 0.7.0 matcher's answers", () => {
         expect({ seed, selector, got }).toEqual({ seed, selector, got: expected });
         compared++;
         if (expected.length > 0) nonEmpty++;
+        // The same selector under containers, where ancestors and siblings
+        // outside the container count, and every container at once.
+        const containers = elements.filter(() => rand() < 0.3);
+        const first = firstMatchIn(root, containers, selector);
+        containers.forEach((container, i) => {
+          const want = naiveQueryAll(container, selector);
+          expect({ seed, selector, i, got: queryAll(container, selector) }).toEqual({
+            seed,
+            selector,
+            i,
+            got: want,
+          });
+          expect({ seed, selector, i, first: first[i] }).toEqual({
+            seed,
+            selector,
+            i,
+            first: want[0],
+          });
+          underContainer++;
+          if (want.length > 0) containerHits++;
+        });
+        for (const node of elements) {
+          const group = parseSelectorGroup(selector);
+          const want = group.some((sel) => {
+            const last = sel[sel.length - 1];
+            return (
+              last !== undefined &&
+              naiveSimple(node, last.simple) &&
+              naiveFrom(node, sel, sel.length - 1)
+            );
+          });
+          expect({ seed, selector, got: group.some((sel) => matches(node, sel)) }).toEqual({
+            seed,
+            selector,
+            got: want,
+          });
+        }
       }
     }
     expect(compared).toBe(2_000);
     // The comparison has to exercise matches, not only empty answers.
     expect(nonEmpty).toBeGreaterThan(500);
-  }, 20_000);
+    expect(underContainer).toBeGreaterThan(2_000);
+    expect(containerHits).toBeGreaterThan(300);
+  }, 30_000);
 
   test("an ancestor or sibling outside the queried container still counts", () => {
     const root = parseHtml(
@@ -632,4 +777,185 @@ describe("HtmlTable builds a bounded grid", () => {
     expect(compared).toBe(500);
     expect(spanned).toBeGreaterThan(300);
   }, 20_000);
+});
+
+describe("element text is budgeted per call", () => {
+  const run = async (
+    tool: typeof htmlQuery,
+    input: Record<string, unknown>,
+  ): Promise<{ raw: string; out: Record<string, unknown> }> => {
+    const raw = (await tool.execute(tool.inputSchema.parse(input), {} as never)) as string;
+    return { raw, out: JSON.parse(raw) };
+  };
+  // Each level's text holds every deeper level's, so N nested elements of
+  // T characters carry about N^2 T / 2 characters of text between them.
+  const nested = (open: string, levels: number, chars: number): string =>
+    `${open}${"x".repeat(chars)} `.repeat(levels);
+
+  test("boundedText is textOf when it fits, and a cut prefix when it does not", () => {
+    for (const html of [
+      "<p>a <b>b</b>\n\n\n c</p><div> d <script>no</script><span>e</span></div>",
+      "<ul><li>one<li>two</ul>  <table><tr><td>x<td>y</table>",
+      nested("<div>", 20, 3),
+    ]) {
+      const root = parseHtml(html);
+      const whole = normalizeText(textOf(root));
+      const work = { units: 1_000_000 };
+      expect(boundedText(root, whole.length, work)).toEqual({ text: whole, complete: true });
+      const cut = boundedText(root, 5, { units: 1_000_000 });
+      expect(cut).toEqual({ text: whole.slice(0, 5), complete: false });
+    }
+    // Work runs out: the walk stops and says so, having read no more than it was given.
+    const work = { units: 50 };
+    const root = parseHtml(nested("<div>", 200, 10));
+    const got = boundedText(root, 1_000_000, work);
+    expect(got.complete).toBe(false);
+    expect(work.units).toBeLessThanOrEqual(0);
+    expect(work.units).toBeGreaterThanOrEqual(-1);
+  });
+
+  test("HtmlQuery: nested matches stop at the text budget and say so", async () => {
+    // 0.7.1's first cut answered 501,518,109 characters for this 1 MB page.
+    const html = nested("<div>", 500, 2_000);
+    const { raw, out } = await run(htmlQuery, { html, selector: "div", limit: 500 });
+    expect(raw.length).toBeLessThan(2_100_000);
+    expect(out.truncated).toBe(true);
+    expect(out.truncatedBy).toEqual(["chars"]);
+    expect(String(out.note)).toContain("1000000-character text budget");
+    const values = out.values as string[];
+    expect(values.length).toBeLessThan(500);
+    expect((out.matches as unknown[]).length).toBe(values.length);
+    // A page no budget touches answers as 0.7.0 did, with no new fields.
+    const small = await run(htmlQuery, { html: "<p>a</p><p>b</p>", selector: "p" });
+    expect(small.out).toEqual({
+      from: "inline",
+      sourceChars: 16,
+      selector: "p",
+      count: 2,
+      truncated: false,
+      values: ["a", "b"],
+      matches: [
+        { tag: "p", text: "a", attrs: {} },
+        { tag: "p", text: "b", attrs: {} },
+      ],
+    });
+  });
+
+  test("HtmlRecords: nested containers stop at the text budget and say so", async () => {
+    const html = nested('<div class="c">', 400, 2_000);
+    const { raw, out } = await run(htmlRecords, {
+      html,
+      container: ".c",
+      fields: { all: "", inner: ".c" },
+      limit: 400,
+    });
+    expect(raw.length).toBeLessThan(2_200_000);
+    expect(out.truncated).toBe(true);
+    expect(String(out.note)).toContain("text budget");
+    expect((out.records as unknown[]).length).toBeLessThan(400);
+    expect(out.containers).toBe(400);
+  });
+
+  test("HtmlRecords: a recipe finding no container never parses its field selectors", async () => {
+    // 0.7.0 ran a field selector only inside a container, so a bad one with
+    // no containers answered an empty table; the one-pass rewrite keeps that.
+    const { out } = await run(htmlRecords, {
+      html: "<p>x</p>",
+      container: ".none",
+      fields: { a: "a:hover" },
+    });
+    expect(out).toEqual({ from: "inline", containers: 0, count: 0, missing: {}, records: [] });
+  });
+
+  test("HtmlLinks: nested anchors stop at the text budget", async () => {
+    const html = nested('<a href="/x">', 1_200, 2_000);
+    const { raw, out } = await run(htmlLinks, { html, limit: 2_000 });
+    expect(raw.length).toBeLessThan(2_300_000);
+    expect(out.truncated).toBe(true);
+    expect(out.truncatedBy).toEqual(["chars"]);
+  });
+
+  test("HtmlForms: one wrapping label is read within the budget for every control", async () => {
+    // Each control inside a label takes the whole label's text as its label.
+    const html = `<form><label>${"x".repeat(20_000)}${"<input name=a>".repeat(300)}</label></form>`;
+    const { raw, out } = await run(htmlForms, { html });
+    expect(raw.length).toBeLessThan(2_300_000);
+    expect(out.truncated).toBe(true);
+    expect(String(out.note)).toContain("text budget");
+  });
+
+  test("HtmlForms: a for= label is found from one index, not one page walk per control", () => {
+    const html = `<form>${Array.from({ length: 200 }, (_, i) => `<label for=f${i}>L${i}</label><input id=f${i}>`).join("")}</form>`;
+    const root = parseHtml(html);
+    let reads = 0;
+    for (const el of walk(root)) {
+      const attrs = el.attrs;
+      (el as { attrs: unknown }).attrs = new Proxy(attrs, {
+        get(target, key) {
+          if (key === "for") reads++;
+          return Reflect.get(target, key);
+        },
+      });
+    }
+    const fields = extractForms(root)[0]?.fields ?? [];
+    expect(fields).toHaveLength(200);
+    expect(fields[7]?.label).toBe("L7");
+    // 0.7.0 read every label's for= once per control: 40,000 reads.
+    expect(reads).toBeLessThanOrEqual(2 * 200);
+  });
+
+  test("HtmlText: nested headings stop the outline at the text budget", async () => {
+    const html = nested("<h2>", 500, 2_000);
+    const { raw, out } = await run(htmlText, { html, outline: true, maxChars: 10 });
+    expect(raw.length).toBeLessThan(2_200_000);
+    expect(out.outlineTruncated).toBe(true);
+    expect((out.outline as unknown[]).length).toBeLessThan(500);
+  });
+
+  test("HtmlTable: captions are charged to the budget and cut", async () => {
+    // 0.7.1's first cut answered 50,306,845 characters for this 503 KB page,
+    // with nothing marked truncated.
+    const html = nested("<table><caption>", 200, 2_500);
+    const { raw, out } = await run(htmlTable, { html });
+    expect(raw.length).toBeLessThan(2_100_000);
+    const tables = out.tables as Array<{ truncated: boolean; truncatedBy?: string[] }>;
+    expect(tables.some((t) => t.truncatedBy?.includes("chars"))).toBe(true);
+    expect((out.tablesOmitted as number) + tables.length).toBe(200);
+  });
+
+  test("HtmlTable: nested tables read no more text than the call's work budget", () => {
+    // Every <tr> under a table is one of its rows, so each level re-reads
+    // the levels below it: 450 KB of nested tables took 38.9 s.
+    const html = `<table><tr><td>${"<b></b>".repeat(50)}`.repeat(40);
+    const root = parseHtml(html);
+    const work = { units: 20_000 };
+    const budget = { chars: 2_000_000, work };
+    const lifted = queryAll(root, "table").map((table) => extractTable(table, { budget }));
+    expect(work.units).toBeLessThanOrEqual(0);
+    expect(work.units).toBeGreaterThan(-100);
+    expect(lifted.some((t) => t.truncatedBy.includes("chars"))).toBe(true);
+    // With room to read, the same page lifts whole.
+    const roomy = { chars: 2_000_000, work: { units: 10_000_000 } };
+    const whole = queryAll(root, "table").map((table) => extractTable(table, { budget: roomy }));
+    expect(whole.every((t) => !t.truncated)).toBe(true);
+  });
+
+  test("extractRecords answers what one query per container answered", () => {
+    const html =
+      "<ul class=l><li class=r><a href=/1>one</a><span>1</span></li><li class=r><span>2</span><li class=r><a href=/3>three</a><ul><li class=r><a href=/4>four</a></ul></ul>";
+    const root = parseHtml(html);
+    const got = extractRecords(root, {
+      container: ".r",
+      fields: { href: "a@href", n: "span", t: "a" },
+    });
+    const containers = queryAll(root, ".r");
+    const want = containers.map((c) => ({
+      href: queryAll(c, "a", 1)[0]?.attrs.href ?? "",
+      n: normalizeText(textOf(queryAll(c, "span", 1)[0] ?? parseHtml(""))),
+      t: normalizeText(textOf(queryAll(c, "a", 1)[0] ?? parseHtml(""))),
+    }));
+    expect(got.records.map((r) => ({ ...r }))).toEqual(want);
+    expect({ ...got.missing }).toEqual({ n: 2, href: 1, t: 1 });
+    expect(got.truncated).toBe(false);
+  });
 });

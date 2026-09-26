@@ -17,6 +17,8 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import {
+  type TextBudget,
+  createTextBudget,
   extractForms,
   extractLinks,
   extractRecords,
@@ -24,9 +26,10 @@ import {
   extractTable,
   outline,
   readableText,
+  textWithin,
 } from "./lib/extract";
-import { type Element, attrOf, normalizeText, parseHtml, textOf } from "./lib/parse";
-import { queryAll } from "./lib/select";
+import { type Element, attrOf, parseHtml } from "./lib/parse";
+import { createMatchContext, queryAll } from "./lib/select";
 import { resolveSafe } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
@@ -40,7 +43,23 @@ const LIMITS = {
   tableColumns: 1_000,
   /** Cell text HtmlTable returns per call, shared by every table in it. */
   tableChars: 2_000_000,
+  /**
+   * Element text any other tool returns per call. HtmlQuery's is half, as
+   * it returns each value twice (in `values` and in `matches`).
+   */
+  textChars: 2_000_000,
+  queryChars: 1_000_000,
+  /**
+   * Text and nodes a call may read to produce that. An element's text is
+   * its whole subtree's, so nested elements read the same text once per
+   * level; this is enough to read the largest page in full, twice.
+   */
+  textWork: 32 * 1024 * 1024,
 } as const;
+
+/** The note a tool adds when its text budget cut what it returns. */
+const cutNote = (chars: number): string =>
+  `the ${chars}-character text budget ran out, so the last value is cut and later ones are not returned; narrow the selector or the page`;
 
 /**
  * Take the markup from wherever the caller has it.
@@ -78,8 +97,7 @@ function loadSource(
 }
 
 /** An element, as plain JSON. The tree's parent links cannot be serialized. */
-function describe(node: Element, includeHtml: boolean): Record<string, unknown> {
-  const text = normalizeText(textOf(node));
+function describe(node: Element, text: string, includeHtml: boolean): Record<string, unknown> {
   return {
     tag: node.tag,
     text,
@@ -108,22 +126,35 @@ export const htmlQuery: RegisteredTool = buildTool({
   execute: async (input) => {
     const { root, from, chars } = loadSource("HtmlQuery", input);
     const limit = input.firstOnly ? 1 : (input.limit ?? 50);
-    const found = queryAll(root, input.selector, limit + 1);
-    const shown = found.slice(0, limit);
-    const values = shown.map((node) =>
-      input.attribute === undefined
-        ? normalizeText(textOf(node))
-        : (attrOf(node, input.attribute.toLowerCase()) ?? ""),
-    );
+    const found = queryAll(root, input.selector, limit + 1, createMatchContext());
+    const budget = createTextBudget(LIMITS.queryChars, LIMITS.textWork);
+    const values: string[] = [];
+    const matches: Array<Record<string, unknown>> = [];
+    // A match's text is its subtree's, so nested matches repeat it: stop
+    // once the budget has cut a value.
+    for (const node of found.slice(0, limit)) {
+      if (budget.cut) break;
+      const text = textWithin(node, budget);
+      values.push(
+        input.attribute === undefined ? text : (attrOf(node, input.attribute.toLowerCase()) ?? ""),
+      );
+      matches.push(describe(node, text, false));
+    }
+    const truncatedBy = [
+      ...(found.length > limit ? ["limit"] : []),
+      ...(budget.cut ? ["chars"] : []),
+    ];
     return json({
       from,
       sourceChars: chars,
       selector: input.selector,
-      count: shown.length,
-      truncated: found.length > limit,
+      count: values.length,
+      truncated: truncatedBy.length > 0,
+      ...(truncatedBy.length > 0 ? { truncatedBy } : {}),
+      ...(budget.cut ? { note: cutNote(LIMITS.queryChars) } : {}),
       ...(input.attribute === undefined ? {} : { attribute: input.attribute }),
       values,
-      matches: shown.map((node) => describe(node, false)),
+      matches,
     });
   },
 });
@@ -150,7 +181,8 @@ export const htmlTable: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const { root, from } = loadSource("HtmlTable", input);
-    const all = queryAll(root, input.selector ?? "table");
+    const match = createMatchContext();
+    const all = queryAll(root, input.selector ?? "table", Number.POSITIVE_INFINITY, match);
     const chosen = input.index === undefined ? all : all.slice(input.index, input.index + 1);
     if (chosen.length === 0) {
       return `no table matched ${input.selector === undefined ? "<table>" : `"${input.selector}"`} in ${from}${all.length > 0 ? ` (the document has ${all.length}, so the index may be out of range)` : ""}`;
@@ -158,7 +190,7 @@ export const htmlTable: RegisteredTool = buildTool({
     const maxRows = input.maxRows ?? 500;
     // One budget for the whole call: spans multiply a cell's text, and many
     // small tables must not add up past what one large one may return.
-    const budget = { chars: LIMITS.tableChars };
+    const budget = { chars: LIMITS.tableChars, work: { units: LIMITS.textWork } };
     const tables: Array<Record<string, unknown>> = [];
     let tablesOmitted = 0;
     for (const table of chosen) {
@@ -166,7 +198,12 @@ export const htmlTable: RegisteredTool = buildTool({
         tablesOmitted += 1;
         continue;
       }
-      const lifted = extractTable(table, { maxRows, maxColumns: LIMITS.tableColumns, budget });
+      const lifted = extractTable(table, {
+        maxRows,
+        maxColumns: LIMITS.tableColumns,
+        budget,
+        match,
+      });
       tables.push({
         caption: lifted.caption,
         headers: lifted.headers,
@@ -184,7 +221,7 @@ export const htmlTable: RegisteredTool = buildTool({
       ...(tablesOmitted > 0
         ? {
             tablesOmitted,
-            note: `the ${LIMITS.tableChars}-character result budget ran out, so ${tablesOmitted} matched table(s) were not read; pass index or a narrower selector`,
+            note: `the ${LIMITS.tableChars}-character text budget ran out, so ${tablesOmitted} matched table(s) were not read; pass index or a narrower selector`,
           }
         : {}),
     });
@@ -209,7 +246,8 @@ export const htmlLinks: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const { root, from } = loadSource("HtmlLinks", input);
-    let links = extractLinks(root, input.baseUrl);
+    const budget = createTextBudget(LIMITS.textChars, LIMITS.textWork);
+    let links = extractLinks(root, input.baseUrl, budget, createMatchContext());
     if (input.externalOnly) links = links.filter((l) => l.external);
     if (input.internalOnly) links = links.filter((l) => !l.external);
     if (input.pattern !== undefined)
@@ -219,7 +257,8 @@ export const htmlLinks: RegisteredTool = buildTool({
       from,
       count: links.length,
       links: links.slice(0, limit),
-      truncated: links.length > limit,
+      truncated: links.length > limit || budget.cut,
+      ...(budget.cut ? { truncatedBy: ["chars"], note: cutNote(LIMITS.textChars) } : {}),
     });
   },
 });
@@ -233,10 +272,21 @@ export const htmlForms: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const { root, from } = loadSource("HtmlForms", input);
-    const forms = extractForms(root).filter((f) =>
+    const budget = createTextBudget(LIMITS.textChars, LIMITS.textWork);
+    const forms = extractForms(root, budget, createMatchContext()).filter((f) =>
       input.selector === undefined ? true : f.id === input.selector || f.name === input.selector,
     );
-    return json({ from, count: forms.length, forms });
+    return json({
+      from,
+      count: forms.length,
+      forms,
+      ...(budget.cut
+        ? {
+            truncated: true,
+            note: `the ${LIMITS.textChars}-character text budget ran out, so later labels and values are cut or empty`,
+          }
+        : {}),
+    });
   },
 });
 
@@ -270,16 +320,27 @@ export const htmlText: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const { root, from, chars } = loadSource("HtmlText", input);
-    const region = input.selector === undefined ? root : queryAll(root, input.selector, 1)[0];
+    const region =
+      input.selector === undefined
+        ? root
+        : queryAll(root, input.selector, 1, createMatchContext())[0];
     if (region === undefined) return `no element matched "${input.selector}" in ${from}`;
     const text = readableText(region, input.dropBoilerplate === true);
     const maxChars = input.maxChars ?? 20_000;
+    const budget: TextBudget = createTextBudget(LIMITS.textChars, LIMITS.textWork);
+    const headings = input.outline ? outline(region, budget) : undefined;
     return json({
       from,
       sourceChars: chars,
       textChars: text.length,
       truncated: text.length > maxChars,
-      ...(input.outline ? { outline: outline(region) } : {}),
+      ...(headings === undefined ? {} : { outline: headings }),
+      ...(budget.cut
+        ? {
+            outlineTruncated: true,
+            note: `the ${LIMITS.textChars}-character text budget ran out, so the outline stops at a cut heading`,
+          }
+        : {}),
       text: text.slice(0, maxChars),
     });
   },
@@ -312,12 +373,20 @@ export const htmlRecords: RegisteredTool = buildTool({
       root,
       { container: input.container, fields: input.fields },
       input.limit ?? 200,
+      createTextBudget(LIMITS.textChars, LIMITS.textWork),
+      createMatchContext(),
     );
     return json({
       from,
       containers: result.containers,
       count: result.records.length,
       missing: result.missing,
+      ...(result.truncated
+        ? {
+            truncated: true,
+            note: `the ${LIMITS.textChars}-character text budget ran out, so the last record may be cut and later ones are not returned; narrow the recipe or the page`,
+          }
+        : {}),
       records: result.records,
     });
   },

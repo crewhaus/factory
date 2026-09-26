@@ -452,6 +452,94 @@ export function textOf(node: Node, skipNonRendered = true): string {
   return BLOCK.has(node.tag) ? `\n${joined}\n` : joined;
 }
 
+/**
+ * What one call may spend reading element text: characters and nodes read,
+ * shared by every element the call takes text from. Nested matches each
+ * read their whole subtree, so without it 500 nested `<div>`s cost 500
+ * copies of the page.
+ */
+export type TextWork = { units: number };
+
+/**
+ * `normalizeText(textOf(node))`, cut to at most `max` characters, reading
+ * no more of the subtree than that needs and charging what it reads to
+ * `work`. `complete` is false when the text returned is not all of it:
+ * longer than `max`, or the walk stopped because `work` ran out (or the
+ * subtree held far more whitespace and markup than text).
+ */
+export function boundedText(
+  node: Node,
+  max: number,
+  work: TextWork,
+): { text: string; complete: boolean } {
+  const limit = Math.max(0, Math.floor(max));
+  // The raw text a walk may collect: whitespace collapses, so it may need
+  // more than `limit` raw characters, but never unboundedly more.
+  const rawCap = limit * 8 + 4096;
+  const parts: string[] = [];
+  let raw = 0;
+  let check = limit + 1;
+  let complete = true;
+  const take = (value: string): boolean => {
+    if (value === "") return true;
+    let piece = value;
+    if (raw + piece.length > rawCap) {
+      piece = piece.slice(0, rawCap - raw);
+      complete = false;
+    }
+    if (piece.length > work.units) {
+      piece = piece.slice(0, Math.max(0, work.units));
+      complete = false;
+    }
+    work.units -= piece.length;
+    parts.push(piece);
+    raw += piece.length;
+    if (!complete) return false;
+    // At doubling lengths, stop once the text is already longer than wanted.
+    if (raw >= check) {
+      if (normalizeText(parts.join("")).length > limit) {
+        complete = false;
+        return false;
+      }
+      check = raw * 2;
+    }
+    return true;
+  };
+
+  if (node.type === "text") {
+    take(node.value);
+  } else if (!NON_RENDERED.has(node.tag)) {
+    const frames: Array<{ node: Element; at: number }> = [{ node, at: 0 }];
+    let going = !BLOCK.has(node.tag) || take("\n");
+    while (going && frames.length > 0) {
+      const frame = frames[frames.length - 1] as { node: Element; at: number };
+      if (frame.at >= frame.node.children.length) {
+        frames.pop();
+        if (BLOCK.has(frame.node.tag)) going = take("\n");
+        continue;
+      }
+      const child = frame.node.children[frame.at] as Node;
+      frame.at += 1;
+      work.units -= 1;
+      if (work.units < 0) {
+        complete = false;
+        break;
+      }
+      if (child.type === "text") going = take(child.value);
+      else if (!NON_RENDERED.has(child.tag)) {
+        frames.push({ node: child, at: 0 });
+        if (BLOCK.has(child.tag)) going = take("\n");
+      }
+    }
+  }
+  let text = normalizeText(parts.join(""));
+  if (text.length > limit) {
+    text = text.slice(0, limit);
+    complete = false;
+  }
+  return { text, complete };
+}
+
 /** Collapse runs of whitespace the way rendering does, keeping paragraphs. */
 export function normalizeText(text: string): string {
   return text
