@@ -124,6 +124,21 @@ export function now(): number {
   return clock();
 }
 
+let platformOverride: NodeJS.Platform | undefined;
+
+/**
+ * Test-only injection point for the platform the default scheduler list is
+ * chosen by; `undefined` restores `process.platform`. Only the choice of
+ * readers follows it — a Windows answer can be proved on any CI host.
+ */
+export function _setPlatform(platform: NodeJS.Platform | undefined): void {
+  platformOverride = platform;
+}
+
+export function currentPlatform(): NodeJS.Platform {
+  return platformOverride ?? process.platform;
+}
+
 /**
  * The uid launchd's `gui/<uid>` domain is keyed on.
  *
