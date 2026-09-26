@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter, StreamEvent } from "@crewhaus/adapter-anthropic";
 import type { Driver } from "@crewhaus/computer-use-driver";
+import { AdapterError, ProviderAuthError } from "@crewhaus/errors";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import { executeTool } from "@crewhaus/tool-executor";
 import { VisionGroundingError, createFindElementTool } from "./index.js";
@@ -321,6 +322,74 @@ describe("a failed grounding reply is never quoted back", () => {
 });
 
 /**
+ * A provider adapter's own error is CrewHaus's sentence about the request —
+ * a wrong model id, a rate limit, a rejected key — not the grounding model's
+ * reply, and it is what tells the model to retry or the operator what to fix.
+ * It is shown (it read "the grounding call failed (AdapterError)" for all
+ * three), with URL credentials redacted and its length capped.
+ */
+describe("a provider's own failure is shown, so it can be acted on", () => {
+  function failingWith(err: Error): ProviderAdapter {
+    return {
+      ...scriptedAdapter("unused"),
+      stream: () =>
+        (async function* (): AsyncIterable<StreamEvent> {
+          yield { kind: "message_start" };
+          throw err;
+        })(),
+    };
+  }
+
+  for (const [label, err, shown] of [
+    [
+      "a wrong model id",
+      new AdapterError("anthropic", "Anthropic said 404: model: claude-sonnet-9"),
+      "Anthropic said 404: model: claude-sonnet-9",
+    ],
+    [
+      "a rate limit",
+      new AdapterError("anthropic", "Anthropic said 429: rate_limit_error — retry after 20s"),
+      "Anthropic said 429: rate_limit_error — retry after 20s",
+    ],
+    [
+      "a rejected key",
+      new ProviderAuthError("anthropic", "ANTHROPIC_API_KEY was rejected (401). Set a valid key."),
+      "ANTHROPIC_API_KEY was rejected (401). Set a valid key.",
+    ],
+  ] as const) {
+    test(`${label}: the adapter's sentence reaches the model`, async () => {
+      const tool = createFindElementTool({
+        driver: stubDriver(new Uint8Array([1])),
+        model: "stub",
+        _adapter: failingWith(err),
+      });
+      const r = await executeTool(tool, { description: "x" }, { toolUseId: "t" });
+      expect(r.isError).toBe(true);
+      expect(String(r.content)).toBe(`[FindElement error] the grounding call failed: ${shown}`);
+    });
+  }
+
+  test("a credential in a URL the adapter quotes is redacted, and a long message is capped", async () => {
+    const secret = ["sk", "live", "0123456789abcdef"].join("-");
+    const tool = createFindElementTool({
+      driver: stubDriver(new Uint8Array([1])),
+      model: "stub",
+      _adapter: failingWith(
+        new AdapterError(
+          "openai",
+          `could not reach https://user:${secret}@models.example.test/v1?api_key=${secret} ${"x".repeat(900)}`,
+        ),
+      ),
+    });
+    const r = String((await executeTool(tool, { description: "x" }, { toolUseId: "t" })).content);
+    expect(r).not.toContain(secret);
+    expect(r).toContain("models.example.test/v1");
+    expect(r).toMatch(/… \(\d+ more chars\)$/);
+    expect(r.length).toBeLessThan(700);
+  });
+});
+
+/**
  * 0.7.1 (C206) — when both grounding attempts fail the call failed, and it is
  * reported so. FindElement used to return "[FindElement error] …" as an
  * ordinary result (is_error false), while a driver or config failure in the
@@ -436,6 +505,10 @@ describe("the grounding call is metered", () => {
 
   const BBOX = '```json\n{"bbox":{"x":1,"y":2,"width":3,"height":4},"confidence":"high"}\n```';
 
+  // The runtime calls a tool through executeTool with the run context on
+  // `bridge` (runtime-core's bridge carries it; tool-executor never sets
+  // `ctx.runContext`), so that is the path these tests drive. Reading
+  // `ctx.runContext` alone published nothing in a real run.
   test("one request/response pair per grounding call, role grounding, usage carried", async () => {
     const { bus, events } = recordingBus();
     const tool = createFindElementTool({
@@ -443,8 +516,12 @@ describe("the grounding call is metered", () => {
       model: "anthropic/claude-sonnet-4-6",
       _adapter: meteredAdapter([BBOX]),
     });
-    const ctx = { runContext: { eventBus: bus } } as unknown as Parameters<typeof tool.execute>[1];
-    await tool.execute({ description: "the Submit button" }, ctx);
+    const r = await executeTool(
+      tool,
+      { description: "the Submit button" },
+      { toolUseId: "t", bridge: { runContext: { eventBus: bus } } },
+    );
+    expect(r.isError).toBe(false);
     expect(events.map((e) => `${e.kind}:${e.role}`)).toEqual([
       "model_request:grounding",
       "model_response:grounding",
@@ -461,8 +538,28 @@ describe("the grounding call is metered", () => {
       model: "stub",
       _adapter: meteredAdapter(["not json", BBOX]),
     });
-    const ctx = { runContext: { eventBus: bus } } as unknown as Parameters<typeof tool.execute>[1];
-    await tool.execute({ description: "x" }, ctx);
+    await executeTool(
+      tool,
+      { description: "x" },
+      { toolUseId: "t", bridge: { runContext: { eventBus: bus } } },
+    );
     expect(events.filter((e) => e.kind === "model_response").length).toBe(2);
+  });
+
+  test("a run context handed on ctx directly is used first", async () => {
+    const direct = recordingBus();
+    const viaBridge = recordingBus();
+    const tool = createFindElementTool({
+      driver: stubDriver(new Uint8Array([1])),
+      model: "stub",
+      _adapter: meteredAdapter([BBOX]),
+    });
+    const ctx = {
+      runContext: { eventBus: direct.bus },
+      bridge: { runContext: { eventBus: viaBridge.bus } },
+    } as unknown as Parameters<typeof tool.execute>[1];
+    await tool.execute({ description: "x" }, ctx);
+    expect(direct.events.length).toBe(2);
+    expect(viaBridge.events.length).toBe(0);
   });
 });
