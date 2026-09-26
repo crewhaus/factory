@@ -952,6 +952,34 @@ describe("EmailSend", () => {
     }
   });
 
+  test("net-review C207: a key reused after an attachment changed sends nothing and says so", async () => {
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const call = {
+        ...base,
+        port,
+        idempotencyKey: "nightly-attachment",
+        attachments: [{ path: "nightly.txt", contentType: "text/plain" }],
+      };
+      writeFileSync(path.join(tmp, "nightly.txt"), "MONDAY: all green");
+      const first = String(await emailSend.execute(call));
+      expect(JSON.parse(first).sent).toBe(true);
+      // The same arguments, so a retry of the same message replays.
+      expect(String(await emailSend.execute(call))).toBe(first);
+      // The path is the same and the bytes are not: a different message.
+      writeFileSync(path.join(tmp, "nightly.txt"), "TUESDAY: DATABASE DOWN");
+      const second = String(await emailSend.execute(call));
+      expect(second).toContain("nothing was sent");
+      expect(second).toContain("attachmentContent");
+      // One DATA in all: the server never saw Tuesday's report, and nothing
+      // claimed it had.
+      expect(log.messages).toHaveLength(1);
+      expect(log.commands.filter((c) => c === "DATA")).toHaveLength(1);
+    } finally {
+      server.close();
+    }
+  });
+
   test("authenticates with AUTH PLAIN and never returns the password", async () => {
     const { server, port, log } = await startSmtpServer();
     try {

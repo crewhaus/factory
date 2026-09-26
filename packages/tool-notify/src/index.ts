@@ -41,6 +41,7 @@
  * destination or content is refused. That is the point of an idempotency
  * key, and it is the only hidden state in the package.
  */
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -1257,7 +1258,15 @@ function buildMessage(
   toolName: string,
   args: ComposeArgs,
 ):
-  | { ok: true; message: string; messageId: string; bytes: number; envelopeTo: readonly string[] }
+  | {
+      ok: true;
+      message: string;
+      messageId: string;
+      bytes: number;
+      envelopeTo: readonly string[];
+      /** sha256 of each attachment's bytes, in order: what the message carries, not its path. */
+      attachmentDigests: readonly string[];
+    }
   | { ok: false; message: string } {
   const instant = parseOffsetInstant(args.date);
   if (!instant.ok) return { ok: false, message: instant.message };
@@ -1293,6 +1302,9 @@ function buildMessage(
     messageId: composed.messageId,
     bytes: composed.bytes,
     envelopeTo: composed.envelopeTo,
+    attachmentDigests: loaded.attachments.map((a) =>
+      createHash("sha256").update(a.content).digest("hex"),
+    ),
   };
 }
 
@@ -1389,12 +1401,6 @@ export const emailSend: RegisteredTool = buildTool({
       idempotencyKey?: string;
       timeoutMs?: number;
     };
-    // `date` only stamps the message, so a retry that re-reads its clock is
-    // still the same message; everything that says who gets what is compared.
-    const fingerprint = requestFingerprint({ ...args, date: undefined });
-    const cached = ledgerAnswer("EmailSend", args.idempotencyKey, fingerprint);
-    if (cached !== undefined) return cached;
-
     const cfg = resolveNotifyConfig(ctx?.toolConfig);
     const everyone = [...(args.to ?? []), ...(args.cc ?? []), ...(args.bcc ?? [])];
     if (everyone.length === 0) return notSentBecause("no recipients");
@@ -1427,6 +1433,21 @@ export const emailSend: RegisteredTool = buildTool({
 
     const built = buildMessage("EmailSend", args);
     if (!built.ok) return notSentBecause(built.message);
+
+    // The ledger is asked about the message that would be SENT, so it is
+    // consulted after the build. `date` only stamps the message, so a retry
+    // that re-reads its clock is still the same message; everything that
+    // says who gets what is compared, and an attachment by its bytes: a key
+    // reused after report.txt was rewritten is a different message, not a
+    // retry of the first (net review, C207). Consulting it before the build
+    // replayed the first `sent: true` for a body that was never sent.
+    const fingerprint = requestFingerprint({
+      ...args,
+      date: undefined,
+      attachmentContent: built.attachmentDigests.length > 0 ? built.attachmentDigests : undefined,
+    });
+    const cached = ledgerAnswer("EmailSend", args.idempotencyKey, fingerprint);
+    if (cached !== undefined) return cached;
 
     const redact = redactorFor([username, password]);
     const deadline = startDeadline(args.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
