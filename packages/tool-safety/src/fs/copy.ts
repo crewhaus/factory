@@ -73,15 +73,20 @@ import {
  * a temp and a rename, and every created link is checked again at the end.
  */
 
-export type CopySymlinkPolicy = "refuse" | "skip" | "copy-contained";
+export type CopySymlinkPolicy = "refuse" | "skip" | "copy-contained" | "copy-no-new-reach";
 
 export type CopyOptions = {
   /**
    * Links in the source: `refuse` fails the copy, `skip` leaves them out
    * (listed in `skipped`), `copy-contained` recreates each one with the same
    * text when, from its new location, it still resolves inside the
-   * destination root, and fails the copy otherwise. Links are never
-   * dereferenced: their targets' contents are never copied.
+   * destination root, and fails the copy otherwise. `copy-no-new-reach`
+   * also keeps a link that leads outside from its new location when it leads
+   * to exactly where it leads from its old one (an absolute link to an
+   * interpreter, say), so the copy reaches nothing the source did not; it
+   * applies only when source and destination share one root, and those
+   * links are listed in `outsideLinks`. Links are never dereferenced: their
+   * targets' contents are never copied.
    */
   readonly symlinks: CopySymlinkPolicy;
   /** FIFOs, sockets and devices: fail the copy (default) or skip them. */
@@ -128,6 +133,11 @@ export type CopyResult =
       /** Destination paths of regular files replaced. */
       readonly replaced: readonly string[];
       readonly skipped: readonly CopySkip[];
+      /**
+       * Destination paths of links created that lead outside the destination
+       * root, each exactly where its source led (`copy-no-new-reach` only).
+       */
+      readonly outsideLinks: readonly string[];
     }
   | SafeFsFailure;
 
@@ -141,6 +151,11 @@ type Planned = {
   readonly destReal: string;
   readonly destPath: string;
   replaces: boolean;
+  /**
+   * Where a link kept under `copy-no-new-reach` leads, from its source and
+   * so from its copy; outside the destination root.
+   */
+  outsideLanding?: string;
 };
 
 const O_NOFOLLOW = (constants as Record<string, number | undefined>)["O_NOFOLLOW"] ?? 0;
@@ -192,6 +207,19 @@ function overlaps(
     return false;
   }
   return lineage(srcTop, srcRoot).some((st) => same(st, dstStats));
+}
+
+/**
+ * Whether the source link `p` leads, from where it is, to `target`: the
+ * copy then reaches nothing the source did not. A source that cannot be
+ * resolved does not.
+ */
+function landsAt(p: Planned, target: string): boolean {
+  try {
+    return physicalFrom(path.dirname(p.srcReal), p.text ?? "") === target;
+  } catch {
+    return false;
+  }
 }
 
 function nothingCopied(failure: SafeFsFailure): SafeFsFailure {
@@ -432,6 +460,11 @@ export function copyTreeSafe(
   }
 
   // --- every link, judged from where it will be ------------------------------
+  // With `copy-no-new-reach` and one root, a link that leads outside from its
+  // new place is kept when it led to that same place from its old one.
+  const keepUnchanged =
+    options.symlinks === "copy-no-new-reach" && sRoot.physical === dRoot.physical;
+  const outsideLinks: string[] = [];
   for (const p of planned) {
     if (p.kind !== "symlink") continue;
     let target: string;
@@ -439,6 +472,11 @@ export function copyTreeSafe(
       target = physicalFrom(path.dirname(p.destReal), p.text ?? "", { overlay });
     } catch (err) {
       return nothingCopied(unresolvable(p.srcPath, err));
+    }
+    if (!isWithin(dRoot.physical, target) && keepUnchanged && landsAt(p, target)) {
+      p.outsideLanding = target;
+      outsideLinks.push(p.destPath);
+      continue;
     }
     if (!isWithin(dRoot.physical, target)) {
       return fail(
@@ -474,6 +512,7 @@ export function copyTreeSafe(
     bytes,
     replaced,
     skipped,
+    outsideLinks,
   });
   if (options.dryRun === true) return summary(true);
 
@@ -530,7 +569,8 @@ export function copyTreeSafe(
     } catch {
       target = undefined;
     }
-    if (target === undefined || !isWithin(dRoot.physical, target)) {
+    const kept = target !== undefined && target === p.outsideLanding;
+    if (target === undefined || (!isWithin(dRoot.physical, target) && !kept)) {
       unlinkIfSame(p.destReal, made);
       return fail(
         "changed",

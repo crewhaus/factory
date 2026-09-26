@@ -106,3 +106,58 @@ describe.if(posix)("checkRelocatedLinks", () => {
     });
   });
 });
+
+describe.if(posix)("keep-unchanged: a link that leads outside exactly where it did", () => {
+  // A virtualenv's interpreter is an absolute link out of the workspace. A
+  // rename leaves it leading where it did, so moving the tree adds no reach.
+  mkdirSync(join(f.ws, "proj", ".venv", "bin"), { recursive: true });
+  symlinkSync(join(f.outside, "python3"), join(f.ws, "proj", ".venv", "bin", "python"));
+  const keep = { outsideLinks: "keep-unchanged" } as const;
+
+  test("is refused by default, and accepted and listed with keep-unchanged", () => {
+    expect(checkRelocatedLinks(f.ws, "proj", f.ws, "proj2")).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+      path: "proj/.venv/bin/python",
+    });
+    expect(checkRelocatedLinks(f.ws, "proj", f.ws, "moved/proj", keep)).toEqual({
+      ok: true,
+      links: 1,
+      visited: 3,
+      outsideLinks: ["moved/proj/.venv/bin/python"],
+    });
+  });
+
+  test("a relative link that already led out is kept at the same depth, refused where it would lead further", () => {
+    // esc/up -> ../.. leads one level above ws, from esc/ or from any depth-1 place.
+    mkdirSync(join(f.ws, "esc"));
+    symlinkSync("../..", join(f.ws, "esc", "up"));
+    expect(checkRelocatedLinks(f.ws, "esc", f.ws, "esc2", keep)).toMatchObject({
+      ok: true,
+      outsideLinks: ["esc2/up"],
+    });
+    // Moved on its own to depth 0 it would lead two levels above ws: new reach.
+    expect(checkRelocatedLinks(f.ws, "esc/up", f.ws, "up", keep)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+      path: "esc/up",
+    });
+  });
+
+  test("a link inside the workspace that would leave at its new depth is still refused", () => {
+    // a/b/up -> ../.. (made above) leads to ws/ now and above it from ws/b.
+    expect(checkRelocatedLinks(f.ws, "a/b", f.ws, "b", keep)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+      path: "a/b/up",
+    });
+  });
+
+  test("across roots it keeps nothing: the destination root never had that reach", () => {
+    mkdirSync(join(f.ws, "root2"));
+    expect(checkRelocatedLinks(f.ws, "proj", join(f.ws, "root2"), "proj", keep)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+    });
+  });
+});
