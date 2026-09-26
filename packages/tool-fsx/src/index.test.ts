@@ -57,6 +57,7 @@ import {
   tree,
 } from "./index";
 import { describeFailure, runProcess } from "./proc";
+import { GITIGNORE_MAX_BYTES } from "./walk";
 
 const originalCwd = process.cwd();
 let tmp: string;
@@ -770,6 +771,26 @@ describe("the listing tools read .gitignore only as a contained regular file (C0
     },
     10_000,
   );
+
+  test("a .gitignore up to the cap is honoured; one byte over contributes no rules", async () => {
+    // 0.7.1 caps what one .gitignore may cost (0.7.0 read any size, a
+    // multi-gigabyte one included). The rule sits at the END, after a
+    // padding comment, so it is only seen when the whole file is.
+    expect(GITIGNORE_MAX_BYTES).toBe(1024 * 1024);
+    write("dir/secret.txt", "s");
+    write("dir/keep.txt", "k");
+    const rule = "secret.txt\n";
+    const sized = (bytes: number): string => `#${"x".repeat(bytes - rule.length - 2)}\n${rule}`;
+    const ignore = path.join(tmp, "dir", ".gitignore");
+    writeFileSync(ignore, sized(GITIGNORE_MAX_BYTES));
+    expect(statSync(ignore).size).toBe(GITIGNORE_MAX_BYTES);
+    const atCap = await run(findFiles, { path: "dir", name: "*.txt" });
+    expect(atCap.matches.map((m: { path: string }) => m.path)).toEqual(["keep.txt"]);
+    writeFileSync(ignore, sized(GITIGNORE_MAX_BYTES + 1));
+    expect(statSync(ignore).size).toBe(GITIGNORE_MAX_BYTES + 1);
+    const over = await run(findFiles, { path: "dir", name: "*.txt" });
+    expect(over.matches.map((m: { path: string }) => m.path)).toEqual(["keep.txt", "secret.txt"]);
+  });
 
   test("a .gitignore linked out of the workspace is not read", async () => {
     const out = outside();
