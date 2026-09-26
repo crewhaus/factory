@@ -70,7 +70,9 @@ export function resolveRange(
       rejected.push({ version: raw, why: "range not understood" });
       continue;
     }
-    if (satisfies(raw, range) !== true) {
+    // includePrerelease widens a wildcard's floor to its `-0` (`>1.2` admits
+    // 1.3.0-rc.1), so the plain range question is asked with it too.
+    if (satisfies(raw, range, { includePrerelease: options.includePrerelease === true }) !== true) {
       rejected.push({ version: raw, why: "out of range" });
       continue;
     }

@@ -78,6 +78,69 @@ describe("resolveRange", () => {
     expect(capped.rejected).toContainEqual({ version: "1.2.3-rc.10", why: "out of range" });
   });
 
+  // npm reads a missing segment as a wildcard: `1.2` is `>=1.2.0 <1.3.0-0`,
+  // `<=1.2` is `<1.3.0-0`, `>1` is `>=2.0.0`, `~1` is `<2.0.0-0`, `^0` is
+  // `<1.0.0-0`. The first 0.7.1 cut read each as a three-segment version and
+  // reported the wrong pick as a definite answer (`1.2` → 1.2.0, `1` →
+  // nothing). Expected values are npm semver 7.7.4's maxSatisfying and
+  // minSatisfying, without and with includePrerelease.
+  test("a partial version is an X-range, and every pick agrees with npm", () => {
+    const versions = [
+      "0.0.1",
+      "0.1.5",
+      "0.9.9",
+      "1.0.0",
+      "1.1.9",
+      "1.2.0",
+      "1.2.4",
+      "1.2.5-rc.1",
+      "1.3.0-rc.1",
+      "1.3.0",
+      "2.0.0-0",
+      "2.0.0",
+    ];
+    type Row = [string, string | null, string | null, string | null, string | null];
+    const npm: Row[] = [
+      ["1", "1.3.0", "1.0.0", "1.3.0", "1.0.0"],
+      ["1.2", "1.2.4", "1.2.0", "1.2.5-rc.1", "1.2.0"],
+      ["=1.2", "1.2.4", "1.2.0", "1.2.5-rc.1", "1.2.0"],
+      ["<=1.2", "1.2.4", "0.0.1", "1.2.5-rc.1", "0.0.1"],
+      [">1.2", "2.0.0", "1.3.0", "2.0.0", "1.3.0-rc.1"],
+      ["<1.2", "1.1.9", "0.0.1", "1.1.9", "0.0.1"],
+      [">=1.2", "2.0.0", "1.2.0", "2.0.0", "1.2.0"],
+      [">1", "2.0.0", "2.0.0", "2.0.0", "2.0.0-0"],
+      ["<=1", "1.3.0", "0.0.1", "1.3.0", "0.0.1"],
+      ["~1", "1.3.0", "1.0.0", "1.3.0", "1.0.0"],
+      ["^0", "0.9.9", "0.0.1", "0.9.9", "0.0.1"],
+      ["^0.0", "0.0.1", "0.0.1", "0.0.1", "0.0.1"],
+      ["~0", "0.9.9", "0.0.1", "0.9.9", "0.0.1"],
+      ["^0.1", "0.1.5", "0.1.5", "0.1.5", "0.1.5"],
+      ["~>1.2", "1.2.4", "1.2.0", "1.2.5-rc.1", "1.2.0"],
+      [">= 1.2", "2.0.0", "1.2.0", "2.0.0", "1.2.0"],
+      ["1.x", "1.3.0", "1.0.0", "1.3.0", "1.0.0"],
+      [">1.x", "2.0.0", "2.0.0", "2.0.0", "2.0.0-0"],
+      ["<=1.x", "1.3.0", "0.0.1", "1.3.0", "0.0.1"],
+      ["*", "2.0.0", "0.0.1", "2.0.0", "0.0.1"],
+      [">*", null, null, null, null],
+      ["1.2 || 0", "1.2.4", "0.0.1", "1.2.5-rc.1", "0.0.1"],
+    ];
+    const ours = npm.map(
+      ([range]): Row => [
+        range,
+        resolveRange(range, versions).best,
+        resolveRange(range, versions, { strategy: "lowest" }).best,
+        resolveRange(range, versions, { includePrerelease: true }).best,
+        resolveRange(range, versions, { includePrerelease: true, strategy: "lowest" }).best,
+      ],
+    );
+    expect(ours).toEqual(npm);
+    for (const [range] of npm)
+      expect({ range, u: resolveRange(range, versions).rangeUnderstood }).toEqual({
+        range,
+        u: true,
+      });
+  });
+
   test("a valid range over versions that do not parse is understood, and says so", () => {
     // On 0.7.0 understanding was learned from the versions, so a list with no
     // parseable version reported "^1.0.0" as a range nobody understood.

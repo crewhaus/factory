@@ -1398,6 +1398,50 @@ describe("semver, the subset", () => {
     expect(satisfies("3.0.0", "^1.0.0 || ^2.0.0")).toBe(false);
   });
 
+  // npm semver 7.7.4 is the oracle for every row: a missing segment is a
+  // wildcard, and each operator widens or narrows it the way node-semver's
+  // replaceXRange/replaceTilde/replaceCaret do. The first 0.7.1 cut read
+  // `1.2` as exactly 1.2.0 and answered each of these wrongly but definitely.
+  test("a partial version reads as npm reads it, under every operator", () => {
+    const rows: Array<[string, string, boolean]> = [
+      ["1.2.4", "1.2", true],
+      ["1.3.0", "1.2", false],
+      ["1.9.0", "1", true],
+      ["1.2.4", "=1.2", true],
+      ["1.2.4", "<=1.2", true],
+      ["1.3.0", "<=1.2", false],
+      ["1.2.4", ">1.2", false],
+      ["1.3.0", ">1.2", true],
+      ["1.9.0", ">1", false],
+      ["2.0.0", ">1", true],
+      ["1.1.9", "<1.2", true],
+      ["1.2.0", "<1.2", false],
+      ["1.9.0", "~1", true],
+      ["2.0.0", "~1", false],
+      ["0.5.0", "^0", true],
+      ["1.0.0", "^0", false],
+      ["0.0.9", "^0.0", true],
+      ["0.1.0", "^0.0", false],
+      ["1.2.7", "~>1.2", true],
+      ["1.2.0", ">= 1.2", true],
+      ["1.9.0", "<=1.x", true],
+      ["2.0.0", ">1.x", true],
+      ["1.0.0", ">*", false],
+      ["1.2.3", "1.2.3+build.5", true],
+    ];
+    const got = rows.map(([version, range]) => [version, range, satisfies(version, range)]);
+    expect(got).toEqual(rows);
+    // Prereleases of the next tuple stay out of a wildcard's ceiling, and
+    // includePrerelease lowers a wildcard's floor to its `-0`, as npm does.
+    expect(satisfiesInstallable("1.3.0-rc.1", "<=1.2", { includePrerelease: true })).toBe(false);
+    expect(satisfiesInstallable("1.2.0-beta.1", "1.2", { includePrerelease: true })).toBe(true);
+    expect(satisfiesInstallable("1.2.0-beta.1", "1.2")).toBe(false);
+    // What npm would not read at all stays "cannot tell".
+    for (const range of ["1.2-beta", "1.2.3foo", "1.2.3 - 2.0.0"]) {
+      expect({ range, got: satisfies("1.2.3", range) }).toEqual({ range, got: undefined });
+    }
+  });
+
   test("satisfiesInstallable applies npm's prerelease rule on top of satisfies", () => {
     // In range, and on the tuple the range names: eligible.
     expect(satisfiesInstallable("1.2.3-beta.4", "^1.2.3-beta.2")).toBe(true);

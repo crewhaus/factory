@@ -1006,51 +1006,171 @@ function comparePrerelease(a: string, b: string): number {
 }
 
 /** One comparator: an optional operator, then the version or wildcard it applies to. */
-const COMPARATOR_RE = /^(?<op>\^|~|>=|<=|>|<|=)?\s*(?<rest>.+)$/;
+const COMPARATOR_RE = /^(?<op>\^|~>?|>=|<=|>|<|=)?\s*(?<rest>.+)$/;
 
-function satisfiesComparator(version: SemVer, comparator: string): boolean | undefined {
-  const text = comparator.trim();
-  if (text === "" || text === "*" || text === "x" || text === "latest") return true;
-  const m = COMPARATOR_RE.exec(text);
+/**
+ * A comparator's version, as node-semver's XRANGEPLAIN reads it: each of
+ * major, minor and patch a number or `x`/`X`/`*`, minor and patch optional,
+ * a prerelease only after a patch, build metadata ignored. Every class is
+ * disjoint from the delimiter after it, so a match is linear.
+ */
+const COMPARATOR_VERSION_RE =
+  /^[v=\s]*(?<major>\d+|[xX*])(?:\.(?<minor>\d+|[xX*])(?:\.(?<patch>\d+|[xX*])(?:-(?<pre>[0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?)?)?$/;
+
+/** A bound a desugared comparator puts on a version. */
+type Bound = { readonly op: ">=" | ">" | "<" | "<=" | "="; readonly at: SemVer };
+
+const sv = (major: number, minor: number, patch: number, prerelease = ""): SemVer => ({
+  major,
+  minor,
+  patch,
+  prerelease,
+});
+
+/**
+ * One comparator as the bounds npm desugars it to (node-semver's
+ * replaceXRange, replaceTilde and replaceCaret), or "any"/"none", or
+ * undefined when it is not a comparator npm would read. A missing or `x`
+ * part is a wildcard: `1.2` is `>=1.2.0 <1.3.0-0`, `<=1.2` is `<1.3.0-0`,
+ * `>1` is `>=2.0.0`, `~1` is `>=1.0.0 <2.0.0-0`, `^0` is `>=0.0.0 <1.0.0-0`.
+ * The `-0` upper bounds keep a prerelease of the next tuple out.
+ * `includePrerelease` lowers a wildcard's floor to its `-0`, as npm does.
+ */
+function desugarComparator(
+  op: string,
+  rest: string,
+  includePrerelease: boolean,
+): readonly Bound[] | "any" | "none" | undefined {
+  const m = COMPARATOR_VERSION_RE.exec(rest);
   if (m === null) return undefined;
-  const op = m.groups?.["op"] ?? "";
-  const restRaw = (m.groups?.["rest"] as string).trim();
-  if (/^(workspace|path|file|link|npm|git|https?|latest)/.test(restRaw)) return undefined;
-  const wildcard = /^(?<major>\d+)(?:\.(?<minor>\d+))?\.(?:x|\*)$/.exec(restRaw);
-  if (wildcard !== null && op === "") {
-    const major = Number(wildcard.groups?.["major"]);
-    const minor = wildcard.groups?.["minor"];
-    if (version.major !== major) return false;
-    return minor === undefined ? true : version.minor === Number(minor);
-  }
-  const target = parseSemver(restRaw);
-  if (target === undefined) return undefined;
-  const cmp = compareSemver(version, target);
+  const part = (raw: string | undefined): number | undefined =>
+    raw === undefined || raw === "x" || raw === "X" || raw === "*" ? undefined : Number(raw);
+  const M = part(m.groups?.["major"]);
+  const xM = M === undefined;
+  const mi = xM ? undefined : part(m.groups?.["minor"]);
+  const xm = mi === undefined;
+  const pa = xm ? undefined : part(m.groups?.["patch"]);
+  const xp = pa === undefined;
+  const pre = xp ? "" : (m.groups?.["pre"] ?? "");
+  const z = includePrerelease ? "0" : "";
+  const major = M ?? 0;
+  const minor = mi ?? 0;
+  const patch = pa ?? 0;
   switch (op) {
-    case ">=":
-      return cmp >= 0;
-    case ">":
-      return cmp > 0;
-    case "<=":
-      return cmp <= 0;
-    case "<":
-      return cmp < 0;
-    case "=":
     case "":
-      return cmp === 0;
-    case "^": {
-      if (cmp < 0) return false;
-      if (target.major > 0) return version.major === target.major;
-      if (target.minor > 0) return version.major === 0 && version.minor === target.minor;
-      return version.major === 0 && version.minor === 0 && version.patch === target.patch;
+    case "=": {
+      if (xM) return "any";
+      if (xm)
+        return [
+          { op: ">=", at: sv(major, 0, 0, z) },
+          { op: "<", at: sv(major + 1, 0, 0, "0") },
+        ];
+      if (xp) {
+        return [
+          { op: ">=", at: sv(major, minor, 0, z) },
+          { op: "<", at: sv(major, minor + 1, 0, "0") },
+        ];
+      }
+      return [{ op: "=", at: sv(major, minor, patch, pre) }];
+    }
+    case ">":
+    case ">=":
+    case "<":
+    case "<=": {
+      if (xM) return op === ">" || op === "<" ? "none" : "any";
+      if (!xp) return [{ op, at: sv(major, minor, patch, pre) }];
+      if (op === ">") {
+        return [{ op: ">=", at: xm ? sv(major + 1, 0, 0, z) : sv(major, minor + 1, 0, z) }];
+      }
+      if (op === "<=") {
+        return [{ op: "<", at: xm ? sv(major + 1, 0, 0, "0") : sv(major, minor + 1, 0, "0") }];
+      }
+      if (op === "<") return [{ op: "<", at: sv(major, minor, 0, "0") }];
+      return [{ op: ">=", at: sv(major, minor, 0, z) }];
     }
     case "~": {
-      if (cmp < 0) return false;
-      return version.major === target.major && version.minor === target.minor;
+      if (xM) return "any";
+      if (xm)
+        return [
+          { op: ">=", at: sv(major, 0, 0) },
+          { op: "<", at: sv(major + 1, 0, 0, "0") },
+        ];
+      return [
+        { op: ">=", at: sv(major, minor, patch, pre) },
+        { op: "<", at: sv(major, minor + 1, 0, "0") },
+      ];
+    }
+    case "^": {
+      if (xM) return "any";
+      if (xm)
+        return [
+          { op: ">=", at: sv(major, 0, 0, z) },
+          { op: "<", at: sv(major + 1, 0, 0, "0") },
+        ];
+      const floor = sv(major, minor, patch, xp ? z : pre === "" && major === 0 ? z : pre);
+      const ceiling =
+        major > 0
+          ? sv(major + 1, 0, 0, "0")
+          : xp || minor > 0
+            ? sv(0, minor + 1, 0, "0")
+            : sv(0, 0, patch + 1, "0");
+      return [
+        { op: ">=", at: floor },
+        { op: "<", at: ceiling },
+      ];
     }
     default:
       return undefined;
   }
+}
+
+function holds(version: SemVer, bound: Bound): boolean {
+  const cmp = compareSemver(version, bound.at);
+  switch (bound.op) {
+    case ">=":
+      return cmp >= 0;
+    case ">":
+      return cmp > 0;
+    case "<":
+      return cmp < 0;
+    case "<=":
+      return cmp <= 0;
+    default:
+      return cmp === 0;
+  }
+}
+
+function satisfiesComparator(
+  version: SemVer,
+  comparator: string,
+  includePrerelease: boolean,
+): boolean | undefined {
+  const text = comparator.trim();
+  if (text === "" || text === "latest") return true;
+  const m = COMPARATOR_RE.exec(text);
+  if (m === null) return undefined;
+  // `~>` is npm's other spelling of `~`.
+  const op = m.groups?.["op"] === "~>" ? "~" : (m.groups?.["op"] ?? "");
+  const restRaw = (m.groups?.["rest"] as string).trim();
+  if (/^(workspace|path|file|link|npm|git|https?|latest)/.test(restRaw)) return undefined;
+  const bounds = desugarComparator(op, restRaw, includePrerelease);
+  if (bounds === undefined) return undefined;
+  if (bounds === "any") return true;
+  if (bounds === "none") return false;
+  return bounds.every((bound) => holds(version, bound));
+}
+
+/**
+ * The comparators of one `||` alternative. An operator may be written apart
+ * from its version (`>= 1.2`), which npm joins before splitting on
+ * whitespace; without the join `>=` alone was a comparator nobody understood.
+ */
+function comparatorsOf(alternative: string): string[] {
+  return alternative
+    .replace(/(\^|~>?|>=|<=|>|<|=)\s+/g, "$1")
+    .trim()
+    .split(/\s+/)
+    .filter((c) => c !== "");
 }
 
 /**
@@ -1058,26 +1178,30 @@ function satisfiesComparator(version: SemVer, comparator: string): boolean | und
  *
  * `undefined` means "cannot tell" — a `workspace:*` protocol, a git URL, a
  * hyphen range — and every caller treats that as unchecked rather than as
- * false. This is a deliberately small subset of node-semver: caret, tilde,
- * the four inequalities, exact, `x`-wildcards, whitespace-joined AND and
- * `||`-joined OR. Enough for the ranges real manifests hold, and honest about
- * the rest.
+ * false. This is a deliberately small subset of node-semver: caret, tilde
+ * (`~` and `~>`), the four inequalities, exact, partial versions and
+ * `x`-wildcards read as npm reads them (a missing segment is a wildcard),
+ * whitespace-joined AND and `||`-joined OR. Enough for the ranges real
+ * manifests hold, and honest about the rest (a hyphen range is not read).
+ * `includePrerelease` lowers a wildcard's floor to its `-0`, as npm's option
+ * does; the prerelease INSTALL rule is {@link satisfiesInstallable}'s.
  */
-export function satisfies(versionRaw: string, range: string): boolean | undefined {
+export function satisfies(
+  versionRaw: string,
+  range: string,
+  options: { readonly includePrerelease?: boolean } = {},
+): boolean | undefined {
   const version = parseSemver(versionRaw);
   if (version === undefined) return undefined;
   const alternatives = range.split("||");
   let anyKnown = false;
   for (const alternative of alternatives) {
-    const comparators = alternative
-      .trim()
-      .split(/\s+/)
-      .filter((c) => c !== "");
+    const comparators = comparatorsOf(alternative);
     if (comparators.length === 0) return true;
     let all = true;
     let known = true;
     for (const comparator of comparators) {
-      const result = satisfiesComparator(version, comparator);
+      const result = satisfiesComparator(version, comparator, options.includePrerelease === true);
       if (result === undefined) {
         known = false;
         break;
@@ -1109,7 +1233,7 @@ export function satisfiesInstallable(
   const version = parseSemver(versionRaw);
   if (version === undefined) return undefined;
   if (version.prerelease === "" || options.includePrerelease === true) {
-    return satisfies(versionRaw, range);
+    return satisfies(versionRaw, range, options);
   }
   let anyKnown = false;
   for (const alternative of range.split("||")) {
@@ -1123,7 +1247,7 @@ export function satisfiesInstallable(
 
 /** Whether a comparator in `alternative` targets a prerelease on `version`'s tuple. */
 function namesPrereleaseOf(alternative: string, version: SemVer): boolean {
-  for (const comparator of alternative.trim().split(/\s+/)) {
+  for (const comparator of comparatorsOf(alternative)) {
     const rest = COMPARATOR_RE.exec(comparator)?.groups?.["rest"];
     const target = rest === undefined ? undefined : parseSemver(rest);
     if (
