@@ -490,6 +490,92 @@ test("packedContentsProblems names each thing a tarball would be missing", () =>
   ]);
 });
 
+test("packedContentsProblems reads a `files` entry the way npm does: a trailing slash wants a directory, a symlink packs nothing", () => {
+  const withFiles = (dir: string, files: string[]) => ({ name: `@crewhaus/${dir}`, dir, files });
+  const root = makeWorkspace([
+    withFiles("slash-notice", ["dist", "README.md", "LICENSE", "NOTICE/"]),
+    withFiles("dot-notice", ["dist/", "README.md", "LICENSE", "./NOTICE"]),
+    withFiles("rooted-notice", ["dist", "README.md", "LICENSE", "/NOTICE"]),
+    withFiles("linked-entry", ["dist", "README.md", "LICENSE", "NOTICE", "skills"]),
+  ]);
+  const pkg = (dir: string) => join(root, "packages", dir);
+  const problems = (dir: string) =>
+    packedContentsProblems(
+      pkg(dir),
+      JSON.parse(readFileSync(join(pkg(dir), "package.json"), "utf8")),
+    );
+  // `NOTICE/` used to be read as `NOTICE`; npm packs no NOTICE for it.
+  expect(problems("slash-notice")).toEqual([
+    '"files" lists "NOTICE/", which is not a directory — a trailing slash matches only a directory, so npm would pack nothing for it',
+    '"files" does not list NOTICE — npm packs NOTICE only when `files` names it',
+  ]);
+  expect(problems("dot-notice")).toEqual([]);
+  expect(problems("rooted-notice")).toEqual([]);
+  // An entry that is a symlink exists, but npm packs nothing for it.
+  mkdirSync(join(pkg("linked-entry"), "real-skills"));
+  writeFileSync(join(pkg("linked-entry"), "real-skills", "a.md"), "a\n");
+  symlinkSync("real-skills", join(pkg("linked-entry"), "skills"));
+  expect(problems("linked-entry")).toEqual([
+    '"files" lists "skills", which is a symlink — npm would pack nothing for it',
+  ]);
+});
+
+// npm's own reading of each spelling, so the check above cannot drift from it.
+test.skipIf(Bun.which("npm") === null)(
+  "packedContentsProblems agrees with real `npm pack` on every `files` spelling it accepts or refuses",
+  () => {
+    const cases: { entry: string; npmPacksIt: boolean }[] = [
+      { entry: "NOTICE", npmPacksIt: true },
+      { entry: "./NOTICE", npmPacksIt: true },
+      { entry: "/NOTICE", npmPacksIt: true },
+      { entry: "NOTICE/", npmPacksIt: false },
+      { entry: "./NOTICE/", npmPacksIt: false },
+      { entry: "skills", npmPacksIt: true },
+      { entry: "skills/", npmPacksIt: true },
+      { entry: "linked", npmPacksIt: false },
+      { entry: "linked/", npmPacksIt: false },
+      { entry: "linked-file.md", npmPacksIt: false },
+    ];
+    const root = mkdtempSync(join(TMP, "spell-"));
+    const npmEnv = { PATH: process.env.PATH ?? "", HOME: root, ...isolatedNpmConfig(root) };
+    for (const [i, { entry, npmPacksIt }] of cases.entries()) {
+      const dir = join(root, `p${i}`);
+      mkdirSync(join(dir, "dist"), { recursive: true });
+      mkdirSync(join(dir, "skills"));
+      writeFileSync(join(dir, "dist", "index.js"), "export {};\n");
+      writeFileSync(join(dir, "skills", "s.md"), "s\n");
+      writeFileSync(join(dir, "real.md"), "r\n");
+      for (const f of ["README.md", "LICENSE", "NOTICE"]) writeFileSync(join(dir, f), `${f}\n`);
+      symlinkSync("skills", join(dir, "linked"));
+      symlinkSync("real.md", join(dir, "linked-file.md"));
+      const isNotice = entry.replace(/^\.?\//, "").startsWith("NOTICE");
+      const manifest = {
+        name: `@crewhaus/spell-${i}`,
+        version: V,
+        main: "dist/index.js",
+        files: ["dist", "README.md", "LICENSE", ...(isNotice ? [] : ["NOTICE"]), entry],
+      };
+      writeFileSync(join(dir, "package.json"), JSON.stringify(manifest));
+      const pack = Bun.spawnSync(["npm", "pack", "--dry-run", "--json", "--ignore-scripts"], {
+        cwd: dir,
+        env: npmEnv,
+      });
+      expect(pack.exitCode).toBe(0);
+      const packed = (
+        JSON.parse(pack.stdout.toString()) as { files: { path: string }[] }[]
+      )[0]?.files.map((f) => f.path);
+      const target = isNotice ? "NOTICE" : entry.replace(/\/+$/, "");
+      const npmPacked = (packed ?? []).some((p) => p === target || p.startsWith(`${target}/`));
+      // Pin npm's behaviour (so a change in npm fails here, loudly) ...
+      expect({ entry, npmPacked }).toEqual({ entry, npmPacked: npmPacksIt });
+      // ... and require the check to agree with it.
+      const problems = packedContentsProblems(dir, manifest);
+      expect({ entry, accepted: problems.length === 0 }).toEqual({ entry, accepted: npmPacksIt });
+    }
+  },
+  60_000,
+);
+
 test("a package whose tarball would miss LICENSE fails the --dry-run pre-flight, and its dependents with it", () => {
   const root = makeWorkspace([{ ...A, omit: ["LICENSE"] }, B]);
   const r = run(root, {}, "--dry-run");

@@ -75,7 +75,8 @@
  * dir must hold what its tarball is supposed to carry — every entry point and
  * literal `files` entry, plus README.md, LICENSE and NOTICE (release-prep
  * --for-publish puts the last three there). npm packs a missing `files` entry
- * as nothing, silently.
+ * as nothing, silently, and the same for a symlinked entry or a `name/` entry
+ * that is not a directory; each is refused here.
  */
 
 import { spawnSync } from "node:child_process";
@@ -490,24 +491,48 @@ export function packedContentsProblems(dir: string, manifest: Record<string, unk
     ? (manifest.files as unknown[]).filter((f): f is string => typeof f === "string")
     : null;
   if (files !== null) {
-    const clean = (e: string) => e.replace(/^\.\//, "").replace(/\/+$/, "");
     for (const entry of files) {
-      const e = clean(entry);
-      // Globs and negations are npm's to expand; the required files are checked above.
-      if (e === "" || /[*?[\]{}!]/.test(e) || (REQUIRED_FILES as readonly string[]).includes(e)) {
-        continue;
-      }
-      if (!existsSync(join(dir, e))) {
-        problems.push(
-          `"files" lists "${entry}", which is not there — npm would pack nothing for it`,
-        );
+      // npm reads `./x` and `/x` as x at the package root, and `x/` as "x, if it
+      // is a directory" (gitignore rules): `NOTICE/` packs no NOTICE.
+      const dirOnly = entry.endsWith("/");
+      const e = entry.replace(/^\.?\/+/, "").replace(/\/+$/, "");
+      // Globs and negations are npm's to expand; the required files are checked
+      // above (npm adds README and LICENSE whatever `files` says).
+      if (e === "" || /[*?[\]{}!]/.test(e)) continue;
+      if (!dirOnly && (REQUIRED_FILES as readonly string[]).includes(e)) continue;
+      const why = literalEntryProblem(join(dir, e), dirOnly);
+      if (why !== undefined) {
+        problems.push(`"files" lists "${entry}", ${why}`);
       }
     }
-    if (!files.some((e) => clean(e) === "NOTICE")) {
+    // Only these spellings pack NOTICE (checked against real npm pack in the tests).
+    if (!files.some((e) => /^(?:\.?\/)?NOTICE$/.test(e))) {
       problems.push('"files" does not list NOTICE — npm packs NOTICE only when `files` names it');
     }
   }
   return problems;
+}
+
+/**
+ * Why npm would pack nothing for a literal `files` entry at `path`, or undefined
+ * when it packs it. npm lstat()s the entry: a regular file or a directory is
+ * packed, a symlink (to anything) or special file is left out, and an entry with
+ * a trailing slash matches only a directory.
+ */
+function literalEntryProblem(path: string, dirOnly: boolean): string | undefined {
+  const nothing = "npm would pack nothing for it";
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return `which is not there — ${nothing}`;
+  }
+  if (st.isSymbolicLink()) return `which is a symlink — ${nothing}`;
+  if (st.isDirectory()) return undefined;
+  if (dirOnly) {
+    return `which is not a directory — a trailing slash matches only a directory, so ${nothing}`;
+  }
+  return st.isFile() ? undefined : `which is not a regular file or directory — ${nothing}`;
 }
 
 /** What the dependency gate knows when it looks at a package. */
