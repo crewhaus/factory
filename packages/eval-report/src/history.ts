@@ -10,11 +10,14 @@
  * - `baselines.json` — map of `<specName>::<datasetName>` → the pinned
  *   baseline run for that key. Written atomically as a whole (small file).
  *
- * Both are WRITTEN only as regular files at their own names. A symbolic link,
- * FIFO or device where `baselines.json` or `index.jsonl` belongs is refused
- * with a {@link HistoryWriteError}, never written through: a cloned repository
- * can carry a committed link, and following it turned a routine re-pin into a
- * write anywhere the user can write (0.7.1). The readers are unchanged; the
+ * Both are WRITTEN only as regular files at their own names, inside the
+ * workspace (see {@link historyRoot}). A symbolic link, FIFO or device where
+ * `baselines.json` or `index.jsonl` belongs is refused with a
+ * {@link HistoryWriteError}, never written through, and so is a `.crewhaus`
+ * or `.crewhaus/evals` directory that is a link leading out of the
+ * workspace: a cloned repository can carry a committed link, and following
+ * it turned a routine re-pin into a write anywhere the user can write
+ * (0.7.1). The readers are unchanged; the
  * text-level parsers ({@link parseRunIndex}, {@link parseBaselines},
  * {@link lookupBaseline}) exist so a caller that contains the leaf itself —
  * the agent-facing `tool-evalops` — can parse the bytes it read instead of
@@ -26,11 +29,12 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
 import {
   type SafeFsFailure,
   appendContained,
+  joinRel,
   openForReadSync,
   probeKind,
   writeFileSafe,
@@ -376,6 +380,27 @@ export class HistoryWriteError extends ReportError {
 }
 
 /**
+ * Where a history write is contained, and the path of the evals directory
+ * under that root.
+ *
+ * An `evalsDir` that ends in `.crewhaus/evals` — the default (relative to the
+ * cwd), and the layout `crewhaus eval`, Hangar and a compiled eval bundle
+ * use — belongs to the WORKSPACE above `.crewhaus`, and that workspace is the
+ * root: a `.crewhaus` or `.crewhaus/evals` that is a link is followed only
+ * while it stays inside it, and a missing directory is created one component
+ * at a time, never through a link. Any other `evalsDir` is a location the
+ * caller named explicitly (a tenant directory, a test) and is its own root.
+ * The root itself is created when missing, as 0.7.0 created `evalsDir`.
+ */
+function historyRoot(evalsDir: string): { readonly root: string; readonly rel: string } {
+  const abs = resolve(evalsDir);
+  const inWorkspace = basename(abs) === "evals" && basename(dirname(abs)) === ".crewhaus";
+  const root = inWorkspace ? dirname(dirname(abs)) : abs;
+  mkdirSync(root, { recursive: true });
+  return { root, rel: inWorkspace ? ".crewhaus/evals" : "" };
+}
+
+/**
  * Refuse anything at `name` in `evalsDir` that is not a regular file, before
  * it is read for a read-modify-write. The write below refuses the same things
  * again, atomically; this check exists so a link's TARGET is never read
@@ -404,8 +429,15 @@ function requireRegularOrAbsent(evalsDir: string, name: string): void {
  * `index.jsonl` is refused with a {@link HistoryWriteError}.
  */
 export function appendRunIndex(entry: RunIndexEntry, evalsDir: string = DEFAULT_EVALS_DIR): void {
-  mkdirSync(evalsDir, { recursive: true });
-  const appended = appendContained(evalsDir, INDEX_FILENAME, `${JSON.stringify(entry)}\n`);
+  const { root, rel } = historyRoot(evalsDir);
+  const appended = appendContained(
+    root,
+    joinRel(rel, INDEX_FILENAME),
+    `${JSON.stringify(entry)}\n`,
+    {
+      createParents: true,
+    },
+  );
   if (!appended.ok) throw new HistoryWriteError(INDEX_FILENAME, appended);
 }
 
@@ -678,7 +710,8 @@ const BASELINES_MAX_BYTES = 64 * 1024 * 1024;
  */
 function baselinesForUpdate(evalsDir: string): BaselinesFile {
   requireRegularOrAbsent(evalsDir, BASELINES_FILENAME);
-  const read = openForReadSync(evalsDir, BASELINES_FILENAME, {
+  const { root, rel } = historyRoot(evalsDir);
+  const read = openForReadSync(root, joinRel(rel, BASELINES_FILENAME), {
     maxBytes: BASELINES_MAX_BYTES,
     followLeafSymlink: false,
   });
@@ -711,13 +744,13 @@ export function writeBaselines(
   baselines: BaselinesFile,
   evalsDir: string = DEFAULT_EVALS_DIR,
 ): void {
-  mkdirSync(evalsDir, { recursive: true });
   requireRegularOrAbsent(evalsDir, BASELINES_FILENAME);
+  const { root, rel } = historyRoot(evalsDir);
   const written = writeFileSafe(
-    evalsDir,
-    BASELINES_FILENAME,
+    root,
+    joinRel(rel, BASELINES_FILENAME),
     `${JSON.stringify(baselines, null, 2)}\n`,
-    { overwrite: true },
+    { overwrite: true, createParents: true },
   );
   if (!written.ok) throw new HistoryWriteError(BASELINES_FILENAME, written);
 }
@@ -738,7 +771,6 @@ export function getBaseline(
  * byte-identical), the V2 per-arm key otherwise.
  */
 export function setBaseline(entry: BaselineEntry, evalsDir: string = DEFAULT_EVALS_DIR): void {
-  mkdirSync(evalsDir, { recursive: true });
   const baselines = baselinesForUpdate(evalsDir);
   baselines[baselineKeyFor(lineageOfEntry(entry))] = entry;
   writeBaselines(baselines, evalsDir);

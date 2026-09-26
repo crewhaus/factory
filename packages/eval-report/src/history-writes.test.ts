@@ -223,6 +223,91 @@ describe("appendRunIndex never appends through a link", () => {
   });
 });
 
+describe("a .crewhaus or .crewhaus/evals directory link does not take the write out of the workspace", () => {
+  // The first 0.7.1 cut contained only the LEAF: the evals directory was the
+  // containment root, realpathed first, so a committed `.crewhaus ->
+  // /anywhere` link took `crewhaus eval`'s index append and first-run pin
+  // there. The workspace above `.crewhaus` is the root now.
+  function workspace(): { ws: string; outside: string } {
+    const root = tmp("crewhaus-history-dirlink-");
+    const ws = join(root, "ws");
+    const outside = join(root, "outside");
+    mkdirSync(ws);
+    mkdirSync(outside);
+    return { ws, outside };
+  }
+
+  test("a .crewhaus link out: no append, no pin, nothing created where it leads", () => {
+    const { ws, outside } = workspace();
+    symlinkSync(outside, join(ws, ".crewhaus"));
+    const evalsDir = join(ws, ".crewhaus", "evals");
+    const refusals = [
+      refusal(() => appendRunIndex(entry("run_a"), evalsDir)),
+      refusal(() => setBaseline(pin("run_a"), evalsDir)),
+    ];
+    expect(refusals.map((e) => [e.file, e.refusal])).toEqual([
+      [INDEX_FILENAME, "escapes-root"],
+      [BASELINES_FILENAME, "escapes-root"],
+    ]);
+    // No evals directory where the link leads: nothing to clear, nothing made.
+    expect(clearBaseline(baselineKey("concierge", "smoke"), evalsDir)).toBe(false);
+    expect(readdirSync(outside)).toEqual([]);
+    for (const err of refusals) expect(err.message).not.toContain(outside);
+    // And a pin file already there is neither read into a rewrite nor changed.
+    mkdirSync(join(outside, "evals"));
+    const there = `${JSON.stringify({ [baselineKey("concierge", "smoke")]: pin("run_z") })}\n`;
+    writeFileSync(join(outside, "evals", BASELINES_FILENAME), there);
+    expect(refusal(() => clearBaseline(baselineKey("concierge", "smoke"), evalsDir)).refusal).toBe(
+      "escapes-root",
+    );
+    expect(refusal(() => setBaseline(pin("run_a"), evalsDir)).refusal).toBe("escapes-root");
+    expect(readFileSync(join(outside, "evals", BASELINES_FILENAME), "utf8")).toBe(there);
+    expect(readdirSync(join(outside, "evals"))).toEqual([BASELINES_FILENAME]);
+  });
+
+  test("the default relative evals dir is contained in the cwd", () => {
+    const { ws, outside } = workspace();
+    symlinkSync(outside, join(ws, ".crewhaus"));
+    const cwd = process.cwd();
+    process.chdir(ws);
+    try {
+      expect(refusal(() => appendRunIndex(entry("run_a"))).refusal).toBe("escapes-root");
+      expect(refusal(() => setBaseline(pin("run_a"))).refusal).toBe("escapes-root");
+    } finally {
+      process.chdir(cwd);
+    }
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test("a .crewhaus/evals link out is refused the same way", () => {
+    const { ws, outside } = workspace();
+    mkdirSync(join(ws, ".crewhaus"));
+    symlinkSync(outside, join(ws, ".crewhaus", "evals"));
+    const evalsDir = join(ws, ".crewhaus", "evals");
+    expect(refusal(() => appendRunIndex(entry("run_a"), evalsDir)).refusal).toBe("escapes-root");
+    expect(refusal(() => setBaseline(pin("run_a"), evalsDir)).refusal).toBe("escapes-root");
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  test("a link that stays inside the workspace is followed, and a fresh workspace is created", () => {
+    const { ws } = workspace();
+    mkdirSync(join(ws, "history"));
+    symlinkSync(join(ws, "history"), join(ws, ".crewhaus"));
+    appendRunIndex(entry("run_a"), join(ws, ".crewhaus", "evals"));
+    setBaseline(pin("run_a"), join(ws, ".crewhaus", "evals"));
+    expect(readdirSync(join(ws, "history", "evals")).sort()).toEqual([
+      BASELINES_FILENAME,
+      INDEX_FILENAME,
+    ]);
+    // First use in a workspace with no .crewhaus yet: the whole path is made.
+    const fresh = workspace().ws;
+    setBaseline(pin("run_b"), join(fresh, ".crewhaus", "evals"));
+    expect(
+      readBaselines(join(fresh, ".crewhaus", "evals"))[baselineKey("concierge", "smoke")]?.runId,
+    ).toBe("run_b");
+  });
+});
+
 describe("the text-level readers agree with the path readers", () => {
   test("parseRunIndex + latestRunIndexEntries = readRunIndex / readRunIndexLatest", () => {
     const { evalsDir } = layout();
