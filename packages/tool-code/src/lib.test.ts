@@ -26,6 +26,7 @@ import {
   parsePackageLockDetailed,
   parsePnpmLock,
   parsePnpmLockDetailed,
+  parsePnpmWorkspacePackages,
   parsePyproject,
   parseRequirementsTxt,
   parseSemver,
@@ -33,6 +34,7 @@ import {
   parseYarnLockDetailed,
   satisfies,
   stripJsonc,
+  unsupportedWorkspaceGlob,
 } from "./lib/deps";
 import {
   countBySeverity,
@@ -1131,6 +1133,88 @@ describe("dependency manifests", () => {
     expect(matchWorkspaceGlob("packages/a/b", "packages/**")).toBe(true);
     expect(matchWorkspaceGlob("apps/web", "packages/*")).toBe(false);
     expect(matchWorkspaceGlob("packages/x", "!packages/x")).toBe(false);
+  });
+
+  test("a workspace glob's ? is one character, and never a regex quantifier (C220)", () => {
+    // 0.7.0 left `?` unescaped, so `pkg-?` compiled to /^pkg-?$/: the one
+    // directory that is not a member matched, and every member did not.
+    expect(matchWorkspaceGlob("pkg", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("pkg-a", "pkg-?")).toBe(true);
+    expect(matchWorkspaceGlob("pkg-ab", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("pkg-", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("pkg-/x", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("packages/pkg-a", "packages/pkg-?")).toBe(true);
+    // `?` never matches a `/`.
+    expect(matchWorkspaceGlob("packages/a/b", "packages?a/b")).toBe(false);
+    // Every other character is itself.
+    expect(matchWorkspaceGlob("packages/aab", "packages/a+b")).toBe(false);
+    expect(matchWorkspaceGlob("packages/a+b", "packages/a+b")).toBe(true);
+    expect(matchWorkspaceGlob("packagesXa", "packages.a")).toBe(false);
+    expect(matchWorkspaceGlob("packages/(x)", "packages/(x)")).toBe(true);
+  });
+
+  test("workspace globs read `**`, `./` and a trailing slash the way package managers do", () => {
+    expect(matchWorkspaceGlob("packages/a", "./packages/*")).toBe(true);
+    expect(matchWorkspaceGlob("packages/a", "packages/*/")).toBe(true);
+    expect(matchWorkspaceGlob("packages/a/b/c", "packages/**/c")).toBe(true);
+    expect(matchWorkspaceGlob("packages/c", "packages/**/c")).toBe(true);
+    expect(matchWorkspaceGlob("apps/c", "packages/**/c")).toBe(false);
+    expect(matchWorkspaceGlob("packages/a/b", "**/b")).toBe(true);
+    // `**` inside a segment is a plain `*`: it does not cross a `/`.
+    expect(matchWorkspaceGlob("packages/a/b-x", "packages/**-x")).toBe(false);
+    expect(matchWorkspaceGlob("packages/b-x", "packages/**-x")).toBe(true);
+  });
+
+  test("a many-star glob is matched in bounded time, not by a backtracking regex", () => {
+    // 0.7.0 compiled this to /^packages\/[^/]*a[^/]*a…b$/, a polynomial
+    // backtracker: ~2s on a 100-character name here, minutes at 250. The glob
+    // is the repository's, so WorkspacePackages hung on it.
+    const dir = `packages/${"a".repeat(100)}`;
+    const started = performance.now();
+    expect(matchWorkspaceGlob(dir, "packages/*a*a*a*a*a*b")).toBe(false);
+    expect(matchWorkspaceGlob(`${dir}b`, "packages/*a*a*a*a*a*b")).toBe(true);
+    expect(matchWorkspaceGlob(`${dir}/a/a/a/a`, "**/**/**/**/**/x")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  test("syntax the matcher does not evaluate is named, not read as literal text", () => {
+    expect(unsupportedWorkspaceGlob("packages/{a,b}")).toContain("brace");
+    expect(unsupportedWorkspaceGlob("!packages/[ab]")).toContain("character classes");
+    expect(unsupportedWorkspaceGlob("packages/*")).toBeUndefined();
+    expect(matchWorkspaceGlob("packages/a", "packages/{a,b}")).toBe(false);
+  });
+
+  test("pnpm-workspace.yaml: only the packages: list, quotes and comments dropped", () => {
+    const yaml = [
+      "# the workspace",
+      "packages:",
+      "  - 'packages/*'",
+      '  - "apps/**"',
+      "  - tools/cli # the cli",
+      "  - '!**/test/**'",
+      "- top-level/*",
+      "onlyBuiltDependencies:",
+      "  - esbuild",
+      "",
+    ].join("\r\n");
+    expect(parsePnpmWorkspacePackages(yaml)).toEqual([
+      "packages/*",
+      "apps/**",
+      "tools/cli",
+      "!**/test/**",
+      "top-level/*",
+    ]);
+  });
+
+  test("pnpm-workspace.yaml is read in linear time, whatever the repository wrote", () => {
+    // The 0.7.0 pattern grew with the square of a run of spaces before a
+    // stray quote, and of a run of blank lines: ~2s each at these sizes,
+    // and a 2 MB file (the read cap) was a hang.
+    const spaces = " ".repeat(40_000);
+    const hostile = `packages:\n  - a${spaces}"x\n${" \n".repeat(20_000)}`;
+    const started = performance.now();
+    expect(parsePnpmWorkspacePackages(hostile)).toEqual([`a${spaces}"x`]);
+    expect(performance.now() - started).toBeLessThan(500);
   });
 });
 

@@ -1059,21 +1059,137 @@ export function satisfies(versionRaw: string, range: string): boolean | undefine
 // workspace globs
 
 /**
- * Match a workspace glob (`packages/*`, `apps/**`, `packages/tool-*`) against
- * a directory path relative to the workspace root.
+ * The `packages:` list of a pnpm-workspace.yaml — the block form pnpm writes,
+ * one `- glob` per line, quotes and trailing comments dropped.
  *
- * Only the two wildcards npm, bun, pnpm and yarn workspaces actually use are
- * supported: `*` within one segment and `**` across segments. Negations
- * (`!packages/private`) are not, and a caller passing one gets no match rather
- * than a wrong one.
+ * Read line by line rather than with one multi-line pattern: the file is the
+ * repository's, and `^\s*-\s*["']?([^"'\n]+)["']?\s*$` over it backtracked
+ * quadratically (a line of spaces before a stray quote, or a run of blank
+ * lines). Only items under the top-level `packages:` key count: another
+ * list in the same file (`onlyBuiltDependencies:`) names packages, not
+ * directories.
+ */
+export function parsePnpmWorkspacePackages(text: string): string[] {
+  const globs: string[] = [];
+  let inPackages = false;
+  for (const raw of text.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (line[0] !== " " && line[0] !== "\t" && line[0] !== "-") {
+      // A top-level key starts (or ends) the block.
+      inPackages = /^packages:[ \t]*(?:#.*)?$/.test(trimmed);
+      continue;
+    }
+    if (!inPackages || !trimmed.startsWith("-")) continue;
+    let item = trimmed.slice(1).trim();
+    const quote = item[0];
+    if (quote === '"' || quote === "'") {
+      const close = item.indexOf(quote, 1);
+      item = close === -1 ? item.slice(1) : item.slice(1, close);
+    } else {
+      const comment = item.search(/\s#/);
+      if (comment !== -1) item = item.slice(0, comment);
+      item = item.trim();
+    }
+    if (item !== "") globs.push(item);
+  }
+  return globs;
+}
+
+/** Split a workspace-relative path or glob into its segments, `./` and trailing `/` dropped. */
+function globSegments(text: string): string[] {
+  return text.split("/").filter((segment) => segment !== "" && segment !== ".");
+}
+
+/**
+ * Why a workspace glob cannot be evaluated here, or undefined when it can.
+ *
+ * Character classes (`[ab]`) and brace sets (`{a,b}`) are real glob syntax in
+ * npm, pnpm and yarn workspaces, and reading them as literal text would drop
+ * the packages they name without a word. A caller is told instead.
+ */
+export function unsupportedWorkspaceGlob(pattern: string): string | undefined {
+  const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
+  if (/[[\]{}]/.test(body)) {
+    return "character classes ([...]) and brace sets ({a,b}) are not evaluated by this tool";
+  }
+  return undefined;
+}
+
+/**
+ * One path segment against one glob segment: `*` is any run of characters,
+ * `?` exactly one. The classic two-pointer walk that backs up only to the
+ * last `*` — at most length × length steps, whatever the pattern, so a
+ * repository's glob cannot make it backtrack exponentially the way a
+ * translated regular expression could.
+ */
+function matchSegment(name: string, glob: string): boolean {
+  let n = 0;
+  let g = 0;
+  let starAt = -1;
+  let resumeAt = 0;
+  while (n < name.length) {
+    const want = glob[g];
+    if (want === "*") {
+      starAt = g++;
+      resumeAt = n;
+    } else if (want !== undefined && (want === "?" || want === name[n])) {
+      g++;
+      n++;
+    } else if (starAt !== -1) {
+      g = starAt + 1;
+      n = ++resumeAt;
+    } else {
+      return false;
+    }
+  }
+  while (glob[g] === "*") g++;
+  return g === glob.length;
+}
+
+/**
+ * Match a workspace glob (`packages/*`, `apps/**`, `packages/tool-?`) against
+ * a directory path relative to the workspace root, the way npm, bun, pnpm and
+ * yarn read it:
+ *
+ * - `*` is any run of characters within one segment, `?` exactly one
+ *   character within one segment — never a `/`;
+ * - `**` as a whole segment is any number of segments, including none;
+ *   anywhere else it is just `*`;
+ * - a leading `./` and a trailing `/` are ignored;
+ * - every other character is itself.
+ *
+ * It is matched segment by segment, not compiled to a regular expression:
+ * the glob comes from the repository, and a translated `**` / `**` / `**`
+ * chain was a polynomial backtracker. Negations (`!packages/private`) are the
+ * caller's to apply — here they match nothing — and a glob
+ * `unsupportedWorkspaceGlob` names matches nothing either.
  */
 export function matchWorkspaceGlob(dir: string, pattern: string): boolean {
   if (pattern.startsWith("!")) return false;
-  const cleaned = pattern.replace(/\/+$/, "");
-  const escaped = cleaned.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  const body = escaped
-    .replace(/\*\*/g, "@@GLOBSTAR@@")
-    .replace(/\*/g, "[^/]*")
-    .replace(/@@GLOBSTAR@@/g, ".*");
-  return new RegExp(`^${body}$`).test(dir.replace(/\/+$/, ""));
+  if (unsupportedWorkspaceGlob(pattern) !== undefined) return false;
+  const globs = globSegments(pattern);
+  const names = globSegments(dir);
+  if (globs.length === 0) return false;
+  // reach[j]: the glob segments so far match the first j path segments.
+  let reach = new Array<boolean>(names.length + 1).fill(false);
+  reach[0] = true;
+  for (const glob of globs) {
+    const next = new Array<boolean>(names.length + 1).fill(false);
+    if (glob === "**") {
+      let seen = false;
+      for (let j = 0; j <= names.length; j++) {
+        seen = seen || (reach[j] as boolean);
+        next[j] = seen;
+      }
+    } else {
+      const segment = glob.replace(/\*{2,}/g, "*");
+      for (let j = 0; j < names.length; j++) {
+        if (reach[j] === true && matchSegment(names[j] as string, segment)) next[j + 1] = true;
+      }
+    }
+    reach = next;
+  }
+  return reach[names.length] === true;
 }

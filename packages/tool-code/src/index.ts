@@ -57,9 +57,11 @@ import {
   parseGoMod,
   parseLockfileDetailed,
   parsePackageJson,
+  parsePnpmWorkspacePackages,
   parsePyproject,
   parseRequirementsTxt,
   satisfies,
+  unsupportedWorkspaceGlob,
 } from "./lib/deps";
 import {
   type Diagnostic,
@@ -1874,16 +1876,21 @@ export const workspacePackages: RegisteredTool = buildTool({
         MAX_FILE_BYTES,
         skipped,
       );
-      if (pnpm !== undefined) {
-        globs = [...pnpm.matchAll(/^\s*-\s*["']?([^"'\n]+)["']?\s*$/gm)].map((m) =>
-          (m[1] as string).trim(),
-        );
-      }
+      if (pnpm !== undefined) globs = parsePnpmWorkspacePackages(pnpm);
     }
     if (globs.length === 0) {
       return `WorkspacePackages found no workspaces in "${input.cwd ?? "."}" — the root package.json declares none and there is no pnpm-workspace.yaml${skippedClause(skipped)}. This does not look like a monorepo root.`;
     }
 
+    // A `!` glob removes what the others include (npm, pnpm and yarn all read
+    // it so); a glob whose syntax is not evaluated here is reported, because
+    // the packages it names — or, negated, excludes — would otherwise be
+    // wrong without a word.
+    const unsupportedGlobs = globs
+      .map((glob) => ({ glob, reason: unsupportedWorkspaceGlob(glob) }))
+      .filter((entry): entry is { glob: string; reason: string } => entry.reason !== undefined);
+    const including = globs.filter((glob) => !glob.startsWith("!"));
+    const excluding = globs.filter((glob) => glob.startsWith("!")).map((glob) => glob.slice(1));
     const walked = walkFiles({
       root: dir.value,
       extensions: [".json"],
@@ -1894,7 +1901,8 @@ export const workspacePackages: RegisteredTool = buildTool({
     for (const rel of walked.files) {
       if (!rel.endsWith("package.json") || rel === "package.json") continue;
       const memberDir = rel.slice(0, rel.length - "/package.json".length);
-      if (!globs.some((glob) => matchWorkspaceGlob(memberDir, glob))) continue;
+      if (!including.some((glob) => matchWorkspaceGlob(memberDir, glob))) continue;
+      if (excluding.some((glob) => matchWorkspaceGlob(memberDir, glob))) continue;
       const text = readTextFile(path.join(dir.value, rel), MAX_FILE_BYTES, skipped);
       if (text === undefined) continue;
       const manifest = parsePackageJson(text);
@@ -1927,6 +1935,13 @@ export const workspacePackages: RegisteredTool = buildTool({
       })),
       ...(capped.truncated ? { resultsTruncated: true } : {}),
       ...(skipped.length > 0 ? { skipped } : {}),
+      ...(unsupportedGlobs.length > 0
+        ? {
+            unsupportedGlobs,
+            complete: false,
+            note: "some workspace globs use syntax this tool does not evaluate, so the packages they include or exclude are not reflected here — the list may be missing members, or hold ones a negated glob removes",
+          }
+        : {}),
       cycles: stronglyConnected(
         members.map((m) => m.name),
         adjacency,

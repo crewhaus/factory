@@ -126,6 +126,19 @@ returns `undefined` for it rather than an empty list — "no reader for this"
 and "no dependencies" are different answers, and only one of them is safe to
 report as a clean result.
 
+## Workspace globs
+
+`WorkspacePackages` reads membership from the root `package.json`'s
+`workspaces`, or from the `packages:` list of `pnpm-workspace.yaml` (other
+lists in that file name packages, not directories). A glob is read the way
+npm, bun, pnpm and yarn read it: `*` is any run of characters within one path
+segment, `?` exactly one, `**` as a whole segment any number of segments, and
+a `!` glob removes what the others include. Character classes (`[ab]`) and
+brace sets (`{a,b}`) are not evaluated; a glob that uses them is listed under
+`unsupportedGlobs` with `complete: false`, never silently read as literal
+text. Globs are matched segment by segment, not compiled to a regular
+expression, so a repository's glob cannot make the match backtrack.
+
 ## Containment, arguments, bounds
 
 - **Containment.** Every caller-supplied path goes through `src/paths.ts`

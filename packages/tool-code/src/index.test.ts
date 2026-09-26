@@ -1126,6 +1126,64 @@ describe("project and dependency tools", () => {
     expect(result["cycles"]).toEqual([]);
   });
 
+  test("WorkspacePackages reads ? in a glob as one character (C220)", async () => {
+    write("package.json", JSON.stringify({ name: "root", private: true, workspaces: ["pkg-?"] }));
+    write("pkg/package.json", JSON.stringify({ name: "not-a-member" }));
+    write("pkg-a/package.json", JSON.stringify({ name: "member-a" }));
+    write("pkg-b/package.json", JSON.stringify({ name: "member-b" }));
+    write("pkg-ab/package.json", JSON.stringify({ name: "not-a-member-either" }));
+    const result = await callJson(workspacePackages, {});
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["member-a", "member-b"]);
+    expect(result["unsupportedGlobs"]).toBeUndefined();
+  });
+
+  test("WorkspacePackages applies a negated glob instead of ignoring it", async () => {
+    write(
+      "package.json",
+      JSON.stringify({
+        name: "root",
+        private: true,
+        workspaces: ["packages/*", "!packages/private"],
+      }),
+    );
+    write("packages/public/package.json", JSON.stringify({ name: "@demo/public" }));
+    write("packages/private/package.json", JSON.stringify({ name: "@demo/private" }));
+    const result = await callJson(workspacePackages, {});
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["@demo/public"]);
+  });
+
+  test("WorkspacePackages names a glob it cannot evaluate rather than dropping its packages", async () => {
+    write(
+      "package.json",
+      JSON.stringify({ name: "root", private: true, workspaces: ["apps/*", "packages/{a,b}"] }),
+    );
+    write("apps/web/package.json", JSON.stringify({ name: "@demo/web" }));
+    write("packages/a/package.json", JSON.stringify({ name: "@demo/a" }));
+    const result = await callJson(workspacePackages, {});
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["@demo/web"]);
+    expect(result["complete"]).toBe(false);
+    expect(result["unsupportedGlobs"]).toEqual([
+      { glob: "packages/{a,b}", reason: expect.stringContaining("brace sets") },
+    ]);
+  });
+
+  test("WorkspacePackages takes pnpm's globs from the packages: list only", async () => {
+    write("package.json", JSON.stringify({ name: "root", private: true }));
+    write(
+      "pnpm-workspace.yaml",
+      "packages:\n  - 'packages/*'\nonlyBuiltDependencies:\n  - esbuild\n",
+    );
+    write("packages/core/package.json", JSON.stringify({ name: "@demo/core" }));
+    write("esbuild/package.json", JSON.stringify({ name: "not-a-member" }));
+    const result = await callJson(workspacePackages, {});
+    expect(result["workspaces"]).toEqual(["packages/*"]);
+    const packages = result["packages"] as Array<Record<string, unknown>>;
+    expect(packages.map((p) => p["name"])).toEqual(["@demo/core"]);
+  });
+
   test("WorkspacePackages says when a directory is not a monorepo root", async () => {
     const message = await call(workspacePackages, {});
     expect(message).toContain("does not look like a monorepo root");
