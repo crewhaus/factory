@@ -44,6 +44,7 @@ import {
   encodeAggregate3,
 } from "@crewhaus/tool-onchain";
 import { z } from "zod";
+import { resolveAggregator } from "./lib/aggregator";
 import { type Call3, chunk, runAggregate3 } from "./lib/batch";
 import {
   SELECTORS,
@@ -112,6 +113,11 @@ export {
 } from "./lib/rpc";
 export { MULTICALL3_ADDRESS } from "@crewhaus/tool-onchain";
 export {
+  type Aggregator,
+  type ChaincallConfigInput,
+  registerChaincallConfig,
+} from "./lib/aggregator";
+export {
   EIP1822_SLOT,
   EIP1967_ADMIN_SLOT,
   EIP1967_BEACON_SLOT,
@@ -177,7 +183,9 @@ const multicallAddressField = z
   .string()
   .regex(/^0x[0-9a-fA-F]{40}$/)
   .optional()
-  .describe(`Multicall3 on this chain; default ${MULTICALL3_ADDRESS}`);
+  .describe(
+    `leave it out: batches go to the canonical Multicall3 (${MULTICALL3_ADDRESS}) or the one the operator configured for the chain, and any other address is refused`,
+  );
 
 type BlockChoice = { readonly blockNumber?: string; readonly blockTag?: string };
 
@@ -269,7 +277,15 @@ export const evmMulticall: RegisteredTool = buildTool({
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       const rpc = resolveRpc(input.chainId, "EvmMulticall");
-      const multicall3 = input.multicall3Address ?? MULTICALL3_ADDRESS;
+      // Resolved before any read: an aggregator the operator did not name
+      // is refused, not asked.
+      const aggregator = resolveAggregator(
+        input.chainId,
+        input.multicall3Address,
+        ctx?.toolConfig,
+        "EvmMulticall",
+      );
+      const multicall3 = aggregator.address;
       const { param, pinnedByCaller } = blockOf(input);
 
       const calls: Call3[] = [];
@@ -398,6 +414,8 @@ export const evmMulticall: RegisteredTool = buildTool({
       return json({
         chainId: input.chainId,
         multicall3,
+        // Who answered every row, since each one is its word.
+        aggregator,
         block: {
           requested: param,
           number: pinned === undefined ? null : pinned.toString(),
@@ -576,9 +594,15 @@ export const contractInspect: RegisteredTool = buildTool({
     const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       const rpc = resolveRpc(input.chainId, "ContractInspect");
+      const aggregator = resolveAggregator(
+        input.chainId,
+        input.multicall3Address,
+        ctx?.toolConfig,
+        "ContractInspect",
+      );
       const target = await checkAddress(input.address, "address");
       const { param } = blockOf(input);
-      const multicall3 = input.multicall3Address ?? MULTICALL3_ADDRESS;
+      const multicall3 = aggregator.address;
       const caveats: string[] = [];
 
       const code = asData(
@@ -798,6 +822,8 @@ export const contractInspect: RegisteredTool = buildTool({
         address: target.address,
         checksumVerified: target.checksumVerified,
         block: { requested: param },
+        // Who answered the batched view calls, when they were batched.
+        aggregator: mode === "multicall3" ? aggregator : null,
         verified: {
           isContract: true,
           codeSize,
@@ -971,7 +997,18 @@ export const evmSimulateBundle: RegisteredTool = buildTool({
     try {
       const rpc = resolveRpc(input.chainId, "EvmSimulateBundle");
       const { param } = blockOf(input);
-      const multicall3 = input.multicall3Address ?? MULTICALL3_ADDRESS;
+      // Multicall3 reads the tracked balances, and nothing else here; without
+      // trackBalances a multicall3Address is ignored, as it always was.
+      const aggregator =
+        input.trackBalances === undefined
+          ? undefined
+          : resolveAggregator(
+              input.chainId,
+              input.multicall3Address,
+              ctx?.toolConfig,
+              "EvmSimulateBundle",
+            );
+      const multicall3 = aggregator?.address ?? MULTICALL3_ADDRESS;
       const traceTransfers = input.traceTransfers ?? true;
 
       const userCalls = input.calls.map((call, index) => toWireCall(call, index));
@@ -1054,6 +1091,19 @@ export const evmSimulateBundle: RegisteredTool = buildTool({
       const calls = inner.map((call, index) => ({ ...call, index }));
 
       const limitations: string[] = [];
+      const overridden = Object.keys(input.stateOverrides ?? {});
+      if (overridden.length > 0) {
+        const aggregatorOverridden =
+          aggregator !== undefined &&
+          overridden.some((a) => a.toLowerCase() === aggregator.address.toLowerCase());
+        limitations.push(
+          `stateOverrides rewrote ${overridden.length} address(es) for this simulation, so every result describes the chain as overridden, not as it is${
+            aggregatorOverridden
+              ? ` — including the Multicall3 (${aggregator.address}) that read the tracked balances, so balanceChanges are whatever the override's code returns`
+              : ""
+          }.`,
+        );
+      }
       if (traceTransfers) {
         limitations.push(
           "traceTransfers is on, so native value movements appear as synthetic ERC-20-shaped Transfer logs emitted by the zero address. They are not events any contract actually emitted.",
@@ -1088,7 +1138,7 @@ export const evmSimulateBundle: RegisteredTool = buildTool({
         callCount: calls.length,
         reverted: calls.filter((c) => c.status === "reverted").length,
         calls,
-        ...(balanceChanges !== undefined ? { balanceChanges } : {}),
+        ...(balanceChanges !== undefined ? { balanceChanges, aggregator } : {}),
         ...(limitations.length > 0 ? { limitations } : {}),
       });
     } finally {

@@ -46,6 +46,32 @@ SUCCEEDS in the EVM and returns nothing. Decode that as `uint256` and you get
 zero, which reads as a balance. Every such row is marked `emptyReturn` and
 left undecoded, and the result says how many there were.
 
+## Who answers a batch
+
+A batch is one `eth_call` to Multicall3, and every row in it — each call's
+return data, whether it succeeded, the block number that pins it — is what
+that contract returns. Any contract can implement `aggregate3` and make rows
+up, so which one answers is the operator's decision, not a call's: batches go
+to the canonical deployment (`0xcA11bde05977b3631167028862bE2a173976CA11`)
+unless `tool_config.chaincall.multicall3` names another for the chain. A
+call's `multicall3Address` is accepted only when it is that same address, and
+anything else is refused before any read. `EvmMulticall`, `ContractInspect`
+(when it batched) and a balance-tracking `EvmSimulateBundle` say who answered:
+`aggregator: { address, source }`, with `source` either `canonical` or
+`config`.
+
+```yaml
+tool_config:
+  chaincall:
+    multicall3:                 # only where the canonical deployment is absent
+      "324": "0xF9cda624FBC7e059355ce98a31693d299FACd963"
+```
+
+`EvmSimulateBundle` runs under `stateOverrides` the caller chose, so its
+results describe the chain as overridden; it says so in `limitations`, and
+names the aggregator when an override rewrote the one that read the tracked
+balances.
+
 ## Verified, and claimed
 
 `ContractInspect` splits its answer in two, because they are different kinds
@@ -220,6 +246,8 @@ A tool that cannot say no is not finished. These say no, with the reason:
 - **balance tracking without a chained simulation**;
 - **fee percentiles that are not strictly ascending**, which `eth_feeHistory`
   requires, and a **block the node does not have**;
+- **a `multicall3Address` other than the canonical deployment or the one the
+  operator configured** for the chain, before anything is dialled;
 - **an address that is not 20 hex bytes**, before anything is dialled. A
   lowercase address is answered, with `checksumVerified: false` attached,
   because EIP-55 can only verify a checksum that is there.

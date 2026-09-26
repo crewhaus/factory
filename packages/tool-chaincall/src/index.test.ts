@@ -47,6 +47,7 @@ import {
   evmMulticall,
   evmSimulateBundle,
   gasMarketRead,
+  registerChaincallConfig,
 } from "./index";
 
 const CHAIN = "base-mainnet";
@@ -1419,6 +1420,145 @@ describe("GasMarketRead", () => {
     const out = await run(gasMarketRead, { chainId: CHAIN, blockCount: 3 });
     expect(out.rollup).toMatchObject({ opStackGasPriceOracle: false });
     expect(out.caveats.join(" ")).toContain("L1 data fee is charged separately");
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe("only the operator decides which Multicall3 answers a batch (C127)", () => {
+  const ALT = "0x9999999999999999999999999999999999999999";
+  // zkSync Era's Multicall3, EIP-55: a chain whose deployment is elsewhere.
+  const ZKSYNC = "0xF9cda624FBC7e059355ce98a31693d299FACd963";
+
+  afterEach(() => registerChaincallConfig({}));
+
+  // biome-ignore lint/suspicious/noExplicitAny: test reader for a tool's JSON
+  async function runWith(tool: RegisteredTool, input: unknown, toolConfig?: unknown): Promise<any> {
+    const out = await tool.execute(tool.inputSchema.parse(input), {
+      ...(toolConfig !== undefined ? { toolConfig } : {}),
+    } as never);
+    return JSON.parse(String(out));
+  }
+
+  /** Every eth_call's `to`, and a forged aggregate3 answer for whatever is asked. */
+  async function recordTargets(): Promise<{ targets: string[] }> {
+    const targets: string[] = [];
+    const blob = await aggregate3Return([
+      [true, word(10n ** 30n)],
+      [true, word(19n)],
+    ]);
+    use({
+      eth_call: (params) => {
+        targets.push(String((params[0] as { to: string }).to));
+        return blob;
+      },
+      eth_simulateV1: () => simulateV1Result(100, [{ returnData: word(1n) }]),
+    });
+    return { targets };
+  }
+
+  const call = {
+    target: ADDR.token,
+    signature: "balanceOf(address)",
+    args: [ADDR.wallet],
+    outputs: ["uint256"],
+  };
+
+  test("a caller's aggregator is refused before anything is read", async () => {
+    const { targets } = await recordTargets();
+    await expect(
+      runWith(evmMulticall, { chainId: CHAIN, multicall3Address: ALT, calls: [call] }),
+    ).rejects.toThrow(
+      `EvmMulticall: multicall3Address "${ALT}" is not the Multicall3 chain "${CHAIN}" reads through (${MULTICALL3_ADDRESS}). The aggregator answers every row of a batch`,
+    );
+    await expect(
+      runWith(contractInspect, { chainId: CHAIN, address: ADDR.token, multicall3Address: ALT }),
+    ).rejects.toThrow(/ContractInspect: multicall3Address .* tool_config\.chaincall\.multicall3/);
+    await expect(
+      runWith(evmSimulateBundle, {
+        chainId: CHAIN,
+        calls: [{ from: ADDR.wallet, to: ADDR.token, data: "0x" }],
+        trackBalances: { accounts: [ADDR.wallet] },
+        multicall3Address: ALT,
+      }),
+    ).rejects.toThrow(/EvmSimulateBundle: multicall3Address/);
+    expect(targets).toEqual([]);
+  });
+
+  test("by default the canonical deployment answers, and says so", async () => {
+    const { targets } = await recordTargets();
+    const out = await runWith(evmMulticall, { chainId: CHAIN, calls: [call] });
+    expect(targets).toEqual([MULTICALL3_ADDRESS]);
+    expect(out.aggregator).toEqual({ address: MULTICALL3_ADDRESS, source: "canonical" });
+    // Naming the address that would be used anyway is still accepted.
+    await runWith(evmMulticall, {
+      chainId: CHAIN,
+      multicall3Address: MULTICALL3_ADDRESS.toLowerCase(),
+      calls: [call],
+    });
+    expect(targets).toHaveLength(2);
+  });
+
+  test("tool_config.chaincall.multicall3 names a chain's deployment, at boot or per candidate", async () => {
+    const { targets } = await recordTargets();
+    registerChaincallConfig({ multicall3: { [CHAIN]: ZKSYNC } });
+    const out = await runWith(evmMulticall, { chainId: CHAIN, calls: [call] });
+    expect(targets).toEqual([ZKSYNC]);
+    expect(out.aggregator).toEqual({ address: ZKSYNC, source: "config" });
+    expect(out.multicall3).toBe(ZKSYNC);
+    // The canonical address is now the refused one on this chain.
+    await expect(
+      runWith(evmMulticall, {
+        chainId: CHAIN,
+        multicall3Address: MULTICALL3_ADDRESS,
+        calls: [call],
+      }),
+    ).rejects.toThrow(/is not the Multicall3 chain/);
+    // A pool candidate's own block replaces the boot registration.
+    const own = await runWith(evmMulticall, { chainId: CHAIN, calls: [call] }, { multicall3: {} });
+    expect(own.aggregator).toEqual({ address: MULTICALL3_ADDRESS, source: "canonical" });
+  });
+
+  test("a malformed or mis-checksummed deployment is refused at boot", () => {
+    expect(() =>
+      registerChaincallConfig({
+        multicall3: { [CHAIN]: ZKSYNC.toLowerCase().replace("f9", "F9") },
+      }),
+    ).toThrow(/tool_config\.chaincall\.multicall3/);
+    expect(() => registerChaincallConfig({ multicall3: ["0x1"] } as never)).toThrow(
+      /must map a chain id to its Multicall3 address/,
+    );
+  });
+
+  test("a simulation says when stateOverrides rewrote the aggregator it read balances through", async () => {
+    await recordTargets();
+    const before = await aggregate3Return([[true, word(5n)]]);
+    use({
+      eth_simulateV1: () =>
+        simulateV1Result(100, [
+          { returnData: before },
+          { returnData: word(1n) },
+          { returnData: before },
+        ]),
+    });
+    const out = await runWith(evmSimulateBundle, {
+      chainId: CHAIN,
+      calls: [{ from: ADDR.wallet, to: ADDR.token, data: "0x" }],
+      trackBalances: { accounts: [ADDR.wallet] },
+      stateOverrides: { [MULTICALL3_ADDRESS.toLowerCase()]: { code: "0x00" } },
+    });
+    expect(out.aggregator).toEqual({ address: MULTICALL3_ADDRESS, source: "canonical" });
+    expect(out.limitations.join(" ")).toContain(
+      `stateOverrides rewrote 1 address(es) for this simulation, so every result describes the chain as overridden, not as it is — including the Multicall3 (${MULTICALL3_ADDRESS}) that read the tracked balances`,
+    );
+    // Without trackBalances there is no aggregator, and a stray address is ignored as before.
+    use({ eth_simulateV1: () => simulateV1Result(100, [{ returnData: word(1n) }]) });
+    const plain = await runWith(evmSimulateBundle, {
+      chainId: CHAIN,
+      calls: [{ from: ADDR.wallet, to: ADDR.token, data: "0x" }],
+      multicall3Address: ALT,
+    });
+    expect(plain.aggregator).toBeUndefined();
   });
 });
 
