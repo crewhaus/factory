@@ -1777,6 +1777,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
       },

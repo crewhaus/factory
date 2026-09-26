@@ -1553,7 +1553,9 @@ export async function activatePlugins(opts: ActivatePluginsOptions): Promise<Act
     // Skill-bundle convention: `<plugin-dir>/skills/` — a directory of
     // `<name>/SKILL.md` subdirs, exactly skills-registry's pluginDirs contract.
     // The entrypoint sits at `<plugin-dir>/index.js`, so its parent is the dir.
-    // Like index.js, it must really be inside the plugin's directory.
+    // Like index.js, it must really be inside the plugin's directory; each
+    // skill in it, and its SKILL.md, is held to the same rule where it is
+    // read (skills-registry's discoverSkills, for every pluginDirs entry).
     const pluginDir = dirname(plugin.entrypointPath);
     const skillDir = join(pluginDir, "skills");
     if (exists(skillDir)) {

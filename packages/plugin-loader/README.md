@@ -161,7 +161,11 @@ the one left out.
 
 ## What a plugin can contribute
 
-Tools, and skills in a `skills/` directory beside `plugin.json`. The SDK also
+Tools, and skills in a `skills/` directory beside `plugin.json`. The
+directory, each skill in it and each `SKILL.md` must really be inside the
+plugin's own directory: a link within it works, a link that leads out is left
+out with a boot note. A `SKILL.md` is read only as a regular file of at most
+1 MiB, so a FIFO cannot hang the boot. The SDK also
 declares channels, models, graders and target emitters, but nothing in crewhaus
 binds them yet: a plugin that contributes one still loads, and the boot says
 that part has no effect. A grader belongs in
