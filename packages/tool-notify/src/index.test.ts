@@ -1894,7 +1894,17 @@ describe("an instant means the same moment on every machine", () => {
     const { server, port, log } = await startSmtpServer();
     try {
       const seen: Array<{ tool: string; now: string; out: string }> = [];
-      for (const now of ["2026-09-17T23:30:00", "2026-09-17", "2026-09-17 23:30"]) {
+      // The last three end in something offset-shaped, and JavaScriptCore's
+      // legacy parser still read them as host time (net review): the whole
+      // string must be a zoned instant, not only its tail.
+      for (const now of [
+        "2026-09-17T23:30:00",
+        "2026-09-17",
+        "2026-09-17 23:30",
+        "Sep 17 2026-23:30",
+        "Sep 17-2026",
+        "17 Sep-0000",
+      ]) {
         const calls: Array<[string, () => Promise<unknown>]> = [
           ["QuietHours", () => quietHours.execute({ schedule: QUIET, now })],
           ["RateLimitGate", () => rateLimitGate.execute({ key: "k", now, windowMs: 3_600_000 })],
@@ -1913,7 +1923,7 @@ describe("an instant means the same moment on every machine", () => {
       expect(seen.filter((s) => s.out.includes('"allowed"') || s.out.includes("Date: "))).toEqual(
         [],
       );
-      expect(seen).toHaveLength(12);
+      expect(seen).toHaveLength(24);
       // Nothing reached the SMTP server: the date is checked before the dial.
       expect(log.commands).toEqual([]);
     } finally {
@@ -1939,6 +1949,8 @@ describe("an instant means the same moment on every machine", () => {
         "2026-09-17T23:30:00Z",
         "2026-09-18T08:30:00+09:00",
         "2026-09-17T16:30:00-0700",
+        "Thu, 17 Sep 2026 23:30:00 +0000",
+        "17 Sep 2026 23:30 GMT",
       ]) {
         const quiet = String(await inZone(tz, () => quietHours.execute({ schedule: QUIET, now })));
         const gate = String(
@@ -1958,7 +1970,7 @@ describe("an instant means the same moment on every machine", () => {
       expect({ name, distinct: new Set(outs).size, runs: outs.length }).toEqual({
         name,
         distinct: 1,
-        runs: 9,
+        runs: 15,
       });
     }
     const decision = JSON.parse(seen.get("QuietHours")?.[0] ?? "{}");

@@ -45,9 +45,10 @@ about the same broken host. `QuietHours` is the reason an overnight alert waits
 until 09:00 when it will read identically. `RateLimitGate` is the reason a loop
 does not re-report the same thing on every iteration. All three are pure, take
 `now` as an argument, and compose. `now` (and an email's `date`) must carry
-its UTC offset — `2026-09-17T03:14:00Z` or `…+09:00`; a time without one is
-refused, because it would mean the host's local time and differ between
-machines:
+its UTC offset. Write it as ISO-8601 (`2026-09-17T03:14:00Z` or `…+09:00`) or
+as an email Date header (`Thu, 17 Sep 2026 03:14:00 +0000`). Anything else is
+refused, including a time without an offset, because it would mean the host's
+local time and differ between machines:
 
 ```
 NotifyDigest → QuietHours → RateLimitGate → MessageTemplate → ChatPost
