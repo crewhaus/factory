@@ -65,6 +65,40 @@ describe("every configurable package's documented block reaches its registrar", 
     );
   });
 
+  // config-delivery#11 / permission-integration#10 — 0.7.0's README read two
+  // hand-kept six-name lists: every newer external tool said "built-in",
+  // imageGenerate was "justification-gated" (it never was), chatPost's real
+  // gate went unmentioned, and any tool_config key read as "configured" with
+  // no registrar behind it.
+  test("the README states each tool's real scope, gate and configuration", () => {
+    const result = compile(
+      cli(
+        "tools: [httpRequest, chatPost, imageGenerate, webFetch, tableProfile]\ntool_config:\n  webFetch: { allowed_domains: [a.example] }\n  tableProfile: { a: 1 }\n",
+      ),
+    );
+    const readme = result.files.find((f) => f.path === "README.md")?.content ?? "";
+    const row = (key: string): string =>
+      readme.split("\n").find((l) => l.startsWith(`| \`${key}\` |`)) ?? "";
+    expect(row("chatPost")).toBe(
+      "| `chatPost` | agent | external | every call carries a justification |",
+    );
+    expect(row("httpRequest")).toBe(
+      "| `httpRequest` | agent | external | every call carries a justification |",
+    );
+    expect(row("imageGenerate")).toBe("| `imageGenerate` | agent | external | — |");
+    expect(row("webFetch")).toBe(
+      "| `webFetch` | agent | external | configured by `tool_config.webFetch` |",
+    );
+    // A block no registrar receives is not reported as configuring anything;
+    // the compile says it is ignored instead.
+    expect(row("tableProfile")).toBe("| `tableProfile` | agent | built-in | — |");
+    expect(
+      result.warnings.some(
+        (w) => w.code === "tool-config-unused" && w.message.includes("tableProfile"),
+      ),
+    ).toBe(true);
+  });
+
   test("the registered name reaches the registrar: tool_config.WebFetch restricts WebFetch", () => {
     expect(
       file(
@@ -86,6 +120,67 @@ describe("every configurable package's documented block reaches its registrar", 
     expect(ts).toContain('registerCodeExecutionConfig({"defaultTimeoutMs":5000});');
     expect(ts).not.toContain("registerWebFetchConfig(");
     expect(ts).not.toContain("registerFetchConfig(");
+  });
+
+  // config-delivery#9 — 0.7.0's cli and managed emitters handed the
+  // codeExecution block to every tool with a registrar: webFetch, fetch AND
+  // imageGenerate. Both spellings, both emitters, and a sibling's own block
+  // still reaching it.
+  test("neither spelling of the alias reaches imageGenerate, webFetch or fetch, on cli or managed", () => {
+    const managed = (config: string): string =>
+      [
+        "name: m",
+        "target: managed",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: i",
+        "  tools: [webFetch, fetch, imageGenerate, python]",
+        "  tool_config:",
+        `    ${config}`,
+        "tenants:",
+        "  - id: t1",
+        "    budget: { maxInputTokens: 1000, maxOutputTokens: 1000 }",
+      ].join("\n");
+    const specs = {
+      cli: (config: string) =>
+        cli(`tools: [webFetch, fetch, imageGenerate, python]\ntool_config:\n  ${config}\n`),
+      managed,
+    };
+    for (const [shape, spec] of Object.entries(specs)) {
+      for (const alias of ["codeExecution", "code_execution"]) {
+        const ts = file(spec(`${alias}: { defaultTimeoutMs: 4321 }`), "agent.ts");
+        expect({
+          shape,
+          alias,
+          calls: ts.split("registerCodeExecutionConfig(").length - 1,
+        }).toEqual({
+          shape,
+          alias,
+          calls: 1,
+        });
+        expect(ts).toContain('registerCodeExecutionConfig({"defaultTimeoutMs":4321});');
+        for (const other of [
+          "registerWebFetchConfig",
+          "registerFetchConfig",
+          "registerImageGenerationConfig",
+        ]) {
+          expect({ shape, alias, other, present: ts.includes(other) }).toEqual({
+            shape,
+            alias,
+            other,
+            present: false,
+          });
+        }
+      }
+    }
+    const both = file(
+      cli(
+        "tools: [webFetch, python]\ntool_config:\n  webFetch: { allowed_domains: [a.example] }\n  code_execution: { warmPoolSize: 1 }\n",
+      ),
+      "agent.ts",
+    );
+    expect(both).toContain('registerWebFetchConfig({"allowed_domains":["a.example"]});');
+    expect(both).toContain('registerCodeExecutionConfig({"warmPoolSize":1});');
   });
 
   test("tool_config.fetch reaches DependencyAudit's mirror allow-list on its own", () => {
