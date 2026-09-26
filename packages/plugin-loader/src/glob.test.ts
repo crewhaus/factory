@@ -5,7 +5,10 @@
  * took exponential time — an `fs` entry of forty `*a` stalled the Hangar that
  * evaluated it. It is now a table walk whose work is counted, and it answers
  * exactly as 0.7.0 did, except that `?` stands for itself (0.7.0 left it a
- * regex quantifier: `v1?` matched `v`, and `?abc` threw).
+ * regex quantifier: `v1?` matched `v`, and `?abc` threw). That change goes
+ * both ways: a pattern with `?` no longer matches what the optional character
+ * let through, and a query-string pattern (`…/search?q=*`) now matches the
+ * URL it spells, which 0.7.0's never did.
  */
 import { describe, expect, test } from "bun:test";
 import { isNetAllowed, matchesGlob } from "./index";
@@ -121,6 +124,19 @@ describe("? stands for itself", () => {
     expect(isNetAllowed(perms, "https://api.example.com/vX")).toBe(false);
     expect(isNetAllowed(perms, "https://api.example.com/v")).toBe(false);
     expect(matchesGlob070("https://api.example.com/vX", "https://api.example.com/v1?*")).toBe(true);
+  });
+
+  test("so it both narrows and widens against 0.7.0: a query-string pattern now matches the URL it spells", () => {
+    // 0.7.0 read `h?q` as "an optional h, then q": the `?` in the URL never
+    // matched it, so a pattern written for one query admitted nothing.
+    const pattern = "https://api.acme.dev/search?q=*";
+    const url = "https://api.acme.dev/search?q=cats";
+    expect(matchesGlob070(url, pattern)).toBe(false);
+    expect(matchesGlob(url, pattern)).toBe(true);
+    expect(isNetAllowed({ net: [`fetch:${pattern}`] }, url)).toBe(true);
+    // …and a URL 0.7.0 admitted through the optional character no longer is.
+    expect(matchesGlob070("https://api.acme.dev/searcq=cats", pattern)).toBe(true);
+    expect(matchesGlob("https://api.acme.dev/searcq=cats", pattern)).toBe(false);
   });
 
   test("a leading ? is a character, not a regex that cannot compile", () => {
