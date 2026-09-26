@@ -33,7 +33,7 @@ import {
 } from "./lib/normalize";
 import { regexExtractAll } from "./lib/regex";
 import {
-  MAX_SIMILARITY_CELLS,
+  MAX_SIMILARITY_WORK,
   type SimilarityMethod,
   extractKeywords as extractKeywordsFn,
   fuzzyRank,
@@ -51,6 +51,11 @@ const json = (value: unknown): string => JSON.stringify(value);
  * memory. Callers hitting it should narrow the input rather than raise it.
  */
 const MAX_INPUT_CHARS = 2_000_000;
+/**
+ * The most cells TextDiff's LCS table may hold: a memory bound (the table
+ * is built whole), the ceiling it has had since 0.7.0.
+ */
+const MAX_DIFF_CELLS = 25_000_000;
 
 function assertSize(text: string, field: string): void {
   if (text.length > MAX_INPUT_CHARS) {
@@ -133,7 +138,7 @@ export const textDiff: RegisteredTool = buildTool({
     const bLines = prep(input.b);
     // The LCS table is O(n*m) cells; refuse rather than exhaust memory.
     const cells = (aLines.length + 1) * (bLines.length + 1);
-    if (cells > MAX_SIMILARITY_CELLS) {
+    if (cells > MAX_DIFF_CELLS) {
       return `inputs too large to diff (${aLines.length} x ${bLines.length} lines) — diff a narrower region`;
     }
     const ops = diffLines(aLines, bLines);
@@ -485,17 +490,17 @@ export const extractEntities: RegisteredTool = buildTool({
 
 /**
  * The most quadratic work one FuzzyMatch call may do, summed over its
- * candidates: eight single comparisons' worth, about a second on a laptop.
- * tool-kyc's SanctionsScreen sends up to 10,000 list names per call; at the
- * name lengths a sanctions list holds (tens of characters) that is a few
- * million cells, far inside it.
+ * candidates, in Levenshtein cells: two single comparisons' worth, about
+ * two seconds of one thread. tool-kyc's SanctionsScreen sends up to 10,000
+ * list names per call; at the name lengths a sanctions list holds (tens of
+ * characters) that is a few million cells, far inside it.
  */
-const MAX_FUZZY_CELLS = 8 * MAX_SIMILARITY_CELLS;
+const MAX_FUZZY_WORK = 2 * MAX_SIMILARITY_WORK;
 
 /** Why comparing a and b by `method` is too much work for one call, or null. */
 function tooCostly(a: string, b: string, method: SimilarityMethod): string | null {
   const cells = similarityCost(a, b, method);
-  if (cells <= MAX_SIMILARITY_CELLS) return null;
+  if (cells <= MAX_SIMILARITY_WORK) return null;
   return `inputs too large for ${method} (${a.length} x ${b.length} characters) — use trigram or tokenJaccard, or compare a narrower region`;
 }
 
@@ -524,8 +529,8 @@ export const fuzzyMatch: RegisteredTool = buildTool({
       if (single !== null) return `candidates[${i}]: ${single}`;
       total += similarityCost(input.query, candidate, method);
     }
-    if (total > MAX_FUZZY_CELLS) {
-      return `candidates too large for ${method}: ${input.candidates.length} comparisons against a ${input.query.length}-character query need about ${total} cells, over the ${MAX_FUZZY_CELLS} one call may take — use trigram or tokenJaccard, or send fewer or shorter candidates`;
+    if (total > MAX_FUZZY_WORK) {
+      return `candidates too large for ${method}: ${input.candidates.length} comparisons against a ${input.query.length}-character query need about ${total} cells, over the ${MAX_FUZZY_WORK} one call may take — use trigram or tokenJaccard, or send fewer or shorter candidates`;
     }
     return json({
       hits: fuzzyRank(

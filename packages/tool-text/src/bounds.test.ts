@@ -11,7 +11,7 @@
 import { describe, expect, test } from "bun:test";
 import { fuzzyMatch, textDiff, textSimilarity } from "./index";
 import { ENTITY_PATTERNS, extractEntities, matchesOf } from "./lib/entities";
-import { MAX_SIMILARITY_CELLS, similarityCost } from "./lib/similarity";
+import { MAX_SIMILARITY_WORK, jaroWinkler, levenshtein, similarityCost } from "./lib/similarity";
 
 // biome-ignore lint/suspicious/noExplicitAny: the executor supplies this context, and none of these tools read it.
 const ctx = {} as any;
@@ -163,23 +163,20 @@ describe("entity scans are linear", () => {
   }, 20_000);
 });
 
-describe("edit-distance comparisons are refused above the cell budget", () => {
-  test("TextSimilarity refuses levenshtein and jaro past the budget, and still scores below it", async () => {
-    const big = { a: "x".repeat(6_000), b: "y".repeat(6_000) };
-    const fits = { a: "x".repeat(4_000), b: "y".repeat(4_000) };
-    let checked = 0;
-    for (const method of ["levenshtein", "jaro"]) {
-      // 0.7.0 computed both, blocking the thread for the whole table.
-      expect(await out(textSimilarity, { ...big, method })).toMatch(
-        new RegExp(`^inputs too large for ${method} \\(6000 x 6000 characters\\)`),
-      );
-      expect(JSON.parse(await out(textSimilarity, { ...fits, method }))).toEqual({
-        score: 0,
-        method,
-      });
-      checked += 1;
-    }
-    expect(checked).toBe(2);
+describe("edit-distance comparisons are refused above the work budget", () => {
+  test("TextSimilarity refuses levenshtein and jaro past the budget, before any work", async () => {
+    // Levenshtein is charged a cell per pair of characters, Jaro a quarter
+    // cell per window step (its measured cost). Past 200 M the call is
+    // refused by name; none of it is computed.
+    expect(MAX_SIMILARITY_WORK).toBe(200_000_000);
+    const lev = { a: "x".repeat(20_000), b: "y".repeat(10_001), method: "levenshtein" };
+    expect(await out(textSimilarity, lev)).toMatch(
+      /^inputs too large for levenshtein \(20000 x 10001 characters\)/,
+    );
+    const jaro = { a: "x".repeat(29_000), b: "y".repeat(29_000), method: "jaro" };
+    expect(await out(textSimilarity, jaro)).toMatch(
+      /^inputs too large for jaro \(29000 x 29000 characters\)/,
+    );
     // Trigram and token overlap are linear, so size alone never refuses them.
     const trigram = JSON.parse(
       await out(textSimilarity, {
@@ -191,38 +188,145 @@ describe("edit-distance comparisons are refused above the cell budget", () => {
     expect(trigram.method).toBe("trigram");
   }, 20_000);
 
+  test("the sizes 0.7.0 answered in a fraction of a second are still answered", async () => {
+    // 0.7.1's first cut reused TextDiff's 25 M-cell memory bound as a time
+    // budget and refused these, which 0.7.0 answered in 10-180 ms.
+    for (const method of ["levenshtein", "jaro"]) {
+      const got = JSON.parse(
+        await out(textSimilarity, { a: "x".repeat(6_000), b: "y".repeat(6_000), method }),
+      );
+      expect(got).toEqual({ score: 0, method });
+    }
+    const words = ["quick", "brown", "fox", "lazy", "dog", "data", "record", "field", "spec"];
+    const rand = prng(7);
+    const text = (n: number): string => {
+      let s = "";
+      while (s.length < n) s += `${words[Math.floor(rand() * words.length)]} `;
+      return s.slice(0, n);
+    };
+    for (const [count, length] of [
+      [3_000, 300],
+      [300, 1_000],
+    ] as const) {
+      const candidates = Array.from({ length: count }, () => text(length));
+      const got = JSON.parse(
+        await out(fuzzyMatch, { query: candidates[count - 1], candidates, limit: 1 }),
+      );
+      expect({ count, length, top: got.hits[0]?.score }).toEqual({ count, length, top: 1 });
+    }
+  }, 30_000);
+
   test("the cost model matches the budget's boundary", () => {
-    expect(similarityCost("x".repeat(5_000), "y".repeat(5_000), "levenshtein")).toBe(
-      MAX_SIMILARITY_CELLS,
+    expect(similarityCost("x".repeat(20_000), "y".repeat(10_000), "levenshtein")).toBe(
+      MAX_SIMILARITY_WORK,
     );
-    expect(similarityCost("x".repeat(6_000), "y".repeat(6_000), "jaro")).toBe(6_000 * 5_999);
+    // Jaro: 6,000 window steps per character, at a quarter cell each.
+    expect(similarityCost("x".repeat(6_000), "y".repeat(6_000), "jaro")).toBe(
+      Math.ceil((6_000 * 5_999) / 4),
+    );
     expect(similarityCost("x".repeat(9_000), "y".repeat(9_000), "trigram")).toBe(0);
     expect(similarityCost("same", "same", "levenshtein")).toBe(0);
   });
 
   test("FuzzyMatch refuses a call whose comparisons add up past the budget, before comparing any", async () => {
-    // 0.7.0: {"hits":[]} after about two seconds.
+    // Two single comparisons' worth: 101 levenshtein comparisons of 2,000 x
+    // 2,000 are 404 M cells.
     const many = await out(fuzzyMatch, {
       query: "x".repeat(2_000),
-      candidates: Array.from({ length: 100 }, () => "y".repeat(2_000)),
+      candidates: Array.from({ length: 101 }, () => "y".repeat(2_000)),
       method: "levenshtein",
     });
-    expect(many).toMatch(/^candidates too large for levenshtein: 100 comparisons/);
+    expect(many).toMatch(/^candidates too large for levenshtein: 101 comparisons/);
     const one = await out(fuzzyMatch, {
-      query: "x".repeat(6_000),
-      candidates: ["short", "y".repeat(6_000)],
+      query: "x".repeat(29_000),
+      candidates: ["short", "y".repeat(29_000)],
       method: "jaro",
     });
     expect(one).toMatch(/^candidates\[1\]: inputs too large for jaro/);
   }, 20_000);
 
-  test("TextDiff's line table is held to the same shared budget, before any of it is built", async () => {
-    // The ceiling TextDiff has had since 0.7.0, now the shared constant: one
-    // line more than a 5,000 x 5,000 table is refused by name, and a diff
-    // well inside it still runs.
+  test("the faster Levenshtein and Jaro give 0.7.0's answers", () => {
+    // 0.7.0's implementations, unchanged, as the oracle.
+    const oldLevenshtein = (a: string, b: string): number => {
+      if (a === b) return 0;
+      if (a.length === 0) return b.length;
+      if (b.length === 0) return a.length;
+      let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+      for (let i = 1; i <= a.length; i++) {
+        const cur = new Array<number>(b.length + 1);
+        cur[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          cur[j] = Math.min(
+            (cur[j - 1] as number) + 1,
+            (prev[j] as number) + 1,
+            (prev[j - 1] as number) + cost,
+          );
+        }
+        prev = cur;
+      }
+      return prev[b.length] as number;
+    };
+    const oldJaroWinkler = (a: string, b: string): number => {
+      if (a === b) return 1;
+      if (a.length === 0 || b.length === 0) return 0;
+      const window = Math.max(0, Math.floor(Math.max(a.length, b.length) / 2) - 1);
+      const aFlags = new Array<boolean>(a.length).fill(false);
+      const bFlags = new Array<boolean>(b.length).fill(false);
+      let matches = 0;
+      for (let i = 0; i < a.length; i++) {
+        const lo = Math.max(0, i - window);
+        const hi = Math.min(b.length - 1, i + window);
+        for (let j = lo; j <= hi; j++) {
+          if (bFlags[j] === true || a[i] !== b[j]) continue;
+          aFlags[i] = true;
+          bFlags[j] = true;
+          matches++;
+          break;
+        }
+      }
+      if (matches === 0) return 0;
+      let transpositions = 0;
+      let k = 0;
+      for (let i = 0; i < a.length; i++) {
+        if (aFlags[i] !== true) continue;
+        while (bFlags[k] !== true) k++;
+        if (a[i] !== b[k]) transpositions++;
+        k++;
+      }
+      const t = transpositions / 2;
+      const jaro = (matches / a.length + matches / b.length + (matches - t) / matches) / 3;
+      let prefix = 0;
+      while (prefix < 4 && prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) {
+        prefix++;
+      }
+      return jaro + prefix * 0.1 * (1 - jaro);
+    };
+    const alphabet = ["a", "b", "c", "é", "\ud83d\ude00", " ", "A"];
+    const rand = prng(11);
+    const word = (): string => {
+      let s = "";
+      const n = Math.floor(rand() * 12);
+      for (let i = 0; i < n; i++) s += alphabet[Math.floor(rand() * alphabet.length)];
+      return s;
+    };
+    let compared = 0;
+    for (let i = 0; i < 3_000; i++) {
+      const a = word();
+      const b = rand() < 0.2 ? a : word();
+      expect({ a, b, d: levenshtein(a, b) }).toEqual({ a, b, d: oldLevenshtein(a, b) });
+      expect({ a, b, j: jaroWinkler(a, b) }).toEqual({ a, b, j: oldJaroWinkler(a, b) });
+      compared += 1;
+    }
+    expect(compared).toBe(3_000);
+  });
+
+  test("TextDiff's line table keeps its 0.7.0 memory ceiling, before any of it is built", async () => {
+    // TextDiff builds its whole LCS table, so its 25 M-cell ceiling is a
+    // memory bound and stays where 0.7.0 had it: one line more than a
+    // 5,000 x 5,000 table is refused by name, and a diff inside it runs.
     const lines = (prefix: string, n: number): string =>
       Array.from({ length: n }, (_, i) => `${prefix}${i}`).join("\n");
-    expect((5_000 + 1) * (5_000 + 1)).toBeGreaterThan(MAX_SIMILARITY_CELLS);
     expect(await out(textDiff, { a: lines("a", 5_000), b: lines("b", 5_000) })).toBe(
       "inputs too large to diff (5000 x 5000 lines) — diff a narrower region",
     );
