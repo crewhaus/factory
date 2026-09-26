@@ -360,10 +360,10 @@ function thredzExcerpt(body: string): string {
  * into the SAME `[wiki:<slug>] <title> — <excerpt>` line shape the local
  * backend fuses into `<recalled_memory>`, so the recall bundle is
  * backend-invariant. Falls back to one excerpted line when the body is not
- * the recognized JSON shape. The runtime classifies + delimiter-escapes the
- * assembled block downstream (the same path local fact/wiki lines take), so
- * recalled Thredz bodies still cross the boundary classifier before any
- * model call.
+ * the recognized JSON shape. The runtime classifies each returned line at
+ * TrustOrigin "memory" and delimiter-escapes it downstream (the same path
+ * local fact/wiki lines take), so recalled Thredz bodies cross the boundary
+ * classifier before any model call.
  */
 export function parseThredzRecallLines(content: string, k: number): readonly string[] {
   const trimmed = content.trim();
