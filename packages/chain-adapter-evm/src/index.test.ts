@@ -316,6 +316,133 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     }
   });
 
+  /**
+   * A fetch whose answer, per URL, is decided by the test: `answers[url]`
+   * resolves with a JSON-RPC result, or never. Every request's signal is
+   * kept, so a test can see which attempts were closed.
+   */
+  function scriptedFetch(answers: Record<string, () => Promise<string>>): {
+    readonly fetchImpl: typeof fetch;
+    readonly asked: string[];
+    readonly signals: Map<string, AbortSignal>;
+  } {
+    const asked: string[] = [];
+    const signals = new Map<string, AbortSignal>();
+    const fetchImpl = (async (input: string, init: RequestInit) => {
+      asked.push(input);
+      const signal = init.signal as AbortSignal;
+      signals.set(input, signal);
+      const answer = answers[input] as () => Promise<string>;
+      const result = await Promise.race([
+        answer(),
+        new Promise<never>((_, reject) =>
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }),
+        ),
+      ]);
+      const body = JSON.parse(String(init.body)) as { id: number };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+    }) as unknown as typeof fetch;
+    return { fetchImpl, asked, signals };
+  }
+  const never = (): Promise<string> => new Promise(() => {});
+
+  test("fallback: a stalled primary gets its share of the deadline, then the secondary answers", async () => {
+    // 0.7.1's first cut gave the primary the whole deadline and never asked
+    // the secondary; a primary that stalls past it cost the whole read.
+    const { fetchImpl, asked, signals } = scriptedFetch({
+      "https://primary.test": never,
+      "https://secondary.test": async () => "0x1234",
+    });
+    const adapter = createEvmAdapter(
+      {
+        ...LOCAL,
+        rpcPolicy: "fallback",
+        rpcUrls: ["https://primary.test", "https://secondary.test"],
+      },
+      fetchImpl,
+    );
+    const outcome = await settle(adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 1_000 }));
+    expect(outcome).toBe("resolved");
+    expect(asked).toEqual(["https://primary.test", "https://secondary.test"]);
+    // The stalled primary is closed once the secondary has answered.
+    expect(signals.get("https://primary.test")?.aborted).toBe(true);
+    expect(signals.get("https://secondary.test")?.aborted).toBe(false);
+  }, 10_000);
+
+  test("fallback: a slow primary that answers after the secondary was asked still wins", async () => {
+    // The secondary is asked at the primary's share, and the primary answers
+    // right after; the secondary never does. The first answer is the answer.
+    let release: (v: string) => void = () => {};
+    const primary = new Promise<string>((r) => {
+      release = r;
+    });
+    const { fetchImpl, signals } = scriptedFetch({
+      "https://primary.test": () => primary,
+      "https://secondary.test": () => {
+        release("0xslow");
+        return never();
+      },
+    });
+    const adapter = createEvmAdapter(
+      {
+        ...LOCAL,
+        rpcPolicy: "fallback",
+        rpcUrls: ["https://primary.test", "https://secondary.test"],
+      },
+      fetchImpl,
+    );
+    expect(await adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 1_000 })).toBe("0xslow");
+    expect(signals.get("https://secondary.test")?.aborted).toBe(true);
+  }, 10_000);
+
+  test("quorum: two agreeing voters decide without waiting for a stalled third", async () => {
+    // 0.7.1's first cut waited for every voter, then threw the agreed answer
+    // away when the deadline had passed.
+    const { fetchImpl, signals } = scriptedFetch({
+      "https://a.test": async () => "0x1234",
+      "https://b.test": async () => "0x1234",
+      "https://slow.test": never,
+    });
+    const adapter = createEvmAdapter(
+      {
+        ...LOCAL,
+        rpcPolicy: "quorum",
+        rpcUrls: ["https://a.test", "https://b.test", "https://slow.test"],
+      },
+      fetchImpl,
+    );
+    const read = adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 60_000 });
+    expect(await settle(read)).toBe("resolved");
+    expect(await read).toBe("0x1234");
+    expect(signals.get("https://slow.test")?.aborted).toBe(true);
+  });
+
+  test("quorum: at the deadline, the voters that answered decide, and too few is a failure that says so", async () => {
+    const { fetchImpl } = scriptedFetch({
+      "https://a.test": async () => "0x1234",
+      "https://b.test": never,
+      "https://c.test": never,
+    });
+    const adapter = createEvmAdapter(
+      {
+        ...LOCAL,
+        rpcPolicy: "quorum",
+        rpcUrls: ["https://a.test", "https://b.test", "https://c.test"],
+      },
+      fetchImpl,
+    );
+    const outcome = await settle(adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 300 }));
+    expect(outcome).toBeInstanceOf(ChainAdapterError);
+    expect((outcome as Error).message).toContain(
+      "quorum failed: no value reached threshold 2/3 — 1 of 3 answered within 300 ms",
+    );
+    // The caller's cancel is not a quorum verdict.
+    const cancel = new AbortController();
+    const cancelled = adapter.rpcRead("eth_blockNumber", [], { signal: cancel.signal });
+    cancel.abort();
+    expect(((await settle(cancelled)) as Error).message).toContain("the read was cancelled");
+  });
+
   test("a body past the cap is refused, not parsed from a prefix", async () => {
     const huge = `{"jsonrpc":"2.0","id":1,"result":"0x${"0".repeat(17 * 1024 * 1024)}"}`;
     const fetchImpl = mockFetch(() => new Response(huge));
