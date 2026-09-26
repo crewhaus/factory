@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { PluginRegistry } from "@crewhaus/plugin-registry";
 import {
@@ -10,7 +10,7 @@ import {
   entrypointImportProblem,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
-import { readFileBounded } from "@crewhaus/tool-safety/streams";
+import { openForRead } from "@crewhaus/tool-safety/fs";
 import pkg from "../package.json" with { type: "json" };
 
 /**
@@ -153,21 +153,37 @@ export type MarketplaceClientOptions = {
   /**
    * Test seam: read a plugin's `index.js`. Resolves `undefined` when there is
    * no such file, and throws when it cannot be read as a regular file. The
-   * default reads at most {@link MAX_ENTRYPOINT_BYTES} and refuses a FIFO or
-   * other special file rather than blocking on it.
+   * default reads at most {@link MAX_ENTRYPOINT_BYTES}, refuses a FIFO or
+   * other special file rather than blocking on it, and refuses a link that
+   * leads outside the plugin's directory, as the loader does at boot.
    */
   readonly readEntrypointImpl?: (path: string) => Promise<Uint8Array | undefined>;
   /** The crewhaus version `engines.crewhaus` is checked against. Defaults to this package's. */
   readonly hostVersion?: string;
 };
 
+/**
+ * The default entrypoint reader, holding `index.js` to the loader's rule: it
+ * must really be inside the plugin's own directory (a link within it is
+ * fine; one that leads out is what the boot refuses) and a regular file, read
+ * up to {@link MAX_ENTRYPOINT_BYTES}.
+ */
 async function defaultReadEntrypoint(path: string): Promise<Uint8Array | undefined> {
-  const read = await readFileBounded(path, { maxBytes: MAX_ENTRYPOINT_BYTES });
+  const pluginDir = dirname(path);
+  const read = await openForRead(pluginDir, basename(path), { maxBytes: MAX_ENTRYPOINT_BYTES });
   if (read.ok) {
     if (read.truncated) throw new Error(`it is larger than ${MAX_ENTRYPOINT_BYTES} bytes`);
     return read.bytes;
   }
   if (read.code === "not-found") return undefined;
+  if (read.code === "escapes-root") {
+    throw new Error(
+      `it is a link that leads outside the plugin's directory ${pluginDir}, and the boot loads only code inside it`,
+    );
+  }
+  if (read.code === "not-regular-file") {
+    throw new Error(`it is a ${read.kind ?? "special file"}, not a regular file`);
+  }
   throw new Error(read.reason);
 }
 
@@ -254,7 +270,7 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
       bytes = await readEntrypoint(entryPath);
     } catch (err) {
       warnings.push(
-        `${who}: ${entryPath} cannot be checked: ${err instanceof Error ? err.message : String(err)}. A spec that names the plugin will not start until it is a readable file${digestNote}.`,
+        `${who}: ${entryPath} cannot be used: ${err instanceof Error ? err.message : String(err)}. A spec that names the plugin will not start until it is a regular file inside the plugin's directory${digestNote}.`,
       );
       return false;
     }

@@ -15,7 +15,15 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPluginRegistry } from "@crewhaus/plugin-registry";
@@ -116,8 +124,33 @@ describe("install says whether the plugin can run (C017)", () => {
     expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
     const result = await client({ name: "greeter", version: "1.0.0" }).client.install("greeter");
     expect(result.runnable).toBe(false);
-    expect(result.warnings[0]).toStartWith(`greeter@1.0.0: ${path} cannot be checked: `);
-    expect(result.warnings[0]).toContain("is a fifo, not a regular file; it was not opened");
+    expect(result.warnings).toEqual([
+      `greeter@1.0.0: ${path} cannot be used: it is a fifo, not a regular file. A spec that names the plugin will not start until it is a regular file inside the plugin's directory.`,
+    ]);
+  });
+
+  test("an index.js that links out of the plugin's directory is not runnable, as the boot will refuse it", async () => {
+    const outside = join(dir, "elsewhere");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, "index.js"), CODE);
+    mkdirSync(join(dir, "plugins", "greeter"), { recursive: true });
+    const path = join(dir, "plugins", "greeter", "index.js");
+    symlinkSync(join(outside, "index.js"), path);
+    const m = { name: "greeter", version: "1.0.0", entrypointDigest: entrypointDigest(CODE) };
+    const result = await client(m).client.install("greeter");
+    expect(result.runnable).toBe(false);
+    expect(result.warnings).toEqual([
+      `greeter@1.0.0: ${path} cannot be used: it is a link that leads outside the plugin's directory ${join(dir, "plugins", "greeter")}, and the boot loads only code inside it. A spec that names the plugin will not start until it is a regular file inside the plugin's directory (its sha256 must equal the manifest's entrypointDigest).`,
+    ]);
+  });
+
+  test("a link that stays inside the plugin's directory is runnable, as the boot allows it", async () => {
+    mkdirSync(join(dir, "plugins", "greeter", "dist"), { recursive: true });
+    writeFileSync(join(dir, "plugins", "greeter", "dist", "index.js"), CODE);
+    symlinkSync(join("dist", "index.js"), join(dir, "plugins", "greeter", "index.js"));
+    const m = { name: "greeter", version: "1.0.0", entrypointDigest: entrypointDigest(CODE) };
+    const result = await client(m).client.install("greeter");
+    expect(result).toMatchObject({ runnable: true, warnings: [] });
   });
 
   test("a range that leaves this crewhaus out is named", async () => {
