@@ -73,7 +73,7 @@ export const MAX_AGE_DAYS = 120;
  * WHEN A PRICE LEGITIMATELY CHANGES: update the row in `pricing.ts` AND the
  * golden here in the same commit, and move `VERIFIED_ON` forward.
  */
-export const VERIFIED_ON = "2026-07-31";
+export const VERIFIED_ON = "2026-09-23";
 
 export const GOLDEN_PRICES: ReadonlyArray<{
   readonly provider: ProviderId;
@@ -82,9 +82,11 @@ export const GOLDEN_PRICES: ReadonlyArray<{
   readonly outputPer1M: number;
 }> = [
   // --- anthropic ---
+  { provider: "anthropic", modelId: "claude-opus-5-5", inputPer1M: 4.0, outputPer1M: 20.0 },
   { provider: "anthropic", modelId: "claude-opus-5", inputPer1M: 5.0, outputPer1M: 25.0 },
   { provider: "anthropic", modelId: "claude-opus-4-8", inputPer1M: 5.0, outputPer1M: 25.0 },
   { provider: "anthropic", modelId: "claude-opus-4-5", inputPer1M: 5.0, outputPer1M: 25.0 },
+  { provider: "anthropic", modelId: "claude-sonnet-5", inputPer1M: 2.0, outputPer1M: 10.0 },
   { provider: "anthropic", modelId: "claude-sonnet-4-6", inputPer1M: 3.0, outputPer1M: 15.0 },
   { provider: "anthropic", modelId: "claude-haiku-4-5", inputPer1M: 1.0, outputPer1M: 5.0 },
   { provider: "anthropic", modelId: "claude-fable-5", inputPer1M: 10.0, outputPer1M: 50.0 },
@@ -99,7 +101,19 @@ export const GOLDEN_PRICES: ReadonlyArray<{
   { provider: "gemini", modelId: "gemini-2.5-flash", inputPer1M: 0.3, outputPer1M: 2.5 },
   { provider: "gemini", modelId: "gemini-2.5-flash-lite", inputPer1M: 0.1, outputPer1M: 0.4 },
   // --- bedrock ---
+  {
+    provider: "bedrock",
+    modelId: "anthropic.claude-opus-5-5",
+    inputPer1M: 4.0,
+    outputPer1M: 20.0,
+  },
   { provider: "bedrock", modelId: "anthropic.claude-opus-5", inputPer1M: 5.0, outputPer1M: 25.0 },
+  {
+    provider: "bedrock",
+    modelId: "anthropic.claude-sonnet-5",
+    inputPer1M: 2.0,
+    outputPer1M: 10.0,
+  },
   {
     provider: "bedrock",
     modelId: "anthropic.claude-haiku-4-5",
