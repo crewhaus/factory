@@ -101,3 +101,94 @@ describe("entrypointImportProblem", () => {
     );
   });
 });
+
+describe("entrypointImportProblem: loading a module by a name found at run time (C108)", () => {
+  const refusedFor = (code: string) => entrypointImportProblem(`${code}\nexport default {};`);
+
+  test("each run-time loader is refused, and named", () => {
+    const cases: ReadonlyArray<readonly [string, string]> = [
+      ['const m = import.meta.require("plantedpkg");', "import.meta.require with a name"],
+      ['const m = import.meta.require("./lib.js");', "import.meta.require with a name"],
+      [
+        'import { createRequire } from "node:module"; createRequire(import.meta.url)("zod");',
+        'it imports "node:module" (the module builtin loads packages by name)',
+      ],
+      ['const { createRequire } = require("module");', 'it imports "module"'],
+      ['const p = require.resolve("zod");', "(require.resolve)"],
+      ['const p = import.meta.resolve("zod");', "(import.meta.resolve)"],
+      ['const p = Bun.resolveSync("zod", "/");', "(Bun.resolveSync)"],
+      ['const p = await Bun.resolve("zod", "/");', "(Bun.resolve)"],
+      ['process.getBuiltinModule("module");', "(process.getBuiltinModule)"],
+      ['process.mainModule.require("zod");', "(process.mainModule)"],
+      ['const n = "planted" + "pkg"; await import(n);', "import() with a name"],
+      ["const n = 'zod'; await import(`${n}`);", "import() with a name"],
+      ['const r = require; r("zod");', "require with a name"],
+      ["const n = 'zod'; require(n);", "require with a name"],
+      ['const m = import.meta; m.require("zod");', "import.meta"],
+      ['import.meta["require"]("zod");', "import.meta"],
+      ['var __require = import.meta.require; __require("zod");', "(through __require)"],
+      [
+        'var __require = import.meta.require; const n = "zod"; __require(n);',
+        "(through __require)",
+      ],
+      ['var __require = import.meta.require; __require.resolve("zod");', "(through __require)"],
+    ];
+    for (const [code, named] of cases) {
+      const problem = refusedFor(code);
+      expect({ code, problem }).toEqual({ code, problem: expect.stringContaining(named) });
+      expect(problem).toEndWith(
+        "bun build src/index.ts --target=bun --format=esm --outfile index.js) and sign that",
+      );
+    }
+    expect(cases.length).toBe(19);
+  });
+
+  test("what a bundle legitimately writes is accepted", () => {
+    // `bun build --target=bun` output for a CommonJS dependency that requires builtins.
+    const bundled = [
+      "var __require = import.meta.require;",
+      "var require_dep = __commonJS((exports, module) => {",
+      '  var fs = __require("fs");',
+      '  var p = __require("node:path");',
+      '  module.exports = { exists: (f) => typeof __require === "function" && fs.existsSync(p.resolve(f)) };',
+      "});",
+      "const here = import.meta.url + import.meta.dir + import.meta.path;",
+      'const fs2 = require("node:fs"); const t = typeof require === "function";',
+      'const has = typeof import.meta.require === "function";',
+      'const os = await import("node:os"); const j = await import("node:path", { with: {} });',
+      "export default { require_dep, here, fs2, t, has, os, j };",
+    ].join("\n");
+    expect(entrypointImportProblem(bundled)).toBeUndefined();
+  });
+
+  test("a mention in a string or comment, or a local that shadows require, is not a load", () => {
+    const code = [
+      '// import.meta.require("zod"), require.resolve("x"), Bun.resolveSync(...)',
+      'const s = "call import(name) or import.meta.require(\\"zod\\") or require.resolve";',
+      "function local(require) { return require(1); }",
+      "const t = `text import(name) ${'import(x)'} and ${`import(y)`}`;",
+      "const r = /import\\(n\\)[/]import(m)/g; const half = 4 / 2 / 1;",
+      "export default { s, local, t, r, half };",
+    ].join("\n");
+    expect(entrypointImportProblem(code)).toBeUndefined();
+  });
+
+  test("code inside a template's ${…} is still code", () => {
+    expect(
+      entrypointImportProblem(
+        "const n = 'zod';\nconst t = `a ${`b ${await import(n)}`}`;\nexport default { t };",
+      ),
+    ).toContain("import() with a name");
+    expect(
+      entrypointImportProblem(
+        "const r = /x/; const n = 'zod'; const y = 4 / 2; await import(n);\nexport default {};",
+      ),
+    ).toContain("import() with a name");
+  });
+
+  test("a CommonJS file is refused: it has module.require, which no scan follows", () => {
+    expect(
+      entrypointImportProblem('module.exports = { default: {} }; module.require("zod");'),
+    ).toStartWith("it exports nothing, so it is not an ES module crewhaus can check");
+  });
+});

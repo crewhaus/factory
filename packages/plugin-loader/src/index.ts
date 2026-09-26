@@ -2,6 +2,8 @@ import { createPublicKey, verify } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  lstatSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -10,7 +12,7 @@ import {
   statSync,
   writeSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve as resolvePath, sep } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type PluginRegistry, createPluginRegistry } from "@crewhaus/plugin-registry";
@@ -82,8 +84,9 @@ export const MAX_PLUGIN_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
  *      for development only — logged loudly). A signed manifest must
  *      carry an `entrypointDigest`, may carry a signed `notAfter`, and
  *      its code is imported from a private copy of exactly the bytes
- *      the digest was checked against — which is why a signed plugin
- *      must be one file with no imports but runtime builtins.
+ *      the digest was checked against, staged under the operator's own
+ *      `~/.crewhaus/verified-code` — which is why a signed plugin must be
+ *      one ES module file that loads nothing but runtime builtins.
  *
  *   3. **What a plugin can reach.** A plugin's code is imported into this
  *      process and runs with its full authority — environment, files,
@@ -146,6 +149,13 @@ export type PluginLoaderOptions = {
    * Defaults to {@link PLUGIN_HOST_VERSION}; tests pin it.
    */
   readonly hostVersion?: string;
+  /**
+   * Where a signed plugin's verified code is staged for import: a private
+   * directory is made here for each load and removed after it. It must be
+   * this user's and writable by nobody else. Defaults to
+   * {@link defaultVerifiedCodeDir} (`~/.crewhaus/verified-code`).
+   */
+  readonly verifiedCodeDir?: string;
   /**
    * Override for tests: load + parse a manifest file. Defaults to
    * reading via `Bun.file` + `JSON.parse`.
@@ -260,22 +270,78 @@ function resolveEntrypoint(pluginName: string, manifestDir: string): string {
   return contained.real;
 }
 
+/** Where a signed plugin's verified code is staged by default: `~/.crewhaus/verified-code`. */
+export function defaultVerifiedCodeDir(homeDir: string = homedir()): string {
+  return join(homeDir, ".crewhaus", "verified-code");
+}
+
+/**
+ * Why `dir` cannot hold a signed plugin's verified code, or undefined when it
+ * can: it must be a real directory (not a link), and — where the platform
+ * has owners — this user's and writable by nobody else. Anyone who can write
+ * there could swap the copy before it is imported, or plant a package beside
+ * it for the plugin's code to find.
+ */
+function stagingDirProblem(dir: string): string | undefined {
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(dir);
+  } catch (err) {
+    return `it cannot be read (${err instanceof Error ? err.message : String(err)})`;
+  }
+  if (st.isSymbolicLink()) return "it is a link";
+  if (!st.isDirectory()) return "it is not a directory";
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (uid === undefined) return undefined;
+  if (st.uid !== uid) return `it belongs to another user (uid ${st.uid})`;
+  if ((st.mode & 0o022) !== 0) {
+    return `other users can write to it (mode ${(st.mode & 0o777).toString(8)}); run chmod go-w on it`;
+  }
+  return undefined;
+}
+
 /**
  * Stage a signed plugin's verified bytes for import: a new private directory
- * (mode 0700, random name) holding `index.js` (0600), created exclusively.
- * Importing this copy instead of the file in `~/.crewhaus/plugins` means what
- * runs is what was hashed — the plugin's file can change after the check and
- * it does not matter — and a relative import has nothing beside it to find.
+ * (mode 0700, random name) under `parent` holding `index.mjs` (0600), created
+ * exclusively. Importing this copy instead of the file in
+ * `~/.crewhaus/plugins` means what runs is what was hashed — the plugin's
+ * file can change after the check and it does not matter — and a relative
+ * import has nothing beside it to find. `.mjs` makes it an ES module
+ * whatever package.json sits above it, so it has no CommonJS `module` to
+ * load packages through.
+ *
+ * `parent` defaults to `~/.crewhaus/verified-code`, never the shared temp
+ * directory: a package the code names at run time resolves by walking up
+ * from the copy, and on Linux `/tmp/node_modules` is anyone's to create. It
+ * must be this user's and writable by nobody else, or nothing is staged.
  * `remove` deletes the directory once the module is loaded.
  */
 function writeVerifiedCopy(
   pluginName: string,
   bytes: Uint8Array,
+  parent: string,
 ): { readonly path: string; readonly remove: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), `crewhaus-plugin-${pluginName}-`));
+  const refuse = (why: string, err?: unknown): PluginLoaderError =>
+    new PluginLoaderError(
+      `plugin "${pluginName}": cannot stage its verified code for import in ${parent}: ${why}`,
+      err,
+    );
+  try {
+    mkdirSync(parent, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    throw refuse(err instanceof Error ? err.message : String(err), err);
+  }
+  const unsafe = stagingDirProblem(parent);
+  if (unsafe !== undefined) throw refuse(unsafe);
+  let dir: string;
+  try {
+    dir = mkdtempSync(join(parent, `${pluginName}-`));
+  } catch (err) {
+    throw refuse(err instanceof Error ? err.message : String(err), err);
+  }
   const remove = (): void => rmSync(dir, { recursive: true, force: true });
   try {
-    const made = createExclusive(dir, "index.js", { mode: 0o600 });
+    const made = createExclusive(dir, "index.mjs", { mode: 0o600 });
     if (!made.ok) throw new Error(made.reason);
     try {
       let written = 0;
@@ -288,10 +354,7 @@ function writeVerifiedCopy(
     return { path: made.real, remove };
   } catch (err) {
     remove();
-    throw new PluginLoaderError(
-      `plugin "${pluginName}": cannot stage its verified code for import: ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
+    throw refuse(err instanceof Error ? err.message : String(err), err);
   }
 }
 
@@ -533,7 +596,11 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
               `plugin "${manifest.name}": ${entrypointPath} cannot run as signed code: ${outside}`,
             );
           }
-          verifiedCopy = writeVerifiedCopy(manifest.name, bytes);
+          verifiedCopy = writeVerifiedCopy(
+            manifest.name,
+            bytes,
+            opts.verifiedCodeDir ?? defaultVerifiedCodeDir(),
+          );
           importPath = verifiedCopy.path;
         }
       }
@@ -728,6 +795,7 @@ export function createDefaultPluginRuntime(opts: DefaultPluginRuntimeOptions = {
     trustedRoots: [opts.pluginsDir ?? paths.pluginsDir],
     ...(opts.trustAnchors !== undefined ? { trustAnchors: opts.trustAnchors } : {}),
     allowUnsigned: opts.allowUnsigned ?? false,
+    verifiedCodeDir: defaultVerifiedCodeDir(opts.homeDir),
   });
   return { registry, loader };
 }
@@ -871,6 +939,7 @@ export function createBootPluginRuntime(
     trustAnchors: anchors,
     allowUnsigned,
     warn,
+    verifiedCodeDir: defaultVerifiedCodeDir(opts.homeDir),
   });
   return { registry, loader, warn };
 }

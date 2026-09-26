@@ -8,15 +8,25 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import {
   type PluginManifest,
   entrypointDigest,
   manifestPayloadForSigning,
 } from "@crewhaus/plugin-sdk";
-import { PluginLoaderError, createPluginLoader } from "./index";
+import { PluginLoaderError, createPluginLoader, defaultVerifiedCodeDir } from "./index";
 
 let root: string;
 let dir: string;
@@ -65,6 +75,7 @@ function install(
 type Seams = {
   importEntrypoint?: (p: string) => Promise<{ default?: unknown }>;
   readEntrypoint?: (p: string) => Promise<Uint8Array>;
+  verifiedCodeDir?: string;
 };
 
 function loader(opts: { allowUnsigned?: boolean; anchors?: boolean } & Seams = {}) {
@@ -76,6 +87,7 @@ function loader(opts: { allowUnsigned?: boolean; anchors?: boolean } & Seams = {
     warn: (w) => warnings.push(w),
     ...(opts.importEntrypoint !== undefined ? { importEntrypoint: opts.importEntrypoint } : {}),
     ...(opts.readEntrypoint !== undefined ? { readEntrypoint: opts.readEntrypoint } : {}),
+    ...(opts.verifiedCodeDir !== undefined ? { verifiedCodeDir: opts.verifiedCodeDir } : {}),
   });
   return { loader: l, warnings };
 }
@@ -169,9 +181,11 @@ describe("only the verified bytes of a signed plugin run (C108)", () => {
   test("the verified copy lives in a private directory outside the plugins root, and is gone after the import", async () => {
     const code = "export default { ok: true };\n";
     const path = install(code, { entrypointDigest: digestOf(code) });
+    const staging = join(root, "..", `${basename(root)}-verified`);
     let importedFrom = "";
     let modeWhileImporting = 0;
     const { loader: l } = loader({
+      verifiedCodeDir: staging,
       importEntrypoint: async (p) => {
         importedFrom = p;
         modeWhileImporting = (await import("node:fs")).statSync(dirname(p)).mode & 0o777;
@@ -179,10 +193,16 @@ describe("only the verified bytes of a signed plugin run (C108)", () => {
         return { default: {} };
       },
     });
-    await l.load(path);
-    expect(importedFrom.startsWith(root)).toBe(false);
-    expect(modeWhileImporting).toBe(0o700);
-    expect(existsSync(dirname(importedFrom))).toBe(false);
+    try {
+      await l.load(path);
+      expect(importedFrom.startsWith(root)).toBe(false);
+      expect(dirname(dirname(importedFrom))).toBe(realpathSync(staging));
+      expect(basename(importedFrom)).toBe("index.mjs");
+      expect(modeWhileImporting).toBe(0o700);
+      expect(existsSync(dirname(importedFrom))).toBe(false);
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
   });
 
   test("an unsigned development plugin may still be several files, imported in place", async () => {
@@ -237,5 +257,160 @@ describe("a signed notAfter ends a manifest (C108)", () => {
     const m = JSON.parse(readFileSync(path, "utf8"));
     writeFileSync(path, JSON.stringify({ ...m, notAfter: "2999-01-01T00:00:00Z" }));
     await expect(loader().loader.load(path)).rejects.toThrow(/signature does not verify/);
+  });
+});
+
+describe("where a signed plugin's code is staged (C108)", () => {
+  /**
+   * A package another local user planted in the shared temp directory, and
+   * a signed plugin that asks for it by a name the import scan cannot see
+   * (the module loader reached through `globalThis`, resolved from the
+   * copy's own location). Before 0.7.1's fix the copy was staged in
+   * os.tmpdir(), so the planted package was found and ran.
+   */
+  function plantedScenario() {
+    const base = mkdtempSync(join(tmpdir(), "plugin-staging-"));
+    const sharedTmp = join(base, "shared-tmp");
+    const planted = join(sharedTmp, "node_modules", "plantedpkg");
+    const ran = join(base, "planted-code-ran");
+    mkdirSync(planted, { recursive: true });
+    writeFileSync(
+      join(planted, "package.json"),
+      JSON.stringify({ name: "plantedpkg", version: "1.0.0", main: "index.js" }),
+    );
+    writeFileSync(
+      join(planted, "index.js"),
+      `require("node:fs").writeFileSync(${JSON.stringify(ran)}, "ran"); module.exports = { planted: true };\n`,
+    );
+    const code = [
+      'const loader = globalThis["process"].getBuiltinModule("module");',
+      "let found = false;",
+      'try { found = loader.createRequire(import.meta.url)("plantedpkg").planted === true; } catch {}',
+      "export default { found };",
+    ].join("\n");
+    return { base, sharedTmp, ran, code, stagingParent: join(base, "home", ".crewhaus") };
+  }
+
+  test("a package planted in the shared temp directory is not found by signed code", async () => {
+    const sc = plantedScenario();
+    const savedTmp = process.env["TMPDIR"];
+    process.env["TMPDIR"] = sc.sharedTmp;
+    try {
+      const path = install(sc.code, { entrypointDigest: digestOf(sc.code) });
+      const { loader: l } = loader({ verifiedCodeDir: join(sc.stagingParent, "verified-code") });
+      const loaded = await l.load(path);
+      expect(loaded.signed).toBe(true);
+      expect(loaded.module.default).toEqual({ found: false });
+      expect(existsSync(sc.ran)).toBe(false);
+    } finally {
+      if (savedTmp === undefined) Reflect.deleteProperty(process.env, "TMPDIR");
+      else process.env["TMPDIR"] = savedTmp;
+      rmSync(sc.base, { recursive: true, force: true });
+    }
+  });
+
+  test("control: resolution really walks up from the staging directory, so only its owner's directories count", async () => {
+    const sc = plantedScenario();
+    try {
+      // The same package in the operator's own directory above the staging one IS found.
+      const own = join(sc.stagingParent, "node_modules", "plantedpkg");
+      mkdirSync(own, { recursive: true });
+      for (const f of ["package.json", "index.js"]) {
+        writeFileSync(
+          join(own, f),
+          readFileSync(join(sc.sharedTmp, "node_modules", "plantedpkg", f)),
+        );
+      }
+      const path = install(sc.code, { entrypointDigest: digestOf(sc.code) });
+      const { loader: l } = loader({ verifiedCodeDir: join(sc.stagingParent, "verified-code") });
+      expect((await l.load(path)).module.default).toEqual({ found: true });
+    } finally {
+      rmSync(sc.base, { recursive: true, force: true });
+    }
+  });
+
+  test("by default it is ~/.crewhaus/verified-code, never the shared temp directory", async () => {
+    expect(defaultVerifiedCodeDir("/home/op")).toBe(join("/home/op", ".crewhaus", "verified-code"));
+    const code = "export default {};\n";
+    const path = install(code, { entrypointDigest: digestOf(code) });
+    let importedFrom = "";
+    const { loader: l } = loader({
+      importEntrypoint: async (p) => {
+        importedFrom = p;
+        return { default: {} };
+      },
+    });
+    await l.load(path);
+    expect(dirname(dirname(importedFrom))).toBe(
+      realpathSync(join(homedir(), ".crewhaus", "verified-code")),
+    );
+    expect(importedFrom.startsWith(realpathSync(tmpdir()))).toBe(false);
+  });
+
+  test("a staging directory that is a link, or that others can write, is refused before anything is staged", async () => {
+    const code = "export default {};\n";
+    const path = install(code, { entrypointDigest: digestOf(code) });
+    const real = join(root, "..", `${basename(root)}-stage-real`);
+    const link = join(root, "..", `${basename(root)}-stage-link`);
+    mkdirSync(real, { mode: 0o700 });
+    symlinkSync(real, link);
+    let imported = 0;
+    const importEntrypoint = async () => {
+      imported += 1;
+      return { default: {} };
+    };
+    try {
+      await expect(
+        loader({ verifiedCodeDir: link, importEntrypoint }).loader.load(path),
+      ).rejects.toThrow(
+        `plugin "my-plugin": cannot stage its verified code for import in ${link}: it is a link`,
+      );
+      if (process.platform !== "win32") {
+        chmodSync(real, 0o777);
+        await expect(
+          loader({ verifiedCodeDir: real, importEntrypoint }).loader.load(path),
+        ).rejects.toThrow(
+          `plugin "my-plugin": cannot stage its verified code for import in ${real}: other users can write to it (mode 777); run chmod go-w on it`,
+        );
+        chmodSync(real, 0o750);
+        await loader({ verifiedCodeDir: real, importEntrypoint }).loader.load(path);
+        expect(imported).toBe(1);
+      }
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(real, { recursive: true, force: true });
+    }
+  });
+
+  test("the copy is an ES module: it has no CommonJS module object", async () => {
+    const code = "export default { mod: typeof module, req: typeof import.meta.require };\n";
+    const path = install(code, { entrypointDigest: digestOf(code) });
+    const staging = join(root, "..", `${basename(root)}-verified`);
+    try {
+      const loaded = await loader({ verifiedCodeDir: staging }).loader.load(path);
+      expect(loaded.module.default).toEqual({ mod: "undefined", req: "function" });
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
+  });
+
+  test("the reviewer's case: a signed plugin that asks for a package by import.meta.require or createRequire is refused before it runs", async () => {
+    for (const code of [
+      'const m = import.meta.require("plantedpkg");\nexport default {};\n',
+      'import { createRequire } from "node:module";\nconst m = createRequire(import.meta.url)("plantedpkg");\nexport default {};\n',
+    ]) {
+      const path = install(code, { entrypointDigest: digestOf(code) });
+      let imported = false;
+      const { loader: l } = loader({
+        importEntrypoint: async () => {
+          imported = true;
+          return { default: {} };
+        },
+      });
+      await expect(l.load(path)).rejects.toThrow(
+        /index\.js cannot run as signed code: it (loads modules by a name found at run time|imports "node:module")/,
+      );
+      expect(imported).toBe(false);
+    }
   });
 });

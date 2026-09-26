@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { builtinModules } from "node:module";
 import { CrewhausError } from "@crewhaus/errors";
 import type { RegisteredTool, ToolDefinition } from "@crewhaus/tool-catalog";
@@ -222,10 +222,11 @@ export type PluginManifest = {
    * and the loader refuses the plugin (it loads unverified only under
    * `CREWHAUS_PLUGIN_ALLOW_UNSIGNED=1`). Compute it with `entrypointDigest`.
    *
-   * A signed plugin is ONE file. The digest covers `index.js` and nothing it
-   * imports, so the loader imports exactly the bytes it checked, from a
-   * private copy, and refuses an `index.js` that imports anything but a
-   * `node:` or `bun:` builtin ({@link entrypointImportProblem}). Bundle the
+   * A signed plugin is ONE ES module file. The digest covers `index.js` and
+   * nothing it loads, so the loader imports exactly the bytes it checked,
+   * from a private copy, and refuses an `index.js` that loads anything but a
+   * runtime builtin — by import, by `require`, or by a name worked out at run
+   * time ({@link entrypointImportProblem}). Bundle the
    * plugin first: `bun build src/index.ts --target=bun --format=esm
    * --outfile index.js`. An unsigned (development) plugin may still be
    * several files; a digest on it is checked, and it is imported in place.
@@ -568,6 +569,14 @@ export function manifestExpiryProblem(
 
 const HOST_BUILTINS: ReadonlySet<string> = new Set(builtinModules);
 
+/**
+ * The builtin that loads modules by name (`createRequire`, `Module._load`,
+ * `register`): a signed plugin that imports it can load a package the
+ * digest does not cover, so it is not one of the builtins a signed plugin
+ * may import.
+ */
+const MODULE_LOADER_BUILTINS: ReadonlySet<string> = new Set(["module", "node:module"]);
+
 /** A module the runtime itself provides: `node:*`, `bun:*`, `bun`, or a bare Node builtin (`fs`). */
 function isRuntimeBuiltin(specifier: string): boolean {
   return (
@@ -578,30 +587,327 @@ function isRuntimeBuiltin(specifier: string): boolean {
   );
 }
 
+/** A module a signed entrypoint may import: a runtime builtin, but not the module loader. */
+function isSignedImportAllowed(specifier: string): boolean {
+  return isRuntimeBuiltin(specifier) && !MODULE_LOADER_BUILTINS.has(specifier);
+}
+
+const BUNDLE_HINT =
+  "A signed plugin must be one file: bundle it (bun build src/index.ts --target=bun --format=esm --outfile index.js) and sign that";
+
 /**
- * Why `code`, a signed plugin's `index.js`, cannot run as the code its
- * `entrypointDigest` attests to, or undefined when it can. The digest covers
- * this one file, so an import of anything the runtime does not provide
- * itself — a sibling (`./lib.js`) or a package (`zod`, which Bun may even
- * fetch from npm when no `node_modules` has it) — would run code the
- * signature does not cover. Imports are read from the source with Bun's own
- * scanner: static imports, re-exports, `require("…")` and `import("…")` with
- * a literal specifier.
+ * The properties of `import.meta` that say where the module is and read
+ * nothing: every other use (`require`, `resolve`, the object itself passed
+ * along) is a way to load a module by name.
  */
-export function entrypointImportProblem(code: string | Uint8Array): string | undefined {
-  const text = typeof code === "string" ? code : new TextDecoder().decode(code);
-  let imports: ReadonlyArray<{ readonly path: string }>;
+const IMPORT_META_LOCATION = /^\.(?:url|dir|dirname|file|filename|path|main|env)(?![\w$])/;
+
+/** The run-time ways to find a module by name that no literal import shows. */
+const RESOLVERS: ReadonlyArray<readonly [string, string]> = [
+  ["require.resolve", "requireResolve"],
+  ["import.meta.resolve", "metaResolve"],
+  ["Bun.resolveSync", "bunResolveSync"],
+  ["Bun.resolve", "bunResolve"],
+  ["process.getBuiltinModule", "getBuiltinModule"],
+  ["process.mainModule", "mainModule"],
+];
+
+/** `"…"`, `'…'` or `` `…` `` holding a specifier a signed entrypoint may import, at the start of `text`. */
+function allowedLiteralAt(text: string, from: number): number | undefined {
+  const m = /^(["'`])([^"'`\\$]*)\1/.exec(text.slice(from, from + 256));
+  if (m === null || m[2] === undefined || !isSignedImportAllowed(m[2])) return undefined;
+  return from + m[0].length;
+}
+
+/** `[A-Za-z0-9_$]`, by code unit; a non-ASCII identifier character reads as punctuation, which only shortens {@link codeMask}'s `word`. */
+function isIdentChar(c: string): boolean {
+  const k = c.charCodeAt(0);
+  return (
+    (k >= 0x61 && k <= 0x7a) ||
+    (k >= 0x41 && k <= 0x5a) ||
+    (k >= 0x30 && k <= 0x39) ||
+    k === 0x5f ||
+    k === 0x24
+  );
+}
+
+function isSpace(c: string): boolean {
+  const k = c.charCodeAt(0);
+  return k === 0x20 || k === 0x0a || k === 0x09 || k === 0x0d;
+}
+
+/** Keywords after which a `/` starts a regular expression, not a division. */
+const REGEX_AFTER_WORD: ReadonlySet<string> = new Set([
+  "return",
+  "typeof",
+  "instanceof",
+  "in",
+  "of",
+  "new",
+  "delete",
+  "void",
+  "throw",
+  "case",
+  "do",
+  "else",
+  "yield",
+  "await",
+]);
+
+/** Punctuation after which a `/` starts a regular expression, not a division. */
+const REGEX_AFTER_PUNCT = "(,=:[!&|?{};+-*%<>~^";
+
+/**
+ * Which characters of `text` — the transpiler's own normalised output — are
+ * code, and which sit inside a string, a template's text, a comment or a
+ * regular-expression literal: a `1` for each code character. One pass, so
+ * its time is linear in the text. A template's `${…}` is code, nested to any
+ * depth. A `/` is read as a regular expression where JavaScript reads it so
+ * (after an operator or one of {@link REGEX_AFTER_WORD}).
+ */
+function codeMask(text: string): Uint8Array {
+  const n = text.length;
+  const mask = new Uint8Array(n);
+  // One entry per open `${`: the `{` depth inside it, so its `}` is found.
+  const templates: number[] = [];
+  let depth = 0;
+  let prev = ""; // the last code character that is not white space
+  let word = ""; // the identifier that ends at `prev`, if any
+  let i = 0;
+  const skipTemplateText = (from: number): number => {
+    let j = from;
+    while (j < n) {
+      const ch = text[j];
+      if (ch === "\\") j += 2;
+      else if (ch === "`") return j + 1;
+      else if (ch === "$" && text[j + 1] === "{") {
+        templates.push(depth);
+        return j + 2;
+      } else j += 1;
+    }
+    return n;
+  };
+  while (i < n) {
+    const c = text[i] as string;
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < n && text[j] !== c && text[j] !== "\n") j += text[j] === "\\" ? 2 : 1;
+      i = j + 1;
+      prev = c;
+      word = "";
+      continue;
+    }
+    if (c === "`") {
+      i = skipTemplateText(i + 1);
+      prev = "`";
+      word = "";
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < n && text[i] !== "\n") i += 1;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      i = end === -1 ? n : end + 2;
+      continue;
+    }
+    if (
+      c === "/" &&
+      (prev === "" || REGEX_AFTER_PUNCT.includes(prev) || REGEX_AFTER_WORD.has(word))
+    ) {
+      let j = i + 1;
+      let inClass = false;
+      while (j < n && text[j] !== "\n") {
+        const ch = text[j];
+        if (ch === "\\") j += 1;
+        else if (ch === "[") inClass = true;
+        else if (ch === "]") inClass = false;
+        else if (ch === "/" && !inClass) break;
+        j += 1;
+      }
+      i = j + 1;
+      while (i < n && isIdentChar(text[i] as string)) i += 1;
+      prev = "/";
+      word = "";
+      continue;
+    }
+    if (c === "{") depth += 1;
+    if (c === "}") {
+      if (templates.length > 0 && templates[templates.length - 1] === depth) {
+        templates.pop();
+        i = skipTemplateText(i + 1);
+        prev = "`";
+        word = "";
+        continue;
+      }
+      depth -= 1;
+    }
+    mask[i] = 1;
+    if (isIdentChar(c)) word = isIdentChar(prev) ? word + c : c;
+    else if (!isSpace(c)) word = "";
+    if (!isSpace(c)) prev = c;
+    i += 1;
+  }
+  return mask;
+}
+
+/**
+ * Whether the name at `start`..`end` of `text` is only tested with `typeof`,
+ * which loads nothing: `typeof name`, or `typeof (0, name)` as the
+ * transpiler prints a replaced member expression.
+ */
+function isTypeofAt(text: string, start: number, end: number): boolean {
+  if (text.slice(Math.max(0, start - 7), start) === "typeof ") return true;
+  return text.slice(Math.max(0, start - 11), start) === "typeof (0, " && text[end] === ")";
+}
+
+/** Whether `text` at `from` is a call on one literal builtin name: `("node:fs")`. */
+function isBuiltinCall(text: string, from: number): boolean {
+  if (text[from] !== "(") return false;
+  const close = allowedLiteralAt(text, from + 1);
+  return close !== undefined && text[close] === ")";
+}
+
+/**
+ * Why the module-loading code in `text` — a signed entrypoint that passed
+ * the literal-import check — could load a module the digest does not cover,
+ * or undefined when it cannot. Bun's own transpiler finds the references
+ * (it replaces each global name below with a random marker, so a string or
+ * a comment never counts, and a local variable that shadows one is left
+ * alone); then:
+ *
+ * - `require` may only be called directly on a builtin's literal name, or
+ *   tested with `typeof`;
+ * - `import.meta.require` likewise, or through the one alias a bundler
+ *   writes (`var __require = import.meta.require;`) when every call through
+ *   that alias names a builtin;
+ * - `import.meta` may only be read for where the module is (`.url`,
+ *   `.dir`, …);
+ * - `import()` must name a builtin literally;
+ * - `require.resolve`, `import.meta.resolve`, `Bun.resolveSync`,
+ *   `Bun.resolve`, `process.getBuiltinModule` and `process.mainModule` are
+ *   refused outright.
+ *
+ * This reads the source as written. Code built or looked up at run time —
+ * `eval`, `new Function`, `globalThis[name]` — is not examined; the loader
+ * stages a signed plugin where only the operator can plant a package, so a
+ * name found that way resolves in the operator's own directories.
+ */
+function runtimeLoadProblem(text: string): string | undefined {
+  const marker = `__crewhaus_${randomBytes(8).toString("hex")}_`;
+  const define: Record<string, string> = {
+    require: `${marker}require`,
+    "import.meta": `${marker}meta`,
+    "import.meta.require": `${marker}metaRequire`,
+  };
+  for (const [name, id] of RESOLVERS) define[name] = `${marker}${id}`;
+  let out: string;
   try {
-    imports = new Bun.Transpiler({ loader: "js" }).scanImports(text);
+    out = new Bun.Transpiler({ loader: "js", define }).transformSync(text);
   } catch (err) {
     return `it cannot be read as JavaScript (${err instanceof Error ? err.message : String(err)})`;
   }
-  const outside = [...new Set(imports.map((i) => i.path).filter((p) => !isRuntimeBuiltin(p)))];
-  if (outside.length === 0) return undefined;
-  const listed = outside
-    .slice(0, 5)
-    .map((p) => JSON.stringify(p))
-    .join(", ");
-  const more = outside.length > 5 ? ` and ${outside.length - 5} more` : "";
-  return `it imports ${listed}${more}, which its entrypointDigest does not cover. A signed plugin must be one file: bundle it (bun build src/index.ts --target=bun --format=esm --outfile index.js) and sign that`;
+  const refused = new Set<string>();
+  const aliases = new Set<string>();
+  const found = new RegExp(`${marker}(\\w+)`, "g");
+  for (let m = found.exec(out); m !== null; m = found.exec(out)) {
+    const id = m[1] as string;
+    const after = found.lastIndex;
+    const resolver = RESOLVERS.find(([, rid]) => rid === id);
+    if (resolver !== undefined) {
+      refused.add(resolver[0]);
+      continue;
+    }
+    if (id === "meta") {
+      if (!IMPORT_META_LOCATION.test(out.slice(after, after + 16))) refused.add("import.meta");
+      continue;
+    }
+    const name = id === "require" ? "require" : "import.meta.require";
+    if (isTypeofAt(out, m.index, after) || isBuiltinCall(out, after)) continue;
+    // The alias a bundler writes for import.meta.require.
+    const alias = /(?:var|let|const) ([A-Za-z_$][\w$]*) = $/.exec(
+      out.slice(Math.max(0, m.index - 80), m.index),
+    );
+    if (id === "metaRequire" && alias?.[1] !== undefined && out[after] === ";") {
+      aliases.add(alias[1]);
+      continue;
+    }
+    refused.add(`${name} with a name that is not a builtin's, written out`);
+  }
+  const code = codeMask(out);
+  for (const alias of aliases) {
+    const uses = new RegExp(`(?<![\\w$.])${alias.replaceAll("$", "\\$")}(?![\\w$])`, "g");
+    for (let m = uses.exec(out); m !== null; m = uses.exec(out)) {
+      if (code[m.index] !== 1) continue; // in a string or a comment
+      const after = uses.lastIndex;
+      if (out.startsWith(` = ${marker}metaRequire;`, after)) continue; // its declaration
+      if (isTypeofAt(out, m.index, after)) continue;
+      if (isBuiltinCall(out, after)) continue;
+      refused.add(
+        `import.meta.require (through ${alias}) with a name that is not a builtin's, written out`,
+      );
+      break;
+    }
+  }
+  const dynamic = /(?<![\w$.])import\(/g;
+  for (let m = dynamic.exec(out); m !== null; m = dynamic.exec(out)) {
+    if (code[m.index] !== 1) continue; // in a string or a comment
+    const close = allowedLiteralAt(out, dynamic.lastIndex);
+    if (close === undefined || (out[close] !== ")" && out[close] !== ",")) {
+      refused.add("import() with a name that is not a builtin's, written out");
+      break;
+    }
+  }
+  if (refused.size === 0) return undefined;
+  return `it loads modules by a name found at run time (${[...refused].join("; ")}), which its entrypointDigest does not cover. ${BUNDLE_HINT}`;
+}
+
+/**
+ * Why `code`, a signed plugin's `index.js`, cannot run as the code its
+ * `entrypointDigest` attests to, or undefined when it can. The digest covers
+ * this one file, so loading anything the runtime does not provide itself —
+ * a sibling (`./lib.js`) or a package (`zod`, which Bun may even fetch from
+ * npm when no `node_modules` has it) — would run code the signature does not
+ * cover.
+ *
+ * - Literal imports are read with Bun's own scanner — static imports,
+ *   re-exports, `require("…")` and `import("…")` — and may name only a
+ *   runtime builtin other than `module` (whose `createRequire` loads
+ *   packages).
+ * - The file must be an ES module that exports something (the loader reads
+ *   its default export): a CommonJS file has `module.require`, which no
+ *   scan can follow.
+ * - Run-time loading by name is refused too (see {@link runtimeLoadProblem}).
+ */
+export function entrypointImportProblem(code: string | Uint8Array): string | undefined {
+  const text = typeof code === "string" ? code : new TextDecoder().decode(code);
+  let scanned: {
+    readonly exports: ReadonlyArray<string>;
+    readonly imports: ReadonlyArray<{ readonly path: string }>;
+  };
+  let imports: ReadonlyArray<{ readonly path: string }>;
+  try {
+    const transpiler = new Bun.Transpiler({ loader: "js" });
+    imports = transpiler.scanImports(text);
+    scanned = transpiler.scan(text);
+  } catch (err) {
+    return `it cannot be read as JavaScript (${err instanceof Error ? err.message : String(err)})`;
+  }
+  const outside = [...new Set(imports.map((i) => i.path).filter((p) => !isSignedImportAllowed(p)))];
+  if (outside.length > 0) {
+    const listed = outside
+      .slice(0, 5)
+      .map((p) => JSON.stringify(p))
+      .join(", ");
+    const more = outside.length > 5 ? ` and ${outside.length - 5} more` : "";
+    const loader = outside.some((p) => MODULE_LOADER_BUILTINS.has(p))
+      ? " (the module builtin loads packages by name)"
+      : "";
+    return `it imports ${listed}${more}${loader}, which its entrypointDigest does not cover. ${BUNDLE_HINT}`;
+  }
+  if (scanned.exports.length === 0) {
+    return `it exports nothing, so it is not an ES module crewhaus can check: a signed plugin is an ES module whose default export is the plugin. ${BUNDLE_HINT}`;
+  }
+  return runtimeLoadProblem(text);
 }

@@ -26,13 +26,21 @@ plugin is refused (it loads unverified only in development mode, below).
 A signed plugin runs as exactly the bytes that digest names. crewhaus reads
 `index.js` once, checks the digest, and imports a private copy of those bytes,
 so a file changed after the check never runs. That makes a signed plugin one
-file: an `index.js` that imports anything other than a `node:` or `bun:`
-builtin (`./lib.js`, `zod`) is refused, because the signature covers none of
-it. Bundle the plugin before you sign it:
+ES module file: an `index.js` that loads anything other than a runtime
+builtin is refused, because the signature covers none of it. That includes
+`import`, `require` and `import()` of a sibling or a package (`./lib.js`,
+`zod`), the `module` builtin (`createRequire`), and loading by a name worked
+out at run time — `import.meta.require(name)`, `import(name)`,
+`require.resolve`, `Bun.resolveSync`. Bundle the plugin before you sign it:
 
 ```sh
 bun build src/index.ts --target=bun --format=esm --outfile index.js
 ```
+
+The private copy is made in `~/.crewhaus/verified-code`, which must be yours
+and writable by nobody else, and is removed once the plugin is loaded. It is
+never made in the shared temp directory, where another user could plant a
+package for the plugin's code to find.
 
 A signed manifest may also carry `notAfter`, an RFC 3339 date-time with `Z` or
 an offset (`"2027-01-01T00:00:00Z"`). It is signed with the rest of the
