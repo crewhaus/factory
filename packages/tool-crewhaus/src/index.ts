@@ -1047,7 +1047,7 @@ function loadEvalDoc(
 export const evalBaselineCompare: RegisteredTool = buildTool({
   name: "EvalBaselineCompare",
   description:
-    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A comparison that never happened fails: runs that share no sample ids, or that name different datasets (unless allowDatasetMismatch), fail the gate, and minSharedFraction can require the candidate to cover more of the baseline. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
+    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A comparison that never happened fails: runs that share no sample ids, or that name different datasets (unless allowDatasetMismatch), fail the gate, and minSharedFraction can require the candidate to cover more of the baseline. Another version or split of the same registry dataset (golden@v3 against golden@v4 or golden@v3#dev) is the same dataset: it is noted, not failed. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
   inputSchema: z.object({
     baseline: evalDocSchema.optional().describe("the baseline run's results document"),
     baselinePath: z.string().optional().describe("path to the baseline results.json instead"),
@@ -1081,7 +1081,7 @@ export const evalBaselineCompare: RegisteredTool = buildTool({
       .boolean()
       .optional()
       .describe(
-        "gate two runs that name different datasets anyway (default false: their scores are not comparable, so the gate fails)",
+        "gate two runs that name different datasets anyway (default false: their scores are not comparable, so the gate fails). Another version or split of one registry dataset is not a different dataset",
       ),
     minSharedFraction: z
       .number()

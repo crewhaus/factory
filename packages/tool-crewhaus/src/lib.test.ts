@@ -7,7 +7,12 @@
 import { describe, expect, test } from "bun:test";
 import { collectSpecModels } from "@crewhaus/preflight";
 import { parseSpec } from "@crewhaus/spec";
-import { DEFAULT_SCORE_EPSILON, compareEvalRuns, readEvalRun } from "./lib/eval-gate";
+import {
+  DEFAULT_SCORE_EPSILON,
+  compareEvalRuns,
+  datasetBaseName,
+  readEvalRun,
+} from "./lib/eval-gate";
 import { readSpecIdentity } from "./lib/identity";
 import {
   auditPermissions,
@@ -782,6 +787,51 @@ describe("eval gate", () => {
     expect(allowed.verdict).toBe("pass");
     expect(allowed.notes.some((n) => n.includes("different datasets"))).toBe(true);
     expect(allowed.thresholds.allowDatasetMismatch).toBe(true);
+  });
+
+  // The first 0.7.1 cut compared the raw names, and `crewhaus eval` records a
+  // registry dataset as `<name>@<version>[#split]`: a routine version bump
+  // (auto-distill registers new versions) or a split selection failed the gate.
+  test("another version or split of the same registry dataset is noted, not failed", () => {
+    const three: Array<[string, boolean, number]> = [
+      ["a", true, 1],
+      ["b", true, 1],
+      ["c", false, 0],
+    ];
+    const at = (datasetName: string, rows = three) => {
+      const read = readEvalRun(evalDoc(rows, { config: { datasetName } }), datasetName);
+      if (!read.ok) throw new Error("fixture did not read");
+      return read.run;
+    };
+    const v3 = at("golden@v3");
+    for (const cand of [at("golden@v4", [...three, ["d", true, 1]]), at("golden@v3#dev")]) {
+      const result = compareEvalRuns(v3, cand);
+      expect({ name: cand.datasetName, verdict: result.verdict, reasons: result.reasons }).toEqual({
+        name: cand.datasetName,
+        verdict: "pass",
+        reasons: [],
+      });
+      expect(
+        result.notes.filter((n) => n.includes("different versions or splits of one dataset")),
+      ).toHaveLength(1);
+    }
+    // A different registry dataset is still a different dataset.
+    const other = compareEvalRuns(v3, at("silver@v3"));
+    expect(other.reasons).toEqual([
+      "the runs name different datasets (golden@v3 vs silver@v3) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway",
+    ]);
+    // The sample rules still decide a version bump that re-keyed everything.
+    expect(
+      compareEvalRuns(v3, at("golden@v4", [["z", true, 1]])).reasons.map((r) => r.slice(0, 30)),
+    ).toEqual(["the two runs share no sample i"]);
+  });
+
+  test("datasetBaseName reads the registry grammar and leaves anything else whole", () => {
+    expect(
+      ["golden@v3", "golden@1.2.0#test", "golden", "evals/smoke.jsonl", "a@b@c", "x#dev"].map(
+        datasetBaseName,
+      ),
+    ).toEqual(["golden", "golden", "golden", "evals/smoke.jsonl", "a@b@c", "x#dev"]);
   });
 
   test("runs that share no sample ids FAIL the gate, even with a perfect candidate", () => {

@@ -224,6 +224,20 @@ export type EvalGateResult = {
   readonly notes: readonly string[];
 };
 
+/**
+ * `<name>@<version>[#split]` — how `crewhaus eval` records a registry
+ * dataset in a run (dataset-ops' `registryDatasetName`). A registry name
+ * and version never contain `@` or `#`, so the split is unambiguous; each
+ * class is disjoint from the delimiter after it, so a match is linear.
+ */
+const REGISTRY_DATASET_RE = /^([^@#]+)@([^@#]+)(?:#([^@#]+))?$/;
+
+/** The dataset a run names, without its registry version or split. */
+export function datasetBaseName(name: string): string {
+  const match = REGISTRY_DATASET_RE.exec(name);
+  return match === null ? name : (match[1] as string);
+}
+
 /** Round to 6 decimals so a float artefact never shows up as a "change". */
 function round(n: number): number {
   return Math.round(n * 1e6) / 1e6;
@@ -244,8 +258,11 @@ function round(n: number): number {
  * runs that share no sample ids, or that both name a dataset and name
  * different ones, FAIL the gate with a reason, because a candidate whose pass
  * rate merely matches a baseline measured on something else has not been
- * shown to hold the line. The verdict stays `pass | fail`: a third value
- * would be read as "not fail" by every caller written `verdict === "fail"`.
+ * shown to hold the line. Another version or split of the same registry
+ * dataset (`golden@v3` → `golden@v4`, `golden@v3#dev`) is the same dataset:
+ * it is noted, and the shared-sample rules above decide. The verdict stays
+ * `pass | fail`: a third value would be read as "not fail" by every caller
+ * written `verdict === "fail"`.
  */
 export function compareEvalRuns(
   baseline: EvalRunView,
@@ -319,7 +336,7 @@ export function compareEvalRuns(
   const datasetsDiffer =
     baseline.datasetName !== undefined &&
     candidate.datasetName !== undefined &&
-    baseline.datasetName !== candidate.datasetName;
+    datasetBaseName(baseline.datasetName) !== datasetBaseName(candidate.datasetName);
   if (datasetsDiffer && thresholds.allowDatasetMismatch !== true) {
     reasons.push(
       `the runs name different datasets (${baseline.datasetName} vs ${candidate.datasetName}) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway`,
@@ -355,7 +372,9 @@ export function compareEvalRuns(
   }
   if (baseline.datasetName !== candidate.datasetName) {
     notes.push(
-      `the two runs name different datasets (${baseline.datasetName ?? "unknown"} vs ${candidate.datasetName ?? "unknown"}) — scores from different datasets are not comparable`,
+      baseline.datasetName !== undefined && candidate.datasetName !== undefined && !datasetsDiffer
+        ? `the two runs use different versions or splits of one dataset (${baseline.datasetName} vs ${candidate.datasetName}) — only the samples they share were compared one by one, and the pass rates cover different sample sets`
+        : `the two runs name different datasets (${baseline.datasetName ?? "unknown"} vs ${candidate.datasetName ?? "unknown"}) — scores from different datasets are not comparable`,
     );
   }
 
