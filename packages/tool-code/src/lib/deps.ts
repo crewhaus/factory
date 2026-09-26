@@ -961,7 +961,15 @@ export function parseSemver(raw: string): SemVer | undefined {
   };
 }
 
-/** Compare two versions, prereleases ordering below their release. */
+/**
+ * Compare two versions, prereleases ordering below their release.
+ *
+ * Prereleases compare identifier by identifier, as SemVer 2.0.0 §11 and npm
+ * do: numeric identifiers numerically and below alphanumeric ones, and a
+ * longer list above a prefix of it. Compared as whole strings, `rc.10`
+ * sorted below `rc.9`, so a range, a pick or an advisory's bounds could
+ * land on the wrong side of a release candidate.
+ */
 export function compareSemver(a: SemVer, b: SemVer): number {
   if (a.major !== b.major) return a.major - b.major;
   if (a.minor !== b.minor) return a.minor - b.minor;
@@ -969,7 +977,32 @@ export function compareSemver(a: SemVer, b: SemVer): number {
   if (a.prerelease === b.prerelease) return 0;
   if (a.prerelease === "") return 1;
   if (b.prerelease === "") return -1;
-  return a.prerelease < b.prerelease ? -1 : 1;
+  return comparePrerelease(a.prerelease, b.prerelease);
+}
+
+const NUMERIC_IDENTIFIER_RE = /^\d+$/;
+
+function comparePrerelease(a: string, b: string): number {
+  const as = a.split(".");
+  const bs = b.split(".");
+  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
+    const x = as[i];
+    const y = bs[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const xNum = NUMERIC_IDENTIFIER_RE.test(x);
+    const yNum = NUMERIC_IDENTIFIER_RE.test(y);
+    if (xNum && yNum) {
+      const diff = Number(x) - Number(y);
+      if (diff !== 0) return diff < 0 ? -1 : 1;
+      continue;
+    }
+    if (xNum) return -1;
+    if (yNum) return 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
 }
 
 /** One comparator: an optional operator, then the version or wildcard it applies to. */

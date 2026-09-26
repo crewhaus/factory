@@ -13,6 +13,8 @@ import { describe, expect, test } from "bun:test";
 import { parseIstanbulSummary, parseLcov, totalOf, worstFirst } from "./lib/coverage";
 import {
   LOCKFILE_NAMES,
+  type SemVer,
+  compareSemver,
   matchWorkspaceGlob,
   parseBunLock,
   parseBunLockDetailed,
@@ -1417,6 +1419,44 @@ describe("semver, the subset", () => {
     expect(satisfiesInstallable("3.0.0", "^1.2.3-beta.2")).toBe(false);
     expect(satisfiesInstallable("1.0.0-rc.1", "workspace:*")).toBeUndefined();
     expect(satisfiesInstallable("banana", "^1.0.0")).toBeUndefined();
+  });
+
+  test("prereleases order identifier by identifier, numbers numerically, as SemVer and npm do", () => {
+    // SemVer 2.0.0 §11's own example chain, shuffled; on 0.7.0 the tags were
+    // compared as whole strings, so beta.11 sorted below beta.2.
+    const chain = [
+      "1.0.0-alpha",
+      "1.0.0-alpha.1",
+      "1.0.0-alpha.beta",
+      "1.0.0-beta",
+      "1.0.0-beta.2",
+      "1.0.0-beta.11",
+      "1.0.0-rc.1",
+      "1.0.0",
+    ];
+    const shuffled = [
+      chain[5],
+      chain[7],
+      chain[2],
+      chain[0],
+      chain[6],
+      chain[4],
+      chain[1],
+      chain[3],
+    ];
+    const sorted = [...(shuffled as string[])].sort((a, b) =>
+      compareSemver(parseSemver(a) as SemVer, parseSemver(b) as SemVer),
+    );
+    expect(sorted).toEqual(chain);
+    const cmp = (a: string, b: string): number =>
+      Math.sign(compareSemver(parseSemver(a) as SemVer, parseSemver(b) as SemVer));
+    expect([cmp("1.0.0-rc.10", "1.0.0-rc.9"), cmp("1.0.0-2", "1.0.0-10")]).toEqual([1, -1]);
+    // A numeric identifier sorts below an alphanumeric one; equal numbers are equal.
+    expect([cmp("1.0.0-1", "1.0.0-a"), cmp("1.0.0-rc.01", "1.0.0-rc.1")]).toEqual([-1, 0]);
+    // Range evaluation rests on the same comparison.
+    expect(satisfies("1.0.0-beta.9", ">=1.0.0-beta.10")).toBe(false);
+    expect(satisfies("1.0.0-rc.10", "<=1.0.0-rc.5")).toBe(false);
+    expect(satisfiesInstallable("1.2.3-beta.11", "^1.2.3-beta.2")).toBe(true);
   });
 
   test("a range it cannot evaluate says so instead of guessing", () => {

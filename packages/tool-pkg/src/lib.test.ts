@@ -66,6 +66,17 @@ describe("resolveRange", () => {
     ).toBe("2.9.0-alpha.1");
   });
 
+  test("the pick among prereleases orders rc.10 above rc.9, as npm does", () => {
+    // On 0.7.0 the tags compared as whole strings: beta.9 was "newer" than
+    // beta.10, and <=1.2.3-rc.5 admitted rc.10.
+    expect(resolveRange("^1.2.3-beta.2", ["1.2.3-beta.9", "1.2.3-beta.10"]).best).toBe(
+      "1.2.3-beta.10",
+    );
+    const capped = resolveRange("<=1.2.3-rc.5", ["1.2.3-rc.2", "1.2.3-rc.10"]);
+    expect(capped.best).toBe("1.2.3-rc.2");
+    expect(capped.rejected).toContainEqual({ version: "1.2.3-rc.10", why: "out of range" });
+  });
+
   test("a valid range over versions that do not parse is understood, and says so", () => {
     // On 0.7.0 understanding was learned from the versions, so a list with no
     // parseable version reported "^1.0.0" as a range nobody understood.
