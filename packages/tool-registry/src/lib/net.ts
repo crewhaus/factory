@@ -426,7 +426,6 @@ export async function readCapped(res: Response, maxBytes: number): Promise<Cappe
 
 export type Deadline = {
   readonly signal: AbortSignal;
-  expired(): boolean;
   /** Clear the timer. Always call it, or the process keeps a handle alive. */
   cancel(): void;
 };
@@ -439,7 +438,6 @@ export type Deadline = {
  */
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const ctrl = new AbortController();
-  const startedAt = Date.now();
   const timer = setTimeout(() => ctrl.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
   const onOuter = (): void => ctrl.abort(outer?.reason);
   if (outer !== undefined) {
@@ -448,7 +446,6 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   }
   return {
     signal: ctrl.signal,
-    expired: () => Date.now() - startedAt >= ms,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);

@@ -316,6 +316,14 @@ function holdsSecret(bytes: Uint8Array, secrets: readonly SecretValue[]): boolea
   return false;
 }
 
+/**
+ * A cancel, not a deadline's timer, aborted the deadline's signal. Says what
+ * a stop is called; `remaining()` says whether there is one.
+ */
+function wasCancelled(deadline: Deadline): boolean {
+  return deadline.signal.aborted && !deadline.timedOut();
+}
+
 /** Run `fn` over `items` with at most `limit` in flight, results in input order. */
 async function mapWithConcurrency<T, R>(
   items: readonly T[],
@@ -472,6 +480,9 @@ export const httpRequest: RegisteredTool = buildTool({
               // already closed
             }
             await sleep(delay, deadline.signal);
+            // A cancel during the backoff ends the call here, not on a retry
+            // that could only start on an aborted signal.
+            deadline.signal.throwIfAborted();
             attempt++;
             continue;
           }
@@ -614,8 +625,8 @@ export const httpPaginate: RegisteredTool = buildTool({
 
     try {
       while (current !== null) {
-        if (deadline.expired()) {
-          stoppedBy = "deadline";
+        if (deadline.remaining() === 0) {
+          stoppedBy = wasCancelled(deadline) ? "aborted" : "deadline";
           break;
         }
         if (pages >= input.maxPages) {
@@ -894,12 +905,18 @@ export const httpBatch: RegisteredTool = buildTool({
           if (typeof url === "string") return { index, url: req.url, ok: false, error: url };
           const prepared = prepareHeaders(req.headers, input.auth, cfg, secrets);
           if (!prepared.ok) return { index, url: req.url, ok: false, error: prepared.message };
-          if (overall.expired()) {
+          // Asked of remaining(), which the timer and a cancel both bring to
+          // 0; the clock alone lags the one and never sees the other, and a
+          // request started on an aborted signal still costs a DNS lookup
+          // and comes back as a failure it did not have.
+          if (overall.remaining() === 0) {
             return {
               index,
               url: req.url,
               ok: false,
-              error: "skipped: the batch deadline elapsed before this request was issued",
+              error: wasCancelled(overall)
+                ? "skipped: the batch was cancelled before this request was issued"
+                : "skipped: the batch deadline elapsed before this request was issued",
             };
           }
           const deadline = startDeadline(
@@ -1281,12 +1298,15 @@ export const linkCheck: RegisteredTool = buildTool({
     const perRequest = input.perRequestTimeoutMs ?? 10_000;
     try {
       const results = await mapWithConcurrency(input.urls, input.concurrency ?? 4, async (raw) => {
-        if (overall.expired()) {
+        // remaining(), not the clock: see HttpBatch.
+        if (overall.remaining() === 0) {
           return {
             url: raw,
             ok: null,
             skipped: true,
-            error: "skipped: the sweep deadline elapsed before this URL was checked",
+            error: wasCancelled(overall)
+              ? "skipped: the sweep was cancelled before this URL was checked"
+              : "skipped: the sweep deadline elapsed before this URL was checked",
           };
         }
         const url = parseUrl(raw);
@@ -1421,7 +1441,11 @@ export const httpWaitFor: RegisteredTool = buildTool({
     let lastError: string | undefined;
 
     try {
-      while (!deadline.expired()) {
+      // remaining(), never the clock alone. After a cancel the clock still
+      // said the whole budget was left, so every pass opened a request on an
+      // aborted signal and then slept not at all: a busy loop for up to the
+      // full timeout, and the runtime waits for the tool to return.
+      while (deadline.remaining() > 0) {
         attempts++;
         try {
           const opened = await openRequest({

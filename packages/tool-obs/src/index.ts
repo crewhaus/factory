@@ -1817,12 +1817,19 @@ export const healthProbe: RegisteredTool = buildTool({
     const probe = async (index: number): Promise<void> => {
       const raw = input.urls[index] as string;
       const label = safeUrlLabel(raw);
-      if (deadline.expired()) {
+      // Asked of remaining(), which the timer and a cancel both bring to 0.
+      // The clock alone lags the one and never sees the other, and a probe
+      // started on an aborted signal fails at once — counted as unhealthy,
+      // for an endpoint nobody reached.
+      if (deadline.remaining() === 0) {
+        const cancelled = deadline.signal.aborted && !deadline.timedOut();
         results[index] = {
           url: label,
           ok: null,
           skipped: true,
-          error: "the sweep deadline elapsed before this endpoint was probed",
+          error: cancelled
+            ? "the sweep was cancelled before this endpoint was probed"
+            : "the sweep deadline elapsed before this endpoint was probed",
         };
         return;
       }

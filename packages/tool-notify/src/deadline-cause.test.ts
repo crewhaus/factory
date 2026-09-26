@@ -6,7 +6,7 @@
  * cause was lost. None of these race a timer against real I/O: a synchronous
  * spin holds the timer back, and a real timeout is awaited on its event.
  */
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import {
   DeadlineElapsedError,
   _setDnsTxtResolver,
@@ -86,6 +86,29 @@ test("a runtime cancel is an abort, not a deadline, whatever its reason looks li
     "the send was aborted before it completed",
     "the send was aborted before it completed",
   ]);
+});
+
+test("remaining() is 0 once the signal aborts, however the clock reads", async () => {
+  // Every caller asks remaining() before starting more work. It used to read
+  // the clock alone, which lags the timer and never sees a cancel: after a
+  // cancel it said the whole budget was left, for the whole budget. The
+  // clock is frozen here, so only the signal can bring it to 0.
+  const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+  const outer = new AbortController();
+  const cancelled = startDeadline(60_000, outer.signal);
+  const timer = startDeadline(1);
+  try {
+    expect([cancelled.remaining(), timer.remaining()]).toEqual([60_000, 1]);
+    outer.abort();
+    await aborted(timer.signal);
+    expect([cancelled.remaining(), timer.remaining()]).toEqual([0, 0]);
+    // The clock alone still says there is time.
+    expect([cancelled.expired(), timer.expired()]).toEqual([false, false]);
+  } finally {
+    cancelled.cancel();
+    timer.cancel();
+    now.mockRestore();
+  }
 });
 
 test("a DNS answer that arrives late is still the answer, and only the timer is a deadline", async () => {
