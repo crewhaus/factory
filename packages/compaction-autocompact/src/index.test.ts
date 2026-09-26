@@ -8,7 +8,7 @@ import {
   type TraceEvent,
   TraceEventBus,
 } from "@crewhaus/trace-event-bus";
-import { autoCompact } from "./index";
+import { COMPACTION_CONTINUE, SUMMARY_MARKER, autoCompact, planCompaction } from "./index";
 
 /**
  * Synthesise an `AsyncIterable<StreamEvent>` from a single text block
@@ -75,7 +75,7 @@ function makeStubAdapter(stream: () => AsyncIterable<StreamEvent>): {
 }
 
 describe("autoCompact", () => {
-  test("returns [user-marker, assistant-summary] tuple", async () => {
+  test("returns [marker, summary, continuation] when no pending user message can be kept", async () => {
     const { adapter } = makeStubAdapter(() => streamWithText("summary stub"));
     const messages: Anthropic.MessageParam[] = [
       { role: "user", content: "hello" },
@@ -84,11 +84,92 @@ describe("autoCompact", () => {
 
     const result = await autoCompact(messages, adapter, "claude-opus-4-7");
 
-    expect(result.length).toBe(2);
-    expect(result[0]?.role).toBe("user");
-    expect(typeof result[0]?.content).toBe("string");
+    expect(result.length).toBe(3);
+    expect(result[0]).toEqual({ role: "user", content: SUMMARY_MARKER });
     expect(result[0]?.content as string).toContain("Previous conversation summary");
     expect(result[1]).toEqual({ role: "assistant", content: "summary stub" });
+    expect(result[2]).toEqual({ role: "user", content: COMPACTION_CONTINUE });
+  });
+
+  test("keeps the pending user message verbatim — the same object — as the final turn", async () => {
+    const { adapter } = makeStubAdapter(() => streamWithText("summary stub"));
+    const pending: Anthropic.MessageParam = {
+      role: "user",
+      content: "what is the capital of France?",
+    };
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: "earlier question" },
+      { role: "assistant", content: "earlier answer" },
+      pending,
+    ];
+
+    const result = await autoCompact(messages, adapter, "m");
+
+    expect(result.length).toBe(3);
+    expect(result[1]).toEqual({ role: "assistant", content: "summary stub" });
+    // Identity, not just equality: an in-memory mark on the message (the
+    // runtime's synthetic WeakSet) must survive compaction.
+    expect(result[2]).toBe(pending);
+  });
+
+  test("never summarizes the kept pending message — the model would see it twice", async () => {
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("x"));
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "second" },
+      { role: "user", content: "the new question" },
+    ];
+    await autoCompact(messages, adapter, "m");
+    const sent = lastReq()?.messages ?? [];
+    expect(sent.map((m) => m.content)).not.toContain("the new question");
+    expect(sent.length).toBe(3); // first, second, the summarization request
+    expect(sent[2]?.content as string).toContain("Summarize");
+  });
+
+  test("the compacted history ends on a user turn for every history shape", async () => {
+    // The invariant this package exists to keep: current Claude models 400
+    // a trailing assistant turn as prefill.
+    const toolUse: Anthropic.MessageParam = {
+      role: "assistant",
+      content: [{ type: "tool_use", id: "t1", name: "Read", input: { path: "a" } }],
+    };
+    const toolResult: Anthropic.MessageParam = {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "t1", content: "file body" }],
+    };
+    const shapes: Anthropic.MessageParam[][] = [
+      [],
+      [{ role: "user", content: "only" }],
+      [
+        { role: "user", content: "u" },
+        { role: "assistant", content: "a" },
+      ],
+      [
+        { role: "user", content: "u" },
+        { role: "assistant", content: "a" },
+        { role: "user", content: "u2" },
+      ],
+      [{ role: "user", content: "read a" }, toolUse, toolResult],
+    ];
+    for (const shape of shapes) {
+      const { adapter } = makeStubAdapter(() => streamWithText("s"));
+      const result = await autoCompact(shape, adapter, "m");
+      expect(result.at(-1)?.role).toBe("user");
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    }
+  });
+
+  test("keepPendingMaxTokens is honoured: an oversized pending message is summarized instead", async () => {
+    const { adapter, lastReq } = makeStubAdapter(() => streamWithText("s"));
+    const big = "x".repeat(4_000); // ~1,000 estimated tokens
+    const messages: Anthropic.MessageParam[] = [
+      { role: "user", content: "u" },
+      { role: "assistant", content: "a" },
+      { role: "user", content: big },
+    ];
+    const result = await autoCompact(messages, adapter, "m", { keepPendingMaxTokens: 100 });
+    expect(result[2]).toEqual({ role: "user", content: COMPACTION_CONTINUE });
+    expect(lastReq()?.messages.map((m) => m.content)).toContain(big);
   });
 
   test("forwards the model id to the adapter", async () => {
@@ -146,8 +227,9 @@ describe("autoCompact", () => {
 
     const result = await autoCompact([{ role: "user", content: "history" }], adapter, "m");
 
-    expect(result.length).toBe(2);
+    expect(result.length).toBe(3);
     expect(result[0]?.role).toBe("user");
+    expect(result[2]?.role).toBe("user");
     const summaryOut = result[1]?.content as string;
     // The malicious summary was swapped for the redaction notice...
     expect(summaryOut).not.toBe(injection);
@@ -293,5 +375,68 @@ describe("compaction profile params (0.6.0 §4.2)", () => {
     expect(req?.thinking?.type).toBe("enabled");
     // The provider requires max_tokens > thinking.budget_tokens.
     expect(req?.maxTokens).toBeGreaterThan(req?.thinking?.budgetTokens ?? 0);
+  });
+});
+
+describe("planCompaction", () => {
+  const u = (content: string): Anthropic.MessageParam => ({ role: "user", content });
+  const a = (content: string): Anthropic.MessageParam => ({ role: "assistant", content });
+
+  test("keeps a trailing plain user message by identity and summarizes the rest", () => {
+    const pending = u("new question");
+    const history = [u("q"), a("r"), pending];
+    const plan = planCompaction(history);
+    expect(plan.kept).toBe(pending);
+    expect(plan.toSummarize).toEqual([u("q"), a("r")]);
+  });
+
+  test("keeps a block-content user message that carries no tool_result (text + image)", () => {
+    const pending: Anthropic.MessageParam = {
+      role: "user",
+      content: [
+        { type: "text", text: "what is in this?" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+      ],
+    };
+    expect(planCompaction([u("q"), a("r"), pending]).kept).toBe(pending);
+  });
+
+  test("never keeps a tool_result tail — its tool_use is summarized away, so keeping it would 400", () => {
+    const result: Anthropic.MessageParam = {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "t1", content: "out" }],
+    };
+    const history: Anthropic.MessageParam[] = [
+      u("q"),
+      { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: {} }] },
+      result,
+    ];
+    const plan = planCompaction(history);
+    expect(plan.kept).toBeUndefined();
+    expect(plan.toSummarize).toBe(history);
+  });
+
+  test("never keeps the only message — summarizing nothing frees nothing", () => {
+    const history = [u("a very long single message")];
+    expect(planCompaction(history).kept).toBeUndefined();
+  });
+
+  test("never keeps an assistant tail", () => {
+    expect(planCompaction([u("q"), a("r")]).kept).toBeUndefined();
+  });
+
+  test("keeps only what fits keepPendingMaxTokens", () => {
+    const pending = u("y".repeat(400)); // ~100 estimated tokens
+    const history = [u("q"), a("r"), pending];
+    expect(planCompaction(history, { keepPendingMaxTokens: 200 }).kept).toBe(pending);
+    expect(planCompaction(history, { keepPendingMaxTokens: 50 }).kept).toBeUndefined();
+  });
+
+  test("is pure — the same input and bound always give the same plan", () => {
+    const history = [u("q"), a("r"), u("s")];
+    const first = planCompaction(history, { keepPendingMaxTokens: 1_000 });
+    const second = planCompaction(history, { keepPendingMaxTokens: 1_000 });
+    expect(second.kept).toBe(first.kept);
+    expect(second.toSummarize).toEqual(first.toSummarize);
   });
 });
