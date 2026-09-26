@@ -790,6 +790,75 @@ describe("WatchPath: what it reports", () => {
     }, 15_000);
   });
 
+  describe("equal stamps from a nanosecond clock are trusted, as 0.7.0 trusted them (0.7.1 review)", () => {
+    /**
+     * Real facts, except that every non-directory reports the same fixed
+     * stamps: `stampMs` plus `subMsNs` nanoseconds. APFS stamps carry a
+     * sub-millisecond part; HFS+ (whole seconds) and a test's coarse tick
+     * do not.
+     */
+    function fixedStampProbe(stampMs: number, subMsNs: bigint): void {
+      const ns = `${BigInt(stampMs) * 1_000_000n + subMsNs}`;
+      _setPathProbe((p): PathFacts | undefined => {
+        const st = lstatSync(p, { bigint: true, throwIfNoEntry: false });
+        if (st === undefined) return undefined;
+        const dir = st.isDirectory();
+        return {
+          exists: true,
+          device: Number(st.dev),
+          isDirectory: dir,
+          isSymlink: st.isSymbolicLink(),
+          mode: Number(st.mode),
+          mtimeMs: dir ? Number(st.mtimeMs) : stampMs,
+          ctimeMs: dir ? Number(st.ctimeMs) : stampMs,
+          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${ns}:${ns}`,
+          sizeBytes: Number(st.size),
+          uid: Number(st.uid),
+        };
+      });
+    }
+
+    /** A 2 MiB file written just before the watch, and one notification about it. */
+    async function bigWriteThenWatch(): Promise<Record<string, unknown>> {
+      writeFileSync(join(workspace, "big.bin"), "z".repeat(2 * 1024 * 1024));
+      scriptedWatcher((emit) => {
+        emit("change", "big.bin");
+      });
+      return await callJson(watchPath, { path: ".", timeoutMs: 400, maxEvents: 1, settleMs: 20 });
+    }
+
+    test("on macOS, a file too large to hash written just before the watch gives no event", async () => {
+      // macOS delivers a write made just before the watch as its first
+      // event. 0.7.1 before this distrusted every recent stamp and could not
+      // hash 2 MiB, so it reported [big.bin, modified] at once.
+      _setPlatform("darwin");
+      fixedStampProbe(Date.now(), 123_457n);
+      const result = await bigWriteThenWatch();
+      expect(result["eventCount"]).toBe(0);
+      expect(result["stoppedBy"]).toBe("deadline");
+      expect((result["notes"] as string[]).join(" ")).toContain(
+        "1 notification(s) named a path whose modification time, inode-change time and size had not moved",
+      );
+    }, 15_000);
+
+    test("the same stamps on Linux prove nothing: the notification is counted", async () => {
+      // Linux's coarse clock gives stamps full nanosecond digits that stand
+      // still for a whole tick, so digits alone are not trusted there.
+      _setPlatform("linux");
+      fixedStampProbe(Date.now(), 123_457n);
+      const result = await bigWriteThenWatch();
+      expect(result["eventCount"]).toBe(1);
+      expect((result["notes"] as string[]).join(" ")).toContain("too large to compare");
+    }, 15_000);
+
+    test("on macOS, a stamp with no sub-millisecond part (HFS+) is not trusted", async () => {
+      _setPlatform("darwin");
+      fixedStampProbe(Math.floor(Date.now() / 1000) * 1000, 0n);
+      const result = await bigWriteThenWatch();
+      expect(result["eventCount"]).toBe(1);
+    }, 15_000);
+  });
+
   test("a chmod is a change, even though it leaves mtime alone", async () => {
     // Which is why ctime is compared too: a permission change moves ctime
     // and nothing else, and a watcher that only looked at mtime would call

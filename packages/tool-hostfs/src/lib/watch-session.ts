@@ -30,7 +30,7 @@ import { createHash } from "node:crypto";
 import { type Dirent, readdirSync, watch } from "node:fs";
 import * as path from "node:path";
 import { readFileBoundedSync } from "@crewhaus/tool-safety/streams";
-import { type PathFacts, monotonicNow, now, probePath } from "../host";
+import { type PathFacts, hostPlatform, monotonicNow, now, probePath } from "../host";
 import { type CoalesceResult, EventCoalescer, type EventKind, type StopReason } from "./coalesce";
 
 /**
@@ -94,6 +94,32 @@ export type EntryState = {
  * whole seconds and FAT two. Two seconds covers all of those.
  */
 export const STAMP_TRUST_WINDOW_MS = 2_000;
+
+/**
+ * Whether equal stamps prove a file unchanged however recent they are: on
+ * macOS, when both stamps have a sub-millisecond part, which is APFS. APFS
+ * takes every stamp from a nanosecond clock, so two writes microseconds
+ * apart get different stamps (measured on macOS 15.6: five rewrites in
+ * 0.2 ms, five distinct stamps). HFS+ keeps whole seconds, so its stamps
+ * have no sub-millisecond part and stay distrusted. Linux is never trusted:
+ * its coarse clock gives stamps full nanosecond digits that stand still for
+ * a whole tick. Windows and anything else are not trusted either.
+ *
+ * Distrusting APFS too cost a real answer (0.7.1 review): macOS delivers a
+ * write made just before the watch as the watch's first event, and a file
+ * over DIGEST_MAX_BYTES could not be hashed, so "build, then wait for the
+ * next rebuild" returned at once with a change that had not happened, where
+ * 0.7.0 correctly dropped it.
+ */
+export function stampsAreFine(facts: PathFacts): boolean {
+  if (hostPlatform() !== "darwin") return false;
+  const [mtime, ctime] = facts.changeStamp.split(":");
+  try {
+    return BigInt(mtime ?? "0") % 1_000_000n !== 0n && BigInt(ctime ?? "0") % 1_000_000n !== 0n;
+  } catch {
+    return false;
+  }
+}
 /** A recent file larger than this is not hashed; its equal-stamp notifications are counted. */
 export const DIGEST_MAX_BYTES = 1024 * 1024;
 /** Bytes hashed per snapshot, and again per session, before recent files go unverified. */
@@ -119,8 +145,10 @@ function digestOf(absolute: string): string | undefined {
 /**
  * What a path looks like now, as the state a later notification is compared
  * with. A regular file whose stamp is within STAMP_TRUST_WINDOW_MS of
- * `atMs` (the wall clock: stamps are wall-clock times) also carries its
- * content's digest, within the budget; past that it is marked unverifiable.
+ * `atMs` (the wall clock: stamps are wall-clock times), on a filesystem whose
+ * stamps are not fine enough to trust ({@link stampsAreFine}), also carries
+ * its content's digest, within the budget; past that it is marked
+ * unverifiable.
  */
 export function entryStateOf(
   absolute: string,
@@ -132,6 +160,7 @@ export function entryStateOf(
   if (facts.isDirectory || facts.isSymlink) return base;
   const stampMs = Math.max(facts.mtimeMs, facts.ctimeMs ?? facts.mtimeMs);
   if (stampMs < atMs - STAMP_TRUST_WINDOW_MS) return base;
+  if (stampsAreFine(facts)) return base;
   if (facts.sizeBytes > DIGEST_MAX_BYTES || facts.sizeBytes > budget.remaining) {
     return { ...base, unverifiable: true };
   }
@@ -494,7 +523,9 @@ export async function runWatchSession(options: WatchSessionOptions): Promise<Wat
       // reported a real save as "unchanged" (C124). So for a file written
       // within STAMP_TRUST_WINDOW_MS of the last look, the content decides:
       // the digest taken then is compared with the content now. A recent
-      // file too large to hash is counted, and named in a note.
+      // file too large to hash is counted, and named in a note. APFS stamps
+      // from a nanosecond clock, so there equal stamps are trusted as 0.7.0
+      // trusted them (see stampsAreFine).
       //
       // A notification with NO filename is exempt: it says only "something
       // happened here", so there is nothing to compare and dropping it would
