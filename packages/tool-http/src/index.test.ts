@@ -16,7 +16,7 @@
  * Filesystem tests run inside a throwaway temp directory; nothing is ever
  * written inside the repository.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -1585,30 +1585,141 @@ describe("DnsLookup / TlsInspect", () => {
     });
     _setDnsRecordResolver(undefined);
     // The budget is spent by the first type, so the other five are never
-    // issued. Giving each type its own copy of the timeout — which is what a
-    // per-call `withTimeout` does — would instead have run all six, and the
-    // "whole lookup" deadline in the description would be six times what it
-    // says. The distinction is visible in WHICH error each type reports.
+    // issued. Giving each type its own copy of the timeout would instead have
+    // run all six, and the "whole lookup" deadline in the description would
+    // be six times what it says. The distinction is visible in WHICH error
+    // each type reports.
     expect(result.records).toEqual({});
     expect(Object.keys(result.errors).sort()).toEqual(["A", "AAAA", "CNAME", "MX", "NS", "TXT"]);
 
     // The distinction that matters is AT MOST ONE type ever got as far as a
     // lookup. Six private budgets would have started all six and reported
-    // "exceeded 1ms" six times; one shared budget can only be spent once.
-    //
-    // Which type that is — or whether even the first one wins the race to
-    // start — is scheduling, not behaviour. This used to assert that `A`
-    // specifically reported the mid-lookup timeout, and on a loaded CI runner
-    // the 1ms was gone before `A` was issued, so every type reported "never
-    // asked" and a correct result failed.
+    // the timeout six times; one shared budget can only be spent once. (The
+    // frozen-clock test below pins which type that is, and that it is the
+    // only one issued.)
     const NEVER_ASKED = "the 1ms lookup budget elapsed before this record type was asked for";
     const all = ["A", "AAAA", "CNAME", "MX", "NS", "TXT"] as const;
-    const started = all.filter((t) => String(result.errors[t]).includes("exceeded 1ms"));
+    const started = all.filter((t) =>
+      String(result.errors[t]).includes("exceeded the 1ms lookup budget"),
+    );
     const neverAsked = all.filter((t) => result.errors[t] === NEVER_ASKED);
     expect(started.length).toBeLessThanOrEqual(1);
     // ...and every type is accounted for by exactly one of the two answers, so
     // a third, vaguer error cannot slip through unnoticed.
     expect(started.length + neverAsked.length).toBe(all.length);
+  });
+
+  test("DnsLookup's budget is its timer, not the wall clock: a spent budget starts nothing more", async () => {
+    // The budget used to be checked against `Date.now()` while a separate
+    // `setTimeout` enforced it. The two clocks disagree: a 1ms timer can fire
+    // before the wall clock has moved a whole millisecond, and then the next
+    // record type saw budget "left", was issued, and timed out too. On a
+    // loaded CI runner that put TWO types in flight and failed the test above.
+    //
+    // Freezing the wall clock makes that disagreement total instead of rare:
+    // the timer still fires, but `Date.now()` never moves. Counting the
+    // lookups the resolver actually receives measures what the budget is for,
+    // rather than inferring it from error text.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      return await new Promise((resolve) => setTimeout(() => resolve([]), 50));
+    });
+    const nowSpy = spyOn(Date, "now").mockReturnValue(1_000_000);
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["A", "AAAA", "CNAME", "MX", "NS", "TXT"],
+      timeoutMs: 1,
+    }).finally(() => {
+      nowSpy.mockRestore();
+      _setDnsRecordResolver(undefined);
+    });
+    // Exactly one lookup is issued: the budget is unspent when the first type
+    // is asked for, and spent for good once its timer fires.
+    expect(issued).toEqual(["A"]);
+    expect(result.records).toEqual({});
+    expect(result.errors.A).toBe("A lookup exceeded the 1ms lookup budget");
+    for (const t of ["AAAA", "CNAME", "MX", "NS", "TXT"]) {
+      expect(result.errors[t]).toBe(
+        "the 1ms lookup budget elapsed before this record type was asked for",
+      );
+    }
+  });
+
+  test("DnsLookup keeps answers that arrive inside the budget, and one type's error does not stop the rest", async () => {
+    // Every other budget test spends the budget on the first type, so none of
+    // them would notice a deadline that fires at once, a race that drops the
+    // answer it won, or a loop that gives up after the first error.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (type === "A") return ["192.0.2.1"];
+      throw Object.assign(new Error(`no ${type} records`), { code: "ENODATA" });
+    });
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["MX", "A", "AAAA"],
+      timeoutMs: 2000,
+    }).finally(() => _setDnsRecordResolver(undefined));
+    expect(issued).toEqual(["A", "AAAA", "MX"]);
+    expect(result.records).toEqual({ A: ["192.0.2.1"] });
+    expect(result.errors).toEqual({ AAAA: "ENODATA", MX: "ENODATA" });
+  });
+
+  test("DnsLookup gives a type issued late only what is left of the budget", async () => {
+    // A answers at 100ms of a 150ms budget, and AAAA never answers. One shared
+    // budget ends the lookup at 150ms; a fresh budget per type would let AAAA
+    // run until 250ms. The sentinel at 200ms tells the two apart without
+    // reading a clock: timers in one heap fire in the order they fall due, so
+    // this holds however late a loaded runner services them.
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      if (type !== "A") return await new Promise(() => {});
+      return await new Promise((resolve) => setTimeout(() => resolve(["192.0.2.1"]), 100));
+    });
+    let settled = false;
+    const pending = run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["A", "AAAA", "MX"],
+      timeoutMs: 150,
+    })
+      .then((r) => {
+        settled = true;
+        return r;
+      })
+      .finally(() => _setDnsRecordResolver(undefined));
+    const settledBySentinel = await new Promise<boolean>((resolve) =>
+      setTimeout(() => resolve(settled), 200),
+    );
+    const result = await pending;
+    expect(settledBySentinel).toBe(true);
+    expect(issued).toEqual(["A", "AAAA"]);
+    expect(result.records).toEqual({ A: ["192.0.2.1"] });
+    expect(result.errors).toEqual({
+      AAAA: "AAAA lookup exceeded the 150ms lookup budget",
+      MX: "the 150ms lookup budget elapsed before this record type was asked for",
+    });
+  });
+
+  test("DnsLookup asks for a repeated record type once", async () => {
+    registerHttpConfig({ allowed_origins: ["https://dns-budget.invalid"] });
+    const issued: string[] = [];
+    _setDnsRecordResolver(async (type) => {
+      issued.push(type);
+      return [`${type}-answer`];
+    });
+    const result = await run(dnsLookup, {
+      name: "dns-budget.invalid",
+      types: ["MX", "A", "MX", "A"],
+    }).finally(() => _setDnsRecordResolver(undefined));
+    expect(issued).toEqual(["A", "MX"]);
+    expect(result.records).toEqual({ A: ["A-answer"], MX: ["MX-answer"] });
+    expect(result.errors).toBeUndefined();
   });
 
   test("TlsInspect refuses a host no allow-listed origin names", async () => {

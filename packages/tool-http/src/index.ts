@@ -251,18 +251,27 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-/** Reject a promise that outlives `ms`; used for APIs with no abort signal. */
-async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * Reject with `message` once `signal` aborts, for APIs with no abort signal of
+ * their own. Everything raced against one signal shares one deadline.
+ */
+async function raceSignal<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+  message: string,
+): Promise<T> {
+  let onAbort: (() => void) | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms`)), ms);
+        onAbort = () => reject(new Error(message));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
       }),
     ]);
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -1610,24 +1619,39 @@ export const dnsLookup: RegisteredTool = buildTool({
     // ONE budget for the whole lookup, as the description promises. Handing
     // the same timeout to each record type in turn means six types can take
     // six times the stated deadline, which is not a deadline.
+    //
+    // And ONE clock: the deadline's timer, and nothing else, spends it. This
+    // used to measure what was left with `Date.now()` while a separate timer
+    // enforced each type's share, and the two clocks disagree — a 1ms timer
+    // can fire before the wall clock has moved a whole millisecond — so a type
+    // could time out and the next still see budget left and be issued.
     const budget = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const startedAt = Date.now();
+    const deadline = startDeadline(budget);
     const records: Record<string, unknown> = {};
     const errors: Record<string, string> = {};
 
-    for (const type of [...wanted].sort(byString)) {
-      const left = budget - (Date.now() - startedAt);
-      if (left <= 0) {
-        errors[type] =
-          `the ${budget}ms lookup budget elapsed before this record type was asked for`;
-        continue;
+    try {
+      // Each type once: a repeat would be looked up again and overwrite its
+      // own answer, and could land in `records` and `errors` both.
+      for (const type of [...new Set(wanted)].sort(byString)) {
+        if (deadline.signal.aborted) {
+          errors[type] =
+            `the ${budget}ms lookup budget elapsed before this record type was asked for`;
+          continue;
+        }
+        try {
+          records[type] = await raceSignal(
+            resolveOne(type, host),
+            deadline.signal,
+            `${type} lookup exceeded the ${budget}ms lookup budget`,
+          );
+        } catch (err) {
+          const code = (err as { code?: string }).code;
+          errors[type] = code ?? (err instanceof Error ? err.message : String(err));
+        }
       }
-      try {
-        records[type] = await withTimeout(resolveOne(type, host), left, `${type} lookup`);
-      } catch (err) {
-        const code = (err as { code?: string }).code;
-        errors[type] = code ?? (err instanceof Error ? err.message : String(err));
-      }
+    } finally {
+      deadline.cancel();
     }
     return json({
       name: host,
