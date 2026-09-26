@@ -53,13 +53,38 @@ describe("Retrieve tool", () => {
 
   // 0.7.1 (C042): the query goes to the embedding provider (and to an HTTP
   // vector store), so the egress classifier and the strict audit see it.
-  test("flags: the pipeline Retrieve is external with ioCapability network, whatever is registered later", () => {
+  test("flags: the pipeline Retrieve is external with ioCapability network before a config says otherwise", () => {
     expect([retrieve.scope, retrieve.ioCapability, retrieve.readOnly]).toEqual([
       "external",
       "network",
       true,
     ]);
     expect(auditToolScopes([retrieve])).toEqual([]);
+  });
+
+  // Review finding: the singleton was built before its config was known, so
+  // the RAG starter's mock embedder over an in-memory store (nothing leaves
+  // the process) was flagged network. Both hosts register the config first
+  // and then read `retrieve` through the live binding.
+  test("flags: once a config is registered, the pipeline Retrieve says where those backends are", async () => {
+    const { embedder, vectorStore } = await seedStore();
+    registerRetrieveConfig({ embedder, vectorStore });
+    expect([retrieve.scope, retrieve.ioCapability]).toEqual(["internal", undefined]);
+    expect(auditToolScopes([retrieve])).toEqual([]);
+    const local = retrieve;
+    expect(String(await local.execute({ query: "fox", k: 1 }))).toContain("[1]");
+
+    registerRetrieveConfig({
+      embedder: createEmbedder({ model: "openai/text-embedding-3-small", apiKey: "unused" }),
+      vectorStore,
+    });
+    expect([retrieve.scope, retrieve.ioCapability]).toEqual(["external", "network"]);
+    // A tool already flagged local keeps the config it was flagged for, so a
+    // later registration cannot make it reach the network.
+    expect(String(await local.execute({ query: "fox", k: 1 }))).toContain("[1]");
+
+    _resetRetrieveConfig();
+    expect([retrieve.scope, retrieve.ioCapability]).toEqual(["external", "network"]);
   });
 
   test("rejects calls before registerRetrieveConfig", async () => {

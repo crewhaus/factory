@@ -94,13 +94,23 @@ export function registerRetrieveConfig(input: RetrieveConfigInput): void {
       "registerRetrieveConfig requires either an `embedder` instance or `embedderModel` string",
     );
   }
-  activeConfig = {
+  const bound: RetrieveConfig = {
     embedder,
     vectorStore,
     ...((input.defaultK ?? input.default_k !== undefined)
       ? { defaultK: input.defaultK ?? input.default_k }
       : {}),
   };
+  activeConfig = bound;
+  // The singleton is rebuilt for this config, so its flags say where THESE
+  // backends are: a mock embedder over an in-memory or lance store stays in
+  // the process (the RAG starter), anything else reaches the network. Both
+  // hosts register the config before they register `retrieve`, and read it
+  // through the live ESM binding. The rebuilt tool keeps this config, so a
+  // later registration cannot make a tool flagged local reach the network.
+  retrieve = makeRetrieveTool(() => bound, {
+    local: retrieveStaysLocal(embedder, vectorStore),
+  });
 }
 
 export function getRetrieveConfig(): RetrieveConfig | undefined {
@@ -110,6 +120,7 @@ export function getRetrieveConfig(): RetrieveConfig | undefined {
 /** Test-only — clear cached config. */
 export function _resetRetrieveConfig(): void {
   activeConfig = undefined;
+  retrieve = unconfiguredRetrieve;
 }
 
 const retrieveSchema = z.object({
@@ -165,10 +176,9 @@ export function retrieveStaysLocal(
  * `scope: "external"` with `ioCapability: "network"`: the query goes through
  * the egress classifier and `compile --strict` counts it. It stays
  * `readOnly`, and the destination is the operator's configuration, never one
- * the model picks. The singleton's config is registered after its flags are
- * fixed, so it is always external; a knowledge tool whose backends are known
- * to stay in the process (`local: true`, see {@link retrieveStaysLocal}) is
- * internal.
+ * the model picks. A tool whose backends are known to stay in the process
+ * (`local: true`, see {@link retrieveStaysLocal}) is internal: a knowledge
+ * tool, and the pipeline singleton once its config is registered.
  */
 function makeRetrieveTool(
   getConfig: () => RetrieveConfig | undefined,
@@ -206,7 +216,19 @@ function makeRetrieveTool(
   });
 }
 
-export const retrieve: RegisteredTool = makeRetrieveTool(() => activeConfig);
+/**
+ * The pipeline `Retrieve` before any config is registered. Its backends are
+ * not known yet, so it says it reaches the network; it reads whatever config
+ * is registered when it runs.
+ */
+const unconfiguredRetrieve: RegisteredTool = makeRetrieveTool(() => activeConfig);
+
+/**
+ * The pipeline shape's `Retrieve`: a live binding that
+ * {@link registerRetrieveConfig} replaces with a tool bound to the config it
+ * registers, flagged from those backends (see {@link retrieveStaysLocal}).
+ */
+export let retrieve: RegisteredTool = unconfiguredRetrieve;
 
 // ===========================================================================
 // Agent-shape RAG — `knowledge:` on cli/channel/managed (Batch E item 3, G22)
