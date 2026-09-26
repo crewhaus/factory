@@ -9,7 +9,15 @@
  * a 1 MiB head, and then answered `hasGps: false` about the stripped copy.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  ftruncateSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { exifApp1Payload, jpegSegment, sampleJpeg } from "./fixtures";
@@ -18,6 +26,7 @@ import { concatBytes, toHex } from "./lib/bytes";
 import { inspectJpegMetadata, stripJpegMetadata, walkJpeg } from "./lib/jpeg";
 
 const EXIF_ID = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]; // "Exif\0\0"
+const EXIF_ID_BYTES = new Uint8Array(EXIF_ID);
 
 function count(haystack: Uint8Array, needle: ReadonlyArray<number>): number {
   let n = 0;
@@ -183,6 +192,156 @@ describe("ExifRead and ExifStrip over the whole file", () => {
     expect(out.hasGps).toBeNull();
     expect(out.gpsUndetermined).toMatch(/could not be parsed/);
   });
+
+  test("GPS in bytes no walk accounts for is found; without it, hasGps is undetermined", async () => {
+    // 0.7.1's first cut answered a definite hasGps: false for each of these,
+    // though every file carries the GPS block byte for byte.
+    const gps = exifApp1Payload(AWAY);
+    const primary = sampleJpeg({ width: 8, height: 8 });
+    const box = (type: string, body: Uint8Array): Uint8Array => {
+      const out = new Uint8Array(8 + body.length);
+      new DataView(out.buffer).setUint32(0, out.length);
+      out.set(new TextEncoder().encode(type), 4);
+      out.set(body, 8);
+      return out;
+    };
+    const cases: Array<[string, Uint8Array]> = [
+      [
+        "an appended JPEG cut off after its APP1",
+        concatBytes([
+          new Uint8Array([0xff, 0xd8]),
+          jpegSegment(0xe1, gps),
+          new Uint8Array([0xff, 0xc0, 0x00, 0x40, 0x08]),
+        ]),
+      ],
+      [
+        "an appended JPEG with a second SOI",
+        concatBytes([
+          new Uint8Array([0xff, 0xd8]),
+          jpegSegment(0xe1, gps),
+          new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+        ]),
+      ],
+      ["a raw EXIF block after EOI", gps],
+      [
+        "a motion-photo video",
+        concatBytes([box("ftyp", new TextEncoder().encode("mp42")), box("uuid", gps)]),
+      ],
+    ];
+    for (const [label, trailer] of cases) {
+      writeFileSync(path.join(tmp, "t.jpg"), concatBytes([primary, trailer]));
+      const out = await run(exifRead, { path: "t.jpg" });
+      expect({ label, hasGps: out.hasGps }).toEqual({ label, hasGps: true });
+      expect(
+        out.exifBlocks.some((b: { where: string }) => b.where === "in bytes no walk accounts for"),
+      ).toBe(true);
+    }
+    // No EXIF block in them: not a definite no, because they were not read.
+    const video = concatBytes([
+      box("ftyp", new TextEncoder().encode("mp42")),
+      box("moov", new Uint8Array(64)),
+    ]);
+    writeFileSync(path.join(tmp, "v.jpg"), concatBytes([primary, video]));
+    const unknown = await run(exifRead, { path: "v.jpg" });
+    expect(unknown.hasGps).toBeNull();
+    expect(unknown.unaccountedBytes).toBe(video.length);
+    expect(unknown.gpsUndetermined).toMatch(
+      /bytes after the image that no walk accounts for \(an appended video \(a motion photo\)\) were searched for EXIF blocks but not parsed/,
+    );
+    // Padding after EOI is not data: still a definite no.
+    writeFileSync(path.join(tmp, "p.jpg"), concatBytes([primary, new Uint8Array(32)]));
+    const padded = await run(exifRead, { path: "p.jpg" });
+    expect({ hasGps: padded.hasGps, trailingBytes: padded.trailingBytes }).toEqual({
+      hasGps: false,
+      trailingBytes: 32,
+    });
+  });
+
+  test("a JPEG that breaks off after its first scan is read and stripped as 0.7.0 did", async () => {
+    // Cut inside a DHT between scans: 0.7.1's first cut refused both tools
+    // ("runs 19 bytes past the end of the file"); 0.7.0 answered.
+    const { file } = withInterScanGps();
+    const walked = walkJpeg(file);
+    const dht = walked.segments.find((s) => s.name === "DHT" && s.offset > 100) as {
+      offset: number;
+    };
+    const cut = file.subarray(0, dht.offset + 6);
+    writeFileSync(path.join(tmp, "cut.jpg"), cut);
+    const read = await run(exifRead, { path: "cut.jpg" });
+    expect(read.make).toBeUndefined();
+    expect(read.hasExif).toBe(true);
+    // The primary block's GPS is found; the break is reported.
+    expect(read.hasGps).toBe(true);
+    expect(read.breaksOffAt).toBe(dht.offset);
+    const stripped = await run(exifStrip, { path: "cut.jpg", output: "clean.jpg" });
+    expect(stripped.breaksOffAt).toBe(dht.offset);
+    const clean = new Uint8Array(readFileSync(path.join(tmp, "clean.jpg")));
+    expect(count(clean, EXIF_ID)).toBe(0);
+    // Everything from the first scan to the break, and the cut DHT, kept verbatim.
+    const firstSos = walked.segments.find((s) => s.name === "SOS")?.offset as number;
+    expect(toHex(clean.subarray(clean.length - (cut.length - firstSos)))).toBe(
+      toHex(cut.subarray(firstSos)),
+    );
+    // Without GPS before the break, no GPS is not a definite no.
+    const plain = sampleJpeg({ width: 8, height: 8, scanBytes: 4 });
+    const plainCut = concatBytes([
+      plain.subarray(0, plain.length - 2),
+      new Uint8Array([0xff, 0xc4, 0x00, 0x40, 0x00]),
+    ]);
+    writeFileSync(path.join(tmp, "plain.jpg"), plainCut);
+    const plainRead = await run(exifRead, { path: "plain.jpg" });
+    expect(plainRead.hasGps).toBeNull();
+    expect(plainRead.gpsUndetermined).toMatch(/the file breaks off at offset \d+ \(segment DHT/);
+  });
+
+  test("a metadata segment cut off after the first scan is dropped; unframed bytes holding one are refused", async () => {
+    const plain = sampleJpeg({ width: 8, height: 8, scanBytes: 4 });
+    const body = plain.subarray(0, plain.length - 2);
+    // A cut-off APP1: dropped, the rest kept.
+    const cutApp1 = concatBytes([body, new Uint8Array([0xff, 0xe1, 0x10, 0x00]), EXIF_ID_BYTES]);
+    const stripped = stripJpegMetadata(cutApp1);
+    expect(stripped.removed.map((r) => r.name)).toContain("APP1 (cut off)");
+    expect(count(stripped.bytes, EXIF_ID)).toBe(0);
+    // Bytes where a marker should be, with an EXIF block further on: refused.
+    const garbled = concatBytes([
+      body,
+      new Uint8Array([0xff, 0xc4, 0x00, 0x04, 0x00, 0x00, 0x42]),
+      EXIF_ID_BYTES,
+    ]);
+    expect(walkJpeg(garbled).stopped?.reason).toMatch(/expected a marker/);
+    expect(() => stripJpegMetadata(garbled)).toThrow(
+      /holds what may be metadata at offset \d+; nothing was written/,
+    );
+    // A broken header is still refused outright, as in 0.7.0.
+    expect(() => walkJpeg(plain.subarray(0, 12))).toThrow();
+  });
+
+  test("a JPEG past the read limit is read as far as the limit, not refused", async () => {
+    // 0.7.0 read a 1 MiB head; 0.7.1's first cut refused anything over 64 MiB.
+    const head = sampleJpeg({ width: 8, height: 8, exif: { ...HOME }, scanBytes: 4 });
+    const body = head.subarray(0, head.length - 2);
+    const file = path.join(tmp, "big.jpg");
+    writeFileSync(file, body);
+    const fd = openSync(file, "r+");
+    ftruncateSync(fd, 64 * 1024 * 1024 + 4096);
+    closeSync(fd);
+    const out = await run(exifRead, { path: "big.jpg" });
+    expect(out.hasExif).toBe(true);
+    expect(out.hasGps).toBe(true);
+    expect(out.fileBytes).toBe(64 * 1024 * 1024 + 4096);
+    expect(out.bytesRead).toBe(64 * 1024 * 1024);
+    // Without GPS in what was read, the answer is undetermined, with the reason.
+    const plain = sampleJpeg({ width: 8, height: 8, scanBytes: 4 });
+    writeFileSync(file, plain.subarray(0, plain.length - 2));
+    const fd2 = openSync(file, "r+");
+    ftruncateSync(fd2, 64 * 1024 * 1024 + 4096);
+    closeSync(fd2);
+    const unknown = await run(exifRead, { path: "big.jpg" });
+    expect(unknown.hasGps).toBeNull();
+    expect(unknown.gpsUndetermined).toMatch(
+      /only the first 67108864 of the file's 67112960 bytes were read/,
+    );
+  }, 20_000);
 
   test.skipIf(process.platform === "win32")("a FIFO is refused, not opened", async () => {
     expect(Bun.spawnSync(["mkfifo", path.join(tmp, "pipe.jpg")]).exitCode).toBe(0);

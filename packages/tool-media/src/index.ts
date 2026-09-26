@@ -408,7 +408,7 @@ export const pngRead: RegisteredTool = buildTool({
 export const exifRead: RegisteredTool = buildTool({
   name: "ExifRead",
   description:
-    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read, so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too.",
+    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read (a file past 64 MiB up to that point), so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too; when it cannot tell, hasGps is null with the reason.",
   inputSchema: z.object({ path: pathField.describe("a JPEG inside the workspace") }),
   readOnly: true,
   concurrencySafe: true,
@@ -416,8 +416,10 @@ export const exifRead: RegisteredTool = buildTool({
     attempt(() => {
       // The whole file, not a head window: GPS can sit between scans or in
       // an appended image, and "no GPS" must not be said about bytes that
-      // were never read.
-      const { path, bytes } = readWhole("ExifRead", input.path);
+      // were never read. A file past the read limit is read as far as the
+      // limit and answered from that, with GPS undetermined unless found.
+      const { path, bytes, size } = readHead("ExifRead", input.path, MAX_FILE_BYTES);
+      const partial = bytes.length < size;
       const kind = detectKind(bytes);
       if (kind?.kind !== "jpeg") {
         throw new ToolInputError(
@@ -425,22 +427,50 @@ export const exifRead: RegisteredTool = buildTool({
         );
       }
       const report = inspectJpegMetadata(bytes);
-      const primary = report.exifBlocks.find((b) => b.where !== "in an appended image");
+      // The main image's own EXIF: never a block found after it.
+      const primary = report.exifBlocks.find(
+        (b) => b.where === "before the first scan" || b.where === "between scans",
+      );
       const withGps = report.exifBlocks.filter((b) => b.exif?.hasGps === true);
       const unreadableBlocks = report.exifBlocks.filter((b) => b.exif === null);
       // GPS found anywhere is a definite yes. No GPS is a definite no only
-      // when every EXIF block was parsed and every appended image walked.
-      const undetermined =
-        withGps.length === 0 &&
-        (report.embeddedImagesNotInspected > 0 || unreadableBlocks.length > 0);
+      // when every byte was read, every EXIF block parsed, and every byte
+      // after the image accounted for by an appended image that was walked.
+      const unknowns: string[] = [];
+      if (partial) {
+        unknowns.push(
+          `only the first ${bytes.length} of the file's ${size} bytes were read, the most this tool reads`,
+        );
+      }
+      if (report.breaksOffAt !== undefined) {
+        // A walk that broke off has no trailer: its unaccounted bytes are
+        // the part after the break.
+        unknowns.push(
+          `the file breaks off at offset ${report.breaksOffAt.offset} (${report.breaksOffAt.reason}), and the ${bytes.length - report.breaksOffAt.offset} bytes from there could not be walked`,
+        );
+      } else if (report.unaccountedBytes > 0) {
+        unknowns.push(
+          `${report.unaccountedBytes} bytes after the image that no walk accounts for (${report.trailingKind ?? "unrecognised data"}) were searched for EXIF blocks but not parsed, and may carry a location`,
+        );
+      }
+      if (report.embeddedImagesNotInspected > 0) {
+        unknowns.push(`${report.embeddedImagesNotInspected} more appended images were not walked`);
+      }
+      if (unreadableBlocks.length > 0)
+        unknowns.push("an EXIF block in the file could not be parsed");
+      const undetermined = withGps.length === 0 && unknowns.length > 0;
       const hasGps = withGps.length > 0 ? true : undetermined ? null : false;
       const where = {
+        ...(partial ? { bytesRead: bytes.length, fileBytes: size } : {}),
         trailingBytes: report.trailingBytes,
         ...(report.trailingKind === undefined ? {} : { trailingKind: report.trailingKind }),
         embeddedImages: report.embeddedImages,
         interScanMetadataSegments: report.interScanMetadataSegments,
-        ...(report.eoiMissing ? { eoiMissing: true } : {}),
-        ...(report.exifBlocks.length > 1
+        ...(report.eoiMissing && !partial ? { eoiMissing: true } : {}),
+        ...(report.breaksOffAt === undefined ? {} : { breaksOffAt: report.breaksOffAt.offset }),
+        ...(report.unaccountedBytes > 0 ? { unaccountedBytes: report.unaccountedBytes } : {}),
+        ...(report.exifBlocks.length > 1 ||
+        (report.exifBlocks.length === 1 && primary === undefined)
           ? {
               exifBlocks: report.exifBlocks.map((b) => ({
                 where: b.where,
@@ -451,14 +481,7 @@ export const exifRead: RegisteredTool = buildTool({
               })),
             }
           : {}),
-        ...(undetermined
-          ? {
-              gpsUndetermined:
-                report.embeddedImagesNotInspected > 0
-                  ? `${report.embeddedImagesNotInspected} more appended images were not walked`
-                  : "an EXIF block in the file could not be parsed",
-            }
-          : {}),
+        ...(undetermined ? { gpsUndetermined: unknowns.join("; ") } : {}),
         ...(report.trailingKind?.startsWith("an appended video") === true
           ? {
               videoNote:
@@ -747,12 +770,15 @@ export const exifStrip: RegisteredTool = buildTool({
         trailingBytesRemoved: result.trailingBytesRemoved,
         ...(result.trailingKind === undefined ? {} : { trailingKind: result.trailingKind }),
         ...(result.eoiMissing ? { eoiMissing: true } : {}),
+        ...(result.breaksOffAt === undefined ? {} : { breaksOffAt: result.breaksOffAt.offset }),
         note:
-          result.trailingBytesRemoved > 0
-            ? `the main image's scan data was copied verbatim, so that picture is unchanged; the ${result.trailingBytesRemoved} bytes after its end-of-image marker were dropped with any metadata in them: ${result.trailingKind}`
-            : result.eoiMissing
-              ? "the scan data was copied verbatim; the file has no end-of-image marker, so it was walked to its end and kept as it was"
-              : "the entropy-coded scan data was copied verbatim; the picture is unchanged",
+          result.breaksOffAt !== undefined
+            ? `the file breaks off at offset ${result.breaksOffAt.offset} (${result.breaksOffAt.reason}); the scan data up to there was copied verbatim, and the cut-off part after it was ${result.removed.some((r) => r.name.endsWith("(cut off)")) ? "a metadata segment, and was dropped" : "kept as it was"}`
+            : result.trailingBytesRemoved > 0
+              ? `the main image's scan data was copied verbatim, so that picture is unchanged; the ${result.trailingBytesRemoved} bytes after its end-of-image marker were dropped with any metadata in them: ${result.trailingKind}`
+              : result.eoiMissing
+                ? "the scan data was copied verbatim; the file has no end-of-image marker, so it was walked to its end and kept as it was"
+                : "the entropy-coded scan data was copied verbatim; the picture is unchanged",
       });
     }),
 });

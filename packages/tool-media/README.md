@@ -108,7 +108,11 @@ bit-for-bit what it was. It walks the whole file: metadata segments between
 the scans of a progressive JPEG are dropped too, and so is everything after
 the end-of-image marker (an appended preview, second view, HDR gain map or
 motion-photo video, each of which can carry its own EXIF and location). The
-result says how many trailing bytes went and what they looked like. It keeps
+result says how many trailing bytes went and what they looked like. A file
+that breaks off after its first scan (a partial download) is stripped up to
+the break and the rest kept as it was, as 0.7.0 did; a cut-off metadata
+segment there is dropped, and unframed bytes that look like metadata are
+refused rather than written into a file that claims to be clean. It keeps
 the ICC colour profile by default, because a profile is not metadata about
 the photographer: it is what tells a display how to interpret the colours,
 and dropping it visibly shifts the image.
@@ -159,10 +163,14 @@ A photograph taken on a phone usually records where it was taken.
 than burying the coordinates in a field list, because publishing the file
 publishes the location. `ExifStrip` is the tool that removes it.
 
-`ExifRead` reads the whole file (up to 64 MiB), not just its first
-megabyte, and counts GPS found anywhere: before the first scan, between
-scans, or in a JPEG appended after the main one. It reports `trailingBytes`,
-`interScanMetadataSegments` and every EXIF block when there is more than
-one. When it cannot tell (an EXIF block that does not parse, or more
-appended images than it walks) and found no GPS elsewhere, `hasGps` is
-`null` with the reason in `gpsUndetermined`, never `false`.
+`ExifRead` reads the whole file, not just its first megabyte, and counts
+GPS found anywhere: before the first scan, between scans, in a JPEG appended
+after the main one, or in an EXIF block sitting in bytes no walk accounts
+for (a video, data it does not recognise, an image that would not walk). It
+reports `trailingBytes`, `interScanMetadataSegments` and every EXIF block
+found outside the main image's own. When it cannot tell and found no GPS
+elsewhere, `hasGps` is `null` with the reason in `gpsUndetermined`, never
+`false`: an EXIF block that does not parse, more appended images than it
+walks, bytes after the image that no walk accounts for (padding aside), a
+file that breaks off after its first scan, or a file past 64 MiB, which is
+read that far and answered from what was read.
