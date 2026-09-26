@@ -47,6 +47,28 @@ describe("registerChainreadConfig — tool_config.chainread at boot", () => {
     );
   });
 
+  test("an entry that does not parse is named by position, never repeated (C157)", () => {
+    // A keyed provider URL written without its scheme: the key is its path.
+    let message = "";
+    try {
+      registerChainreadConfig({
+        allowed_origins: [
+          "https://mainnet.base.org",
+          "eth-mainnet.g.alchemy.com/v2/SECRET-PROVIDER-KEY",
+        ],
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toBe(
+      "tool_config.chainread.allowed_origins[1] is not an origin — it must start with https:// (or http://). Write it as https://host[:port]; the value is not repeated here, because a provider keeps its key in the path.",
+    );
+    expect(message).not.toContain("SECRET");
+    expect(() =>
+      registerChainreadConfig({ allowed_origins: ["https://exa mple.com/v2/SECRET"] }),
+    ).toThrow(/allowed_origins\[0\] is not an origin — check the host and the port\./);
+  });
+
   test("through the tools, an origin the block does not list is never dialled (C029)", async () => {
     // 0.7.0 had the seam and no caller: every public origin a model named was
     // dialled by these read-only tools, which plan and auto mode run unasked.

@@ -93,13 +93,20 @@ export function registerChainreadConfig(input: ChainreadConfigInput): void {
       'tool_config.chainread.allowed_origins must be a list of origins, for example ["https://mainnet.base.org"].',
     );
   }
-  const origins = (raw as string[]).map((o) => {
+  const origins = (raw as string[]).map((o, i) => {
     let url: URL;
     try {
       url = new URL(o);
     } catch {
+      // Named by position, never by value: an entry that fails to parse is
+      // most often a keyed provider URL written without its scheme, and the
+      // key is in its path — the rule vetEndpoint keeps for rpcUrl.
       throw new RpcEndpointError(
-        `tool_config.chainread.allowed_origins has "${o}", which is not an origin. Write it as https://host[:port].`,
+        `tool_config.chainread.allowed_origins[${i}] is not an origin — ${
+          /^[a-z][a-z0-9+.-]*:\/\//i.test(o)
+            ? "check the host and the port"
+            : "it must start with https:// (or http://)"
+        }. Write it as https://host[:port]; the value is not repeated here, because a provider keeps its key in the path.`,
       );
     }
     if (url.protocol !== "https:" && url.protocol !== "http:") {
