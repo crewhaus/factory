@@ -16,7 +16,7 @@
  * Filesystem tests run inside a throwaway temp directory; nothing is ever
  * written inside the repository.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -68,6 +68,38 @@ async function run(tool: RegisteredTool, input: unknown): Promise<any> {
     return JSON.parse(out);
   } catch {
     return out;
+  }
+}
+
+/**
+ * Run `body` with every timer of exactly `ms` milliseconds held: scheduled
+ * never, so a deadline of that length cannot fire however slow the runner
+ * is, while its clock (`expired()`) still runs. Other timers run as usual.
+ * For tests about what a failure is CALLED once the clock has run out,
+ * which must not depend on whether the deadline's timer won a race.
+ */
+async function withTimersHeld<T>(ms: number, body: () => Promise<T>): Promise<T> {
+  const realSetTimeout = globalThis.setTimeout;
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) =>
+    delay === ms
+      ? (0 as unknown as ReturnType<typeof setTimeout>)
+      : realSetTimeout(fn, delay, ...rest)) as typeof setTimeout);
+  try {
+    return await body();
+  } finally {
+    held.mockRestore();
+  }
+}
+
+/** Hold the event loop for `ms`, so that the clock moves and nothing else runs. */
+function busy(ms: number): void {
+  const started = performance.now();
+  while (performance.now() - started < ms) {
+    // spin
   }
 }
 
@@ -991,17 +1023,17 @@ describe("HttpBatch", () => {
 
   test("a transport failure that lands after the deadline's time is reported as itself", async () => {
     // The stub holds the event loop past the 50ms per-request deadline and
-    // then fails, so the failure is delivered before the deadline's timer can
-    // run: deterministic, with no race against real I/O.
+    // then fails; the deadline's timer is held, so however slow the runner,
+    // the failure is what ends the request while the clock says the time is
+    // up — no race against the timer or real I/O.
     _setRawFetch(async () => {
-      const started = performance.now();
-      while (performance.now() - started < 80) {
-        // spin
-      }
+      busy(80);
       throw new TypeError("fetch failed: ECONNRESET");
     });
     try {
-      const result = await run(httpBatch, { requests: [{ url: `${origin}/json` }], timeoutMs: 50 });
+      const result = await withTimersHeld(50, () =>
+        run(httpBatch, { requests: [{ url: `${origin}/json` }], timeoutMs: 50 }),
+      );
       // 0.7.0 said "deadline elapsed before the request completed", off the
       // clock, and the reset was never mentioned.
       expect(result.results[0].error).toBe(
@@ -1449,6 +1481,51 @@ describe("SseRead", () => {
       _setRawFetch(undefined);
     }
   }, 20_000);
+
+  test("a cancel that lands after the deadline's time, before its timer, is not a deadline", async () => {
+    // The stream's second read holds the event loop past the 50 ms deadline
+    // and then the runtime cancels: the clock says "expired", the cause is
+    // the cancel. 0.7.0 asked the clock and said stoppedBy "deadline".
+    const runtime = new AbortController();
+    let reads = 0;
+    _setRawFetch(async () => {
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            reads++;
+            if (reads === 1) {
+              controller.enqueue(new TextEncoder().encode("event: tick\ndata: 1\n\n"));
+              return;
+            }
+            busy(80);
+            runtime.abort();
+          },
+        },
+        // Pulled only when read, so the first event is taken before the
+        // second read cancels.
+        new CountQueuingStrategy({ highWaterMark: 0 }),
+      );
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    });
+    try {
+      // The deadline's timer is held, so it cannot fire first on a slow
+      // runner: the clock runs out, and the cancel is what ends the read.
+      const out = await withTimersHeld(50, () =>
+        sseRead.execute(
+          { url: `${origin}/sse`, maxEvents: 10, timeoutMs: 50 },
+          { toolUseId: "t", signal: runtime.signal },
+        ),
+      );
+      const result = JSON.parse(String(out));
+      expect({ stoppedBy: result.stoppedBy, count: result.count, reads }).toEqual({
+        stoppedBy: "error",
+        count: 1,
+        reads: 2,
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
 
   test("events after the terminator in the same chunk are not returned", async () => {
     const result = await run(sseRead, {
