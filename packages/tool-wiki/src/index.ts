@@ -351,12 +351,48 @@ function refLine(ref: WikiRef): string {
   return `${ref.slug} (v${ref.version}, ${ref.status}, conf ${ref.confidence.toFixed(2)}${verifiedSuffix}) — ${ref.title}${tagSuffix}`;
 }
 
-/** One list row, classified: the ref line, or its slug and version with the
- *  notice when the title or tags carry an injection. */
-async function safeRefLine(ref: WikiRef, rc: RunContext | undefined): Promise<string> {
-  const line = refLine(ref);
-  const c = await classifyMemory(line, rc);
+/**
+ * One list row, classified as ONE unit: `prefix` (text from the article that
+ * the row shows before the ref line, e.g. wiki_list's `updatedAt`) and the
+ * ref line together. Returns the row, or its slug and version with the
+ * notice when any of it carries an injection. `updatedAt` used to be printed
+ * outside the unit, so a planted article's timestamp reached the model
+ * unredacted while wiki_get redacted the same article.
+ */
+async function safeRefLine(ref: WikiRef, rc: RunContext | undefined, prefix = ""): Promise<string> {
+  const c = await classifyMemory(`${prefix}${refLine(ref)}`, rc);
   return c.safe ? c.text : `${ref.slug} (v${ref.version}) — ${c.notice}`;
+}
+
+/** How many list rows are classified at once. */
+const ROW_CLASSIFY_CONCURRENCY = 8;
+
+/**
+ * {@link safeRefLine} over many rows, in order, at most
+ * {@link ROW_CLASSIFY_CONCURRENCY} at a time. Each row stays its own unit —
+ * one classification of the joined rows would see only the head and tail of
+ * a long list, and decode a bounded number of blobs across all of them — but
+ * a model-backed classifier (Layer 3) is no longer awaited once per row in
+ * sequence.
+ */
+async function safeRefLines<R extends WikiRef>(
+  refs: ReadonlyArray<R>,
+  rc: RunContext | undefined,
+  render: (ref: R, line: string) => string = (_ref, line) => line,
+  prefix: (ref: R) => string = () => "",
+): Promise<string[]> {
+  const out = new Array<string>(refs.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < refs.length; i = next++) {
+      const ref = refs[i] as R;
+      out[i] = render(ref, await safeRefLine(ref, rc, prefix(ref)));
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(ROW_CLASSIFY_CONCURRENCY, refs.length) }, () => worker()),
+  );
+  return out;
 }
 
 function hitHeader(hit: WikiHit): string {
@@ -450,7 +486,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         const lines = [
           "no embedder configured — degraded to keyword search (configure memory.wiki.embedder for semantic ranking):",
         ];
-        for (const ref of refs.slice(0, k)) lines.push(`  • ${await safeRefLine(ref, rc)}`);
+        for (const row of await safeRefLines(refs.slice(0, k), rc)) lines.push(`  • ${row}`);
         if (refs.length === 0) lines.push(`  (no keyword matches for "${input.query}")`);
         return lines.join("\n");
       }
@@ -459,9 +495,13 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         return `no semantic matches ≥ ${(input.minScore ?? 0.05).toFixed(2)} for "${input.query}"`;
       }
       const lines = [`${hits.length} semantic match(es) for "${input.query}":`];
-      for (const hit of hits) {
-        lines.push(`  • (${hit.score.toFixed(3)}) ${await safeRefLine(hit.ref, rc)}`);
-      }
+      const rows = await safeRefLines(
+        hits.map((hit) => hit.ref),
+        rc,
+      );
+      hits.forEach((hit, i) => {
+        lines.push(`  • (${hit.score.toFixed(3)}) ${rows[i]}`);
+      });
       return lines.join("\n");
     },
   });
@@ -478,7 +518,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       const refs = await store.search(input.query);
       if (refs.length === 0) return `no wiki articles matched "${input.query}"`;
       const lines = [`${refs.length} keyword match(es) for "${input.query}":`];
-      for (const ref of refs) lines.push(`  • ${await safeRefLine(ref, rc)}`);
+      for (const row of await safeRefLines(refs, rc)) lines.push(`  • ${row}`);
       return lines.join("\n");
     },
   });
@@ -623,7 +663,11 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         `${rows.length}/${refs.length} article(s) (sort ${sort === "title" ? "title" : "updated"} ${order}):`,
         ...notes,
       ];
-      for (const ref of rows) lines.push(`  • ${ref.updatedAt}  ${await safeRefLine(ref, rc)}`);
+      // The timestamp is article text too (a planted file sets it), so it is
+      // classified with the row it heads.
+      for (const row of await safeRefLines(rows, rc, undefined, (ref) => `${ref.updatedAt}  `)) {
+        lines.push(`  • ${row}`);
+      }
       if (rows.length === 0) lines.push("  (none)");
       return lines.join("\n");
     },
@@ -646,9 +690,12 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       }
       if (refs.length === 0) return `no articles related to "${input.slug}"`;
       const lines = [`${refs.length} article(s) related to "${input.slug}":`];
-      for (const ref of refs) {
-        lines.push(`  • (${ref.relatedScore.toFixed(2)}) ${await safeRefLine(ref, rc)}`);
-      }
+      const rows = await safeRefLines(
+        refs,
+        rc,
+        (ref, row) => `(${ref.relatedScore.toFixed(2)}) ${row}`,
+      );
+      for (const row of rows) lines.push(`  • ${row}`);
       return lines.join("\n");
     },
   });

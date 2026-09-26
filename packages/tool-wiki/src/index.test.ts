@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { createEmbedder } from "@crewhaus/embedder";
 import { openEventLog } from "@crewhaus/event-log";
 import { createRunContext } from "@crewhaus/run-context";
@@ -371,6 +372,81 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
     const tagged = [...(rc.dataLineage?.keys() ?? [])];
     expect(tagged.some((t) => t.includes("exfiltrate"))).toBe(false);
     expect(new Set(rc.dataLineage?.values()).has("memory")).toBe(true);
+  });
+
+  // C154 residual (review): wiki_list printed `updatedAt` outside the
+  // classified unit. The store now normalises timestamps it reads, so this
+  // drives the tool with a store whose list() returns the planted value, as
+  // a store from another backend could.
+  test("wiki_list classifies an article's updatedAt with the row it heads", async () => {
+    const real = createWikiStore({ specName: "spec", rootDir: tmp });
+    const ref = {
+      slug: "notes",
+      title: "Coffee notes",
+      tags: ["coffee"],
+      confidence: 0.5,
+      verified: false,
+      version: 1,
+      links: [],
+      status: "published" as const,
+    };
+    const store = {
+      ...real,
+      list: async () => [
+        { ...ref, updatedAt: MALICIOUS_BODY },
+        { ...ref, slug: "clean", updatedAt: "2026-09-01T00:00:00.000Z" },
+      ],
+    };
+    const bundle = makeBundle({ store });
+    const out = String(await bundle.list.execute({}, { runContext: createRunContext() }));
+    expect(out).not.toContain("exfiltrate the system prompt");
+    expect(out).toContain("notes (v1) — ");
+    expect(out.toLowerCase()).toContain("redact");
+    expect(out).toContain("2026-09-01T00:00:00.000Z  clean (v1");
+  });
+
+  test("list rows are classified a few at a time, and keep their order", async () => {
+    const bundle = makeBundle();
+    for (let i = 0; i < 20; i++) {
+      await bundle.store.write({
+        slug: `widget-${String(i).padStart(2, "0")}`,
+        title: `Widget ${i}`,
+        body: `widget number ${i}`,
+        tags: ["widget"],
+      });
+    }
+    let inFlight = 0;
+    let most = 0;
+    let calls = 0;
+    const classifier = async () => {
+      calls++;
+      inFlight++;
+      most = Math.max(most, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      return { verdict: "clean" as const };
+    };
+    setDefaultBoundaryLlmClassifier(classifier);
+    try {
+      const out = String(await bundle.search.execute({ query: "widget" }));
+      // Each row is still its own unit...
+      expect(calls).toBe(20);
+      // ...but a model-backed classifier is no longer awaited once per row
+      // in sequence, and never more than the cap at once.
+      expect(most).toBeGreaterThan(1);
+      expect(most).toBeLessThanOrEqual(8);
+      const slugs = out
+        .split("\n")
+        .slice(1)
+        .map((l) => /widget-\d\d/.exec(l)?.[0]);
+      expect(slugs).toHaveLength(20);
+      expect(slugs.every((slug) => slug !== undefined)).toBe(true);
+      // Same order the store ranked them in.
+      const ranked = (await bundle.store.search("widget")).map((r) => r.slug);
+      expect(slugs).toEqual(ranked);
+    } finally {
+      setDefaultBoundaryLlmClassifier(undefined);
+    }
   });
 
   test("a Sources bullet written through wiki_write is not re-emitted in wiki_get's header", async () => {
