@@ -26,13 +26,16 @@ import { preferIdentity, readBodyBounded, withRawBody } from "./body";
  *      cannot inflate past it in the runtime first.
  *   8. `Cookie` and `Authorization` headers are stripped from the
  *      response before returning to the model.
- *   9. A redirect to another origin carries only the content-negotiation
- *      headers the call set (Accept, Accept-Encoding, Accept-Language,
- *      Content-Type, Content-Language, User-Agent): a header the call set
- *      for the origin it named — Authorization, Cookie, an X-Api-Key — is
- *      not sent to one it did not. A 303, or a 301/302 after a method
- *      other than GET/HEAD, is followed as a GET without the body
- *      (RFC 9110 §15.4), as tool-http's openRequest does.
+ *   9. A redirect to another origin carries only the headers that describe
+ *      the request — content negotiation (Accept*, Content-Type,
+ *      Content-Language, User-Agent), a Range and its conditionals
+ *      (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since,
+ *      If-Range) and Cache-Control: a header the call set for the origin it
+ *      named — Authorization, Cookie, an X-Api-Key — is not sent to one it
+ *      did not. The method follows the Fetch Standard: a 303 turns any
+ *      method but GET/HEAD into a GET without the body, and a 301/302 does
+ *      so only to a POST; a PUT or DELETE keeps its method and body, as on
+ *      a 307/308 (tool-http's openRequest follows the same rule).
  *
  * Layer R4. Pairs with the `target-cli` codegen contract — `BUILTIN_TOOL_MAP`
  * declares `fetch: { initSymbol: "registerFetchConfig" }` so the bundle
@@ -525,16 +528,40 @@ export function _setRawFetch(fn: RawFetch | undefined): void {
  * takes any header from the call, and it cannot tell which of them is a
  * credential for the origin the call named (`Authorization` and `Cookie`
  * are, and so is an `X-Api-Key`), so a cross-origin hop keeps only these,
- * which describe the request rather than who makes it.
+ * which describe the request rather than who makes it. A ranged or
+ * conditional read keeps its Range and conditionals, so a release asset a
+ * code host redirects to its CDN is still read in part, as 0.7.0 read it.
  */
 const CROSS_ORIGIN_HEADERS = new Set([
   "accept",
+  "accept-charset",
   "accept-encoding",
   "accept-language",
+  "cache-control",
   "content-language",
   "content-type",
+  "if-match",
+  "if-modified-since",
+  "if-none-match",
+  "if-range",
+  "if-unmodified-since",
+  "range",
   "user-agent",
 ]);
+
+/**
+ * Whether a redirect turns the request into a GET without its body (the
+ * Fetch Standard's HTTP-redirect fetch, as browsers, curl and Bun's own
+ * fetch do): a 303 turns any method but GET/HEAD into a GET, a 301 or 302
+ * only a POST. A PUT or DELETE keeps its method and body, as on a 307/308,
+ * so it is made where the server moved it instead of becoming a GET whose
+ * 200 reports an update or a delete that never happened.
+ */
+function becomesGet(status: number, method: string): boolean {
+  const m = method.toUpperCase();
+  if (status === 303) return m !== "GET" && m !== "HEAD";
+  return (status === 301 || status === 302) && m === "POST";
+}
 
 function originOf(url: URL): string {
   try {
@@ -593,14 +620,7 @@ async function performFetch(
           if (!CROSS_ORIGIN_HEADERS.has(name)) headers.delete(name);
         }
       }
-      // RFC 9110 §15.4.4 and §15.4.3: a 303 always becomes a GET, and 301/302
-      // after a non-GET have meant GET in every deployed client. Replaying
-      // the body would re-send the payload somewhere that did not ask for it.
-      if (
-        (res.status === 303 || res.status === 301 || res.status === 302) &&
-        method !== "GET" &&
-        method !== "HEAD"
-      ) {
+      if (becomesGet(res.status, method)) {
         method = "GET";
         body = undefined;
         headers.delete("content-type");

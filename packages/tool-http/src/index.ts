@@ -384,7 +384,7 @@ export const httpRequest: RegisteredTool = buildTool({
   name: "HttpRequest",
   operativeArgs: [{ field: "url", kind: "url" }],
   description:
-    "Issue one HTTP request to an allow-listed origin, with an env-resolved auth profile, a redirect policy, a retry-on-status rule and a deadline, returning status, headers, body and timing. Use it when Fetch is not enough because the call needs authentication, a non-default redirect policy, or an automatic retry on 429/503 that would otherwise cost a model turn per attempt. It does not stream, does not keep cookies between calls, and its elapsedMs field is wall-clock, so it differs run to run. A 301, 302 or 303 answer to a non-GET is followed as a GET with the body dropped, as HTTP requires, so a POST is never replayed at a hop the caller did not ask for.",
+    "Issue one HTTP request to an allow-listed origin, with an env-resolved auth profile, a redirect policy, a retry-on-status rule and a deadline, returning status, headers, body and timing. Use it when Fetch is not enough because the call needs authentication, a non-default redirect policy, or an automatic retry on 429/503 that would otherwise cost a model turn per attempt. It does not stream, does not keep cookies between calls, and its elapsedMs field is wall-clock, so it differs run to run. A 303 answer, or a 301 or 302 answer to a POST, is followed as a GET with the body dropped, as the Fetch standard and browsers do, so a POST is never replayed at a hop the caller did not ask for; a PUT, PATCH or DELETE keeps its method and body on a 301 or 302, as on a 307 or 308.",
   inputSchema: z.object({
     url: urlSchema,
     method: z

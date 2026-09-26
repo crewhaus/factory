@@ -9,8 +9,10 @@
  * tool-http's openRequest and tool-codehost already dropped credentials at
  * an origin change and followed RFC 9110's method rewrite; Fetch was the
  * outlier. Fetch takes arbitrary headers from the call and cannot tell which
- * of them is a credential, so a cross-origin hop keeps only the
- * content-negotiation ones.
+ * of them is a credential, so a cross-origin hop keeps only the ones that
+ * describe the request: content negotiation, a Range and its conditionals.
+ * The method follows the Fetch Standard: only a POST becomes a GET on a
+ * 301/302 (net review, 0.7.1).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -125,5 +127,61 @@ describe("a redirect carries the call's credentials only to the origin the call 
     redirectingFrom(302, "https://A.EXAMPLE:443/v2");
     await fetch.execute({ ...call, method: "GET", body: undefined }, {} as never);
     expect(seen[1]?.headers["authorization"]).toBe("Bearer T");
+  });
+
+  test("net-review: a same-origin 301 or 302 after a PUT or DELETE keeps the method and body", async () => {
+    let checked = 0;
+    for (const [status, method] of [
+      [301, "PUT"],
+      [302, "PUT"],
+      [301, "DELETE"],
+      [302, "DELETE"],
+    ] as const) {
+      seen = [];
+      redirectingFrom(status, "/moved");
+      const out = String(await fetch.execute({ ...call, method }, {} as never));
+      expect(out.endsWith("\ndone")).toBe(true);
+      expect({ status, method, hop: seen[1] }).toMatchObject({
+        status,
+        method,
+        hop: { url: "https://a.example/moved", method, body: '{"q":1}' },
+      });
+      expect(seen[1]?.headers["content-type"]).toBe("application/json");
+      checked += 1;
+    }
+    expect(checked).toBe(4);
+  });
+
+  test("a same-origin 301 after a POST is still a GET without the body", async () => {
+    redirectingFrom(301, "/moved");
+    await fetch.execute(call, {} as never);
+    expect(seen[1]).toMatchObject({ url: "https://a.example/moved", method: "GET", body: "" });
+  });
+
+  test("net-review: a cross-origin 302 keeps a Range and its conditionals, and still drops credentials", async () => {
+    redirectingFrom(302, "https://b.example/asset");
+    await fetch.execute(
+      {
+        url: "https://a.example/release/1",
+        headers: {
+          Range: "bytes=0-9",
+          "If-None-Match": '"abc"',
+          "If-Modified-Since": "Wed, 21 Oct 2026 07:28:00 GMT",
+          "Cache-Control": "no-cache",
+          Authorization: "Bearer T",
+          "X-Api-Key": "k-123",
+          "X-Session": "s-1",
+        },
+      },
+      {} as never,
+    );
+    expect(seen[1]?.url).toBe("https://b.example/asset");
+    expect(seen[1]?.headers).toEqual({
+      range: "bytes=0-9",
+      "if-none-match": '"abc"',
+      "if-modified-since": "Wed, 21 Oct 2026 07:28:00 GMT",
+      "cache-control": "no-cache",
+      "accept-encoding": "identity",
+    });
   });
 });

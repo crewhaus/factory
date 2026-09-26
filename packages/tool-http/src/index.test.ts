@@ -190,6 +190,9 @@ async function mainHandler(req: Request): Promise<Response> {
   if (p === "/redirect-303") {
     return new Response(null, { status: 303, headers: { location: "/echo" } });
   }
+  if (p === "/redirect-301") {
+    return new Response(null, { status: 301, headers: { location: "/echo" } });
+  }
   if (p === "/redirect-307") {
     return new Response(null, { status: 307, headers: { location: "/echo" } });
   }
@@ -765,6 +768,36 @@ describe("HttpRequest", () => {
     });
     expect(preserved.json.method).toBe("POST");
     expect(preserved.json.body).toBe('{"a":1}');
+  });
+
+  test("net-review: a 301 or 302 after a PUT, PATCH or DELETE keeps the method and body", async () => {
+    let checked = 0;
+    for (const path of ["/redirect-301", "/redirect-same"]) {
+      for (const method of ["PUT", "PATCH", "DELETE"] as const) {
+        const moved = await run(httpRequest, {
+          url: `${origin}${path}`,
+          method,
+          body: '{"a":1}',
+          parseJson: true,
+        });
+        expect({ path, method, seen: moved.json.method, body: moved.json.body }).toEqual({
+          path,
+          method,
+          seen: method,
+          body: '{"a":1}',
+        });
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(6);
+    // A POST still becomes a GET on a 301.
+    const post = await run(httpRequest, {
+      url: `${origin}/redirect-301`,
+      method: "POST",
+      body: '{"a":1}',
+      parseJson: true,
+    });
+    expect(post.json).toMatchObject({ method: "GET", body: "" });
   });
 
   test("a same-origin redirect keeps the credential", async () => {

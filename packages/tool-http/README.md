@@ -71,8 +71,11 @@ second HTTP surface with a weaker gate would be the same hole twice.
    for `Host` and TLS SNI, so a rebinding resolver cannot swap in a private
    address between the check and the socket.
 6. Redirects are followed by hand, capped, and re-checked against 3–5 at every
-   hop. A 301/302/303 answer to a non-GET becomes a GET with the body dropped,
-   so a request payload is never replayed at a hop nobody asked for.
+   hop. A 303 answer, or a 301/302 answer to a POST, becomes a GET with the
+   body dropped, as the Fetch standard and browsers do, so a POST is never
+   replayed at a hop nobody asked for. A PUT, PATCH or DELETE keeps its method
+   and body on a 301/302, as on a 307/308, so an update is made where the
+   server moved it rather than turned into a read that reports 200.
 7. `Authorization`, `Proxy-Authorization`, `Cookie` **and whatever header the
    call's `auth` profile set** are **dropped the moment a redirect leaves the
    origin they were minted for**, and the result reports `credentialsDropped`.

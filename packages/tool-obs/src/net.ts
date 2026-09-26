@@ -998,6 +998,21 @@ export type OpenResult = {
 };
 
 /**
+ * Whether a redirect turns the request into a GET without its body, as the
+ * Fetch Standard says (HTTP-redirect fetch) and browsers, curl and Bun's own
+ * fetch do: a 303 turns any method but GET and HEAD into a GET, and a 301 or
+ * 302 turns only a POST into one. A PUT, PATCH or DELETE keeps its method
+ * and body there, as on a 307 or 308, so it is made where the server moved
+ * it instead of becoming a read whose 200 reports an update or a delete
+ * that never happened. A POST is still never replayed on a 301/302/303.
+ */
+function becomesGet(status: number, method: string): boolean {
+  const m = method.toUpperCase();
+  if (status === 303) return m !== "GET" && m !== "HEAD";
+  return (status === 301 || status === 302) && m === "POST";
+}
+
+/**
  * Issue a request, following redirects by hand so the allow-list, the SSRF
  * gate and the credential rule run on every hop. The response body is left
  * unread — the caller decides how to drain it under which cap.
@@ -1094,15 +1109,8 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
         }
       }
     }
-    // RFC 9110 §15.4.4 and §15.4.3: a 303 always becomes a GET, and 301/302
-    // after a non-GET have meant GET in every deployed client since Netscape.
-    // Replaying an alert acknowledgement at each hop is not what a server
-    // asking for a redirect means.
-    if (
-      (res.status === 303 || res.status === 301 || res.status === 302) &&
-      method !== "GET" &&
-      method !== "HEAD"
-    ) {
+    // See becomesGet: 303 always, 301/302 only after a POST.
+    if (becomesGet(res.status, method)) {
       method = "GET";
       body = undefined;
       for (const name of Object.keys(headers)) {
