@@ -202,6 +202,27 @@ describe("Edit writes newString literally (C134)", () => {
   }
 });
 
+describe("Read and Edit keep a UTF-8 byte-order mark (0.7.1 review)", () => {
+  const BOM = "\uFEFF";
+  test("Edit changes only the text asked for, and the BOM stays on disk", async () => {
+    // Before this fix Edit wrote the file back without its BOM while the
+    // diff showed line 1 unchanged: tool-safety's decoder drops a BOM.
+    await writeFile(path.join(tmp, "App.cs"), `${BOM}using System;\r\nclass A {}\r\n`);
+    const result = String(
+      await edit.execute({ path: "App.cs", oldString: "class A {}", newString: "class B {}" }),
+    );
+    const bytes = readFileSync(path.join(tmp, "App.cs"));
+    expect([...bytes.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+    expect(bytes.toString("utf8")).toBe(`${BOM}using System;\r\nclass B {}\r\n`);
+    expect(result).toContain(` ${BOM}using System;`);
+  });
+
+  test("Read returns the text as the file holds it, BOM first", async () => {
+    await writeFile(path.join(tmp, "data.csv"), `${BOM}name,qty\n`);
+    expect(await read.execute({ path: "data.csv" })).toBe(`${BOM}name,qty\n`);
+  });
+});
+
 describe("Write and Edit keep the file's permission bits (C213)", () => {
   const posixOnly = process.platform !== "win32";
 

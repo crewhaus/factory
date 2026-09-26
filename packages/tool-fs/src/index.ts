@@ -101,6 +101,8 @@ function fsError(toolName: string, given: string, failure: SafeFsFailure): Error
   return new CrewhausError("tool", `${toolName}: ${failure.reason}`);
 }
 
+const BOM_KEEPING_DECODER = new TextDecoder("utf-8", { ignoreBOM: true });
+
 const READ_TOO_LARGE_HINT =
   "read part of it with a line-range tool (ReadLines, TailFile) if you have one, or search it with Grep";
 
@@ -139,7 +141,13 @@ function readWorkspaceText(toolName: string, given: string): string {
       throw new CrewhausError("tool", `${toolName}: ${JSON.stringify(given)} could not be read`);
     }
     if (r.truncated) throw tooLarge(toolName, given, undefined);
-    return r.text;
+    // Decoded here, keeping a leading byte-order mark, not taken from
+    // `r.text`: tool-safety decodes with TextDecoder's default, which drops
+    // the BOM. Read then showed text the file does not start with, and Edit
+    // wrote the file back without it, changing bytes nobody asked it to
+    // touch (a Windows .cs or .csproj, a CSV meant for Excel), while its
+    // diff showed line 1 as unchanged. 0.7.0 kept it.
+    return BOM_KEEPING_DECODER.decode(r.bytes);
   } finally {
     closeSync(opened.fd);
   }
