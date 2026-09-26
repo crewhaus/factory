@@ -66,18 +66,25 @@ sitting in a branch this particular value never reached is not in it. A
 
 A recursive schema may recurse through any keyword, `anyOf`, `oneOf`, `not`,
 `if` and `contains` included; only the same `$ref` reached twice at the same
-place in the value is reported as a cycle.
+place in the value is reported as a cycle. Depth is counted where the value
+nests, so a recursive schema follows a value 512 levels deep whatever
+keywords it recurses through; a deeper value, or a schema nested so deep the
+walk would overflow the stack, is `undetermined` rather than a verdict.
 
 **The work is bounded.** `anyOf`, `oneOf` and `allOf` over `$ref`s that share
 a target multiply, so a small schema can ask for billions of evaluations.
 Each call gets a budget of subschema evaluations, sized to the value (at
-least 500,000, and 64 per node of the value). When a schema needs more,
-`JsonSchemaValidate` answers `valid: null` with `undetermined: true` and the
-reason, never a verdict either way; `ValidateRecords` shares one budget
-across its rows and counts the rows it could not decide as `undetermined`,
-neither passed nor failed, with `ok: false`. A failing alternative's reason
-is summarised in a bounded message, so nested alternatives cannot grow the
-result either.
+least 500,000, and 64 per node of the value, a long string or key counting
+as a node per 256 characters). A check whose cost follows the value's size —
+a string's length, pattern or format, `uniqueItems`, listing an object's
+keys, an `enum` or `const` comparison — is charged for that size, and an
+error message is built only when it is kept, from a preview that reads just
+the part it shows. When a schema needs more, `JsonSchemaValidate` answers
+`valid: null` with `undetermined: true` and the reason, never a verdict
+either way; `ValidateRecords` shares one budget across its rows and counts
+the rows it could not decide as `undetermined`, neither passed nor failed,
+with `ok: false`. A failing alternative's reason is summarised in a bounded
+message, so nested alternatives cannot grow the result either.
 
 ## The formats
 

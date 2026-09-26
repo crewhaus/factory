@@ -55,11 +55,24 @@
  * 1.3 KB schema can ask for 2^30 subschema evaluations, and the walk is
  * synchronous. Every subschema evaluation is counted against a budget
  * (`maxWork`; by default the larger of {@link DEFAULT_MAX_WORK} and
- * {@link WORK_PER_VALUE_NODE} per node of the value). When it runs out the
- * walk stops and the result is `undetermined`, with `valid: false` and the
- * reason — never a verdict either way. A failing branch is summarised in a
- * bounded message, so the nested reasons of a deep `anyOf` cannot grow the
- * result exponentially either.
+ * {@link WORK_PER_VALUE_NODE} per unit of the value's weight: a node, or
+ * 256 characters of a string or key). So is every check whose cost follows
+ * the value's size rather than the schema's — a string's length or
+ * pattern, uniqueItems, an object's keys, an enum or const comparison, and
+ * each error message built — so a small schema cannot spend the value's
+ * size once per leaf. When the budget runs out the walk stops and the
+ * result is `undetermined`, with `valid: false` and the reason — never a
+ * verdict either way. A failing branch is summarised in a bounded message,
+ * and a message is built only when it will be kept.
+ *
+ * ## Depth is the value's
+ *
+ * A recursive schema walks as deep as the value does, so nesting is counted
+ * where the value nests — into an item or a property — not per `$ref` or
+ * branch. A value deeper than {@link MAX_VALUE_DEPTH}, or a schema and value
+ * nesting past {@link MAX_NESTING} walk frames together, is `undetermined`:
+ * the part not walked may be valid or not. A `$ref` that reaches itself at
+ * one position with nothing consumed between is a cycle, and an error.
  *
  * `pattern` is an unanchored ECMA-262 match, per the spec — `"pattern": "a"`
  * matches `"banana"`.
@@ -67,13 +80,13 @@
 import { type FormatName, checkFormat, isFormatName } from "./formats";
 import {
   type JsonType,
+  type PreviewCache,
   canonicalize,
-  deepEqual,
   isPlainObject,
   joinPointer,
   matchesType,
   parsePointer,
-  preview,
+  preview as previewValue,
   resolveSegments,
   typeOf,
 } from "./value";
@@ -115,8 +128,12 @@ export type WorkBudget = { used: number; readonly limit: number };
 
 /** The budget floor: about a third of a second of the worst schemas measured (Apple silicon). */
 export const DEFAULT_MAX_WORK = 500_000;
-/** Work allowed per node of the value, so a large document is not refused for its size. */
+/** Work allowed per unit of the value's weight, so a large document is not refused for its size. */
 export const WORK_PER_VALUE_NODE = 64;
+/** Characters of a string (or key) that weigh, and cost, one unit. */
+const CHARS_PER_UNIT = 256;
+/** Keys or items that cost one unit to list or compare. */
+const MEMBERS_PER_UNIT = 16;
 
 /** Nodes in a JSON value (itself included), counted iteratively, stopping at `cap`. */
 export function countValueNodes(value: unknown, cap = Number.MAX_SAFE_INTEGER): number {
@@ -131,11 +148,34 @@ export function countValueNodes(value: unknown, cap = Number.MAX_SAFE_INTEGER): 
   return count;
 }
 
+/**
+ * A value's weight: one per node, and one more per CHARS_PER_UNIT
+ * characters of each string and key — the size the size-bound checks are
+ * charged in, so the budget grows with the value in the same units.
+ */
+export function valueWeight(value: unknown): number {
+  let weight = 0;
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    weight += 1;
+    if (typeof node === "string") weight += Math.floor(node.length / CHARS_PER_UNIT);
+    else if (Array.isArray(node)) for (const item of node) stack.push(item);
+    else if (isPlainObject(node)) {
+      for (const key of Object.keys(node)) {
+        weight += Math.floor(key.length / CHARS_PER_UNIT);
+        stack.push(node[key]);
+      }
+    }
+  }
+  return weight;
+}
+
 /** The default budget for validating `value`. */
 export function defaultWorkLimit(value: unknown): number {
-  const floorNodes = Math.ceil(DEFAULT_MAX_WORK / WORK_PER_VALUE_NODE);
-  const nodes = countValueNodes(value);
-  return nodes <= floorNodes ? DEFAULT_MAX_WORK : nodes * WORK_PER_VALUE_NODE;
+  const floor = Math.ceil(DEFAULT_MAX_WORK / WORK_PER_VALUE_NODE);
+  const weight = valueWeight(value);
+  return weight <= floor ? DEFAULT_MAX_WORK : weight * WORK_PER_VALUE_NODE;
 }
 
 export type ValidationResult = {
@@ -213,12 +253,16 @@ const ANNOTATIONS = new Set([
   "definitions",
 ]);
 
+/** Deepest value the walk follows; past it the answer is undetermined. */
+export const MAX_VALUE_DEPTH = 512;
 /**
- * Depth ceiling for the walk. It guards a schema that references itself
- * through a value that never shrinks, and it also stops a value nested past
- * this many levels — both are counted, so the message names either cause.
+ * Most walk frames (a subschema evaluation inside another) at once, value
+ * and schema nesting together; past it the answer is undetermined. It keeps
+ * a deeply nested schema from overflowing the stack.
  */
-const MAX_DEPTH = 100;
+export const MAX_NESTING = 2_048;
+/** How deep `checkSchemaShape` descends; it only guards a hand-built cyclic object. */
+const MAX_SHAPE_DEPTH = 100;
 
 type Ctx = {
   root: Schema;
@@ -226,7 +270,8 @@ type Ctx = {
   errors: ValidationError[];
   truncated: boolean;
   unsupported: Set<string>;
-  refStack: string[];
+  /** `$ref`s entered and not yet left, each at its absolute position. */
+  refs: Set<string>;
   /**
    * Where this context's `path` "" sits in the whole value. A branch is
    * validated in a scratch context whose paths restart at "" (so its
@@ -236,12 +281,37 @@ type Ctx = {
    * valid recursive value was reported as a cycle.
    */
   refBase: string;
-  depth: number;
+  /** Items and properties descended into. */
+  valueDepth: number;
+  /** Subschema evaluations open, one inside another. */
+  nesting: number;
   work: WorkBudget;
+  /** Previews of the value's objects, reused across the walk. */
+  previews: PreviewCache;
 };
 
 /** Thrown when the work budget runs out; caught only in `validateValue`. */
 class WorkExhausted extends Error {}
+
+/** Thrown when the walk cannot reach a verdict for another reason; caught only in `validateValue`. */
+class Undetermined extends Error {}
+
+/** Where in the whole value `path` is, for a message. */
+function where(ctx: Ctx, path: string): string {
+  const absolute = `${ctx.refBase}${path}`;
+  return absolute === "" ? "the top" : clip(absolute, 120);
+}
+
+/** Spend `units` of the budget, stopping the walk once it is gone. */
+function charge(ctx: Ctx, units: number): void {
+  ctx.work.used += units;
+  if (ctx.work.used > ctx.work.limit) throw new WorkExhausted();
+}
+
+/** A bounded preview, reusing the walk's renderings of the value's objects. */
+function preview(ctx: Ctx, value: unknown, maxChars: number): string {
+  return previewValue(value, maxChars, ctx.previews);
+}
 
 /** Longest message one error carries; nested branch reasons are cut here. */
 const MAX_MESSAGE_CHARS = 1_000;
@@ -252,12 +322,68 @@ function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
 }
 
-function fail(ctx: Ctx, path: string, keyword: string, schemaPath: string, message: string): false {
+/**
+ * Record a failure. The message is built only when it will be kept: past
+ * `maxErrors` a failure costs nothing to report, and one that is kept is
+ * charged for the text it builds.
+ */
+function fail(
+  ctx: Ctx,
+  path: string,
+  keyword: string,
+  schemaPath: string,
+  message: string | (() => string),
+): false {
   if (ctx.errors.length >= ctx.opts.maxErrors) {
     ctx.truncated = true;
     return false;
   }
-  ctx.errors.push({ path, keyword, message: clip(message, MAX_MESSAGE_CHARS), schemaPath });
+  const text = clip(typeof message === "string" ? message : message(), MAX_MESSAGE_CHARS);
+  charge(ctx, 1 + Math.floor(text.length / 512));
+  ctx.errors.push({ path, keyword, message: text, schemaPath });
+  return false;
+}
+
+/** Code points in `text`, counted without building an array of them. */
+function codePointLength(text: string): number {
+  let length = text.length;
+  for (let i = 0; i < text.length - 1; i++) {
+    const unit = text.charCodeAt(i);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        length -= 1;
+        i += 1;
+      }
+    }
+  }
+  return length;
+}
+
+/**
+ * `deepEqual`, charged for what it reads: listing an object's keys and
+ * comparing long strings cost the value's size, not the schema's.
+ */
+function sameJson(a: unknown, b: unknown, ctx: Ctx): boolean {
+  if (typeof a === "string" && typeof b === "string") {
+    charge(ctx, Math.floor(Math.min(a.length, b.length) / CHARS_PER_UNIT));
+    return a === b;
+  }
+  if (a === b) return true;
+  if (typeof a !== typeof b) return false;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    charge(ctx, Math.floor(a.length / MEMBERS_PER_UNIT));
+    for (let i = 0; i < a.length; i++) if (!sameJson(a[i], b[i], ctx)) return false;
+    return true;
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    charge(ctx, Math.floor((aKeys.length + bKeys.length) / MEMBERS_PER_UNIT));
+    if (aKeys.length !== bKeys.length) return false;
+    return aKeys.every((k) => Object.hasOwn(b, k) && sameJson(a[k], b[k], ctx));
+  }
   return false;
 }
 
@@ -275,10 +401,12 @@ function branchErrors(
     errors: [],
     truncated: false,
     unsupported: ctx.unsupported,
-    refStack: ctx.refStack,
+    refs: ctx.refs,
     refBase: `${ctx.refBase}${path}`,
-    depth: ctx.depth,
+    valueDepth: ctx.valueDepth,
+    nesting: ctx.nesting,
     work: ctx.work,
+    previews: ctx.previews,
   };
   validateNode(value, schema, "", schemaPath, scratch);
   return scratch.errors;
@@ -379,9 +507,15 @@ function validateString(
   ctx: Ctx,
 ): void {
   const { minLength, maxLength, pattern, format } = schema;
+  const checksLength = typeof minLength === "number" || typeof maxLength === "number";
+  const checksFormat = typeof format === "string" && ctx.opts.assertFormat;
+  // Each of these reads the whole string, so each is charged for its length.
+  const reads =
+    (checksLength ? 1 : 0) + (typeof pattern === "string" ? 1 : 0) + (checksFormat ? 1 : 0);
+  if (reads > 0) charge(ctx, reads * Math.floor(value.length / CHARS_PER_UNIT));
   // Length is counted in code points, as the spec requires, so an emoji
   // counts as one character rather than as its two UTF-16 units.
-  const length = [...value].length;
+  const length = checksLength ? codePointLength(value) : 0;
   if (typeof minLength === "number" && length < minLength) {
     fail(
       ctx,
@@ -419,7 +553,7 @@ function validateString(
         path,
         "pattern",
         joinPointer(sp, "pattern"),
-        `${preview(value, 60)} does not match /${pattern}/`,
+        () => `${preview(ctx, value, 60)} does not match /${pattern}/`,
       );
     }
   }
@@ -434,7 +568,7 @@ function validateString(
           path,
           "format",
           joinPointer(sp, "format"),
-          `${preview(value, 60)} is not a valid ${format}: ${result.reason}`,
+          () => `${preview(ctx, value, 60)} is not a valid ${format}: ${result.reason}`,
         );
       }
     }
@@ -471,6 +605,8 @@ function validateArray(
     const seen = new Map<string, number>();
     for (let i = 0; i < value.length; i++) {
       const key = canonicalize(value[i]);
+      // An item's canonical form is as long as the item: charged per item.
+      charge(ctx, 1 + Math.floor(key.length / CHARS_PER_UNIT));
       const previous = seen.get(key);
       if (previous !== undefined) {
         fail(
@@ -478,13 +614,14 @@ function validateArray(
           path,
           "uniqueItems",
           joinPointer(sp, "uniqueItems"),
-          `items ${previous} and ${i} are equal (${preview(value[i], 60)})`,
+          () => `items ${previous} and ${i} are equal (${preview(ctx, value[i], 60)})`,
         );
         break;
       }
       seen.set(key, i);
     }
   }
+  ctx.valueDepth += 1;
   if (Array.isArray(items)) {
     // Tuple form: schema i applies to item i; the rest fall to additionalItems.
     for (let i = 0; i < value.length; i++) {
@@ -535,6 +672,7 @@ function validateArray(
         ).length === 0,
     );
     if (!matched) {
+      ctx.valueDepth -= 1;
       fail(
         ctx,
         path,
@@ -542,8 +680,10 @@ function validateArray(
         joinPointer(sp, "contains"),
         "no item matches the contains schema",
       );
+      return;
     }
   }
+  ctx.valueDepth -= 1;
 }
 
 function validateObject(
@@ -563,6 +703,8 @@ function validateObject(
     maxProperties,
   } = schema;
   const keys = Object.keys(value);
+  // Listing the keys, and the loop over them below, cost the object's size.
+  charge(ctx, Math.floor(keys.length / MEMBERS_PER_UNIT));
 
   if (Array.isArray(required)) {
     for (const key of required) {
@@ -595,6 +737,7 @@ function validateObject(
       `${keys.length} properties, more than ${maxProperties}`,
     );
   }
+  ctx.valueDepth += 1;
   if (propertyNames !== undefined) {
     for (const key of keys) {
       const errors = branchErrors(
@@ -677,6 +820,7 @@ function validateObject(
       );
     }
   }
+  ctx.valueDepth -= 1;
 }
 
 function validateLogic(
@@ -793,18 +937,26 @@ function resolveRef(ref: string, ctx: Ctx): { schema: Schema } | { error: string
 
 /** Validate one value against one schema, appending any failures to `ctx`. */
 function validateNode(value: unknown, schema: Schema, path: string, sp: string, ctx: Ctx): void {
-  ctx.work.used += 1;
-  if (ctx.work.used > ctx.work.limit) throw new WorkExhausted();
-  if (ctx.depth > MAX_DEPTH) {
-    fail(
-      ctx,
-      path,
-      "depth",
-      sp,
-      `nesting passed ${MAX_DEPTH} levels — either the value is that deep or a $ref is cycling`,
+  charge(ctx, 1);
+  if (ctx.valueDepth > MAX_VALUE_DEPTH) {
+    throw new Undetermined(
+      `the value nests deeper than ${MAX_VALUE_DEPTH} levels (at ${where(ctx, path)}), and nothing below that was checked`,
     );
-    return;
   }
+  if (ctx.nesting >= MAX_NESTING) {
+    throw new Undetermined(
+      `the schema and value nest past ${MAX_NESTING} checks inside one another (at ${where(ctx, path)}), and nothing below that was checked`,
+    );
+  }
+  ctx.nesting += 1;
+  try {
+    checkNode(value, schema, path, sp, ctx);
+  } finally {
+    ctx.nesting -= 1;
+  }
+}
+
+function checkNode(value: unknown, schema: Schema, path: string, sp: string, ctx: Ctx): void {
   if (schema === true) return;
   if (schema === false) {
     fail(ctx, path, "false", sp, "this position accepts no value at all");
@@ -831,7 +983,7 @@ function validateNode(value: unknown, schema: Schema, path: string, sp: string, 
     // Keyed on the ABSOLUTE instance position: the same $ref twice at one
     // place in the value, with nothing consumed between, is a real cycle.
     const marker = `${ref}@${ctx.refBase}${path}`;
-    if (ctx.refStack.includes(marker)) {
+    if (ctx.refs.has(marker)) {
       fail(ctx, path, "$ref", joinPointer(sp, "$ref"), `$ref "${ref}" cycles at this position`);
       return;
     }
@@ -840,11 +992,12 @@ function validateNode(value: unknown, schema: Schema, path: string, sp: string, 
       fail(ctx, path, "$ref", joinPointer(sp, "$ref"), resolved.error);
       return;
     }
-    ctx.refStack.push(marker);
-    ctx.depth += 1;
-    validateNode(value, resolved.schema, path, ref, ctx);
-    ctx.depth -= 1;
-    ctx.refStack.pop();
+    ctx.refs.add(marker);
+    try {
+      validateNode(value, resolved.schema, path, ref, ctx);
+    } finally {
+      ctx.refs.delete(marker);
+    }
     return;
   }
 
@@ -861,7 +1014,7 @@ function validateNode(value: unknown, schema: Schema, path: string, sp: string, 
         path,
         "type",
         joinPointer(sp, "type"),
-        `expected ${allowed.join(" or ")}, found ${actual} (${preview(value, 60)})`,
+        () => `expected ${allowed.join(" or ")}, found ${actual} (${preview(ctx, value, 60)})`,
       );
       // A wrong type makes every type-specific keyword below noise.
       validateLogic(value, schema, path, sp, ctx);
@@ -870,33 +1023,32 @@ function validateNode(value: unknown, schema: Schema, path: string, sp: string, 
   }
 
   if (Array.isArray(schema["enum"])) {
-    if (!schema["enum"].some((candidate) => deepEqual(candidate, value))) {
+    const candidates = schema["enum"];
+    if (!candidates.some((candidate) => sameJson(candidate, value, ctx))) {
       fail(
         ctx,
         path,
         "enum",
         joinPointer(sp, "enum"),
-        `${preview(value, 60)} is not one of ${preview(schema["enum"], 120)}`,
+        () => `${preview(ctx, value, 60)} is not one of ${preview(ctx, candidates, 120)}`,
       );
     }
   }
-  if (Object.hasOwn(schema, "const") && !deepEqual(schema["const"], value)) {
+  if (Object.hasOwn(schema, "const") && !sameJson(schema["const"], value, ctx)) {
     fail(
       ctx,
       path,
       "const",
       joinPointer(sp, "const"),
-      `expected ${preview(schema["const"], 60)}, found ${preview(value, 60)}`,
+      () => `expected ${preview(ctx, schema["const"], 60)}, found ${preview(ctx, value, 60)}`,
     );
   }
 
-  ctx.depth += 1;
   if (typeof value === "number") validateNumber(value, schema, path, sp, ctx);
   else if (typeof value === "string") validateString(value, schema, path, sp, ctx);
   else if (Array.isArray(value)) validateArray(value, schema, path, sp, ctx);
   else if (isPlainObject(value)) validateObject(value, schema, path, sp, ctx);
   validateLogic(value, schema, path, sp, ctx);
-  ctx.depth -= 1;
 }
 
 /**
@@ -920,17 +1072,29 @@ export function validateValue(
     errors: [],
     truncated: false,
     unsupported: new Set<string>(),
-    refStack: [],
+    refs: new Set<string>(),
     refBase: "",
-    depth: 0,
+    valueDepth: 0,
+    nesting: 0,
     work,
+    previews: new WeakMap(),
   };
   let undetermined: string | null = null;
   try {
     validateNode(value, schema, "", "", ctx);
   } catch (err) {
-    if (!(err instanceof WorkExhausted)) throw err;
-    undetermined = `the schema needed more than ${work.limit} subschema evaluations for this value, so no verdict was reached — anyOf, oneOf and allOf over shared $refs multiply`;
+    if (err instanceof WorkExhausted) {
+      undetermined = `the schema needed more than ${work.limit} subschema evaluations for this value, so no verdict was reached — anyOf, oneOf and allOf over shared $refs multiply`;
+    } else if (err instanceof Undetermined) {
+      undetermined = err.message;
+    } else if (err instanceof RangeError && /call stack/i.test(err.message)) {
+      // The caps above stop the walk first on the shapes measured; a value
+      // item compared whole (uniqueItems) can still nest past the stack.
+      undetermined =
+        "the schema or value nests too deep for this validator to walk, so no verdict was reached";
+    } else {
+      throw err;
+    }
   }
   return {
     valid: undetermined === null && ctx.errors.length === 0,
@@ -961,7 +1125,7 @@ export function checkSchemaShape(schema: unknown, path = "", depth = 0): string[
   }
   // A schema is finite JSON, so this only guards against a hand-built cyclic
   // object; it costs nothing and cannot be hit by a parsed document.
-  if (depth > MAX_DEPTH) return problems;
+  if (depth > MAX_SHAPE_DEPTH) return problems;
 
   const validTypes = ["null", "boolean", "object", "array", "number", "string", "integer"];
   const declared = schema["type"];
