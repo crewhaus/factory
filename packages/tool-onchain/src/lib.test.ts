@@ -380,6 +380,37 @@ describe("ABI decoding cannot be made to inflate (C085)", () => {
     );
   });
 
+  test("an empty tuple is refused, so a type string cannot multiply the data (C085)", () => {
+    // Each item is ONE word of data, but the type gives it 2,700 components
+    // that read nothing: 0.7.1's first cut decoded 2,000 words to 5.4M values.
+    const type = `(${"(),".repeat(2_700)}uint256)[]`;
+    expect(type.length).toBeLessThan(8192);
+    const items = 250;
+    const data = `0x${word(32)}${word(items)}${word(1).repeat(items)}`;
+    expect(() => decodeData([type], data)).toThrow(
+      "value[0][0][0]: () is an empty tuple — no Solidity type is one, and it decodes from no bytes, so nothing in the data can back it",
+    );
+    expect(() => decodeData(["()"], "0x")).toThrow(/\(\) is an empty tuple/);
+    expect(() => decodeData(["(uint256,())"], `0x${word(1)}`)).toThrow(/\(\) is an empty tuple/);
+  });
+
+  test("a decode yields at most as many values as its words could hold for its types", () => {
+    // Every head of an outer array points at ONE inner array of two
+    // `uint256[1]` items. That reads three words per item (within the word
+    // budget) but yields five values per item from a single word of heads.
+    const heads = 400;
+    const data = `0x${word(32)}${word(heads)}${word(heads * 32).repeat(heads)}${word(2)}${word(7)}${word(8)}`;
+    expect(() => decodeData(["uint256[1][][]"], data)).toThrow(
+      /^value\[0\]\[\d+\]\[\d+\]\[0\]: the data decodes to more than 1620 values, more than its size can hold for these types when each word is read once .* Refusing to inflate it\.$/,
+    );
+    // The same shape with each head pointing at its own inner array decodes.
+    const honest = [
+      Array.from({ length: heads }, (_, i) => [[String(i)], [String(i + 1)]]),
+    ] as const;
+    const hex = `0x${encodeCall("f(uint256[1][][])", [...honest]).slice(10)}`;
+    expect(decodeData(["uint256[1][][]"], hex)).toEqual([...honest]);
+  });
+
   test("honest encodings, however large, still decode exactly", () => {
     const square = Array.from({ length: 200 }, (_, i) =>
       Array.from({ length: 200 }, (_, j) => String(i * 200 + j)),

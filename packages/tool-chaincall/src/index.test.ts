@@ -168,6 +168,22 @@ describe("EvmMulticall", () => {
     });
   });
 
+  test("outputs whose types read no bytes cannot multiply a row's return data (C085)", async () => {
+    const items = 64;
+    const returnData = `0x${word(32n).slice(2)}${word(BigInt(items)).slice(2)}${word(1n).slice(2).repeat(items)}`;
+    const blob = await aggregate3Return([
+      [true, returnData],
+      [true, word(19n)],
+    ]);
+    use({ eth_call: () => blob });
+    const out = await run(evmMulticall, {
+      chainId: CHAIN,
+      calls: [{ ...balanceCall(ADDR.token), outputs: [`(${"(),".repeat(500)}uint256)[]`] }],
+    });
+    expect(out.results[0].decoded).toBeUndefined();
+    expect(out.results[0].decodeError).toContain("() is an empty tuple");
+  });
+
   test("an empty return is flagged, never decoded as a zero balance", async () => {
     const blob = await aggregate3Return([
       [true, "0x"],

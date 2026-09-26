@@ -457,18 +457,47 @@ export type Decoded = string | boolean | Decoded[];
  * n times, at every level of nesting, so a few kilobytes decode to millions
  * of values, and one call pins a core and fills the heap.
  *
- * So a decode is metered. Every word read and every word of string or bytes
- * payload costs one unit, and a decode may spend {@link MAX_INFLATION} units
- * per word of input (and at least {@link BUDGET_FLOOR}). An honest encoding
- * reads each word about once and never comes near the limit.
+ * So a decode is metered twice:
+ *
+ * - Every word read and every word of string or bytes payload costs one
+ *   unit, and a decode may spend {@link MAX_INFLATION} units per word of
+ *   input (and at least {@link BUDGET_FLOOR}). An honest encoding reads each
+ *   word about once and never comes near the limit.
+ * - Every value decoded — a tuple and an array included, not only the words
+ *   in them — is counted, and a decode may produce at most `1 + n` values
+ *   per word of input, where `n` is how deeply the types nest. A value either
+ *   reads a word of its own or is a tuple or an array holding at least one
+ *   value, so an encoding that reads each word once never produces more.
+ *   Without this count a type string could multiply its data on its own:
+ *   `((),(),…,uint256)[]` read one word per item and returned thousands of
+ *   values for it.
+ *
+ * An empty tuple `()` is refused outright: no Solidity type is one, and it
+ * decodes from no bytes at all, so nothing in the data could back it.
  */
 export const MAX_INFLATION = 4;
 const BUDGET_FLOOR = 1024;
 
-type DecodeBudget = { remaining: number };
+type DecodeBudget = { remaining: number; values: number; readonly maxValues: number };
 
-function budgetFor(data: Uint8Array): DecodeBudget {
-  return { remaining: Math.max(BUDGET_FLOOR, Math.ceil(data.length / WORD) * MAX_INFLATION) };
+/** How many tuples and arrays deep a type goes: 0 for a word, 1 for `uint256[]`. */
+function nesting(type: AbiType): number {
+  if (type.base === "array") return 1 + nesting(type.child as AbiType);
+  if (type.base === "tuple") {
+    return 1 + type.components.reduce((deepest, c) => Math.max(deepest, nesting(c)), 0);
+  }
+  return 0;
+}
+
+function budgetFor(data: Uint8Array, types: ReadonlyArray<AbiType>): DecodeBudget {
+  const words = Math.ceil(data.length / WORD);
+  const perWord = 1 + types.reduce((deepest, t) => Math.max(deepest, nesting(t)), 0);
+  const maxValues = Math.max(BUDGET_FLOOR, words * perWord);
+  return {
+    remaining: Math.max(BUDGET_FLOOR, words * MAX_INFLATION),
+    values: maxValues,
+    maxValues,
+  };
 }
 
 function charge(budget: DecodeBudget, units: number, what: string): void {
@@ -476,6 +505,16 @@ function charge(budget: DecodeBudget, units: number, what: string): void {
   if (budget.remaining < 0) {
     throw new Error(
       `${what}: the data decodes to more than ${MAX_INFLATION} times its own size — its offsets point at the same bytes again and again, which no ABI encoder writes. Refusing to inflate it.`,
+    );
+  }
+}
+
+/** One decoded value, counted against the decode's value budget. */
+function chargeValue(budget: DecodeBudget, what: string): void {
+  budget.values -= 1;
+  if (budget.values < 0) {
+    throw new Error(
+      `${what}: the data decodes to more than ${budget.maxValues} values, more than its size can hold for these types when each word is read once — its offsets point at the same bytes again and again, or the types multiply it. Refusing to inflate it.`,
     );
   }
 }
@@ -536,6 +575,7 @@ function decodeValue(
   what: string,
   budget: DecodeBudget,
 ): Decoded {
+  chargeValue(budget, what);
   if (type.base === "array") {
     const child = type.child as AbiType;
     if (type.arrayLength === -1) {
@@ -546,6 +586,11 @@ function decodeValue(
   }
   if (type.base === "tuple") {
     const components = type.components;
+    if (components.length === 0) {
+      throw new Error(
+        `${what}: () is an empty tuple — no Solidity type is one, and it decodes from no bytes, so nothing in the data can back it`,
+      );
+    }
     return decodeSequence(
       components.length,
       (i) => components[i] as AbiType,
@@ -670,7 +715,7 @@ export function decodeTuple(
     data,
     base,
     what,
-    budgetFor(data),
+    budgetFor(data, types),
   );
 }
 

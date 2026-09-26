@@ -72,8 +72,13 @@ nothing on a chain. So:
   one tail decode to millions of values. `AbiDecode` (and every package that
   decodes through it) refuses data that decodes to more than four times its
   own size — no encoder writes such data — and checks an array's length
-  against the bytes that follow it before building anything. Type strings
-  are capped at 8,192 characters and 32 levels of nesting.
+  against the bytes that follow it before building anything. It also counts
+  the values it produces, tuples and arrays included, and stops at what the
+  data could hold for those types if each word were read once. An empty
+  tuple `()` is refused as a type to decode: no Solidity type is one, and it
+  reads no bytes, so a type string full of them multiplied every word of
+  data on its own. Type strings are capped at 8,192 characters and 32 levels
+  of nesting.
 
 - **An address re-typed between two calls.** `AbiEncodeCall` and
   `TypedDataHash` (message fields and `verifyingContract` alike) check every
