@@ -300,9 +300,29 @@ type SendOutcome = {
   readonly body: string;
   readonly truncated: boolean;
   readonly parsed: unknown;
+  /**
+   * The request was delivered and answered (`status` is real), but the
+   * reply body could not be read: why. A send that got this far was SENT;
+   * only what the reply said is unknown.
+   */
+  readonly replyUnreadable?: string;
 };
 
-/** POST (or whatever verb) to an allow-listed URL and read a capped reply. */
+/** The `replyUnreadable` field for a result, when there is one. */
+function unreadableField(outcome: SendOutcome): { replyUnreadable?: string } {
+  return outcome.replyUnreadable !== undefined ? { replyUnreadable: outcome.replyUnreadable } : {};
+}
+
+/**
+ * POST (or whatever verb) to an allow-listed URL and read a capped reply.
+ *
+ * Once `openRequest` returns, the request has been delivered and answered.
+ * A failure to READ the reply (a coding this reader will not decode, a
+ * corrupt body, the deadline while it streams) does not un-send it, so it is
+ * returned as `replyUnreadable` rather than thrown: 0.7.1's first cut threw
+ * it, the tools reported "nothing was sent" for a delivered message, and a
+ * retry under the same idempotency key delivered it again (net review).
+ */
 async function send(
   url: URL,
   method: string,
@@ -322,7 +342,20 @@ async function send(
     redirect: "refuse",
     credentialHeaders: secretHeaders,
   });
-  const capped = await readCapped(opened.res, maxBytes, prepared.deadline.signal);
+  const status = opened.res.status;
+  let capped: Awaited<ReturnType<typeof readCapped>>;
+  try {
+    capped = await readCapped(opened.res, maxBytes, prepared.deadline.signal);
+  } catch (err) {
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      body: "",
+      truncated: false,
+      parsed: undefined,
+      replyUnreadable: describeFailure(err, prepared.deadline),
+    };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(capped.text);
@@ -345,7 +378,9 @@ async function send(
  */
 function platformFailure(platform: Platform, outcome: SendOutcome): string | null {
   if (!outcome.ok) {
-    return `the service answered ${outcome.status}: ${outcome.body.slice(0, 500)}`;
+    return outcome.replyUnreadable !== undefined
+      ? `the service answered ${outcome.status}, and its reply could not be read: ${outcome.replyUnreadable}`
+      : `the service answered ${outcome.status}: ${outcome.body.slice(0, 500)}`;
   }
   if (platform === "slack" && typeof outcome.parsed === "object" && outcome.parsed !== null) {
     const record = outcome.parsed as Record<string, unknown>;
@@ -354,6 +389,17 @@ function platformFailure(platform: Platform, outcome: SendOutcome): string | nul
     }
   }
   return null;
+}
+
+/**
+ * Slack keeps its verdict in the reply body (`ok:false` on a 200). When that
+ * body could not be read, the request was delivered but whether Slack took
+ * it is unknown: said so, never "sent" and never "not sent". Other platforms
+ * answer with the status, which is known.
+ */
+function unknownVerdict(platform: Platform, outcome: SendOutcome): string | null {
+  if (platform !== "slack" || !outcome.ok || outcome.replyUnreadable === undefined) return null;
+  return `Slack answered ${outcome.status}, but its reply, which says whether it accepted the request, could not be read (${outcome.replyUnreadable}); check before trying again`;
 }
 
 /** Where a platform keeps the id of the message just posted. */
@@ -721,12 +767,29 @@ export const chatPost: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(notSentBecause(failure));
+      const unknown = unknownVerdict(args.platform, outcome);
+      if (unknown !== null) {
+        // Recorded like a success: the request was delivered, so a retry
+        // under the same key must not deliver it again.
+        const result = prepared.redact(
+          json({
+            sent: null,
+            platform: args.platform,
+            mode: route.mode,
+            status: outcome.status,
+            reason: unknown,
+          }),
+        );
+        ledgerRecord("ChatPost", args.idempotencyKey, fingerprint, result);
+        return result;
+      }
       const result = prepared.redact(
         json({
           sent: true,
           platform: args.platform,
           mode: route.mode,
           status: outcome.status,
+          ...unreadableField(outcome),
           characters: rendered.text.length,
           ...(postedMessageId(args.platform, outcome) !== undefined
             ? { messageId: postedMessageId(args.platform, outcome) }
@@ -817,12 +880,25 @@ export const chatUpdate: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(notSentBecause(failure));
+      const unknown = unknownVerdict(args.platform, outcome);
+      if (unknown !== null) {
+        return prepared.redact(
+          json({
+            updated: null,
+            platform: args.platform,
+            messageId: args.messageId,
+            status: outcome.status,
+            reason: unknown,
+          }),
+        );
+      }
       return prepared.redact(
         json({
           updated: true,
           platform: args.platform,
           messageId: args.messageId,
           status: outcome.status,
+          ...unreadableField(outcome),
           characters: rendered.text.length,
           ...(rendered.truncated
             ? { warnings: ["the message was cut to the platform limit"] }
@@ -887,12 +963,14 @@ export const chatDelete: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(`the message was not deleted: ${failure}`);
+      const unknown = unknownVerdict(args.platform, outcome);
       return prepared.redact(
         json({
-          deleted: true,
+          deleted: unknown === null ? true : null,
           platform: args.platform,
           messageId: args.messageId,
           status: outcome.status,
+          ...(unknown === null ? unreadableField(outcome) : { reason: unknown }),
         }),
       );
     } catch (err) {
@@ -971,13 +1049,15 @@ export const chatReact: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(`the reaction was not added: ${failure}`);
+      const unknown = unknownVerdict(args.platform, outcome);
       return prepared.redact(
         json({
-          reacted: true,
+          reacted: unknown === null ? true : null,
           platform: args.platform,
           messageId: args.messageId,
           emoji: args.emoji,
           status: outcome.status,
+          ...(unknown === null ? unreadableField(outcome) : { reason: unknown }),
         }),
       );
     } catch (err) {
@@ -1900,6 +1980,7 @@ export const webhookPost: RegisteredTool = buildTool({
               signed: args.signing !== undefined,
               ...(attempts.length > 0 ? { earlierAttempts: attempts } : {}),
               ...(outcome.body !== "" ? { response: outcome.body } : {}),
+              ...unreadableField(outcome),
             }),
           );
           ledgerRecord("WebhookPost", args.idempotencyKey, fingerprint, result);
@@ -1915,7 +1996,7 @@ export const webhookPost: RegisteredTool = buildTool({
         if (!retryable) {
           return prepared.redact(
             notSentBecause(
-              `${safeUrlLabel(url)} answered ${(outcome as SendOutcome).status}, which is not a retryable status: ${(outcome as SendOutcome).body.slice(0, 500)}`,
+              `${safeUrlLabel(url)} answered ${(outcome as SendOutcome).status}, which is not a retryable status: ${(outcome as SendOutcome).replyUnreadable ?? (outcome as SendOutcome).body.slice(0, 500)}`,
             ),
           );
         }
@@ -2068,7 +2149,7 @@ async function runProviderSend(
     if (!outcome.ok) {
       return prepared.redact(
         notSentBecause(
-          `${safeUrlLabel(call.url)} answered ${outcome.status}: ${outcome.body.slice(0, 500)}`,
+          `${safeUrlLabel(call.url)} answered ${outcome.status}: ${outcome.replyUnreadable ?? outcome.body.slice(0, 500)}`,
         ),
       );
     }
@@ -2083,6 +2164,7 @@ async function runProviderSend(
         status: outcome.status,
         ...(typeof id === "string" || typeof id === "number" ? { messageId: String(id) } : {}),
         ...(typeof status === "string" ? { deliveryStatus: status } : {}),
+        ...unreadableField(outcome),
       }),
     );
     ledgerRecord(toolName, args.idempotencyKey, fingerprint, result);
