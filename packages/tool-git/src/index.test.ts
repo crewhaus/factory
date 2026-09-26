@@ -369,6 +369,10 @@ describe("containment of the repository git discovers", () => {
         leaked: false,
       });
     }
+    // The remedy is one a harness that runs from its own directory can follow.
+    const said = String(await gitStatus.execute({ cwd: "." }));
+    expect(said).toContain("the directory the harness runs from");
+    expect(said).not.toContain("run the harness from the repository's top level");
     expect(readFileSync(join(parent, "outside.txt"), "utf8")).toBe("user edit\n");
     expect(git(["stash", "list"], parent).stdout).toBe("");
     expect(git(["branch", "--show-current"], parent).stdout.trim()).toBe("main");
@@ -448,6 +452,36 @@ describe("containment of the repository git discovers", () => {
         leaked: false,
       });
     }
+  });
+
+  test("a .git/hooks, .git/lfs or info/exclude linked outside is not history: the repository still works", async () => {
+    // Sharing hooks by symlinking .git/hooks predates core.hooksPath, and
+    // relocating .git/lfs to another disk is common. Neither moves the
+    // working tree, refs or objects.
+    const shared = outsideDir("shared-hooks");
+    const lfs = outsideDir("shared-lfs");
+    const exclude = join(outsideDir("shared-info"), "exclude");
+    writeFileSync(exclude, "*.log\n");
+    rmSync(join(repo, ".git", "hooks"), { recursive: true, force: true });
+    symlinkSync(shared, join(repo, ".git", "hooks"));
+    symlinkSync(lfs, join(repo, ".git", "lfs"));
+    mkdirSync(join(repo, ".git", "info"), { recursive: true });
+    rmSync(join(repo, ".git", "info", "exclude"), { force: true });
+    symlinkSync(exclude, join(repo, ".git", "info", "exclude"));
+    writeFileSync(join(repo, "noise.log"), "x\n");
+    const status = await call(gitStatus);
+    expect(status.branch).toBe("main");
+    // The linked exclude file is honoured.
+    expect(JSON.stringify(status)).not.toContain("noise.log");
+    const branch = await call(gitBranchCreate, { name: "with-shared-hooks" });
+    expect(branch.created).toBe("with-shared-hooks");
+
+    // A link that does carry history (reflogs a write appends to) still
+    // refuses the repository.
+    rmSync(join(repo, ".git", "logs"), { recursive: true, force: true });
+    symlinkSync(outsideDir("logs-out"), join(repo, ".git", "logs"));
+    const refused = String(await gitStatus.execute({ cwd: "repo" }));
+    expect(refused).toContain("holds a link (logs) leading outside");
   });
 
   test("an inherited GIT_DIR or GIT_WORK_TREE never redirects a tool", async () => {

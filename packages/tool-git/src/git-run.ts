@@ -688,7 +688,7 @@ export async function locateRepository(
   }
   const outside = (why: string): Refusal =>
     refuse(
-      `${toolName} refused "${requested}": ${why}. The git tools work only on a repository whose working tree and history are inside the workspace root — run the harness from the repository's top level, or give the workspace a repository of its own.`,
+      `${toolName} refused "${requested}": ${why}. The git tools work only on a repository whose working tree and history are inside the workspace root, the directory the harness runs from: keep the harness at the repository's top level, or give the harness directory a repository of its own.`,
     );
 
   const top = realOrUndefined(topRaw);

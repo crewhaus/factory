@@ -61,6 +61,30 @@ const SCANNED_SUBDIRS = ["refs", "objects", "info", "logs", "worktrees", "module
 const MAX_SCANNED_ENTRIES = 4096;
 
 /**
+ * Entries of a git dir that may lead outside the workspace, because none of
+ * them holds or redirects the repository's history, config, index or logs:
+ *
+ *   - `hooks`: symlinking it to a shared directory was the standard way to
+ *     share hooks before `core.hooksPath`. A hook is a program either way;
+ *     where it lives adds nothing, and a read runs none.
+ *   - `lfs`: git-lfs's object cache, commonly moved to another disk.
+ *   - `description`: gitweb's one-line label.
+ *   - `info/exclude`, `info/attributes`: ignore and attribute patterns. The
+ *     drivers an attribute selects are still the checked config's.
+ *
+ * Everything else (objects, refs, packed-refs, HEAD, config, the index,
+ * logs, rr-cache, worktrees, modules …) still refuses the repository when
+ * it leads out.
+ */
+const MAY_LEAD_OUT: ReadonlySet<string> = new Set([
+  "hooks",
+  "lfs",
+  "description",
+  "info/exclude",
+  "info/attributes",
+]);
+
+/**
  * The first entry of an in-workspace git dir that is a link leading outside
  * the root (or nowhere), as a path relative to that git dir; undefined when
  * there is none.
@@ -68,11 +92,14 @@ const MAX_SCANNED_ENTRIES = 4096;
  * git never creates a symlink inside a git dir, so one there was put there by
  * hand, and a link at `objects` or `refs/heads` hands git another
  * repository's history while the git dir itself sits inside the workspace.
+ * The entries in {@link MAY_LEAD_OUT} (hooks, lfs …) hold no history and
+ * are allowed to.
  * Only the git dir's own entries and those of the directories git reads by
  * name are checked: a bounded scan, not a walk of every loose object.
  */
 export function linkLeadingOut(gitDir: string, root: string): string | undefined {
   const check = (abs: string, rel: string): string | undefined => {
+    if (MAY_LEAD_OUT.has(rel)) return undefined;
     let isLink = false;
     try {
       isLink = lstatSync(abs).isSymbolicLink();
