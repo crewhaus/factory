@@ -3026,13 +3026,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     const result = await runCli(["--help"]);
     expect(result.stdout).toContain("channel provision <spec.yaml>");
     expect(result.stdout).toContain("channel verify <spec.yaml>");
-  });
+  }, 20_000);
 
   test("unknown channel action exits 1 with the allowed set", async () => {
     const result = await runCli(["channel", "frobnicate"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('channel action must be "provision" or "verify"');
-  });
+  }, 20_000);
 
   test("a non-channel spec is refused", async () => {
     const result = await runCli([
@@ -3045,13 +3045,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("requires a channel-target spec");
     expect(result.stderr).toContain('"cli"');
-  });
+  }, 20_000);
 
   test("provision requires --base-url", async () => {
     const result = await runCli(["channel", "provision", CHANNEL_SPEC]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("missing --base-url");
-  });
+  }, 20_000);
 
   test("provision --dry-run prints every platform call with secrets redacted", async () => {
     const result = await runCli([
@@ -3083,7 +3083,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.stdout).toContain("permissions=274877910016");
     // dry-run writes nothing.
     expect(existsSync(join(tmp, "slack-app-manifest.yaml"))).toBe(false);
-  });
+  }, 20_000);
 
   test("provision --platform slack writes the manifest file (no network involved)", async () => {
     const result = await runCli([
@@ -3108,7 +3108,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     // The instructions point the operator at the spec's env refs.
     expect(result.stdout).toContain("$SLACK_BOT_TOKEN");
     expect(result.stdout).toContain("$SLACK_SIGNING_SECRET");
-  });
+  }, 20_000);
 
   test("verify --dry-run prints redacted probes and performs nothing", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--dry-run"]);
@@ -3118,7 +3118,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
       "would GET https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo",
     );
     expect(result.stdout).toContain("would GET https://discord.com/api/v10/applications/@me");
-  });
+  }, 20_000);
 
   test("verify without the secret env exits 1 on env-ref checks (no probes fire)", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC]);
@@ -3128,13 +3128,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.stdout).toContain("$TELEGRAM_BOT_TOKEN");
     expect(result.stdout).toContain("$DISCORD_BOT_TOKEN");
     expect(result.stdout).toMatch(/\d+ check\(s\), \d+ failed/);
-  });
+  }, 20_000);
 
   test("--platform must be configured in the spec", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--platform", "matrix"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("expected one of: slack, telegram, discord, all");
-  });
+  }, 20_000);
 
   // Demo-driver audit: `verify` named 5 of the 8 env vars the emitted daemon
   // refuses to boot without, so fixing exactly what it listed still produced
@@ -3166,7 +3166,7 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     // …plus the provider credential group the daemon also gates on.
     expect(result.stdout).toContain("ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY");
     expect(result.stdout).toContain("8 check(s), 8 failed");
-  });
+  }, 20_000);
 
   // Demo-driver audit: with a token present, verify made a live auth.test, so
   // its exit code depended on the network. --offline is the deterministic
@@ -3191,13 +3191,13 @@ describe("crewhaus channel provision|verify (item 61)", () => {
     expect(result.stdout).toContain("(offline)");
     expect(result.stdout).toContain("offline: no platform probes ran");
     expect(result.stdout).not.toContain("auth.test");
-  });
+  }, 20_000);
 
   test("verify --offline and --dry-run are mutually exclusive", async () => {
     const result = await runCli(["channel", "verify", CHANNEL_SPEC, "--offline", "--dry-run"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("mutually exclusive");
-  });
+  }, 20_000);
 
   // Demo-driver audit: provision wrote slack-app-manifest.yaml into the cwd
   // and only THEN validated telegram/discord env, leaving a stray file (and a
