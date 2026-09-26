@@ -1305,6 +1305,29 @@ describe("toolchain detection", () => {
     );
   });
 
+  test("TypeScript 3.x keeps 0.7.0's typecheck argv: it rejects --incremental with --noEmit", () => {
+    write("tsconfig.json", "{}");
+    installBinary("tsc", "exit 0");
+    const argvFor = (version: string | undefined): string[] => {
+      rmSync(join(workspace, "node_modules", "typescript"), { recursive: true, force: true });
+      if (version !== undefined)
+        write("node_modules/typescript/package.json", JSON.stringify({ version }));
+      return (detectTypecheck(workspace, workspace) as { argv: string[] }).argv;
+    };
+    // 3.9 answered every run with TS5053 and none of the project's errors.
+    const old = argvFor("3.9.10");
+    expect(old).toContain("--noEmit");
+    expect(old).not.toContain("--incremental");
+    expect(old).not.toContain("--tsBuildInfoFile");
+    for (const version of ["4.0.2", "5.9.3", undefined, "not-a-version"]) {
+      const argv = argvFor(version);
+      expect({ version, incremental: argv.includes("--incremental") }).toEqual({
+        version,
+        incremental: true,
+      });
+    }
+  });
+
   test("a configured node tool with no local install is reported as missing", () => {
     write("biome.json", "{}");
     const linter = detectLint(workspace, workspace);

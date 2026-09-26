@@ -259,7 +259,8 @@ export function detectBuild(
  * `tsBuildInfoFile` points, even outside the workspace. So the build info
  * is sent to a per-user temp file keyed by the project (./lib/checker-cache,
  * C150) with `--incremental --tsBuildInfoFile`, which the command line lets
- * override the tsconfig. mypy gets `--cache-dir=/dev/null` (its documented
+ * override the tsconfig — on TypeScript 4.0 and later; 3.x rejects the pair
+ * and writes no build info under `--noEmit`. mypy gets `--cache-dir=/dev/null` (its documented
  * way to write no cache) and ruff `--no-cache`, for the same reason.
  */
 export function detectTypecheck(
@@ -271,18 +272,18 @@ export function detectTypecheck(
     const binary = localBinary(dir, root, "tsc");
     if (binary === undefined) return { missing: "typescript" };
     const config = path.join(dir, tsconfig);
+    // TypeScript before 4.0 rejects `--incremental` with `--noEmit` (TS5053)
+    // and replaced every diagnostic with that error; under `--noEmit` it
+    // never wrote a .tsbuildinfo either, so it keeps 0.7.0's argv. A version
+    // that cannot be read gets the flags: a failed check is loud, a build
+    // info file written into the project is not.
+    const major = typescriptMajor(binary);
+    const buildInfo =
+      major !== undefined && major < 4
+        ? []
+        : ["--incremental", "--tsBuildInfoFile", typecheckBuildInfoFile(config)];
     return {
-      argv: [
-        binary,
-        "--noEmit",
-        "--incremental",
-        "--tsBuildInfoFile",
-        typecheckBuildInfoFile(config),
-        "--pretty",
-        "false",
-        "-p",
-        config,
-      ],
+      argv: [binary, "--noEmit", ...buildInfo, "--pretty", "false", "-p", config],
       tool: "tsc",
       reason: tsconfig,
     };
@@ -304,6 +305,26 @@ export function detectTypecheck(
     return { argv: ["go", "vet", "./..."], tool: "go-vet", reason: "go.mod" };
   }
   return undefined;
+}
+
+/**
+ * The major version of the `typescript` package a `node_modules/.bin/tsc`
+ * belongs to, from `node_modules/typescript/package.json` beside it, or
+ * undefined when that cannot be read. The read is the package's contained
+ * one: a manifest linked out of the workspace is not read.
+ */
+export function typescriptMajor(binary: string): number | undefined {
+  const manifest = path.join(path.dirname(path.dirname(binary)), "typescript", "package.json");
+  const text = readTextFile(manifest, 1_000_000);
+  if (text === undefined) return undefined;
+  let version: unknown;
+  try {
+    version = (JSON.parse(text) as { version?: unknown }).version;
+  } catch {
+    return undefined;
+  }
+  const m = typeof version === "string" ? /^(\d{1,4})\./.exec(version) : null;
+  return m === null ? undefined : Number(m[1]);
 }
 
 /** The project's linter. */
