@@ -434,24 +434,36 @@ describe.if(posix)("spawnBounded hooks", () => {
 describe.if(posix)("when the host goes away", () => {
   const spawnModule = join(import.meta.dir, "spawn.ts");
 
-  async function host(mode: "sigint" | "exit" | "own-handler"): Promise<{
+  type Mode = "sigint" | "exit" | "own-handler" | "once-handler" | "hook-exit" | "hook-sigint";
+
+  /** The marker an `addHostExitHook` hook writes, synchronously. */
+  const hookMarker = (mode: Mode): string => join(scratch, `${mode}.hook-ran`);
+
+  async function host(mode: Mode): Promise<{
     host: ReturnType<typeof Bun.spawn>;
     sleeper: number;
   }> {
     const pidFile = join(scratch, `${mode}.pid`);
     const script = join(scratch, `${mode}-host.ts`);
+    const exits = mode === "exit" || mode === "hook-exit";
     writeFileSync(
       script,
       [
-        `import { spawnBounded } from ${JSON.stringify(spawnModule)};`,
+        `import { addHostExitHook, spawnBounded } from ${JSON.stringify(spawnModule)};`,
         mode === "own-handler" ? `process.on("SIGINT", () => console.log("host handles it"));` : "",
+        mode === "once-handler"
+          ? `process.once("SIGINT", () => console.log("host handles it once"));`
+          : "",
+        mode.startsWith("hook-")
+          ? `addHostExitHook(() => require("node:fs").writeFileSync(${JSON.stringify(hookMarker(mode))}, "ran"));`
+          : "",
         `void spawnBounded({ cmd: ["sh", "-c", ${JSON.stringify(`echo $$ > ${pidFile}; exec sleep 60`)}], timeoutMs: 120_000, maxStdoutBytes: 100, maxStderrBytes: 100 });`,
-        mode === "exit"
+        exits
           ? `const t = setInterval(() => { if (require("node:fs").existsSync(${JSON.stringify(pidFile)})) process.exit(0); }, 20);`
           : "setInterval(() => {}, 1000);",
       ].join("\n"),
     );
-    const proc = Bun.spawn([process.execPath, script], { stdout: "ignore", stderr: "ignore" });
+    const proc = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "ignore" });
     const until = performance.now() + 15_000;
     while (!existsSync(pidFile) || readFileSync(pidFile, "utf8").trim() === "") {
       if (performance.now() > until) throw new Error("the host never started its command");
@@ -480,6 +492,73 @@ describe.if(posix)("when the host goes away", () => {
       await h.exited;
       expect(h.exitCode).toBe(0);
       expect(await waitGone(sleeper, 10_000)).toBe(true);
+    } finally {
+      if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
+    }
+  }, 30_000);
+
+  // eval-runner's pattern. The once-wrapper removes itself before later
+  // listeners run, so a listener added after it counted the host as having
+  // no handler of its own, killed the group and re-raised: the host died.
+  test("a host whose handler is process.once keeps its policy too", async () => {
+    const { host: h, sleeper } = await host("once-handler");
+    try {
+      await Bun.sleep(100);
+      h.kill("SIGINT");
+      await Bun.sleep(500);
+      expect({ exitCode: h.exitCode, signal: h.signalCode }).toEqual({
+        exitCode: null,
+        signal: null,
+      });
+      expect(alive(sleeper)).toBe(true);
+    } finally {
+      h.kill("SIGKILL");
+      await h.exited;
+      if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
+    }
+    expect(await new Response(h.stdout).text()).toContain("host handles it once");
+  }, 30_000);
+
+  test("addHostExitHook: process.exit runs the hook, after the group is killed", async () => {
+    const { host: h, sleeper } = await host("hook-exit");
+    try {
+      await h.exited;
+      expect(h.exitCode).toBe(0);
+      expect(existsSync(hookMarker("hook-exit"))).toBe(true);
+      expect(await waitGone(sleeper, 10_000)).toBe(true);
+    } finally {
+      if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
+    }
+  }, 30_000);
+
+  test("addHostExitHook: a hook registered while nothing runs is still run on exit", async () => {
+    const marker = join(scratch, "hook-only.hook-ran");
+    const script = join(scratch, "hook-only-host.ts");
+    writeFileSync(
+      script,
+      [
+        `import { addHostExitHook } from ${JSON.stringify(spawnModule)};`,
+        `const remove = addHostExitHook(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran"));`,
+        `addHostExitHook(() => require("node:fs").writeFileSync(${JSON.stringify(`${marker}.removed`)}, "ran"))();`,
+        "setTimeout(() => process.exit(0), 20);",
+      ].join("\n"),
+    );
+    const h = Bun.spawn([process.execPath, script], { stdout: "ignore", stderr: "ignore" });
+    await h.exited;
+    expect(h.exitCode).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+    // Unregistered, it does not run.
+    expect(existsSync(`${marker}.removed`)).toBe(false);
+  }, 30_000);
+
+  test("addHostExitHook: a SIGINT the host does not handle runs the hook before the host dies of it", async () => {
+    const { host: h, sleeper } = await host("hook-sigint");
+    try {
+      await Bun.sleep(100);
+      h.kill("SIGINT");
+      await h.exited;
+      expect(h.signalCode).toBe("SIGINT");
+      expect(existsSync(hookMarker("hook-sigint"))).toBe(true);
     } finally {
       if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
     }

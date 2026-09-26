@@ -28,6 +28,7 @@ export {
   SPAWN_DEFAULTS,
   type SpawnBoundedOptions,
   type SpawnBoundedResult,
+  addHostExitHook,
   setHostExitCleanup,
   spawnBounded,
 } from "./spawn";

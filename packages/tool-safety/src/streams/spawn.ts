@@ -27,7 +27,9 @@ import { byteBudget, deadlineMs, graceMs, optionalByteBudget } from "./limits";
  * for that signal — the host then dies of it as it would have. A host that
  * handles those signals itself keeps that policy; it should pass the turn's
  * abort signal to every call, and its own exit path is covered by the exit
- * hook. {@link setHostExitCleanup} turns this off.
+ * hook. A child that is only a client of the process doing the work (a
+ * `docker run` CLI) registers {@link addHostExitHook} for the work itself.
+ * {@link setHostExitCleanup} turns all of this off.
  *
  * POSIX only for the group kill. On Windows the tree is stopped with
  * `taskkill /T /F`, best effort, and there is no host-exit cleanup.
@@ -176,11 +178,17 @@ function killTree(pid: number, sig: "SIGTERM" | "SIGKILL", fallback: (s: string)
 
 /** Process groups of commands still running, or still being killed. */
 const liveGroups = new Set<number>();
+/** Synchronous cleanups to run if the host goes away (see {@link addHostExitHook}). */
+const exitHooks = new Set<() => void>();
 let cleanupEnabled = true;
 let hooksInstalled = false;
 const HOST_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
-function killLiveGroups(): void {
+/**
+ * The host is going away: SIGKILL every live group first, so nothing they
+ * run can start more work, then run the registered hooks, each on its own.
+ */
+function cleanUpForHostExit(): void {
   for (const pid of liveGroups) {
     try {
       process.kill(-pid, "SIGKILL");
@@ -189,10 +197,19 @@ function killLiveGroups(): void {
     }
   }
   liveGroups.clear();
+  const hooks = [...exitHooks];
+  exitHooks.clear();
   uninstallHooks();
+  for (const hook of hooks) {
+    try {
+      hook();
+    } catch {
+      // One hook's failure must not stop the others.
+    }
+  }
 }
 
-/** Track a group; the host hooks exist only while some group is tracked. */
+/** Track a group; the host hooks exist only while some group or hook is registered. */
 function track(group: number): void {
   if (isWindows) return;
   liveGroups.add(group);
@@ -201,16 +218,19 @@ function track(group: number): void {
 
 function untrack(group: number): void {
   liveGroups.delete(group);
-  if (liveGroups.size === 0) uninstallHooks();
+  if (liveGroups.size === 0 && exitHooks.size === 0) uninstallHooks();
 }
 
-const onHostExit = (): void => killLiveGroups();
+const onHostExit = (): void => cleanUpForHostExit();
 
 function onHostSignal(sig: NodeJS.Signals): void {
   // Another listener means the host has its own policy for this signal
-  // (a first Ctrl-C that only aborts the turn, say). Leave it alone.
+  // (a first Ctrl-C that only aborts the turn, say). Leave it alone. This
+  // listener is PREPENDED, so it runs first: a host's `process.once`
+  // handler is still registered when it is counted — run after it, the
+  // once-wrapper has already removed itself and the host looked handler-less.
   if (process.listenerCount(sig) > 1) return;
-  killLiveGroups();
+  cleanUpForHostExit();
   // Die of the signal, as the host would have without this listener.
   process.kill(process.pid, sig);
 }
@@ -219,7 +239,7 @@ function installHooks(): void {
   if (hooksInstalled || !cleanupEnabled || isWindows) return;
   hooksInstalled = true;
   process.on("exit", onHostExit);
-  for (const sig of HOST_SIGNALS) process.on(sig, onHostSignal);
+  for (const sig of HOST_SIGNALS) process.prependListener(sig, onHostSignal);
 }
 
 function uninstallHooks(): void {
@@ -230,14 +250,37 @@ function uninstallHooks(): void {
 }
 
 /**
- * Whether the process groups of commands still running are killed when the
- * host exits (default true; see the module comment). The listeners exist
- * only while a command runs. Turning this off removes them; turning it on
- * again installs them at the next spawn.
+ * Registers synchronous work to do if the host goes away while something is
+ * in flight: on `process.exit` (or the end of the event loop), and on
+ * SIGINT, SIGTERM or SIGHUP when the host does not handle that signal
+ * itself — the same moments a live group is killed, and after it is. For
+ * work a killed child cannot stop on its own: the sandbox removes the
+ * containers its `docker run` clients started. The hook must be synchronous
+ * and bounded (`Bun.spawnSync` with a `timeout`); a throw is ignored. It
+ * runs at most once. Returns a function that unregisters it. POSIX only,
+ * like the rest of the host-exit cleanup; a no-op while
+ * {@link setHostExitCleanup} is off.
+ */
+export function addHostExitHook(hook: () => void): () => void {
+  if (isWindows) return () => undefined;
+  exitHooks.add(hook);
+  installHooks();
+  return () => {
+    exitHooks.delete(hook);
+    if (liveGroups.size === 0 && exitHooks.size === 0) uninstallHooks();
+  };
+}
+
+/**
+ * Whether the process groups of commands still running are killed, and the
+ * {@link addHostExitHook} hooks run, when the host exits (default true; see
+ * the module comment). The listeners exist only while a command runs or a
+ * hook is registered. Turning this off removes them; turning it on again
+ * installs them at once if anything is registered, else at the next spawn.
  */
 export function setHostExitCleanup(enabled: boolean): void {
   cleanupEnabled = enabled;
-  if (enabled && liveGroups.size > 0) installHooks();
+  if (enabled && (liveGroups.size > 0 || exitHooks.size > 0)) installHooks();
   if (!enabled) uninstallHooks();
 }
 
