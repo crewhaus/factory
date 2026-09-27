@@ -17,6 +17,7 @@ import { attrOf } from "./parse";
 type AttrTest = {
   readonly name: string;
   readonly op: "exists" | "=" | "^=" | "$=" | "*=" | "~=";
+  /** The value compared against: lowercased once here under `i`, not per element. */
   readonly value: string;
   readonly insensitive: boolean;
 };
@@ -56,7 +57,8 @@ export const MAX_COMPOUND_TESTS = 32;
 export const MAX_SELECTOR_CHARS = 8_192;
 /**
  * Matching work one context may spend: about one unit per element a
- * selector is asked about and per compound test made. It bounds the worst
+ * selector is asked about, per compound test made, and per 16 characters of
+ * a class list or attribute value a test reads. It bounds the worst
  * case the caps above still allow (every element asked every step of 32
  * selectors of 32 steps) at seconds of one thread, where an ordinary query
  * over the largest page these tools accept spends a small fraction of it.
@@ -105,11 +107,13 @@ function parseAttr(body: string): AttrTest {
   );
   if (m === null) throw new Error(`"[${body}]" is not an attribute selector this understands`);
   const op = m[2] === undefined ? "exists" : (m[2] as AttrTest["op"]);
+  const insensitive = m[6] !== undefined;
+  const value = m[3] ?? m[4] ?? m[5] ?? "";
   return {
     name: (m[1] as string).toLowerCase(),
     op,
-    value: m[3] ?? m[4] ?? m[5] ?? "",
-    insensitive: m[6] !== undefined,
+    value: insensitive ? value.toLowerCase() : value,
+    insensitive,
   };
 }
 
@@ -365,9 +369,20 @@ type Facts = {
   count: number;
   /** The class list, split when a class test first asks. */
   classes: Set<string> | null;
+  /** Attribute values lowercased or split into words, when a test first asks. */
+  attrs: Map<string, AttrView> | null;
 };
 
-const noPosition = (): Facts => ({ index: -1, typeIndex: -1, count: -1, classes: null });
+/** One attribute's derived forms, each made at most once per element. */
+type AttrView = { lower?: string; words?: Set<string>; lowerWords?: Set<string> };
+
+const noPosition = (): Facts => ({
+  index: -1,
+  typeIndex: -1,
+  count: -1,
+  classes: null,
+  attrs: null,
+});
 
 function classesOf(node: Element, facts: Facts): Set<string> {
   if (facts.classes !== null) return facts.classes;
@@ -380,25 +395,67 @@ function classesOf(node: Element, facts: Facts): Set<string> {
   return set;
 }
 
-function attrMatches(node: Element, test: AttrTest): boolean {
+function attrView(facts: Facts, name: string): AttrView {
+  if (facts.attrs === null) facts.attrs = new Map();
+  let view = facts.attrs.get(name);
+  if (view === undefined) {
+    view = {};
+    facts.attrs.set(name, view);
+  }
+  return view;
+}
+
+/** `raw` lowercased, once per element and attribute, charged by its length. */
+function lowerOf(raw: string, view: AttrView): string {
+  if (view.lower === undefined) {
+    spent += raw.length >> 4;
+    view.lower = raw.toLowerCase();
+  }
+  return view.lower;
+}
+
+/**
+ * Every test is charged for the characters it reads, like the class list:
+ * a value is the other cost that follows the page rather than the selector.
+ * The fix round charged one unit per test, so 32 selectors of 29
+ * `[a~=y]` over 16 KB attribute values split every value 928 times per
+ * element and ran for minutes on the largest page, never refused. A split or
+ * lowercased value is now made once per element and reused.
+ */
+function attrMatches(node: Element, test: AttrTest, facts: Facts): boolean {
   // Own attributes only: `[constructor]` must not match every element, and
   // `[constructor^=f]` must not call startsWith on a function.
   const raw = attrOf(node, test.name);
   if (raw === undefined) return false;
   if (test.op === "exists") return true;
-  const actual = test.insensitive ? raw.toLowerCase() : raw;
-  const expected = test.insensitive ? test.value.toLowerCase() : test.value;
+  const expected = test.value;
+  if (test.op === "~=") {
+    const view = attrView(facts, test.name);
+    let words = test.insensitive ? view.lowerWords : view.words;
+    if (words === undefined) {
+      const source = test.insensitive ? lowerOf(raw, view) : raw;
+      spent += source.length >> 4;
+      words = new Set(source.split(/\s+/));
+      if (test.insensitive) view.lowerWords = words;
+      else view.words = words;
+    }
+    return words.has(expected);
+  }
+  const actual = test.insensitive ? lowerOf(raw, attrView(facts, test.name)) : raw;
   switch (test.op) {
     case "=":
+      // Unequal lengths answer at once; equal ones compare every character.
+      if (actual.length === expected.length) spent += actual.length >> 4;
       return actual === expected;
     case "^=":
+      spent += expected.length >> 4;
       return expected !== "" && actual.startsWith(expected);
     case "$=":
+      spent += expected.length >> 4;
       return expected !== "" && actual.endsWith(expected);
-    case "*=":
-      return expected !== "" && actual.includes(expected);
     default:
-      return actual.split(/\s+/).includes(expected);
+      spent += actual.length >> 4;
+      return expected !== "" && actual.includes(expected);
   }
 }
 
@@ -410,7 +467,7 @@ function matchesSimple(node: Element, simple: Simple, facts: Facts): boolean {
     const have = classesOf(node, facts);
     for (const c of simple.classes) if (!have.has(c)) return false;
   }
-  for (const attr of simple.attrs) if (!attrMatches(node, attr)) return false;
+  for (const attr of simple.attrs) if (!attrMatches(node, attr, facts)) return false;
 
   for (const pseudo of simple.pseudos) {
     if (pseudo.kind === "not") {
@@ -522,7 +579,7 @@ function stateOf(node: Element, group: Compiled, ctx: MatchContext): Int32Array 
     for (const child of children) {
       if (child.type !== "element") continue;
       const typeIndex = types === null ? -1 : (types.get(child.tag) ?? 0);
-      const facts: Facts = { index, typeIndex, count, classes: null };
+      const facts: Facts = { index, typeIndex, count, classes: null, attrs: null };
       if (child === target) {
         evaluate(target, state, previous, facts, group, next, ctx);
         found = true;
@@ -612,6 +669,7 @@ function pass(
       seen.set(node.tag, facts.typeIndex + 1);
     }
     facts.classes = null;
+    facts.attrs = null;
     evaluate(
       node,
       states[depth] as Int32Array,

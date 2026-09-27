@@ -186,6 +186,41 @@ describe("the selector engine answers each (element, step) question once", () =>
     expect(retained(5_000)).toBe(small);
   }, 20_000);
 
+  test("an attribute test is charged for the characters it reads", () => {
+    // The fix round charged one unit per test: 32 selectors of 29 tests over
+    // 16 KB attribute values held HtmlQuery for 11 s on a 1 MB page and for
+    // minutes on the largest, and it answered instead of refusing.
+    const value = `${"y ".repeat(8_192)}Z`;
+    const root = parseHtml(`<body>${`<div a="${value}"></div>`.repeat(16)}</body>`);
+    const perRead = value.length >> 4;
+    const spentOn = (selector: string): number => {
+      const ctx = createMatchContext();
+      queryAll(root, selector, Number.POSITIVE_INFINITY, ctx);
+      return ctx.limit - ctx.work;
+    };
+    // `*=` reads the value on every test.
+    for (const test of ["[a*=Z]", "[a*=z i]"]) {
+      expect({ test, spent: spentOn(`div${test.repeat(29)}`) >= 16 * 29 * perRead }).toEqual({
+        test,
+        spent: true,
+      });
+    }
+    // `~=` and `i` split or lowercase a value once per element, and pay for it once.
+    for (const test of ["[a~=y]", "[a~=Y i]", "[a$=z i]", "[a=Q i]"]) {
+      const spent = spentOn(`div${test.repeat(29)}`);
+      expect({ test, charged: spent >= 16 * perRead }).toEqual({ test, charged: true });
+      expect({ test, once: spent < 16 * 3 * perRead }).toEqual({ test, once: true });
+    }
+    // A budget the page's values exceed is refused, naming the selector.
+    const ctx = createMatchContext(16 * 28 * perRead);
+    expect(() =>
+      queryAll(root, `div${"[a*=Z]".repeat(29)}`, Number.POSITIVE_INFINITY, ctx),
+    ).toThrow(/matching "div\[a\*=Z\].*units of work/);
+    // Tests that answer from a length or a short prefix cost what they read.
+    expect(spentOn("div[a=q]")).toBeLessThan(16 * 8);
+    expect(spentOn("div[a^=y]")).toBeLessThan(16 * 8);
+  });
+
   test("work past the context's budget is refused with the selector named, not run", () => {
     expect(MATCH_WORK_LIMIT).toBe(200_000_000);
     const root = parseHtml(`<div>${"<p></p>".repeat(2_000)}</div>`);
@@ -387,6 +422,63 @@ describe("the matcher gives the 0.7.0 matcher's answers", () => {
     expect(underContainer).toBeGreaterThan(2_000);
     expect(containerHits).toBeGreaterThan(300);
   }, 30_000);
+
+  test("attribute tests give 0.7.0's answers, with every operator and case flag", () => {
+    type Attr = { name: string; op: string; value: string; i: boolean };
+    // 0.7.0's attribute test, unchanged, as the oracle.
+    const naiveAttr = (node: Element, t: Attr): boolean => {
+      const raw = Object.hasOwn(node.attrs, t.name) ? node.attrs[t.name] : undefined;
+      if (raw === undefined) return false;
+      if (t.op === "exists") return true;
+      const actual = t.i ? raw.toLowerCase() : raw;
+      const expected = t.i ? t.value.toLowerCase() : t.value;
+      if (t.op === "=") return actual === expected;
+      if (t.op === "^=") return expected !== "" && actual.startsWith(expected);
+      if (t.op === "$=") return expected !== "" && actual.endsWith(expected);
+      if (t.op === "*=") return expected !== "" && actual.includes(expected);
+      return actual.split(/\s+/).includes(expected);
+    };
+    const words = ["a", "B", "ab", "Ab b", " a", "a ", "", "b A"];
+    const ops = ["exists", "=", "^=", "$=", "*=", "~="];
+    let hits = 0;
+    let compared = 0;
+    for (let seed = 1; seed <= 300; seed++) {
+      const rand = prng(seed);
+      const pick = <T>(list: ReadonlyArray<T>): T => list[Math.floor(rand() * list.length)] as T;
+      const html = Array.from({ length: 6 }, () => {
+        const attrs = ["x", "y"]
+          .filter(() => rand() < 0.8)
+          .map((name) => ` ${name}="${pick(words)}"`)
+          .join("");
+        return `<p${attrs}></p>`;
+      }).join("");
+      const root = parseHtml(`<div>${html}</div>`);
+      // Several tests on one compound, so a value lowercased or split for
+      // one test is the value the next one reads.
+      const tests: Attr[] = Array.from({ length: 1 + Math.floor(rand() * 4) }, () => ({
+        name: pick(["x", "y"]),
+        op: pick(ops),
+        value: pick(["a", "A", "b", "ab", "AB", "", "b a"]),
+        i: rand() < 0.5,
+      }));
+      const selector = `p${tests
+        .map((t) =>
+          t.op === "exists" ? `[${t.name}]` : `[${t.name}${t.op}"${t.value}"${t.i ? " i" : ""}]`,
+        )
+        .join("")}`;
+      const elements = [...walk(root)].filter((e) => e.tag === "p");
+      const want = elements.filter((e) => tests.every((t) => naiveAttr(e, t)));
+      expect({ seed, selector, got: queryAll(root, selector) }).toEqual({
+        seed,
+        selector,
+        got: want,
+      });
+      compared++;
+      hits += want.length;
+    }
+    expect(compared).toBe(300);
+    expect(hits).toBeGreaterThan(100);
+  });
 
   test("an ancestor or sibling outside the queried container still counts", () => {
     const root = parseHtml(
