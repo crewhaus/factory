@@ -6274,7 +6274,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "regexExtract",
     name: "RegexExtract",
     description:
-      "Extract every regex match from text, with named capture groups, character offsets and line numbers. Use to pull ids, versions, paths or fields out of logs and documents without reading the whole thing into context.",
+      "Extract every regex match from text, with named capture groups, character offsets and line numbers. Use to pull ids, versions, paths or fields out of logs and documents without reading the whole thing into context. The pattern runs under a time limit; a pattern that backtracks exponentially is refused, and a run that cannot finish says so rather than reporting the matches it found as all of them.",
     readOnly: true,
     destructive: false,
     scope: "internal",
