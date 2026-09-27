@@ -303,10 +303,14 @@ export function classifyTarget(target: string, allowed: readonly OpenableScheme[
  * The list also names what INSTALLS or RUNS on open without an execute bit:
  * configuration profiles, Java Web Start, ClickOnce and MSIX installers,
  * scripts an interpreter's launcher is registered for, Automator and
- * Shortcuts documents, macOS plug-in bundles, and disk images that mount.
- * A deny-list always trails the handler table on a real machine; this one is
- * the union of what the 0.7.0 review found, and an allow-list of document
- * types for path opens is the structural fix still to be decided.
+ * Shortcuts documents, macOS plug-in bundles, every disk image type macOS's
+ * DiskImageMounter registers, System Settings extensions and network
+ * configurations, certificates and keychains Keychain Access imports, and
+ * Microsoft's Level-1 attachment list in full. A deny-list always trails the
+ * handler table on a real machine; this one is the union of what the 0.7.0
+ * reviews found and those handlers register (read from their Info.plist
+ * files on macOS 26), and an allow-list of document types for path opens is
+ * the structural fix still to be decided.
  */
 const DANGEROUS_EXTENSIONS = new Set([
   // runs directly
@@ -401,8 +405,33 @@ const DANGEROUS_EXTENSIONS = new Set([
   "rdp",
   "theme",
   "themepack",
-  // the rest of Microsoft's Level-1 (always blocked) attachment list that
-  // runs, installs or configures on open
+  "deskthemepack",
+  // the rest of Microsoft's Level-1 (always blocked) attachment list, in
+  // full: each runs, installs, configures or redirects on open
+  "appcontent-ms",
+  "printerexport",
+  "osd",
+  "prf",
+  "xnk",
+  "udl",
+  "vsmacros",
+  "vsw",
+  "webpnp",
+  "asp",
+  "aspx",
+  "asx",
+  "bgi",
+  "cnt",
+  "fxp",
+  "hpj",
+  "htc",
+  "its",
+  "ops",
+  "pcd",
+  "plg",
+  "prg",
+  "pst",
+  "tmp",
   "msu",
   "mst",
   "cab",
@@ -462,11 +491,45 @@ const DANGEROUS_EXTENSIONS = new Set([
   "flatpakref",
   "appimage",
   "snap",
-  // disk images that mount on open (and skip mark-of-the-web on Windows)
+  // disk images that mount on open (and skip mark-of-the-web on Windows):
+  // on macOS, every type DiskImageMounter registers
   "iso",
   "img",
   "vhd",
   "vhdx",
+  "udif",
+  "toast",
+  "dvdr",
+  "cdr",
+  "dmgpart",
+  "sparseimage",
+  "asif",
+  "sparsebundle",
+  "backupbundle",
+  // macOS System Settings extensions and network configurations, which it
+  // installs on open
+  "sysprefex",
+  "internetconnect",
+  "networkconnect",
+  // certificates and keychains: Keychain Access imports them on open (and
+  // Windows' Level-1 list names cer, crt and der for the same reason)
+  "cer",
+  "cert",
+  "crt",
+  "der",
+  "pem",
+  "p7",
+  "p7b",
+  "p7c",
+  "p7m",
+  "p7r",
+  "p7s",
+  "p10",
+  "p12",
+  "pfx",
+  "pkcs12",
+  "keychain",
+  "keychain-db",
   // indirection — the target never passes the scheme gate
   "desktop",
   "lnk",
@@ -474,6 +537,7 @@ const DANGEROUS_EXTENSIONS = new Set([
   "webloc",
   "inetloc",
   "fileloc",
+  "vncloc",
   "afploc",
   "ftploc",
   "mailloc",
@@ -518,7 +582,7 @@ export function refusePath(absolutePath: string, facts: PathFacts | undefined): 
   }
   const extension = extensionOf(absolutePath);
   if (DANGEROUS_EXTENSIONS.has(extension)) {
-    return `the path ends in ".${extension}", which a desktop either RUNS or follows to a target this tool never got to check — "open this" and "run this" are the same gesture to an operating system, so it is refused`;
+    return `the path ends in ".${extension}", which a desktop RUNS, installs, mounts or imports on open, or follows to a target this tool never got to check — "open this" and "run this" are the same gesture to an operating system, so it is refused`;
   }
   if (facts.isFile && isExecutable(facts)) {
     return "the path is an executable file, and asking a desktop to OPEN one is how it gets RUN — this tool refuses, whatever the registered handler would have done";

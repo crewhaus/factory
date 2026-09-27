@@ -1271,6 +1271,55 @@ test("OpenExternal refuses what a desktop would RUN, mode bit or no mode bit", a
   expect(argvSeen[0]?.argv?.[0]).toBe("open");
 });
 
+// C122 residual (attacker review): the commit claimed disk images that mount
+// on open and "the rest of Microsoft's Level-1 list", but .sparseimage,
+// .sparsebundle, .cdr, .sysprefex, .udl, .cer and more were still handed
+// off. These lists are the sources, not this file's own deny-list:
+// Microsoft's published Level-1 attachment list, and the document types
+// macOS's DiskImageMounter, System Settings, Keychain Access and Screen
+// Sharing register (their Info.plist files on macOS 26).
+const MICROSOFT_LEVEL_1 = `ade adp app appcontent-ms application appref-ms asp aspx asx bas bat bgi
+  cab cer chm cmd cnt com cpl crt csh der diagcab exe fxp gadget grp hlp hpj hta htc inf ins iso
+  isp its jar jnlp js jse ksh lnk mad maf mag mam maq mar mas mat mau mav maw mcf mda mdb mde mdt
+  mdw mdz msc msh msh1 msh2 mshxml msh1xml msh2xml msi msp mst msu ops osd pcd pif pl plg prf prg
+  printerexport ps1 ps1xml ps2 ps2xml psc1 psc2 psd1 psdm1 pst py pyc pyo pyw pyz pyzw reg scf
+  scr sct shb shs theme tmp udl url vb vbe vbp vbs vhd vhdx vsmacros vsw webpnp website ws wsb
+  wsc wsf wsh xbap xll xnk`
+  .split(/\s+/)
+  .filter((e) => e !== "");
+const MACOS_HANDLERS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  DiskImageMounter: `dmg udif img toast dvdr cdr dmgpart iso sparseimage asif sparsebundle
+    backupbundle`.split(/\s+/),
+  "System Settings": ["prefpane", "saver", "sysprefex", "internetconnect", "networkconnect"],
+  "Keychain Access": `cer cert crt der keychain keychain-db p10 p12 p7 p7b p7c p7m p7r p7s pem pfx
+    pkcs12`.split(/\s+/),
+  "Screen Sharing": ["vncloc"],
+  Installer: ["pkg", "mpkg"],
+  Themes: ["themepack", "deskthemepack"],
+};
+
+test("OpenExternal refuses Microsoft's Level-1 list in full and what macOS mounts, installs or imports on open", async () => {
+  const names = [...MICROSOFT_LEVEL_1, ...Object.values(MACOS_HANDLERS).flat()];
+  expect(MICROSOFT_LEVEL_1).toHaveLength(123);
+  expect(new Set(names).size).toBeGreaterThan(150);
+  _setFs(memoryFs(() => PLAIN_FILE));
+  const handedOff: string[] = [];
+  for (const platform of ["darwin", "linux", "win32"] as const) {
+    _setPlatform(platform);
+    _setSessionEnv(platform === "linux" ? X11 : HEADLESS_ENV);
+    for (const ext of new Set(names)) {
+      argvSeen = [];
+      const out = JSON.parse(
+        String(await openExternal.execute({ target: `payload.${ext}` } as never)),
+      ) as Record<string, unknown>;
+      if (out["outcome"] !== "refused" || argvSeen.length > 0) handedOff.push(`${platform}:${ext}`);
+    }
+  }
+  expect(handedOff).toEqual([]);
+  _setPlatform("darwin");
+  _setSessionEnv(HEADLESS_ENV);
+});
+
 test("the Windows print path that DOES work carries its values in the environment", async () => {
   _setPlatform("win32");
   const out = JSON.parse(
