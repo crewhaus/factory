@@ -37,7 +37,7 @@ The match runs in a Bun Worker. At the deadline, or when `signal` fires, the wor
 | `matchAll` | Finds every match (`g` implied), up to `maxMatches` | `{ matches, truncated, truncatedBy? }` |
 | `replace` | Replaces with a string replacement, supporting `$&` `$1` `$<n>` `` $` `` `$'` `$$` | `{ output, replacements }` |
 | `split` | Behaves like `String.prototype.split`, captures included | `{ pieces, truncated, truncatedBy? }` |
-| `testEach` | Runs one pattern over many inputs | `{ matched: indexes, scanned, truncated, undetermined }` |
+| `testEach` | Runs one pattern over many inputs: an array, or `{ lines: text }` (the text's `\n`-separated lines) | `{ matched: indexes, scanned, truncated, undetermined }` |
 | `firstMatchingRule` | Runs many patterns over many inputs and finds the first rule that hits each input | `{ ruleIndexes, undetermined }` (-1 = none, null = undetermined) |
 | `testMatrix` | Runs every pattern against every input | `{ matched, undetermined }`, one index list per pattern |
 | `replaceEach` | Runs one `replace` over many inputs; `maxOutputChars` caps all outputs together | `{ outputs, replacements, undetermined }` |
@@ -56,7 +56,7 @@ For warm reuse, open a session: `const s = openRegexSession(); … await s.run(r
 
 - A warm session run costs about **0.02 ms**, or **0.07 ms** under `i`. The pattern's screen is cached after its first run; that first screen costs 0.01–0.3 ms for everyday patterns and at most a few milliseconds (see the screen below).
 - A one-shot `runRegex`, which starts a worker, costs about **2.3 ms**.
-- `testEach` over 10 000 log lines takes **4.3 ms**, against 0.3 ms for a synchronous loop. Most of the difference is copying the inputs to the worker.
+- `testEach` over 10 000 log lines takes **1.8 ms**, or **0.9 ms** given as one text (`inputs: { lines }`, which crosses to the worker in one copy), against 0.2 ms for a synchronous loop. Most of the difference is copying the inputs to the worker.
 
 `runRegex` is a one-run session.
 
@@ -83,7 +83,7 @@ Only `status: "ok"` carries a definite answer. Every other status means the help
 
 JavaScriptCore stops a match after a fixed backtracking budget and returns `null`, the same value as "no match". Measured on Bun 1.3.14, it throws no exception, and it leaves `lastIndex` and `RegExp.lastMatch` exactly as a genuine failure would. This holds under every flag (`"" g y d u v`). **A give-up can't be detected from the return value.**
 
-The only difference is cost. Every give-up measured took 0.4–3 s, while a genuine no-match over the input sizes admitted here takes microseconds to milliseconds. So the worker times every `exec`, and reports a `null` that took at least `giveUpMs` (default 100) as `gave-up`, never as a no-match. This is a heuristic, and it errs in one direction: a genuinely slow no-match is also reported `gave-up`. That outcome is undetermined, which is safe. Every give-up measured was far above the threshold.
+The only difference is cost. Every give-up measured took 0.4–3 s, while a genuine no-match over the input sizes admitted here takes microseconds to milliseconds. So the worker times every `exec`, and reports a `null` that took at least `giveUpMs` (default 100) as `gave-up`, never as a no-match. `testEach` reads the clock once per group of up to 64 inputs, since a clock read costs about as much as matching a short line: a group quicker than `giveUpMs` holds no slow input, and in a slower one each no-match is run again alone and timed. This is a heuristic, and it errs in one direction: a genuinely slow no-match is also reported `gave-up`. That outcome is undetermined, which is safe. Every give-up measured was far above the threshold.
 
 ### The static screen: `screenUserRegex` and `compileUserRegex`
 

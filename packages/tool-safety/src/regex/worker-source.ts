@@ -245,8 +245,8 @@ function Reporter(id, lists) {
   for (var k in lists) this.sent[k] = 0;
   this.last = performance.now();
 }
-Reporter.prototype.tick = function (completed, scalars) {
-  var now = performance.now();
+Reporter.prototype.tick = function (completed, scalars, at) {
+  var now = at === undefined ? performance.now() : at;
   if (now - this.last < progressEveryMs) return;
   var extra = {};
   for (var s in scalars) extra[s] = scalars[s];
@@ -273,24 +273,92 @@ function tryRun(req, re, s) {
   }
 }
 
+/* testEach is the op a search runs over every line of a tree, and a clock
+   read cost about as much as matching a short line (some 60 ns in a worker,
+   Bun 1.3.14 on an Apple-silicon Mac; a million characters of source is
+   some 23 000 lines). So the clock is read once per group of inputs. A group
+   that took less than giveUpMs holds no input that took that long, so each
+   of its no-matches is genuine, by the same rule as timing each one. In a
+   group that took longer, each no-match is run again alone and timed: a
+   give-up repeats, since the engine's budget is the same each time (one
+   that matches the second time is taken as undetermined, never as a miss).
+   A match is a match however long it took. The group starts at one input,
+   shrinks to one after a slow group, and grows (up to MAX_GROUP) only while
+   it takes well under giveUpMs, so a pattern that is slow on many inputs
+   seldom pays for a second run. The lists hold only inputs before the one
+   being decided, as a per-input loop's would, so a progress report (at
+   least once a group) or a give-up never covers more than its count.
+   Inputs may come as one text whose newline-separated lines are the
+   inputs: one string crosses to the worker in a single copy, where an array
+   of many short strings is copied one string at a time. */
+var MAX_GROUP = 64;
+
 function opTestEach(req) {
   var re = new RegExp(req.pattern, req.flags);
-  var inputs = req.inputs;
+  var inputs = typeof req.lines === "string" ? req.lines.split("\\n") : req.inputs;
   var matched = [];
   var undetermined = [];
   var report = new Reporter(req.id, { matched: matched, undetermined: undetermined });
   var truncated = false;
+  /* Every input before i is decided, and only those are listed. */
   var i = 0;
+  var stop = inputs.length;
+  /* Start small, so an early match is reported before a slow stretch. */
+  var size = 1;
+  /* The inputs of the current group that matched, in order. */
+  var hits = [];
   try {
-    for (; i < inputs.length; i++) {
-      var m = tryRun(req, re, inputs[i]);
-      if (m === undefined) {
-        undetermined.push(i);
-      } else if (m !== null) {
-        if (matched.length >= req.maxMatches) { truncated = true; break; }
-        matched.push(i);
+    while (i < stop) {
+      var end = Math.min(stop, i + size);
+      hits.length = 0;
+      var t0 = performance.now();
+      for (var k = i; k < end; k++) {
+        if (inputs[k].length > req.maxItemChars) continue;
+        re.lastIndex = 0;
+        if (re.test(inputs[k])) {
+          if (matched.length + hits.length >= req.maxMatches) { truncated = true; stop = end = k; break; }
+          hits.push(k);
+        }
       }
-      report.tick(i + 1);
+      var t1 = performance.now();
+      var slow = t1 - t0 >= giveUpMs;
+      /* A group of one was timed alone already. */
+      var alone = end - i === 1;
+      var h = 0;
+      for (; i < end; i++) {
+        var s = inputs[i];
+        if (s.length > req.maxItemChars) {
+          if (!req.skip) throw new TooLarge("item");
+          undetermined.push(i);
+        } else if (h < hits.length && hits[h] === i) {
+          matched.push(i);
+          h++;
+        } else if (slow) {
+          var ms = t1 - t0;
+          var hit = false;
+          if (!alone) {
+            re.lastIndex = 0;
+            var a = performance.now();
+            hit = re.test(s);
+            ms = performance.now() - a;
+          }
+          if (hit || ms >= giveUpMs) {
+            if (!req.skip) throw new GaveUp(ms);
+            undetermined.push(i);
+          }
+          report.tick(i + 1);
+        }
+      }
+      /* Keep a group well under giveUpMs, so slow inputs are rarely run twice. */
+      var took = t1 - t0;
+      size = slow
+        ? 1
+        : took * 4 >= giveUpMs
+          ? Math.max(1, size >> 1)
+          : took * 16 < giveUpMs
+            ? Math.min(MAX_GROUP, size * 2)
+            : size;
+      report.tick(i, undefined, t1);
     }
   } catch (e) {
     if (e instanceof GaveUp) {

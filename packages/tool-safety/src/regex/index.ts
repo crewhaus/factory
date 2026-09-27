@@ -18,6 +18,7 @@ export {
 export {
   type FirstMatchingRuleRequest,
   type FirstMatchingRuleResult,
+  type LineBlock,
   type MatchAllRequest,
   type MatchAllResult,
   type OnGiveUp,
