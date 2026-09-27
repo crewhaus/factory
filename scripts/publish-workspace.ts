@@ -41,17 +41,20 @@
  *   bun scripts/publish-workspace.ts --dry-run                  # plan only
  *   bun scripts/publish-workspace.ts --filter @crewhaus/errors  # canary a leaf first
  *   bun scripts/publish-workspace.ts                            # full run
- *   bun scripts/publish-workspace.ts --dry-run --no-registry    # offline pack check (CI)
+ *   bun scripts/publish-workspace.ts --dry-run --no-registry    # pack check, no registry (CI)
  *
- * Every form except --no-registry needs `npm` on PATH (checked once, up front)
- * and a registry that answers (the ownership guard below will not guess), and
- * every form needs a tree already stamped by `release-prep.ts --for-publish` (an
- * unstamped one fails the manifest check).
+ * Every form needs `npm` on PATH (checked once, up front): npm itself says what
+ * each tarball would carry. Every form except --no-registry also needs a
+ * registry that answers (the ownership guard below will not guess), and every
+ * form needs a tree already built (`bun run build`) and stamped by
+ * `release-prep.ts --for-publish` (an unstamped one fails the manifest check).
  *
  * After a failed run, fix the cause and re-run WITHOUT --filter: versions already
  * on the registry are skipped and everything the failure held back goes out.
  * `--filter <leaf>` would publish the leaf alone and exit 0 with its dependents
- * still missing. The summary of a failed run says this.
+ * still missing. The summary of a failed run says this. A --filter run looks up
+ * every dependency outside the run on the registry, down its whole closure (for
+ * the CLI, nearly every package); those lookups run a few at a time.
  *
  * Brand-new package names can 404 on the registry for a few minutes after a
  * successful publish — poll before assuming failure or re-running.
@@ -78,18 +81,22 @@
  * whose dependency is not is reported as not installable and fails the run.
  * Under --dry-run the plan shows the same cascade.
  *
- * Packed-contents check: before publishing (and under --dry-run), the package
- * dir must hold what its tarball is supposed to carry — every entry point and
- * literal `files` entry, plus README.md, LICENSE and NOTICE (release-prep
- * --for-publish puts the last three there). npm packs a missing `files` entry
- * as nothing, silently, and the same for a symlinked entry or a `name/` entry
- * that is not a directory; each is refused here.
+ * Packed-contents check: before publishing (and under --dry-run), npm is asked
+ * what each tarball would hold (`npm pack --dry-run --json`, from the package
+ * dir, as `npm publish` packs it), and that list must carry every entry point,
+ * every literal `files` entry, and README.md, LICENSE and NOTICE (release-prep
+ * --for-publish puts the last three there). npm drops a file without a word
+ * for many reasons — a missing or symlinked entry, a symlinked directory on the
+ * way, an ignore file under the package, a `!` entry, a spelling one npm major
+ * reads and another does not — so the list, not a reading of the manifest, is
+ * the verdict; the directory is only read to say why something is missing.
+ * CI and the release run the same npm line, so they get the same answer.
  */
 
 import { spawnSync } from "node:child_process";
 import { existsSync, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
-import { preflight } from "../packages/tool-pkg/src/lib/preflight";
+import { join, relative, resolve } from "node:path";
+import { entryPoints, preflight, wouldInclude } from "../packages/tool-pkg/src/lib/preflight";
 
 type PkgInfo = {
   name: string;
@@ -321,6 +328,109 @@ function registryState(name: string, version: string): RegistryState {
   return versionState(npmView([`${name}@${version}`, "version"]));
 }
 
+/** How many npm processes run at once when listing tarballs or asking the registry. */
+const NPM_POOL = 8;
+
+/** `fn` over every item, at most `limit` at a time; results in input order. */
+export async function mapPool<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+/** `npm <args>` without blocking, so several can run at once. */
+async function npmAsync(args: readonly string[], cwd?: string): Promise<ViewResult> {
+  let proc: ReturnType<typeof Bun.spawn<"ignore", "pipe", "pipe">>;
+  try {
+    proc = Bun.spawn(["npm", ...args], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  } catch (err) {
+    // Bun throws, rather than exits, for a command it cannot start.
+    const e = err as { code?: string; message?: string };
+    return {
+      status: undefined,
+      stdout: "",
+      stderr: "",
+      error: { code: e.code, message: e.message ?? String(err) },
+    };
+  }
+  const [stdout, stderr, status] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  const signal = proc.signalCode ?? null;
+  return { status: signal === null ? status : null, stdout, stderr, signal };
+}
+
+/** What npm says a package's tarball would hold, or why it could not say. */
+export type PackList =
+  | { readonly ok: true; readonly paths: readonly string[] }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * The file list for package `name` out of `npm pack --dry-run --json`. npm 8 to
+ * 11 print an array with one result per package, npm 12 an object keyed by
+ * package name, and npm 7 prints no JSON for pack at all. Output that is not
+ * one of those is a reason, never an empty list: "npm said nothing" must not
+ * read as "the tarball is empty" (or as "it holds everything").
+ */
+export function parsePackJson(stdout: string, name: string): PackList {
+  let json: unknown;
+  try {
+    json = JSON.parse(stdout);
+  } catch {
+    return { ok: false, reason: "npm pack --json printed no JSON (npm before 8 has none)" };
+  }
+  const results: unknown[] = Array.isArray(json)
+    ? json
+    : json !== null && typeof json === "object"
+      ? Object.values(json)
+      : [];
+  const mine = results.filter(
+    (r) => r !== null && typeof r === "object" && (r as { name?: unknown }).name === name,
+  );
+  const files = mine.length === 1 ? (mine[0] as { files?: unknown }).files : undefined;
+  if (
+    !Array.isArray(files) ||
+    !files.every((f) => typeof (f as { path?: unknown } | null)?.path === "string")
+  ) {
+    return { ok: false, reason: `npm pack --json gave no file list for ${name}` };
+  }
+  return { ok: true, paths: files.map((f) => (f as { path: string }).path) };
+}
+
+/**
+ * Ask npm what it would pack for the package in `dir`, from that dir, as
+ * `npm publish` does. `--ignore-scripts`: no package here has a pack-time
+ * script, and a dry run must not run one; if one ever adds files, they read as
+ * missing here, which refuses rather than ships.
+ */
+export async function npmPackList(dir: string, name: string): Promise<PackList> {
+  const r = await npmAsync(["pack", "--dry-run", "--json", "--ignore-scripts"], dir);
+  const spawn = spawnProblem(r);
+  if (spawn !== undefined) return { ok: false, reason: spawn };
+  if (r.status !== 0) {
+    const code = npmErrorCode(r.stdout, r.stderr);
+    const line = r.stderr.match(/^npm (?:error|ERR!) (?!code )(.+)$/m)?.[1]?.trim();
+    return {
+      ok: false,
+      reason: `npm pack exited ${r.status}${code ? ` with code ${code}` : ""}${line ? `: ${line}` : ""}`,
+    };
+  }
+  return parsePackJson(r.stdout, name);
+}
+
 /** Normalize a repository URL for comparison: lowercase, strip git+ / .git. */
 function normRepoUrl(url: string | undefined): string {
   return (url ?? "")
@@ -375,7 +485,7 @@ function ownershipMismatch(p: PkgInfo): string | null {
 
 type PublishResult = "ok" | "already" | "failed";
 
-function publish(p: PkgInfo): PublishResult {
+function publish(p: PkgInfo, pack: PackList): PublishResult {
   console.log(`\n→ publishing ${p.name}@${p.version}`);
   // Checked BEFORE the dry-run early-return, like the ownership guard above: a
   // manifest that would install broken is exactly what a pre-flight is for, and
@@ -385,10 +495,17 @@ function publish(p: PkgInfo): PublishResult {
     console.error(`✗ ${p.name}: ${manifestErr}`);
     return "failed";
   }
-  const packErrs = packedContentsProblems(
-    p.dir,
-    readJson<Record<string, unknown>>(join(p.dir, "package.json")),
-  );
+  // An unbuilt dist/ lands here too (its entry points are not in the tarball),
+  // with the hint to build: it used to have a guard of its own further down.
+  const packErrs = pack.ok
+    ? packedContentsProblems(
+        p.dir,
+        readJson<Record<string, unknown>>(join(p.dir, "package.json")),
+        pack.paths,
+      )
+    : [
+        `could not list what npm would pack (${pack.reason}) — refusing, since nothing says what it would carry`,
+      ];
   if (packErrs.length > 0) {
     for (const e of packErrs) console.error(`✗ ${p.name} (${relative(ROOT, p.dir)}): ${e}`);
     return "failed";
@@ -396,20 +513,6 @@ function publish(p: PkgInfo): PublishResult {
   if (DRY) {
     console.log("  (dry-run, skipping)");
     return "ok";
-  }
-  // Guard: when release-prep --for-publish has flipped entrypoints to dist/, the build
-  // must have run first. If the dist entrypoint is missing, `bun publish` would pack a
-  // tarball with no JS (just README/LICENSE) and ship a broken package — fail loudly.
-  const pj = readJson<{ main?: string }>(join(p.dir, "package.json"));
-  if (
-    typeof pj.main === "string" &&
-    pj.main.startsWith("dist/") &&
-    !existsSync(join(p.dir, pj.main))
-  ) {
-    console.error(
-      `✗ ${p.name}: main="${pj.main}" but ${join(p.dir, pj.main)} is missing — run \`bun run build\` before publishing.`,
-    );
-    return "failed";
   }
   // Capture output so we can recognize "already published" as success.
   // `npm publish`, not `bun publish`: only the npm CLI can do the OIDC trusted-
@@ -477,27 +580,32 @@ function checkPublishableManifest(p: PkgInfo): string | undefined {
 /** Files every published package carries. release-prep --for-publish puts them there. */
 const REQUIRED_FILES = ["README.md", "LICENSE", "NOTICE"] as const;
 
-function isRegularFile(path: string): boolean {
-  try {
-    return lstatSync(path).isFile();
-  } catch {
-    return false;
-  }
-}
+/** preflight() rules whose verdict comes from npm's own list here, not from reading `files`. */
+const NPM_DECIDES = new Set(["entry-missing", "entry-excluded"]);
+
+/** A `files` entry as npm reads its path: `./x` and `/x` are x at the package root. */
+const filesPath = (entry: string): string => entry.replace(/^\.?\/+/, "").replace(/\/+$/, "");
 
 /**
  * What the tarball of the package in `dir` would be missing, as messages; empty
- * when it carries everything it declares. npm packs a missing `files` entry as
- * nothing, without a word, so this is the only place it gets noticed.
+ * when it carries everything it declares. `packed` is npm's own list of what it
+ * would pack (see npmPackList), and it is the verdict: every entry point, every
+ * literal `files` entry, and README.md, LICENSE and NOTICE must be in it. npm
+ * leaves a file out without a word — a missing or symlinked entry, a symlinked
+ * directory on the way, an ignore file, a `!` entry, a spelling one npm major
+ * reads and another does not — so only its list can say. The directory is read
+ * afterwards, to say why something is missing.
  *
- * The rules shared with the PackagePreflight tool (entry points that do not exist
- * or that `files` does not cover, unpublishable ranges, secrets that would ship)
- * come from @crewhaus/tool-pkg's preflight(); its blocking findings block here.
- * On top of that, every literal `files` entry must exist, and README.md, LICENSE
- * and NOTICE must be regular files (npm leaves a symlink out) — NOTICE listed in
- * `files` too, since npm adds README and LICENSE by itself but never NOTICE.
+ * The other rules shared with the PackagePreflight tool (unpublishable ranges,
+ * secrets that would ship) come from @crewhaus/tool-pkg's preflight(); its
+ * blocking findings block here, except its reading of whether `files` covers an
+ * entry point, which is an approximation npm's list replaces.
  */
-export function packedContentsProblems(dir: string, manifest: Record<string, unknown>): string[] {
+export function packedContentsProblems(
+  dir: string,
+  manifest: Record<string, unknown>,
+  packed: readonly string[],
+): string[] {
   const report = preflight(manifest, {
     exists: (rel) => existsSync(join(dir, rel)),
     isDirectory: (rel) => {
@@ -508,60 +616,124 @@ export function packedContentsProblems(dir: string, manifest: Record<string, unk
       }
     },
   });
-  const problems = report.blocking.map((b) => b.message);
-  for (const f of REQUIRED_FILES) {
-    if (!isRegularFile(join(dir, f))) {
-      problems.push(
-        `${f} is missing or not a regular file — run \`release-prep.ts --for-publish\`, which puts README.md, LICENSE and NOTICE into every package`,
-      );
-    }
-  }
+  const problems = report.blocking.filter((b) => !NPM_DECIDES.has(b.id)).map((b) => b.message);
   const files = Array.isArray(manifest.files)
     ? (manifest.files as unknown[]).filter((f): f is string => typeof f === "string")
     : null;
-  if (files !== null) {
-    for (const entry of files) {
-      // npm reads `./x` and `/x` as x at the package root, and `x/` as "x, if it
-      // is a directory" (gitignore rules): `NOTICE/` packs no NOTICE.
-      const dirOnly = entry.endsWith("/");
-      const e = entry.replace(/^\.?\/+/, "").replace(/\/+$/, "");
-      // Globs and negations are npm's to expand; the required files are checked
-      // above (npm adds README and LICENSE whatever `files` says).
-      if (e === "" || /[*?[\]{}!]/.test(e)) continue;
-      if (!dirOnly && (REQUIRED_FILES as readonly string[]).includes(e)) continue;
-      const why = literalEntryProblem(join(dir, e), dirOnly);
-      if (why !== undefined) {
-        problems.push(`"files" lists "${entry}", ${why}`);
-      }
-    }
-    // Only these spellings pack NOTICE (checked against real npm pack in the tests).
-    if (!files.some((e) => /^(?:\.?\/)?NOTICE$/.test(e))) {
-      problems.push('"files" does not list NOTICE — npm packs NOTICE only when `files` names it');
-    }
+  const exact = new Set(packed);
+  const inTarball = (rel: string) => exact.has(rel) || packed.some((p) => p.startsWith(`${rel}/`));
+  let unbuilt = false;
+  const mustCarry = (what: string, rel: string, dirOnly = false): void => {
+    if (rel === "" || inTarball(rel)) return;
+    const why = whyLeftOut(dir, rel, files, dirOnly);
+    if (why.absent && /^dist(?:\/|$)/.test(rel)) unbuilt = true;
+    problems.push(`${what} is not in the tarball npm would publish: ${why.reason}`);
+  };
+  for (const entry of entryPoints(manifest)) {
+    // A subpath pattern (`./dist/*.js`) names no one file.
+    if (!entry.includes("*")) mustCarry(`entry point "${entry}"`, entry);
+  }
+  for (const entry of files ?? []) {
+    const rel = filesPath(entry);
+    // Negations and globs are npm's to expand: what they must cover is checked
+    // as an entry point. A required file is checked below, once.
+    if (entry.startsWith("!") || /[*?[\]{}]/.test(rel)) continue;
+    const dirOnly = entry.endsWith("/");
+    if (!dirOnly && (REQUIRED_FILES as readonly string[]).includes(rel)) continue;
+    mustCarry(`"files" entry "${entry}"`, rel, dirOnly);
+  }
+  for (const f of REQUIRED_FILES) mustCarry(f, f);
+  if (unbuilt) {
+    problems.push(
+      "dist/ is not built — run `bun run build` (tsc -b) before `release-prep.ts --for-publish`",
+    );
   }
   return problems;
 }
 
 /**
- * Why npm would pack nothing for a literal `files` entry at `path`, or undefined
- * when it packs it. npm lstat()s the entry: a regular file or a directory is
- * packed, a symlink (to anything) or special file is left out, and an entry with
- * a trailing slash matches only a directory.
+ * Why npm left `rel` out of a package's tarball, as far as the package dir
+ * shows; `absent` when the path is simply not there. Only asked once npm's list
+ * lacks it, so this is a diagnosis, not a verdict. It walks from the package
+ * root, the way npm lstat()s its way down: a component that is not there, a
+ * symlink (npm packs nothing for one and nothing through one), a trailing slash
+ * on something that is not a directory. When the path is there and plain, it
+ * names what can drop a file that exists.
  */
-function literalEntryProblem(path: string, dirOnly: boolean): string | undefined {
-  const nothing = "npm would pack nothing for it";
-  let st: ReturnType<typeof lstatSync>;
-  try {
-    st = lstatSync(path);
-  } catch {
-    return `which is not there — ${nothing}`;
+function whyLeftOut(
+  dir: string,
+  rel: string,
+  files: readonly string[] | null,
+  dirOnly: boolean,
+): { readonly absent: boolean; readonly reason: string } {
+  const release = (REQUIRED_FILES as readonly string[]).includes(rel)
+    ? " — run `release-prep.ts --for-publish`, which puts README.md, LICENSE and NOTICE into every package"
+    : "";
+  const parts = rel.split("/").filter((s) => s !== "");
+  for (let i = 1; i <= parts.length; i++) {
+    const sub = parts.slice(0, i).join("/");
+    const leaf = i === parts.length;
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(join(dir, sub));
+    } catch {
+      return { absent: true, reason: `${leaf ? "it" : `"${sub}"`} is not there${release}` };
+    }
+    if (st.isSymbolicLink()) {
+      return {
+        absent: false,
+        reason: leaf
+          ? "it is a symlink, and npm packs nothing for one"
+          : `"${sub}" is a symlink, and npm packs nothing through one`,
+      };
+    }
+    if (!leaf && !st.isDirectory()) {
+      return { absent: true, reason: `"${sub}" is not a directory` };
+    }
+    if (leaf && dirOnly && !st.isDirectory()) {
+      return {
+        absent: false,
+        reason: 'it is not a directory, and a trailing slash in "files" matches only a directory',
+      };
+    }
+    if (leaf && !st.isDirectory() && !st.isFile()) {
+      return { absent: false, reason: "it is not a regular file or directory" };
+    }
+    if (leaf && st.isDirectory() && readdirSync(join(dir, sub)).length === 0) {
+      return { absent: false, reason: "it is an empty directory" };
+    }
   }
-  if (st.isSymbolicLink()) return `which is a symlink — ${nothing}`;
-  if (st.isDirectory()) return undefined;
-  if (dirOnly) {
-    return `which is not a directory — a trailing slash matches only a directory, so ${nothing}`;
+  const look: string[] = [];
+  if (files !== null) {
+    const names = files.filter((f) => !f.startsWith("!") && filesPath(f) === rel);
+    if (rel === "NOTICE" && names.length === 0) {
+      // npm adds README and LICENSE whatever `files` says, but never NOTICE.
+      return { absent: false, reason: '"files" does not name it, and npm packs NOTICE only then' };
+    }
+    // tool-pkg's reading of `files` is exact only for literal entries: its `*`
+    // never crosses a `/`, so with a glob in the list it is no hint at all.
+    const literal = files.every((f) => !/[*?[\]{}]/.test(f));
+    if (literal && rel !== "NOTICE" && names.length === 0 && !wouldInclude(files, rel)) {
+      look.push('"files" (no entry covers it)');
+    }
+    for (const f of names) {
+      if (f !== rel) {
+        look.push(`the "files" entry "${f}" (not every npm reads that spelling; write "${rel}")`);
+      }
+    }
+    for (const f of files) if (f.startsWith("!")) look.push(`the "files" entry "${f}"`);
   }
-  return st.isFile() ? undefined : `which is not a regular file or directory — ${nothing}`;
+  // Ignore files npm reads on the way down (and inside, for a directory).
+  for (let i = 0; i <= parts.length; i++) {
+    const at = parts.slice(0, i).join("/");
+    for (const f of [".npmignore", ".gitignore"]) {
+      if (existsSync(join(dir, at, f))) look.push(at === "" ? f : `${at}/${f}`);
+    }
+  }
+  return {
+    absent: false,
+    reason: look.length > 0 ? `npm leaves it out; look at ${look.join(", ")}` : "npm leaves it out",
+  };
 }
 
 /** What the dependency gate knows when it looks at a package. */
@@ -623,6 +795,31 @@ export function unmetDependencies(
 }
 
 /**
+ * Every `<name>@<version>` unmetDependencies() may ask the registry about for
+ * these packages: each dependency outside the run and its whole closure, at the
+ * dependent's version, once each. Empty for a full run (every dependency is in
+ * it). Asked up front, a few at a time, it costs a `--filter crewhaus` run
+ * seconds instead of one sequential lookup per package in the closure.
+ */
+export function outsideClosure(
+  pkgs: readonly Pick<PkgInfo, "deps" | "version">[],
+  inRun: ReadonlySet<string>,
+  depsOf: (name: string) => readonly string[],
+): { readonly name: string; readonly version: string }[] {
+  const out: { name: string; version: string }[] = [];
+  const seen = new Set<string>();
+  const visit = (name: string, version: string): void => {
+    const key = `${name}@${version}`;
+    if (inRun.has(name) || seen.has(key)) return;
+    seen.add(key);
+    out.push({ name, version });
+    for (const next of depsOf(name)) visit(next, version);
+  };
+  for (const p of pkgs) for (const d of p.deps) visit(d, p.version);
+  return out;
+}
+
+/**
  * What to do after a failed run. A full re-run is what finishes a release: it
  * skips every version already on the registry and publishes what the failure
  * held back. `--filter <name>` publishes that one package and nothing that
@@ -637,26 +834,26 @@ export function rerunAdvice(filter: string | undefined): string {
 }
 
 // ─── main ──────────────────────────────────────────────────────────────────
-function main(): void {
+async function main(): Promise<void> {
+  if (NO_REGISTRY && !DRY) {
+    console.error("✗ --no-registry is a --dry-run option: a real publish must check the registry.");
+    process.exit(1);
+  }
+  // Once, up front: without a working npm every package below would be refused
+  // with a complaint that is not the reason. Every form needs it, --no-registry
+  // too: npm is what says what each tarball would carry.
+  const probe = toViewResult(spawnSync("npm", ["--version"], { encoding: "utf-8" }));
+  const why =
+    spawnProblem(probe) ??
+    (probe.status === 0 ? undefined : `npm --version exited ${probe.status}`);
+  if (why !== undefined) {
+    console.error(
+      `✗ ${why}. Every run needs npm on PATH: it is what says what each tarball would carry.`,
+    );
+    process.exit(1);
+  }
   if (NO_REGISTRY) {
-    if (!DRY) {
-      console.error(
-        "✗ --no-registry is a --dry-run option: a real publish must check the registry.",
-      );
-      process.exit(1);
-    }
     console.log("Registry not consulted (--no-registry): ownership is NOT checked.");
-  } else {
-    // Once, up front: without a working npm every package below would be refused
-    // with a registry complaint that is not the reason.
-    const probe = toViewResult(spawnSync("npm", ["--version"], { encoding: "utf-8" }));
-    const why =
-      spawnProblem(probe) ??
-      (probe.status === 0 ? undefined : `npm --version exited ${probe.status}`);
-    if (why !== undefined) {
-      console.error(`✗ ${why}. Every run except --dry-run --no-registry needs npm on PATH.`);
-      process.exit(1);
-    }
   }
   // `npm whoami` is a TOKEN identity check and there is no equivalent under OIDC:
   // trusted publishing mints a short-lived, package-scoped credential during
@@ -724,6 +921,21 @@ function main(): void {
     },
     depsOf: (name) => byName.get(name)?.deps ?? [],
   };
+  // Registry lookups the dependency gate will make (under --filter, a whole
+  // closure), asked a few at a time now rather than one by one in the loop.
+  if (!NO_REGISTRY) {
+    const ahead = outsideClosure(filtered, gate.inRun, gate.depsOf);
+    const states = await mapPool(ahead, NPM_POOL, async ({ name, version }) =>
+      versionState(await npmAsync(["view", `${name}@${version}`, "version"])),
+    );
+    ahead.forEach(({ name, version }, i) => {
+      registryMemo.set(`${name}@${version}`, states[i] as RegistryState);
+    });
+  }
+  // What npm would pack for each package, asked before anything is published.
+  console.log(`Asking npm what it would pack for ${filtered.length} package(s)...`);
+  const packLists = await mapPool(filtered, NPM_POOL, (p) => npmPackList(p.dir, p.name));
+  const packOf = new Map(filtered.map((p, i) => [p.name, packLists[i] as PackList]));
   const fail = (p: PkgInfo, entry: string) => {
     failures.push(entry);
     unavailable.add(p.name);
@@ -770,7 +982,10 @@ function main(): void {
       );
       continue;
     }
-    const result = publish(p);
+    const result = publish(
+      p,
+      packOf.get(p.name) ?? { ok: false, reason: "npm was not asked about this package" },
+    );
     if (result === "ok") {
       published++;
     } else if (result === "already") {
@@ -797,4 +1012,4 @@ function main(): void {
   }
 }
 
-if (import.meta.main) main();
+if (import.meta.main) await main();

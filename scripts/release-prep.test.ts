@@ -315,6 +315,63 @@ test("every publishable manifest is stamped with the root's engines.bun, on both
   }
 }, 30_000);
 
+test("a package's own engines.bun is kept when it asks for a newer Bun, and raised when it is older", () => {
+  for (const mode of [[], ["--for-publish"]]) {
+    const { tmp, root } = makeRoot({ engines: { bun: ">=1.2.0" }, biome: true });
+    try {
+      const pkg = (dir: string, engines: Record<string, string>) =>
+        addPkg(root, dir, { name: `@crewhaus/${dir}`, version: "0.0.0", engines });
+      // It uses an API from a newer Bun: stamping the root's range would claim
+      // it runs where it does not.
+      const newer = pkg("newer", { bun: ">=1.3" });
+      // Stamped before the root was raised: it rises with the root.
+      const older = pkg("older", { bun: ">= 1.1.9", node: ">=22" });
+      const same = pkg("same", { bun: ">=1.2.0" });
+      const r = runPrep(root, ...mode);
+      expect(r.exitCode).toBe(0);
+      expect(readPkg(newer).engines).toEqual({ bun: ">=1.3" });
+      expect(readPkg(older).engines).toEqual({ bun: ">=1.2.0", node: ">=22" });
+      expect(readPkg(same).engines).toEqual({ bun: ">=1.2.0" });
+      if (mode.length > 0) {
+        // The generated README states the range the manifest does.
+        expect(readFileSync(join(newer, "README.md"), "utf8")).toContain(
+          "Bun](https://bun.sh) `>=1.3`; plain Node is not supported.",
+        );
+        expect(readFileSync(join(older, "README.md"), "utf8")).toContain(
+          "Bun](https://bun.sh) `>=1.2.0`; plain Node is not supported.",
+        );
+      }
+      // And a second run leaves both where they are.
+      const again = runPrep(root, ...mode);
+      expect(again.exitCode).toBe(0);
+      expect(again.stdout).toContain("Updated: 0");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+}, 60_000);
+
+test("a package engines.bun that cannot be ordered against the root's is refused, named, before anything is written", () => {
+  const { tmp, root } = makeRoot({ biome: true });
+  try {
+    const plain = { name: "@crewhaus/aa-plain", version: "0.0.0" };
+    const caret = { name: "@crewhaus/caret", version: "0.0.0", engines: { bun: "^1.3.0" } };
+    const plainDir = addPkg(root, "aa-plain", plain);
+    const caretDir = addPkg(root, "caret", caret);
+    const r = runPrep(root, "--for-publish");
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("cannot stamp engines.bun (nothing was written)");
+    expect(r.stderr).toContain(
+      `packages/caret/package.json: engines.bun is "^1.3.0" but the root's is ">=1.2.0"`,
+    );
+    expect(readPkg(plainDir)).toEqual(plain);
+    expect(readPkg(caretDir)).toEqual(caret);
+    expect(existsSync(join(plainDir, "LICENSE"))).toBe(false);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("a root package.json without engines.bun is refused, before anything is written", () => {
   const { tmp, root } = makeRoot({ engines: null });
   try {

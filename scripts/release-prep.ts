@@ -22,8 +22,9 @@
  * scope. After writing, the touched files are re-run through biome so the
  * bump commits lint-clean.
  *
- * Every publishable manifest is stamped with the workspace root's `engines.bun`:
- * the libraries run on Bun only, and the manifest should say so. `--for-publish`
+ * Every publishable manifest is stamped with the workspace root's `engines.bun`
+ * (or its own, when that asks for a newer Bun): the libraries run on Bun only,
+ * and the manifest should say so. `--for-publish`
  * also copies the root LICENSE and NOTICE into every publishable package (npm
  * packs a `files` entry only when the file is there, and skips a missing one
  * silently) and writes a short README.md where a package has none.
@@ -130,6 +131,40 @@ const ROOT_BUN_ENGINE = (() => {
   }
   return bun;
 })();
+
+/** A bare lower bound (`>=1.2`, `>= 1.2.3`): the one range shape two of can be ordered. */
+const LOWER_BOUND = /^>=\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?$/;
+
+function lowerBound(range: string): string | undefined {
+  const m = range.trim().match(LOWER_BOUND);
+  return m ? `${m[1]}.${m[2] ?? 0}.${m[3] ?? 0}` : undefined;
+}
+
+/**
+ * The engines.bun a package is stamped with: the stricter of its own and the
+ * root's. A package that needs a newer Bun than the rest (it calls a newer API)
+ * keeps saying so; one stamped by an earlier run, before the root was raised, is
+ * raised with it. Only bare `>=` bounds can be ordered here, so any other range
+ * that differs from the root's is refused rather than overwritten either way.
+ */
+function stampedBunEngine(
+  own: unknown,
+  root: string,
+): { readonly ok: true; readonly range: string } | { readonly ok: false; readonly reason: string } {
+  if (own === undefined || own === root) return { ok: true, range: root };
+  if (typeof own !== "string") {
+    return { ok: false, reason: `engines.bun is ${JSON.stringify(own)}, not a version range` };
+  }
+  const mine = lowerBound(own);
+  const theirs = lowerBound(root);
+  if (mine === undefined || theirs === undefined) {
+    return {
+      ok: false,
+      reason: `engines.bun is "${own}" but the root's is "${root}", and only ">=x.y.z" ranges can be compared — make it ">=x.y.z" or remove it`,
+    };
+  }
+  return { ok: true, range: Bun.semver.order(mine, theirs) > 0 ? own : root };
+}
 
 /** Root files every published package carries (Apache-2.0 §4(a) and §4(d)). */
 const LEGAL_FILES = ["LICENSE", "NOTICE"] as const;
@@ -302,12 +337,15 @@ function applyRelease(pkg: Json, pkgDir: string, isRoot: boolean): boolean {
   // publishConfig
   set("publishConfig", { access: ACCESS });
 
-  // engines: the runtime the package needs, from the workspace root. Stamped on the
-  // committed tree too (not only --for-publish): the src/*.ts entrypoints are Bun-only
-  // as well. Any other engine a package declares is kept.
+  // engines: the runtime the package needs — the root's Bun range, or the package's
+  // own when it asks for a newer Bun. Stamped on the committed tree too (not only
+  // --for-publish): the src/*.ts entrypoints are Bun-only as well. Any other engine
+  // a package declares is kept. The pre-pass in main refused a range that cannot
+  // be ordered against the root's, before anything was written.
   const engines =
     pkg.engines !== null && typeof pkg.engines === "object" ? (pkg.engines as Json) : {};
-  set("engines", { ...engines, bun: ROOT_BUN_ENGINE });
+  const bun = stampedBunEngine(engines.bun, ROOT_BUN_ENGINE);
+  set("engines", { ...engines, bun: bun.ok ? bun.range : ROOT_BUN_ENGINE });
 
   // files (default to src + README + LICENSE; respect existing if present)
   if (pkg.files === undefined) {
@@ -415,8 +453,11 @@ function generatedReadme(pkg: Json, relDir: string): string {
       "",
     );
   }
+  // The range this package was stamped with (applyRelease ran first), which may be
+  // newer than the root's.
+  const bun = (pkg.engines as Json | undefined)?.bun;
   out.push(
-    `Requires [Bun](https://bun.sh) \`${ROOT_BUN_ENGINE}\`; plain Node is not supported.`,
+    `Requires [Bun](https://bun.sh) \`${typeof bun === "string" ? bun : ROOT_BUN_ENGINE}\`; plain Node is not supported.`,
     "",
   );
   out.push(`[Source](${HOMEPAGE_BASE}/tree/main/${relDir})`, "");
@@ -486,6 +527,29 @@ if (FOR_PUBLISH) {
     console.error(
       `✗ --for-publish copies the root ${LEGAL_FILES.join(" and ")} into every published package, but ${ROOT} has no ${missing.join(" or ")} (as a regular file).`,
     );
+    process.exit(1);
+  }
+}
+
+// Refuse before stamping anything: a package's own engines.bun that cannot be
+// ordered against the root's would otherwise be overwritten one way or the other.
+{
+  const unorderable: string[] = [];
+  for (const dir of pkgDirs) {
+    let pkg: Json;
+    try {
+      pkg = readJson(join(dir, "package.json"));
+    } catch {
+      continue; // the loop below reports an unreadable manifest
+    }
+    if (!isPublishableName(pkg.name)) continue;
+    const engines = pkg.engines !== null && typeof pkg.engines === "object" ? pkg.engines : {};
+    const bun = stampedBunEngine((engines as Json).bun, ROOT_BUN_ENGINE);
+    if (!bun.ok) unorderable.push(`${relative(ROOT, join(dir, "package.json"))}: ${bun.reason}`);
+  }
+  if (unorderable.length > 0) {
+    console.error("✗ cannot stamp engines.bun (nothing was written):");
+    for (const u of unorderable) console.error(`  ${u}`);
     process.exit(1);
   }
 }
