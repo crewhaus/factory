@@ -7,6 +7,7 @@ import { canonicalFunction } from "@crewhaus/tool-onchain";
 import {
   type AbiItem,
   ContractToolError,
+  type SkippedFunction,
   type WriteExecutor,
   generateContractTools,
 } from "./index";
@@ -527,7 +528,7 @@ describe("an ABI either becomes tools that each mean one thing, or is refused (C
     );
   });
 
-  test("the same function listed twice, or a type no encoder knows, is refused by name", () => {
+  test("a function listed twice alike is one function; twice differently, neither", () => {
     const generate = (abi: ReadonlyArray<AbiItem>) => () =>
       generateContractTools({
         contract: NFT,
@@ -535,9 +536,23 @@ describe("an ABI either becomes tools that each mean one thing, or is refused (C
         readExecutor: async () => "0x",
         writeExecutor: async () => "{}",
       });
-    expect(generate([SAFE_TRANSFER_3, SAFE_TRANSFER_3])).toThrow(
-      /the ABI lists the same function twice/,
+    // A merged ABI repeats an entry: it is one function, not an overload.
+    const once = generate([SAFE_TRANSFER_3, { ...SAFE_TRANSFER_3 }])();
+    expect(once.map((t) => t.name)).toEqual(["nft__safeTransferFrom"]);
+    // The same signature as a view and as a write: which is true cannot be told.
+    expect(generate([SAFE_TRANSFER_3, { ...SAFE_TRANSFER_3, stateMutability: "view" }])).toThrow(
+      "nft: the ABI lists safeTransferFrom(address,address,uint256) 2 times, not all alike, so which one is true cannot be told",
     );
+  });
+
+  test("a type no encoder knows is refused by name", () => {
+    const generate = (abi: ReadonlyArray<AbiItem>) => () =>
+      generateContractTools({
+        contract: NFT,
+        abi,
+        readExecutor: async () => "0x",
+        writeExecutor: async () => "{}",
+      });
     expect(
       generate([
         {
@@ -578,5 +593,108 @@ describe("an ABI either becomes tools that each mean one thing, or is refused (C
     });
     await tool?.execute({ walletId: "w", orders: [] });
     expect(calls.at(-1)?.signature).toBe("settle((address,uint256)[])");
+  });
+});
+
+describe("one function that cannot be a tool leaves the rest of the ABI alone", () => {
+  const SAFE = { id: "safe", chainId: "1", address: "0xsafe" };
+  // The Safe's ABI, cut down: two reads, and execTransaction, which is
+  // payable and names its second input `value` — the key a payable write
+  // tool already uses for the native-token amount.
+  const SAFE_ABI: ReadonlyArray<AbiItem> = [
+    {
+      type: "function",
+      name: "getOwners",
+      inputs: [],
+      outputs: [{ name: "", type: "address[]" }],
+      stateMutability: "view",
+    },
+    {
+      type: "function",
+      name: "nonce",
+      inputs: [],
+      outputs: [{ name: "", type: "uint256" }],
+      stateMutability: "view",
+    },
+    {
+      type: "function",
+      name: "execTransaction",
+      inputs: [
+        { name: "to", type: "address" },
+        { name: "value", type: "uint256" },
+        { name: "data", type: "bytes" },
+      ],
+      outputs: [{ name: "success", type: "bool" }],
+      stateMutability: "payable",
+    },
+  ];
+  const generate = (contract: typeof SAFE, abi: ReadonlyArray<AbiItem>) => {
+    const skipped: SkippedFunction[] = [];
+    const tools = generateContractTools({
+      contract,
+      abi,
+      readExecutor: async () => "0x",
+      writeExecutor: async () => "{}",
+      onSkipped: (s) => skipped.push(s),
+    });
+    return { names: tools.map((t) => t.name), skipped };
+  };
+
+  test("the Safe's reads are generated, and execTransaction is named as left out", () => {
+    // 0.7.1's first cut refused the whole ABI, so the reads were lost too.
+    const { names, skipped } = generate(SAFE, SAFE_ABI);
+    expect(names).toEqual(["safe__getOwners", "safe__nonce"]);
+    expect(skipped).toEqual([
+      {
+        signature: "execTransaction(address,uint256,bytes)",
+        reason: expect.stringContaining(
+          'safe: execTransaction(address,uint256,bytes): input 1 is named "value", which the generated write tool already takes as the native-token amount to send',
+        ),
+      },
+    ]);
+  });
+
+  test("a function-typed input leaves only that function out", () => {
+    const { names, skipped } = generate(SAFE, [
+      ...SAFE_ABI.slice(0, 1),
+      {
+        type: "function",
+        name: "onCallback",
+        inputs: [{ name: "cb", type: "function" }],
+        outputs: [],
+        stateMutability: "nonpayable",
+      },
+    ]);
+    expect(names).toEqual(["safe__getOwners"]);
+    expect(skipped.map((s) => s.signature)).toEqual(["onCallback(function)"]);
+    expect(skipped[0]?.reason).toContain("cannot be encoded");
+  });
+
+  test("an input named like something every object inherits is left out, not read from the prototype", async () => {
+    // The input parser reads `toString` as present in a call that leaves it
+    // out, and the executor was handed Object.prototype.toString.
+    for (const name of ["toString", "constructor", "valueOf", "hasOwnProperty"]) {
+      const label: AbiItem = {
+        type: "function",
+        name: "setLabel",
+        inputs: [{ name, type: "string" }],
+        outputs: [],
+        stateMutability: "nonpayable",
+      };
+      const { names, skipped } = generate(SAFE, [...SAFE_ABI.slice(0, 1), label]);
+      expect({ name, names }).toEqual({ name, names: ["safe__getOwners"] });
+      expect(skipped[0]?.reason).toContain(
+        `input 0 is named "${name}", a name every object inherits`,
+      );
+      // Alone, nothing is left to generate, and the ABI is refused by name.
+      expect(() =>
+        generateContractTools({
+          contract: SAFE,
+          abi: [label],
+          readExecutor: async () => "0x",
+          writeExecutor: async () => "{}",
+        }),
+      ).toThrow(new RegExp(`input 0 is named "${name}", a name every object inherits`));
+    }
   });
 });

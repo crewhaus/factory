@@ -28,12 +28,18 @@
  * handed the function's canonical `signature` and four-byte `selector`,
  * so it can encode the right overload of a name the ABI declares twice.
  *
- * What an ABI cannot be turned into is refused when the tools are
- * generated, with a {@link ContractToolError} naming the function, rather
- * than when a model first calls one: two functions whose tools would share
- * a name, an input whose name a write tool already uses for its own fields
- * (`walletId`, `justification` — the intent gate's — and `value` on a
- * payable function), and two inputs of one function that would share a key.
+ * A function the gateway cannot turn into a tool that means one thing is
+ * left out when the tools are generated, with the reason, rather than
+ * failing when a model first calls it: a type no encoder knows, an input
+ * whose name a write tool already uses for its own fields (`walletId`,
+ * `justification` — the intent gate's — and `value` on a payable function),
+ * an input named like something every object inherits (`toString`), two
+ * inputs of one function that would share a key, and a signature the ABI
+ * lists twice in different ways. Only that function is left out: the rest
+ * of the ABI still becomes tools, and `onSkipped` hears which were not and
+ * why. An ABI none of whose functions can be generated is refused with a
+ * {@link ContractToolError}. A function listed twice identically (a merged
+ * ABI) is one function.
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -123,6 +129,14 @@ export type WriteExecutor = (args: {
   readonly value?: string;
 }) => Promise<string>;
 
+/** A function left out of the generated tools, and why. */
+export type SkippedFunction = {
+  /** `name(type,…)` as the ABI writes it (canonical when it could be worked out). */
+  readonly signature: string;
+  /** One sentence naming the contract, the function and the reason. */
+  readonly reason: string;
+};
+
 /** One ABI function, with what the generator worked out about it. */
 type PlannedFunction = {
   readonly fn: AbiFunction;
@@ -141,17 +155,25 @@ type PlannedFunction = {
  * overload gets which name never depends on the order the ABI lists them).
  * Returns an array (preserves ABI order for deterministic codegen output).
  *
- * Throws {@link ContractToolError} for an ABI it cannot turn into a set of
- * tools that each mean one thing.
+ * A function that cannot be a tool that means one thing is left out and
+ * reported to `onSkipped`; throws {@link ContractToolError} when that leaves
+ * no tool at all from an ABI that has functions.
  */
 export function generateContractTools(args: {
   readonly contract: ContractBinding;
   readonly abi: ReadonlyArray<AbiItem>;
   readonly readExecutor: ReadExecutor;
   readonly writeExecutor: WriteExecutor;
+  /** Hears each function left out, with the reason. */
+  readonly onSkipped?: (skipped: SkippedFunction) => void;
 }): RegisteredTool[] {
   const functions = args.abi.filter((item): item is AbiFunction => item.type === "function");
-  const plans = planFunctions(args.contract, functions);
+  const skipped: SkippedFunction[] = [];
+  const plans = planFunctions(args.contract, functions, skipped);
+  for (const s of skipped) args.onSkipped?.(s);
+  if (plans.length === 0 && skipped.length > 0) {
+    throw new ContractToolError(skipped.map((s) => s.reason).join("; "));
+  }
   return plans.map((plan) =>
     plan.fn.stateMutability === "view" || plan.fn.stateMutability === "pure"
       ? buildReadTool(args.contract, plan, args.readExecutor)
@@ -165,47 +187,94 @@ const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 function planFunctions(
   contract: ContractBinding,
   functions: ReadonlyArray<AbiFunction>,
+  skipped: SkippedFunction[],
 ): PlannedFunction[] {
-  const declared = new Map<string, number>();
-  for (const fn of functions) declared.set(fn.name, (declared.get(fn.name) ?? 0) + 1);
-
-  const plans: PlannedFunction[] = [];
-  const byToolName = new Map<string, string>();
+  // Every function's canonical signature first: one no encoder can read is
+  // left out here, and the rest are grouped by what they are.
+  const bySignature = new Map<
+    string,
+    { readonly selector: string; readonly entries: Array<{ fn: AbiFunction; json: string }> }
+  >();
   for (const fn of functions) {
     const written = `${fn.name}(${fn.inputs.map((p) => typeString(p)).join(",")})`;
     let id: { signature: string; selector: string };
     try {
       id = canonicalFunction(written);
     } catch (err) {
-      throw new ContractToolError(
-        `${contract.id}: the ABI's function ${written} cannot be encoded — ${(err as Error).message}`,
-      );
+      skipped.push({
+        signature: written,
+        reason: `${contract.id}: the ABI's function ${written} cannot be encoded — ${(err as Error).message}`,
+      });
+      continue;
     }
+    const group = bySignature.get(id.signature) ?? { selector: id.selector, entries: [] };
+    group.entries.push({ fn, json: stableJson(fn) });
+    bySignature.set(id.signature, group);
+  }
+
+  // A signature listed twice alike (a merged ABI) is one function; listed
+  // twice differently, which entry is true cannot be told, so neither is
+  // made a tool.
+  const unique: Array<{ fn: AbiFunction; signature: string; selector: string }> = [];
+  for (const [signature, group] of bySignature) {
+    const first = group.entries[0] as { fn: AbiFunction; json: string };
+    if (group.entries.some((e) => e.json !== first.json)) {
+      skipped.push({
+        signature,
+        reason: `${contract.id}: the ABI lists ${signature} ${group.entries.length} times, not all alike, so which one is true cannot be told — remove the wrong entry`,
+      });
+      continue;
+    }
+    unique.push({ fn: first.fn, signature, selector: group.selector });
+  }
+
+  const declared = new Map<string, number>();
+  for (const { fn } of unique) declared.set(fn.name, (declared.get(fn.name) ?? 0) + 1);
+
+  const plans: PlannedFunction[] = [];
+  const byToolName = new Map<string, string>();
+  for (const { fn, signature, selector } of unique) {
     const overloaded = (declared.get(fn.name) ?? 0) > 1;
     const toolName = overloaded
-      ? `${contract.id}__${fn.name}_${id.selector.slice(2)}`
+      ? `${contract.id}__${fn.name}_${selector.slice(2)}`
       : `${contract.id}__${fn.name}`;
     const clash = byToolName.get(toolName);
     if (clash !== undefined) {
-      throw new ContractToolError(
-        `${contract.id}: ${clash} and ${id.signature} would both be the tool "${toolName}" — ${
-          clash === id.signature
-            ? "the ABI lists the same function twice; remove the duplicate"
-            : "rename one of them in the ABI passed to generateContractTools"
-        }`,
-      );
+      // Two overloads whose selectors share their digits: neither name would
+      // say which one it calls.
+      skipped.push({
+        signature,
+        reason: `${contract.id}: ${clash} and ${signature} would both be the tool "${toolName}" — rename one of them in the ABI passed to generateContractTools`,
+      });
+      continue;
     }
-    byToolName.set(toolName, id.signature);
-    plans.push({
-      fn,
-      toolName,
-      signature: id.signature,
-      selector: id.selector,
-      overloaded,
-      keys: inputKeys(contract, fn, id.signature),
-    });
+    let keys: string[];
+    try {
+      keys = inputKeys(contract, fn, signature);
+    } catch (err) {
+      if (!(err instanceof ContractToolError)) throw err;
+      skipped.push({ signature, reason: err.message });
+      continue;
+    }
+    byToolName.set(toolName, signature);
+    plans.push({ fn, toolName, signature, selector, overloaded, keys });
   }
-  return plans;
+  // ABI order, as before, whatever order the groups were read in.
+  const order = new Map(functions.map((fn, i) => [fn, i]));
+  return plans.sort((a, b) => (order.get(a.fn) ?? 0) - (order.get(b.fn) ?? 0));
+}
+
+/** JSON with object keys sorted, so two ABI entries alike compare alike. */
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableJson(record[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
 }
 
 /**
@@ -244,6 +313,14 @@ function inputKeys(contract: ContractBinding, fn: AbiFunction, signature: string
     if (!IDENTIFIER_RE.test(key) || key === "__proto__") {
       throw new ContractToolError(
         `${where}: input ${i} is named "${key}", which is not an argument name a tool can take`,
+      );
+    }
+    // Every object inherits `toString`, `constructor`, `valueOf`…: the input
+    // parser reads such a key as present when the call leaves it out, and
+    // the executor was handed Object.prototype's function as the argument.
+    if (key in Object.prototype) {
+      throw new ContractToolError(
+        `${where}: input ${i} is named "${key}", a name every object inherits, so a call that leaves it out would still carry a value — rename the input in the ABI passed to generateContractTools`,
       );
     }
     if (reserved.has(key)) {
