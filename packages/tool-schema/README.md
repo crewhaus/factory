@@ -107,7 +107,9 @@ is past 10,000 characters, makes the schema malformed (`schemaValid: false`),
 and fails an `Assert` check as an invalid regex does. One that cannot be run
 to an answer (the deadline, the engine giving up, which includes a no-match
 slower than 100 ms) leaves the value `undetermined`, never invalid or valid,
-and an `Assert` check `undetermined` and not ok. A library caller of `runChecks` or `validateValue` with no
+and an `Assert` check `undetermined` and not ok. `Branch`, `DecisionTable`,
+`RuleScore`, `LeadAssign`, `SequenceRun` and `ErrorClassify` in
+`@crewhaus/tool-flow` read the same answers. A library caller of `runChecks` or `validateValue` with no
 answers gets a bounded fallback on its own thread: the same screen, at most
 64 KiB of input per pattern, and a give-up read as undetermined.
 

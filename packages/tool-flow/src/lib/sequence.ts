@@ -27,7 +27,7 @@
  *   a step that died three turns ago.
  * - **skipped** — the step's own conditions did not hold. A settled no.
  */
-import { type Check, runChecks } from "@crewhaus/tool-schema";
+import { type Check, type RegexAnswers, checksVerdict, runChecks } from "@crewhaus/tool-schema";
 import type { MatchMode } from "./branch";
 
 /**
@@ -97,13 +97,26 @@ export type SequencePlan = {
   readonly waiting: ReadonlyArray<HeldStep>;
   readonly unreachable: ReadonlyArray<HeldStep>;
   readonly skipped: ReadonlyArray<HeldStep>;
+  /**
+   * Steps whose conditions could not be decided (a pattern had no answer):
+   * neither ready nor skipped, so the flow is `blocked` on them rather than
+   * running or ruling out a step on a guess. Present only when there are any.
+   */
+  readonly undetermined?: ReadonlyArray<HeldStep>;
   readonly completed: ReadonlyArray<string>;
   readonly failed: ReadonlyArray<string>;
   readonly version: string | null;
   readonly total: number;
 };
 
-type StepState = "done" | "failed" | "ready" | "waiting" | "unreachable" | "skipped";
+type StepState =
+  | "done"
+  | "failed"
+  | "ready"
+  | "waiting"
+  | "unreachable"
+  | "skipped"
+  | "undetermined";
 
 /**
  * Work out what to run next.
@@ -120,6 +133,7 @@ export function planSequence(
   value: unknown,
   spec: SequenceSpec,
   state: SequenceState,
+  options: { readonly regex?: RegexAnswers } = {},
 ): SequencePlan {
   const steps = spec.steps;
   if (steps.length === 0) throw new Error("the sequence has no steps");
@@ -211,16 +225,32 @@ export function planSequence(
       continue;
     }
 
-    // The shared evaluator reports a check it could not evaluate — a regex
-    // that will not compile, a malformed path — as a check that did not hold,
-    // with the reason as its text and no flag to tell the two apart. That is
-    // `Branch` and `RuleScore`'s behaviour too, and inventing a different one
-    // here would mean two answers to the same question. It bites harder in a
-    // sequence, because the skip cascades into `unreachable` dependents, so
-    // the reason travels with every one of them.
+    // The shared evaluator reports a malformed check (a regex that will not
+    // compile, a bad path) as a check that did not hold, with the reason as
+    // its text. That is `Branch` and `RuleScore`'s behaviour too, and
+    // inventing a different one here would mean two answers to the same
+    // question. It bites harder in a sequence, because the skip cascades
+    // into `unreachable` dependents, so the reason travels with every one of
+    // them. A pattern that could not be run to an answer is different: it
+    // is not a verdict, so the step is held as undetermined instead.
     if (step.when && step.when.length > 0) {
-      const report = runChecks(value, step.when as Check[]);
-      const holds = (step.match ?? "all") === "all" ? report.ok : report.passed > 0;
+      const report = runChecks(
+        value,
+        step.when as Check[],
+        options.regex === undefined ? {} : { regex: options.regex },
+      );
+      const verdict = checksVerdict(report, step.match ?? "all");
+      if (verdict === "undetermined") {
+        // Neither due nor ruled out: skipping it would cascade `unreachable`
+        // through its dependents on an answer nobody got.
+        states.set(step.id, "undetermined");
+        reasons.set(step.id, {
+          id: step.id,
+          reason: report.failures.find((f) => f.undetermined === true)?.reason ?? "",
+        });
+        continue;
+      }
+      const holds = verdict === "pass";
       if (!holds) {
         states.set(step.id, "skipped");
         reasons.set(step.id, {
@@ -241,6 +271,7 @@ export function planSequence(
   const waiting: HeldStep[] = [];
   const unreachable: HeldStep[] = [];
   const skipped: HeldStep[] = [];
+  const undecided: HeldStep[] = [];
   const doneIds: string[] = [];
   const failedIds: string[] = [];
 
@@ -263,6 +294,9 @@ export function planSequence(
       case "skipped":
         skipped.push(held);
         break;
+      case "undetermined":
+        undecided.push(held);
+        break;
       case "done":
         doneIds.push(step.id);
         break;
@@ -275,7 +309,7 @@ export function planSequence(
   const planState: PlanState =
     ready.length > 0
       ? "ready"
-      : waiting.length > 0
+      : waiting.length > 0 || undecided.length > 0
         ? "blocked"
         : failedIds.length > 0 || unreachable.length > 0
           ? "halted"
@@ -288,6 +322,7 @@ export function planSequence(
     waiting,
     unreachable,
     skipped,
+    ...(undecided.length > 0 ? { undetermined: undecided } : {}),
     completed: doneIds,
     failed: failedIds,
     version: spec.version ?? null,

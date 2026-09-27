@@ -9,7 +9,7 @@
  * version of the rules that produced them.
  */
 import { decimalKernel } from "@crewhaus/tool-math";
-import { type Check, runChecks } from "@crewhaus/tool-schema";
+import { type Check, type RegexAnswers, checksVerdict, runChecks } from "@crewhaus/tool-schema";
 
 type Decimal = decimalKernel.Decimal;
 const { align, decimalAdd, decimalToNumber, parseDecimal } = decimalKernel;
@@ -51,9 +51,10 @@ export type ScoreModel = {
 };
 
 export type ScoreResult = {
-  readonly score: number;
+  /** Null when a rule could not be decided: its points may or may not count. */
+  readonly score: number | null;
   /** The sum before clamping, which differs from `score` when it was clamped. */
-  readonly rawScore: number;
+  readonly rawScore: number | null;
   readonly band: string | null;
   readonly version: string | null;
   readonly contributors: ReadonlyArray<{
@@ -63,9 +64,19 @@ export type ScoreResult = {
   }>;
   /** Rules that did not fire, with the first reason they did not. */
   readonly missed: ReadonlyArray<{ readonly id: string; readonly reason: string }>;
+  /**
+   * Rules that could not be decided (a pattern had no answer), with why. When
+   * any is listed, `score`, `rawScore` and `band` are null: a total that left
+   * their points out would be a guess.
+   */
+  readonly undetermined?: ReadonlyArray<{ readonly id: string; readonly reason: string }>;
 };
 
-export function scoreValue(value: unknown, model: ScoreModel): ScoreResult {
+export function scoreValue(
+  value: unknown,
+  model: ScoreModel,
+  options: { readonly regex?: RegexAnswers } = {},
+): ScoreResult {
   if (model.rules.length === 0) throw new Error("the scoring model has no rules");
 
   const seen = new Set<string>();
@@ -93,14 +104,34 @@ export function scoreValue(value: unknown, model: ScoreModel): ScoreResult {
   // declared in (0.1 + 0.1 + 0.6 and 0.6 + 0.1 + 0.1 used to band apart).
   let exact: Decimal = { unscaled: 0n, scale: 0 };
 
+  const undecided: Array<{ id: string; reason: string }> = [];
   for (const rule of model.rules) {
-    const report = runChecks(value, rule.when as Check[]);
-    if (report.ok) {
+    const report = runChecks(
+      value,
+      rule.when as Check[],
+      options.regex === undefined ? {} : { regex: options.regex },
+    );
+    const verdict = checksVerdict(report, "all");
+    if (verdict === "pass") {
       exact = decimalAdd(exact, parseDecimal(rule.points));
       contributors.push({ id: rule.id, label: rule.label ?? rule.id, points: rule.points });
+    } else if (verdict === "undetermined") {
+      const why = report.failures.find((f) => f.undetermined === true)?.reason ?? "";
+      undecided.push({ id: rule.id, reason: why });
     } else {
       missed.push({ id: rule.id, reason: report.failures[0]?.reason ?? "" });
     }
+  }
+  if (undecided.length > 0) {
+    return {
+      score: null,
+      rawScore: null,
+      band: null,
+      version: model.version ?? null,
+      contributors,
+      missed,
+      undetermined: undecided,
+    };
   }
 
   const rawScore = decimalToNumber(exact);

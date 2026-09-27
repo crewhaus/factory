@@ -22,14 +22,26 @@
  */
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { ASSERT_OPS, type Check } from "@crewhaus/tool-schema";
+import {
+  ASSERT_OPS,
+  type Check,
+  RegexAnswers,
+  askCheckPatterns,
+  regexRunContext,
+} from "@crewhaus/tool-schema";
 import { z } from "zod";
 import { ASSIGN_STRATEGIES, type Roster, assignOwner } from "./lib/assign";
 import { type BranchRule, evaluateBranches } from "./lib/branch";
 import { type ConsensusOptions, VOTE_MODES, type Vote, tallyVotes } from "./lib/consensus";
 import { checkDeadline } from "./lib/deadline";
 import { type DecisionTable, HIT_POLICIES, evaluateTable } from "./lib/decision";
-import { ERROR_CLASSES, type ErrorRule, NEXT_ACTIONS, classifyError } from "./lib/errors";
+import {
+  ERROR_CLASSES,
+  type ErrorRule,
+  NEXT_ACTIONS,
+  askErrorPatterns,
+  classifyError,
+} from "./lib/errors";
 import { type ScoreModel, scoreValue } from "./lib/score";
 import { type SequenceStep, planSequence } from "./lib/sequence";
 import { type Snapshot, detectStall } from "./lib/stall";
@@ -114,6 +126,24 @@ function parseInstant(value: string | number, field: string): number {
 
 const instantField = z.union([z.string(), z.number()]);
 
+/**
+ * Answer every `matches` pattern the given check lists will test against
+ * `value`, in the regex worker, before any of them is evaluated. The
+ * evaluators then read the answers and never run a caller's pattern on this
+ * thread; a pattern with no answer leaves its arm, row, rule, owner or step
+ * undetermined rather than unmatched.
+ */
+async function answerChecks(
+  value: unknown,
+  lists: ReadonlyArray<ReadonlyArray<Check> | undefined>,
+  ctx: unknown,
+): Promise<RegexAnswers> {
+  const regex = new RegexAnswers();
+  for (const list of lists) if (list !== undefined) askCheckPatterns(value, list, regex);
+  await regex.resolve(regexRunContext(ctx));
+  return regex;
+}
+
 // ---------------------------------------------------------------------------
 
 export const branch: RegisteredTool = buildTool({
@@ -144,16 +174,21 @@ export const branch: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const outcome = evaluateBranches(input.value, input.arms as ReadonlyArray<BranchRule>, {
-      otherwise: input.otherwise,
-    });
+  execute: async (input, ctx) => {
+    const arms = input.arms as ReadonlyArray<BranchRule>;
+    const regex = await answerChecks(
+      input.value,
+      arms.map((arm) => arm.when),
+      ctx,
+    );
+    const outcome = evaluateBranches(input.value, arms, { otherwise: input.otherwise, regex });
     const body = {
       matched: outcome.matched,
       name: outcome.name,
       index: outcome.index,
       fallback: outcome.fallback,
       result: outcome.result,
+      ...(outcome.undetermined === undefined ? {} : { undetermined: outcome.undetermined }),
       ...(input.verbose ? { evaluated: outcome.evaluated } : {}),
     };
     return json(body);
@@ -184,7 +219,15 @@ export const decisionTable: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => json(evaluateTable(input.value, input as unknown as DecisionTable)),
+  execute: async (input, ctx) => {
+    const table = input as unknown as DecisionTable;
+    const regex = await answerChecks(
+      input.value,
+      table.rows.map((row) => row.when),
+      ctx,
+    );
+    return json(evaluateTable(input.value, table, { regex }));
+  },
 });
 
 export const errorClassify: RegisteredTool = buildTool({
@@ -229,11 +272,14 @@ export const errorClassify: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const nowMs = input.now === undefined ? Date.now() : parseInstant(input.now, "now");
-    return json(
-      classifyError(input, { rules: input.rules as ReadonlyArray<ErrorRule> | undefined, nowMs }),
-    );
+    const rules = input.rules as ReadonlyArray<ErrorRule> | undefined;
+    // The caller rules' patterns run in the worker, against the error text.
+    const regex = new RegexAnswers();
+    askErrorPatterns(input, rules ?? [], regex);
+    await regex.resolve(regexRunContext(ctx));
+    return json(classifyError(input, { rules, nowMs, regex }));
   },
 });
 
@@ -388,8 +434,14 @@ export const ruleScore: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const result = scoreValue(input.value, input as unknown as ScoreModel);
+  execute: async (input, ctx) => {
+    const model = input as unknown as ScoreModel;
+    const regex = await answerChecks(
+      input.value,
+      model.rules.map((rule) => rule.when),
+      ctx,
+    );
+    const result = scoreValue(input.value, model, { regex });
     if (input.includeMissed) return json(result);
     const { missed: _missed, ...rest } = result;
     return json(rest);
@@ -447,8 +499,14 @@ export const leadAssign: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const { considered, ...rest } = assignOwner(input.value, input as unknown as Roster);
+  execute: async (input, ctx) => {
+    const roster = input as unknown as Roster;
+    const regex = await answerChecks(
+      input.value,
+      roster.owners.map((owner) => owner.when),
+      ctx,
+    );
+    const { considered, ...rest } = assignOwner(input.value, roster, { regex });
     return json(input.verbose ? { ...rest, considered } : rest);
   },
 });
@@ -493,7 +551,7 @@ export const sequenceRun: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const nowMs = input.now === undefined ? Date.now() : parseInstant(input.now, "now");
     // Each `after` is parsed here and dropped, so the planner can only read
     // the parsed number: a step can never end up gated on an offset-less
@@ -504,11 +562,17 @@ export const sequenceRun: RegisteredTool = buildTool({
       afterMs: after === undefined ? undefined : parseInstant(after, `step "${step.id}" after`),
       when: step.when as ReadonlyArray<Check> | undefined,
     }));
+    const regex = await answerChecks(
+      input.value,
+      steps.map((step) => step.when),
+      ctx,
+    );
     return json(
       planSequence(
         input.value,
         { version: input.version, steps },
         { nowMs, completed: input.completed, failed: input.failed },
+        { regex },
       ),
     );
   },
