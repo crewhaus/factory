@@ -12,7 +12,7 @@
  * would be a crawler, and would leak which documents are being reviewed.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -28,7 +28,14 @@ import {
   readableText,
   textOf,
 } from "@crewhaus/tool-html";
-import { joinRel, openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
+import {
+  type FileKind,
+  fileKind,
+  joinRel,
+  openForReadSync,
+  resolveContained,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 import {
   type RegexSession,
   describeRegexOutcome,
@@ -424,19 +431,86 @@ function manifestKey(rel: string): string {
 }
 
 /**
- * What ChecksumVerify leaves out when it is given neither a directory nor an
- * exclude list, and so walks the whole workspace: the version-control store
- * and the installed dependencies. At a project root they are nearly every
- * entry (a repo's 400 files became 13,000 entries and a 2 MB manifest), and
- * neither is what "has this project changed" means. Always echoed back in
- * `excluded`; `exclude: []` walks everything.
+ * What ChecksumVerify leaves out when it walks the workspace root with no
+ * exclude list: the version-control store and the installed dependencies. At
+ * a project root they are nearly every entry (a repo's 400 files became 13,000
+ * entries and a 2 MB manifest), and neither is what "has this project
+ * changed" means. Decided on the directory walked, not on whether the field
+ * was sent, so `{}` and `{directory: "."}` give one answer. Always echoed back
+ * in `excluded`; `exclude: []` walks everything.
  */
 const DEFAULT_ROOT_EXCLUDE: ReadonlyArray<string> = [".git", "node_modules"];
+
+/**
+ * What a manifest records for one entry: a file's digest, or, for an entry
+ * that is not hashed, what it is. A link that leads to a directory, out of the
+ * workspace or nowhere, and a FIFO, socket or device, have no content this
+ * tool reads; recorded by kind and link text, an unchanged tree verifies
+ * against its own manifest (it could never be ok while every such entry was
+ * "unreadable" and then "unexpected"), and a link retargeted or a pipe
+ * swapped for a file is still a change.
+ */
+type Recorded =
+  | { readonly digest: string }
+  | { readonly kind: Exclude<FileKind, "file" | "directory">; readonly target?: string };
+
+/** One comparable string per recorded entry. */
+function recordedSignature(r: Recorded): string {
+  if ("digest" in r) return r.digest;
+  return r.target === undefined ? r.kind : `${r.kind} -> ${JSON.stringify(r.target)}`;
+}
+
+/**
+ * A manifest line. A digest line is what `sha256sum` writes; an entry that is
+ * not hashed is a `#` line, which `sha256sum -c` skips as a comment, with the
+ * path and link text JSON-quoted so no name can forge a line or a field.
+ */
+function manifestLine(rel: string, r: Recorded): string {
+  if ("digest" in r) return `${r.digest}  ${rel}`;
+  return `# ${r.kind} ${JSON.stringify(rel)}${r.target === undefined ? "" : ` -> ${JSON.stringify(r.target)}`}`;
+}
+
+const RECORDED_LINE =
+  /^# (symlink|fifo|socket|character-device|block-device|unknown) ("(?:[^"\\]|\\.)*")(?: -> ("(?:[^"\\]|\\.)*"))?$/;
+
+/** A `#` line of {@link manifestLine}, or undefined for any other comment. */
+function parseRecordedLine(line: string): { rel: string; signature: string } | undefined {
+  const m = RECORDED_LINE.exec(line);
+  if (m === null) return undefined;
+  try {
+    const rel = JSON.parse(m[2] as string) as string;
+    const target = m[3] === undefined ? undefined : (JSON.parse(m[3]) as string);
+    const kind = m[1] as Exclude<FileKind, "file" | "directory">;
+    return {
+      rel,
+      signature: recordedSignature(target === undefined ? { kind } : { kind, target }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What a named entry is, asked without following its last component: for a
+ * `files` entry the read refused, so a link or a pipe is recorded like the
+ * walk records it. `undefined` when nothing is there or it cannot be asked.
+ */
+function describeUnhashed(root: string, rel: string): Recorded | "absent" | undefined {
+  const at = resolveContained(root, rel, { followLeaf: false });
+  if (!at.ok) return undefined;
+  try {
+    const kind = fileKind(lstatSync(at.real));
+    if (kind === "file" || kind === "directory") return undefined;
+    return kind === "symlink" ? { kind, target: readlinkSync(at.real) } : { kind };
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : undefined;
+  }
+}
 
 export const checksumVerify: RegisteredTool = buildTool({
   name: "ChecksumVerify",
   description:
-    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that with no directory given, the workspace root's .git and node_modules are left out and listed as excluded; symlinks are reported, never followed out of the workspace; a walk that stops early is not ok.",
+    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that when the workspace root is walked with no exclude, its .git and node_modules are left out and listed as excluded. A link to a file in the workspace is hashed through, like sha256sum; any other link, and a FIFO, socket or device, is never opened and is recorded by kind and link text on a # line sha256sum skips. A walk that stops early is not ok.",
   inputSchema: z
     .object({
       directory: z.string().optional().describe("what to hash; defaults to the workspace root"),
@@ -446,6 +520,7 @@ export const checksumVerify: RegisteredTool = buildTool({
         .describe("workspace-relative SHA256SUMS file to check against"),
       files: z
         .array(z.string())
+        .min(1)
         .max(LIMITS.files)
         .optional()
         .describe(
@@ -456,7 +531,7 @@ export const checksumVerify: RegisteredTool = buildTool({
         .max(64)
         .optional()
         .describe(
-          "paths under the directory to leave out with everything below them, e.g. .git; listed back as excluded. With no directory and no exclude, .git and node_modules at the workspace root are left out",
+          "paths under the directory to leave out with everything below them, e.g. .git; listed back as excluded. When the directory is the workspace root and no exclude is given, .git and node_modules at the root are left out",
         ),
       write: z
         .boolean()
@@ -473,7 +548,8 @@ export const checksumVerify: RegisteredTool = buildTool({
       input.manifest === undefined ? undefined : resolveSafe("ChecksumVerify", input.manifest);
     const writing = input.manifest === undefined || input.write === true;
 
-    const digests = new Map<string, string>();
+    /** Every entry the manifest will list or is checked against, by path. */
+    const recorded = new Map<string, Recorded>();
     const unreadable: string[] = [];
     /** Everything the walk found, hashable or not: what "unexpected" is measured against. */
     const onDisk = new Set<string>();
@@ -489,19 +565,22 @@ export const checksumVerify: RegisteredTool = buildTool({
     let truncated = false;
     const exclude =
       input.exclude ??
-      (input.directory === undefined && input.files === undefined
-        ? DEFAULT_ROOT_EXCLUDE
-        : undefined);
+      (base.rel === "" && input.files === undefined ? DEFAULT_ROOT_EXCLUDE : undefined);
     const excludedByDefault = input.exclude === undefined && exclude !== undefined;
 
-    const hash = (rel: string): void => {
+    /** Hash `rel` through to its file; `link` is recorded instead when that is not a file. */
+    const hash = (rel: string, link?: string): void => {
       const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
-      if (!read.ok) {
+      if (!read.ok && link !== undefined && read.code === "not-regular-file") {
+        // A link to a directory (every workspace package under
+        // node_modules/@scope is one) has no content to hash.
+        recorded.set(rel, { kind: "symlink", target: link });
+      } else if (!read.ok) {
         unreadable.push(`${rel}: ${read.reason}`);
       } else if (read.truncated) {
         unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
       } else {
-        digests.set(rel, sha256(Buffer.from(read.bytes)));
+        recorded.set(rel, { digest: sha256(Buffer.from(read.bytes)) });
       }
     };
 
@@ -517,14 +596,28 @@ export const checksumVerify: RegisteredTool = buildTool({
         // Read like every walked file: contained, never through a link that
         // leads out, and a FIFO or device is refused instead of opened.
         const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
-        if (!read.ok && read.code === "not-found") {
+        if (read.ok) {
+          onDisk.add(rel);
+          if (read.truncated) unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
+          else recorded.set(rel, { digest: sha256(Buffer.from(read.bytes)) });
+          continue;
+        }
+        // Refused, or not there: a link that leads to a directory, out of
+        // the workspace or nowhere, or a pipe, is recorded as the walk
+        // records it, never opened.
+        const unhashed =
+          read.code === "not-found" ||
+          read.code === "not-regular-file" ||
+          read.code === "escapes-root"
+            ? describeUnhashed(root, joinRel(base.rel, rel))
+            : undefined;
+        if (unhashed === "absent" || (unhashed === undefined && read.code === "not-found")) {
           absent.add(rel);
           continue;
         }
         onDisk.add(rel);
-        if (!read.ok) unreadable.push(`${rel}: ${read.reason}`);
-        else if (read.truncated) unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
-        else digests.set(rel, sha256(Buffer.from(read.bytes)));
+        if (unhashed === undefined) unreadable.push(`${rel}: ${read.reason}`);
+        else recorded.set(rel, unhashed);
       }
     } else {
       const walk = integrityWalk(root, base.rel, {
@@ -565,17 +658,16 @@ export const checksumVerify: RegisteredTool = buildTool({
           const target = entry.link?.text ?? "";
           symlinks.push({ path: entry.rel, target });
           // A link is hashed as `sha256sum` would, through to its file, but
-          // only when that file is inside the workspace; one that leads out
-          // is never read.
-          if (entry.link?.inside !== true) {
-            unreadable.push(`${entry.rel}: a symlink that leads outside the workspace; not read`);
-          } else if (entry.link.dangling) {
-            unreadable.push(`${entry.rel}: a symlink whose target does not exist`);
+          // only when that file is inside the workspace. One that leads out,
+          // or nowhere, is never read: it is recorded by its link text.
+          if (entry.link?.inside !== true || entry.link.dangling) {
+            recorded.set(entry.rel, { kind: "symlink", target });
           } else {
-            hash(entry.rel);
+            hash(entry.rel, target);
           }
-        } else {
-          unreadable.push(`${entry.rel}: a ${entry.kind}, not a regular file; not opened`);
+        } else if (entry.kind !== "directory") {
+          // A FIFO, socket or device: named, never opened.
+          recorded.set(entry.rel, { kind: entry.kind });
         }
       }
     }
@@ -587,17 +679,20 @@ export const checksumVerify: RegisteredTool = buildTool({
       ...(excludedByDefault
         ? {
             excludedNote:
-              "no directory was given, so the workspace root was walked without .git and node_modules; pass directory, or exclude: [] to walk everything",
+              "the workspace root was walked without its .git and node_modules; pass exclude: [] to walk everything",
           }
         : {}),
     };
 
     if (writing) {
       for (const rel of absent) unreadable.push(`${rel}: does not exist`);
-      const body = [...digests.entries()].map(([rel, hash]) => `${hash}  ${rel}`).join("\n");
+      const body = [...recorded].map(([rel, r]) => manifestLine(rel, r)).join("\n");
+      let fileCount = 0;
+      for (const r of recorded.values()) if ("digest" in r) fileCount += 1;
       return json({
         directory: base.rel,
-        fileCount: digests.size,
+        fileCount,
+        ...(recorded.size > fileCount ? { recordedByKind: recorded.size - fileCount } : {}),
         ...walkReport,
         unreadable,
         manifest: `${body}\n`,
@@ -613,7 +708,13 @@ export const checksumVerify: RegisteredTool = buildTool({
     }
     const expected = new Map<string, string>();
     for (const line of manifestText.split("\n")) {
-      const m = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line.trim());
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#")) {
+        const entry = parseRecordedLine(trimmed);
+        if (entry !== undefined) expected.set(manifestKey(entry.rel), entry.signature);
+        continue;
+      }
+      const m = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(trimmed);
       if (m === null) continue;
       expected.set(manifestKey((m[2] as string).trim()), (m[1] as string).toLowerCase());
     }
@@ -625,11 +726,11 @@ export const checksumVerify: RegisteredTool = buildTool({
     for (const [rel, want] of expected) {
       if (requested !== null && !requested.has(rel)) continue;
       checked += 1;
-      const got = digests.get(rel);
+      const got = recorded.get(rel);
       // Listed and on disk but not hashable is in `unreadable` already.
       if (got === undefined) {
         if (!onDisk.has(rel)) missing.push(rel);
-      } else if (got !== want) mismatched.push(rel);
+      } else if (recordedSignature(got) !== want) mismatched.push(rel);
     }
     for (const rel of onDisk) if (!expected.has(rel)) unexpected.push(rel);
     // Asked for, not on disk, and not listed either: not "missing" (the

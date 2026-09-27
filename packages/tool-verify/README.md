@@ -63,20 +63,24 @@ re-derive them:
   meant to ship, and it is invisible in a simple "does everything listed
   still match". So it walks EVERY entry of the directory: dotfiles, `.git`,
   `node_modules`, `dist` and the rest included, unless you name them in
-  `exclude` (they come back as `excluded`). Given no `directory` and no
-  `exclude`, it walks the workspace root without the root's `.git` and
-  `node_modules` — nearly every entry of a project, and not what "has this
-  changed" means — and says so in `excluded`; `exclude: []` walks all of it.
-  A symlink is listed under
-  `symlinks` and is never followed out of the workspace: one that stays
-  inside is hashed through to its file, as `sha256sum` does, and one that
-  leads out, a FIFO or a device is reported under `unreadable` without being
-  opened. A manifest that sits inside the directory it describes is left out
-  of it. Anything unreadable, and a walk that stopped at its cap (`truncated`),
-  make the answer not `ok`, and `write: true` refuses to emit a partial
-  manifest; a walk that stops at its cap is refused before anything is
-  hashed. `GoldenCompare` walks a tree the same way, and compares links by
-  where they point.
+  `exclude` (they come back as `excluded`). Walking the workspace root
+  (no `directory`, or `"."`) with no `exclude`, it leaves out the root's
+  `.git` and `node_modules` — nearly every entry of a project, and not what
+  "has this changed" means — and says so in `excluded`; `exclude: []` walks
+  all of it. A symlink is listed under `symlinks` and is never followed out
+  of the workspace: one that leads to a file inside is hashed through to it,
+  as `sha256sum` does. Any other link (to a directory, out of the workspace,
+  or to nothing), and a FIFO, socket or device, is never opened: the
+  manifest records it by kind and link text on a `#` line, which
+  `sha256sum -c` skips as a comment (macOS's BSD `sha256sum` warns about it
+  and still passes, unless `--strict`), so an unchanged tree verifies
+  against its own manifest and a retargeted link or a pipe swapped for a
+  file is a change. A manifest that sits inside the directory it describes
+  is left out of it. Anything unreadable, and a walk that stopped at its cap
+  (`truncated`), make the answer not `ok`, and `write: true` refuses to emit
+  a partial manifest; a walk that stops at its cap is refused before anything
+  is hashed. `files` must name at least one entry. `GoldenCompare` walks a
+  tree the same way, and compares links by where they point.
 - `AcceptanceCheck` reports every check's own verdict, so one failure does
   not hide the others and a pass is a list of things that were actually
   checked rather than an opinion.

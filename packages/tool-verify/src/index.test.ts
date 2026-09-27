@@ -339,20 +339,47 @@ describe("ChecksumVerify", () => {
     expect(listed(byDefault)).toEqual([".env.example", "src/a.txt"]);
     expect(byDefault.excluded).toEqual([".git", "node_modules"]);
     expect(byDefault.excludedNote).toMatch(/exclude: \[\] to walk everything/);
-    // Asked for, the whole root is walked; an explicit exclude replaces the default.
-    for (const input of [
-      { write: true, exclude: [] },
-      { write: true, directory: "." },
-    ]) {
-      const all = await call<Written>(checksumVerify, input);
-      expect(listed(all)).toEqual([
-        ".env.example",
-        ".git/objects/ab",
-        "node_modules/dep/index.js",
-        "src/a.txt",
-      ]);
-      expect(all.excluded).toBeUndefined();
+    // The root spelled out is the same root: the fix round walked all of
+    // .git and node_modules for `directory: "."`, and refused a large one.
+    for (const directory of [".", "./", "src/.."]) {
+      const spelled = await call<Written>(checksumVerify, { write: true, directory });
+      expect({ directory, manifest: spelled.manifest, excluded: spelled.excluded }).toEqual({
+        directory,
+        manifest: byDefault.manifest,
+        excluded: [".git", "node_modules"],
+      });
     }
+    // Asked for, the whole root is walked; an explicit exclude replaces the default.
+    const all = await call<Written>(checksumVerify, { write: true, exclude: [] });
+    expect(listed(all)).toEqual([
+      ".env.example",
+      ".git/objects/ab",
+      "node_modules/dep/index.js",
+      "src/a.txt",
+    ]);
+    expect(all.excluded).toBeUndefined();
+    // A directory below the root is walked whole.
+    const src = await call<Written>(checksumVerify, { write: true, directory: "src" });
+    expect(src.excluded).toBeUndefined();
+  });
+
+  test("files: [] is refused, not a pass that checked nothing", async () => {
+    // The fix round answered ok: true, checked: 0 here while a listed file
+    // had been tampered with.
+    mkdirSync(join(workspace, "art"));
+    writeFileSync(join(workspace, "art/a.txt"), "A\n");
+    const w = await call<{ manifest: string }>(checksumVerify, { directory: "art", write: true });
+    writeFileSync(join(workspace, "SUMS"), w.manifest);
+    writeFileSync(join(workspace, "art/a.txt"), "TAMPERED\n");
+    await expect(
+      raw(checksumVerify, { directory: "art", manifest: "SUMS", files: [] }),
+    ).rejects.toThrow(/schema rejected the input/);
+    expect(
+      await call<{ ok: boolean; mismatched: string[] }>(checksumVerify, {
+        directory: "art",
+        manifest: "SUMS",
+      }),
+    ).toMatchObject({ ok: false, mismatched: ["a.txt"] });
   });
 
   describe("files checks just those entries of the manifest", () => {
@@ -481,14 +508,23 @@ describe("ChecksumVerify", () => {
       });
     });
 
-    test("a FIFO named in files is refused, not opened", async () => {
+    test("a FIFO named in files is not opened, and is not the file the manifest lists", async () => {
       execFileSync("mkfifo", [join(workspace, "pipe")]);
       writeFileSync(join(workspace, "PIPESUMS"), `${"0".repeat(64)}  pipe\n`);
       const r = await call<Subset>(checksumVerify, { manifest: "PIPESUMS", files: ["pipe"] });
-      expect(r.ok).toBe(false);
-      expect(r.unreadable.length).toBe(1);
-      expect(r.unreadable[0]).toMatch(/^pipe: /);
-      expect(r.missing).toEqual([]);
+      expect(summary(r)).toEqual({
+        ok: false,
+        checked: 1,
+        notChecked: 0,
+        mismatched: ["pipe"],
+        missing: [],
+        unexpected: [],
+        unreadable: [],
+      });
+      // Recorded as a pipe, it verifies as one.
+      writeFileSync(join(workspace, "PIPESUMS"), '# fifo "pipe"\n');
+      const same = await call<Subset>(checksumVerify, { manifest: "PIPESUMS", files: ["pipe"] });
+      expect(same).toMatchObject({ ok: true, checked: 1, mismatched: [] });
     });
 
     test("a full walk, with no files, still checks every entry and carries no notChecked", async () => {
@@ -581,30 +617,84 @@ describe("ChecksumVerify", () => {
         mkdirSync(join(workspace, "art"));
         writeFileSync(join(workspace, "art/index.js"), "code");
         symlinkSync("index.js", join(workspace, "art/in-link.js"));
-        symlinkSync(join(outside, "secret.txt"), join(workspace, "art/out-link"));
+        const secret = join(outside, "secret.txt");
+        symlinkSync(secret, join(workspace, "art/out-link"));
         const w = await call<{ manifest: string; unreadable: string[] }>(checksumVerify, {
           directory: "art",
           write: true,
         });
         const lines = w.manifest.trim().split("\n");
-        expect(lines.map((l) => l.split("  ")[1])).toEqual(["in-link.js", "index.js"]);
+        expect(lines.slice(0, 2).map((l) => l.split("  ")[1])).toEqual(["in-link.js", "index.js"]);
         expect(lines[0]?.split("  ")[0]).toBe(lines[1]?.split("  ")[0]);
-        expect(w.unreadable).toEqual([
-          "out-link: a symlink that leads outside the workspace; not read",
-        ]);
+        // Recorded by its link text, never by what is out there.
+        expect(lines[2]).toBe(`# symlink "out-link" -> ${JSON.stringify(secret)}`);
+        expect(w.manifest).not.toContain("SENTINEL");
+        expect(w.unreadable).toEqual([]);
         writeFileSync(join(workspace, "SUMS"), w.manifest);
         const raw1 = await raw(checksumVerify, { directory: "art", manifest: "SUMS" });
         expect(raw1).not.toContain("SENTINEL");
-        const r = JSON.parse(raw1) as Check;
-        expect(r.ok).toBe(false);
-        expect(r.unexpected).toEqual(["out-link"]);
+        expect(JSON.parse(raw1) as Check).toMatchObject({ ok: true, unexpected: [] });
+        // Pointed elsewhere, it is a change.
+        rmSync(join(workspace, "art/out-link"));
+        symlinkSync("/etc/hosts", join(workspace, "art/out-link"));
+        const moved = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
+        expect(moved).toMatchObject({ ok: false, mismatched: ["out-link"], unexpected: [] });
       } finally {
         rmSync(outside, { recursive: true, force: true });
       }
     });
 
+    test("a tree holding links to directories verifies against its own manifest", async () => {
+      // A bun or npm workspace: every package under node_modules/@scope is a
+      // link to a directory. The fix round could never call such a tree ok:
+      // the link was unreadable, left out of the manifest, then unexpected.
+      mkdirSync(join(workspace, "packages/lib"), { recursive: true });
+      writeFileSync(join(workspace, "packages/lib/index.js"), "lib");
+      mkdirSync(join(workspace, "packages/app/node_modules/@acme"), { recursive: true });
+      writeFileSync(join(workspace, "packages/app/index.js"), "app");
+      symlinkSync("../../../lib", join(workspace, "packages/app/node_modules/@acme/lib"));
+      mkdirSync(join(workspace, "releases/v1"), { recursive: true });
+      writeFileSync(join(workspace, "releases/v1/app.js"), "v1");
+      symlinkSync("v1", join(workspace, "releases/current"));
+      symlinkSync("gone", join(workspace, "releases/dangling"));
+      type Written = { manifest: string; unreadable: string[]; recordedByKind?: number };
+      for (const directory of [undefined, "packages/app", "releases"]) {
+        const input = directory === undefined ? {} : { directory };
+        const w = await call<Written>(checksumVerify, { ...input, write: true });
+        expect({ directory, unreadable: w.unreadable }).toEqual({ directory, unreadable: [] });
+        writeFileSync(join(workspace, "SUMS"), w.manifest);
+        const r = await call<Check>(checksumVerify, { ...input, manifest: "SUMS" });
+        expect({ directory, ok: r.ok, unexpected: r.unexpected, unreadable: r.unreadable }).toEqual(
+          { directory, ok: true, unexpected: [], unreadable: [] },
+        );
+      }
+      const w = await call<Written>(checksumVerify, { directory: "releases", write: true });
+      expect(w.manifest.trim().split("\n")).toEqual([
+        '# symlink "current" -> "v1"',
+        '# symlink "dangling" -> "gone"',
+        `${createHash("sha256").update("v1").digest("hex")}  v1/app.js`,
+      ]);
+      expect(w.recordedByKind).toBe(2);
+      writeFileSync(join(workspace, "SUMS"), w.manifest);
+      // Retargeted, removed, or replaced by a file: each is a change.
+      mkdirSync(join(workspace, "releases/v2"));
+      rmSync(join(workspace, "releases/current"));
+      symlinkSync("v2", join(workspace, "releases/current"));
+      rmSync(join(workspace, "releases/dangling"));
+      const r = await call<Check>(checksumVerify, { directory: "releases", manifest: "SUMS" });
+      expect(r).toMatchObject({ ok: false, mismatched: ["current"], missing: ["dangling"] });
+      // files names a link to a directory: recorded, compared, not unreadable.
+      const one = await call<Check>(checksumVerify, {
+        directory: "releases",
+        manifest: "SUMS",
+        files: ["current", "dangling"],
+      });
+      expect(one).toMatchObject({ ok: false, mismatched: ["current"], missing: ["dangling"] });
+      expect(one.unreadable).toEqual([]);
+    });
+
     test.skipIf(process.platform === "win32")(
-      "a FIFO in the directory is named, not opened, and not ok",
+      "a FIFO in the directory is named by kind, never opened",
       async () => {
         mkdirSync(join(workspace, "art"));
         writeFileSync(join(workspace, "art/a.txt"), "a");
@@ -613,11 +703,18 @@ describe("ChecksumVerify", () => {
           directory: "art",
           write: true,
         });
-        expect(w.unreadable).toEqual(["pipe: a fifo, not a regular file; not opened"]);
+        // Named by kind: the tree it describes verifies against it.
+        expect(w.unreadable).toEqual([]);
+        expect(w.manifest).toContain('# fifo "pipe"\n');
         writeFileSync(join(workspace, "SUMS"), w.manifest);
+        const same = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
+        expect(same).toMatchObject({ ok: true, unexpected: [], unreadable: [] });
+        // A pipe swapped for a file is a change, and an unlisted pipe is unexpected.
+        rmSync(join(workspace, "art/pipe"));
+        writeFileSync(join(workspace, "art/pipe"), "now a file");
+        expect(Bun.spawnSync(["mkfifo", join(workspace, "art/pipe2")]).exitCode).toBe(0);
         const r = await call<Check>(checksumVerify, { directory: "art", manifest: "SUMS" });
-        expect(r.ok).toBe(false);
-        expect(r.unexpected).toEqual(["pipe"]);
+        expect(r).toMatchObject({ ok: false, mismatched: ["pipe"], unexpected: ["pipe2"] });
       },
     );
 
