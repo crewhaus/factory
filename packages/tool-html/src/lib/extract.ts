@@ -293,6 +293,18 @@ export function extractLinks(
         // Keep the raw value; `javascript:` and `mailto:` land here.
       }
     }
+    // Resolving copies the base into every href, so what it adds is charged
+    // like text: a 40 KB <base href> and 2,000 `<a href=?>` turned 75 KB of
+    // markup into an 80 MB answer, untruncated. The page's own attribute
+    // text is not multiplied, and costs nothing here.
+    const added = href.length - raw.length;
+    if (added > 0) {
+      if (added > budget.chars) {
+        budget.cut = true;
+        break;
+      }
+      budget.chars -= added;
+    }
     const text = textWithin(anchor, budget);
     // A JSON pair rather than a joined key: link text is arbitrary page
     // content, and any separator could occur inside it and collide.

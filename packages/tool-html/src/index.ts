@@ -130,14 +130,30 @@ export const htmlQuery: RegisteredTool = buildTool({
     const budget = createTextBudget(LIMITS.queryChars, LIMITS.textWork);
     const values: string[] = [];
     const matches: Array<Record<string, unknown>> = [];
+    const attribute = input.attribute?.toLowerCase();
+    /** With `attribute`, the first match whose text the budget cut or left out. */
+    let textCutAt: number | undefined;
     // A match's text is its subtree's, so nested matches repeat it: stop
     // once the budget has cut a value.
     for (const node of found.slice(0, limit)) {
-      if (budget.cut) break;
+      if (attribute === undefined) {
+        if (budget.cut) break;
+        const text = textWithin(node, budget);
+        values.push(text);
+        matches.push(describe(node, text, false));
+        continue;
+      }
+      // An attribute is the element's own, never a subtree's, so the values
+      // asked for are not charged to the text budget: the fix round let
+      // section text it was never asked for use the budget up, and returned
+      // 51 of 60 ids. Only `matches[].text` is cut, and then left out.
+      values.push(attrOf(node, attribute) ?? "");
+      if (budget.cut) {
+        matches.push({ tag: node.tag, attrs: node.attrs });
+        continue;
+      }
       const text = textWithin(node, budget);
-      values.push(
-        input.attribute === undefined ? text : (attrOf(node, input.attribute.toLowerCase()) ?? ""),
-      );
+      if (budget.cut) textCutAt = matches.length;
       matches.push(describe(node, text, false));
     }
     const truncatedBy = [
@@ -151,7 +167,14 @@ export const htmlQuery: RegisteredTool = buildTool({
       count: values.length,
       truncated: truncatedBy.length > 0,
       ...(truncatedBy.length > 0 ? { truncatedBy } : {}),
-      ...(budget.cut ? { note: cutNote(LIMITS.queryChars) } : {}),
+      ...(budget.cut
+        ? {
+            note:
+              textCutAt === undefined
+                ? cutNote(LIMITS.queryChars)
+                : `the ${LIMITS.queryChars}-character text budget ran out, so matches[${textCutAt}].text is cut and later matches carry no text; every attribute value in values is whole`,
+          }
+        : {}),
       ...(input.attribute === undefined ? {} : { attribute: input.attribute }),
       values,
       matches,
@@ -258,7 +281,12 @@ export const htmlLinks: RegisteredTool = buildTool({
       count: links.length,
       links: links.slice(0, limit),
       truncated: links.length > limit || budget.cut,
-      ...(budget.cut ? { truncatedBy: ["chars"], note: cutNote(LIMITS.textChars) } : {}),
+      ...(budget.cut
+        ? {
+            truncatedBy: ["chars"],
+            note: `the ${LIMITS.textChars}-character budget for link text and what resolving adds to hrefs ran out, so later links are not returned and the last one's text may be cut; narrow the page, or pass a shorter baseUrl`,
+          }
+        : {}),
     });
   },
 });

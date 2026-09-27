@@ -967,6 +967,58 @@ describe("element text is budgeted per call", () => {
     expect(out.truncatedBy).toEqual(["chars"]);
   });
 
+  test("HtmlLinks: what resolving against a long <base href> adds is charged", async () => {
+    // Before, 75 KB of markup answered 80 MB, with truncated: false.
+    const html = `<base href="http://x/${"a".repeat(40_000)}">${'<a href="?">i</a>'.repeat(2_000)}`;
+    const { raw, out } = await run(htmlLinks, { html, limit: 2_000 });
+    expect(html.length).toBeLessThan(80_000);
+    expect(raw.length).toBeLessThan(2_300_000);
+    expect(out).toMatchObject({ truncated: true, truncatedBy: ["chars"] });
+    expect(String(out.note)).toMatch(/what resolving adds to hrefs ran out/);
+    const links = out.links as Array<{ href: string }>;
+    expect(links.length).toBeGreaterThan(0);
+    // Every link returned is whole; the budget stops before a link, not inside one.
+    for (const link of links) expect(link.href).toBe(`http://x/${"a".repeat(40_000)}?`);
+    // A caller's long baseUrl is charged the same way.
+    const viaCaller = await run(htmlLinks, {
+      html: '<a href="?">i</a>'.repeat(2_000),
+      baseUrl: `http://x/${"a".repeat(40_000)}`,
+      limit: 2_000,
+    });
+    expect(viaCaller.raw.length).toBeLessThan(2_300_000);
+    expect(viaCaller.out.truncated).toBe(true);
+    // An ordinary base adds little, and nothing is cut.
+    const plain = await run(htmlLinks, {
+      html: `<base href="https://example.test/docs/">${'<a href="a.html">a</a>'.repeat(500)}`,
+    });
+    expect(plain.out).toMatchObject({ count: 1, truncated: false });
+    expect(plain.out).not.toHaveProperty("truncatedBy");
+  });
+
+  test("HtmlQuery: an attribute query returns every value, however much text the matches hold", async () => {
+    // The fix round charged each match's text even when only an attribute
+    // was asked for, and returned 51 of 60 ids from this 1.2 MB page.
+    const prose = "Lorem ipsum dolor sit amet. ".repeat(720);
+    const html = Array.from(
+      { length: 60 },
+      (_, i) => `<section id="s${i}">${prose}</section>`,
+    ).join("");
+    const { out } = await run(htmlQuery, { html, selector: "section", attribute: "id", limit: 60 });
+    expect(out.values).toEqual(Array.from({ length: 60 }, (_, i) => `s${i}`));
+    expect(out).toMatchObject({ count: 60, truncated: true, truncatedBy: ["chars"] });
+    const matches = out.matches as Array<{ tag: string; text?: string; attrs: object }>;
+    expect(matches).toHaveLength(60);
+    const cutAt = matches.findIndex((m) => m.text === undefined) - 1;
+    expect(cutAt).toBeGreaterThan(0);
+    expect(String(out.note)).toBe(
+      `the 1000000-character text budget ran out, so matches[${cutAt}].text is cut and later matches carry no text; every attribute value in values is whole`,
+    );
+    expect(matches[cutAt + 1]).toEqual({ tag: "section", attrs: { id: `s${cutAt + 1}` } });
+    // Without an attribute, the values are the text, and they stop at the budget.
+    const text = await run(htmlQuery, { html, selector: "section", limit: 60 });
+    expect((text.out.values as string[]).length).toBeLessThan(60);
+  });
+
   test("HtmlForms: one wrapping label is read within the budget for every control", async () => {
     // Each control inside a label takes the whole label's text as its label.
     const html = `<form><label>${"x".repeat(20_000)}${"<input name=a>".repeat(300)}</label></form>`;
