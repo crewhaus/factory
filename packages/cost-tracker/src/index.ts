@@ -104,10 +104,12 @@ export {
 
 export {
   describeToolLimitOverrun,
+  limitIsUnverified,
   PROVIDER_TOOL_LIMITS,
   providerToolLimit,
   toolLimitOverrun,
   type ProviderToolLimit,
+  type ToolLimitEnv,
   type ToolLimitOverrun,
 } from "./tool-limits";
 

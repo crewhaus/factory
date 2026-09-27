@@ -194,15 +194,29 @@ const FIXTURES = listFixtureShapes();
 describe("every shape's fixture compiles every kind of tool, or refuses it by name", () => {
   test("the matrix covers every fixture and every leaf category", () => {
     expect(FIXTURES.length).toBeGreaterThanOrEqual(15);
-    // Exactly one fixture's model cannot take the whole matrix (cli-openai);
-    // a second would mean the matrix proves less than it claims.
+    // No fixture is refused for its provider's tool limit: the one whose
+    // model is over one (cli-openai, OpenAI takes 128) is an `openai/` model,
+    // which OPENAI_BASE_URL may send to a server with no such limit, so the
+    // compiler warns (provider-tool-cap-unverified) and the run checks at
+    // start. A refused fixture would mean the matrix proves less than it
+    // claims.
     const limited = FIXTURES.filter((shape) => {
       const yaml = withTools(shape, SELECTORS);
       return (
         yaml !== undefined && checkProviderToolLimits(lower(parseSpec(yaml))).errors.length > 0
       );
     });
-    expect(limited).toEqual(["cli-openai"]);
+    expect(limited).toEqual([]);
+    const unverified = FIXTURES.filter((shape) => {
+      const yaml = withTools(shape, SELECTORS);
+      return (
+        yaml !== undefined &&
+        checkProviderToolLimits(lower(parseSpec(yaml))).warnings.some(
+          (w) => w.code === "provider-tool-cap-unverified",
+        )
+      );
+    });
+    expect(unverified).toEqual(["cli-openai"]);
     expect(LEAF_PICKS.length).toBe(leafCategories().length);
     expect(LEAF_PICKS.length).toBeGreaterThanOrEqual(50);
     expect(EXPECTED_KEYS.length).toBeGreaterThanOrEqual(150);

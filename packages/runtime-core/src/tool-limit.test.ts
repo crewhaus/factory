@@ -9,7 +9,7 @@
  * the check that also sees the loop's own tools, MCP tools and a `--model`
  * override.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -30,12 +30,20 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type { ModelRouteEvent, TraceEvent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { type RunChatLoopOptions, runChatLoop } from "./index";
-import { type ServingModel, checkServingToolLimits } from "./tool-limit";
+import {
+  type ServingModel,
+  __resetToolLimitReportsForTests,
+  checkServingToolLimits,
+} from "./tool-limit";
 
 const SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-tool-limit-tests-"));
 const TMP: string[] = [];
 beforeAll(() => {
   process.env["CREWHAUS_SESSION_DIR"] = SESSION_ROOT;
+});
+beforeEach(() => {
+  // Boot lines are written once per process; each test starts from none.
+  __resetToolLimitReportsForTests();
 });
 afterAll(() => {
   process.env["CREWHAUS_SESSION_DIR"] = undefined;
@@ -54,7 +62,7 @@ describe("checkServingToolLimits", () => {
   test("every serving model over its limit is fatal, naming each one", () => {
     const v = checkServingToolLimits([serving("openai/gpt-5", 141), serving("groq/x", 141)]);
     expect(v.fatal).toContain(
-      '141 tools (the run\'s tools) exceed the 128-tool limit OpenAI puts on one request, so every call to model "openai/gpt-5" is refused; 141 tools',
+      '141 tools (the run\'s tools) exceed the 128-tool limit OpenAI puts on one request, so every call to model "openai/gpt-5" is refused by api.openai.com; 141 tools',
     );
     expect(v.fatal).toContain('limit Groq puts on one request, so every call to model "groq/x"');
     expect(v.warnings).toEqual([]);
@@ -80,6 +88,19 @@ describe("checkServingToolLimits", () => {
       '"gemini/gemini-2.5-pro"',
     ]);
     expect(v.warnings[0]).toContain("; it is skipped. Narrow the tools");
+  });
+
+  test("an openai/ model OPENAI_BASE_URL sends elsewhere is not held to OpenAI's 128", () => {
+    const over = [serving("openai/gpt-5", 141)];
+    const gateway = { OPENAI_BASE_URL: "http://localhost:8000/v1" };
+    expect(checkServingToolLimits(over, gateway)).toEqual({ warnings: [] });
+    expect(
+      checkServingToolLimits(over, { OPENAI_BASE_URL: "https://api.openai.com/v1" }).fatal,
+    ).toContain("128-tool limit OpenAI");
+    // The variable moves only the openai/ route.
+    expect(checkServingToolLimits([serving("azure/big", 141)], gateway).fatal).toContain(
+      "128-tool limit Azure OpenAI",
+    );
   });
 
   test("within every limit, or on routes with none: nothing to say", () => {
@@ -266,7 +287,7 @@ describe("a model over its limit beside one within it", () => {
     expect(route?.eligible).toEqual(["claude-opus-4-8"]);
     expect(route?.reason).toContain("openai/gpt-5 ineligible (tool-limit)");
     expect(stderr).toContain(
-      '[tools] model_pool candidate "openai/gpt-5": 141 tools (the run\'s tools) exceed the 128-tool limit OpenAI puts on one request, so every call to model "openai/gpt-5" is refused; routing leaves it out.',
+      '[tools] model_pool candidate "openai/gpt-5": 141 tools (the run\'s tools) exceed the 128-tool limit OpenAI puts on one request, so every call to model "openai/gpt-5" is refused by api.openai.com; routing leaves it out.',
     );
   });
 
@@ -294,5 +315,102 @@ describe("a model over its limit beside one within it", () => {
     });
     await expect(run).rejects.toBeInstanceOf(ConfigError);
     expect(a.requests.length + b.requests.length).toBe(0);
+  });
+});
+
+/** Run `fn` with `OPENAI_BASE_URL` set to `value`, then put it back. */
+async function withBaseUrl<T>(value: string, fn: () => Promise<T>): Promise<T> {
+  const before = process.env["OPENAI_BASE_URL"];
+  process.env["OPENAI_BASE_URL"] = value;
+  try {
+    return await fn();
+  } finally {
+    if (before === undefined) Reflect.deleteProperty(process.env, "OPENAI_BASE_URL");
+    else process.env["OPENAI_BASE_URL"] = before;
+  }
+}
+
+// provider-limits#0 — `openai/` + OPENAI_BASE_URL is the documented way to
+// reach an OpenAI-compatible gateway (vLLM, LiteLLM), which has no 128-tool
+// limit. The boot check reads the variable the adapter reads.
+describe("OPENAI_BASE_URL decides whether OpenAI's limit applies at start", () => {
+  test("a gateway: an openai/ model with 131 tools starts and is sent all of them", async () => {
+    const adapter = recordingAdapter();
+    const { text, stderr } = await withBaseUrl("http://localhost:8000/v1", () =>
+      boot({ model: "openai/meta-llama/Llama-3.3-70B", _adapter: adapter, tools: tools(130) }),
+    );
+    expect(text).toBe("done");
+    expect(adapter.requests[0]?.tools?.length).toBe(131);
+    expect(stderr).not.toContain("[tools]");
+  });
+
+  test("api.openai.com named outright: still refused before any call", async () => {
+    const adapter = recordingAdapter();
+    const run = withBaseUrl("https://api.openai.com/v1", () =>
+      boot({ model: "openai/gpt-5", _adapter: adapter, tools: tools(130) }),
+    );
+    await expect(run).rejects.toBeInstanceOf(ConfigError);
+    expect(adapter.requests).toHaveLength(0);
+  });
+
+  test("a pool candidate on a gateway is eligible, and is the one that serves", async () => {
+    const gateway = recordingAdapter("gateway");
+    const strong = recordingAdapter("strong");
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-tool-limit-sb-"));
+    TMP.push(dir);
+    const { text, events, stderr } = await withBaseUrl("http://localhost:8000/v1", () =>
+      boot({
+        model: "claude-sonnet-4-6",
+        _adapter: recordingAdapter("primary"),
+        tools: tools(140),
+        modelPool: {
+          policy: "static",
+          candidates: [
+            { model: "openai/meta-llama/Llama-3.3-70B", tags: ["cheap"] },
+            { model: "claude-opus-4-8", tags: ["strong"] },
+          ],
+        },
+        _poolAdapters: new Map([
+          ["openai/meta-llama/Llama-3.3-70B", gateway],
+          ["claude-opus-4-8", strong],
+        ]),
+        _scoreboard: openScoreboard(dir, { now: () => 1_700_000_000_000 }),
+      }),
+    );
+    expect(text).toBe("gateway");
+    expect(strong.requests).toHaveLength(0);
+    const route = events.find((e): e is ModelRouteEvent => e.kind === "model_route");
+    expect(route?.eligible).toEqual(["openai/meta-llama/Llama-3.3-70B", "claude-opus-4-8"]);
+    expect(stderr).not.toContain("[tools]");
+  });
+});
+
+// A channel daemon, `managed` and `serve --mcp` run one loop per message: the
+// same boot verdict must not be written again for every one of them.
+describe("a [tools] boot line is written once per process", () => {
+  const overFallback = () =>
+    boot({
+      model: "claude-sonnet-4-6",
+      _adapter: recordingAdapter("primary"),
+      modelFallbacks: ["azure/big"],
+      _failoverAdapters: new Map([["azure/big", recordingAdapter("fallback")]]),
+      tools: tools(140),
+    });
+  const toolLines = (stderr: string) => stderr.split("\n").filter((l) => l.startsWith("[tools] "));
+
+  test("two loops, one line; a different verdict is still written", async () => {
+    const first = await overFallback();
+    const second = await overFallback();
+    expect(toolLines(first.stderr)).toHaveLength(1);
+    expect(toolLines(second.stderr)).toEqual([]);
+    const other = await boot({
+      model: "claude-sonnet-4-6",
+      _adapter: recordingAdapter("primary"),
+      modelFallbacks: ["groq/llama-3.3-70b"],
+      _failoverAdapters: new Map([["groq/llama-3.3-70b", recordingAdapter("fallback")]]),
+      tools: tools(140),
+    });
+    expect(toolLines(other.stderr)).toHaveLength(1);
+    expect(toolLines(other.stderr)[0]).toContain("groq/llama-3.3-70b");
   });
 });

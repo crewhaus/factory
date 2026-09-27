@@ -1902,10 +1902,13 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  every call fails), tool-config-unused (a tool_config block no listed\n" +
         "  tool reads, so the setting is not in force), sub-agent-tool-ungranted\n" +
         "  (a sub-agent lists a builtin its parent never registers),\n" +
-        "  provider-tool-cap (a fallback, tier or pool model whose provider\n" +
-        "  refuses that many tools on one request — OpenAI, Azure OpenAI and\n" +
-        "  Groq take 128, Gemini 512; when no model can take them it is an\n" +
-        "  error), channel-reactions-join\n" +
+        "  provider-tool-cap (informational — a fallback, tier or pool model\n" +
+        "  whose provider refuses that many tools on one request: OpenAI,\n" +
+        "  Azure OpenAI and Groq take 128, Gemini 512; when no model can take\n" +
+        "  them it is an error), provider-tool-cap-unverified (informational —\n" +
+        "  an openai/ model over OpenAI's 128; OPENAI_BASE_URL may send it to a\n" +
+        "  server that takes more, and the run checks at start),\n" +
+        "  channel-reactions-join\n" +
         "  (informational — reaction feedback attributes to the exact turn\n" +
         "  only once the outbound-ts join file accumulates),\n" +
         "  channel-plugins-at-start (informational — a channel daemon skips a\n" +
@@ -1918,7 +1921,8 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  --strict   Escalate compile warnings to errors: any remediable\n" +
         "             warning fails the compile (exit 1) before files are\n" +
         "             written. Informational codes (channel-reactions-join,\n" +
-        "             channel-plugins-at-start,\n" +
+        "             channel-plugins-at-start, provider-tool-cap,\n" +
+        "             provider-tool-cap-unverified,\n" +
         "             cli-autodistill-toolchain, model-plan-candidate-only,\n" +
         "             model-capabilities-unknown, model-sunset,\n" +
         "             model-strongest-crosses-provider) still print but\n" +
@@ -2178,11 +2182,21 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // 0.7.1 — mcp-server-name is informational for the same reason as
   // model-sunset: the key ran on 0.7.0, and a spec that compiled under
   // --strict before the upgrade must still compile after it.
+  //
+  // 0.7.1 — provider-tool-cap and provider-tool-cap-unverified are
+  // informational for that reason too. A fallback, tier or pool model over
+  // its provider's tool limit sat beside a model that serves, and the spec
+  // passed --strict on 0.7.0; an `openai/` model may be sent by
+  // OPENAI_BASE_URL to a server with no such limit, which only the running
+  // process can see (it checks again at start). A site no model can serve is
+  // still a compile error.
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
     "channel-plugins-at-start",
     "cli-autodistill-toolchain",
     "mcp-server-name",
+    "provider-tool-cap",
+    "provider-tool-cap-unverified",
     "model-plan-candidate-only",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",

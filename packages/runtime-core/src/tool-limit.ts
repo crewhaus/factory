@@ -11,11 +11,16 @@
  * on every call (retried, then reported as "tombstone budget exhausted", or
  * for a fallback as "breaker open").
  *
- * Pure: the caller says which models can serve and how many tools each is
- * sent; the limits come from `@crewhaus/cost-tracker`, the table the
- * compiler reads.
+ * The verdict is pure: the caller says which models can serve, how many
+ * tools each is sent and the environment the adapters read their endpoints
+ * from; the limits come from `@crewhaus/cost-tracker`, the table the
+ * compiler reads. An `openai/` model is held to api.openai.com's limit only
+ * when OPENAI_BASE_URL is unset or names api.openai.com — the compiler cannot
+ * see where it points, and leaves that to this check. The one piece of state
+ * is which boot lines this process has already written.
  */
 import {
+  type ToolLimitEnv,
   type ToolLimitOverrun,
   describeToolLimitOverrun,
   toolLimitOverrun,
@@ -44,11 +49,19 @@ export type ToolLimitVerdict = {
   readonly warnings: ReadonlyArray<string>;
 };
 
-/** Check every serving model's tool count against its provider's per-request limit. */
-export function checkServingToolLimits(serving: ReadonlyArray<ServingModel>): ToolLimitVerdict {
+/**
+ * Check every serving model's tool count against its provider's per-request
+ * limit. `env` is where the adapters read their endpoints from: an `openai/`
+ * model that `OPENAI_BASE_URL` sends to another server is not held to
+ * api.openai.com's limit.
+ */
+export function checkServingToolLimits(
+  serving: ReadonlyArray<ServingModel>,
+  env: ToolLimitEnv = {},
+): ToolLimitVerdict {
   const overruns = new Map<ServingModel, ToolLimitOverrun>();
   for (const s of serving) {
-    const o = toolLimitOverrun(s.model, s.toolCount);
+    const o = toolLimitOverrun(s.model, s.toolCount, env);
     if (o !== undefined) overruns.set(s, o);
   }
   if (overruns.size === 0) return { warnings: [] };
@@ -66,4 +79,24 @@ export function checkServingToolLimits(serving: ReadonlyArray<ServingModel>): To
       `${s.label}: ${describeToolLimitOverrun(o, "the run's tools")}; ${s.whenOver}. ${fix}`,
   );
   return { warnings };
+}
+
+/**
+ * Boot lines this process has already written. A channel daemon, `managed`
+ * and `serve --mcp` run one loop per message or request, and the same
+ * verdict would otherwise be repeated on every one of them for the daemon's
+ * whole life.
+ */
+const reportedLines = new Set<string>();
+
+/** The `lines` this process has not written yet, now marked as written. */
+export function unreportedToolLimitLines(lines: ReadonlyArray<string>): string[] {
+  const fresh = lines.filter((line) => !reportedLines.has(line));
+  for (const line of fresh) reportedLines.add(line);
+  return fresh;
+}
+
+/** Tests only: forget which boot lines were written. */
+export function __resetToolLimitReportsForTests(): void {
+  reportedLines.clear();
 }

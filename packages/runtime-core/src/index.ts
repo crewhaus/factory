@@ -222,7 +222,12 @@ import {
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
-import { type ServingModel, type ToolLimitVerdict, checkServingToolLimits } from "./tool-limit";
+import {
+  type ServingModel,
+  type ToolLimitVerdict,
+  checkServingToolLimits,
+  unreportedToolLimitLines,
+} from "./tool-limit";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -3139,23 +3144,26 @@ export function buildTimeoutFailureReport(timeout: TimeoutAbortReason): FailureR
 }
 
 /**
+ * provider-limits#0 — act on a boot tool-limit verdict: no model can take the
+ * run's tools → a `ConfigError` before any model call; some model cannot →
+ * one `[tools]` line per model on stderr, beside the `[failover]` and
+ * `[model_pool]` boot lines. A daemon runs one loop per message, so each
+ * line is written once per process (`unreportedToolLimitLines`).
+ */
+function reportToolLimits(verdict: ToolLimitVerdict): void {
+  if (verdict.fatal !== undefined) throw new ConfigError(verdict.fatal);
+  for (const line of unreportedToolLimitLines(verdict.warnings)) {
+    process.stderr.write(`[tools] ${line}\n`);
+  }
+}
+
+/**
  * Item 3 (G32) — merge plugin-contributed tools into the run's advertised tool
  * set. First-party `base` tools WIN any name collision, so an activated plugin
  * can augment the catalog but never silently shadow a built-in. Returns the
  * `base` array unchanged (same reference) when there are no plugin tools, so a
  * run without the `plugins` option is byte-identical to a pre-G32 runtime.
  */
-/**
- * provider-limits#0 — act on a boot tool-limit verdict: no model can take the
- * run's tools → a `ConfigError` before any model call; some model cannot →
- * one `[tools]` line per model on stderr, beside the `[failover]` and
- * `[model_pool]` boot lines.
- */
-function reportToolLimits(verdict: ToolLimitVerdict): void {
-  if (verdict.fatal !== undefined) throw new ConfigError(verdict.fatal);
-  for (const line of verdict.warnings) process.stderr.write(`[tools] ${line}\n`);
-}
-
 function mergeEffectiveTools(
   base: ReadonlyArray<RegisteredTool>,
   pluginTools: ReadonlyArray<RegisteredTool> | undefined,
@@ -3328,7 +3336,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         whenOver: "a budget degrade to it would fail every call",
       });
     }
-    reportToolLimits(checkServingToolLimits(serving));
+    reportToolLimits(checkServingToolLimits(serving, process.env));
   }
   let compactionAdapter: ProviderAdapter;
   let compactionWireModelId: string;
@@ -4472,7 +4480,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         whenOver: "a budget degrade to it would fail every call",
       });
     }
-    reportToolLimits(checkServingToolLimits(serving));
+    reportToolLimits(checkServingToolLimits(serving, process.env));
   }
   {
     const currentToolNames = [...effectiveTools.map((t) => t.name)].sort();
@@ -7534,7 +7542,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 const maxOutputTokens =
                   cfg?.capabilities?.maxOutputTokens ?? table?.maxOutputTokens;
                 const breakerState = c.breaker?.state();
-                const toolLimit = providerToolLimit(c.modelString);
+                const toolLimit = providerToolLimit(c.modelString, process.env);
                 return {
                   armId: armIdOf(c),
                   modelString: c.modelString,

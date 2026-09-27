@@ -591,41 +591,51 @@ describe("crewhaus compile", () => {
     expect(existsSync(strictOut)).toBe(false);
   }, 30_000);
 
-  // provider-limits#0 — 0.7.0 compiled `tools: [all-code]` on an OpenAI model
-  // (even under --strict) and every call then failed with the provider's 400.
-  test("compile refuses a tool list the only model's provider cannot take, and --strict refuses an over-limit fallback", async () => {
+  // provider-limits#0 — 0.7.0 compiled `tools: [all-code]` on a 128-tool
+  // provider (even under --strict) and every call then failed with the
+  // provider's 400. A site no model can serve is now refused. The warnings
+  // are informational: an over-limit fallback beside a model that serves
+  // passed --strict on 0.7.0, and an `openai/` model may be sent by
+  // OPENAI_BASE_URL to a gateway with no such limit — both must still pass.
+  test("compile refuses a tool list no model can take; the over-limit warnings never fail --strict", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     const head = "name: wide\ntarget: cli\nagent:\n  instructions: i\n";
-    writeFileSync(specPath, `${head}  model: openai/gpt-5\ntools: [all-code]\n`);
+    writeFileSync(specPath, `${head}  model: azure/big\ntools: [all-code]\n`);
     const outDir = join(tmp, "out");
     const refused = await runCli(["compile", specPath, "--no-register", "-o", outDir], {
       cwd: tmp,
     });
     expect(refused.exitCode).toBe(1);
     expect(refused.stderr).toMatch(
-      /^crewhaus: tools: \d+ tools \(from tools:\) exceed the 128-tool limit OpenAI puts on one request, so every call to model "openai\/gpt-5" is refused\./,
+      /^crewhaus: tools: \d+ tools \(from tools:\) exceed the 128-tool limit Azure OpenAI puts on one request, so every call to model "azure\/big" is refused\./,
     );
     expect(refused.stderr).not.toContain("    at ");
     expect(existsSync(outDir)).toBe(false);
 
+    const strictPasses = async (label: string, code: string, env: Record<string, string> = {}) => {
+      const strictOut = join(tmp, `strict-${label}`);
+      const strict = await runCli(
+        ["compile", specPath, "--strict", "--no-register", "-o", strictOut],
+        { cwd: tmp, env },
+      );
+      expect({ label, exit: strict.exitCode }).toEqual({ label, exit: 0 });
+      expect(strict.stderr).toContain(`crewhaus: warning[${code}] agent.model`);
+      expect(strict.stderr).not.toContain("--strict:");
+      expect(existsSync(join(strictOut, "agent.ts"))).toBe(true);
+    };
+
     writeFileSync(
       specPath,
-      `${head}  model: claude-sonnet-4-6\n  model_fallbacks: [openai/gpt-4o]\ntools: [all-code]\n`,
+      `${head}  model: claude-sonnet-4-6\n  model_fallbacks: [azure/big]\ntools: [all-code]\n`,
     );
-    const loose = await runCli(["compile", specPath, "--no-register", "-o", outDir], { cwd: tmp });
-    expect(loose.exitCode).toBe(0);
-    expect(loose.stderr).toContain(
-      "crewhaus: warning[provider-tool-cap] agent.model_fallbacks[0]:",
-    );
-    const strictOut = join(tmp, "strict-out");
-    const strict = await runCli(
-      ["compile", specPath, "--strict", "--no-register", "-o", strictOut],
-      { cwd: tmp },
-    );
-    expect(strict.exitCode).toBe(1);
-    expect(strict.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
-    expect(existsSync(strictOut)).toBe(false);
-  }, 30_000);
+    await strictPasses("fallback", "provider-tool-cap");
+
+    writeFileSync(specPath, `${head}  model: openai/meta-llama/Llama-3.3-70B\ntools: [all-code]\n`);
+    await strictPasses("gateway", "provider-tool-cap-unverified", {
+      OPENAI_BASE_URL: "http://localhost:4000/v1",
+    });
+    await strictPasses("openai", "provider-tool-cap-unverified");
+  }, 60_000);
 
   test("compile --strict passes a warning-free spec (and prints no warning lines)", async () => {
     const outDir = join(tmp, "out");

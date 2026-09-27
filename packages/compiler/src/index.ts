@@ -7,6 +7,7 @@ import {
   crossesProvider,
   describeToolLimitOverrun,
   findSunset,
+  limitIsUnverified,
   providerOfSpecString,
   resolveCapabilities,
   resolveCheapestForSlot,
@@ -257,7 +258,10 @@ export type LowerOptions = {
  * `"model-plan-ignored-on-slot"`, `"model-plan-candidate-only"`,
  * `"model-plan-self-judge"`, `"model-sunset"`, `"model-capabilities-unknown"`,
  * `"model-strongest-crosses-provider"`, and from 0.7.1 `"provider-tool-cap"`
- * for a model whose provider refuses the site's tool count), `path` the spec key it concerns
+ * for a model whose provider refuses the site's tool count and
+ * `"provider-tool-cap-unverified"` for an `openai/` model over OpenAI's
+ * limit, which `OPENAI_BASE_URL` may send elsewhere; both informational),
+ * `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged.
  */
@@ -940,13 +944,21 @@ export function checkShapeTools(ir: IrNode): {
  * profile's `tools` subset), else both tiers, else the model and its
  * fallbacks.
  *
- * - when EVERY one of those models is over its limit, the site can never
- *   make a call that succeeds: an ERROR naming the count, the limit and the
- *   fix. No spec that ran on 0.7.0 is refused by this — none of its calls
- *   could have been answered;
- * - when only some are, a `provider-tool-cap` WARNING per model over the
- *   limit (`--strict` escalates it): the spec runs while a model within its
- *   limit serves, and fails on every call routed to the others.
+ * - when EVERY one of those models is over a limit that certainly applies,
+ *   the site can never make a call that succeeds: an ERROR naming the count,
+ *   the limit and the fix. No spec that ran on 0.7.0 is refused by this —
+ *   none of its calls could have been answered;
+ * - otherwise one WARNING per model over its limit: `provider-tool-cap` for
+ *   a route whose server is fixed (the spec runs while a model within its
+ *   limit serves, and every call routed to this one fails), and
+ *   `provider-tool-cap-unverified` for an `openai/` model, whose limit is
+ *   api.openai.com's: `OPENAI_BASE_URL` can send it to an OpenAI-compatible
+ *   server with no such limit (the documented way to reach a gateway or a
+ *   proxy), and only the running process can see where it goes, so
+ *   runtime-core checks it again at boot, against the real endpoint, before
+ *   any call. Both are informational — `compile --strict` does not fail on
+ *   them: a spec that passed `--strict` on 0.7.0 with an over-limit
+ *   fallback still runs on its primary, and must still pass.
  */
 export function checkProviderToolLimits(ir: IrNode): {
   readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>;
@@ -992,7 +1004,11 @@ export function checkProviderToolLimits(ir: IrNode): {
       return o === undefined ? [] : [{ site: s, overrun: o }];
     });
     if (over.length === 0) continue;
-    if (over.length === serving.length) {
+    // An `openai/` model's limit is unverified (OPENAI_BASE_URL may send it
+    // to a server without one), so a site is refused only when every model
+    // is over a limit that certainly applies.
+    const certain = over.filter((x) => !limitIsUnverified(x.overrun.limit));
+    if (over.length === serving.length && certain.length === over.length) {
       const why = over.map((x) => describeToolLimitOverrun(x.overrun, "from tools:")).join("; ");
       const no =
         over.length === 1
@@ -1002,11 +1018,21 @@ export function checkProviderToolLimits(ir: IrNode): {
       continue;
     }
     for (const x of over) {
-      warnings.push({
-        code: "provider-tool-cap",
-        path: x.site.path,
-        message: `${describeToolLimitOverrun(x.overrun, `from ${site.path}`)}; the spec still runs while another model serves. ${fix}`,
-      });
+      const described = describeToolLimitOverrun(x.overrun, `from ${site.path}`);
+      const endpoint = x.overrun.limit.endpoint;
+      warnings.push(
+        endpoint !== undefined
+          ? {
+              code: "provider-tool-cap-unverified",
+              path: x.site.path,
+              message: `${described}. It runs only if ${endpoint.env} sends the model to an OpenAI-compatible server that takes more; the run checks this when it starts, where it can see ${endpoint.env}, and stops before the first call if not. ${fix}`,
+            }
+          : {
+              code: "provider-tool-cap",
+              path: x.site.path,
+              message: `${described}; the spec runs while another model serves. ${fix}`,
+            },
+      );
     }
   }
   return { errors, warnings };
