@@ -93,6 +93,7 @@ import {
   type WikiStore,
   WikiVersionConflictError,
   createWikiStore,
+  isWikiSlug,
 } from "@crewhaus/wiki-store";
 import { z } from "zod";
 
@@ -352,6 +353,32 @@ function refLine(ref: WikiRef): string {
 }
 
 /**
+ * What a redacted article or row is still named by: its slug and version,
+ * the only parts printed OUTSIDE the classified unit. The store validates
+ * both, but a store from another backend (or a planted index.json read by an
+ * older store) may not, so each is printed only when it is a slug and a
+ * positive whole number, and a fixed placeholder otherwise.
+ */
+function redactedName(ref: { readonly slug: unknown; readonly version: unknown }): {
+  readonly slug: string;
+  readonly version: string;
+} {
+  return {
+    slug: isWikiSlug(ref.slug) ? ref.slug : "(an article with an invalid slug)",
+    version:
+      typeof ref.version === "number" && Number.isSafeInteger(ref.version) && ref.version > 0
+        ? `v${ref.version}`
+        : "v?",
+  };
+}
+
+/** `slug (vN)`, from {@link redactedName}. */
+function named(ref: { readonly slug: unknown; readonly version: unknown }): string {
+  const name = redactedName(ref);
+  return `${name.slug} (${name.version})`;
+}
+
+/**
  * One list row, classified as ONE unit: `prefix` (text from the article that
  * the row shows before the ref line, e.g. wiki_list's `updatedAt`) and the
  * ref line together. Returns the row, or its slug and version with the
@@ -361,7 +388,7 @@ function refLine(ref: WikiRef): string {
  */
 async function safeRefLine(ref: WikiRef, rc: RunContext | undefined, prefix = ""): Promise<string> {
   const c = await classifyMemory(`${prefix}${refLine(ref)}`, rc);
-  return c.safe ? c.text : `${ref.slug} (v${ref.version}) — ${c.notice}`;
+  return c.safe ? c.text : `${named(ref)} — ${c.notice}`;
 }
 
 /** How many list rows are classified at once. */
@@ -461,9 +488,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         const c = await classifyMemory(`${hitHeader(hit)}\n${hit.body}`, rc);
         lines.push(
           "",
-          ...(c.safe
-            ? [c.text]
-            : [`--- ${hit.ref.slug} (v${hit.ref.version}) — [article redacted]`, c.notice]),
+          ...(c.safe ? [c.text] : [`--- ${named(hit.ref)} — [article redacted]`, c.notice]),
         );
       }
       return lines.join("\n");
@@ -547,7 +572,8 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       // one unit, classified before anything is rendered.
       const c = await classifyMemory(`${header.join("\n")}\n\n${article.body}`, rc);
       if (!c.safe) {
-        return `slug: ${article.slug} · v${article.version} — [article redacted]\n\n${c.notice}`;
+        const name = redactedName(article);
+        return `slug: ${name.slug} · ${name.version} — [article redacted]\n\n${c.notice}`;
       }
       const body =
         input.concise === true && article.body.length > CONCISE_CHARS

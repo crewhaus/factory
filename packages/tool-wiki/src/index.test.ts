@@ -7,7 +7,15 @@
  * fallback + injected callback, and the wiki_write event seam.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
@@ -447,6 +455,89 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
     } finally {
       setDefaultBoundaryLlmClassifier(undefined);
     }
+  });
+
+  // C154 (attacker review): a planted index.json put injection text in the
+  // slug key and a string `version`, which the redacted fallback printed
+  // beside the notice, outside the classified unit.
+  test("a planted index.json reaches no read tool: slug, version and title stay out", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({
+      slug: "coffee",
+      title: "Coffee",
+      body: "coffee grind size notes",
+      tags: ["coffee"],
+    });
+    await bundle.store.write({
+      slug: "tea",
+      title: "Tea",
+      body: "tea and coffee notes",
+      tags: ["coffee"],
+    });
+    const index = {
+      version: 1,
+      articles: {
+        [`notes ${MALICIOUS_BODY}`]: {
+          title: "Coffee notes",
+          tags: ["coffee"],
+          confidence: 0.5,
+          verified: false,
+          version: `1) ${MALICIOUS_BODY} (`,
+          links: [],
+          status: "published",
+          updatedAt: "2026-09-01T00:00:00.000Z",
+        },
+        coffee: {
+          title: `Coffee ${MALICIOUS_BODY}`,
+          tags: "coffee",
+          confidence: "high",
+          verified: false,
+          version: 1,
+          links: [],
+          status: "published",
+          updatedAt: "2026-09-01T00:00:00.000Z",
+        },
+      },
+    };
+    writeFileSync(join(tmp, "spec", "index.json"), JSON.stringify(index));
+    const outputs: Record<string, string> = {
+      list: String(await bundle.list.execute({})),
+      search: String(await bundle.search.execute({ query: "coffee" })),
+      related: String(await bundle.related.execute({ slug: "tea" })),
+      recall: String(await bundle.recall.execute({ query: "coffee" })),
+      semantic: String(await bundle.semanticSearch.execute({ query: "coffee" })),
+      stats: String(await bundle.stats.execute({})),
+    };
+    const leaks = Object.entries(outputs)
+      .filter(([, out]) => out.includes("exfiltrate"))
+      .map(([name]) => name);
+    expect(leaks).toEqual([]);
+    // The index was rebuilt from the articles: both real ones are listed.
+    expect(outputs["list"]).toContain("2/2 article(s)");
+    expect(outputs["list"]).toContain("coffee (v1, published");
+  });
+
+  test("a redacted row from another store prints no slug or version that is not one", async () => {
+    const real = createWikiStore({ specName: "spec", rootDir: tmp });
+    const store = {
+      ...real,
+      list: async () => [
+        {
+          slug: `notes ${MALICIOUS_BODY}`,
+          title: "Coffee notes",
+          tags: ["coffee"],
+          confidence: 0.5,
+          verified: false,
+          version: `1) ${MALICIOUS_BODY} (` as unknown as number,
+          links: [],
+          status: "published" as const,
+          updatedAt: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+    };
+    const out = String(await makeBundle({ store }).list.execute({}));
+    expect(out).not.toContain("exfiltrate");
+    expect(out).toContain("(an article with an invalid slug) (v?) — ");
   });
 
   test("a Sources bullet written through wiki_write is not re-emitted in wiki_get's header", async () => {
