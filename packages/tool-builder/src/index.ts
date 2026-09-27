@@ -99,9 +99,13 @@ const OPERATIVE_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set([
   "id",
 ]);
 
-/** The kinds whose value can be qualified by another field (`within`). */
+/**
+ * The kinds whose value can be qualified by another field (`within`). For a
+ * `command` the field is the directory it runs in (see OperativeArg).
+ */
 const QUALIFIABLE_KINDS: ReadonlySet<OperativeArgKind> = new Set([
   "path",
+  "command",
   "recipient",
   "text",
   "id",

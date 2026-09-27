@@ -193,6 +193,72 @@ describe("url, command and id values", () => {
     expect(canonical({ cwd: "pkg", paths: ["/etc/passwd"] })).toEqual(["/etc/passwd"]);
   });
 
+  // C033 — the same argv is another program in another directory
+  // (`./build.sh` in `src/` runs `src/build.sh`), and the directory was
+  // invisible to every rule: `RunCommand(./build.sh)` granted it.
+  test("a command within its working directory: an allow covers it only at the workspace root", () => {
+    const tool = buildTool({
+      name: "Run",
+      description: "d",
+      inputSchema: z.object({ argv: z.array(z.string()), cwd: z.string().optional() }),
+      operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+      execute: async () => "ok",
+    });
+    const values = (input: unknown) => operativeValuesFor(tool, input) ?? [];
+    const match = (pattern: string, polarity: "allow" | "restrict", input: unknown) =>
+      matchesPattern(compilePattern(pattern), "Run", input, {
+        polarity,
+        operativeValues: values(input),
+      });
+    const build = ["./build.sh"];
+    for (const cwd of [undefined, ".", "", "src/..", "./"]) {
+      const input = cwd === undefined ? { argv: build } : { argv: build, cwd };
+      expect({ cwd, allowed: match("Run(./build.sh)", "allow", input) }).toEqual({
+        cwd,
+        allowed: true,
+      });
+    }
+    for (const cwd of ["src", "src/../src", "../elsewhere"]) {
+      expect({ cwd, allowed: match("Run(./build.sh)", "allow", { argv: build, cwd }) }).toEqual({
+        cwd,
+        allowed: false,
+      });
+    }
+    // A deny or ask still reads the command, wherever it runs.
+    const rm = { argv: ["rm", "-rf", "x"], cwd: "src" };
+    expect(match("Run(rm)", "restrict", rm)).toBe(true);
+    expect(match("Run(rm -rf *)", "restrict", rm)).toBe(true);
+    expect(values(rm)).toEqual([
+      { kind: "command", canonical: [], spellings: ["rm -rf x", "rm", "-rf", "x"] },
+    ]);
+    // The command is not written with its directory in front.
+    expect(readOperativeField(rm, { field: "argv", kind: "command", within: "cwd" })).toEqual([
+      "rm -rf x",
+    ]);
+  });
+
+  test("a pipeline step runs in its own directory, else the top-level one", () => {
+    const tool = buildTool({
+      name: "Pipe",
+      description: "d",
+      inputSchema: z.object({
+        steps: z.array(z.object({ argv: z.array(z.string()), cwd: z.string().optional() })),
+        cwd: z.string().optional(),
+      }),
+      operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd" }],
+      execute: async () => "ok",
+    });
+    const grantable = (input: unknown) =>
+      (operativeValuesFor(tool, input) ?? []).map((v) => v.canonical.length > 0);
+    expect(grantable({ steps: [{ argv: ["make"] }, { argv: ["make"], cwd: "sub" }] })).toEqual([
+      true,
+      false,
+    ]);
+    expect(
+      grantable({ cwd: "sub", steps: [{ argv: ["make"] }, { argv: ["make"], cwd: "." }] }),
+    ).toEqual([false, true]);
+  });
+
   test("an empty declaration is matched like no declaration: on the string values", () => {
     const tool = buildTool({
       name: "Clip",

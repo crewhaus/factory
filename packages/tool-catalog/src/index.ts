@@ -220,7 +220,19 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * directory the path is relative to (`{ field: "paths", kind: "path", within:
  * "cwd" }`), and the joined path is what gets resolved; an absolute path is
  * left as it is. When the call leaves the qualifying field out, the value is
- * matched on its own. A `url` or `command` cannot be qualified.
+ * matched on its own. A `url` cannot be qualified.
+ *
+ * For a `command`, `within` names the directory it runs in (`{ field: "argv",
+ * kind: "command", within: "cwd" }`), because the same words are another
+ * program elsewhere: `./build.sh` in `src/` runs `src/build.sh`. A command
+ * that runs in the workspace root — the field left out, or naming the root —
+ * is matched as usual. One that runs anywhere else is not covered by any
+ * scoped allow (`RunCommand(./build.sh)` asks), while a deny or ask still
+ * reads the command as written. A command inside an array of objects
+ * (`steps.argv`) runs in its own object's field of that name when it has
+ * one, else the top-level one. A command tool whose input has a working
+ * directory declares it this way; without it, the directory is invisible to
+ * every rule.
  *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows

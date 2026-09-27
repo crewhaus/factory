@@ -3893,7 +3893,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
   },
   processStatus: {
     key: "processStatus",
@@ -4217,7 +4217,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
   },
   robotsCheck: {
     key: "robotsCheck",
@@ -4290,7 +4290,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
   },
   runPipeline: {
     key: "runPipeline",
@@ -4301,7 +4301,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "steps.argv", kind: "command" }],
+    operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd" }],
   },
   runTests: {
     key: "runTests",

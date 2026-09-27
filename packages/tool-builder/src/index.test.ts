@@ -454,6 +454,13 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
         buildTool({ ...def, operativeArgs: [{ field: "owner", kind: "url", within: "repo" }] }),
       ).toThrow(/a "url" value cannot be qualified/);
       expect(bad("owner", "path")).not.toThrow();
+      // A command names the directory it runs in (C033).
+      expect(() =>
+        buildTool({
+          ...def,
+          operativeArgs: [{ field: "path", kind: "command", within: "owner" }],
+        }),
+      ).not.toThrow();
       expect(bad("missing")).toThrow(/has no top-level field "missing"/);
       expect(bad("tags")).toThrow(/field "tags" is a list/);
       expect(bad("nested")).toThrow(/field "nested" is not a string or a number/);

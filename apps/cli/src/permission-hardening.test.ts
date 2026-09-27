@@ -527,6 +527,43 @@ describe("C033 — a scoped allow on a multi-field builtin is usable", () => {
     expect(await gate("HttpRequest", { ...call, url: "https://evil.example/v1" }, rs)).toBe("ask");
   });
 
+  // The same argv is another program in another directory: `./build.sh` in
+  // src/ runs src/build.sh, a file a scoped `Write(src/**)` lets the model
+  // write. The working directory was invisible to every rule, so this allow
+  // ran it.
+  test("a scoped command allow covers the workspace root, not another directory", async () => {
+    const rs = rules(
+      ["alwaysAllow", "RunCommand(./build.sh)"],
+      ["alwaysAllow", "ProcessStart(./build.sh)"],
+      ["alwaysAllow", "Retry(./build.sh)"],
+      ["alwaysAllow", "RunPipeline(./build.sh)"],
+    );
+    const argv = ["./build.sh"];
+    const extra: Record<string, object> = {
+      RunCommand: {},
+      ProcessStart: {},
+      Retry: { maxAttempts: 2, backoff: { kind: "fixed", delayMs: 0 } },
+    };
+    for (const [tool, more] of Object.entries(extra)) {
+      const at = async (cwd?: string) =>
+        gate(tool, cwd === undefined ? { argv, ...more } : { argv, cwd, ...more }, rs);
+      expect({ tool, root: await at(), dot: await at("."), src: await at("src") }).toEqual({
+        tool,
+        root: "allow",
+        dot: "allow",
+        src: "ask",
+      });
+    }
+    const pipe = async (input: unknown) => gate("RunPipeline", input, rs);
+    expect(await pipe({ steps: [{ argv }] })).toBe("allow");
+    expect(await pipe({ steps: [{ argv }], cwd: "src" })).toBe("ask");
+    expect(await pipe({ steps: [{ argv }, { argv, cwd: "src" }] })).toBe("ask");
+    // A deny still reads the command wherever it runs.
+    const deny = rules(["alwaysDeny", "RunCommand(rm*)"], ["alwaysAllow", "RunCommand"]);
+    expect(await gate("RunCommand", { argv: ["rm", "-rf", "x"], cwd: "src" }, deny)).toBe("deny");
+    expect(await gate("RunCommand", { argv: ["ls"], cwd: "src" }, deny)).toBe("allow");
+  }, 30_000);
+
   test("a boolean switch is not part of what a rule sees (documented; 0.8)", async () => {
     const rs = rules(["alwaysAllow", "RemovePath(build/**)"]);
     const call = { path: "build/nothing-here", recursive: true, dryRun: false };
