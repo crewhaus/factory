@@ -17,7 +17,10 @@ import {
   __setPrivateHostsAllowedForTest,
   _resetIdempotencyLedger,
   _resetNotifyConfig,
+  chatDelete,
   chatPost,
+  chatReact,
+  chatUpdate,
   registerNotifyConfig,
   webhookPost,
 } from "./index";
@@ -45,6 +48,16 @@ beforeAll(() => {
       const path = new URL(req.url).pathname;
       posts.push(path);
       await req.arrayBuffer();
+      if (path.startsWith("/refuses/")) {
+        // Slack's Web API refusing on a 200, with a reply longer than 256 bytes.
+        return Response.json({
+          ok: false,
+          error: "invalid_blocks",
+          errors: ["invalid additional property: x".repeat(20)],
+          response_metadata: { messages: ["[ERROR] invalid block".repeat(10)] },
+        });
+      }
+      if (path.startsWith("/plain/")) return new Response("ok");
       if (path.startsWith("/corrupt")) {
         return new Response(corrupt, {
           headers: { "content-encoding": "gzip", "content-type": "application/json" },
@@ -125,5 +138,67 @@ describe("a delivered message whose reply cannot be read", () => {
     expect(parsed.reason).toContain("could not be read");
     expect(second).toBe(first);
     expect(posts).toEqual(["/api/chat.postMessage"]);
+  });
+});
+
+describe("Slack's verdict in a reply longer than maxBytes (net attacker review)", () => {
+  const api = (base: string) => ({
+    platform: "slack" as const,
+    apiBaseUrl: `${origin}${base}`,
+    tokenEnv: TOKEN_VAR,
+    channel: "C1",
+  });
+
+  test("the same refusal is 'not sent' when it fits, and unknown, not sent: true, when it is cut", async () => {
+    const whole = String(await chatPost.execute({ ...api("/refuses"), text: "hello" }));
+    expect(whole).toBe(
+      "nothing was sent: Slack accepted the request and refused the message: invalid_blocks",
+    );
+    const call = { ...api("/refuses"), text: "hello", maxBytes: 256, idempotencyKey: "cut-1" };
+    const cut = String(await chatPost.execute(call));
+    const parsed = JSON.parse(cut) as { sent: unknown; status: number; reason: string };
+    expect(parsed).toMatchObject({ sent: null, status: 200 });
+    expect(parsed.reason).toContain("longer than maxBytes");
+    // Recorded, like any delivered request: a retry under the key sends nothing.
+    expect(String(await chatPost.execute(call))).toBe(cut);
+    expect(posts).toEqual(["/refuses/chat.postMessage", "/refuses/chat.postMessage"]);
+  });
+
+  test("an API reply that is not a JSON object is unknown too; an incoming webhook's plain ok is sent", async () => {
+    const plainApi = JSON.parse(String(await chatPost.execute({ ...api("/plain"), text: "hi" })));
+    expect(plainApi).toMatchObject({ sent: null, status: 200 });
+    expect(plainApi.reason).toContain("not the JSON object");
+    process.env["CREWHAUS_TEST_REPLY_UNREADABLE_HOOK"] = `${origin}/plain/hook`;
+    try {
+      const hook = String(
+        await chatPost.execute(
+          { platform: "slack", webhookUrlEnv: "CREWHAUS_TEST_REPLY_UNREADABLE_HOOK", text: "hi" },
+          {
+            toolConfig: {
+              allowed_origins: [origin],
+              allowed_secret_envs: [TOKEN_VAR, "CREWHAUS_TEST_REPLY_UNREADABLE_HOOK"],
+            },
+          } as never,
+        ),
+      );
+      expect(JSON.parse(hook)).toMatchObject({ sent: true, mode: "webhook", status: 200 });
+    } finally {
+      Reflect.deleteProperty(process.env, "CREWHAUS_TEST_REPLY_UNREADABLE_HOOK");
+    }
+  });
+
+  test("ChatUpdate, ChatDelete and ChatReact answer null for a cut verdict", async () => {
+    const target = { ...api("/refuses"), messageId: "1.2", maxBytes: 256 };
+    const outs = [
+      JSON.parse(String(await chatUpdate.execute({ ...target, text: "edited" }))),
+      JSON.parse(String(await chatDelete.execute(target))),
+      JSON.parse(String(await chatReact.execute({ ...target, emoji: "tada" }))),
+    ];
+    expect(outs.map((o) => [o.updated, o.deleted, o.reacted, o.status])).toEqual([
+      [null, undefined, undefined, 200],
+      [undefined, null, undefined, 200],
+      [undefined, undefined, null, 200],
+    ]);
+    for (const o of outs) expect(o.reason).toContain("longer than maxBytes");
   });
 });

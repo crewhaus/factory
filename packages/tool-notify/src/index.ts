@@ -402,14 +402,32 @@ function platformFailure(platform: Platform, outcome: SendOutcome): string | nul
 }
 
 /**
- * Slack keeps its verdict in the reply body (`ok:false` on a 200). When that
- * body could not be read, the request was delivered but whether Slack took
- * it is unknown: said so, never "sent" and never "not sent". Other platforms
- * answer with the status, which is known.
+ * Slack's Web API keeps its verdict in the reply body (`ok:false` on a
+ * 200). When that verdict cannot be read, the request was delivered but
+ * whether Slack took it is unknown: said so, never "sent" and never "not
+ * sent". It cannot be read when the body could not be read at all, or, in
+ * API mode, when the body is not a JSON object: most often because it was
+ * longer than maxBytes and was cut (net attacker review: a 680-byte
+ * `{"ok":false,"error":"invalid_blocks",...}` cut at 256 bytes was reported
+ * `sent: true`, and ledgered). An incoming webhook answers with its status
+ * and a plain `ok`, and other platforms answer with the status, which is
+ * known.
  */
-function unknownVerdict(platform: Platform, outcome: SendOutcome): string | null {
-  if (platform !== "slack" || !outcome.ok || outcome.replyUnreadable === undefined) return null;
-  return `Slack answered ${outcome.status}, but its reply, which says whether it accepted the request, could not be read (${outcome.replyUnreadable}); check before trying again`;
+function unknownVerdict(
+  platform: Platform,
+  outcome: SendOutcome,
+  mode: "api" | "webhook",
+): string | null {
+  if (platform !== "slack" || !outcome.ok) return null;
+  if (outcome.replyUnreadable !== undefined) {
+    return `Slack answered ${outcome.status}, but its reply, which says whether it accepted the request, could not be read (${outcome.replyUnreadable}); check before trying again`;
+  }
+  if (mode !== "api" || (typeof outcome.parsed === "object" && outcome.parsed !== null)) {
+    return null;
+  }
+  return outcome.truncated
+    ? `Slack answered ${outcome.status}, but its reply, which says whether it accepted the request, was longer than maxBytes and was cut before it could be read; check before trying again, and raise maxBytes`
+    : `Slack answered ${outcome.status}, but its reply is not the JSON object that says whether it accepted the request; check before trying again`;
 }
 
 /** Where a platform keeps the id of the message just posted. */
@@ -777,7 +795,7 @@ export const chatPost: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(notSentBecause(failure));
-      const unknown = unknownVerdict(args.platform, outcome);
+      const unknown = unknownVerdict(args.platform, outcome, route.mode);
       if (unknown !== null) {
         // Recorded like a success: the request was delivered, so a retry
         // under the same key must not deliver it again.
@@ -890,7 +908,7 @@ export const chatUpdate: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(notSentBecause(failure));
-      const unknown = unknownVerdict(args.platform, outcome);
+      const unknown = unknownVerdict(args.platform, outcome, "api");
       if (unknown !== null) {
         return prepared.redact(
           json({
@@ -973,7 +991,7 @@ export const chatDelete: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(`the message was not deleted: ${failure}`);
-      const unknown = unknownVerdict(args.platform, outcome);
+      const unknown = unknownVerdict(args.platform, outcome, "api");
       return prepared.redact(
         json({
           deleted: unknown === null ? true : null,
@@ -1059,7 +1077,7 @@ export const chatReact: RegisteredTool = buildTool({
       );
       const failure = platformFailure(args.platform, outcome);
       if (failure !== null) return prepared.redact(`the reaction was not added: ${failure}`);
-      const unknown = unknownVerdict(args.platform, outcome);
+      const unknown = unknownVerdict(args.platform, outcome, "api");
       return prepared.redact(
         json({
           reacted: unknown === null ? true : null,
