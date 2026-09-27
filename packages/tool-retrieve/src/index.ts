@@ -379,6 +379,13 @@ export type KnowledgeRetrieveConfig = {
  * told apart from the secret, and all of it is replaced. An `@` the parser
  * places in the path or query of a URL with no userinfo and no port (npm's
  * `/@scope/`) is left alone.
+ *
+ * With a port, an `@` later in the path hides the host too
+ * (`https://docs.example.com:8443/guides/@team/x.md` is labelled
+ * `https://<redacted>@team/x.md#src-…`): the parser's `host:port` there may
+ * be a username and the leading digits of a password that holds a `/`, and
+ * a username is often itself a token. Boot errors therefore also name the
+ * source's position in `knowledge.sources`.
  */
 export function knowledgeSourceLabel(raw: string): string {
   const fingerprint = (): string =>
@@ -448,7 +455,7 @@ export async function loadKnowledgeSources(
   const cwd = opts.cwd ?? process.cwd();
   const fetchImpl = opts.fetch ?? (globalThis.fetch as unknown as KnowledgeFetch | undefined);
   const docs: Document[] = [];
-  for (const src of sources) {
+  for (const [position, src] of sources.entries()) {
     if (src.kind === "path") {
       const abs = isAbsolute(src.path) ? src.path : resolvePath(cwd, src.path);
       if (!existsSync(abs)) {
@@ -478,11 +485,14 @@ export async function loadKnowledgeSources(
         docs.push({ id: rel, text, metadata: { docId: rel, source: rel } });
       }
     } else {
-      // Fetched as written; named everywhere else by its cleaned label.
+      // Fetched as written; named everywhere else by its cleaned label. A
+      // label can hide the host (see knowledgeSourceLabel), so a boot error
+      // also names the source's position, which always identifies it.
       const label = knowledgeSourceLabel(src.url);
+      const where = `knowledge.sources[${position}]`;
       if (fetchImpl === undefined) {
         throw new RetrieveConfigError(
-          `knowledge url source needs a fetch implementation: ${label}`,
+          `knowledge url source needs a fetch implementation: ${where} ${label}`,
         );
       }
       let res: KnowledgeFetchResponse;
@@ -493,12 +503,14 @@ export async function loadKnowledgeSources(
         // its code travels on.
         const reason = fetchFailureName(cause);
         throw new RetrieveConfigError(
-          `knowledge url fetch failed (${reason}): ${label}`,
+          `knowledge url fetch failed (${reason}): ${where} ${label}`,
           new Error(reason),
         );
       }
       if (!res.ok) {
-        throw new RetrieveConfigError(`knowledge url fetch failed (${res.status}): ${label}`);
+        throw new RetrieveConfigError(
+          `knowledge url fetch failed (${res.status}): ${where} ${label}`,
+        );
       }
       const text = await res.text();
       docs.push({ id: label, text, metadata: { docId: label, source: label } });

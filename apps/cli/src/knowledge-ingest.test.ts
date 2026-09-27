@@ -131,6 +131,34 @@ describe("loadKnowledgeSources", () => {
     expect(String((thrown as Error).message)).not.toContain(token);
   });
 
+  // Regression review: a label can hide the host (a port and an "@" later in
+  // the path), so each url boot error also names the source's position.
+  test("a url boot error names the source's position", async () => {
+    const hidden = "https://docs.example.com:8443/guides/@team/onboarding.md";
+    const sources = [
+      { kind: "url" as const, url: "https://ok.example/a.md" },
+      { kind: "url" as const, url: hidden },
+    ];
+    const notFound = await loadKnowledgeSources(sources, {
+      cwd: dir,
+      fetchImpl: (async (u: string) =>
+        new Response("body", { status: u === hidden ? 404 : 200 })) as unknown as typeof fetch,
+    }).catch((e: unknown) => e as Error);
+    expect(String((notFound as Error).message)).toMatch(
+      /^knowledge source knowledge\.sources\[1\] \S+ returned HTTP 404$/,
+    );
+    const thrown = await loadKnowledgeSources(sources, {
+      cwd: dir,
+      fetchImpl: (async (u: string) => {
+        if (u !== hidden) return new Response("body", { status: 200 });
+        throw Object.assign(new Error(`refused ${u}`), { code: "ConnectionRefused" });
+      }) as unknown as typeof fetch,
+    }).catch((e: unknown) => e as Error);
+    expect(String((thrown as Error).message)).toMatch(
+      /^could not fetch knowledge source knowledge\.sources\[1\] \S+: ConnectionRefused$/,
+    );
+  });
+
   test("throws ConfigError on a non-2xx url source", async () => {
     await expect(
       loadKnowledgeSources([{ kind: "url", url: "https://x/gone" }], {

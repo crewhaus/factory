@@ -133,16 +133,24 @@ function loadGlobSource(
  * its URL. A fetch failure is named by its code, never its message, which
  * quotes the URL.
  */
-async function loadUrlSource(url: string, fetchImpl: typeof fetch): Promise<KnowledgeDocument> {
+async function loadUrlSource(
+  url: string,
+  position: number,
+  fetchImpl: typeof fetch,
+): Promise<KnowledgeDocument> {
   const label = knowledgeSourceLabel(url);
+  // A label can hide the host; the position always identifies the source.
+  const where = `knowledge.sources[${position}]`;
   let res: Response;
   try {
     res = await fetchImpl(url);
   } catch (err) {
-    throw new ConfigError(`could not fetch knowledge source ${label}: ${fetchFailureName(err)}`);
+    throw new ConfigError(
+      `could not fetch knowledge source ${where} ${label}: ${fetchFailureName(err)}`,
+    );
   }
   if (!res.ok) {
-    throw new ConfigError(`knowledge source ${label} returned HTTP ${res.status}`);
+    throw new ConfigError(`knowledge source ${where} ${label} returned HTTP ${res.status}`);
   }
   return { id: label, text: await res.text() };
 }
@@ -158,7 +166,7 @@ export async function loadKnowledgeSources(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const scan = deps.globScan ?? bunGlobScan;
   const docs: KnowledgeDocument[] = [];
-  for (const src of sources) {
+  for (const [position, src] of sources.entries()) {
     switch (src.kind) {
       case "path":
         docs.push(loadPathSource(src.path, deps.cwd));
@@ -167,7 +175,7 @@ export async function loadKnowledgeSources(
         docs.push(...loadGlobSource(src.glob, deps.cwd, scan));
         break;
       case "url":
-        docs.push(await loadUrlSource(src.url, fetchImpl));
+        docs.push(await loadUrlSource(src.url, position, fetchImpl));
         break;
       default: {
         const exhaustive: never = src;

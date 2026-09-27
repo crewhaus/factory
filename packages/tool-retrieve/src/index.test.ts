@@ -528,6 +528,35 @@ describe("knowledge url sources never show a credential", () => {
     expect(leaked(String((thrown as { cause?: unknown }).cause))).toEqual([]);
   });
 
+  // Regression review: a credential-free URL with a port and an "@" later in
+  // its path is labelled without its host, so the boot error alone could not
+  // say which source failed.
+  test("a url boot error names the source's position, whatever its label hides", async () => {
+    const hidden = "https://docs.example.com:8443/guides/@team/onboarding.md";
+    expect(knowledgeSourceLabel(hidden)).not.toContain("docs.example.com");
+    const sources = [
+      { kind: "url" as const, url: "https://ok.example/a.md" },
+      { kind: "url" as const, url: hidden },
+    ];
+    const ok = async (url: string) =>
+      url === hidden
+        ? { ok: false, status: 404, text: async () => "" }
+        : { ok: true, status: 200, text: async () => "body" };
+    const notFound = await loadKnowledgeSources(sources, { fetch: ok }).catch(
+      (err: unknown) => err as Error,
+    );
+    expect((notFound as Error).message).toBe(
+      `knowledge url fetch failed (404): knowledge.sources[1] ${knowledgeSourceLabel(hidden)}`,
+    );
+    const refused = await loadKnowledgeSources(sources, {
+      fetch: async (url) => {
+        if (url !== hidden) return { ok: true, status: 200, text: async () => "body" };
+        throw Object.assign(new Error(`refused ${url}`), { code: "ConnectionRefused" });
+      },
+    }).catch((err: unknown) => err as Error);
+    expect((refused as Error).message).toContain("(ConnectionRefused): knowledge.sources[1] ");
+  });
+
   test("a store indexed before 0.7.1, holding raw-URL ids, is shown redacted", async () => {
     const embedder = createEmbedder({ model: "mock/det" });
     const vectorStore = createVectorStore({ backend: "in-memory" });
