@@ -840,6 +840,28 @@ describe("AuditVerify", () => {
     expect(JSON.parse(raw).ok).toBe(false);
   });
 
+  // The ops review: a chain file this user cannot read came back as
+  // `{ ok: false, break }`, a tamper finding; 0.7.0 threw. Root reads a
+  // 0o000 file anyway, so the case means nothing there.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "a chain file that cannot be read is 'could not verify', not a break",
+    async () => {
+      await seedAudit();
+      const file = auditFiles()[0] as string;
+      chmodSync(file, 0o000);
+      let raw: string;
+      try {
+        raw = await call(auditVerify, {});
+      } finally {
+        chmodSync(file, 0o600);
+      }
+      expect(raw).toContain("could not be verified, which is not a tamper finding");
+      expect(raw).toContain("cannot be read");
+      expect(raw).not.toContain('"break"');
+      expect(raw).not.toContain(tmp);
+    },
+  );
+
   // In a child process: before the fix a FIFO blocked the walk for ever, even
   // with maxBytes 1 (it stat's as 0 bytes), and a blocked test hangs the suite.
   test.skipIf(process.platform === "win32")(
@@ -1344,6 +1366,66 @@ describe("secret hygiene", () => {
       ],
       ["proxy", ["mcp-proxy", "--headers", "X-Api-Key", "(redacted)", "https://example.io/sse"], 1],
     ]);
+  });
+
+  test("a quoted sh -c assignment, a seed phrase and a key in a URL path reach neither tool", async () => {
+    // Printed verbatim by both tools after the first 0.7.1 fix-up (the ops
+    // review's e2e and sse proofs). Built from parts: no secret-shaped literal.
+    const secret = ["Hunter", "2", "Secret", "Q9"].join("");
+    const key = ["Xk9", "q2Lm", "Pz7Rt", "4Wv8"].join("");
+    const seed = "abandon ability able about above absent";
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const servers = (zapierKey: string) =>
+      [
+        ...base,
+        "mcp_servers:",
+        "  shell:",
+        "    transport: stdio",
+        "    command: sh",
+        `    args: ["-c", "API_KEY='${secret}' exec my-mcp-server"]`,
+        "  wallet:",
+        "    transport: stdio",
+        "    command: npx",
+        `    args: [evm-mcp-server, --mnemonic, "${seed}", --rpc-url, "https://eth-mainnet.g.alchemy.com/v2/${key}"]`,
+        "  zap:",
+        "    transport: sse",
+        `    url: "https://actions.zapier.com/mcp/sk-ak-${zapierKey}/sse"`,
+      ].join("\n");
+    const spec = servers(key);
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, { before: { spec: base.join("\n") }, after: { spec } });
+    const leaks = (text: string) => [secret, key, seed].filter((s) => text.includes(s)).length;
+    expect({ summary: leaks(summary), diff: leaks(diff) }).toEqual({ summary: 0, diff: 0 });
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; endpoint?: string }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.args ?? s.endpoint])).toEqual([
+      ["shell", ["-c", "API_KEY='(redacted)' exec my-mcp-server"]],
+      [
+        "wallet",
+        [
+          "evm-mcp-server",
+          "--mnemonic",
+          "(redacted)",
+          "--rpc-url",
+          "https://eth-mainnet.g.alchemy.com/v2/(redacted)",
+        ],
+      ],
+      ["zap", "https://actions.zapier.com/mcp/(redacted)/sse"],
+    ]);
+    // A rotated key in the path is still a change, reported without the key.
+    const rotated = await call(specDiff, {
+      before: { spec },
+      after: { spec: servers(key.split("").reverse().join("")) },
+    });
+    expect(rotated).toContain("mcp-server-url-value-changed");
+    expect(leaks(rotated)).toBe(0);
   });
 
   test("an sse endpoint keeps neither its query string nor its userinfo", async () => {

@@ -60,7 +60,9 @@ import { resolve } from "node:path";
 import {
   type BaselineEntry,
   type BaselineLineage,
+  HistoryWriteError,
   type LoadedRun,
+  type RecordEvalRunOptions,
   type ReportDiff,
   ReportError,
   type RunIndexEntry,
@@ -72,6 +74,7 @@ import {
   readRunIndexLatest,
   recordEvalRun,
   resolveBaseline,
+  runIndexEntryFromSummary,
   setBaseline,
 } from "@crewhaus/eval-report";
 import type { EvalRoutingMode, EvalRunSummary } from "@crewhaus/eval-runner";
@@ -318,7 +321,7 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
   // runner already refuses to run zero samples): a 0-sample run has no signal,
   // and a passRate-0 "clean" entry would poison the index and could pin an
   // empty baseline, so it throws before anything is written.
-  const entry: RunIndexEntry = recordEvalRun(summary, {
+  const recordOpts: RecordEvalRunOptions = {
     specName,
     ...(specSource !== undefined ? { specSource } : {}),
     datasetHash: opts.datasetHash,
@@ -333,7 +336,25 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
     ...(opts.routing !== undefined ? { routing: opts.routing } : {}),
     outDir: absOut,
     ...(opts.evalsDir !== undefined ? { evalsDir: opts.evalsDir } : {}),
-  });
+  };
+  // eval-report refuses a history write through a link (a linked
+  // `baselines.json`, or a `.crewhaus` / `.crewhaus/evals` that leads out of
+  // the project). By now the run has been paid for and scored, so the
+  // refusal is a warning with its remedy, never an exception that loses the
+  // verdict: the gate below still runs, against the history as it stands.
+  const historyRefused = (what: string, err: HistoryWriteError): void => {
+    warn(
+      `[eval] warning: ${what} — ${err.message}. The run itself is complete (results in ${absOut}). To keep an eval history, make .crewhaus and .crewhaus/evals real directories inside the project, and baselines.json and index.jsonl regular files, not links.`,
+    );
+  };
+  let entry: RunIndexEntry;
+  try {
+    entry = recordEvalRun(summary, recordOpts);
+  } catch (err) {
+    if (!(err instanceof HistoryWriteError)) throw err;
+    historyRefused("this run was not recorded in the eval history", err);
+    entry = runIndexEntryFromSummary(summary, recordOpts);
+  }
 
   const pinCurrentRun = (label: string): void => {
     // NEW-HUNT-3 — a budget-aborted run records its unexecuted samples as
@@ -380,7 +401,13 @@ export async function finishEvalRun(opts: FinishEvalOptions): Promise<FinishEval
       ...(entry.armsDigest !== undefined ? { armsDigest: entry.armsDigest } : {}),
       ts: entry.ts,
     };
-    setBaseline(pin, opts.evalsDir);
+    try {
+      setBaseline(pin, opts.evalsDir);
+    } catch (err) {
+      if (!(err instanceof HistoryWriteError)) throw err;
+      historyRefused(`baseline not set (${label})`, err);
+      return;
+    }
     write(`[eval] baseline set: ${summary.runId} (${label})`);
   };
 

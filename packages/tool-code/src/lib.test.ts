@@ -1735,9 +1735,55 @@ describe("semver, the subset", () => {
     expect(satisfiesInstallable("1.2.0-beta.1", "1.2", { includePrerelease: true })).toBe(true);
     expect(satisfiesInstallable("1.2.0-beta.1", "1.2")).toBe(false);
     // What npm would not read at all stays "cannot tell".
-    for (const range of ["1.2-beta", "1.2.3foo", "1.2.3 - 2.0.0"]) {
+    for (const range of ["1.2-beta", "1.2.3foo"]) {
       expect({ range, got: satisfies("1.2.3", range) }).toEqual({ range, got: undefined });
     }
+  });
+
+  // The ops review: a hyphen range was never read, and inside one `||`
+  // alternative it turned into a definite "no" once another alternative was
+  // read: `1.x || 5.0.0 - 7.2.3` picked 1.5.0 as "understood" where npm
+  // picks 7.2.3. npm semver 7.7.4 is the oracle for every row (and agreed on
+  // 2.3M random range × version × includePrerelease cases).
+  test("a hyphen range reads as npm reads it, alone or in an alternative", () => {
+    const rows: Array<[string, string, boolean]> = [
+      ["1.2.3", "1.2.3 - 2.3.4", true],
+      ["2.3.4", "1.2.3 - 2.3.4", true],
+      ["2.3.5", "1.2.3 - 2.3.4", false],
+      ["1.2.0", "1.2 - 2.3.4", true],
+      ["2.3.9", "1.2.3 - 2.3", true],
+      ["2.4.0", "1.2.3 - 2.3", false],
+      ["2.9.9", "1.2.3 - 2", true],
+      ["3.0.0", "1.2.3 - 2", false],
+      ["0.1.0", "* - 2.0.0", true],
+      ["9.0.0", "1.0.0 - x", true],
+      ["6.0.0", "1.x || 5.0.0 - 7.2.3", true],
+      ["7.2.3", "^1.0.0 || 5.0.0 - 7.2.3", true],
+      ["7.9.0", ">=1.0.0 <1.2.0 || 5 - 7", true],
+      ["8.0.0", ">=1.0.0 <1.2.0 || 5 - 7", false],
+    ];
+    const got = rows.map(([version, range]) => [version, range, satisfies(version, range)]);
+    expect(got).toEqual(rows);
+    // A prerelease named at either end is eligible on its own tuple, and
+    // includePrerelease lowers the floor but admits nothing past the ceiling.
+    expect(satisfiesInstallable("1.2.3-rc.2", "1.2.3-rc.1 - 2.0.0")).toBe(true);
+    expect(satisfiesInstallable("2.0.1-0", "1.2.3 - 2.0.0", { includePrerelease: true })).toBe(
+      false,
+    );
+    expect(satisfiesInstallable("2.0.0-rc.1", "1.2.3 - 2.0.0", { includePrerelease: true })).toBe(
+      true,
+    );
+    expect(satisfiesInstallable("1.2.0-rc.1", "1.2 - 2.0.0", { includePrerelease: true })).toBe(
+      true,
+    );
+    expect(satisfiesInstallable("1.2.0-rc.1", "1.2 - 2.0.0")).toBe(false);
+  });
+
+  test("an alternative that cannot be read makes a miss 'cannot tell', not 'no'", () => {
+    // It might have matched. A hit in a readable alternative is still a hit.
+    expect(satisfies("0.0.0", "1.x || workspace:*")).toBeUndefined();
+    expect(satisfies("1.5.0", "1.x || workspace:*")).toBe(true);
+    expect(satisfiesInstallable("2.0.0-rc.1", "^1.0.0 || workspace:*")).toBeUndefined();
   });
 
   test("satisfiesInstallable applies npm's prerelease rule on top of satisfies", () => {

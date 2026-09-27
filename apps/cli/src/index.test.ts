@@ -591,6 +591,41 @@ describe("crewhaus compile", () => {
     expect(existsSync(strictOut)).toBe(false);
   }, 30_000);
 
+  // C146 and the review of 89df527f: a deny spelled another way than the
+  // tool's name never fires, so --strict refuses it; a glob that still fires
+  // on a declared MCP server's tools is a note --strict does not escalate.
+  test("compile --strict refuses a misspelled deny, and only notes a glob that reaches MCP tools", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const head = "agent:\n  model: claude-sonnet-4-6\n  instructions: tidy up\n";
+    writeFileSync(
+      specPath,
+      `name: spelled\ntarget: cli\n${head}tools: [codegraphSearch]\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "Codegraph*" }\n`,
+    );
+    const dead = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "a")],
+      {
+        cwd: tmp,
+      },
+    );
+    expect(dead.exitCode).toBe(1);
+    expect(dead.stderr).toContain('warning[permission-rule] permissions.rules: rule "Codegraph*"');
+    expect(dead.stderr).toContain('Write "CodeGraph*"');
+    writeFileSync(
+      specPath,
+      `name: mcpdeny\ntarget: cli\n${head}tools: [read, write]\nmcp_servers:\n  fs:\n    transport: stdio\n    command: npx\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "*write*" }\n`,
+    );
+    const noted = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "b")],
+      { cwd: tmp },
+    );
+    expect(noted.stderr).toContain(
+      'warning[permission-rule-note] permissions.rules: rule "*write*"',
+    );
+    expect(noted.stderr).not.toContain("never fires");
+    expect(noted.stderr).not.toContain("escalated to errors");
+    expect(noted.exitCode).toBe(0);
+  }, 60_000);
+
   // provider-limits#0 — 0.7.0 compiled `tools: [all-code]` on a 128-tool
   // provider (even under --strict) and every call then failed with the
   // provider's 400. A site no model can serve is now refused. The warnings

@@ -196,6 +196,173 @@ describe("rules that name no tool", () => {
   });
 });
 
+describe("a rule spelled another way than the tool's name (C146)", () => {
+  // The engine matches a name exactly. Before this, only a near miss of one
+  // or two letters and a key-form glob were caught, so these denies passed
+  // lint and `compile --strict` silently and never fired.
+  const tools = [
+    { name: "RemovePath", key: "removePath", destructive: true },
+    { name: "WebFetch", key: "webFetch", ...safe },
+    { name: "Fetch", key: "fetch", ...safe },
+    { name: "JavaScript", key: "javascript", destructive: true },
+    { name: "CodeGraphSearch", key: "codegraphSearch", ...safe },
+    { name: "CodeGraphCallers", key: "codegraphCallers", ...safe },
+  ];
+  const check = (type: string, pattern: string, mcpServers: string[] = []) =>
+    permissionRuleProblems({
+      rules: [{ type, pattern }],
+      granted: tools,
+      known: tools,
+      mcpServers,
+    });
+  const reachedBy = (pattern: string) => {
+    const compiled = compilePattern(pattern);
+    return tools
+      .filter((t) => matchesToolName(compiled, t.name))
+      .map((t) => t.name)
+      .sort();
+  };
+
+  test("each variant is reported as never firing, and the fix reaches exactly the tools it names", () => {
+    const cases: Array<[string, string | undefined, string[]]> = [
+      ["REMOVEPATH", "RemovePath", ["RemovePath"]],
+      ["remove_path", "RemovePath", ["RemovePath"]],
+      ["Remove-Path", "RemovePath", ["RemovePath"]],
+      ["web fetch", "WebFetch", ["WebFetch"]],
+      ["JAVASCRIPT", "JavaScript", ["JavaScript"]],
+      ["Codegraph*", "CodeGraph*", ["CodeGraphCallers", "CodeGraphSearch"]],
+      ["CODEGRAPH*", "CodeGraph*", ["CodeGraphCallers", "CodeGraphSearch"]],
+      ["*FETCH", "*Fetch", ["Fetch", "WebFetch"]],
+      ["CodeGraph*search", undefined, ["CodeGraphSearch"]],
+      ["code_graph_*", "CodeGraph*", ["CodeGraphCallers", "CodeGraphSearch"]],
+    ];
+    let reported = 0;
+    for (const [pattern, suggestion, names] of cases) {
+      // The property: the rule as written reaches nothing by name.
+      expect({ pattern, reaches: reachedBy(pattern) }).toEqual({ pattern, reaches: [] });
+      const found = check("alwaysDeny", pattern);
+      reported += found.length;
+      expect({
+        pattern,
+        codes: found.map((p) => p.code),
+        suggestion: found[0]?.suggestion,
+        named: names.every((n) => found[0]?.message.includes(n)),
+        says: found[0]?.message.includes("never fires"),
+      }).toEqual({ pattern, codes: ["unknown-tool"], suggestion, named: true, says: true });
+      if (suggestion !== undefined) expect(reachedBy(suggestion)).toEqual(names);
+    }
+    expect(reported).toBe(cases.length);
+  });
+
+  test("a name the runtime spells with underscores is found the same way", () => {
+    const found = permissionRuleProblems({
+      rules: [{ type: "alwaysDeny", pattern: "WikiWrite" }],
+      granted: tools,
+      known: [...tools, { name: "wiki_write" }],
+      mcpServers: [],
+    });
+    expect(found.map((p) => [p.code, p.suggestion])).toEqual([["unknown-tool", "wiki_write"]]);
+  });
+
+  test("no rewrite when the re-cased glob would reach fewer tools than the rule was read as naming", () => {
+    // `CODEGRAPH*` reads as all three; `CodeGraph*` would miss Codegraphviz.
+    const withViz = [...tools, { name: "Codegraphviz", key: "codegraphviz", ...safe }];
+    const found = permissionRuleProblems({
+      rules: [{ type: "alwaysDeny", pattern: "CODEGRAPH*" }],
+      granted: withViz,
+      known: withViz,
+      mcpServers: [],
+    });
+    expect(found.map((p) => [p.code, p.suggestion])).toEqual([["unknown-tool", undefined]]);
+    expect(found[0]?.message).toContain(
+      "Name them by name: CodeGraphCallers, CodeGraphSearch and Codegraphviz.",
+    );
+  });
+
+  test("an allow is not rewritten into a grant of a tool that can change or delete things", () => {
+    const [p] = check("alwaysAllow", "REMOVEPATH");
+    expect(p?.code).toBe("unknown-tool");
+    expect(p?.suggestion).toBeUndefined();
+    expect(p?.message).toContain("may change or delete things, so no fix is offered");
+    // A read-only tool's spelling is corrected on an allow too.
+    expect(check("alwaysAllow", "Codegraph*")[0]?.suggestion).toBe("CodeGraph*");
+  });
+
+  test("a glob that reaches a tool by name is a live spelling, not a misspelling", () => {
+    // `Code*` reaches the CodeGraph tools; `Web*` reaches WebFetch although it
+    // is not granted here, and so does the runtime's own `Task`.
+    const known = [...tools, { name: "Task" }];
+    for (const pattern of ["Web*", "Task"]) {
+      expect(
+        permissionRuleProblems({
+          rules: [{ type: "alwaysDeny", pattern }],
+          granted: tools.filter((t) => t.name !== "WebFetch"),
+          known,
+          mcpServers: [],
+        }),
+      ).toEqual([]);
+    }
+  });
+});
+
+describe("a glob that can still match a declared MCP server's tools", () => {
+  // 89df527f reported `alwaysDeny *write*` as a key-form rule that "never
+  // fires" and failed `compile --strict` on it, though it fires on
+  // mcp__fs__write_file; following its fix (`Write`) dropped that deny.
+  const read = { name: "Read", key: "read", ...safe };
+  const grep = { name: "Grep", key: "grep", ...safe };
+  const write = { name: "Write", key: "write", destructive: true };
+  const run = (granted: RuleToolDescriptor[], mcpServers: string[], pattern = "*write*") =>
+    permissionRuleProblems({
+      rules: [{ type: "alwaysDeny", pattern }],
+      granted,
+      known: [read, grep, write, removePath],
+      mcpServers,
+    });
+
+  test("is not reported as dead when no granted builtin is missed", () => {
+    expect(matchesToolName(compilePattern("*write*"), "mcp__fs__write_file")).toBe(true);
+    expect(run([read, grep], ["fs"])).toEqual([]);
+    expect(run([read, grep], ["github"], "*remove*")).toEqual([]);
+    // Without a declared server nothing can match it, and it is still dead.
+    expect(run([read, grep], []).map((p) => p.code)).toEqual(["tool-key-not-name"]);
+  });
+
+  test("names a granted builtin it misses, as a note with no rewrite", () => {
+    const found = run([read, write], ["fs"]);
+    expect(found.map((p) => [p.code, p.suggestion])).toEqual([["builtin-not-reached", undefined]]);
+    expect(found[0]?.message).toContain("can match tools of the MCP server fs");
+    expect(found[0]?.message).toContain("add a rule that names it: Write");
+    expect(found[0]?.message).not.toContain("never fires");
+  });
+
+  test("a glob whose fixed start rules out every declared server is judged as before", () => {
+    // `Remove_*` cannot start `mcp__fs__` or the old `fs__` spelling.
+    expect(run([removePath], ["fs"], "Remove_*").map((p) => [p.code, p.suggestion])).toEqual([
+      ["unknown-tool", "Remove*"],
+    ]);
+    // The old `<server>__` spelling still reaches the server's tools:
+    // `file*` fires on mcp__files__list through it, so it is only a note.
+    expect(matchesToolName(compilePattern("file*"), "mcp__files__list")).toBe(true);
+    const fileInfo = { name: "FileInfo", key: "fileInfo", ...safe };
+    expect(run([fileInfo], ["files"], "file*").map((p) => p.code)).toEqual(["builtin-not-reached"]);
+    expect(run([fileInfo], [], "file*").map((p) => p.code)).toEqual(["tool-key-not-name"]);
+  });
+
+  test("an exact name in the old `<server>__<tool>` spelling is an MCP rule, not a misspelled builtin", () => {
+    // `web__fetch` folds to `webfetch`, as WebFetch does, but it fires on
+    // mcp__web__fetch; calling it dead and offering `WebFetch` would move the
+    // deny off the MCP tool onto a builtin.
+    const webFetch = { name: "WebFetch", key: "webFetch", ...safe };
+    expect(matchesToolName(compilePattern("web__fetch"), "mcp__web__fetch")).toBe(true);
+    expect(run([webFetch], ["web"], "web__fetch")).toEqual([]);
+    // With no `web` server declared, nothing can match it, and it is dead.
+    expect(run([webFetch], [], "web__fetch").map((p) => [p.code, p.suggestion])).toEqual([
+      ["unknown-tool", "WebFetch"],
+    ]);
+  });
+});
+
 describe("argument patterns that cannot scope", () => {
   test("a URL rule written after an HTTP method can never match, and the fix does", () => {
     const [p] = problems(["HttpRequest(GET https://api.example.com/**)"]);

@@ -1233,6 +1233,62 @@ function satisfiesComparator(
   return bounds.every((bound) => holds(version, bound));
 }
 
+/** `A - B`: one whole `||` alternative that is a hyphen range. Linear: each class is disjoint from the next. */
+const HYPHEN_RANGE_RE = /^\s*(\S+)\s+-\s+(\S+)\s*$/;
+
+/**
+ * A hyphen range as the comparators npm desugars it to (node-semver's
+ * hyphenReplace): `1.2.3 - 2.3.4` is `>=1.2.3 <=2.3.4`; a partial FROM is
+ * its floor (`1.2 - 2.3.4` is `>=1.2.0 <=2.3.4`) and a partial TO its
+ * ceiling (`1.2.3 - 2.3` is `>=1.2.3 <2.4.0-0`); an `x` side is unbounded.
+ * `includePrerelease` lowers the floor to `-0`, as npm does (npm also
+ * writes an inclusive release ceiling as `<` the next patch's `-0`, which
+ * admits exactly the same versions). The
+ * alternative unchanged when it is not a hyphen range, or when either side
+ * is not a version npm reads (then it stays "cannot tell").
+ */
+function expandHyphenRange(alternative: string, includePrerelease: boolean): string {
+  const m = HYPHEN_RANGE_RE.exec(alternative);
+  if (m === null) return alternative;
+  const sides = [m[1] as string, m[2] as string].map((raw) => {
+    const v = COMPARATOR_VERSION_RE.exec(raw);
+    if (v === null) return undefined;
+    const x = (part: string | undefined) =>
+      part === undefined || part === "x" || part === "X" || part === "*";
+    return {
+      M: v.groups?.["major"] as string,
+      m: v.groups?.["minor"],
+      p: v.groups?.["patch"],
+      pre: v.groups?.["pre"],
+      xM: x(v.groups?.["major"]),
+      xm: x(v.groups?.["major"]) || x(v.groups?.["minor"]),
+      xp: x(v.groups?.["major"]) || x(v.groups?.["minor"]) || x(v.groups?.["patch"]),
+    };
+  });
+  const [from, to] = sides;
+  if (from === undefined || to === undefined) return alternative;
+  const z = includePrerelease ? "-0" : "";
+  const floor = from.xM
+    ? ""
+    : from.xm
+      ? `>=${from.M}.0.0${z}`
+      : from.xp
+        ? `>=${from.M}.${from.m}.0${z}`
+        : from.pre !== undefined
+          ? `>=${from.M}.${from.m}.${from.p}-${from.pre}`
+          : `>=${from.M}.${from.m}.${from.p}${z}`;
+  const ceiling = to.xM
+    ? ""
+    : to.xm
+      ? `<${Number(to.M) + 1}.0.0-0`
+      : to.xp
+        ? `<${to.M}.${Number(to.m) + 1}.0-0`
+        : to.pre !== undefined
+          ? `<=${to.M}.${to.m}.${to.p}-${to.pre}`
+          : `<=${to.M}.${to.m}.${to.p}`;
+  return `${floor} ${ceiling}`.trim();
+}
+
 /**
  * The comparators of one `||` alternative. An operator may be written apart
  * from its version (`>= 1.2`), which npm joins before splitting on
@@ -1250,12 +1306,14 @@ function comparatorsOf(alternative: string): string[] {
  * Does `version` satisfy `range`?
  *
  * `undefined` means "cannot tell" — a `workspace:*` protocol, a git URL, a
- * hyphen range — and every caller treats that as unchecked rather than as
- * false. This is a deliberately small subset of node-semver: caret, tilde
- * (`~` and `~>`), the four inequalities, exact, partial versions and
- * `x`-wildcards read as npm reads them (a missing segment is a wildcard),
+ * typo — and every caller treats that as unchecked rather than as false.
+ * This is a deliberately small subset of node-semver: caret, tilde (`~` and
+ * `~>`), the four inequalities, exact, partial versions and `x`-wildcards
+ * read as npm reads them (a missing segment is a wildcard), hyphen ranges,
  * whitespace-joined AND and `||`-joined OR. Enough for the ranges real
- * manifests hold, and honest about the rest (a hyphen range is not read).
+ * manifests hold, and honest about the rest: when one `||` alternative
+ * cannot be read and no other matched, the answer is "cannot tell", never
+ * a definite no (the unread alternative might have matched).
  * `includePrerelease` lowers a wildcard's floor to its `-0`, as npm's option
  * does; the prerelease INSTALL rule is {@link satisfiesInstallable}'s.
  */
@@ -1267,9 +1325,11 @@ export function satisfies(
   const version = parseSemver(versionRaw);
   if (version === undefined) return undefined;
   const alternatives = range.split("||");
-  let anyKnown = false;
+  let anyUnknown = false;
   for (const alternative of alternatives) {
-    const comparators = comparatorsOf(alternative);
+    const comparators = comparatorsOf(
+      expandHyphenRange(alternative, options.includePrerelease === true),
+    );
     if (comparators.length === 0) return true;
     let all = true;
     let known = true;
@@ -1281,11 +1341,13 @@ export function satisfies(
       }
       if (!result) all = false;
     }
-    if (!known) continue;
-    anyKnown = true;
+    if (!known) {
+      anyUnknown = true;
+      continue;
+    }
     if (all) return true;
   }
-  return anyKnown ? false : undefined;
+  return anyUnknown ? undefined : false;
 }
 
 /**
@@ -1308,14 +1370,16 @@ export function satisfiesInstallable(
   if (version.prerelease === "" || options.includePrerelease === true) {
     return satisfies(versionRaw, range, options);
   }
-  let anyKnown = false;
+  let anyUnknown = false;
   for (const alternative of range.split("||")) {
     const result = satisfies(versionRaw, alternative);
-    if (result === undefined) continue;
-    anyKnown = true;
-    if (result && namesPrereleaseOf(alternative, version)) return true;
+    if (result === undefined) {
+      anyUnknown = true;
+      continue;
+    }
+    if (result && namesPrereleaseOf(expandHyphenRange(alternative, false), version)) return true;
   }
-  return anyKnown ? false : undefined;
+  return anyUnknown ? undefined : false;
 }
 
 /** Whether a comparator in `alternative` targets a prerelease on `version`'s tuple. */

@@ -39,6 +39,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import {
+  AuditLogError,
   type ChainFiles,
   type VerifyResult,
   listChainFiles,
@@ -445,7 +446,7 @@ export const specCompileCheck: RegisteredTool = buildTool({
 export const specSummarize: RegisteredTool = buildTool({
   name: "SpecSummarize",
   description:
-    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path, and a stdio server's argv has its credentials redacted (a credential flag's value, a header value, a URL's userinfo and token parameters), so a credential pasted into a spec is not echoed into the report.",
+    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path with any key in the path withheld, and a stdio server's argv has its credentials redacted (a credential flag's value, a header value, a URL's userinfo, token parameters and path keys, a credential-named assignment), so a credential pasted into a spec is not echoed into the report.",
   inputSchema: specSourceSchema,
   readOnly: true,
   concurrencySafe: true,
@@ -461,7 +462,7 @@ export const specSummarize: RegisteredTool = buildTool({
 export const specDiff: RegisteredTool = buildTool({
   name: "SpecDiff",
   description:
-    "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. An existing MCP server counts too: a different command, argv, transport or endpoint, an added env or header key, a changed env, header or redacted-argv value (reported without the value) and a removed destructive or requireJustification trust flag all widen. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
+    "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. Permission rules are compared in order, because the first rule that matches decides: moving an allow ahead of a deny or an ask widens. An existing MCP server counts too: a different command, argv, transport or endpoint, an added env or header key, a changed env, header or redacted-argv value (reported without the value) and a removed destructive or requireJustification trust flag all widen. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
   inputSchema: z.object({
     before: specSourceSchema.describe("the spec as it was"),
     after: specSourceSchema.describe("the spec as it is now"),
@@ -936,11 +937,18 @@ export const auditVerify: RegisteredTool = buildTool({
     // to be a regular file: a chain file linked out of the directory, or a
     // FIFO, is tamper evidence and is reported as the break — never read,
     // never counted as zero bytes (security-5#2, flag-truth-3#6).
+    // "Could not verify" (a chain file this user cannot read: they are
+    // created 0600) is its own answer, never a break: a break is tamper
+    // evidence. audit-log's message names the chain file only, never a path.
+    const couldNot = (err: unknown, fallback: string): string =>
+      err instanceof AuditLogError
+        ? `audit log at "${renderPath(rel)}": ${err.message}`
+        : `audit log at "${renderPath(rel)}" ${fallback}`;
     let chain: ChainFiles;
     try {
       chain = listChainFiles(dir.value.real);
-    } catch {
-      return `audit log at "${renderPath(rel)}" could not be listed`;
+    } catch (err) {
+      return couldNot(err, "could not be listed");
     }
     const dirShown = dir.value.rel === "" ? "." : dir.value.rel;
     if (!chain.ok) {
@@ -958,9 +966,9 @@ export const auditVerify: RegisteredTool = buildTool({
     let result: VerifyResult;
     try {
       result = await verifyAuditChain(dir.value.real);
-    } catch {
-      // Not the error text: a node error carries the absolute path.
-      return `audit log at "${renderPath(rel)}" could not be verified (an entry could not be read)`;
+    } catch (err) {
+      // Not a node error's text: it carries the absolute path.
+      return couldNot(err, "could not be verified (an entry could not be read)");
     }
     if (result.ok) {
       return json({
@@ -1047,7 +1055,7 @@ function loadEvalDoc(
 export const evalBaselineCompare: RegisteredTool = buildTool({
   name: "EvalBaselineCompare",
   description:
-    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A comparison that never happened fails: runs that share no sample ids, or that name different datasets (unless allowDatasetMismatch), fail the gate, and minSharedFraction can require the candidate to cover more of the baseline. Another version or split of the same registry dataset (golden@v3 against golden@v4 or golden@v3#dev) is the same dataset: it is noted, not failed. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
+    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A comparison that never happened fails: runs that share no sample ids, or that name different datasets (unless allowDatasetMismatch), fail the gate, and minSharedFraction can require the candidate to cover more of the baseline. Another version or split of the same registry dataset (golden@v3 against golden@v4 or golden@v3#dev), or the same dataset with a regression suite unioned in (golden@v3+regressions@v1), is the same dataset: it is noted, not failed. A sample with no sampleId is never matched by position: it counts in its run's pass rate and is named in a note. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
   inputSchema: z.object({
     baseline: evalDocSchema.optional().describe("the baseline run's results document"),
     baselinePath: z.string().optional().describe("path to the baseline results.json instead"),

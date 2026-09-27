@@ -206,8 +206,13 @@ describe("range dialects", () => {
     expect(toNpmRange("npm", "latest").ok).toBe(false);
   });
 
-  test("a hyphen range is refused rather than split into nonsense", () => {
-    expect(toNpmRange("npm", "1.2.3 - 2.0.0").ok).toBe(false);
+  // The shared evaluator reads a hyphen range as npm does now, so it is no
+  // longer refused; before, it was, rather than split into nonsense.
+  test("a hyphen range passes through and picks what npm picks", () => {
+    expect(toNpmRange("npm", "1.2.3 - 2.0.0")).toEqual({ ok: true, range: "1.2.3 - 2.0.0" });
+    expect(highestSatisfying(["1.0.0", "1.5.0", "6.0.0", "7.2.3", "8.0.0"], "1.x || 5 - 7")).toBe(
+      "7.2.3",
+    );
   });
 
   test("a PyPI prerelease is not mistaken for its own release", () => {

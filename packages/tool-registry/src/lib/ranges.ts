@@ -118,12 +118,8 @@ export function toNpmRangeIn(dialect: RangeDialect, rawSpec: string): RangeTrans
 }
 
 function translateNpm(spec: string): RangeTranslation {
-  if (spec.includes(" - ")) {
-    // `1.2.3 - 2.3.4` is a hyphen range, which the shared evaluator does not
-    // implement; it would otherwise be split on whitespace into comparators
-    // that mean something else entirely.
-    return { ok: false, reason: `hyphen ranges ("${spec}") are not evaluated here` };
-  }
+  // A hyphen range (`1.2.3 - 2.3.4`) is npm grammar the shared evaluator
+  // reads as npm does, so it passes through like any other npm range.
   if (/^[a-zA-Z][\w./-]*$/.test(spec) && spec !== "x") {
     return { ok: false, reason: `"${spec}" is a dist-tag or an alias, not a version range` };
   }

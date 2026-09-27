@@ -204,7 +204,11 @@ export function collectToolSites(spec: unknown): ToolSite[] {
   return sites;
 }
 
-/** `scheme://host/path` — the query string is dropped, it can carry a token. */
+/**
+ * `scheme://host/path` — the query string is dropped, it can carry a token,
+ * and a path segment that holds a key is withheld (`/v2/<key>`,
+ * `/mcp/sk-…/sse`; see {@link redactPathSegments}).
+ */
 function safeEndpoint(raw: unknown): string | undefined {
   const url = asString(raw);
   if (url === undefined) return undefined;
@@ -212,7 +216,7 @@ function safeEndpoint(raw: unknown): string | undefined {
     const parsed = new URL(url);
     // `host` is authority WITHOUT userinfo, so a `https://user:token@h/p`
     // loses the credential here as well as in the query string.
-    return `${parsed.protocol}//${parsed.host}${parsed.pathname}`;
+    return `${parsed.protocol}//${parsed.host}${redactPathSegments(parsed.pathname)}`;
   } catch {
     // The schema requires a valid URL, so this is unreachable for a parsed
     // spec; withhold rather than echo an unparsed string that may be a secret.
@@ -251,6 +255,107 @@ function looksLikeSecretValue(value: string): boolean {
 const URL_VALUE_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
 
 /**
+ * Path segments after which hosted MCP servers and webhooks put a key:
+ * Alchemy and Infura `/v2/<key>` and `/v3/<key>`, Zapier `/mcp/<key>/sse`
+ * and `/api/mcp/s/<key>/mcp`, Slack `/services/T…/B…/<secret>`, Discord
+ * `/api/webhooks/<id>/<token>`.
+ */
+const KEY_PATH_OWNERS: ReadonlySet<string> = new Set([
+  "v1",
+  "v2",
+  "v3",
+  "mcp",
+  "s",
+  "services",
+  "hooks",
+  "webhooks",
+  "key",
+  "keys",
+  "token",
+  "tokens",
+  "apikey",
+  "api-key",
+  "secret",
+  "secrets",
+]);
+
+/** A run of key characters, long enough to be a key rather than an id or a word. */
+const KEYISH_RE = /^[A-Za-z0-9_-]{16,}$/;
+
+/** Letters AND digits: a key has both; a word, a slug or a number has one kind. */
+function mixesLettersAndDigits(value: string): boolean {
+  return /[A-Za-z]/.test(value) && /\d/.test(value);
+}
+
+/**
+ * A URL path with every segment that holds a key withheld: one that is a
+ * credential on its own evidence (a vendor prefix such as `sk-`, a JWT, a
+ * long opaque run), or a run of 16+ key characters mixing letters and digits
+ * anywhere after a {@link KEY_PATH_OWNERS} segment. A path segment carries no
+ * name to judge it by, so this is shape alone, and errs towards hiding.
+ */
+function redactPathSegments(path: string): string {
+  let owned = false;
+  return path
+    .split("/")
+    .map((segment) => {
+      const secret =
+        segment !== "" &&
+        (looksLikeSecretValue(segment) ||
+          (owned && KEYISH_RE.test(segment) && mixesLettersAndDigits(segment)));
+      if (KEY_PATH_OWNERS.has(segment.toLowerCase())) owned = true;
+      return secret ? REDACTED : segment;
+    })
+    .join("/");
+}
+
+/** Characters that end a URL written inside a longer entry. */
+const URL_END_RE = /[\s"'`<>]/;
+
+/**
+ * Every `scheme://…` URL inside `text` with its key-bearing path segments
+ * withheld (see {@link redactPathSegments}), and a bare `#fragment` that
+ * looks like a token (8+ key characters mixing letters and digits, no
+ * `name=`) withheld too; tool-safety's URL redaction has already taken the
+ * userinfo and the credential-named parameters. A linear scan.
+ */
+function redactUrlPathsInText(text: string): string {
+  if (!text.includes("://")) return text;
+  let out = "";
+  let copied = 0;
+  let from = 0;
+  for (;;) {
+    const sep = text.indexOf("://", from);
+    if (sep < 0) break;
+    let end = sep + 3;
+    while (end < text.length && !URL_END_RE.test(text.charAt(end))) end++;
+    from = end;
+    if (sep === 0 || !/[A-Za-z0-9+.-]/.test(text.charAt(sep - 1))) continue;
+    // The authority ends at the first `/`, `?` or `#`; the path runs to `?` or `#`.
+    let pathStart = sep + 3;
+    while (pathStart < end && !"/?#".includes(text.charAt(pathStart))) pathStart++;
+    let pathEnd = pathStart;
+    while (pathEnd < end && !"?#".includes(text.charAt(pathEnd))) pathEnd++;
+    // Searched only up to the URL's end, so many URLs in one entry stay linear.
+    let hash = pathEnd;
+    while (hash < end && text.charAt(hash) !== "#") hash++;
+    const fragment = hash < end ? text.slice(hash + 1, end) : undefined;
+    out += text.slice(copied, pathStart) + redactPathSegments(text.slice(pathStart, pathEnd));
+    copied = pathEnd;
+    if (
+      fragment !== undefined &&
+      !fragment.includes("=") &&
+      /^[A-Za-z0-9._~+/-]{8,}$/.test(fragment) &&
+      mixesLettersAndDigits(fragment)
+    ) {
+      out += `${text.slice(copied, hash + 1)}${REDACTED}`;
+      copied = end;
+    }
+  }
+  return out + text.slice(copied);
+}
+
+/**
  * Whether `word` ENDS in a credential word (`KEY`, `APIKEY`, `GHTOKEN`,
  * `BEARER`, `COOKIE`, `SECRETS`, `CONNECTIONSTRING`), by tool-safety's one
  * table of credential words. A word that only STARTS with one —
@@ -258,8 +363,22 @@ const URL_VALUE_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
  * a switch, a name.
  */
 function endsInCredentialWord(word: string): boolean {
-  const shape = credentialShapeOf(word);
+  // `PW` is a password in a flag or an assignment's last word (`--pw`,
+  // `DB_PW=`), but too common a PREFIX of environment names (Playwright's
+  // `PW_TEST_…`) for tool-safety's shared table, which flags a word anywhere.
+  if (word === "PW") return true;
+  // Lower-cased: tool-safety's one exception, `PWD`, is the shell's working
+  // directory variable, and `--pwd` is a password.
+  const shape = credentialShapeOf(word.toLowerCase());
   return shape !== undefined && (word.endsWith(shape) || word.endsWith(`${shape}S`));
+}
+
+/**
+ * Whether a `NAME=value`, `"name": value` or header name says its value is a
+ * credential: tool-safety's rule, plus a last word of `PW`.
+ */
+function isCredentialName(name: string): boolean {
+  return isCredentialShapedName(name) || nameWords(name).at(-1) === "PW";
 }
 
 /**
@@ -356,10 +475,13 @@ const BEARER_TOKEN_RE = /\bBearer(\s+)(?!\$)[A-Za-z0-9._~+/=-]{8,}/g;
  * parameter of a connection string (`Server=db;Password=…`,
  * `jdbc:sqlserver://db:1433;user=sa;password=…`). The name starts the entry
  * or follows whitespace, `;`, `&`, `?`, a quote, `{` or `,`, and the value
- * runs to the next of those. Every class is disjoint from the one after it,
- * so a match is linear.
+ * is quoted (`API_KEY='…'`, `API_KEY="…"`, the forms `sh -c` scripts use) or
+ * runs to the next of those. The value's three alternatives start with
+ * different characters and every class is disjoint from the one after it, so
+ * a match is linear.
  */
-const ASSIGNMENT_RE = /(^|[\s;&?"'{,])([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)([^\s;&"',}]+)/g;
+const ASSIGNMENT_RE =
+  /(^|[\s;&?"'{,])([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)("[^"]*"|'[^']*'|[^\s;&"',}]+)/g;
 
 /**
  * `"name": "value"` inside a JSON entry — `--config '{"apiKey":"…"}'`, the
@@ -367,6 +489,36 @@ const ASSIGNMENT_RE = /(^|[\s;&?"'{,])([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)([^\s;&
  * value's two alternatives are disjoint, so a match is linear.
  */
 const JSON_STRING_MEMBER_RE = /"([A-Za-z_$][\w$.-]{0,127})"(\s*:\s*)"((?:[^"\\]|\\.)*)"/g;
+
+/**
+ * `'name': 'value'` — the single-quoted spelling of a JSON member that a
+ * YAML or JavaScript object literal takes (`--config "{'apiKey':'…'}"`).
+ * Linear for the same reasons as {@link JSON_STRING_MEMBER_RE}.
+ */
+const SINGLE_QUOTED_MEMBER_RE = /'([A-Za-z_$][\w$.-]{0,127})'(\s*:\s*)'((?:[^'\\]|\\.)*)'/g;
+
+/**
+ * `user:password@host…` without a scheme — the form `psql`, `mysql` and
+ * `redis-cli` take. The user, host and the rest stay. A pinned image
+ * (`node:20@sha256:…`) has the same shape and is not one: see
+ * {@link IMAGE_DIGEST_RE}.
+ */
+const BARE_USERINFO_RE = /^([^\s:@/]+):([^\s@/]+)@([^\s@/]+)/;
+
+/** The digest half of an image reference, `sha256:…`: a tag before it is not a password. */
+const IMAGE_DIGEST_RE = /^sha\d+:/;
+
+/** Flags whose value is `user:password` (curl's `-u`/`--user`). */
+const USERINFO_FLAGS: ReadonlySet<string> = new Set(["-u", "--user"]);
+
+/** `user:password` with the password withheld; a bare user, or `uid:gid`, is left alone. */
+function redactUserPassword(value: string): string {
+  const colon = value.indexOf(":");
+  if (colon <= 0 || colon === value.length - 1) return value;
+  const password = value.slice(colon + 1);
+  if (/^\d+$/.test(password) || keepsNothingSecret(password)) return value;
+  return `${value.slice(0, colon)}:${REDACTED}`;
+}
 
 /** A value an earlier rule already cut down to `Bearer (redacted)` or `(redacted)`. */
 const ALREADY_REDACTED_RE = /^(?:(?:Bearer|Basic|Token)\s+)?\(redacted\)$/;
@@ -390,22 +542,35 @@ function keepsNothingSecret(value: string): boolean {
  * a credential-named `NAME=value` or JSON `"name": "value"` member.
  */
 function redactEmbedded(text: string): string {
-  let out = redactUrlCredentialsInText(text, REDACTED);
+  let out = redactUrlPathsInText(redactUrlCredentialsInText(text, REDACTED));
+  const bare = BARE_USERINFO_RE.exec(out);
+  if (bare !== null && !URL_VALUE_RE.test(out)) {
+    const [whole, user, password, host] = bare as unknown as [string, string, string, string];
+    if (!keepsNothingSecret(password) && !IMAGE_DIGEST_RE.test(host))
+      out = `${user}:${REDACTED}@${host}${out.slice(whole.length)}`;
+  }
   const header = splitHeader(out);
-  if (header !== undefined && isCredentialShapedName(header.name)) out = redactHeader(out);
+  if (header !== undefined && isCredentialName(header.name)) out = redactHeader(out);
   out = out.replace(BEARER_TOKEN_RE, (_m, gap: string) => `Bearer${gap}${REDACTED}`);
   out = out.replace(
     ASSIGNMENT_RE,
-    (whole, lead: string, name: string, eq: string, value: string) =>
-      isCredentialShapedName(name) && !keepsNothingSecret(value)
-        ? `${lead}${name}${eq}${REDACTED}`
-        : whole,
+    (whole, lead: string, name: string, eq: string, value: string) => {
+      const quote = value.startsWith('"') || value.startsWith("'") ? value.charAt(0) : "";
+      const inner = quote === "" ? value : value.slice(1, -1);
+      return isCredentialName(name) && !keepsNothingSecret(inner)
+        ? `${lead}${name}${eq}${quote}${REDACTED}${quote}`
+        : whole;
+    },
   );
-  return out.replace(JSON_STRING_MEMBER_RE, (whole, name: string, colon: string, value: string) =>
-    isCredentialShapedName(name) && !keepsNothingSecret(value)
-      ? `"${name}"${colon}"${REDACTED}"`
-      : whole,
-  );
+  const member =
+    (q: string) =>
+    (whole: string, name: string, colon: string, value: string): string =>
+      isCredentialName(name) && !keepsNothingSecret(value)
+        ? `${q}${name}${q}${colon}${q}${REDACTED}${q}`
+        : whole;
+  return out
+    .replace(JSON_STRING_MEMBER_RE, member('"'))
+    .replace(SINGLE_QUOTED_MEMBER_RE, member("'"));
 }
 
 /**
@@ -442,7 +607,7 @@ function redactCredentialValue(value: string): string {
 export function redactArgs(args: readonly string[]): { args: string[]; redacted: number } {
   const out: string[] = [];
   let redacted = 0;
-  let previous: "credential-flag" | "header-flag" | "header-name" | undefined;
+  let previous: "credential-flag" | "header-flag" | "header-name" | "userinfo-flag" | undefined;
   const push = (value: string, original: string): void => {
     out.push(value);
     if (value !== original) redacted += 1;
@@ -461,6 +626,10 @@ export function redactArgs(args: readonly string[]): { args: string[]; redacted:
       push(redactHeaderValue(arg), arg);
       continue;
     }
+    if (after === "userinfo-flag" && !arg.startsWith("-")) {
+      push(redactEmbedded(redactUserPassword(arg)), arg);
+      continue;
+    }
     if (after === "header-flag" && !arg.startsWith("-")) {
       if (splitHeader(arg) !== undefined) {
         push(redactHeader(arg), arg);
@@ -475,11 +644,32 @@ export function redactArgs(args: readonly string[]): { args: string[]; redacted:
       }
       continue;
     }
+    if (/^-H[^-=]/.test(arg)) {
+      // `-HAuthorization: Bearer …`: curl's short flag with its value attached.
+      push(`-H${redactHeader(arg.slice(2))}`, arg);
+      continue;
+    }
+    const colon = arg.startsWith("-") && eq === -1 ? arg.indexOf(":") : -1;
+    if (colon > 0 && isCredentialFlag(arg.slice(0, colon))) {
+      // `--token:VALUE`, the separator some CLIs take in place of `=`.
+      const value = arg.slice(colon + 1);
+      push(
+        value === "" || ENV_REF_RE.test(value)
+          ? arg
+          : `${arg.slice(0, colon)}:${redactCredentialValue(value)}`,
+        arg,
+      );
+      continue;
+    }
     if (eq > 0) {
       const flag = arg.slice(0, eq);
       const value = arg.slice(eq + 1);
       if (HEADER_FLAGS.has(flag)) {
         push(`${flag}=${redactHeader(value)}`, arg);
+        continue;
+      }
+      if (USERINFO_FLAGS.has(flag)) {
+        push(`${flag}=${redactEmbedded(redactUserPassword(value))}`, arg);
         continue;
       }
       if (isCredentialFlag(flag) && value.length > 0 && !ENV_REF_RE.test(value)) {
@@ -495,6 +685,7 @@ export function redactArgs(args: readonly string[]): { args: string[]; redacted:
     }
     push(arg.startsWith("-") ? arg : redactEmbedded(arg), arg);
     if (HEADER_FLAGS.has(arg)) previous = "header-flag";
+    else if (USERINFO_FLAGS.has(arg)) previous = "userinfo-flag";
     else if (isCredentialFlag(arg)) previous = "credential-flag";
   }
   return { args: out, redacted };
@@ -676,6 +867,62 @@ function diffSets(
   };
 }
 
+/** Where each key first appears: the occurrence the first-match rule sees. */
+function firstPositions(keys: readonly string[]): Map<string, number> {
+  const out = new Map<string, number>();
+  keys.forEach((key, i) => {
+    if (!out.has(key)) out.set(key, i);
+  });
+  return out;
+}
+
+/** How much a rule type lets through when it is the first to match. */
+const RULE_LEAD: Readonly<Record<string, number>> = {
+  alwaysAllow: 0,
+  alwaysAsk: 1,
+  alwaysDeny: 2,
+};
+const ruleLead = (key: string): number => RULE_LEAD[key.slice(0, key.indexOf(" "))] ?? 2;
+
+/**
+ * Two rules on both sides whose ORDER swapped, when their types differ.
+ *
+ * The engine takes the first matching rule in declaration order, so
+ * `[alwaysDeny X, alwaysAllow X]` denies X and the same two rules reversed
+ * allow it. A swap widens when the rule that now comes first lets more
+ * through (an allow ahead of an ask or a deny, an ask ahead of a deny); it
+ * is conservative in that it does not check the two patterns can match the
+ * same call. A widening swap is reported in preference to a narrowing one.
+ * Linear in the number of rules.
+ */
+function ruleReorder(
+  before: readonly string[],
+  after: readonly string[],
+): { first: string; second: string; widens: boolean } | undefined {
+  const posBefore = firstPositions(before);
+  const posAfter = firstPositions(after);
+  const common = [...posBefore.keys()]
+    .filter((key) => posAfter.has(key))
+    .sort((a, b) => (posBefore.get(a) ?? 0) - (posBefore.get(b) ?? 0));
+  // For each lead (0..2), the seen rule of that type that now sits LATEST.
+  const latest: Array<{ key: string; at: number } | undefined> = [undefined, undefined, undefined];
+  let narrowing: { first: string; second: string; widens: boolean } | undefined;
+  for (const key of common) {
+    const at = posAfter.get(key) ?? 0;
+    const lead = ruleLead(key);
+    for (let other = 0; other < latest.length; other++) {
+      const seen = latest[other];
+      if (other === lead || seen === undefined || seen.at <= at) continue;
+      // `seen` came first before, and `key` comes first now.
+      if (lead < other) return { first: seen.key, second: key, widens: true };
+      narrowing ??= { first: seen.key, second: key, widens: false };
+    }
+    const current = latest[lead];
+    if (current === undefined || current.at < at) latest[lead] = { key, at };
+  }
+  return narrowing;
+}
+
 function sourceToModel(models: readonly ModelSlot[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const slot of models) {
@@ -799,16 +1046,34 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
     });
   }
   const ruleKey = (r: PermissionRuleView): string => `${r.type} ${r.pattern}`;
-  const rules = diffSets(
-    before.permissions.rules.map(ruleKey),
-    after.permissions.rules.map(ruleKey),
-  );
+  const beforeRules = before.permissions.rules.map(ruleKey);
+  const afterRules = after.permissions.rules.map(ruleKey);
+  const rules = diffSets(beforeRules, afterRules);
+  const afterPos = firstPositions(afterRules);
+  // The first matching rule decides, so an ask placed ahead of a deny can
+  // turn that deny into a question for every call both match. One pass finds
+  // the last deny, so the check stays linear however many rules are added.
+  let lastDeny = -1;
+  afterRules.forEach((key, i) => {
+    if (key.startsWith("alwaysDeny ")) lastDeny = i;
+  });
   for (const key of rules.added) {
+    const aheadOfDeny = key.startsWith("alwaysAsk ") && (afterPos.get(key) ?? 0) < lastDeny;
     push({
       kind: "permission-rule-added",
       path: "permissions.rules",
       to: key,
-      widens: key.startsWith("alwaysAllow "),
+      widens: key.startsWith("alwaysAllow ") || aheadOfDeny,
+    });
+  }
+  const reorder = ruleReorder(beforeRules, afterRules);
+  if (reorder !== undefined) {
+    push({
+      kind: "permission-rules-reordered",
+      path: "permissions.rules",
+      from: `${reorder.first}, then ${reorder.second}`,
+      to: `${reorder.second}, then ${reorder.first}`,
+      widens: reorder.widens,
     });
   }
   for (const key of rules.removed) {
@@ -880,7 +1145,7 @@ function diffServer(path: string, from: McpServerView, to: McpServerView): SpecC
       out.push({
         kind: "mcp-server-url-value-changed",
         path,
-        to: "the URL's query, userinfo or fragment changed (withheld)",
+        to: "a withheld part of the URL changed (its query, userinfo, fragment or a key in its path)",
         widens: true,
       });
     }

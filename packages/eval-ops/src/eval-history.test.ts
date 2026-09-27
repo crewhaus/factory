@@ -5,7 +5,16 @@
  * no LLM/credentials needed.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getBaseline, readBaselines, readRunIndex, resolveBaseline } from "@crewhaus/eval-report";
@@ -299,6 +308,45 @@ describe("finishEvalRun — index + baseline lifecycle", () => {
     expect(result.gateFailed).toBe(false);
     expect(ctx.lines.join("\n")).toContain("starting new baseline lineage");
     expect(getBaseline("concierge", "smoke", ctx.evalsDir)?.runId).toBe("run_bbbb2222bbbb2222");
+  });
+});
+
+// The ops review: eval-report now refuses a history write through a link,
+// and finishEvalRun let that HistoryWriteError escape AFTER the run was paid
+// for, even after printing "gate: PASS", so `crewhaus eval --gate` exited
+// non-zero on a passing gate. A refusal is a warning with its remedy.
+describe("finishEvalRun — a refused history write never loses the verdict", () => {
+  test("a linked baselines.json: the gate still passes, and the pin is a warning", async () => {
+    const ctx = newCtx();
+    const prev = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    await finish(ctx, prev);
+    // Pins moved to a tracked file and linked back, inside the project.
+    const tracked = join(ctx.root, "baselines.tracked.json");
+    renameSync(join(ctx.evalsDir, "baselines.json"), tracked);
+    symlinkSync(tracked, join(ctx.evalsDir, "baselines.json"));
+    const pinsBefore = readFileSync(tracked, "utf8");
+    const next = makeRun(ctx, "run_bbbb2222bbbb2222", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, next, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.lines.join("\n")).toContain("gate: PASS");
+    expect(ctx.warnings.filter((w) => w.includes("baseline not set"))).toHaveLength(1);
+    expect(ctx.warnings.join("\n")).toContain("refusing to write baselines.json");
+    // Nothing was written through the link.
+    expect(readFileSync(tracked, "utf8")).toBe(pinsBefore);
+  });
+
+  test("a .crewhaus linked out of the project: the run is not recorded, and still gated", async () => {
+    const ctx = newCtx();
+    const shared = newTempRoot();
+    mkdirSync(join(shared, "evals"), { recursive: true });
+    symlinkSync(shared, join(ctx.root, ".crewhaus"));
+    const run = makeRun(ctx, "run_aaaa1111aaaa1111", [makeSample("a", true, 1)]);
+    const result = await finish(ctx, run, { gateRequested: true });
+    expect(result.gateFailed).toBe(false);
+    expect(ctx.warnings.filter((w) => w.includes("was not recorded"))).toHaveLength(1);
+    expect(ctx.warnings.filter((w) => w.includes("baseline not set"))).toHaveLength(1);
+    expect(ctx.warnings.join("\n")).toContain("real directories inside the project");
+    expect(readdirSync(join(shared, "evals"))).toEqual([]);
   });
 });
 

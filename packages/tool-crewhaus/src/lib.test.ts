@@ -172,6 +172,96 @@ describe("spec diff", () => {
     expect(dropAllow.some((c) => c.kind === "permission-rule-removed" && c.widens)).toBe(false);
   });
 
+  // The engine takes the FIRST matching rule in declaration order, so the
+  // same rules in another order can decide differently: [deny X, allow X]
+  // denies X, [allow X, deny X] allows it. SpecDiff compared rules as a set
+  // and reported no change at all.
+  describe("rule order", () => {
+    const rulesSpec = (...rules: string[]) =>
+      [
+        "name: t",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: go",
+        "tools: [runCommand]",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        ...rules.map((r) => {
+          const [type, pattern] = r.split(" ");
+          return `    - { type: ${type}, pattern: "${pattern}" }`;
+        }),
+      ].join("\n");
+    const diff = (before: string[], after: string[]) =>
+      diffSpecViews(view(rulesSpec(...before)), view(rulesSpec(...after)));
+
+    test("an allow moved ahead of a deny widens, and says which two rules swapped", () => {
+      expect(
+        diff(
+          ["alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+          ["alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+        ),
+      ).toEqual([
+        {
+          kind: "permission-rules-reordered",
+          path: "permissions.rules",
+          from: "alwaysDeny RunCommand, then alwaysAllow RunCommand",
+          to: "alwaysAllow RunCommand, then alwaysDeny RunCommand",
+          widens: true,
+        },
+      ]);
+      // An ask moved ahead of a deny turns the deny into a question.
+      expect(
+        diff(
+          ["alwaysDeny RunCommand(rm *)", "alwaysAsk RunCommand"],
+          ["alwaysAsk RunCommand", "alwaysDeny RunCommand(rm *)"],
+        ).map((c) => [c.kind, c.widens]),
+      ).toEqual([["permission-rules-reordered", true]]);
+    });
+
+    test("a guard moved ahead of an allow is reported and does not widen", () => {
+      expect(
+        diff(
+          ["alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+          ["alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+        ).map((c) => [c.kind, c.widens]),
+      ).toEqual([["permission-rules-reordered", false]]);
+    });
+
+    test("a widening swap is reported even beside a narrowing one", () => {
+      const changes = diff(
+        ["alwaysAllow Read", "alwaysDeny Read", "alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+        ["alwaysDeny Read", "alwaysAllow Read", "alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+      );
+      expect(changes.map((c) => [c.kind, c.widens, c.to])).toEqual([
+        ["permission-rules-reordered", true, "alwaysAllow RunCommand, then alwaysDeny RunCommand"],
+      ]);
+    });
+
+    test("rules of one type in another order decide the same, and are no change", () => {
+      expect(
+        diff(
+          ["alwaysDeny RunCommand(rm *)", "alwaysDeny RunCommand(curl *)"],
+          ["alwaysDeny RunCommand(curl *)", "alwaysDeny RunCommand(rm *)"],
+        ),
+      ).toEqual([]);
+    });
+
+    test("an ask ADDED ahead of a deny widens; one added after it does not", () => {
+      const ahead = diff(
+        ["alwaysDeny RunCommand"],
+        ["alwaysAsk RunCommand", "alwaysDeny RunCommand"],
+      );
+      expect(ahead.map((c) => [c.kind, c.widens])).toEqual([["permission-rule-added", true]]);
+      const behind = diff(
+        ["alwaysDeny RunCommand"],
+        ["alwaysDeny RunCommand", "alwaysAsk RunCommand"],
+      );
+      expect(behind.map((c) => [c.kind, c.widens])).toEqual([["permission-rule-added", false]]);
+    });
+  });
+
   test("default → auto widens, default → plan does not", () => {
     const auto = CLI_SPEC.replace("mode: default", "mode: auto");
     const plan = CLI_SPEC.replace("mode: default", "mode: plan");
@@ -832,6 +922,108 @@ describe("eval gate", () => {
         datasetBaseName,
       ),
     ).toEqual(["golden", "golden", "golden", "evals/smoke.jsonl", "a@b@c", "x#dev"]);
+    // The regression-suite union `crewhaus eval` records is set aside first.
+    expect(
+      [
+        "smoke+regressions@v1",
+        "golden@v3+regressions@v1",
+        "golden@v3#dev+regressions@v2",
+        "a+regressions@v1@x",
+      ].map(datasetBaseName),
+    ).toEqual(["smoke", "golden", "golden", "a+regressions@v1@x"]);
+  });
+
+  // The ops review: `crewhaus eval` records `<primary>+regressions@<v>` when
+  // the pinned regression suite (on by default after `crewhaus optimize`)
+  // added samples, and every pair below FAILED as "different datasets"
+  // although 0.7.0 passed it — including the version bump d01ef02a allowed.
+  test("a regression-suite union of the same dataset is noted, not failed", () => {
+    const rows: Array<[string, boolean, number]> = [
+      ["a", true, 1],
+      ["b", true, 1],
+    ];
+    const at = (datasetName: string) => {
+      const read = readEvalRun(evalDoc(rows, { config: { datasetName } }), datasetName);
+      if (!read.ok) throw new Error("fixture did not read");
+      return read.run;
+    };
+    const pairs: Array<[string, string]> = [
+      ["smoke", "smoke+regressions@v1"],
+      ["golden@v3", "golden@v3+regressions@v1"],
+      ["golden@v3+regressions@v1", "golden@v4+regressions@v1"],
+      ["golden@v3#dev+regressions@v1", "golden@v3#dev+regressions@v2"],
+    ];
+    for (const [from, to] of pairs) {
+      const result = compareEvalRuns(at(from), at(to));
+      expect({ from, to, verdict: result.verdict, reasons: result.reasons }).toEqual({
+        from,
+        to,
+        verdict: "pass",
+        reasons: [],
+      });
+      expect(result.notes.filter((n) => n.includes("regression-suite union"))).toHaveLength(1);
+    }
+    // Another dataset with a suite unioned in is still another dataset.
+    expect(compareEvalRuns(at("smoke"), at("other+regressions@v1")).reasons).toEqual([
+      "the runs name different datasets (smoke vs other+regressions@v1) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway",
+    ]);
+  });
+
+  // The ops review: a sample with no `sampleId` got the id `<sample i>`, so
+  // two runs that share no real id matched by POSITION — 50 baseline samples
+  // against 1 unrelated candidate sample came back `shared: 1`, pass.
+  test("a sample with no sampleId is never matched by position", () => {
+    const anonymousDoc = (passes: boolean[], idKey?: string) => ({
+      samples: passes.map((passed, i) => ({
+        ...(idKey !== undefined ? { [idKey]: `${idKey}-${i}` } : {}),
+        grades: { overall: { passed, score: passed ? 1 : 0 } },
+      })),
+    });
+    const read = (doc: unknown) => {
+      const r = readEvalRun(doc, "x");
+      if (!r.ok) throw new Error("fixture did not read");
+      return r.run;
+    };
+    for (const idKey of [undefined, "id"]) {
+      const result = compareEvalRuns(
+        read(
+          anonymousDoc(
+            Array.from({ length: 50 }, () => true),
+            idKey,
+          ),
+        ),
+        read(anonymousDoc([true], idKey)),
+      );
+      expect({
+        idKey,
+        verdict: result.verdict,
+        shared: result.samples.shared,
+        reasons: result.reasons,
+      }).toEqual({
+        idKey,
+        verdict: "fail",
+        shared: 0,
+        reasons: [
+          "the two runs share no sample ids — samples without a sampleId (50 in the baseline and 1 in the candidate) are never matched by position, so nothing was compared sample by sample and the candidate cannot be shown to hold the line",
+        ],
+      });
+    }
+    // Beside real ids, an anonymous sample is left out of the matching and
+    // named in a note; the named samples still decide.
+    const mixed = evalDoc([
+      ["a", true, 1],
+      ["b", true, 1],
+    ]);
+    (mixed["samples"] as unknown[]).push({ grades: { overall: { passed: false, score: 0 } } });
+    const baseRun = read(evalDoc([["a", true, 1]]));
+    const result = compareEvalRuns(baseRun, read(mixed), { maxPassRateDrop: 1 });
+    expect([result.verdict, result.samples]).toEqual([
+      "pass",
+      { shared: 1, baselineOnly: [], candidateOnly: ["b"] },
+    ]);
+    expect(result.notes).toContain(
+      "samples without a sampleId (1 in the candidate) are never matched by position: they were not compared one by one, but they count in the pass rates",
+    );
   });
 
   test("runs that share no sample ids FAIL the gate, even with a perfect candidate", () => {
@@ -1360,6 +1552,106 @@ describe("redactArgs", () => {
       "-H",
       "ssh://(redacted)@build-host",
     ]);
+  });
+
+  // The ops review found each of these printed verbatim after the first
+  // 0.7.1 fix-up: a quoted `sh -c` assignment, a wallet seed phrase, a key
+  // in a URL PATH, curl's `-u user:password`, `--pw`/`--pwd`, a bare token
+  // fragment, and a few spellings of forms already caught.
+  test("a quoted assignment, a seed phrase and curl's -u user:password lose their secret", () => {
+    for (const [args, want] of [
+      [
+        ["-c", `API_KEY='${tok}' exec my-mcp-server`],
+        ["-c", "API_KEY='(redacted)' exec my-mcp-server"],
+      ],
+      [
+        ["-c", `API_KEY="${tok}" exec my-mcp-server`],
+        ["-c", 'API_KEY="(redacted)" exec my-mcp-server'],
+      ],
+      [
+        ["--mnemonic", "abandon ability able about above absent"],
+        ["--mnemonic", "(redacted)"],
+      ],
+      [
+        ["--seed-phrase", tok],
+        ["--seed-phrase", "(redacted)"],
+      ],
+      [
+        ["-e", `WALLET_MNEMONIC=${tok}`],
+        ["-e", "WALLET_MNEMONIC=(redacted)"],
+      ],
+      [
+        ["-u", `admin:${pw}`],
+        ["-u", "admin:(redacted)"],
+      ],
+      [[`--user=admin:${pw}`], ["--user=admin:(redacted)"]],
+      [
+        ["--pw", pw],
+        ["--pw", "(redacted)"],
+      ],
+      [
+        ["--pwd", pw],
+        ["--pwd", "(redacted)"],
+      ],
+      [
+        ["-c", `DB_PW=${pw} server`],
+        ["-c", "DB_PW=(redacted) server"],
+      ],
+      [[`admin:${pw}@db.internal:5432/prod`], ["admin:(redacted)@db.internal:5432/prod"]],
+      [[`-HAuthorization: Bearer ${hdr}`], ["-HAuthorization: (redacted)"]],
+      [[`--token:${tok}`], ["--token:(redacted)"]],
+      [
+        ["--config", `{'apiKey':'${tok}'}`],
+        ["--config", "{'apiKey':'(redacted)'}"],
+      ],
+    ] as const) {
+      expect({ args, out: redactArgs(args).args }).toEqual({ args, out: [...want] });
+    }
+  });
+
+  test("a key in a URL's path or a bare token fragment is withheld; the rest of the URL stays", () => {
+    const key = ["Xk9", "q2Lm", "Pz7Rt", "4Wv8"].join("");
+    for (const [arg, want] of [
+      [
+        `https://eth-mainnet.g.alchemy.com/v2/${key}`,
+        "https://eth-mainnet.g.alchemy.com/v2/(redacted)",
+      ],
+      [
+        `https://hooks.slack.com/services/T000/B000/${key}`,
+        "https://hooks.slack.com/services/T000/B000/(redacted)",
+      ],
+      [
+        `https://discord.com/api/webhooks/123/${key}`,
+        "https://discord.com/api/webhooks/123/(redacted)",
+      ],
+      [
+        `--rpc-url=https://mainnet.infura.io/v3/${key}`,
+        "--rpc-url=https://mainnet.infura.io/v3/(redacted)",
+      ],
+      [`https://h.example/sse#${key}`, "https://h.example/sse#(redacted)"],
+    ] as const) {
+      expect({ arg, out: redactArgs([arg]).args }).toEqual({ arg, out: [want] });
+    }
+  });
+
+  test("the new forms leave ordinary argv readable", () => {
+    const kept = [
+      // `-u` is python's unbuffered switch and docker's uid:gid.
+      "python",
+      "-u",
+      "server.py",
+      "-u",
+      "1000:1000",
+      // A pinned image is `name:tag@sha256:…`, not user:password@host.
+      "node:20@sha256:0123abcd",
+      // A version or a word in a URL path is not a key.
+      "https://api.example.com/v1/models/claude-sonnet",
+      "https://github.com/org/repo/blob/main/README.md#usage",
+      // Playwright's variables start with PW; they are not passwords.
+      "PW_TEST_HTML_REPORT_OPEN=never",
+      "RANDOM_SEED=42",
+    ];
+    expect(redactArgs(kept)).toEqual({ args: [...kept], redacted: 0 });
   });
 
   test("an env reference in a header, and a URL with nothing to hide, stay as written", () => {

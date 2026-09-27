@@ -2197,6 +2197,9 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // OPENAI_BASE_URL to a server with no such limit, which only the running
   // process can see (it checks again at start). A site no model can serve is
   // still a compile error.
+  //
+  // permission-rule-note: a glob such as `*write*` that still fires on a
+  // declared MCP server's tools is not dead, it merely misses a builtin.
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
     "channel-plugins-at-start",
@@ -2204,6 +2207,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     "mcp-server-name",
     "provider-tool-cap",
     "provider-tool-cap-unverified",
+    "permission-rule-note",
     "model-plan-candidate-only",
     "model-plan-tool-config-widens",
     "model-capabilities-unknown",
@@ -2754,8 +2758,14 @@ async function permissionRuleWarnings(
   const toolMap = await loadToolMap();
   const byRegisteredName: Record<string, RegisteredTool> = {};
   for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  // A `builtin-not-reached` note is about a rule that still fires (on a
+  // declared MCP server's tools), so --strict does not escalate it.
   return permissionRuleProblemsOf(ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
-    (p) => ({ code: "permission-rule", path: "permissions.rules", message: p.message }),
+    (p) => ({
+      code: p.code === "builtin-not-reached" ? "permission-rule-note" : "permission-rule",
+      path: "permissions.rules",
+      message: p.message,
+    }),
   );
 }
 
