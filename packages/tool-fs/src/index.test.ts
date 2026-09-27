@@ -683,6 +683,80 @@ describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
   });
 });
 
+describe("Grep keeps 0.7.0's pace with no literal to pre-filter on (0.7.1 review)", () => {
+  /**
+   * About 12 MB of source-like lines in 300 files, a few holding a 40-digit
+   * hex id. `[0-9a-f]{40}` names no plain character, so every line goes to
+   * the regex worker.
+   */
+  async function sourceTree(dir: string): Promise<number> {
+    await mkdir(dir);
+    let ids = 0;
+    for (let f = 0; f < 300; f++) {
+      const lines: string[] = [];
+      for (let i = 0; i < 900; i++) {
+        const n = f * 900 + i;
+        if (n % 997 === 0) {
+          lines.push(
+            `  const id = "${(n * 2_654_435_761).toString(16).padStart(8, "0").repeat(5)}";`,
+          );
+          ids++;
+        } else {
+          lines.push(
+            `    const value${n % 89} = someFunction(argumentNumber${n % 97}, "text ${n}"); // note`,
+          );
+        }
+      }
+      await writeFile(path.join(dir, `f${f}.ts`), `${lines.join("\n")}\n`);
+    }
+    return ids;
+  }
+
+  /** 0.7.0's Grep, on the caller's thread: read, split, test each line. */
+  function inThread(dir: string, pattern: RegExp): { ms: number; hits: number } {
+    const started = performance.now();
+    let hits = 0;
+    for (const name of readdirSync(dir)) {
+      for (const line of readFileSync(path.join(dir, name), "utf8").split("\n")) {
+        if (line.length <= 10_000 && pattern.test(line)) hits++;
+      }
+    }
+    return { ms: performance.now() - started, hits };
+  }
+
+  test("a search every line of which goes to the worker stays close to an in-thread loop", async () => {
+    // 0.7.1 before this waited for each batch in turn and sent it as an
+    // array of strings: 3-4x 0.7.0's time on a 58 MB source tree, which
+    // under load then stopped at the deadline with most of its hits
+    // unfound; now it matches 0.7.0 there. On this tree of short lines the
+    // loop below takes what 0.7.0's Grep took; 0.7.1 before this took 5-7
+    // times as long, and now 2-3 times (the worker's fixed cost per line).
+    // Both runs are timed on the same files, interleaved, and the best of
+    // each is compared, so the machine's load falls on both alike; a round
+    // a load spike spoiled is outweighed by the next, up to twelve.
+    const dir = path.join(tmp, "src");
+    const ids = await sourceTree(dir);
+    _setGrepLimitsForTest({ deadlineMs: 120_000 });
+    const pattern = "[0-9a-f]{40}";
+    let best = { grep: Number.POSITIVE_INFINITY, inThread: Number.POSITIVE_INFINITY };
+    for (let round = 0; round < 12; round++) {
+      const base = inThread(dir, new RegExp(pattern));
+      expect(base.hits).toBe(ids);
+      const started = performance.now();
+      const result = String(await grep.execute({ pattern, path: "src" }));
+      const ms = performance.now() - started;
+      expect(result.split("\n")).toHaveLength(ids);
+      expect(result).not.toContain("[grep:");
+      // Round 0 warms the worker, the JIT and the page cache for both.
+      if (round > 0) {
+        best = { grep: Math.min(best.grep, ms), inThread: Math.min(best.inThread, base.ms) };
+      }
+      if (round >= 5 && best.grep < 4 * best.inThread) break;
+    }
+    expect(best.grep).toBeLessThan(4 * best.inThread);
+  }, 120_000);
+});
+
 describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 review)", () => {
   test("a pattern whose repeats split the same text one after another is refused before it runs", async () => {
     await writeFile(path.join(tmp, "a.txt"), `${"a".repeat(9_000)}\n`);
