@@ -82,15 +82,65 @@ export function decodeXmlText(raw: string): string {
   });
 }
 
-const ATTR_RE = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+/** An attribute name: a run of anything but whitespace, `=`, `/` and `>`. */
+const ATTR_NAME = /[^\s=/>]+/y;
+/** What must follow a name for it to be an attribute: `= value`, quoted or bare. */
+const ATTR_VALUE = /\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/y;
 
-function parseAttrs(source: string): Record<string, string> {
+/**
+ * Attributes of one tag, last spelling wins.
+ *
+ * This reads what `/([^\s=/>]+)\s*=\s*(?:"…"|'…'|[^\s"'>]+)/g` read, but in one
+ * forward pass. The global pattern, on a name with no `=` after it, failed
+ * and then retried from every later character of the same name, each retry
+ * rescanning to the same end: a feed or sitemap tag with one 80 KB token
+ * held the event loop for seconds, and `timeoutMs` covers only the fetch.
+ * Every retry inside a name ends where the name ends and meets the same
+ * `=` check, so skipping to the end of the name gives the same answer.
+ */
+export function parseAttrs(source: string): Record<string, string> {
   const attrs: Record<string, string> = {};
-  for (const match of source.matchAll(ATTR_RE)) {
-    const key = localName(match[1] as string);
-    attrs[key] = decodeXmlText(match[2] ?? match[3] ?? match[4] ?? "");
+  let p = 0;
+  while (p < source.length) {
+    ATTR_NAME.lastIndex = p;
+    const name = ATTR_NAME.exec(source);
+    if (name === null) {
+      p++;
+      continue;
+    }
+    const nameEnd = ATTR_NAME.lastIndex;
+    ATTR_VALUE.lastIndex = nameEnd;
+    const value = ATTR_VALUE.exec(source);
+    if (value === null) {
+      p = nameEnd;
+      continue;
+    }
+    attrs[localName(name[0])] = decodeXmlText(value[1] ?? value[2] ?? value[3] ?? "");
+    p = ATTR_VALUE.lastIndex;
   }
   return attrs;
+}
+
+/**
+ * Whether any `<!DOCTYPE` is followed by a `[` before its closing `>`: the
+ * internal subset an XXE payload needs. This is `/<!DOCTYPE[^>]*\[/i`, but
+ * that pattern rescanned to the same `>` from every `<!DOCTYPE` before it,
+ * quadratically. Here each stretch of the document is scanned once: a
+ * `<!DOCTYPE` that starts before the `>` already checked shares that `>`,
+ * and the next `[` is found once and reused until it is passed.
+ */
+export function hasInternalSubset(source: string): boolean {
+  const opener = /<!DOCTYPE/gi;
+  let bracket = -2; // not yet looked for
+  for (let m = opener.exec(source); m !== null; m = opener.exec(source)) {
+    const from = m.index + m[0].length;
+    if (bracket !== -1 && bracket < from) bracket = source.indexOf("[", from);
+    const gt = source.indexOf(">", from);
+    if (bracket !== -1 && (gt === -1 || bracket < gt)) return true;
+    if (gt === -1 || bracket === -1) return false;
+    opener.lastIndex = gt + 1;
+  }
+  return false;
 }
 
 /** Index just past the `>` that closes the tag starting at `open`. */
@@ -121,7 +171,7 @@ export function parseXml(source: string): XmlNode {
   if (/<!ENTITY/i.test(source)) {
     throw new XmlParseError("refused: the document declares entities (entity-expansion risk)");
   }
-  if (/<!DOCTYPE[^>]*\[/i.test(source)) {
+  if (hasInternalSubset(source)) {
     throw new XmlParseError("refused: the document has an internal DTD subset (XXE risk)");
   }
 

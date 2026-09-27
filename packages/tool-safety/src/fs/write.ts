@@ -541,6 +541,19 @@ export type AppendOptions = {
   readonly create?: boolean;
   /** Mode for a file this call creates (umask applies). Default 0o666. */
   readonly mode?: number;
+  /**
+   * A symlink at the leaf: refuse it (default), or append to where it leads
+   * when that is inside the root. A link out of the root is refused either
+   * way.
+   */
+  readonly leafSymlink?: LeafSymlinkPolicy;
+  /**
+   * An existing file with more than one name (a hard link): append to it
+   * (default), or refuse. An append changes the file under every name, and
+   * the others need not be inside the root; a write through a temp and a
+   * rename does not have this problem, an append in place does.
+   */
+  readonly hardLinks?: "allow" | "refuse";
 };
 
 export type AppendResult =
@@ -582,7 +595,10 @@ export function appendContained(
   options: AppendOptions = {},
 ): AppendResult {
   for (let attempt = 0; ; attempt++) {
-    const found = locateLeaf(root, given, { createParents: options.createParents === true });
+    const found = locateLeaf(root, given, {
+      createParents: options.createParents === true,
+      ...(options.leafSymlink !== undefined ? { leafSymlink: options.leafSymlink } : {}),
+    });
     if (!found.ok) return found;
     const existing = found.existing;
     if (existing === undefined && options.create === false) {
@@ -624,6 +640,14 @@ export function appendContained(
           "changed",
           given,
           `${quote(given)} changed while it was being opened; nothing was appended`,
+        );
+      }
+      // Asked of the descriptor, so it is the file that will be written.
+      if (existing !== undefined && options.hardLinks === "refuse" && opened.nlink > 1) {
+        return fail(
+          "escapes-root",
+          given,
+          `${quote(given)} is a hard link (the file has ${opened.nlink} names); an append would change it under every name, and they need not be inside the workspace, so nothing was appended`,
         );
       }
       const bytes = writeAll(fd, data);

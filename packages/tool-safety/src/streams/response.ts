@@ -1,5 +1,6 @@
 import * as zlib from "node:zlib";
 import { onAbort } from "../signal";
+import { GzipStepDecoder, type StepDecoder, StreamStepDecoder } from "./decoders";
 import { byteBudget, graceMs } from "./limits";
 import { concatBytes, decodeHead } from "./utf8";
 
@@ -24,8 +25,18 @@ import { concatBytes, decodeHead } from "./utf8";
  * that parses as it goes (server-sent events) or writes as it goes (a
  * download); `readResponseBounded` collects them.
  *
- * Every read is raced against the signal and against `idleTimeoutMs`, so a
- * server that sends one chunk and then stalls cannot hold the reader.
+ * Every read, and every step of the decoder, is raced against the signal
+ * and against `idleTimeoutMs`, so neither a server that sends one chunk and
+ * then stalls nor a corrupt body can hold the reader.
+ *
+ * WHAT COUNTS AS THE BODY. A gzip body is its first member: bytes after it
+ * (a stray CRLF, padding) are not read, as Bun's own decoder, curl and
+ * browsers treat them; a deflate, br or zstd body ends where its encoded
+ * data ends, likewise. A `Content-Encoding` label that names no coding
+ * (`none`, `utf-8`, `binary`) is read as the bytes it is, under the same
+ * cap, and reported in `undecodedEncoding`; only a stack that includes a
+ * real compression (`gzip, br`) is refused, since each stage would need a
+ * bound of its own.
  *
  * MISUSE IS DETECTED WHERE IT CAN BE. A body that was already decoded by the
  * runtime is recognised when it runs past its own `Content-Length`, or when
@@ -85,6 +96,12 @@ export type ResponseReadResult =
       readonly encodedBytes: number;
       /** The coding that was undone, or null for an identity body. */
       readonly contentEncoding: string | null;
+      /**
+       * A `Content-Encoding` label that names no coding this reader knows
+       * (`none`, `utf-8`): the body was read as it arrived, not decoded.
+       * Null otherwise.
+       */
+      readonly undecodedEncoding: string | null;
     }
   | ResponseReadFailure;
 
@@ -98,6 +115,7 @@ export type DecodedBodyOutcome =
       readonly decodedBytes: number;
       readonly encodedBytes: number;
       readonly contentEncoding: string | null;
+      readonly undecodedEncoding: string | null;
     }
   | ResponseReadFailure;
 
@@ -136,41 +154,68 @@ export function fetchRaw(input: string | URL | Request, init: RequestInit = {}):
 /** Input fed to the decoder per step. Small, so one step cannot inflate far past the cap. */
 const DECODE_STEP = 16 * 1024;
 
-type Decoder = zlib.Gunzip | zlib.Inflate | zlib.InflateRaw | zlib.BrotliDecompress;
-
 type Coding = "gzip" | "deflate" | "br" | "zstd";
 
-function codingOf(header: string | null): Coding | null | { readonly unsupported: string } {
-  if (header === null) return null;
-  const codings = header
+/** The content codings this reader decodes. */
+const DECODABLE: Readonly<Record<string, Coding>> = {
+  gzip: "gzip",
+  "x-gzip": "gzip",
+  deflate: "deflate",
+  br: "br",
+  zstd: "zstd",
+};
+
+type CodingPlan =
+  | { readonly kind: "identity"; readonly label: string | null }
+  | { readonly kind: "decode"; readonly coding: Coding }
+  | { readonly kind: "unsupported"; readonly label: string };
+
+/**
+ * What to do with a `Content-Encoding` header. A label that names no coding
+ * this reader knows is read as identity and reported: the raw read is
+ * capped like any other, so it cannot be a bomb, and misconfigured servers
+ * that send `none` or `utf-8` are real (Bun's own fetch passes such a body
+ * through, as 0.7.0 did). A stack that includes a real compression is
+ * refused.
+ */
+function planFor(header: string | null): CodingPlan {
+  if (header === null) return { kind: "identity", label: null };
+  const tokens = header
     .split(",")
     .map((c) => c.trim().toLowerCase())
     .filter((c) => c !== "" && c !== "identity");
-  if (codings.length === 0) return null;
-  if (codings.length > 1) return { unsupported: header };
-  const only = codings[0] as string;
-  if (only === "gzip" || only === "x-gzip") return "gzip";
-  if (only === "deflate" || only === "br" || only === "zstd") return only;
-  return { unsupported: only };
+  if (tokens.length === 0) return { kind: "identity", label: null };
+  const decodable = tokens.filter((t) => Object.hasOwn(DECODABLE, t));
+  if (decodable.length === 0) return { kind: "identity", label: tokens.join(", ") };
+  if (tokens.length === 1)
+    return { kind: "decode", coding: DECODABLE[tokens[0] as string] as Coding };
+  return { kind: "unsupported", label: tokens.join(", ") };
 }
 
-function makeDecoder(coding: Coding, head: Uint8Array): Decoder | undefined {
+function makeDecoder(
+  coding: Coding,
+  head: Uint8Array,
+  onData: (chunk: Uint8Array) => void,
+): StepDecoder | undefined {
   switch (coding) {
     case "gzip":
-      return zlib.createGunzip();
+      return new GzipStepDecoder(onData);
     case "deflate": {
       // RFC 9110 "deflate" is zlib-wrapped; some servers send it raw.
       const b0 = head[0] ?? 0;
       const b1 = head[1] ?? 0;
       const zlibWrapped = (b0 & 0x0f) === 8 && ((b0 << 8) | b1) % 31 === 0;
-      return zlibWrapped ? zlib.createInflate() : zlib.createInflateRaw();
+      return new StreamStepDecoder(
+        zlibWrapped ? zlib.createInflate() : zlib.createInflateRaw(),
+        onData,
+      );
     }
     case "br":
-      return zlib.createBrotliDecompress();
+      return new StreamStepDecoder(zlib.createBrotliDecompress(), onData);
     case "zstd": {
-      const make = (zlib as unknown as { createZstdDecompress?: () => Decoder })
+      const make = (zlib as unknown as { createZstdDecompress?: () => zlib.Inflate })
         .createZstdDecompress;
-      return typeof make === "function" ? make() : undefined;
+      return typeof make === "function" ? new StreamStepDecoder(make(), onData) : undefined;
     }
   }
 }
@@ -183,6 +228,9 @@ function magicMismatch(coding: Coding, head: Uint8Array): boolean {
   }
   return false;
 }
+
+/** How many leading encoded bytes {@link makeDecoder} and {@link magicMismatch} look at. */
+const SNIFF_BYTES = 4;
 
 function declaredLength(res: Response): number | undefined {
   const raw = res.headers.get("content-length");
@@ -264,25 +312,33 @@ async function* iterate(
   idleMs: number | undefined,
   state: { outcome: DecodedBodyOutcome | undefined },
 ): AsyncGenerator<Uint8Array, void, undefined> {
-  const coding = codingOf(res.headers.get("content-encoding"));
-  if (coding !== null && typeof coding === "object") {
+  const plan = planFor(res.headers.get("content-encoding"));
+  if (plan.kind === "unsupported") {
     await res.body?.cancel().catch(() => undefined);
     state.outcome = {
       ok: false,
       code: "unsupported-encoding",
-      reason: `the response is encoded as "${coding.unsupported}", which this reader cannot decode within a memory bound`,
+      reason: `the response is encoded as "${plan.label}", which this reader cannot decode within a memory bound`,
       encodedBytes: 0,
     };
     return;
   }
-  const contentEncoding = coding;
+  const contentEncoding = plan.kind === "decode" ? plan.coding : null;
+  const undecodedEncoding = plan.kind === "identity" ? plan.label : null;
   const declared = declaredLength(res);
   let encodedBytes = 0;
   let decodedBytes = 0;
   let given = 0;
   let full = false;
   const succeed = (): void => {
-    state.outcome = { ok: true, truncated: full, decodedBytes, encodedBytes, contentEncoding };
+    state.outcome = {
+      ok: true,
+      truncated: full,
+      decodedBytes,
+      encodedBytes,
+      contentEncoding,
+      undecodedEncoding,
+    };
   };
   if (res.body === null) {
     succeed();
@@ -290,9 +346,10 @@ async function* iterate(
   }
 
   const reader = res.body.getReader();
+  let readerDone = false;
   let cancelled = false;
   const cancel = async (): Promise<void> => {
-    if (cancelled) return;
+    if (cancelled || readerDone) return;
     cancelled = true;
     await reader.cancel().catch(() => undefined);
   };
@@ -300,9 +357,14 @@ async function* iterate(
     await cancel();
     state.outcome = { ok: false, code, reason, encodedBytes };
   };
+  const stoppedReason = (stopped: "aborted" | "stalled"): string =>
+    stopped === "aborted"
+      ? "the read was aborted"
+      : `no data arrived for ${idleMs} ms, so the read was abandoned`;
 
   /** Decoded output waiting to be handed over, cut to the cap. */
   const pending: Uint8Array[] = [];
+  let decoder: StepDecoder | undefined;
   const accept = (chunk: Uint8Array): void => {
     // Counted even past the cap: `decodedBytes` is what the decoder really
     // produced, so a decoder that is not stopped here shows up.
@@ -312,16 +374,27 @@ async function* iterate(
       pending.push(take === chunk.length ? chunk : chunk.slice(0, take));
       given += take;
     }
-    if (decodedBytes > maxBytes) full = true;
+    if (decodedBytes > maxBytes) {
+      full = true;
+      decoder?.destroy();
+    }
   };
+  const corrupt = (): Promise<void> =>
+    failWith("decode-error", `the ${contentEncoding} body is corrupt: ${decoder?.error}`);
 
-  let decoder: Decoder | undefined;
-  let decoderError: string | undefined;
-  let decoderEnded: Promise<void> | undefined;
+  /**
+   * Encoded bytes held until the format can be told from its first
+   * {@link SNIFF_BYTES}: deflate's zlib-or-raw choice reads two bytes, and
+   * zstd's signature four. The network may split them across chunks; a
+   * sniff of a one-byte first chunk read deflate as raw and failed a good
+   * body as corrupt (net regression review).
+   */
+  let held: Uint8Array | undefined;
+
   let finished = false;
-
   try {
-    for (;;) {
+    reading: for (;;) {
+      let chunk: Uint8Array;
       let next: Raced<Awaited<ReturnType<typeof reader.read>>>;
       try {
         next = await race(reader.read(), signal, idleMs);
@@ -330,19 +403,27 @@ async function* iterate(
         return;
       }
       if ("stopped" in next) {
-        await failWith(
-          next.stopped,
-          next.stopped === "aborted"
-            ? "the read was aborted"
-            : `no data arrived for ${idleMs} ms, so the read was abandoned`,
-        );
+        await failWith(next.stopped, stoppedReason(next.stopped));
         return;
       }
-      if (next.value.done) break;
-      const chunk = next.value.value;
-      if (chunk.length === 0) continue;
-      const before = encodedBytes;
-      encodedBytes += chunk.length;
+      if (next.value.done) {
+        readerDone = true;
+        // The body ended inside the sniff window: decode what there is.
+        if (held === undefined) break;
+        chunk = held;
+        held = undefined;
+      } else {
+        chunk = next.value.value;
+        if (chunk.length === 0) continue;
+        encodedBytes += chunk.length;
+        if (contentEncoding !== null && decoder === undefined) {
+          held =
+            held === undefined ? chunk : concatBytes([held, chunk], held.length + chunk.length);
+          if (held.length < SNIFF_BYTES) continue;
+          chunk = held;
+          held = undefined;
+        }
+      }
 
       if (contentEncoding === null) {
         accept(chunk);
@@ -354,7 +435,7 @@ async function* iterate(
           );
           return;
         }
-        if (before === 0) {
+        if (decoder === undefined) {
           if (magicMismatch(contentEncoding, chunk)) {
             await failWith(
               "auto-decompressed",
@@ -362,67 +443,60 @@ async function* iterate(
             );
             return;
           }
-          decoder = makeDecoder(contentEncoding, chunk);
+          decoder = makeDecoder(contentEncoding, chunk, accept);
           if (decoder === undefined) {
             await failWith("decode-error", `this runtime has no ${contentEncoding} decoder`);
             return;
           }
-          const d = decoder;
-          d.on("data", (out: Uint8Array) => {
-            accept(out);
-            if (full && !d.destroyed) d.destroy();
-          });
-          decoderEnded = new Promise<void>((resolve) => {
-            d.once("end", () => resolve());
-            d.once("close", () => resolve());
-            d.once("error", (err: Error) => {
-              decoderError = err.message;
-              resolve();
-            });
-          });
         }
-        const d = decoder as Decoder;
-        for (
-          let off = 0;
-          off < chunk.length && !full && decoderError === undefined;
-          off += DECODE_STEP
-        ) {
-          const step = chunk.subarray(off, off + DECODE_STEP);
-          await new Promise<void>((resolve) => {
-            if (d.destroyed) {
-              resolve();
-              return;
-            }
-            d.write(step, () => resolve());
-          });
+        const d = decoder as StepDecoder;
+        for (let off = 0; off < chunk.length; off += DECODE_STEP) {
+          // A step settles even when the decoder fails without calling back,
+          // and it is raced like a read, so neither can outlast the signal.
+          const stepped = await race(
+            d.write(chunk.subarray(off, off + DECODE_STEP)),
+            signal,
+            idleMs,
+          );
+          if ("stopped" in stepped) {
+            await failWith(stepped.stopped, stoppedReason(stepped.stopped));
+            return;
+          }
           // Hand over what this step produced before feeding the next.
           while (pending.length > 0) yield pending.shift() as Uint8Array;
-        }
-        if (decoderError !== undefined) {
-          await failWith("decode-error", `the ${contentEncoding} body is corrupt: ${decoderError}`);
-          return;
+          if (full) break reading;
+          if (d.error !== undefined) {
+            await corrupt();
+            return;
+          }
+          // The encoded data is over; what follows is not part of the body.
+          if (d.complete) break reading;
         }
       }
       while (pending.length > 0) yield pending.shift() as Uint8Array;
-      if (full) break;
+      if (full || readerDone) break;
     }
 
-    if (decoder !== undefined && !full && decoderError === undefined) {
-      decoder.end();
-      await decoderEnded;
-      if (decoderError !== undefined) {
-        await failWith("decode-error", `the ${contentEncoding} body is corrupt: ${decoderError}`);
+    if (decoder !== undefined && !full && !decoder.complete) {
+      const flushed = await race(decoder.finish(), signal, idleMs);
+      if ("stopped" in flushed) {
+        await failWith(flushed.stopped, stoppedReason(flushed.stopped));
         return;
       }
       while (pending.length > 0) yield pending.shift() as Uint8Array;
+      if (decoder.error !== undefined && !full) {
+        await corrupt();
+        return;
+      }
     }
     finished = true;
     succeed();
   } finally {
-    if (decoder !== undefined && !decoder.destroyed) decoder.destroy();
-    // Cut at the cap, or the consumer stopped iterating: the rest is unread.
-    if (full || !finished) await cancel();
-    if (state.outcome === undefined) {
+    decoder?.destroy();
+    // Cut at the cap, a body whose encoded data ended early, or a consumer
+    // that stopped iterating: the rest is unread.
+    await cancel();
+    if (!finished && state.outcome === undefined) {
       state.outcome = {
         ok: false,
         code: "aborted",
@@ -456,5 +530,6 @@ export async function readResponseBounded(
     decodedBytes: outcome.decodedBytes,
     encodedBytes: outcome.encodedBytes,
     contentEncoding: outcome.contentEncoding,
+    undecodedEncoding: outcome.undecodedEncoding,
   };
 }

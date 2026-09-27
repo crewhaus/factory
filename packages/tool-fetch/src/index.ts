@@ -3,6 +3,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { preferIdentity, readBodyBounded, withRawBody } from "./body";
 
 /**
  * Section 14 — generic HTTP fetch tool for API integrations.
@@ -19,9 +20,22 @@ import { z } from "zod";
  *   5. Manual redirect handling, max 5; allow-list + SSRF re-checked at
  *      every hop.
  *   6. 30 s default timeout (honours `ctx.signal`).
- *   7. 5 MB response body cap (streaming abort once exceeded).
+ *   7. 5 MB response body cap, on the DECODED body: the body is fetched
+ *      raw and a gzip, deflate, br or zstd body is decoded here with the
+ *      decoder stopped at the cap (see ./body.ts), so a compressed reply
+ *      cannot inflate past it in the runtime first.
  *   8. `Cookie` and `Authorization` headers are stripped from the
  *      response before returning to the model.
+ *   9. A redirect to another origin carries only the headers that describe
+ *      the request — content negotiation (Accept*, Content-Type,
+ *      Content-Language, User-Agent), a Range and its conditionals
+ *      (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since,
+ *      If-Range) and Cache-Control: a header the call set for the origin it
+ *      named — Authorization, Cookie, an X-Api-Key — is not sent to one it
+ *      did not. The method follows the Fetch Standard: a 303 turns any
+ *      method but GET/HEAD into a GET without the body, and a 301/302 does
+ *      so only to a POST; a PUT or DELETE keeps its method and body, as on
+ *      a 307/308 (tool-http's openRequest follows the same rule).
  *
  * Layer R4. Pairs with the `target-cli` codegen contract — `BUILTIN_TOOL_MAP`
  * declares `fetch: { initSymbol: "registerFetchConfig" }` so the bundle
@@ -391,64 +405,58 @@ export function isPrivateIp(address: string): boolean {
 }
 // END SYNCHRONISED BLOCK
 
+/**
+ * Refusals open with a bracketed tag, the runtime's own convention
+ * (`[egress denied]`, `[rate-limited]`). They used to open "Fetch denied:",
+ * and a last line that starts with "fetch" is exactly what the
+ * prompt-injection detector's trailing-imperative rule flags — so Fetch's own
+ * refusal was classified as a suspected injection and spent the session's
+ * single console warning.
+ */
 function checkOriginAllowed(url: URL, cfg: FetchConfig): void {
   if (cfg.allowedOrigins.size === 0) {
     throw new FetchPermissionError(
-      `Fetch denied: origin "${url.origin}" is not in allowed_origins (empty allow-list = deny all)`,
+      `[fetch denied] origin "${url.origin}" is not in allowed_origins (empty allow-list = deny all)`,
     );
   }
   const canonical = canonicalizeOrigin(url.toString());
   if (!cfg.allowedOrigins.has(canonical)) {
-    throw new FetchPermissionError(`Fetch denied: origin "${canonical}" is not in allowed_origins`);
+    throw new FetchPermissionError(
+      `[fetch denied] origin "${canonical}" is not in allowed_origins`,
+    );
   }
 }
 
 const STRIPPED_RESPONSE_HEADERS = new Set(["cookie", "set-cookie", "authorization"]);
 
 /**
- * Drain a Response body with a hard byte cap. Aborts the underlying read
- * once the cap is exceeded so a hostile server can't pin memory.
+ * Read the body with its DECODED size capped at {@link MAX_BODY_BYTES}.
+ * Returns the text and the coding that was undone, if any.
  */
-async function readBodyCapped(res: Response): Promise<string> {
-  if (res.body === null) return "";
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
-        try {
-          await reader.cancel();
-        } catch {
-          // ignore — we're already aborting
-        }
-        throw new FetchPermissionError(`response body exceeded ${MAX_BODY_BYTES} bytes — aborted`);
-      }
-      chunks.push(value);
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // ignore
-    }
-  }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+async function readBodyCapped(
+  res: Response,
+): Promise<{ text: string; decodedFrom: string | null }> {
+  const read = await readBodyBounded(res, MAX_BODY_BYTES);
+  if (!read.ok) throw new FetchPermissionError(read.reason);
+  return {
+    text: new TextDecoder("utf-8", { fatal: false }).decode(read.bytes),
+    decodedFrom: read.decodedFrom,
+  };
 }
 
-function formatResponse(res: Response, body: string): string {
+/**
+ * Response headers that describe the body as it crossed the wire. When the
+ * body shown was decoded here, they no longer describe it, so they are left
+ * out rather than contradict it.
+ */
+const WIRE_FORM_HEADERS = new Set(["content-encoding", "content-length"]);
+
+function formatResponse(res: Response, body: string, decodedFrom: string | null): string {
   const lines: string[] = [`HTTP ${res.status} ${res.statusText}`.trimEnd()];
   for (const [key, value] of res.headers.entries()) {
-    if (STRIPPED_RESPONSE_HEADERS.has(key.toLowerCase())) continue;
+    const lower = key.toLowerCase();
+    if (STRIPPED_RESPONSE_HEADERS.has(lower)) continue;
+    if (decodedFrom !== null && WIRE_FORM_HEADERS.has(lower)) continue;
     lines.push(`${key}: ${value}`);
   }
   lines.push("");
@@ -479,8 +487,10 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const hostUnbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
 
   // Already an IP literal (or no resolution happened) ⇒ nothing to rewrite.
+  // The body is still fetched raw: Bun ignores `decompress` inside a
+  // Request's own init, so it goes on this, the final call.
   if (hostUnbracketed === pinnedIp || pinnedIp === "") {
-    return globalThis.fetch(req);
+    return globalThis.fetch(req, withRawBody({}));
   }
 
   // Rebuild the URL pointing at the pinned IP. Bracket IPv6 literals.
@@ -505,7 +515,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     // Streaming a request body in Bun/undici requires duplex: "half".
     (init as { duplex?: string }).duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return globalThis.fetch(pinnedUrl.toString(), withRawBody(init));
 }
 
 let rawFetch: RawFetch = pinnedFetch;
@@ -513,19 +523,71 @@ export function _setRawFetch(fn: RawFetch | undefined): void {
   rawFetch = fn ?? pinnedFetch;
 }
 
+/**
+ * The request headers a redirect to ANOTHER origin still carries. Fetch
+ * takes any header from the call, and it cannot tell which of them is a
+ * credential for the origin the call named (`Authorization` and `Cookie`
+ * are, and so is an `X-Api-Key`), so a cross-origin hop keeps only these,
+ * which describe the request rather than who makes it. A ranged or
+ * conditional read keeps its Range and conditionals, so a release asset a
+ * code host redirects to its CDN is still read in part, as 0.7.0 read it.
+ */
+const CROSS_ORIGIN_HEADERS = new Set([
+  "accept",
+  "accept-charset",
+  "accept-encoding",
+  "accept-language",
+  "cache-control",
+  "content-language",
+  "content-type",
+  "if-match",
+  "if-modified-since",
+  "if-none-match",
+  "if-range",
+  "if-unmodified-since",
+  "range",
+  "user-agent",
+]);
+
+/**
+ * Whether a redirect turns the request into a GET without its body (the
+ * Fetch Standard's HTTP-redirect fetch, as browsers, curl and Bun's own
+ * fetch do): a 303 turns any method but GET/HEAD into a GET, a 301 or 302
+ * only a POST. A PUT or DELETE keeps its method and body, as on a 307/308,
+ * so it is made where the server moved it instead of becoming a GET whose
+ * 200 reports an update or a delete that never happened.
+ */
+function becomesGet(status: number, method: string): boolean {
+  const m = method.toUpperCase();
+  if (status === 303) return m !== "GET" && m !== "HEAD";
+  return (status === 301 || status === 302) && m === "POST";
+}
+
+function originOf(url: URL): string {
+  try {
+    return canonicalizeOrigin(url.toString());
+  } catch {
+    return url.origin;
+  }
+}
+
 async function performFetch(
   initialUrl: URL,
-  method: string,
-  body: string | undefined,
-  headers: Record<string, string> | undefined,
+  initialMethod: string,
+  initialBody: string | undefined,
+  callHeaders: Record<string, string> | undefined,
   signal: AbortSignal,
   cfg: FetchConfig,
 ): Promise<Response> {
   let currentUrl = initialUrl;
+  let method = initialMethod;
+  let body = initialBody;
+  const headers = new Headers(callHeaders ?? {});
+  preferIdentity(headers);
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (currentUrl.protocol !== "http:" && currentUrl.protocol !== "https:") {
       throw new FetchPermissionError(
-        `Fetch denied: scheme "${currentUrl.protocol}" — only http/https allowed`,
+        `[fetch denied] scheme "${currentUrl.protocol}" — only http/https allowed`,
       );
     }
     checkOriginAllowed(currentUrl, cfg);
@@ -538,8 +600,8 @@ async function performFetch(
       method,
       redirect: "manual",
       signal,
-      ...(body !== undefined ? { body } : {}),
-      headers: headers ?? {},
+      ...(body !== undefined && method !== "GET" && method !== "HEAD" ? { body } : {}),
+      headers,
     };
     const res = await rawFetch(new Request(currentUrl.toString(), init), pinnedIp);
 
@@ -550,6 +612,19 @@ async function performFetch(
         next = new URL(loc, currentUrl);
       } catch {
         throw new FetchPermissionError(`invalid redirect target "${loc}"`);
+      }
+      if (originOf(next) !== originOf(currentUrl)) {
+        // Headers were set for the origin the call named; a redirect is the
+        // server's choice of destination, not the caller's.
+        for (const name of [...headers.keys()]) {
+          if (!CROSS_ORIGIN_HEADERS.has(name)) headers.delete(name);
+        }
+      }
+      if (becomesGet(res.status, method)) {
+        method = "GET";
+        body = undefined;
+        headers.delete("content-type");
+        headers.delete("content-length");
       }
       currentUrl = next;
       // Drain and discard the redirect body so the connection can be
@@ -589,7 +664,13 @@ export const fetch: RegisteredTool = buildTool({
     }
 
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error("fetch timeout")), DEFAULT_TIMEOUT_MS);
+    // Worded so no line of it starts with a verb the prompt-injection
+    // detector reads as an order ("fetch …"): a tool's own refusal must not
+    // be flagged as an injection, and use up the session's one warning.
+    const timer = setTimeout(
+      () => ctrl.abort(new Error(`the request timed out after ${DEFAULT_TIMEOUT_MS}ms`)),
+      DEFAULT_TIMEOUT_MS,
+    );
     if (ctx?.signal !== undefined) {
       if (ctx.signal.aborted) ctrl.abort(ctx.signal.reason);
       else
@@ -607,7 +688,7 @@ export const fetch: RegisteredTool = buildTool({
         resolveFetchConfig(ctx?.toolConfig),
       );
       const body = await readBodyCapped(res);
-      return formatResponse(res, body);
+      return formatResponse(res, body.text, body.decodedFrom);
     } finally {
       clearTimeout(timer);
     }

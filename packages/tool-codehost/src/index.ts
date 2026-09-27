@@ -94,12 +94,14 @@ import {
   type HostKind,
   MAX_MAX_BYTES,
   MAX_TIMEOUT_MS,
+  assertOriginAllowed,
   byString,
   describeFailure,
   json,
+  originOfBase,
   redactorFor,
+  resolveCallToken,
   resolveCodehostConfig,
-  resolveToken,
   startDeadline,
 } from "./net";
 
@@ -136,7 +138,7 @@ const tokenEnvSchema = z
   .min(1)
   .optional()
   .describe(
-    "NAME of the environment variable holding the API token — never the token itself, which is not accepted as an argument and is refused, unquoted, if one is passed here",
+    "NAME of the environment variable holding the API token — never the token itself, which is not accepted as an argument and is refused, unquoted, if one is passed here. Defaults to the codehost tool_config's token_env; a call may name only that or a variable listed in its token_envs",
   );
 
 const timeoutSchema = z
@@ -228,7 +230,16 @@ async function withCall(
   // is a mistake to report, not a reason to go looking for a secret.
   const baseProblem = baseUrlProblem(baseUrl);
   if (baseProblem !== null) return baseProblem;
-  const token = resolveToken(input.tokenEnv ?? cfg.tokenEnv);
+  // An origin the operator did not list is refused as that, first: it says
+  // what is actually wrong, and no token question arises for a host that
+  // will never be reached.
+  try {
+    assertOriginAllowed(new URL(baseUrl), cfg);
+  } catch (err) {
+    return describeFailure(err);
+  }
+  const tokenOrigin = originOfBase(baseUrl);
+  const token = resolveCallToken(input.tokenEnv, cfg, tokenOrigin);
   if (!token.ok) return token.message;
   const redact = redactorFor(token.token);
   const deadline = startDeadline(input.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
@@ -237,6 +248,7 @@ async function withCall(
     host,
     baseUrl,
     token: token.token,
+    tokenOrigin,
     deadline,
     maxBytes: input.maxBytes ?? DEFAULT_MAX_BYTES,
     redact,
@@ -1204,7 +1216,9 @@ export const workflowRunLogs: RegisteredTool = readTool({
         job = failed ?? jobs[jobs.length - 1];
         const chosen = job?.["id"];
         if (typeof chosen !== "number") {
-          return `run ${input.runId} reported ${jobs.length} jobs and none of them carries an id to read a log from`;
+          // "workflow run", not "run …": a result that starts with "run" is
+          // what the prompt-injection detector flags as an order.
+          return `workflow run ${input.runId} reported ${jobs.length} jobs and none of them carries an id to read a log from`;
         }
         jobId = chosen;
       }

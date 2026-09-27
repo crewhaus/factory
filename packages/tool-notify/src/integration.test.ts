@@ -51,6 +51,9 @@ beforeEach(() => {
   process.env[WEBHOOK_VAR] = `${origin}/services/T/B/x`;
   registerNotifyConfig({
     allowed_origins: [origin],
+    allowed_secret_envs: [WEBHOOK_VAR],
+    allowed_sms_recipients: ["+1*"],
+    allowed_push_targets: ["d"],
     allowed_recipients: ["*@example.com"],
     allowed_smtp_hosts: ["127.0.0.1"],
     allowed_sender_domains: ["example.com"],
@@ -163,7 +166,13 @@ describe("dispatch through executeTool", () => {
     const denied = await executeTool(
       lookup("ChatPost"),
       { platform: "slack", webhookUrlEnv: WEBHOOK_VAR, text: "x" },
-      { toolUseId: "t7", toolConfig: { allowed_origins: ["https://elsewhere.test"] } },
+      {
+        toolUseId: "t7",
+        toolConfig: {
+          allowed_origins: ["https://elsewhere.test"],
+          allowed_secret_envs: [WEBHOOK_VAR],
+        },
+      },
     );
     expect(denied.content).toContain("not in allowed_origins");
     const allowed = await executeTool(
@@ -244,7 +253,7 @@ describe("dispatch through executeTool", () => {
   });
 
   test("a refusal comes back as a readable result, not as a thrown exception", async () => {
-    _resetNotifyConfig();
+    registerNotifyConfig({ allowed_secret_envs: [WEBHOOK_VAR] });
     const result = await executeTool(
       lookup("ChatPost"),
       { platform: "slack", webhookUrlEnv: WEBHOOK_VAR, text: "x" },

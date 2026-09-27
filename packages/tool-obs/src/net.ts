@@ -48,9 +48,10 @@
  * validates certificates exactly as the runtime's `fetch` does, and it keeps
  * no cookie jar.
  */
-import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import { createSecretRedactor, trimSecretTail } from "@crewhaus/tool-safety/env";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 /** Refusal by the allow-list, the SSRF gate, a redirect rule or the config. */
 export class ObsPermissionError extends CrewhausError {
@@ -59,6 +60,39 @@ export class ObsPermissionError extends CrewhausError {
     super("tool", message);
   }
 }
+
+/**
+ * The gate refused a request before sending it: a scheme, userinfo, an
+ * origin not in allowed_origins, or an address the SSRF check will not dial.
+ * It says nothing about the endpoint, which was never asked, so a probe
+ * reports it as refused, never as unhealthy.
+ *
+ * `redirectStatus` is set when the refusal came at a redirect hop: the
+ * endpoint DID answer, with that status, and the gate would not follow its
+ * `Location`. It is undefined when nothing was sent at all.
+ */
+export class ObsRefusedError extends ObsPermissionError {
+  constructor(
+    message: string,
+    readonly redirectStatus: number | undefined,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * The host's name did not resolve. The SSRF check raises it, but unlike a
+ * refusal it is a fact about the network, so it is not an
+ * {@link ObsRefusedError}.
+ */
+export class ObsUnresolvedError extends ObsPermissionError {}
+
+/**
+ * The body is labelled as compressed but is not: corrupt, cut short, or
+ * decoded once already. Unlike a refusal, this is a fact about the endpoint:
+ * any client reading that reply would fail too.
+ */
+export class ObsCorruptBodyError extends ObsPermissionError {}
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 600_000;
@@ -451,7 +485,7 @@ export async function assertNotSsrf(hostname: string, signal?: AbortSignal): Pro
     if (err instanceof Error && err.name === "AbortError") throw err;
     if (signal?.aborted === true) throw abortError(signal);
     const msg = err instanceof Error ? err.message : String(err);
-    throw new ObsPermissionError(`SSRF: cannot resolve "${hostname}": ${msg}`);
+    throw new ObsUnresolvedError(`SSRF: cannot resolve "${hostname}": ${msg}`);
   }
   if (refused(resolved.address)) {
     throw new ObsPermissionError(
@@ -651,11 +685,32 @@ export function expandIpv6(raw: string): number[] | null {
 // deadlines
 // ---------------------------------------------------------------------------
 
+/**
+ * The reason a deadline's own timer aborts its signal with. An error is
+ * traced to the deadline by this reason, never by the clock: a transport
+ * failure that merely ARRIVES after the deadline's time (a starved event
+ * loop delivers it before the timer callback runs) is that failure, and a
+ * runtime cancel aborts with the runtime's reason instead.
+ */
+export class DeadlineElapsedError extends Error {
+  override readonly name = "TimeoutError";
+}
+
 export type Deadline = {
   readonly signal: AbortSignal;
   /** Milliseconds left; never negative. */
   remaining(): number;
+  /**
+   * The clock says the time is up. For scheduling (stop starting new work),
+   * never for saying why something failed — that is {@link timedOut}.
+   */
   expired(): boolean;
+  /**
+   * The deadline's timer — or an outer deadline's, forwarded — really
+   * aborted the signal. False for a runtime cancel, and false while the
+   * timer has not run, however late the clock says it is.
+   */
+  timedOut(): boolean;
   /** Clear the timer. Always call it, or the process keeps a handle alive. */
   cancel(): void;
 };
@@ -668,7 +723,10 @@ export type Deadline = {
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const ctrl = new AbortController();
   const startedAt = Date.now();
-  const timer = setTimeout(() => ctrl.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(
+    () => ctrl.abort(new DeadlineElapsedError(`deadline of ${ms}ms elapsed`)),
+    ms,
+  );
   const onOuter = () => ctrl.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) ctrl.abort(outer.reason);
@@ -678,6 +736,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
     signal: ctrl.signal,
     remaining: () => Math.max(0, ms - (Date.now() - startedAt)),
     expired: () => Date.now() - startedAt >= ms,
+    timedOut: () => ctrl.signal.aborted && ctrl.signal.reason instanceof DeadlineElapsedError,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);
@@ -789,26 +848,20 @@ export function resolveToken(
  * transport error that quotes a request, would each put the token in a
  * transcript, and that is not a mistake worth leaving one layer deep.
  *
+ * It is tool-safety's redactor, so it also catches the JSON-escaped and
+ * base64url spellings, and the start of the token that a cut left at a
+ * string's end.
+ *
  * Secrets shorter than six characters are left alone: replacing every "x" in a
  * result would mangle it without protecting anything real, and no usable API
  * token is that short.
  */
 export function redactorFor(secret: string | undefined): (text: string) => string {
-  if (secret === undefined || secret.length < 6) return (text) => text;
-  const encodedForms = new Set<string>([secret, encodeURIComponent(secret)]);
-  try {
-    encodedForms.add(Buffer.from(secret, "utf8").toString("base64"));
-  } catch {
-    // not encodable — the literal form is still covered
-  }
-  return (text: string): string => {
-    let out = text;
-    for (const form of [...encodedForms].sort((a, b) => b.length - a.length)) {
-      if (form.length < 6) continue;
-      out = out.split(form).join("<redacted>");
-    }
-    return out;
-  };
+  // tool-safety's redactor: every spelling of the token, and the part of
+  // one a cut left at a string's end. A cut this package makes itself is
+  // trimmed where it is made (readCapped), as tool-http's is (net attacker
+  // review).
+  return createSecretRedactor([secret]);
 }
 
 /**
@@ -875,12 +928,17 @@ export type RawFetch = (req: Request, pinnedIp: string) => Promise<Response>;
 /**
  * Dial the vetted IP while keeping the real hostname for the `Host` header and
  * TLS SNI, so virtual hosting and certificate validation still work.
+ *
+ * Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`).
+ * Without it Bun inflates a gzip, deflate, br or zstd body in native code
+ * before any reader sees a byte, and the byte cap bounded only what was
+ * returned (security-5#7). {@link readCapped} decodes it, under the cap.
  */
 function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (unbracketed === pinnedIp || pinnedIp === "") return globalThis.fetch(req);
+  if (unbracketed === pinnedIp || pinnedIp === "") return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -899,7 +957,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     init.body = req.body;
     init.duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 let rawFetch: RawFetch = pinnedFetch;
@@ -934,6 +992,21 @@ export type OpenResult = {
 };
 
 /**
+ * Whether a redirect turns the request into a GET without its body, as the
+ * Fetch Standard says (HTTP-redirect fetch) and browsers, curl and Bun's own
+ * fetch do: a 303 turns any method but GET and HEAD into a GET, and a 301 or
+ * 302 turns only a POST into one. A PUT, PATCH or DELETE keeps its method
+ * and body there, as on a 307 or 308, so it is made where the server moved
+ * it instead of becoming a read whose 200 reports an update or a delete
+ * that never happened. A POST is still never replayed on a 301/302/303.
+ */
+function becomesGet(status: number, method: string): boolean {
+  const m = method.toUpperCase();
+  if (status === 303) return m !== "GET" && m !== "HEAD";
+  return (status === 301 || status === 302) && m === "POST";
+}
+
+/**
  * Issue a request, following redirects by hand so the allow-list, the SSRF
  * gate and the credential rule run on every hop. The response body is left
  * unread — the caller decides how to drain it under which cap.
@@ -945,6 +1018,12 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     const lower = name.toLowerCase();
     return CREDENTIAL_HEADERS.has(lower) || o.credentialHeaders?.has(lower) === true;
   };
+  // Ask for the body as it is. The reader decodes gzip, deflate, br and zstd
+  // under the cap anyway, so a server that compresses regardless still
+  // works; a caller that set its own Accept-Encoding keeps it.
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === "accept-encoding")) {
+    headers["accept-encoding"] = "identity";
+  }
   const redirects: string[] = [];
   let credentialsDropped = false;
   let current = o.url;
@@ -952,7 +1031,8 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
   let method = o.method;
   let body = o.body;
 
-  for (let hop = 0; ; hop++) {
+  /** The gate, for the hop about to be sent; returns the address to pin. */
+  const gateHop = async (): Promise<string> => {
     if (current.protocol !== "http:" && current.protocol !== "https:") {
       throw new ObsPermissionError(
         `denied: scheme "${current.protocol}" — only http/https are allowed`,
@@ -960,7 +1040,24 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     assertNoUserinfo(current);
     assertOriginAllowed(current, o.cfg);
-    const pinnedIp = await assertNotSsrf(current.hostname, o.signal);
+    return assertNotSsrf(current.hostname, o.signal);
+  };
+
+  /** The status of the answer whose Location led to this hop, if any. */
+  let redirectStatus: number | undefined;
+
+  for (let hop = 0; ; hop++) {
+    let pinnedIp: string;
+    try {
+      pinnedIp = await gateHop();
+    } catch (err) {
+      // Everything the gate refuses is a refusal, not a fact about the
+      // endpoint; a name that does not resolve is the one exception.
+      if (err instanceof ObsPermissionError && !(err instanceof ObsUnresolvedError)) {
+        throw new ObsRefusedError(err.message, redirectStatus);
+      }
+      throw err;
+    }
 
     const init: RequestInit = {
       method,
@@ -1006,15 +1103,8 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
         }
       }
     }
-    // RFC 9110 §15.4.4 and §15.4.3: a 303 always becomes a GET, and 301/302
-    // after a non-GET have meant GET in every deployed client since Netscape.
-    // Replaying an alert acknowledgement at each hop is not what a server
-    // asking for a redirect means.
-    if (
-      (res.status === 303 || res.status === 301 || res.status === 302) &&
-      method !== "GET" &&
-      method !== "HEAD"
-    ) {
+    // See becomesGet: 303 always, 301/302 only after a POST.
+    if (becomesGet(res.status, method)) {
       method = "GET";
       body = undefined;
       for (const name of Object.keys(headers)) {
@@ -1024,6 +1114,7 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     await discard(res);
     redirects.push(safeUrlLabel(next));
+    redirectStatus = res.status;
     current = next;
     currentOrigin = nextOrigin;
   }
@@ -1053,52 +1144,52 @@ export type CappedBody = {
 };
 
 /**
- * Drain a body with a hard byte cap, cancelling the stream the moment the cap
- * is passed so a hostile or merely enormous response cannot pin memory. The
- * cap bounds what is HELD, not what is returned after buffering.
+ * Drain a body with a hard cap on its DECODED size: the body arrives raw
+ * (see `pinnedFetch`), a gzip, deflate, br or zstd body is decoded here in
+ * small steps, and the decoder stops once `maxBytes` exist, so neither a
+ * hostile server nor a merely enormous compressed reply can pin memory. A
+ * body that cannot be decoded within the bound is refused without quoting
+ * it; an aborted read throws an `AbortError`, which `describeFailure`
+ * reports as the deadline or the abort.
  */
-export async function readCapped(res: Response, maxBytes: number): Promise<CappedBody> {
-  if (res.body === null) return { text: "", bytes: 0, truncated: false };
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let truncated = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        chunks.push(value.subarray(0, maxBytes - total));
-        total = maxBytes;
-        truncated = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
+export async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+  secrets: readonly (string | undefined)[] = [],
+): Promise<CappedBody> {
+  const read = await readResponseBounded(res, {
+    maxBytes,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (read.ok) {
+    return {
+      // A cut can fall inside a token the server echoed; what it leaves is a
+      // prefix no whole spelling matches, so it is trimmed here.
+      text: read.truncated ? trimSecretTail(read.text, secrets) : read.text,
+      bytes: read.bytes.byteLength,
+      truncated: read.truncated,
+    };
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+  switch (read.code) {
+    case "aborted":
+    case "stalled": {
+      const aborted = new Error("the read was aborted before the body ended");
+      aborted.name = "AbortError";
+      throw aborted;
+    }
+    case "unsupported-encoding":
+      throw new ObsPermissionError(
+        "the server sent the body in a stack of content-encodings this tool cannot decode within its byte cap, so it was not read",
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      throw new ObsCorruptBodyError(
+        "the body is labelled as compressed but could not be decoded, so it was not read",
+      );
+    default:
+      throw new ObsPermissionError("the body could not be read to the end");
   }
-  return {
-    text: new TextDecoder("utf-8", { fatal: false }).decode(merged),
-    bytes: total,
-    truncated,
-  };
 }
 
 /** A URL the caller supplied, or a readable refusal. */
@@ -1117,10 +1208,28 @@ export function parseUrl(raw: string): URL | string {
  */
 export function describeFailure(err: unknown, deadline?: Deadline): string {
   if (err instanceof ObsPermissionError) return err.message;
-  if (deadline?.expired() === true) return "deadline elapsed before the request completed";
+  // The cause decides, not the clock: see DeadlineElapsedError.
+  if (isDeadlineAbort(err, deadline)) return "deadline elapsed before the request completed";
+  const aborted = "the request was aborted before it completed";
+  if (deadline?.signal.aborted === true && err === deadline.signal.reason) return aborted;
   if (err instanceof Error) {
-    if (err.name === "AbortError") return "the request was aborted before it completed";
-    return `${err.name}: ${err.message}`;
+    if (err.name === "AbortError") return aborted;
+    // A real failure that arrived late is still that failure; the clock is
+    // mentioned, because the caller may want a longer deadline as well.
+    const late = deadline?.expired() === true ? " (the deadline had also elapsed)" : "";
+    return `${err.name}: ${err.message}${late}`;
   }
   return String(err);
+}
+
+/**
+ * Whether `err` is what the deadline's own timer did: its abort reason, or an
+ * abort-shaped error (a body reader's AbortError) raised after that timer
+ * fired. Exported for the few callers that report a deadline themselves.
+ */
+export function isDeadlineAbort(err: unknown, deadline?: Deadline): boolean {
+  if (err instanceof DeadlineElapsedError) return true;
+  if (deadline?.timedOut() !== true) return false;
+  if (err === deadline.signal.reason) return true;
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
 }

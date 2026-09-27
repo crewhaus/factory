@@ -10,7 +10,7 @@ of those patterns into a single call with a stated bound.
 
 ```yaml
 tools:
-  - all-http          # every tool below
+  - all-http          # every tool below, plus Fetch (@crewhaus/tool-fetch)
   - -downloadFile     # ...except this one
 
 tool_config:
@@ -18,6 +18,9 @@ tool_config:
     allowed_origins:  # REQUIRED — an empty list denies everything
       - https://api.example.com
       - https://api.github.com
+    allowed_auth_envs:  # the only variables an auth profile may read
+      GITHUB_TOKEN: [https://api.github.com]  # ...and where each may be sent
+    allowed_signing_envs: [WEBHOOK_SECRET]    # WebhookSign / WebhookVerify keys
 ```
 
 | Tool | What it does |
@@ -29,8 +32,8 @@ tool_config:
 | `DownloadFile` | Fetch to a contained path under a byte cap, with an optional sha256 verified before the file is kept |
 | `HeadRequest` | Existence, size, content type and caching headers without the body |
 | `HttpWaitFor` | Poll until a status or a JSON field predicate holds, within a required deadline |
-| `UrlReachable` | A bounded connectivity probe: status and latency |
-| `LinkCheck` | Check a list of URLs with a concurrency cap and a shared deadline |
+| `UrlReachable` | A bounded connectivity probe: status and latency. A probe the gate refused comes back as `refused`, never as unreachable |
+| `LinkCheck` | Check a list of URLs with a concurrency cap and a shared deadline; refused and skipped URLs are counted apart from broken ones |
 | `SseRead` | Collect server-sent events until a count, a terminator event, or a required deadline |
 | `WebhookSign` | HMAC signature header in the timestamped or plain-body scheme |
 | `WebhookVerify` | Constant-time verification that rejects a stale timestamp as a replay |
@@ -49,7 +52,11 @@ second HTTP surface with a weaker gate would be the same hole twice.
 1. **Empty allow-list denies everything.** There is no "allow all" value.
 2. Scheme must be `http` or `https`.
 3. Origin must match an allow-list entry exactly after canonicalisation
-   (lowercase host, default port elided).
+   (lowercase host, default port elided). The two tools addressed by host
+   rather than URL — `DnsLookup` and `TlsInspect` — need the host to be named
+   by an allow-listed origin; `TlsInspect`'s port is the caller's choice on
+   that host, and a service there that does not speak TLS is reported as
+   "no TLS handshake", never as a certificate.
 4. **SSRF**: loopback, link-local (including the cloud metadata address),
    RFC1918, CGNAT, multicast, reserved and mDNS targets are refused *even when
    allow-listed* — as an IP literal in any encoding and as the DNS-resolved
@@ -64,15 +71,22 @@ second HTTP surface with a weaker gate would be the same hole twice.
    for `Host` and TLS SNI, so a rebinding resolver cannot swap in a private
    address between the check and the socket.
 6. Redirects are followed by hand, capped, and re-checked against 3–5 at every
-   hop. A 301/302/303 answer to a non-GET becomes a GET with the body dropped,
-   so a request payload is never replayed at a hop nobody asked for.
+   hop. A 303 answer, or a 301/302 answer to a POST, becomes a GET with the
+   body dropped, as the Fetch standard and browsers do, so a POST is never
+   replayed at a hop nobody asked for. A PUT, PATCH or DELETE keeps its method
+   and body on a 301/302, as on a 307/308, so an update is made where the
+   server moved it rather than turned into a read that reports 200.
 7. `Authorization`, `Proxy-Authorization`, `Cookie` **and whatever header the
    call's `auth` profile set** are **dropped the moment a redirect leaves the
    origin they were minted for**, and the result reports `credentialsDropped`.
-   A URL carrying `user:pass@` is refused outright — at the first hop and at
+   `HttpPaginate` holds the same line across pages: a `Link` header naming
+   another origin is followed without the credential, because the server
+   chose that URL, not the call. A URL carrying `user:pass@` is refused outright — at the first hop and at
    every redirect — because userinfo is a credential that would otherwise ride
    in `finalUrl` and `redirects` straight into a transcript.
-8. Every request has a deadline and every body a byte cap. The polling and
+8. Every request has a deadline and every body a byte cap, on its decoded
+   size: bodies are fetched raw and decoded under the cap, so a compressed
+   reply cannot inflate past it. Requests ask for `identity`. The polling and
    streaming tools *require* the deadline rather than defaulting it,
    `HttpBatch` bounds the batch as well as each request, and `HttpPaginate`
    bounds the bytes across all pages as well as within one — a per-page cap is
@@ -93,6 +107,31 @@ and an inline `Authorization` or `Cookie` header is refused with a message
 pointing at `auth`, as is a URL with `user:pass@` in it. A token a model can
 put in a tool argument is a token in the transcript, the trace event and the
 eval report.
+
+The variable must be one you list in `tool_config.http.allowed_auth_envs`.
+A tool call may choose among the listed names and can never add one, so a
+model cannot send another process secret (your LLM provider key, say) to an
+allowed origin. With no list, every `auth` profile is refused. Write the
+list as names, whose credentials may go to any allowed origin, or as a map
+from a name to the origins its credential may go to:
+
+```yaml
+allowed_auth_envs: [GITHUB_TOKEN, STATUS_API_KEY]      # any allowed origin
+allowed_auth_envs:                                      # or bound
+  GITHUB_TOKEN: [https://api.github.com]
+```
+
+A request that would carry a bound credential anywhere else is refused
+before it is sent. Whatever the server echoes back (a 401 that quotes the
+key, a debug endpoint that repeats the headers) is scrubbed from the result,
+in its URL-encoded and base64 spellings too, and for `basic` the
+`user:secret` pair as well.
+
+`WebhookSign` and `WebhookVerify` take the signing secret the same way, from
+a variable you list in `tool_config.http.allowed_signing_envs`
+(`[WEBHOOK_SECRET]`). A call that could name any variable could mint a valid
+signature over any payload with any secret in the process; with no list,
+both tools refuse.
 
 Echoed request headers come back as `<redacted>` — including the one a
 `{ "type": "header", "headerName": "X-Api-Key" }` profile set, which is just as
@@ -125,7 +164,11 @@ robots.txt matching, HMAC signatures, JSON path reading, backoff arithmetic
 and certificate shaping. `src/net.ts` is the gate. `src/index.ts` wraps them
 as tools. `src/paths.ts` is the workspace-containment check, copied from
 `@crewhaus/tool-fsx`, that `DownloadFile` passes every caller-supplied path
-through.
+through before it makes the request. The write itself goes through
+`@crewhaus/tool-safety/fs`'s `writeFileSafe`: a temp created exclusively,
+under a random name, beside the destination, and renamed into place, so a
+link planted where the temp will be cannot carry the bytes out of the
+workspace.
 
 The tests use real servers: `Bun.serve({ port: 0 })` on 127.0.0.1, never a
 public address, never a mocked `fetch`. A stubbed transport would prove

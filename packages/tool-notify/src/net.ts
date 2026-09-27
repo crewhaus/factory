@@ -8,7 +8,8 @@
  * twice:
  *
  *   1. Empty allow-list ⇒ deny all. There is no "allow everything" value,
- *      for origins, for SMTP hosts, or for email recipients.
+ *      for origins, for SMTP hosts, for email recipients, for SMS numbers or
+ *      for push targets.
  *   2. Scheme must be http or https.
  *   3. Origin (scheme + lowercase host + non-default port) must match an
  *      allow-list entry exactly, after canonicalisation.
@@ -29,10 +30,13 @@
  *      real endpoint. Only the read-only `DeliveryCheck` follows, and then
  *      the allow-list, the SSRF gate and the credential rules run again on
  *      every hop.
- *   7. Credentials are environment variable NAMES, never values. Whatever
- *      header a profile sets is dropped the moment a redirect leaves the
- *      origin it was minted for, and every result — success or failure —
- *      goes through a redactor built from the resolved secret.
+ *   7. Credentials are environment variable NAMES, never values, and only
+ *      names the operator listed (`allowed_secret_envs`, or a provider's own
+ *      `auth.envVar` for that provider): a call chooses among them and can
+ *      never add one. Whatever header a profile sets is dropped the moment a
+ *      redirect leaves the origin it was minted for, and every result —
+ *      success or failure — goes through a redactor built from the resolved
+ *      secret.
  *   8. Every request is deadline-bounded and every response is byte-capped,
  *      with the cap bounding memory rather than applied after buffering.
  *
@@ -40,8 +44,20 @@
  * cookie jar, and no certificate handling beyond the runtime's own.
  */
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { lookup as dnsLookup, resolveTxt } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
+import {
+  REDACTED,
+  type SecretValue,
+  createSecretRedactor,
+  isEnvName,
+  looksLikePastedSecret,
+  resolveCredentialEnv,
+  secretForms,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import { joinTxtChunks, normalizeDomain } from "./lib/dns-records";
 
 /** Refusal by the allow-list, the SSRF gate, or a redirect rule. */
@@ -128,6 +144,23 @@ export type NotifyConfig = {
   readonly allowedSenderDomains: ReadonlySet<string>;
   /** Named REST providers for SMS, push and delivery lookups. */
   readonly providers: ReadonlyMap<string, ProviderProfile>;
+  /**
+   * The environment variables a tool call may name as a credential: a bot
+   * token, a webhook URL, a WebhookPost auth or signing secret, SMTP
+   * credentials. Empty (the default) refuses every such name. A provider's
+   * own `auth.envVar` is operator-written and needs no listing, but it is
+   * read only for that provider, never by a name a call supplies.
+   */
+  readonly allowedSecretEnvs: readonly string[];
+  /**
+   * The numbers `SmsSend` may address, in E.164 form: an exact number, or a
+   * prefix ending in `*` (`+44*`). Empty (the default) refuses every number,
+   * as `allowedRecipients` refuses every address: an SMS costs money, and a
+   * number the model chooses is the premium-rate pumping surface.
+   */
+  readonly allowedSmsRecipients: readonly string[];
+  /** The device tokens or topics `PushNotify` may address: exact, or a `prefix*`. Empty refuses all. */
+  readonly allowedPushTargets: readonly string[];
 };
 
 export type NotifyConfigInput = {
@@ -140,7 +173,16 @@ export type NotifyConfigInput = {
   readonly allowed_sender_domains?: readonly string[];
   readonly allowedSenderDomains?: readonly string[];
   readonly providers?: Readonly<Record<string, ProviderProfile>>;
+  readonly allowed_secret_envs?: readonly string[];
+  readonly allowedSecretEnvs?: readonly string[];
+  readonly allowed_sms_recipients?: readonly string[];
+  readonly allowedSmsRecipients?: readonly string[];
+  readonly allowed_push_targets?: readonly string[];
+  readonly allowedPushTargets?: readonly string[];
 };
+
+/** Where an operator allows a credential variable. Every refusal names it. */
+export const SECRET_ENVS_KEY = "tool_config.notify.allowed_secret_envs";
 
 const EMPTY_CONFIG: NotifyConfig = {
   allowedOrigins: new Set<string>(),
@@ -148,6 +190,9 @@ const EMPTY_CONFIG: NotifyConfig = {
   allowedSmtpHosts: new Set<string>(),
   allowedSenderDomains: new Set<string>(),
   providers: new Map<string, ProviderProfile>(),
+  allowedSecretEnvs: [],
+  allowedSmsRecipients: [],
+  allowedPushTargets: [],
 };
 
 let notifyConfig: NotifyConfig = EMPTY_CONFIG;
@@ -194,7 +239,136 @@ export function buildNotifyConfig(input: NotifyConfigInput): NotifyConfig {
     allowedSmtpHosts: smtpHosts,
     allowedSenderDomains: senderDomains,
     providers,
+    allowedSecretEnvs: buildSecretEnvs(input.allowedSecretEnvs ?? input.allowed_secret_envs),
+    allowedSmsRecipients: buildDestinations(
+      input.allowedSmsRecipients ?? input.allowed_sms_recipients,
+      "sms",
+    ),
+    allowedPushTargets: buildDestinations(
+      input.allowedPushTargets ?? input.allowed_push_targets,
+      "push",
+    ),
   };
+}
+
+/** Which allow-list a provider send's destination is checked against. */
+export type DestinationKind = "sms" | "push";
+
+const DESTINATION_KEYS: Readonly<Record<DestinationKind, string>> = {
+  sms: "allowed_sms_recipients",
+  push: "allowed_push_targets",
+};
+
+/** An E.164 number: `+`, a non-zero digit, and at most fifteen digits in all. */
+const E164 = /^\+[1-9]\d{0,14}$/;
+
+/**
+ * A phone number as the SMS allow-list compares it: the separators people
+ * write (spaces, `-`, `.`, parentheses) removed, so `+1 (555) 000-1111` and
+ * `+15550001111` are the same number.
+ */
+export function normalizeSmsNumber(raw: string): string {
+  let out = "";
+  for (const ch of raw.trim()) {
+    if (ch === " " || ch === "-" || ch === "." || ch === "(" || ch === ")") continue;
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Check a destination allow-list at boot. A malformed entry throws, so a
+ * misconfiguration surfaces when the harness starts. There is no "allow
+ * everything" value: a bare `*` is refused, as an empty allow-list elsewhere
+ * here refuses everyone.
+ */
+function buildDestinations(raw: unknown, kind: DestinationKind): readonly string[] {
+  const key = `tool_config.notify.${DESTINATION_KEYS[kind]}`;
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new NotifyPermissionError(`${key} must be a list`);
+  const out = new Set<string>();
+  raw.forEach((entry, index) => {
+    const where = `${key} entry ${index + 1}`;
+    if (typeof entry !== "string") throw new NotifyPermissionError(`${where} is not a string`);
+    if (kind === "sms") {
+      const normalized = normalizeSmsNumber(entry);
+      const digits = normalized.endsWith("*") ? normalized.slice(0, -1) : normalized;
+      if (!E164.test(digits)) {
+        throw new NotifyPermissionError(
+          `${where} must be a number in E.164 form (a + and up to fifteen digits, such as +15550001111), or a prefix of one ending in * (such as +44*); there is no allow-everything value`,
+        );
+      }
+      out.add(normalized);
+      return;
+    }
+    const target = entry.trim();
+    const star = target.indexOf("*");
+    if (target === "" || target === "*" || (star !== -1 && star !== target.length - 1)) {
+      throw new NotifyPermissionError(
+        `${where} must be a device token or topic, or a prefix of one ending in * (such as topic:ops-*); there is no allow-everything value`,
+      );
+    }
+    out.add(target);
+  });
+  return [...out].sort(byString);
+}
+
+/**
+ * Why a provider send's destination is refused, or `null` when the list
+ * admits it. The one matcher for both lists: an entry matches exactly, or,
+ * ending in `*`, as a prefix. An SMS number is compared in normalised E.164
+ * form, so a destination that is not a number in that form matches nothing.
+ */
+export function destinationRefusal(
+  to: string,
+  kind: DestinationKind,
+  cfg: NotifyConfig,
+): string | null {
+  const key = DESTINATION_KEYS[kind];
+  const patterns = kind === "sms" ? cfg.allowedSmsRecipients : cfg.allowedPushTargets;
+  const value = kind === "sms" ? normalizeSmsNumber(to) : to.trim();
+  const usable = kind === "push" || E164.test(value);
+  if (
+    usable &&
+    patterns.some((p) => (p.endsWith("*") ? value.startsWith(p.slice(0, -1)) : value === p))
+  ) {
+    return null;
+  }
+  const what =
+    kind === "sms"
+      ? `${JSON.stringify(to)} is not in ${key}${usable ? "" : " (numbers are matched in E.164 form: a + and digits)"}`
+      : `that push target is not in ${key}`;
+  const how =
+    kind === "sms"
+      ? "An operator adds a number in E.164 form, or a prefix such as +44*"
+      : "An operator adds a device token or topic, or a prefix ending in *";
+  return patterns.length === 0
+    ? `${what} (an empty allow-list refuses everyone). ${how}`
+    : `${what}. ${how}`;
+}
+
+/**
+ * Check `allowed_secret_envs` at boot: a list of variable NAMES. A
+ * malformed entry throws, so a misconfiguration surfaces when the harness
+ * starts, and it is never quoted: an operator who pasted a token here, or
+ * wrote `$SLACK_BOT_TOKEN` (which the bundle resolves to the token itself),
+ * would otherwise see it printed.
+ */
+function buildSecretEnvs(raw: unknown): readonly string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    throw new NotifyPermissionError(`${SECRET_ENVS_KEY} must be a list of variable names`);
+  }
+  const names = new Set<string>();
+  raw.forEach((name, index) => {
+    if (!isEnvName(name) || looksLikePastedSecret(name)) {
+      throw new NotifyPermissionError(
+        `${SECRET_ENVS_KEY} lists environment variable NAMES (such as SLACK_BOT_TOKEN, written without a $); entry ${index + 1} is not one, and has not been echoed back`,
+      );
+    }
+    names.add(name);
+  });
+  return [...names].sort(byString);
 }
 
 /** Replace the process-global allow-list. Codegen calls this at boot. */
@@ -440,7 +614,18 @@ const MAX_TXT_RECORD_CHARS = 8192;
 function withDeadline<T>(work: Promise<T>, deadline: Deadline): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const signal = deadline.signal;
-    const fail = (): void => reject(new Error("aborted"));
+    // The signal's own reason, so the caller can tell the deadline's timer
+    // from a runtime cancel by what it caught rather than by the clock.
+    const fail = (): void => {
+      const reason: unknown = signal.reason;
+      if (reason instanceof Error) {
+        reject(reason);
+        return;
+      }
+      const err = new Error("aborted");
+      err.name = "AbortError";
+      reject(err);
+    };
     if (signal.aborted) {
       fail();
       return;
@@ -475,7 +660,10 @@ export async function lookupTxt(name: string, deadline: Deadline): Promise<TxtAn
   try {
     raw = await withDeadline(dnsTxtFn(name), deadline);
   } catch (err) {
-    if (deadline.expired()) {
+    // An answer that arrived after the deadline's time is still the answer
+    // (an NXDOMAIN is still an NXDOMAIN); only the timer's abort is a
+    // deadline.
+    if (isDeadlineAbort(err, deadline)) {
       return { outcome: "unknown", reason: `the lookup of "${name}" hit the deadline` };
     }
     const code = (err as NodeJS.ErrnoException).code;
@@ -796,11 +984,32 @@ export function expandIpv6(raw: string): number[] | null {
 // deadlines
 // ---------------------------------------------------------------------------
 
+/**
+ * The reason a deadline's own timer aborts its signal with. An error is
+ * traced to the deadline by this reason, never by the clock: a transport
+ * failure that merely ARRIVES after the deadline's time (a starved event
+ * loop delivers it before the timer callback runs) is that failure, and a
+ * runtime cancel aborts with the runtime's reason instead.
+ */
+export class DeadlineElapsedError extends Error {
+  override readonly name = "TimeoutError";
+}
+
 export type Deadline = {
   readonly signal: AbortSignal;
   /** Milliseconds left; never negative. */
   remaining(): number;
+  /**
+   * The clock says the time is up. For scheduling (stop starting new work),
+   * never for saying why something failed — that is {@link timedOut}.
+   */
   expired(): boolean;
+  /**
+   * The deadline's timer — or an outer deadline's, forwarded — really
+   * aborted the signal. False for a runtime cancel, and false while the
+   * timer has not run, however late the clock says it is.
+   */
+  timedOut(): boolean;
   /** Clear the timer. Always call it, or the process keeps a handle alive. */
   cancel(): void;
 };
@@ -813,7 +1022,10 @@ export type Deadline = {
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const ctrl = new AbortController();
   const startedAt = Date.now();
-  const timer = setTimeout(() => ctrl.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(
+    () => ctrl.abort(new DeadlineElapsedError(`deadline of ${ms}ms elapsed`)),
+    ms,
+  );
   const onOuter = () => ctrl.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) ctrl.abort(outer.reason);
@@ -823,6 +1035,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
     signal: ctrl.signal,
     remaining: () => Math.max(0, ms - (Date.now() - startedAt)),
     expired: () => Date.now() - startedAt >= ms,
+    timedOut: () => ctrl.signal.aborted && ctrl.signal.reason instanceof DeadlineElapsedError,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);
@@ -869,69 +1082,39 @@ export type AuthProfile = {
   readonly prefix?: string;
 };
 
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const MAX_ENV_NAME_LENGTH = 64;
-const SECRET_PREFIXES: readonly string[] = [
-  "xoxb-",
-  "xoxp-",
-  "xoxa-",
-  "xapp-",
-  "sk_live_",
-  "sk_test_",
-  "ghp_",
-  "github_pat_",
-  "glpat-",
-  "whsec_",
-  "bearer ",
-  "sk-",
-  "ac", // Twilio account sids are `AC` + 32 hex, and are paired with a token
-];
-
-/** True when a value that arrived as a NAME is really a secret. */
-function looksLikeASecret(value: string): boolean {
-  const lower = value.toLowerCase();
-  if (lower.startsWith("ac") && /^ac[0-9a-f]{32}$/.test(lower)) return true;
-  return SECRET_PREFIXES.filter((p) => p !== "ac").some((prefix) => lower.startsWith(prefix));
-}
-
 export type ResolvedSecret =
   | { readonly ok: true; readonly value: string }
   | { readonly ok: false; readonly message: string };
 
 /**
- * Read a secret out of the named environment variable.
+ * Read a secret out of the named environment variable, if and only if
+ * `allowed` lists it.
  *
- * The NAME travels through the tool call; the value never does. A value that
- * is not shaped like an environment variable name, or that carries a known
- * secret prefix, is refused as a pasted credential — and the refusal quotes
- * nothing, because a tool result is a transcript, a trace and usually an
- * eval report.
+ * The NAME travels through the tool call; the value never does. `allowed`
+ * is the operator's `allowed_secret_envs` for a name a call supplies, or a
+ * provider's own `auth.envVar` for that provider's call: a call may choose
+ * among the listed names and never add one, so it cannot send another
+ * process secret (the LLM provider's key, say) to an allowed origin, where
+ * the egress classifier would see only the name. The refusal names the key
+ * to set, reads the same whether or not an unlisted variable is set, and
+ * never quotes a value or a "name" that is really a pasted secret, because a
+ * tool result is a transcript, a trace and usually an eval report.
  */
 export function resolveSecret(
   envVar: string | undefined,
   what: string,
+  allowed: readonly string[],
   env: Record<string, string | undefined> = process.env,
 ): ResolvedSecret {
-  if (envVar === undefined || envVar === "") {
-    return {
-      ok: false,
-      message: `no ${what}: name the environment variable holding it — the secret itself is never accepted as an argument`,
-    };
-  }
-  if (!ENV_NAME.test(envVar) || envVar.length > MAX_ENV_NAME_LENGTH || looksLikeASecret(envVar)) {
-    return {
-      ok: false,
-      message: `${what} must be the NAME of an environment variable (letters, digits and underscores, e.g. SLACK_WEBHOOK_URL), not the secret. The value given is not a usable name and has not been echoed back; if it was the secret itself, treat it as exposed to whoever wrote it and set the variable instead`,
-    };
-  }
-  const value = env[envVar];
-  if (value === undefined || value === "") {
-    return {
-      ok: false,
-      message: `${what} names environment variable "${envVar}", which is unset or empty in this process`,
-    };
-  }
-  return { ok: true, value };
+  const resolved = resolveCredentialEnv(envVar, {
+    allowed,
+    purpose: what,
+    configKey: SECRET_ENVS_KEY,
+    env,
+  });
+  return resolved.ok
+    ? { ok: true, value: resolved.value }
+    : { ok: false, message: resolved.reason };
 }
 
 /** Header names that must never be supplied inline, and never survive a hop. */
@@ -956,7 +1139,11 @@ export function rejectInlineCredentials(headers: Record<string, string>): string
 }
 
 export type AppliedAuth =
-  | { readonly ok: true; readonly secretHeaders: ReadonlySet<string>; readonly secrets: string[] }
+  | {
+      readonly ok: true;
+      readonly secretHeaders: ReadonlySet<string>;
+      readonly secrets: SecretValue[];
+    }
   | { readonly ok: false; readonly message: string };
 
 /**
@@ -968,10 +1155,11 @@ export type AppliedAuth =
 export function applyAuth(
   headers: Record<string, string>,
   auth: AuthProfile | undefined,
+  allowed: readonly string[],
   env: Record<string, string | undefined> = process.env,
 ): AppliedAuth {
   if (auth === undefined) return { ok: true, secretHeaders: new Set(), secrets: [] };
-  const resolved = resolveSecret(auth.envVar, "auth profile envVar", env);
+  const resolved = resolveSecret(auth.envVar, "the auth profile", allowed, env);
   if (!resolved.ok) return { ok: false, message: resolved.message };
   const secret = resolved.value;
   if (auth.type === "bearer") {
@@ -985,9 +1173,16 @@ export function applyAuth(
         message: 'auth type "basic" needs a username; the password comes from envVar',
       };
     }
-    const encoded = Buffer.from(`${auth.username}:${secret}`, "utf8").toString("base64");
+    const publicPrefix = `${auth.username}:`;
+    const encoded = Buffer.from(`${publicPrefix}${secret}`, "utf8").toString("base64");
     headers["Authorization"] = `Basic ${encoded}`;
-    return { ok: true, secretHeaders: new Set(["authorization"]), secrets: [secret, encoded] };
+    // The pair's `user:` is the account name, not a secret: a reply that
+    // ends with it is left alone, while every spelling of the pair is not.
+    return {
+      ok: true,
+      secretHeaders: new Set(["authorization"]),
+      secrets: [secret, { publicPrefix, secret }],
+    };
   }
   if (auth.headerName === undefined) {
     return { ok: false, message: 'auth type "header" needs a headerName' };
@@ -1014,26 +1209,47 @@ export function applyAuth(
  *
  * Secrets shorter than six characters are left alone: replacing every "x" in
  * a result would mangle it without protecting anything real.
+ *
+ * This is tool-safety's redactor: every spelling of a secret, and the part
+ * of one a cut left at a string's end. A cut this package makes itself is
+ * trimmed where it is made ({@link readCapped}, {@link excerptOf}), because a
+ * cut inside a JSON result is not at the end of the text this runs on (net
+ * attacker review: a byte cap through an echoed header returned all but one
+ * character of the credential).
+ *
+ * `identifiers` (an SMTP username) are replaced only whole, as 0.7.0 did:
+ * they are not secrets, so the start of one at a string's end is not cut.
  */
-export function redactorFor(secrets: readonly (string | undefined)[]): (text: string) => string {
-  const forms = new Set<string>();
-  for (const secret of secrets) {
-    if (secret === undefined || secret.length < 6) continue;
-    forms.add(secret);
-    forms.add(encodeURIComponent(secret));
-    try {
-      forms.add(Buffer.from(secret, "utf8").toString("base64"));
-    } catch {
-      // not encodable — the literal form is still covered
-    }
-  }
-  const ordered = [...forms].filter((f) => f.length >= 6).sort((a, b) => b.length - a.length);
-  if (ordered.length === 0) return (text) => text;
+export function redactorFor(
+  secrets: readonly (SecretValue | undefined)[],
+  identifiers: readonly (string | undefined)[] = [],
+): (text: string) => string {
+  const redactSecrets = createSecretRedactor(secrets);
+  const idForms = [
+    ...new Set(
+      identifiers.flatMap((v) =>
+        v === undefined || v.trim().length < 6 ? [] : secretForms(v).filter((f) => f.length >= 6),
+      ),
+    ),
+  ].sort((a, b) => b.length - a.length);
   return (text: string): string => {
-    let out = text;
-    for (const form of ordered) out = out.split(form).join("<redacted>");
+    let out = redactSecrets(text);
+    for (const form of idForms) if (out.includes(form)) out = out.split(form).join(REDACTED);
     return out;
   };
+}
+
+/** The most of a reply an error message quotes. */
+export const EXCERPT_CHARS = 500;
+
+/**
+ * The first {@link EXCERPT_CHARS} of a reply, for an error message. When
+ * that cuts the reply, whatever part of an echoed credential the cut leaves
+ * at the end is trimmed, since the redactor matches whole spellings.
+ */
+export function excerptOf(text: string, secrets: readonly (SecretValue | undefined)[]): string {
+  if (text.length <= EXCERPT_CHARS) return text;
+  return trimSecretTail(text.slice(0, EXCERPT_CHARS), secrets);
 }
 
 /** Response headers as a sorted plain object, credentials removed. */
@@ -1062,12 +1278,18 @@ export type RawFetch = (req: Request, pinnedIp: string) => Promise<Response>;
 /**
  * Dial the vetted IP while keeping the real hostname for the `Host` header
  * and TLS SNI, so virtual hosting and certificate validation still work.
+ *
+ * Both branches fetch with the body kept RAW (`fetchRaw`, Bun's
+ * `decompress: false`). Without it Bun inflates a gzip, deflate, br or zstd
+ * reply in native code before any reader sees a byte, so a 300 KB gzip reply
+ * cost about 860 MB however small `maxBytes` was (security-5#7).
+ * {@link readCapped} decodes the body itself, under the cap.
  */
 function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (unbracketed === pinnedIp || pinnedIp === "") return globalThis.fetch(req);
+  if (unbracketed === pinnedIp || pinnedIp === "") return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -1086,7 +1308,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     init.body = req.body;
     init.duplex = "half";
   }
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 let rawFetch: RawFetch = pinnedFetch;
@@ -1132,6 +1354,13 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     const lower = name.toLowerCase();
     return CREDENTIAL_HEADERS.has(lower) || o.credentialHeaders?.has(lower) === true;
   };
+  // Ask for the body as it is. The reader decodes gzip, deflate, br and zstd
+  // under the cap anyway, so a provider that compresses regardless still
+  // works; asking for identity just spares the decoding. A caller that set
+  // its own Accept-Encoding keeps it.
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === "accept-encoding")) {
+    headers["accept-encoding"] = "identity";
+  }
   let redirects = 0;
   let credentialsDropped = false;
   let current = o.url;
@@ -1219,52 +1448,54 @@ export type CappedBody = {
 };
 
 /**
- * Drain a body with a hard byte cap, cancelling the stream the moment the cap
- * is passed so a hostile endpoint cannot pin memory. The cap bounds what is
- * ever held, not what is kept after buffering.
+ * Drain a body with a hard byte cap on its DECODED size, so a hostile
+ * endpoint cannot pin memory: the body arrives raw (see `pinnedFetch`), a
+ * gzip, deflate, br or zstd body is decoded here in small steps, and the
+ * decoder stops once `maxBytes` exist. The cap bounds what is ever held, not
+ * what is kept after buffering.
+ *
+ * A body this reader cannot decode within the bound (an unknown or stacked
+ * coding, a corrupt stream) is a refusal that quotes nothing the endpoint
+ * sent. An aborted read throws an `AbortError`, so `describeFailure` reports
+ * the deadline or the abort as it does for the request itself.
  */
-export async function readCapped(res: Response, maxBytes: number): Promise<CappedBody> {
-  if (res.body === null) return { text: "", bytes: 0, truncated: false };
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let truncated = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        chunks.push(value.subarray(0, maxBytes - total));
-        total = maxBytes;
-        truncated = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
+export async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+  secrets: readonly (SecretValue | undefined)[] = [],
+): Promise<CappedBody> {
+  const read = await readResponseBounded(res, {
+    maxBytes,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (read.ok) {
+    return {
+      // A cut can fall inside a credential the endpoint echoed; what it
+      // leaves is a prefix no whole spelling matches, so it goes here.
+      text: read.truncated ? trimSecretTail(read.text, secrets) : read.text,
+      bytes: read.bytes.byteLength,
+      truncated: read.truncated,
+    };
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+  switch (read.code) {
+    case "aborted": {
+      const err = new Error("the read was aborted before the reply ended");
+      err.name = "AbortError";
+      throw err;
+    }
+    case "unsupported-encoding":
+      throw new NotifyPermissionError(
+        "the endpoint sent its reply in a stack of content-encodings this tool cannot decode within its byte cap, so the reply was not read",
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      throw new NotifyPermissionError(
+        "the endpoint's reply is labelled as compressed but could not be decoded, so it was not read",
+      );
+    default:
+      throw new NotifyPermissionError("the endpoint's reply could not be read to the end");
   }
-  return {
-    text: new TextDecoder("utf-8", { fatal: false }).decode(merged),
-    bytes: total,
-    truncated,
-  };
 }
 
 /** A URL the caller supplied, or a readable refusal that does not echo it. */
@@ -1275,6 +1506,50 @@ export function parseUrl(raw: string): URL | string {
     return "that is not an absolute URL — include the scheme, e.g. https://hooks.example.com/services/… (the value has not been echoed back, in case it was a webhook URL, which is itself a credential)";
   }
 }
+
+/**
+ * True for a value made only of dots. `.` and `..` are the two values
+ * `encodeURIComponent` does NOT neutralise: they encode to themselves, and
+ * the URL parser then RESOLVES them, so a message id of `..` substituted
+ * into `/channels/1/messages/{id}` addresses `/channels/1/` — the channel,
+ * not a message. A dot segment is never an id.
+ */
+export function isDotSegment(value: string): boolean {
+  return /^\.+$/.test(value);
+}
+
+/**
+ * `template` with every `placeholder` replaced by `value`, percent-encoded,
+ * as the URL that will be requested — or why not: `invalid` when the
+ * template is not an absolute URL, `reshaped` when the parser would send
+ * the request anywhere but the template's own path with the value written
+ * in.
+ *
+ * The check is made on the URL the parser produced, not on the string it
+ * was built from: the template is also parsed with a sentinel in the
+ * value's place, and the two paths must match once the sentinel is the
+ * value. Whatever normalisation the parser applies (a dot segment today),
+ * a value that changes the shape of the path is refused.
+ */
+export function substituteIntoUrl(
+  template: string,
+  placeholder: string,
+  value: string,
+):
+  | { readonly ok: true; readonly url: URL }
+  | { readonly ok: false; readonly why: "invalid" | "reshaped" } {
+  const encoded = encodeURIComponent(value);
+  const parsed = parseUrl(template.split(placeholder).join(encoded));
+  const shape = parseUrl(template.split(placeholder).join(PATH_SENTINEL));
+  if (typeof parsed === "string" || typeof shape === "string") return { ok: false, why: "invalid" };
+  if (parsed.pathname !== shape.pathname.split(PATH_SENTINEL).join(encoded)) {
+    return { ok: false, why: "reshaped" };
+  }
+  return { ok: true, url: parsed };
+}
+
+/** A path segment no parser rewrites and no real value contains. */
+const PATH_SENTINEL = "crewhaus-substitution-4b1f0c";
 
 /** Read a dotted path out of a parsed JSON body. `undefined` when absent. */
 export function readPath(value: unknown, path: string): unknown {
@@ -1300,19 +1575,99 @@ export function readPath(value: unknown, path: string): unknown {
  */
 export function describeFailure(err: unknown, deadline?: Deadline): string {
   if (err instanceof NotifyPermissionError) return err.message;
-  if (deadline?.expired() === true) return "deadline elapsed before the send completed";
+  // The cause decides, not the clock: see DeadlineElapsedError.
+  if (isDeadlineAbort(err, deadline)) return "deadline elapsed before the send completed";
+  const aborted = "the send was aborted before it completed";
+  if (deadline?.signal.aborted === true && err === deadline.signal.reason) return aborted;
   if (err instanceof Error) {
-    if (err.name === "AbortError") return "the send was aborted before it completed";
-    return `${err.name}: ${err.message}`;
+    if (err.name === "AbortError") return aborted;
+    // A real failure that arrived late is still that failure; the clock is
+    // mentioned, because the caller may want a longer deadline as well.
+    const late = deadline?.expired() === true ? " (the deadline had also elapsed)" : "";
+    return `${err.name}: ${err.message}${late}`;
   }
   return String(err);
+}
+
+/**
+ * Whether `err` is what the deadline's own timer did: its abort reason, or an
+ * abort-shaped error (a body reader's AbortError) raised after that timer
+ * fired. Exported for the few callers that report a deadline themselves.
+ */
+export function isDeadlineAbort(err: unknown, deadline?: Deadline): boolean {
+  if (err instanceof DeadlineElapsedError) return true;
+  if (deadline?.timedOut() !== true) return false;
+  if (err === deadline.signal.reason) return true;
+  return err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError");
 }
 
 // ---------------------------------------------------------------------------
 // idempotency
 // ---------------------------------------------------------------------------
 
-export type LedgerEntry = { readonly tool: string; readonly result: string };
+/**
+ * What makes two calls under one key the SAME request: every argument except
+ * the ones that only say how to deliver it (the key itself, deadlines, byte
+ * caps, retry pacing), each reduced to a SHA-256 of its canonical JSON. Kept
+ * per field, so a refusal can say which fields differed without keeping
+ * the message itself in memory. A caller-supplied clock reading that only
+ * stamps the message (EmailSend's `date`, a webhook signature's timestamp)
+ * is left out by the caller: a retry that re-reads its clock is still a
+ * retry.
+ */
+export type RequestFingerprint = ReadonlyMap<string, string>;
+
+const DELIVERY_KNOBS = new Set([
+  "idempotencyKey",
+  "idempotencyHeader",
+  "timeoutMs",
+  "maxBytes",
+  "retries",
+  "backoffMs",
+  "justification",
+]);
+
+/** Object keys sorted, so `{a, b}` and `{b, a}` are one request. */
+function sortedKeys(_key: string, value: unknown): unknown {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+  const sorted: Record<string, unknown> = Object.create(null);
+  for (const key of Object.keys(value).sort()) {
+    sorted[key] = (value as Record<string, unknown>)[key];
+  }
+  return sorted;
+}
+
+export function requestFingerprint(args: Readonly<Record<string, unknown>>): RequestFingerprint {
+  const fields = new Map<string, string>();
+  for (const key of Object.keys(args).sort()) {
+    const value = args[key];
+    if (DELIVERY_KNOBS.has(key) || value === undefined) continue;
+    const canonical = JSON.stringify(value, sortedKeys) ?? "undefined";
+    fields.set(key, createHash("sha256").update(canonical, "utf8").digest("hex"));
+  }
+  return fields;
+}
+
+/** The fields two fingerprints disagree on, sorted; empty when they match. */
+function differingFields(a: RequestFingerprint, b: RequestFingerprint): string[] {
+  const names = new Set([...a.keys(), ...b.keys()]);
+  return [...names].filter((name) => a.get(name) !== b.get(name)).sort(byString);
+}
+
+export type LedgerEntry = {
+  readonly tool: string;
+  readonly fingerprint: RequestFingerprint;
+  readonly result: string;
+};
+
+/**
+ * `replay` — this key already sent this request; here is what it returned.
+ * `conflict` — this key already sent a DIFFERENT request, which this call
+ * must not be mistaken for: it is refused and sends nothing.
+ */
+export type LedgerAnswer =
+  | { readonly kind: "replay"; readonly result: string }
+  | { readonly kind: "conflict"; readonly differs: readonly string[] };
 
 /**
  * The per-process record of what has already been sent under which key.
@@ -1321,8 +1676,14 @@ export type LedgerEntry = { readonly tool: string; readonly result: string };
  * agent, and "post it again" is the wrong answer when the first post
  * succeeded. Every sending tool takes an `idempotencyKey`; the key is passed
  * to the provider when the provider honours one, AND recorded here, so a
- * second call with the same key returns the first call's result and posts
- * nothing.
+ * second call with the same key and the same request returns the first
+ * call's result and posts nothing.
+ *
+ * A key names ONE request. The same key with a different destination or
+ * body used to be answered from here too, so it returned the first call's
+ * `sent: true` and message id for a message that was never sent. It is now
+ * a `conflict`, which the tool refuses (as a provider that honours
+ * Idempotency-Key would), and nothing goes out.
  *
  * This is deliberate hidden state, and it is the one place in the package
  * where a repeated call does not repeat its effect — which is the entire
@@ -1333,12 +1694,35 @@ export type LedgerEntry = { readonly tool: string; readonly result: string };
 const LEDGER_LIMIT = 512;
 const ledger = new Map<string, LedgerEntry>();
 
-export function ledgerLookup(tool: string, key: string | undefined): LedgerEntry | undefined {
+/**
+ * `ignoring` names fields left out of the comparison: EmailSend asks with
+ * `attachmentContent` ignored when an attachment can no longer be read, so
+ * a retry after a temp file was cleaned up finds the message it already
+ * sent instead of reporting it unsent.
+ */
+export function ledgerLookup(
+  tool: string,
+  key: string | undefined,
+  fingerprint: RequestFingerprint,
+  ignoring: readonly string[] = [],
+): LedgerAnswer | undefined {
   if (key === undefined || key === "") return undefined;
-  return ledger.get(`${tool}\u0000${key}`);
+  const entry = ledger.get(`${tool}\u0000${key}`);
+  if (entry === undefined) return undefined;
+  const differs = differingFields(entry.fingerprint, fingerprint).filter(
+    (name) => !ignoring.includes(name),
+  );
+  return differs.length === 0
+    ? { kind: "replay", result: entry.result }
+    : { kind: "conflict", differs };
 }
 
-export function ledgerRecord(tool: string, key: string | undefined, result: string): void {
+export function ledgerRecord(
+  tool: string,
+  key: string | undefined,
+  fingerprint: RequestFingerprint,
+  result: string,
+): void {
   if (key === undefined || key === "") return;
   const id = `${tool}\u0000${key}`;
   if (ledger.size >= LEDGER_LIMIT && !ledger.has(id)) {
@@ -1346,7 +1730,7 @@ export function ledgerRecord(tool: string, key: string | undefined, result: stri
     const oldest = ledger.keys().next();
     if (!oldest.done) ledger.delete(oldest.value);
   }
-  ledger.set(id, { tool, result });
+  ledger.set(id, { tool, fingerprint, result });
 }
 
 /** Test-only — a fresh process's empty ledger. */

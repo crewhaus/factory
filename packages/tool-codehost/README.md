@@ -12,8 +12,10 @@ Twenty-six tools: seventeen read, nine write.
 
 ## The four commitments
 
-**The token is a NAME, never a value.** `tokenEnv` names an environment variable — or
-`token_env` in the `tool_config` block. The token is read at call time, attached as a request
+**The token is a NAME, never a value, and the operator's.** `token_env` in the `tool_config`
+block names an environment variable; a call's `tokenEnv` may name only that one or one listed in
+`token_envs`, so a call cannot send another process secret as a bearer token. The token is read at
+call time, attached as a request
 header, and scrubbed out of every string on the way back. It never appears in a path, a query
 string or a body, and a server that echoes it into its own payload gets it redacted out of the
 record. There is an explicit test for that, driven by a fixture that deliberately leaks. The
@@ -24,8 +26,8 @@ and the refusal does not quote what it refused.
 **The gate is fail-closed.** An empty origin allow-list denies everything, `api.github.com`
 included. Every redirect hop is re-checked against the allow-list and the SSRF classifier, the
 classification is numeric rather than a string prefix, the vetted IP is pinned for the connection,
-and the token is dropped the moment a redirect crosses an origin. This is `@crewhaus/tool-http`'s
-posture, carried over rather than re-derived.
+and the token is dropped the moment a redirect crosses an origin — or a `rel="next"` page URL
+names another one. This is `@crewhaus/tool-http`'s posture, carried over rather than re-derived.
 
 **Nothing runs unbounded.** Every call has a deadline, and it covers the name resolution too:
 `node:dns` takes neither a timeout nor an `AbortSignal`, so a wedged resolver is the one thing
@@ -47,11 +49,22 @@ the answer — and it is an `order` option, spelled out in the description.
       "allowed_origins": ["https://api.github.com"],
       "base_url": "https://api.github.com",   // optional; per-host default otherwise
       "token_env": "GITHUB_TOKEN",            // the NAME of the variable
+      "token_envs": { "GHE_TOKEN": ["https://ghe.example.com"] },  // optional; see below
       "host": "github"                        // default dialect
     }
   }
 }
 ```
+
+`token_env` is the variable every call uses unless it names another. Its token goes only to
+`base_url`'s origin, or, when `base_url` is not set, to the default API of `host`
+(`https://api.github.com`, or `https://gitlab.com` with `host: "gitlab"`). A call that passes its
+own `baseUrl` or `host` for another origin is refused rather than handed that token. `token_envs` lists the other variables a call may name
+in `tokenEnv` — as a list, whose tokens may go to any allowed origin, or as a map from a name to
+the origins its token may go to, which is how a spec that reaches github.com and a self-hosted
+instance keeps each token with its own host. A call can choose among these names and never add
+one; with neither key set, a call that names a variable is refused. Names are checked when the
+harness starts, and a malformed one is refused without being printed.
 
 A self-hosted instance is reached by allow-listing it and pointing `base_url` at its API root
 (`https://ghe.example.com/api/v3`, `https://gitlab.example.com/api/v4`). Nothing else changes.

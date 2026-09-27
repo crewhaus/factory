@@ -39,20 +39,11 @@
  * string rather than an exception.
  */
 import { Buffer } from "node:buffer";
-import {
-  appendFileSync,
-  closeSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readSync,
-  readdirSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { appendContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { budgetCheck as budgetCheckFn } from "./lib/budget";
 import { costReport as costReportFn } from "./lib/cost";
@@ -83,7 +74,9 @@ import {
   MAX_MAX_BYTES,
   MAX_TIMEOUT_MS,
   type ObsConfig,
+  ObsCorruptBodyError,
   ObsPermissionError,
+  ObsRefusedError,
   authHeaders,
   configuredOrigins,
   describeFailure,
@@ -99,10 +92,13 @@ import {
   safeUrlLabel,
   startDeadline,
 } from "./net";
-import { type SafePath, ToolPermissionError, resolveSafe, toPosix } from "./paths";
+import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot } from "./paths";
 
 export {
+  ObsCorruptBodyError,
   ObsPermissionError,
+  ObsRefusedError,
+  ObsUnresolvedError,
   _resetObsConfig,
   _setDnsLookup,
   _setRawFetch,
@@ -802,25 +798,26 @@ export const incidentBundle: RegisteredTool = buildTool({
     if (bytes > MAX_BUNDLE_BYTES) {
       return `the bundle would be ${bytes} bytes, over the ${MAX_BUNDLE_BYTES} limit — lower maxEntries or maxPayloadChars`;
     }
-    try {
-      // The parent is created because `reports/incident.json` is the obvious
-      // thing to ask for and failing on it teaches nothing. It is created
-      // through the already-validated real path, so the directory that appears
-      // is inside the workspace by the same check the file is.
-      const parent = path.dirname(out.real);
-      if (parent !== out.real) mkdirSync(parent, { recursive: true });
-      // "wx" is an atomic create-or-fail, so the no-clobber promise is kept by
-      // the filesystem rather than by a stat that something could race.
-      writeFileSync(out.real, text, {
-        encoding: "utf8",
-        flag: input.overwrite === true ? "w" : "wx",
-      });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") {
+    // The parent is created because `reports/incident.json` is the obvious
+    // thing to ask for and failing on it teaches nothing; each directory is
+    // created contained. The bytes go to an exclusive temp that is renamed
+    // into place, so without overwrite an existing name is refused by the
+    // filesystem, and with it a hard link at the name is replaced, never
+    // written through to the file's other names. A link at the name is
+    // followed only while it stays in the workspace, and a FIFO, device or
+    // directory there is refused rather than opened (net attacker review:
+    // `writeFileSync` blocked the event loop on a FIFO, and wrote through a
+    // hard link to a file outside the workspace).
+    const written = writeFileSafe(workspaceRoot(), input.out, text, {
+      overwrite: input.overwrite === true,
+      createParents: true,
+      leafSymlink: "follow-contained",
+    });
+    if (!written.ok) {
+      if (written.code === "exists") {
         return `"${renderPath(input.out)}" already exists — pass overwrite: true to replace it`;
       }
-      return `"${renderPath(input.out)}" could not be written${code !== undefined ? ` (${code})` : ""}`;
+      return `${written.reason} — nothing was written`;
     }
     return json({
       wrote: toPosix(out.rel),
@@ -1097,19 +1094,21 @@ export const emitTraceEvent: RegisteredTool = buildTool({
     // something else.
     if (input.dryRun === true) return json({ dryRun: true, ...report, line: text });
 
-    try {
-      if (size === undefined) {
-        const parent = path.dirname(target.real);
-        if (parent !== target.real) mkdirSync(parent, { recursive: true });
-      }
-      // Mode and append semantics are `@crewhaus/event-log`'s: owner-only, and
-      // one O_APPEND write per line so a runtime appending to the same log
-      // concurrently cannot end up interleaved with this one.
-      appendFileSync(target.real, text, { mode: 0o600 });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      return `"${shown}" could not be appended to${code !== undefined ? ` (${code})` : ""}`;
-    }
+    // Mode and append semantics are `@crewhaus/event-log`'s: owner-only, and
+    // one O_APPEND write per line so a runtime appending to the same log
+    // concurrently cannot end up interleaved with this one. The open never
+    // follows a link out of the workspace (a contained one is followed, as
+    // before), refuses a FIFO or any other special file, and refuses a file
+    // with a second name: an append in place would change it under every
+    // name, one of which may be outside the workspace (net attacker review).
+    const appended = appendContained(workspaceRoot(), rel, text, {
+      createParents: size === undefined,
+      create: input.create === true,
+      mode: 0o600,
+      leafSymlink: "follow-contained",
+      hardLinks: "refuse",
+    });
+    if (!appended.ok) return `${appended.reason} — "${shown}" was not appended to`;
     return json({ appended: true, ...report });
   },
 });
@@ -1265,7 +1264,7 @@ async function callRemote(call: RemoteCall): Promise<RemoteResult> {
       cfg: call.cfg,
       credentialHeaders: secretHeaders,
     });
-    const body = await readCapped(opened.res, call.maxBytes);
+    const body = await readCapped(opened.res, call.maxBytes, deadline.signal, [token.token]);
     return {
       ok: true,
       status: opened.res.status,
@@ -1735,7 +1734,7 @@ export const healthProbe: RegisteredTool = buildTool({
   name: "HealthProbe",
   operativeArgs: [{ field: "urls", kind: "url" }],
   description:
-    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have. The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
+    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have; one the allow-list or the SSRF check refused was never sent and comes back as refused, not unhealthy (both with ok null). The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
   inputSchema: z.object({
     urls: z
       .array(z.string().min(1))
@@ -1796,10 +1795,13 @@ export const healthProbe: RegisteredTool = buildTool({
 
     type Probe = {
       url: string;
-      ok: boolean;
+      /** null: not determined — the probe was skipped or refused. */
+      ok: boolean | null;
       status?: number;
       latencyMs?: number;
       skipped?: boolean;
+      /** The gate refused it (or the redirect it answered with); see error. */
+      refused?: boolean;
       /** Present only when a token exists: whether this probe carried it. */
       authenticated?: boolean;
       error?: string;
@@ -1812,7 +1814,7 @@ export const healthProbe: RegisteredTool = buildTool({
       if (deadline.expired()) {
         results[index] = {
           url: label,
-          ok: false,
+          ok: null,
           skipped: true,
           error: "the sweep deadline elapsed before this endpoint was probed",
         };
@@ -1835,17 +1837,40 @@ export const healthProbe: RegisteredTool = buildTool({
           credentialHeaders: secretHeaders,
         });
         // Drain under the cap rather than leaving the stream open: a probe
-        // that never reads the body leaks a socket per endpoint.
-        await readCapped(opened.res, maxBytes);
+        // that never reads the body leaks a socket per endpoint. The probe
+        // judges the status, not the body, so a body in codings the reader
+        // will not stack is released rather than reported as the endpoint
+        // failing. A CORRUPT body is the endpoint failing, as 0.7.0 said:
+        // every client reading that reply would fail too.
+        let corrupt: string | undefined;
+        await readCapped(opened.res, maxBytes, deadline.signal).catch((err: unknown) => {
+          if (err instanceof Error && err.name === "AbortError") throw err;
+          if (err instanceof ObsCorruptBodyError) corrupt = err.message;
+        });
         const status = opened.res.status;
         results[index] = {
           url: redact(opened.finalUrl),
-          ok: expected !== undefined ? expected.has(status) : status >= 200 && status < 300,
+          ok:
+            corrupt === undefined &&
+            (expected !== undefined ? expected.has(status) : status >= 200 && status < 300),
           status,
           latencyMs: Date.now() - startedAt,
           ...(token.token === "" ? {} : { authenticated: carriesToken }),
+          ...(corrupt !== undefined ? { error: corrupt } : {}),
         };
       } catch (err) {
+        if (err instanceof ObsRefusedError) {
+          // Never probed (or its redirect was not followed), so it is
+          // neither healthy nor unhealthy: say which, and why.
+          results[index] = {
+            url: label,
+            ok: null,
+            refused: true,
+            ...(err.redirectStatus !== undefined ? { status: err.redirectStatus } : {}),
+            error: redact(err.message),
+          };
+          return;
+        }
         results[index] = {
           url: label,
           ok: false,
@@ -1876,9 +1901,10 @@ export const healthProbe: RegisteredTool = buildTool({
     const probes = [...results].sort((a, b) => byString(a.url, b.url));
     return json({
       probed: probes.length,
-      healthy: probes.filter((p) => p.ok).length,
-      unhealthy: probes.filter((p) => !p.ok && p.skipped !== true).length,
+      healthy: probes.filter((p) => p.ok === true).length,
+      unhealthy: probes.filter((p) => p.ok === false).length,
       skipped: probes.filter((p) => p.skipped === true).length,
+      refused: probes.filter((p) => p.refused === true).length,
       deadlineMs: input.deadlineMs,
       probes,
     });

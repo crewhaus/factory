@@ -152,7 +152,14 @@ Measured on Bun 1.3.14: unless a request passes `decompress: false`, `fetch` inf
 
 The bound therefore has to start at the request. Fetch with `fetchRaw(input, init)`, or with `withRawBody(init)` as the init of the **final** `fetch` call. Bun ignores `decompress` inside a `Request`'s own init, so `fetch(new Request(url, withRawBody({})))` is inflated anyway; a pinned-fetch helper that passes a `Request` should call `fetchRaw(request)`. This reader then decodes the body itself, stopping the decoder once `maxBytes` of decoded output exist. Against 1 GiB bombs it decoded the cap plus one 16 KiB chunk, with peak RSS up about 20–25 MB, in all four codings. Without the raw body, the same bombs cost +1.5 GB (gzip) and +3.5 GB (br) before any reader saw them.
 
-Every read is raced against `signal` and `idleTimeoutMs`, so a server that sends one chunk and stalls cannot hold the reader: it ends as `aborted` or `stalled`.
+Every read, and every decoder step, is raced against `signal` and `idleTimeoutMs`, so a server that sends one chunk and stalls cannot hold the reader: it ends as `aborted` or `stalled`. A corrupt compressed body ends as `decode-error`. The runtime's zlib emits `error` on corrupt input and never calls the write callback, so a decoder step settles on either.
+
+What counts as the body:
+
+- **gzip.** The first member. Its header and trailer are parsed here, and its CRC-32 and length are checked. Bytes after the member are not read: a stray CRLF, NUL padding or a second member. Bun's own fetch decoder, curl and browsers read a gzip body the same way.
+- **deflate, br and zstd.** The body ends where the encoded data ends.
+- **A label that names no coding** (`none`, `utf-8`, `binary`). The body is read as it arrived, under the same cap, and the label is reported in `undecodedEncoding`.
+- **A stack that includes a real compression** (`gzip, br`). Refused with `unsupported-encoding`.
 
 `decodeBody(res, options)` yields the decoded chunks as they are produced, at most `maxBytes` in all, and sets `outcome` when the iteration ends. Use it for a reader that works as bytes arrive: `SseRead` feeds each chunk to its event decoder, and a large `DownloadFile` writes each chunk to a `beginAtomicWrite` writer instead of holding the body. `readResponseBounded` is `decodeBody`, collected.
 
@@ -197,9 +204,12 @@ A leaf joined onto a contained directory is spelled with `joinRel(dir.rel, "pack
 
 The temp needs a place beside the destination, so `writeFileSafe` refuses a file in a directory it cannot write, with `permission-denied`, even when the file itself is writable. This is by design: that write could only be done in place, which is neither atomic nor safe from a link swapped in at the leaf.
 
-### Appending: `appendContained(root, path, data, { createParents?, create?, mode? })`
+### Appending: `appendContained(root, path, data, { createParents?, create?, mode?, leafSymlink?, hardLinks? })`
 
 This appends in place: to a JSONL index that every run adds to, or to touch a file. A rewrite through a temp would cost O(n) and race other appenders. A link or special file at the leaf is refused. An existing file is opened without `O_CREAT`, with `O_NOFOLLOW|O_NONBLOCK`, and must be the very file that was checked, in the directory that was checked. A missing one is created with `O_EXCL`. Nothing is written until those checks pass; a file created in the wrong place is removed there, and one that already existed is left alone. One `write` is atomic against other appenders, so keep a record to one append.
+
+- `leafSymlink: "follow-contained"` appends to where a link at the leaf leads, when that is inside the root, as `writeFileSafe` can.
+- `hardLinks: "refuse"` refuses an existing file with more than one name. An append in place changes the file under every name, and the others need not be inside the root; a temp-and-rename write replaces the name instead, so it has no such problem. The default is `"allow"`, which is 0.7.0's behaviour.
 
 ### New files at exact names: `createExclusive(root, path, { mode?, createParents? })`
 
@@ -272,7 +282,10 @@ One heuristic for "this name holds a credential": KEY, TOKEN, SECRET, PASSWORD, 
 
 ### Redaction
 
-- `redactKnownSecrets(text, values)` and `createSecretRedactor(values)` replace each known secret in text. They also catch its URL-encoded, base64, base64url and JSON-escaped spellings and a trimmed copy. A composite, such as a Basic header's `base64(user:secret)`, cannot be derived from the secret alone, so pass it as a value of its own.
+- `redactKnownSecrets(text, values)` and `createSecretRedactor(values)` replace each known secret in text. They also catch its URL-encoded, base64, base64url and JSON-escaped spellings (including `\/` for `/`, which PHP's `json_encode` writes) and a trimmed copy.
+- A composite, such as a Basic header's `user:secret`, cannot be derived from the secret alone. Pass it as `{ publicPrefix: "user:", secret }`. Its spellings are redacted whole, but the username is not a secret: a result that ends with it (a login, an assignee, a URL) is left alone.
+- **A cut can split a secret.** A byte cap, a preview or a window can leave a prefix of an echoed credential that no whole form matches, and it can be every character but the last. So these functions also replace a run at a string's end that is the start of a form, or a run at its start that is the end of one, when that run holds at least `minLength` characters of the secret. A composite's public prefix does not count towards them.
+- `trimSecretTail(text, values)` is for a caller that cut a text itself. It removes a partial run of any length from the end, and should be applied at the cut.
 - `redactKnownSecretsDeep(value, values)` redacts every string in a result object, keys included, and the result still round-trips through JSON.
 - `redactUrlCredentials(url)` replaces the whole userinfo and the value of each query or fragment parameter whose name is credential-shaped (`token`, `api_key`, `X-Amz-Signature`, `access_token` …) or whose value looks like a token. Everything else is left as written. `redactUrlCredentialsInText(text)` does this for every URL in an error message or a log line.
 

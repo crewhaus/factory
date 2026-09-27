@@ -16,7 +16,7 @@
  * Filesystem tests run inside a throwaway temp directory; nothing is ever
  * written inside the repository.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -28,6 +28,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer as createTcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { auditToolScopes } from "@crewhaus/tool-builder";
@@ -38,6 +39,7 @@ import {
   _resetHttpConfig,
   _setDnsLookup,
   _setDnsRecordResolver,
+  _setRawFetch,
   dnsLookup,
   downloadFile,
   feedParse,
@@ -69,6 +71,38 @@ async function run(tool: RegisteredTool, input: unknown): Promise<any> {
   }
 }
 
+/**
+ * Run `body` with every timer of exactly `ms` milliseconds held: scheduled
+ * never, so a deadline of that length cannot fire however slow the runner
+ * is, while its clock (`expired()`) still runs. Other timers run as usual.
+ * For tests about what a failure is CALLED once the clock has run out,
+ * which must not depend on whether the deadline's timer won a race.
+ */
+async function withTimersHeld<T>(ms: number, body: () => Promise<T>): Promise<T> {
+  const realSetTimeout = globalThis.setTimeout;
+  const held = spyOn(globalThis, "setTimeout").mockImplementation(((
+    fn: (...args: unknown[]) => void,
+    delay?: number,
+    ...rest: unknown[]
+  ) =>
+    delay === ms
+      ? (0 as unknown as ReturnType<typeof setTimeout>)
+      : realSetTimeout(fn, delay, ...rest)) as typeof setTimeout);
+  try {
+    return await body();
+  } finally {
+    held.mockRestore();
+  }
+}
+
+/** Hold the event loop for `ms`, so that the clock moves and nothing else runs. */
+function busy(ms: number): void {
+  const started = performance.now();
+  while (performance.now() - started < ms) {
+    // spin
+  }
+}
+
 const TOKEN_VAR = "CREWHAUS_TEST_HTTP_TOKEN";
 const SECRET_VAR = "CREWHAUS_TEST_WEBHOOK_SECRET";
 
@@ -84,6 +118,11 @@ let origin = "";
 let otherOrigin = "";
 /** Per-test counters, so a flaky-endpoint test starts from a known state. */
 let flakyCalls = 0;
+/**
+ * What `/echo` (on either server) really received. A tool result scrubs the
+ * credential, so what arrived on the wire is read here.
+ */
+let echoSeen: Array<{ authorization: string | null; apiKey: string | null }> = [];
 let jobCalls = 0;
 
 const FEED_XML = `<?xml version="1.0"?><rss version="2.0"><channel>
@@ -116,6 +155,10 @@ async function mainHandler(req: Request): Promise<Response> {
   if (p === "/json") return jsonRes({ hello: "world" });
 
   if (p === "/echo") {
+    echoSeen.push({
+      authorization: req.headers.get("authorization"),
+      apiKey: req.headers.get("x-api-key"),
+    });
     return jsonRes({
       method: req.method,
       path: `${url.pathname}${url.search}`,
@@ -146,6 +189,9 @@ async function mainHandler(req: Request): Promise<Response> {
   }
   if (p === "/redirect-303") {
     return new Response(null, { status: 303, headers: { location: "/echo" } });
+  }
+  if (p === "/redirect-301") {
+    return new Response(null, { status: 301, headers: { location: "/echo" } });
   }
   if (p === "/redirect-307") {
     return new Response(null, { status: 307, headers: { location: "/echo" } });
@@ -282,11 +328,16 @@ async function mainHandler(req: Request): Promise<Response> {
 beforeEach(() => {
   flakyCalls = 0;
   jobCalls = 0;
+  echoSeen = [];
   main = Bun.serve({ port: 0, fetch: mainHandler });
   other = Bun.serve({
     port: 0,
     fetch: async (req) => {
       const url = new URL(req.url);
+      echoSeen.push({
+        authorization: req.headers.get("authorization"),
+        apiKey: req.headers.get("x-api-key"),
+      });
       return new Response(
         JSON.stringify({
           server: "other",
@@ -301,7 +352,11 @@ beforeEach(() => {
   });
   origin = `http://127.0.0.1:${main.port}`;
   otherOrigin = `http://127.0.0.1:${other.port}`;
-  registerHttpConfig({ allowed_origins: [origin, otherOrigin] });
+  registerHttpConfig({
+    allowed_origins: [origin, otherOrigin],
+    allowed_auth_envs: [TOKEN_VAR, "CREWHAUS_TEST_ABSENT"],
+    allowed_signing_envs: [SECRET_VAR, "CREWHAUS_TEST_NO_SUCH_SECRET"],
+  });
   __setPrivateHostsAllowedForTest(true);
   process.env[TOKEN_VAR] = "s3cret-token";
   process.env[SECRET_VAR] = "whsec_fixture";
@@ -586,6 +641,7 @@ describe("refusals", () => {
     });
     expect(result).toContain("CREWHAUS_TEST_ABSENT");
     expect(result).toContain("unset or empty");
+    expect(echoSeen).toEqual([]);
   });
 
   test("a deadline fires and is reported as a deadline", async () => {
@@ -634,7 +690,9 @@ describe("HttpRequest", () => {
       auth: { type: "bearer", envVar: TOKEN_VAR },
       parseJson: true,
     });
-    expect(result.json.authorization).toBe("Bearer s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: "Bearer s3cret-token", apiKey: null }]);
+    // The server repeated it back; the result does not.
+    expect(result.json.authorization).toBe("Bearer <redacted>");
     expect(result.requestHeaders["Authorization"]).toBe("<redacted>");
     expect(JSON.stringify(result.requestHeaders)).not.toContain("s3cret-token");
   });
@@ -645,7 +703,8 @@ describe("HttpRequest", () => {
       auth: { type: "header", envVar: TOKEN_VAR, headerName: "X-Api-Key" },
       parseJson: true,
     });
-    expect(result.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: "s3cret-token" }]);
+    expect(result.json.apiKey).toBe("<redacted>");
   });
 
   test("a header-type auth secret is redacted in the echo, not just the Authorization one", async () => {
@@ -655,7 +714,7 @@ describe("HttpRequest", () => {
       parseJson: true,
     });
     // The server really did receive it...
-    expect(result.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: "s3cret-token" }]);
     // ...and the model really does not.
     expect(result.requestHeaders["X-Api-Key"]).toBe("<redacted>");
     expect(JSON.stringify(result.requestHeaders)).not.toContain("s3cret-token");
@@ -667,7 +726,8 @@ describe("HttpRequest", () => {
       auth: { type: "header", envVar: TOKEN_VAR, headerName: "X-Api-Key" },
       parseJson: true,
     });
-    expect(same.json.apiKey).toBe("s3cret-token");
+    expect(echoSeen.at(-1)).toEqual({ authorization: null, apiKey: "s3cret-token" });
+    expect(same.json.apiKey).toBe("<redacted>");
     expect(same.credentialsDropped).toBe(false);
 
     const cross = await run(httpRequest, {
@@ -677,6 +737,7 @@ describe("HttpRequest", () => {
     });
     expect(cross.json.server).toBe("other");
     expect(cross.json.apiKey).toBeNull();
+    expect(echoSeen.at(-1)).toEqual({ authorization: null, apiKey: null });
     expect(cross.credentialsDropped).toBe(true);
   });
 
@@ -709,13 +770,44 @@ describe("HttpRequest", () => {
     expect(preserved.json.body).toBe('{"a":1}');
   });
 
+  test("net-review: a 301 or 302 after a PUT, PATCH or DELETE keeps the method and body", async () => {
+    let checked = 0;
+    for (const path of ["/redirect-301", "/redirect-same"]) {
+      for (const method of ["PUT", "PATCH", "DELETE"] as const) {
+        const moved = await run(httpRequest, {
+          url: `${origin}${path}`,
+          method,
+          body: '{"a":1}',
+          parseJson: true,
+        });
+        expect({ path, method, seen: moved.json.method, body: moved.json.body }).toEqual({
+          path,
+          method,
+          seen: method,
+          body: '{"a":1}',
+        });
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(6);
+    // A POST still becomes a GET on a 301.
+    const post = await run(httpRequest, {
+      url: `${origin}/redirect-301`,
+      method: "POST",
+      body: '{"a":1}',
+      parseJson: true,
+    });
+    expect(post.json).toMatchObject({ method: "GET", body: "" });
+  });
+
   test("a same-origin redirect keeps the credential", async () => {
     const result = await run(httpRequest, {
       url: `${origin}/redirect-same`,
       auth: { type: "bearer", envVar: TOKEN_VAR },
       parseJson: true,
     });
-    expect(result.json.authorization).toBe("Bearer s3cret-token");
+    expect(echoSeen).toEqual([{ authorization: "Bearer s3cret-token", apiKey: null }]);
+    expect(result.json.authorization).toBe("Bearer <redacted>");
     expect(result.credentialsDropped).toBe(false);
     expect(result.redirects.length).toBe(1);
   });
@@ -728,6 +820,7 @@ describe("HttpRequest", () => {
     });
     expect(result.json.server).toBe("other");
     expect(result.json.authorization).toBeNull();
+    expect(echoSeen).toEqual([{ authorization: null, apiKey: null }]);
     expect(result.credentialsDropped).toBe(true);
   });
 
@@ -961,6 +1054,29 @@ describe("HttpBatch", () => {
   // healthy request exposed to the failure: still in flight when the failure
   // lands, or not yet started when the deadline fires.
 
+  test("a transport failure that lands after the deadline's time is reported as itself", async () => {
+    // The stub holds the event loop past the 50ms per-request deadline and
+    // then fails; the deadline's timer is held, so however slow the runner,
+    // the failure is what ends the request while the clock says the time is
+    // up — no race against the timer or real I/O.
+    _setRawFetch(async () => {
+      busy(80);
+      throw new TypeError("fetch failed: ECONNRESET");
+    });
+    try {
+      const result = await withTimersHeld(50, () =>
+        run(httpBatch, { requests: [{ url: `${origin}/json` }], timeoutMs: 50 }),
+      );
+      // 0.7.0 said "deadline elapsed before the request completed", off the
+      // clock, and the reset was never mentioned.
+      expect(result.results[0].error).toBe(
+        "TypeError: fetch failed: ECONNRESET (the deadline had also elapsed)",
+      );
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
+
   test("a failure never cancels a sibling that is still in flight", async () => {
     // The refused origin fails before any I/O; /slow is then mid-request for
     // two seconds. An abort that fanned out from the failure would reach it.
@@ -1035,8 +1151,12 @@ describe("HttpBatch", () => {
       requests: [{ url: `${origin}/echo` }, { url: `${origin}/echo` }],
       auth: { type: "bearer", envVar: TOKEN_VAR },
     });
+    expect(echoSeen).toEqual([
+      { authorization: "Bearer s3cret-token", apiKey: null },
+      { authorization: "Bearer s3cret-token", apiKey: null },
+    ]);
     for (const entry of result.results) {
-      expect(JSON.parse(entry.body).authorization).toBe("Bearer s3cret-token");
+      expect(JSON.parse(entry.body).authorization).toBe("Bearer <redacted>");
     }
   });
 });
@@ -1266,7 +1386,9 @@ describe("HeadRequest / UrlReachable / LinkCheck", () => {
     });
     expect(result.checked).toBe(3);
     expect(result.okCount).toBe(1);
-    expect(result.brokenCount).toBe(2);
+    // The 404 is broken; the URL the allow-list refused was never checked.
+    expect(result.brokenCount).toBe(1);
+    expect(result.refusedCount).toBe(1);
     expect(result.results.map((r: { url: string }) => r.url)).toEqual([
       `${origin}/json`,
       `${origin}/status/404`,
@@ -1353,21 +1475,90 @@ describe("SseRead", () => {
   });
 
   test("the deadline stops a stream that never terminates", async () => {
-    // The budget has to outlast connecting and fall well short of the
-    // stream, or the test measures the runner rather than the deadline. At
-    // 12ms against a stream that ended after four events it measured both,
-    // and on CI the connection itself did not finish in time.
+    // The budget has to cover connecting, the response head AND the first
+    // event on a contended runner, and fall far short of the stream (one
+    // event per 5 ms or more, for at least 50 s). CI has taken 300-375 ms
+    // for a single loopback request, so 300 ms raced the runner: a deadline
+    // before the head came back as a plain failure string, one before the
+    // first event as count 0 (C117; #481 fixed the same race in HttpBatch).
+    // 2 s is far above the first and far below the second. maxEvents is the
+    // schema's maximum, and at 5 ms an event it cannot pre-empt the deadline.
     const started = performance.now();
     const result = await run(sseRead, {
       url: `${origin}/sse-forever`,
-      maxEvents: 10_000,
-      timeoutMs: 300,
+      maxEvents: 1_000,
+      timeoutMs: 2_000,
     });
     expect(result.stoppedBy).toBe("deadline");
     expect(result.count).toBeGreaterThan(0);
     // It stopped because of the budget, not because the stream ran out.
     expect(performance.now() - started).toBeLessThan(10_000);
   }, 20_000);
+
+  test("half a second of connect latency still leaves the deadline to end the read", async () => {
+    // The latency CI has shown, and more, injected in front of the real
+    // fetch: the 300 ms budget this test file used to give failed here.
+    _setRawFetch(async (req) => {
+      await Bun.sleep(500);
+      return fetch(req, { decompress: false } as RequestInit);
+    });
+    try {
+      const result = await run(sseRead, {
+        url: `${origin}/sse-forever`,
+        maxEvents: 1_000,
+        timeoutMs: 2_000,
+      });
+      expect(result.stoppedBy).toBe("deadline");
+      expect(result.count).toBeGreaterThan(0);
+    } finally {
+      _setRawFetch(undefined);
+    }
+  }, 20_000);
+
+  test("a cancel that lands after the deadline's time, before its timer, is not a deadline", async () => {
+    // The stream's second read holds the event loop past the 50 ms deadline
+    // and then the runtime cancels: the clock says "expired", the cause is
+    // the cancel. 0.7.0 asked the clock and said stoppedBy "deadline".
+    const runtime = new AbortController();
+    let reads = 0;
+    _setRawFetch(async () => {
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            reads++;
+            if (reads === 1) {
+              controller.enqueue(new TextEncoder().encode("event: tick\ndata: 1\n\n"));
+              return;
+            }
+            busy(80);
+            runtime.abort();
+          },
+        },
+        // Pulled only when read, so the first event is taken before the
+        // second read cancels.
+        new CountQueuingStrategy({ highWaterMark: 0 }),
+      );
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    });
+    try {
+      // The deadline's timer is held, so it cannot fire first on a slow
+      // runner: the clock runs out, and the cancel is what ends the read.
+      const out = await withTimersHeld(50, () =>
+        sseRead.execute(
+          { url: `${origin}/sse`, maxEvents: 10, timeoutMs: 50 },
+          { toolUseId: "t", signal: runtime.signal },
+        ),
+      );
+      const result = JSON.parse(String(out));
+      expect({ stoppedBy: result.stoppedBy, count: result.count, reads }).toEqual({
+        stoppedBy: "error",
+        count: 1,
+        reads: 2,
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
 
   test("events after the terminator in the same chunk are not returned", async () => {
     const result = await run(sseRead, {
@@ -1439,6 +1630,16 @@ describe("RobotsCheck / SitemapParse / FeedParse", () => {
     );
     expect(await run(sitemapParse, {})).toContain("either text or url");
   });
+
+  test("FeedParse on a hostile tag parses in milliseconds rather than holding the loop (C091)", async () => {
+    const hostile = `<rss version="2.0"><channel x${"y".repeat(40_000)}><title>T</title><item><title>a</title></item></channel></rss>`;
+    const t0 = performance.now();
+    const result = await run(feedParse, { text: hostile });
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(result.kind).toBe("rss");
+    expect(result.title).toBe("T");
+    expect(result.entries.map((e: { title: string }) => e.title)).toEqual(["a"]);
+  }, 20_000);
 
   test("FeedParse reads a fetched feed and keeps its order", async () => {
     const result = await run(feedParse, { url: `${origin}/feed.xml` });
@@ -1625,6 +1826,43 @@ describe("DnsLookup / TlsInspect", () => {
     expect(await run(tlsInspect, { host: "127.0.0.1", port: main.port })).toContain("SSRF");
   });
 
+  test("TlsInspect says a service that does not speak TLS presented no certificate", async () => {
+    // Two services that answer a ClientHello with something other than TLS.
+    // On this runtime the handshake callback still fires, with an empty
+    // certificate, a cipher named null and "TLSv1.2" — which 0.7.0 reported
+    // as a certificate with the wrong name.
+    const speakers = [
+      (socket: import("node:net").Socket) => socket.write("SSH-2.0-OpenSSH_9.6\r\n"),
+      (socket: import("node:net").Socket) =>
+        socket.once("data", () =>
+          socket.end("HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"),
+        ),
+    ];
+    const outs: string[] = [];
+    for (const speak of speakers) {
+      const server = createTcpServer(speak);
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      const port = (server.address() as { port: number }).port;
+      try {
+        registerHttpConfig({ allowed_origins: [`https://127.0.0.1:${port}`] });
+        outs.push(
+          String(
+            await tlsInspect.execute({
+              host: "127.0.0.1",
+              port,
+              servername: "crewhaus.test",
+              timeoutMs: 10_000,
+            }),
+          ),
+        );
+      } finally {
+        server.close();
+      }
+    }
+    expect(outs.filter((o) => !o.includes("no TLS handshake with 127.0.0.1:"))).toEqual([]);
+    expect(outs.filter((o) => o.includes('"protocol"') || o.includes('"certificate"'))).toEqual([]);
+  });
+
   test.skipIf(!hasOpenssl())(
     "TlsInspect reads a real certificate chain from a local TLS server",
     async () => {
@@ -1636,8 +1874,13 @@ describe("DnsLookup / TlsInspect", () => {
           "openssl",
           "req",
           "-x509",
+          // An EC key: RSA-2048 keygen is the heavy-tailed part of this test
+          // (70-670 ms locally), and TlsInspect reports nothing about the
+          // key type, so P-256 loses no coverage.
           "-newkey",
-          "rsa:2048",
+          "ec",
+          "-pkeyopt",
+          "ec_paramgen_curve:prime256v1",
           "-nodes",
           "-days",
           "30",
@@ -1650,7 +1893,13 @@ describe("DnsLookup / TlsInspect", () => {
           "-out",
           certPath,
         ]);
-        if (made.exitCode !== 0) return; // no usable openssl — nothing to assert
+        // skipIf covers a machine with no openssl. One that has it but cannot
+        // build the fixture is a failure, not a pass with nothing asserted.
+        expect(
+          made.exitCode === 0
+            ? ""
+            : `openssl exited ${made.exitCode}: ${made.stderr.toString().trim()}`,
+        ).toBe("");
 
         const tlsServer = Bun.serve({
           port: 0,
@@ -1672,6 +1921,7 @@ describe("DnsLookup / TlsInspect", () => {
             "DNS:crewhaus.test",
             "IP Address:127.0.0.1",
           ]);
+          expect(typeof result.cipher).toBe("string");
           // Self-signed: the handshake completes, but nothing vouches for it.
           expect(result.authorized).toBe(false);
           expect(result.authorizationError).toBeDefined();
@@ -1682,6 +1932,9 @@ describe("DnsLookup / TlsInspect", () => {
         rmSync(dir, { recursive: true, force: true });
       }
     },
+    // Key generation plus a TLS handshake: 0.8-2.9 s on CI with RSA, where
+    // bun's default budget is 5 s.
+    20_000,
   );
 });
 

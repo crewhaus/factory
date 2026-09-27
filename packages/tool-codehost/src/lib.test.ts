@@ -10,7 +10,16 @@
  */
 import { describe, expect, test } from "bun:test";
 import { baseUrlProblem, normalizeBaseUrl } from "./api";
-import { excerptLog, failureRule, looksLikeFailure, normalizeLogLine } from "./lib/logs";
+import {
+  GITLAB_SECTION,
+  MATCH_WINDOW_CHARS,
+  RUNNER_MARKER,
+  WORKFLOW_COMMAND,
+  excerptLog,
+  failureRule,
+  looksLikeFailure,
+  normalizeLogLine,
+} from "./lib/logs";
 import { nextPageFrom, parseLinkHeader, rateHeadersFrom } from "./lib/page";
 import {
   buildQuery,
@@ -652,6 +661,121 @@ describe("excerptLog", () => {
     expect(excerpt.totalLines).toBe(2);
     expect(excerpt.firstError?.text).toBe("error: killed");
     expect(excerpt.firstError?.line).toBe(2);
+  });
+});
+
+// A CI log line is written by whoever's pull request ran the job, and a
+// synchronous RegExp cannot be interrupted by the call's deadline: one
+// quadratic pattern froze the whole process for as long as the match took.
+// 60 000 characters is deliberate. The 0.7.0 patterns took about 2 s on it
+// locally (so a regression fails here instead of hanging CI, as a megabyte
+// line would), and the linear ones take well under a millisecond.
+describe("excerptLog on hostile lines (C011)", () => {
+  const N = 60_000;
+  const hostile: Array<[string, string]> = [
+    ["a command with a long space run and no closing ::", `::error${" ".repeat(N)}x\n`],
+    ["a command with a long tab run and no closing ::", `::x${"\t".repeat(N)}y\n`],
+    [
+      "a GitLab section with a space run and a U+2028",
+      `section_start:1:build${" ".repeat(N)}b\u2028c\n`,
+    ],
+    ["a closed command with a space run and a U+2028", `::error${" ".repeat(N)}::b\u2028c\n`],
+    ["a runner marker with a long payload and a U+2028", `##[error]${"x".repeat(N)} \u2028`],
+  ];
+  for (const [name, line] of hostile) {
+    test(`${name} is matched in linear time`, () => {
+      const t0 = performance.now();
+      const excerpt = excerptLog(line);
+      expect(performance.now() - t0).toBeLessThan(500);
+      expect(excerpt.totalLines).toBe(1);
+    }, 20_000);
+  }
+
+  test("a line past the match window costs one window, and what is kept is still cut by maxLineChars", () => {
+    const line = `##[error]${"y".repeat(MATCH_WINDOW_CHARS * 4)}`;
+    const excerpt = excerptLog(line, { maxLineChars: 100 });
+    expect(excerpt.annotations).toHaveLength(1);
+    expect(excerpt.annotations[0]?.text).toBe(`${"y".repeat(100)}…`);
+    expect(excerpt.tail[0]).toBe(`##[error]${"y".repeat(91)}…`);
+  });
+
+  test("a payload is taken from the whole line, not the match window", () => {
+    const long = "z".repeat(MATCH_WINDOW_CHARS + 10);
+    const excerpt = excerptLog(`::error::${long}`, { maxLineChars: MATCH_WINDOW_CHARS * 2 });
+    expect(excerpt.annotations[0]?.text).toBe(long);
+  });
+});
+
+describe("the log line patterns keep their meaning (C011)", () => {
+  test("workflow commands are recognised as before", () => {
+    const a = excerptLog("::error file=a.ts,line=3::boom");
+    expect(a.annotations).toEqual([{ level: "error", line: 1, text: "boom" }]);
+    expect(a.firstError?.text).toBe("boom");
+    expect(excerptLog("::warning::w").annotations[0]).toEqual({
+      level: "warning",
+      line: 1,
+      text: "w",
+    });
+    expect(excerptLog("::error   ::spaced").annotations[0]?.text).toBe("spaced");
+    expect(excerptLog("::error x:y").annotations).toEqual([]);
+    expect(excerptLog("::group::G\nerror: here").failingStep).toBe("G");
+    // A line separator inside a payload no longer hides the annotation.
+    expect(excerptLog("::error::msg\u2028tail").annotations[0]?.text).toBe("msg\u2028tail");
+  });
+
+  test("a GitLab section with options still opens its step", () => {
+    const excerpt = excerptLog(
+      "section_start:1756723200:build_script[collapsed=true] Build\nnpm ERR! x",
+    );
+    expect(excerpt.failingStep).toBe("build_script");
+  });
+
+  // The 0.7.0 spellings, kept here only as the oracle for the rewrite.
+  const OLD_COMMAND = /^::([a-z]+)(?:\s+[^:]*)?::(.*)$/;
+  const OLD_SECTION = /^section_(start|end):\d+:([A-Za-z0-9_.-]+)(?:\[[^\]]*\])?\s*(.*)$/;
+  const OLD_MARKER = /^##\[([a-z]+)\](.*)$/;
+
+  test("on every short line without a line separator, the rewrite matches exactly what 0.7.0 matched", () => {
+    const alphabet = [
+      ":",
+      " ",
+      "\t",
+      "e",
+      "x",
+      "[",
+      "]",
+      "#",
+      "_",
+      "1",
+      "a",
+      "section_start:1:",
+      "##[error]",
+      "::",
+    ];
+    let seed = 7;
+    const next = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    let compared = 0;
+    for (let i = 0; i < 20_000; i++) {
+      let line = "";
+      const len = next(10);
+      for (let j = 0; j < len; j++) line += alphabet[next(alphabet.length)];
+      const pairs: Array<[RegExp, RegExp, number[]]> = [
+        [WORKFLOW_COMMAND, OLD_COMMAND, [1, 2]],
+        [GITLAB_SECTION, OLD_SECTION, [1, 2]],
+        [RUNNER_MARKER, OLD_MARKER, [1, 2]],
+      ];
+      for (const [now, old, groups] of pairs) {
+        const a = line.match(now);
+        const b = line.match(old);
+        expect(a === null).toBe(b === null);
+        if (a !== null && b !== null) for (const g of groups) expect(a[g]).toBe(b[g]);
+        compared++;
+      }
+    }
+    expect(compared).toBe(60_000);
   });
 });
 

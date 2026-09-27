@@ -1927,6 +1927,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "             channel-plugins-at-start, provider-tool-cap,\n" +
         "             provider-tool-cap-unverified,\n" +
         "             cli-autodistill-toolchain, model-plan-candidate-only,\n" +
+        "             model-plan-tool-config-widens,\n" +
         "             model-capabilities-unknown, model-sunset,\n" +
         "             model-strongest-crosses-provider) still print but\n" +
         "             never fail --strict. (The FR-002 scope\n" +
@@ -2184,7 +2185,10 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   //
   // 0.7.1 — mcp-server-name is informational for the same reason as
   // model-sunset: the key ran on 0.7.0, and a spec that compiled under
-  // --strict before the upgrade must still compile after it.
+  // --strict before the upgrade must still compile after it. So is
+  // model-plan-tool-config-widens: a pool candidate's tool_config REPLACES
+  // the agent-level block by design, the wider list may be intended, and the
+  // same spec compiled under --strict on 0.7.0.
   //
   // 0.7.1 — provider-tool-cap and provider-tool-cap-unverified are
   // informational for that reason too. A fallback, tier or pool model over
@@ -2201,6 +2205,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     "provider-tool-cap",
     "provider-tool-cap-unverified",
     "model-plan-candidate-only",
+    "model-plan-tool-config-widens",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",
     "model-sunset",

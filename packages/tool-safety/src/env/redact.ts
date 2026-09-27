@@ -34,27 +34,135 @@ export type RedactOptions = {
 const DEFAULT_MIN_LENGTH = 6;
 
 /**
+ * A credential sent inside a larger value whose START is not secret: a
+ * Basic header's `user:secret`, where `user:` is the account name. Its
+ * spellings are redacted whole, like any secret, but the start of one left
+ * at a cut counts only once it runs past `publicPrefix`: a result that ends
+ * with the account name (a login, an assignee, a URL ending `/users/<name>`)
+ * is not a credential and is left alone (net regression review).
+ */
+export type ComposedSecret = {
+  /** The part that is not secret, sent first: `user:` for Basic. */
+  readonly publicPrefix: string;
+  /** The credential that follows it. */
+  readonly secret: string;
+};
+
+/** A credential value, as the redactors take it. */
+export type SecretValue = string | ComposedSecret;
+
+/** A spelling of a secret, and how many of its leading characters spell only the public prefix. */
+type Form = { readonly form: string; readonly publicLength: number };
+
+/**
+ * The encodings a secret is echoed in, each with the length its encoding of
+ * a public prefix takes at the start of the encoded whole. The character-wise
+ * encodings map a prefix to a prefix; base64 fixes one character per six
+ * bits, so the characters wholly inside the prefix's bytes are public.
+ */
+const ENCODINGS: readonly {
+  readonly encode: (v: string) => string;
+  readonly publicLength: (prefix: string) => number;
+}[] = [
+  { encode: (v) => v, publicLength: (p) => p.length },
+  { encode: (v) => encodeURIComponent(v), publicLength: (p) => encodeURIComponent(p).length },
+  { encode: (v) => Buffer.from(v, "utf8").toString("base64"), publicLength: base64PublicLength },
+  {
+    encode: (v) => Buffer.from(v, "utf8").toString("base64").replace(/=+$/, ""),
+    publicLength: base64PublicLength,
+  },
+  { encode: (v) => Buffer.from(v, "utf8").toString("base64url"), publicLength: base64PublicLength },
+  { encode: jsonInner, publicLength: (p) => jsonInner(p).length },
+  // `\/` is a legal JSON escape for `/`, and PHP's json_encode and others
+  // write every solidus that way; JSON.stringify never does.
+  {
+    encode: (v) => jsonInner(v).replaceAll("/", "\\/"),
+    publicLength: (p) => jsonInner(p).replaceAll("/", "\\/").length,
+  },
+];
+
+function jsonInner(v: string): string {
+  return JSON.stringify(v).slice(1, -1);
+}
+
+function base64PublicLength(prefix: string): number {
+  return Math.floor((Buffer.byteLength(prefix, "utf8") * 8) / 6);
+}
+
+/** Every spelling of `value`, with its public length (0 for a plain secret). */
+function spellingsOf(value: SecretValue): Form[] {
+  const prefix = typeof value === "string" ? "" : value.publicPrefix;
+  const secret = typeof value === "string" ? value : value.secret;
+  const out = new Map<string, number>();
+  for (const s of new Set([secret, secret.trim()])) {
+    for (const { encode, publicLength } of ENCODINGS) {
+      let form: string;
+      let pub: number;
+      try {
+        form = encode(prefix + s);
+        pub = prefix === "" ? 0 : publicLength(prefix);
+      } catch {
+        continue; // a lone surrogate cannot be URL-encoded; the other spellings still count
+      }
+      if (form === "" || form.length <= pub) continue;
+      const seen = out.get(form);
+      out.set(form, seen === undefined ? pub : Math.min(seen, pub));
+    }
+  }
+  return [...out].map(([form, publicLength]) => ({ form, publicLength }));
+}
+
+/**
  * The spellings a secret takes on the way back: as is, trimmed (a value
  * read from a file often ends in a newline), URL-encoded, base64 and
- * base64url, and JSON-escaped. A composite (a Basic header's
- * `base64(user:secret)`) cannot be derived from the secret alone: pass it
- * as a value of its own.
+ * base64url, and JSON-escaped (with and without `\/` for `/`). A composite
+ * (a Basic header's `user:secret`) cannot be derived from the secret alone:
+ * pass it as a {@link ComposedSecret}, whose spellings are those of the
+ * whole.
  */
-export function secretForms(value: string): string[] {
-  const forms = new Set<string>();
-  const add = (form: string): void => {
-    if (form !== "") forms.add(form);
-  };
-  for (const v of new Set([value, value.trim()])) {
-    add(v);
-    add(encodeURIComponent(v));
-    const b64 = Buffer.from(v, "utf8").toString("base64");
-    add(b64);
-    add(b64.replace(/=+$/, ""));
-    add(Buffer.from(v, "utf8").toString("base64url"));
-    add(JSON.stringify(v).slice(1, -1));
+export function secretForms(value: SecretValue): string[] {
+  return spellingsOf(value).map((f) => f.form);
+}
+
+/** The forms a redactor looks for: every spelling whose secret part is at least `minLength` long. */
+function formsOf(values: Iterable<SecretValue | undefined>, minLength: number): Form[] {
+  const forms = new Map<string, number>();
+  for (const value of values) {
+    if (value === undefined) continue;
+    const secret = typeof value === "string" ? value : value.secret;
+    if (typeof secret !== "string" || secret.trim().length < minLength) continue;
+    for (const { form, publicLength } of spellingsOf(value)) {
+      if (form.length < minLength) continue;
+      const seen = forms.get(form);
+      forms.set(form, seen === undefined ? publicLength : Math.min(seen, publicLength));
+    }
   }
-  return [...forms];
+  return [...forms]
+    .map(([form, publicLength]) => ({ form, publicLength }))
+    .sort((a, b) => b.form.length - a.form.length);
+}
+
+/**
+ * How many characters at the end of `text` are the START of `form` (a
+ * proper prefix, at least `min` long), or 0. Checked from the longest
+ * candidate down, and only where the first character matches, so the cost
+ * is one pass over the form's length.
+ */
+function partialAtEnd(text: string, form: string, min: number): number {
+  const first = form.charCodeAt(0);
+  for (let p = Math.max(0, text.length - form.length + 1); p <= text.length - min; p++) {
+    if (text.charCodeAt(p) === first && form.startsWith(text.slice(p))) return text.length - p;
+  }
+  return 0;
+}
+
+/** How many characters at the start of `text` are the END of `form` (a proper suffix, at least `min` long), or 0. */
+function partialAtStart(text: string, form: string, min: number): number {
+  const last = form.charCodeAt(form.length - 1);
+  for (let n = Math.min(form.length - 1, text.length); n >= min; n--) {
+    if (text.charCodeAt(n - 1) === last && form.endsWith(text.slice(0, n))) return n;
+  }
+  return 0;
 }
 
 /**
@@ -63,31 +171,66 @@ export function secretForms(value: string): string[] {
  * strings. Longest forms first, so a secret that contains another is
  * replaced whole. Matching is literal (`split`/`join`): a secret full of
  * regex metacharacters is matched as written.
+ *
+ * A cut can split a secret: a byte cap, a preview, a window. What is left at
+ * the edge is a prefix (or suffix) that no whole form matches, and it can be
+ * every character of the secret but one. So, as a backstop, a string that
+ * ENDS with the start of a form, or STARTS with the end of one, has that run
+ * replaced too, when it holds at least `minLength` characters of the secret
+ * (a {@link ComposedSecret}'s public prefix does not count towards them). A
+ * caller that knows it cut a string should also trim it with
+ * {@link trimSecretTail}, which removes a partial run of any length.
  */
 export function createSecretRedactor(
-  values: Iterable<string | undefined>,
+  values: Iterable<SecretValue | undefined>,
   options: RedactOptions = {},
 ): (text: string) => string {
   const minLength = options.minLength ?? DEFAULT_MIN_LENGTH;
   const placeholder = options.placeholder ?? REDACTED;
-  const forms = new Set<string>();
-  for (const value of values) {
-    if (typeof value !== "string" || value.trim().length < minLength) continue;
-    for (const form of secretForms(value)) if (form.length >= minLength) forms.add(form);
-  }
-  const ordered = [...forms].sort((a, b) => b.length - a.length);
+  const ordered = formsOf(values, minLength);
   if (ordered.length === 0) return (text) => text;
   return (text: string): string => {
     let out = text;
-    for (const form of ordered) if (out.includes(form)) out = out.split(form).join(placeholder);
-    return out;
+    for (const { form } of ordered) if (out.includes(form)) out = out.split(form).join(placeholder);
+    let tail = 0;
+    let head = 0;
+    for (const { form, publicLength } of ordered) {
+      tail = Math.max(tail, partialAtEnd(out, form, publicLength + minLength));
+      head = Math.max(head, partialAtStart(out, form, minLength));
+    }
+    if (head === 0 && tail === 0) return out;
+    if (head + tail >= out.length) return placeholder;
+    return `${head > 0 ? placeholder : ""}${out.slice(head, out.length - tail)}${tail > 0 ? placeholder : ""}`;
   };
+}
+
+/**
+ * `text`, which the caller has just CUT (a byte cap, a preview), without a
+ * trailing run that is the start of a known secret form — what a cut
+ * through an echoed credential leaves behind. Any run holding at least
+ * `minPartial` characters of the secret (default 1) is removed: the caller
+ * knows the text was cut, so a partial match is the secret, not a
+ * coincidence. A {@link ComposedSecret}'s public prefix alone (a Basic
+ * username at the cut) is not a secret and stays. Whole forms are left for
+ * {@link createSecretRedactor}.
+ */
+export function trimSecretTail(
+  text: string,
+  values: Iterable<SecretValue | undefined>,
+  options: { readonly minLength?: number; readonly minPartial?: number } = {},
+): string {
+  const forms = formsOf(values, options.minLength ?? DEFAULT_MIN_LENGTH);
+  const minPartial = options.minPartial ?? 1;
+  let tail = 0;
+  for (const { form, publicLength } of forms)
+    tail = Math.max(tail, partialAtEnd(text, form, publicLength + minPartial));
+  return tail > 0 ? text.slice(0, text.length - tail) : text;
 }
 
 /** `text` with every known secret value replaced. See {@link createSecretRedactor}. */
 export function redactKnownSecrets(
   text: string,
-  values: Iterable<string | undefined>,
+  values: Iterable<SecretValue | undefined>,
   options: RedactOptions = {},
 ): string {
   return createSecretRedactor(values, options)(text);
@@ -101,7 +244,7 @@ export function redactKnownSecrets(
  */
 export function redactKnownSecretsDeep<T>(
   value: T,
-  values: Iterable<string | undefined>,
+  values: Iterable<SecretValue | undefined>,
   options: RedactOptions = {},
 ): T {
   const redact = createSecretRedactor(values, options);

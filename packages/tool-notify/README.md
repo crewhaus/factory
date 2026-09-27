@@ -14,7 +14,7 @@ is a different and more dangerous act.
 ```yaml
 tools:
   - all-notify          # every tool below
-  - -SmsSend            # ...except this one
+  - -smsSend            # ...except this one (a tools: list takes the camelCase key)
 ```
 
 | Tool | What it does |
@@ -44,7 +44,13 @@ The tools worth reaching for first are the ones that send nothing.
 about the same broken host. `QuietHours` is the reason an overnight alert waits
 until 09:00 when it will read identically. `RateLimitGate` is the reason a loop
 does not re-report the same thing on every iteration. All three are pure, take
-`now` as an argument, and compose:
+`now` as an argument, and compose. `now` (and an email's `date`) must name
+its zone. Write it as ISO-8601 (`2026-09-17T03:14:00Z` or `…+09:00`) or
+as an email Date header (`Thu, 17 Sep 2026 03:14:00 +0000`). JavaScript's
+`Date#toString()` form and the US zones an email header may use (`EST`,
+`PDT`, …) are read too. A time without a zone is refused, because it would
+mean the host's local time and differ between machines. So is an abbreviation
+such as `CET` or `IST`, which names different zones in different places:
 
 ```
 NotifyDigest → QuietHours → RateLimitGate → MessageTemplate → ChatPost
@@ -74,7 +80,11 @@ re-deriving it — a second outbound surface with a weaker gate is the same hole
 twice. In summary:
 
 - **Empty allow-list denies everything.** Separately for origins, for SMTP
-  hosts, and for email recipients. There is no "allow all" value.
+  hosts, for email recipients, for SMS numbers (`allowed_sms_recipients`, in
+  E.164 form or a prefix such as `+44*`) and for push targets
+  (`allowed_push_targets`, exact or a `prefix*`). There is no "allow all"
+  value. A provider that pins the number in `staticFields` and maps no `to`
+  never sends the call's value, so it needs no list.
 - **SSRF refusal is numeric, not textual.** Loopback, link-local (including
   the cloud metadata address), RFC1918, CGNAT, multicast and mDNS are refused
   as an IP literal in any of its encodings — octal, hex, integer, every IPv6
@@ -83,6 +93,11 @@ twice. In summary:
 - **The vetted IP is pinned** for the connection, so a rebinding resolver
   cannot swap in a private address between the check and the socket. The SMTP
   client pins the same way, and still presents and verifies the hostname.
+- **An id names an item; it never moves the request.** A Discord channel,
+  message id or emoji, and `DeliveryCheck`'s message id, are written into a
+  URL path. `.` and `..` survive percent-encoding and the URL parser resolves
+  them, so they are refused, and the path actually requested must be the path
+  built with the value written in.
 - **A send never follows a redirect.** Replaying a body at a new origin, or
   downgrading to a GET that delivers nothing, are both worse than stopping.
   Only `DeliveryCheck` follows, re-running the whole gate on every hop.
@@ -92,7 +107,7 @@ twice. In summary:
 ## Credentials
 
 No tool accepts a secret. Every credential is the **NAME** of an environment
-variable, read at call time:
+variable, read at call time, and only a name you list:
 
 ```yaml
 tool_config:
@@ -101,11 +116,27 @@ tool_config:
     allowed_recipients: ["ops@example.com", "*@team.example.com"]
     allowed_smtp_hosts: ["smtp.example.com"]
     allowed_sender_domains: ["example.com"]
+    allowed_secret_envs: [SLACK_OPS_WEBHOOK, SLACK_BOT_TOKEN]
+    allowed_sms_recipients: ["+15550001111", "+4420*"]
+    allowed_push_targets: ["topic:ops-*"]
 ```
+
+`allowed_secret_envs` covers every name a call supplies: `webhookUrlEnv` and
+`tokenEnv` for the chat tools, `WebhookPost`'s `urlEnv`, `auth.envVar` and
+`signing.secretEnv`, and `EmailSend`'s `usernameEnv` and `passwordEnv`. A call
+may choose among the listed names and can never add one, so it cannot send
+another process secret (your LLM provider key, say) to an allowed origin.
+With no list, every such name is refused. A provider's own `auth.envVar`
+(under `providers`) is yours already and needs no listing, but it is read
+only for that provider's calls.
 
 ```jsonc
 { "platform": "slack", "webhookUrlEnv": "SLACK_OPS_WEBHOOK", "text": "…" }
 ```
+
+In API mode (`apiBaseUrl` plus `tokenEnv`) the variable holds a bot token.
+Discord receives it as `Authorization: Bot <token>` and Slack as
+`Authorization: Bearer <token>`, which is what each platform expects of a bot.
 
 A Slack incoming-webhook URL (`/services/T…/B…/…`) and a Discord one
 (`/api/webhooks/<id>/<token>`) carry their whole authority in the **path**, so
@@ -238,7 +269,10 @@ Stated rather than papered over:
 - **Implicit TLS (port 465) is untested** for the same reason.
 - **The idempotency ledger is per-process.** A retry after a restart will send
   again. The ledger is the second line of defence; the key is also passed to
-  the provider, which is the first.
+  the provider, which is the first. A key names one message: the same key
+  with a different destination or content is refused and sends nothing,
+  while a retry that changes only its timeout, byte cap, retry pacing or
+  clock reading (`date`, a signature timestamp) returns the first result.
 - **`ChatUpdate` does not return the previous text,** because the platform
   does not give it back.
 - **`EmailSendPreflight` does not fold provider-specific aliases.** Two

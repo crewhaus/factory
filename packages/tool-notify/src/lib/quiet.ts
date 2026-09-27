@@ -70,25 +70,57 @@ type Zoned = {
   readonly second: number;
 };
 
-/** A cached formatter per timezone — building one per call is the slow path. */
-const formatters = new Map<string, Intl.DateTimeFormat>();
+/**
+ * The zone's canonical name: `america/new_york` is `America/New_York`,
+ * `-0800` is `-08:00`. Throws a RangeError for a zone the runtime does not
+ * know. The formatter it builds to ask is thrown away, never cached.
+ */
+function canonicalZone(timeZone: string): string {
+  return new Intl.DateTimeFormat("en-US", { timeZone }).resolvedOptions().timeZone;
+}
 
+/**
+ * Formatters by CANONICAL zone name, least recently used first, at most
+ * {@link MAX_FORMATTERS} of them. Building one per call is the slow path,
+ * but a cache keyed by whatever the caller spelled is unbounded: Intl
+ * accepts any casing of an IANA name and several spellings of every offset,
+ * each formatter holds tens of kilobytes, and 0.7.0 kept every one for the
+ * life of the process (20 000 case variants of one zone cost about 730 MB).
+ * Canonical names alone are not a bound either — the offset zones number in
+ * the thousands — so the cache is also capped.
+ */
+const formatters = new Map<string, Intl.DateTimeFormat>();
+const MAX_FORMATTERS = 64;
+
+/** `timeZone` must already be canonical (see {@link canonicalZone}). */
 function formatterFor(timeZone: string): Intl.DateTimeFormat {
   let formatter = formatters.get(timeZone);
-  if (formatter === undefined) {
-    formatter = new Intl.DateTimeFormat("en-US", {
-      timeZone,
-      hourCycle: "h23",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
+  if (formatter !== undefined) {
+    // Most recently used moves to the back.
+    formatters.delete(timeZone);
     formatters.set(timeZone, formatter);
+    return formatter;
   }
+  formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  while (formatters.size >= MAX_FORMATTERS) {
+    formatters.delete(formatters.keys().next().value as string);
+  }
+  formatters.set(timeZone, formatter);
   return formatter;
+}
+
+/** Test-only: how many formatters the cache holds. */
+export function __quietFormatterCountForTest(): number {
+  return formatters.size;
 }
 
 /** The wall-clock reading of an instant in a timezone. */
@@ -153,7 +185,7 @@ function isoDate(z: Zoned): string {
 /** Validate a schedule up front, so a bad window is one error and not silence. */
 export function validateSchedule(schedule: QuietSchedule): string | null {
   try {
-    formatterFor(schedule.timezone);
+    canonicalZone(schedule.timezone);
   } catch {
     return `"${schedule.timezone}" is not a timezone this runtime knows — use an IANA name such as Europe/Berlin`;
   }
@@ -223,9 +255,12 @@ const SEARCH_DAYS = 9;
  * weekly schedule; a schedule that blacks out more than nine consecutive
  * days is reported as such rather than answered with a guess.
  */
-export function quietDecision(schedule: QuietSchedule, nowMs: number): QuietDecision | QuietError {
-  const invalid = validateSchedule(schedule);
+export function quietDecision(given: QuietSchedule, nowMs: number): QuietDecision | QuietError {
+  const invalid = validateSchedule(given);
   if (invalid !== null) return { error: invalid };
+  // Every lookup below goes through the cache, so it is keyed by the zone,
+  // not by how this call happened to spell it.
+  const schedule: QuietSchedule = { ...given, timezone: canonicalZone(given.timezone) };
 
   const z = zonedParts(nowMs, schedule.timezone);
   const local = {

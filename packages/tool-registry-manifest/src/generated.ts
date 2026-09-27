@@ -1983,7 +1983,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "downloadFile",
     name: "DownloadFile",
     description:
-      "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination.",
+      "Download a URL to a path inside the workspace under a byte cap, optionally verifying an expected sha256 before the file is kept. Use it to bring an artifact, dataset or fixture onto disk without piping a response body through a model's context. The download is written to a temporary file and renamed only after the cap and the checksum both pass, so a failed transfer never leaves a half-written file at the destination. A body that contains the credential the call sent (a server echoing it) is refused, because a file is not scrubbed the way a result is.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -3658,7 +3658,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "healthProbe",
     name: "HealthProbe",
     description:
-      "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have. The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
+      "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have; one the allow-list or the SSRF check refused was never sent and comes back as refused, not unhealthy (both with ok null). The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -3892,7 +3892,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "httpRequest",
     name: "HttpRequest",
     description:
-      "Issue one HTTP request to an allow-listed origin, with an env-resolved auth profile, a redirect policy, a retry-on-status rule and a deadline, returning status, headers, body and timing. Use it when Fetch is not enough because the call needs authentication, a non-default redirect policy, or an automatic retry on 429/503 that would otherwise cost a model turn per attempt. It does not stream, does not keep cookies between calls, and its elapsedMs field is wall-clock, so it differs run to run. A 301, 302 or 303 answer to a non-GET is followed as a GET with the body dropped, as HTTP requires, so a POST is never replayed at a hop the caller did not ask for.",
+      "Issue one HTTP request to an allow-listed origin, with an env-resolved auth profile, a redirect policy, a retry-on-status rule and a deadline, returning status, headers, body and timing. Use it when Fetch is not enough because the call needs authentication, a non-default redirect policy, or an automatic retry on 429/503 that would otherwise cost a model turn per attempt. It does not stream, does not keep cookies between calls, and its elapsedMs field is wall-clock, so it differs run to run. A 303 answer, or a 301 or 302 answer to a POST, is followed as a GET with the body dropped, as the Fetch standard and browsers do, so a POST is never replayed at a hop the caller did not ask for; a PUT, PATCH or DELETE keeps its method and body on a 301 or 302, as on a 307 or 308.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -4719,7 +4719,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "linkCheck",
     name: "LinkCheck",
     description:
-      "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable.",
+      "Check a list of URLs for reachability with a concurrency cap and a shared deadline, returning a status per URL in input order. Use it to validate the links in a document or a sitemap in one call instead of one per link. It reports what each server answered and does not judge content, so a soft 404 that returns HTTP 200 is reported as reachable. A URL the allow-list or the SSRF check refuses (or whose redirect it refuses), and one the sweep deadline left unchecked, is reported as refused or skipped with ok null, and counted apart from the broken links.",
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -7612,7 +7612,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "tlsInspect",
     name: "TlsInspect",
     description:
-      "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock.",
+      "Open a TLS connection to a host and port and report the certificate chain: subject, issuer, validity window, days remaining, SANs and fingerprint. Use it to check an expiry date or confirm which certificate a host is actually serving, instead of shelling out to openssl. It completes the handshake without requiring a valid chain — reporting authorized and authorizationError rather than refusing — so an expired or self-signed certificate can still be examined, and daysRemaining is measured against this machine's clock. The host must be named by an allow-listed origin; the port is the caller's choice on that host (443 by default), and a service on it that does not speak TLS is reported as such.",
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -7958,7 +7958,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "urlReachable",
     name: "UrlReachable",
     description:
-      "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one.",
+      "Probe one URL within a deadline and report whether it answered, with what status, and how long it took. Use it as a bounded connectivity check — is this endpoint up, is the tunnel open — rather than as a health check of what the service returns. Both status and latencyMs are wall-clock facts about one moment, so a passing probe is not a promise about the next one. A probe the allow-list or the SSRF check refuses was never sent, and comes back as reachable null with refused true, not as unreachable.",
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -8268,7 +8268,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "webhookSign",
     name: "WebhookSign",
     description:
-      "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
+      "Produce an HMAC webhook signature header over a payload, in either the timestamped scheme or the plain-body scheme. Use it to sign an outgoing webhook, or to build a realistic fixture for testing a receiver, without a code-execution round trip. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs, and is never echoed; the payload is signed as the exact string given, so re-serialised JSON will not match what a receiver verifies.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -8296,7 +8296,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "webhookVerify",
     name: "WebhookVerify",
     description:
-      "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
+      "Verify an inbound webhook signature header against a payload in constant time, rejecting a stale timestamp as a replay. Use it before acting on any webhook body, because an unverified payload is attacker-controlled input. The secret comes from a named environment variable the operator listed in tool_config.http.allowed_signing_envs. The comparison does not short-circuit on the first differing byte, a timestamped signature outside the tolerance is refused even when its HMAC is correct, and the plain-body scheme carries no timestamp at all — so it offers no replay protection and the result says so.",
     readOnly: true,
     destructive: false,
     scope: "internal",

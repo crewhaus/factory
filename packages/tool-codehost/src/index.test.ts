@@ -15,6 +15,7 @@
  * is proved with the flag in its production position.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { classifyText } from "@crewhaus/prompt-injection-detector";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -400,6 +401,9 @@ async function mainHandler(req: Request): Promise<Response> {
   }
   if (p === "/repos/acme/widget/actions/runs/43/jobs") {
     return jsonRes({ jobs: [{ id: 504, name: "test", conclusion: "failure", steps: [] }] });
+  }
+  if (p === "/repos/acme/widget/actions/runs/45/jobs") {
+    return jsonRes({ jobs: [{ name: "test", conclusion: "failure", steps: [] }] });
   }
   if (p === "/repos/acme/widget/actions/runs/44/jobs") {
     return jsonRes({ jobs: [{ id: 505, name: "test", conclusion: "failure", steps: [] }] });
@@ -1057,6 +1061,19 @@ describe("checks and CI", () => {
     expect(result.excerpt.failingStep).toBe("Run bun test");
     expect(result.excerpt.exitCode).toBe(1);
     expect(result.excerpt.firstError.text).toContain("expected 3 to be 4");
+  });
+
+  test("WorkflowRunLogs' answer for a run with no readable job is not read as an order", async () => {
+    // A result that starts with "run …" is what the prompt-injection
+    // detector's trailing-imperative rule flags, so 0.7.0's wording was
+    // classified suspicious and spent the session's one console warning.
+    const result = String(await workflowRunLogs.execute(gh({ runId: 45 })));
+    expect(result).toStartWith("workflow run 45 reported");
+    expect((await classifyText(result)).classification).toBe("clean");
+    // The detector is live: the 0.7.0 wording is still flagged.
+    expect((await classifyText(result.replace(/^workflow /, ""))).classification).toBe(
+      "suspicious",
+    );
   });
 
   test("WorkflowRunLogs honours an explicit jobId", async () => {

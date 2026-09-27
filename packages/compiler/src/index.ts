@@ -155,6 +155,7 @@ import {
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
 // gate never drags the loop into the compiler-worker's CF bundle.
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
+import { toolConfigWidenings } from "./tool-config-widening";
 
 /**
  * Compile a YAML spec text into a deployable bundle.
@@ -257,11 +258,11 @@ export type LowerOptions = {
  * 0.6.0 the field-precise model-plan notices `"model-plan-ignored-on-shape"`,
  * `"model-plan-ignored-on-slot"`, `"model-plan-candidate-only"`,
  * `"model-plan-self-judge"`, `"model-sunset"`, `"model-capabilities-unknown"`,
- * `"model-strongest-crosses-provider"`, and from 0.7.1 `"provider-tool-cap"`
- * for a model whose provider refuses the site's tool count and
- * `"provider-tool-cap-unverified"` for an `openai/` model over OpenAI's
- * limit, which `OPENAI_BASE_URL` may send elsewhere; both informational),
- * `path` the spec key it concerns
+ * `"model-strongest-crosses-provider"`, and from 0.7.1
+ * `"model-plan-tool-config-widens"`, `"provider-tool-cap"` for a model whose
+ * provider refuses the site's tool count and `"provider-tool-cap-unverified"`
+ * for an `openai/` model over OpenAI's limit, which `OPENAI_BASE_URL` may send
+ * elsewhere; all informational), `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged.
  */
@@ -1052,7 +1053,10 @@ export function checkProviderToolLimits(ir: IrNode): {
  *   `--strict` escalates — a restriction written under a key nothing reads
  *   is a restriction that is not in force;
  * - a tool that reads a chain, with no `chains` block, is a `tool-unwired`
- *   WARNING naming the block to write.
+ *   WARNING naming the block to write;
+ * - a model_pool candidate whose block admits more than the agent-level
+ *   block (the candidate's REPLACES it per call) is the informational
+ *   `model-plan-tool-config-widens` notice.
  */
 function checkToolConfigDelivery(ir: IrNode): {
   readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>;
@@ -1091,6 +1095,17 @@ function checkToolConfigDelivery(ir: IrNode): {
         warnings.push({ code: "tool-config-partial-cap", path: p.path, message: p.message });
       }
       for (const bad of malformedToolConfigRefs(blocks, candidate.path)) errors.push(bad);
+      // Informational: a candidate's block replaces the agent's, so a wider
+      // allow-list there is legal but worth saying (see the module).
+      for (const w of toolConfigWidenings(
+        site.tools,
+        site.toolConfigs ?? {},
+        toolConfigPathOf(site),
+        blocks,
+        candidate.path,
+      )) {
+        warnings.push({ code: "model-plan-tool-config-widens", path: w.path, message: w.message });
+      }
     }
   }
   const chained = chainBootConfig(ir as Parameters<typeof chainBootConfig>[0]) !== undefined;
@@ -1718,8 +1733,12 @@ function lowerCompaction(spec: SpecWithPermissions, ctx: LowerContext): IrCompac
 //     as the way to get a per-candidate ceiling.
 //
 // One class is REFUSED rather than warned, and this too is by design: the
-// NARROWING knobs (`tools` / `tool_config` / `permissions` / `rate_limits` /
-// `cost`) of a profile referenced from a SINGLE-MODEL serving slot. §4.2
+// per-candidate knobs (`tools` / `tool_config` / `permissions` /
+// `rate_limits` / `cost`) of a profile referenced from a SINGLE-MODEL serving
+// slot. `tools` and `permissions` narrow the shape's; `tool_config` REPLACES
+// the agent-level block for that tool while the candidate serves, and does
+// not narrow it (a wider candidate allow-list is reported as the
+// informational `model-plan-tool-config-widens`). §4.2
 // gives a single-model slot the profile's request params its shape can honour
 // (`model`, `thinking`, `maxTokens`, `temperature`), a provenance-only
 // `modelProfile` name, its failover chain (`fallbacks` / `circuit_breaker`,
@@ -2612,7 +2631,7 @@ function applyProfileToSlot(
       if (!ctx.allowPending) {
         throw candidateOnlyRefusal(
           `${at}.${field} (referenced from ${slotPath})`,
-          "Accepting it here would serve the profile with the shape's full toolset and permissions, so it is refused rather than dropped: name the profile as a model_pool candidate, or declare the narrowing on the shape itself",
+          "Accepting it here would serve the profile with the shape's full toolset and permissions and without its tool settings, so it is refused rather than dropped: name the profile as a model_pool candidate, or declare the setting on the shape itself",
         );
       }
       candidateOnly(field);
