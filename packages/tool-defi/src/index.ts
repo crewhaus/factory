@@ -129,9 +129,10 @@ export const PORTFOLIO_DEFAULT_TIMEOUT_MS = 60_000;
  * per holding priced from a provider — what an asset no provider lists costs
  * in a fiat quote currency: direct, inverse, and both via USD — between
  * PriceQuote's sixteen and {@link PORTFOLIO_PROVIDER_REQUESTS}; an answer
- * already fetched in the same call is reused, not counted again. And each
- * holding not yet reached keeps one request in reserve, so listed assets
- * after a run of unlisted ones are still asked (see ProviderLedger.reserve).
+ * already fetched in the same call is reused, not counted again. The
+ * requests go out in rounds, one per holding still unpriced, and only whole
+ * rounds run, so which holdings are priced does not depend on their order
+ * (see valuePortfolio and ProviderLedger.allowance).
  */
 export const PRICE_QUOTE_PROVIDER_REQUESTS = 16;
 export const PORTFOLIO_PROVIDER_REQUESTS = 512;
@@ -726,8 +727,9 @@ async function valuePortfolio(
     options,
   });
 
-  const priced: PricedRow[] = [];
-  const unpriced: UnpricedRow[] = [];
+  // Each holding's row, by its index, so the table keeps the holdings' order
+  // whichever pass priced them.
+  const rows: Array<{ readonly priced: PricedRow } | { readonly unpriced: UnpricedRow }> = [];
   const notes: string[] = [];
   // Two running totals, on purpose. `total` is the sum of the ROUNDED rows, so
   // the table a human reads adds up to the figure at the bottom of it;
@@ -736,79 +738,44 @@ async function valuePortfolio(
   let total: Fixed = ZERO;
   let exactSum: Fixed = ZERO;
   let outOfTime = 0;
-  // The provider budget: how many holdings after each one will quote, so
-  // each keeps a request in reserve for them; and how many unpriced
-  // holdings had a route that was not asked for want of budget.
-  const ledger = options.providers;
-  const quotingAfter = input.holdings.map(
-    (_, i) =>
-      input.holdings.filter(
-        (h, j) => j > i && h.quotePair !== undefined && sourceErrors[j] === undefined,
-      ).length,
-  );
   let budgetShort = 0;
-
-  for (let index = 0; index < input.holdings.length; index++) {
-    const holding = input.holdings[index] as Holding;
-    const amount = amounts[index] as AmountOutcome;
-    const sourceError = sourceErrors[index];
-    if (sourceError !== undefined) {
-      unpriced.push({
-        asset: holding.asset,
-        amount: amount.ok ? toDecimalString(trim(amount.value)) : null,
-        reason: sourceError,
-      });
-      continue;
-    }
-    if (!amount.ok) {
-      unpriced.push({ asset: holding.asset, amount: null, reason: amount.reason });
-      continue;
-    }
-    if (call.deadline.signal.aborted && holding.price === undefined) {
-      // Past the deadline nothing more is asked of anybody: every holding
-      // left is a row that says so, rather than a request per holding that
-      // is refused one at a time.
-      outOfTime++;
-      unpriced.push({
-        asset: holding.asset,
-        amount: toDecimalString(trim(amount.value)),
-        reason: `${holding.asset}: not priced — ${
-          ctx?.signal?.aborted === true
-            ? "the call was cancelled first"
-            : `the call's timeoutMs of ${call.deadline.ms}ms elapsed first`
-        }`,
-      });
-      continue;
-    }
-    let price: { value: Fixed; provenance: unknown };
-    const refusedBefore = ledger?.refused ?? 0;
-    if (ledger !== undefined) ledger.reserve = quotingAfter[index] as number;
-    try {
-      price = await priceFor(holding, {
-        quoteCurrency,
-        config,
-        endpoint,
-        chainId: input.chainId,
-        blockTag: block?.blockTag,
-        at: input.at,
-        options,
-      });
-    } catch (err) {
-      // A holding that could not be priced is a ROW, not a thrown error: the
-      // other forty-nine assets still have values, and the whole point of the
-      // unpriced bucket is that it is visible rather than absent.
-      if ((ledger?.refused ?? 0) > refusedBefore) budgetShort++;
-      unpriced.push({
-        asset: holding.asset,
-        amount: toDecimalString(trim(amount.value)),
-        reason: (err as Error).message,
-      });
-      continue;
-    }
+  const ledger = options.providers;
+  const context = {
+    quoteCurrency,
+    config,
+    endpoint,
+    chainId: input.chainId,
+    blockTag: block?.blockTag,
+    at: input.at,
+    options,
+  };
+  const unpricedRow = (holding: Holding, amount: Fixed | null, reason: string): UnpricedRow => ({
+    asset: holding.asset,
+    amount: amount === null ? null : toDecimalString(trim(amount)),
+    reason,
+  });
+  const outOfTimeRow = (holding: Holding, amount: Fixed): UnpricedRow => {
+    outOfTime++;
+    return unpricedRow(
+      holding,
+      amount,
+      `${holding.asset}: not priced — ${
+        ctx?.signal?.aborted === true
+          ? "the call was cancelled first"
+          : `the call's timeoutMs of ${call.deadline.ms}ms elapsed first`
+      }`,
+    );
+  };
+  /** A price found: the row, or an arithmetic refusal as a row. */
+  const valued = (
+    holding: Holding,
+    amount: Fixed,
+    price: { value: Fixed; provenance: unknown },
+  ): { readonly priced: PricedRow } | { readonly unpriced: UnpricedRow } => {
     let exact: Fixed;
     let value: Fixed;
     try {
-      exact = multiply(amount.value, price.value);
+      exact = multiply(amount, price.value);
       value = roundToPlaces(exact, places, rounding);
     } catch (err) {
       // The multiplication refuses past MAX_SCALE, and it used to do it out
@@ -817,24 +784,137 @@ async function valuePortfolio(
       // of the whole call, so forty-nine priceable rows were lost to the
       // fiftieth. An arithmetic refusal is a row, exactly like a price
       // refusal is.
-      unpriced.push({
-        asset: holding.asset,
-        amount: toDecimalString(trim(amount.value)),
-        reason: `${holding.asset}: the amount and the price could not be multiplied — ${(err as Error).message}`,
-      });
-      continue;
+      return {
+        unpriced: unpricedRow(
+          holding,
+          amount,
+          `${holding.asset}: the amount and the price could not be multiplied — ${(err as Error).message}`,
+        ),
+      };
     }
     total = add(total, value);
     exactSum = add(exactSum, exact);
-    priced.push({
-      asset: holding.asset,
-      amount: toDecimalString(trim(amount.value)),
-      price: toDecimalString(trim(price.value)),
-      value: toDecimalString(value),
-      weightBps: 0,
-      belowMinValue: false,
-      provenance: price.provenance,
-    });
+    return {
+      priced: {
+        asset: holding.asset,
+        amount: toDecimalString(trim(amount)),
+        price: toDecimalString(trim(price.value)),
+        value: toDecimalString(value),
+        weightBps: 0,
+        belowMinValue: false,
+        provenance: price.provenance,
+      },
+    };
+  };
+
+  // Holdings priced from a public provider, left for the rounds below.
+  let quoting: number[] = [];
+  for (let index = 0; index < input.holdings.length; index++) {
+    const holding = input.holdings[index] as Holding;
+    const amount = amounts[index] as AmountOutcome;
+    const sourceError = sourceErrors[index];
+    if (sourceError !== undefined) {
+      rows[index] = {
+        unpriced: unpricedRow(holding, amount.ok ? amount.value : null, sourceError),
+      };
+      continue;
+    }
+    if (!amount.ok) {
+      rows[index] = { unpriced: unpricedRow(holding, null, amount.reason) };
+      continue;
+    }
+    if (call.deadline.signal.aborted && holding.price === undefined) {
+      // Past the deadline nothing more is asked of anybody: every holding
+      // left is a row that says so, rather than a request per holding that
+      // is refused one at a time.
+      rows[index] = { unpriced: outOfTimeRow(holding, amount.value) };
+      continue;
+    }
+    if (holding.quotePair !== undefined && ledger !== undefined) {
+      quoting.push(index);
+      continue;
+    }
+    try {
+      rows[index] = valued(holding, amount.value, await priceFor(holding, context));
+    } catch (err) {
+      // A holding that could not be priced is a ROW, not a thrown error: the
+      // other forty-nine assets still have values, and the whole point of the
+      // unpriced bucket is that it is visible rather than absent.
+      rows[index] = { unpriced: unpricedRow(holding, amount.value, (err as Error).message) };
+    }
+  }
+
+  // The provider budget goes out in ROUNDS: each round lets every holding
+  // still unpriced make one more request (an answer this call already has
+  // is free), and a round runs only when what is left covers every holding
+  // in it. So which holdings are priced does not depend on where they sit in
+  // the list: a run of assets no provider lists cannot spend the requests a
+  // holding after them needed, nor can one before them take a larger share.
+  // A holding stays in play while its last attempt was cut short by the
+  // round; one that failed having asked everything it wanted is final.
+  const lastReason = new Map<number, string>();
+  while (quoting.length > 0 && ledger !== undefined) {
+    if (call.deadline.signal.aborted) break;
+    // Also what ends the loop: every holding kept in play asked one new
+    // request in its round, so each round spends the budget down.
+    if (ledger.limit - ledger.made < quoting.length) break;
+    const next: number[] = [];
+    for (const index of quoting) {
+      if (call.deadline.signal.aborted) {
+        // Out of time: left for the rows below that say so.
+        next.push(index);
+        continue;
+      }
+      const holding = input.holdings[index] as Holding;
+      const amount = (amounts[index] as { value: Fixed }).value;
+      ledger.allowance = 1;
+      ledger.halted = false;
+      const refusedBefore = ledger.refused;
+      try {
+        const price = await priceFor(holding, context);
+        rows[index] = valued(holding, amount, price);
+      } catch (err) {
+        // Refused a request, so cut short by its round rather than out of
+        // routes: it stays in play.
+        if (ledger.refused > refusedBefore && !call.deadline.signal.aborted) {
+          next.push(index);
+          lastReason.set(index, (err as Error).message);
+        } else {
+          rows[index] = { unpriced: unpricedRow(holding, amount, (err as Error).message) };
+        }
+      }
+    }
+    quoting = next;
+  }
+  if (ledger !== undefined) {
+    ledger.allowance = undefined;
+    ledger.halted = false;
+  }
+  for (const index of quoting) {
+    const holding = input.holdings[index] as Holding;
+    const amount = (amounts[index] as { value: Fixed }).value;
+    const reason = lastReason.get(index);
+    if (call.deadline.signal.aborted) {
+      rows[index] = { unpriced: outOfTimeRow(holding, amount) };
+    } else {
+      budgetShort++;
+      rows[index] = {
+        unpriced: unpricedRow(
+          holding,
+          amount,
+          reason ??
+            `${holding.asset}: not priced — this call's ${ledger?.limit} price-provider requests could not give every holding still unpriced a round`,
+        ),
+      };
+    }
+  }
+
+  const priced: PricedRow[] = [];
+  const unpriced: UnpricedRow[] = [];
+  for (const row of rows) {
+    if (row === undefined) continue;
+    if ("priced" in row) priced.push(row.priced);
+    else unpriced.push(row.unpriced);
   }
 
   const minValue =
@@ -863,7 +943,7 @@ async function valuePortfolio(
   }
   if (budgetShort > 0) {
     notes.push(
-      `${budgetShort} unpriced holding(s) had a price route that was not asked, because this call's ${ledger?.limit} price-provider requests were spent or held for later holdings; fewer distinct assets per call would try them`,
+      `${budgetShort} unpriced holding(s) had a price route that was not asked: this call's ${ledger?.limit} price-provider requests go out one per holding per round, and ran out before another round could reach every holding still unpriced; fewer distinct assets per call would try them`,
     );
   }
   if (!isPositive(total) && priced.length > 0) {
