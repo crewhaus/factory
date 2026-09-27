@@ -1399,6 +1399,29 @@ describe("GitApplyPatch", () => {
       expect(existsSync(join(repo, "pkg", "outside.txt"))).toBe(false);
     });
 
+    test("a rename whose TARGET lies outside cwd is refused before anything runs", async () => {
+      // The mirror of the case above: reversed, this patch's new name is
+      // pkg/inside.txt, inside cwd, so only the forward preflight names it.
+      // Without that preflight the real apply skipped it and came back as a
+      // "partial" apply of a patch that changed nothing.
+      const rename = [
+        "diff --git a/pkg/inside.txt b/moved-out.txt",
+        "similarity index 100%",
+        "rename from pkg/inside.txt",
+        "rename to moved-out.txt",
+        "",
+      ].join("\n");
+      for (const check of [true, false]) {
+        const out = await call(gitApplyPatch, { cwd: "repo/pkg", patch: rename, check });
+        expect(out).toMatchObject({ applied: false, wouldApply: false });
+        expect(out.partial).toBeUndefined();
+        expect(out.skipped).toEqual(["pkg/inside.txt => moved-out.txt"]);
+        expect(out.reason).toContain("Nothing was applied");
+      }
+      expect(read("pkg/inside.txt")).toBe("alpha\n");
+      expect(existsSync(join(repo, "moved-out.txt"))).toBe(false);
+    });
+
     test("a rename wholly inside cwd still applies from there", async () => {
       const rename = [
         "diff --git a/pkg/inside.txt b/pkg/moved.txt",
