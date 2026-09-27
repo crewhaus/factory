@@ -5,7 +5,6 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -44,7 +43,7 @@ import {
   probeKind,
   resolveContained,
 } from "@crewhaus/tool-safety/fs";
-import { readFileBounded } from "@crewhaus/tool-safety/streams";
+import { readFileBounded, readFileBoundedSync } from "@crewhaus/tool-safety/streams";
 import type { ZodType as Zod4Type } from "zod/v4";
 import pkg from "../package.json" with { type: "json" };
 
@@ -817,6 +816,13 @@ export const PLUGIN_TRUST_ANCHORS_ENV = "CREWHAUS_PLUGIN_TRUST_ANCHORS";
 /** `1` loads unsigned plugins. Development only; every boot says so. */
 export const PLUGIN_ALLOW_UNSIGNED_ENV = "CREWHAUS_PLUGIN_ALLOW_UNSIGNED";
 
+/**
+ * The largest trust-anchor file read. An Ed25519 public key in PEM is about
+ * 113 bytes; this leaves room for comments and a certificate chain, and keeps
+ * a stray large file from being read whole on every boot.
+ */
+export const MAX_TRUST_ANCHOR_BYTES = 64 * 1024;
+
 /** The documented trust-anchor directory: `~/.crewhaus/plugin-trust`, one `*.pem` per publisher. */
 export function defaultTrustAnchorDir(homeDir: string = homedir()): string {
   return join(homeDir, ".crewhaus", "plugin-trust");
@@ -845,13 +851,24 @@ export function loadTrustAnchors(
     const abs = resolvePath(file);
     if (seen.has(abs)) return;
     seen.add(abs);
-    let pem: string;
-    try {
-      pem = readFileSync(abs, "utf8");
-    } catch (err) {
-      problems.push(`cannot read trust anchor ${abs}: ${(err as Error).message}`);
+    // A regular file only, and bounded: a FIFO named here would block every
+    // boot and install on a read that waits for a writer.
+    const read = readFileBoundedSync(abs, { maxBytes: MAX_TRUST_ANCHOR_BYTES });
+    if (!read.ok) {
+      problems.push(
+        read.code === "not-regular-file"
+          ? `trust anchor ${abs} is a ${read.kind ?? "special file"}, not a regular file`
+          : `cannot read trust anchor ${abs}: ${read.reason}`,
+      );
       return;
     }
+    if (read.truncated) {
+      problems.push(
+        `trust anchor ${abs} is larger than ${MAX_TRUST_ANCHOR_BYTES} bytes, so it is not a public key`,
+      );
+      return;
+    }
+    const pem = read.text;
     try {
       const key = createPublicKey(pem);
       if (key.asymmetricKeyType !== "ed25519") {

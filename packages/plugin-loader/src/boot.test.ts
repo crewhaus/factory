@@ -19,6 +19,7 @@ import {
   manifestPayloadForSigning,
 } from "@crewhaus/plugin-sdk";
 import {
+  MAX_TRUST_ANCHOR_BYTES,
   PLUGIN_ALLOW_UNSIGNED_ENV,
   PLUGIN_TRUST_ANCHORS_ENV,
   activatePlugins,
@@ -203,6 +204,50 @@ describe("loadTrustAnchors", () => {
   test("a missing default directory is not a problem", () => {
     expect(loadTrustAnchors({ homeDir: home, env: {} })).toEqual({ anchors: [], problems: [] });
   });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO or an oversized .pem is a problem naming it, not a boot that waits forever",
+    () => {
+      // A FIFO in ~/.crewhaus/plugin-trust hung every boot and install on a
+      // read waiting for a writer (review of the C015 foundations).
+      const dir = defaultTrustAnchorDir(home);
+      mkdirSync(dir, { recursive: true });
+      const fifo = join(dir, "publisher.pem");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      const big = trust(`${"#".repeat(MAX_TRUST_ANCHOR_BYTES)}\n`, join(home, "keys"), "big.pem");
+      const good = keypair();
+      const listed = trust(good.pem, join(home, "keys"), "good.pem");
+      // In a child with a deadline: an unfixed read blocks its thread for good.
+      const script = `
+        const { loadTrustAnchors, createBootPluginRuntime } = await import(${JSON.stringify(join(import.meta.dir, "index.ts"))});
+        const env = { ${JSON.stringify(PLUGIN_TRUST_ANCHORS_ENV)}: ${JSON.stringify([big, listed].join(delimiter))} };
+        const r = loadTrustAnchors({ homeDir: ${JSON.stringify(home)}, env });
+        let boot;
+        try { createBootPluginRuntime({ homeDir: ${JSON.stringify(home)}, env, warn: () => {} }); boot = "booted"; }
+        catch (err) { boot = err.message; }
+        console.log(JSON.stringify({ anchors: r.anchors.map((a) => a.name), problems: r.problems, boot }));
+      `;
+      const run = Bun.spawnSync([process.execPath, "-e", script], {
+        timeout: 30_000,
+        stderr: "pipe",
+      });
+      expect({ exit: run.exitCode, stderr: run.stderr.toString() }).toEqual({
+        exit: 0,
+        stderr: "",
+      });
+      const got = JSON.parse(run.stdout.toString());
+      const problems = [
+        `trust anchor ${fifo} is a fifo, not a regular file`,
+        `trust anchor ${big} is larger than ${MAX_TRUST_ANCHOR_BYTES} bytes, so it is not a public key`,
+      ];
+      expect(got).toEqual({
+        anchors: [listed],
+        problems,
+        boot: `plugin trust anchors: ${problems.join("; ")}`,
+      });
+    },
+    40_000,
+  );
 });
 
 describe("the channel daemon starts without a plugin it cannot load", () => {
