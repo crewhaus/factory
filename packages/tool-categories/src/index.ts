@@ -49,6 +49,7 @@ export {
   type BuiltinToolEntry,
   type ChainBootConfig,
   HOST_BOOT_SEAMS,
+  LOOP_TOOL_NAMES,
   OPTIONAL_BOOT_SEAMS,
   TOOL_BOOT_REGISTRARS,
 } from "./builtins";

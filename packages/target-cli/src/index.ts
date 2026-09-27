@@ -21,6 +21,7 @@ import {
 import {
   BUILTIN_TOOLS,
   BuiltinToolError,
+  LOOP_TOOL_NAMES,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
   type SpecChainBlocks,
@@ -549,6 +550,10 @@ const __evaluation: RunEvaluation = {
  *     duplicate-name error and bricks boot. (0.7.0 ran it right after the
  *     extension boot, so a plugin tool named FocusRead or Task crashed the
  *     bundle at wireMemory / createTaskTool while `crewhaus run` skipped it.)
+ *     It also skips the names the run loop adds itself (`LOOP_TOOL_NAMES`:
+ *     ListTools, Consult, Escalate), which are not on the catalog yet when
+ *     this runs — the loop keeps a tool it is handed under one of them, so a
+ *     plugin's ListTools replaced the loop's (and took its builtin allow).
  *
  * Trust: `createBootPluginRuntime` builds the loader against
  * `~/.crewhaus/plugins`, verifying each signature against the operator's trust
@@ -576,7 +581,12 @@ function renderPlugins(ir: IrV0): {
   names: ${JSON.stringify(names)},
   ...createBootPluginRuntime(),
 });`,
-    registerBoot: `for (const __t of __plugins.tools) {
+    registerBoot: `const __loopOwned = new Set(${JSON.stringify(LOOP_TOOL_NAMES)});
+for (const __t of __plugins.tools) {
+  if (__loopOwned.has(__t.name)) {
+    process.stderr.write(\`[plugins] tool "\${__t.name}" is the run loop's own — plugin contribution skipped\\n\`);
+    continue;
+  }
   if (defaultCatalog.get(__t.name) !== undefined) {
     process.stderr.write(\`[plugins] tool "\${__t.name}" already registered — plugin contribution skipped\\n\`);
     continue;

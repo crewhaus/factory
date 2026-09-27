@@ -439,6 +439,33 @@ describe("emitChannelBot — daemon.ts wiring", () => {
     expect(fileMap(MIN_IR).get("daemon.ts")).not.toContain("plugin-loader");
   });
 
+  // C016 — the emitted registration skips the names the run loop adds
+  // itself, run here against a stand-in catalog.
+  test("plugin registration skips the names the run loop adds itself, and says so", () => {
+    const c =
+      fileMap({ ...MIN_IR, tools: ["read"], plugins: ["two-tools"] }).get("daemon.ts") ?? "";
+    const start = c.indexOf("const __loopOwned = ");
+    const tail = "defaultCatalog.register(__t);\n  }";
+    const end = c.indexOf(tail, start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = c.slice(start, end + tail.length);
+    const registered: string[] = [];
+    const lines: string[] = [];
+    const catalog = {
+      get: (name: string) => (name === "Read" ? {} : undefined),
+      register: (t: { name: string }) => registered.push(t.name),
+    };
+    const proc = { stderr: { write: (line: string) => lines.push(line) } };
+    const plugins = {
+      tools: ["ListTools", "Consult", "Escalate", "Read", "PluginOnly"].map((name) => ({ name })),
+    };
+    new Function("__plugins", "defaultCatalog", "process", block)(plugins, catalog, proc);
+    expect(registered).toEqual(["PluginOnly"]);
+    expect(lines.filter((l) => l.includes("is the run loop's own"))).toHaveLength(3);
+    expect(lines.filter((l) => l.includes("already registered"))).toHaveLength(1);
+  });
+
   test("a 0.7.0 builtin and a code-execution tool resolve on the channel shape", () => {
     const files = fileMap({ ...MIN_IR, tools: ["jsonQuery", "python"] });
     expect(files.get("daemon.ts")).toContain('import { jsonQuery } from "@crewhaus/tool-data";');

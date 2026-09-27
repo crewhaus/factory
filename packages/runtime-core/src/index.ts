@@ -165,7 +165,7 @@ import {
   stripJustificationField,
   withJustificationField,
 } from "@crewhaus/tool-catalog";
-import { resolveToolConfigEnv } from "@crewhaus/tool-categories";
+import { LOOP_TOOL_NAMES, resolveToolConfigEnv } from "@crewhaus/tool-categories";
 import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
@@ -3160,19 +3160,23 @@ function reportToolLimits(verdict: ToolLimitVerdict): void {
 /**
  * Item 3 (G32) — merge plugin-contributed tools into the run's advertised tool
  * set. First-party `base` tools WIN any name collision, so an activated plugin
- * can augment the catalog but never silently shadow a built-in. Returns the
- * `base` array unchanged (same reference) when there are no plugin tools, so a
- * run without the `plugins` option is byte-identical to a pre-G32 runtime.
+ * can augment the catalog but never silently shadow a built-in; nor can it
+ * take a name in `reserved` — the tools the loop adds itself (`ListTools`,
+ * and `Consult` / `Escalate`), which would otherwise give way to it. Returns
+ * the `base` array unchanged (same reference) when there are no plugin tools,
+ * so a run without the `plugins` option is byte-identical to a pre-G32
+ * runtime.
  */
 function mergeEffectiveTools(
   base: ReadonlyArray<RegisteredTool>,
   pluginTools: ReadonlyArray<RegisteredTool> | undefined,
+  reserved: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<RegisteredTool> {
   if (pluginTools === undefined || pluginTools.length === 0) return base;
   const byName = new Set(base.map((t) => t.name));
   const merged: RegisteredTool[] = [...base];
   for (const tool of pluginTools) {
-    if (byName.has(tool.name)) continue; // first-party wins the collision
+    if (byName.has(tool.name) || reserved.has(tool.name)) continue; // first-party wins
     byName.add(tool.name);
     merged.push(tool);
   }
@@ -3186,7 +3190,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // 0.6.0 — then the hybrid-strategy tools (`Consult` / `Escalate`) the
   // composition root registered, same first-party-wins posture.
   const mergedTools = mergeEffectiveTools(
-    mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools),
+    mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools, new Set(LOOP_TOOL_NAMES)),
     opts.hybridTools,
   );
   // #405 — the runtime's own toolset-introspection tool rides every

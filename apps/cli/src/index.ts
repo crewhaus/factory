@@ -478,6 +478,7 @@ import { type RegisteredTool, ToolCatalog, mcpToolName } from "@crewhaus/tool-ca
 import {
   BUILTIN_TOOLS,
   CATEGORIES,
+  LOOP_TOOL_NAMES,
   SHAPE_TOOL_PROFILES,
   type SpecChainBlocks,
   ToolCategoryError,
@@ -4279,6 +4280,32 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * Append the activated plugins' tools to `tools`, skipping any a first-party
+ * tool already holds the name of, and any named after a tool the run loop
+ * adds itself (`LOOP_TOOL_NAMES`: ListTools, Consult, Escalate). The loop
+ * keeps a tool it is handed under one of those names instead of its own, so
+ * a plugin's ListTools replaced the loop's, and took its builtin allow. The
+ * compiled bundles skip the same names (target-cli, target-channel-bot).
+ */
+function addPluginTools(tools: RegisteredTool[], pluginTools: ReadonlyArray<RegisteredTool>): void {
+  const loopOwned = new Set(LOOP_TOOL_NAMES);
+  for (const t of pluginTools) {
+    if (loopOwned.has(t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" is the run loop's own — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    if (tools.some((existing) => existing.name === t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    tools.push(t);
+  }
+}
+/**
  * cli-target run path. Multi-turn interactive REPL, session-store backed,
  * loads hooks/skills/slash-commands/sub-agents from the user's workspace,
  * and wires every spec-declared MCP server.
@@ -4897,15 +4924,7 @@ async function runRunCli(
   // named after a built-in / skill / memory / MCP / sub-agent tool is skipped
   // (first-party wins the collision), mirroring the compiled bundle's
   // register-late boot.
-  for (const t of pluginTools) {
-    if (tools.some((existing) => existing.name === t.name)) {
-      process.stdout.write(
-        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
-      );
-      continue;
-    }
-    tools.push(t);
-  }
+  addPluginTools(tools, pluginTools);
 
   // Section 18 — wire the sandbox floor for code-execution tools. #18 made
   // python/javascript/shell RESOLVABLE at run time, but the run path never set
@@ -6092,15 +6111,7 @@ async function buildServeRuntime(
 
   // Plugin tools register LAST — a plugin tool named after a built-in / skill /
   // MCP tool is skipped so first-party wins the collision.
-  for (const t of pluginTools) {
-    if (tools.some((existing) => existing.name === t.name)) {
-      process.stdout.write(
-        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
-      );
-      continue;
-    }
-    tools.push(t);
-  }
+  addPluginTools(tools, pluginTools);
 
   const hasCodeExecTools = ir.tools.some(
     (t) => t === "python" || t === "javascript" || t === "shell",

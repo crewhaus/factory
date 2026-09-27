@@ -32,6 +32,7 @@ import {
 } from "@crewhaus/model-service";
 import {
   BuiltinToolError,
+  LOOP_TOOL_NAMES,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
   SANDBOX_AVAILABLE_IMPORT,
@@ -672,7 +673,9 @@ defaultCatalog.register(__knowledgeTool);`;
  *   - `registerBoot` runs AFTER the built-in + skill tools are on the catalog and
  *     skips any name already registered — first-party wins, and a plugin tool
  *     named after a built-in never trips `defaultCatalog.register`'s
- *     duplicate-name throw and bricks the daemon.
+ *     duplicate-name throw and bricks the daemon. It also skips the names the
+ *     run loop adds itself (`LOOP_TOOL_NAMES`), which a plugin tool would
+ *     otherwise take from the loop.
  * Both blocks are indented two spaces for the `main()` body. Empty when the spec
  * omits `plugins:`, keeping bundles byte-identical.
  */
@@ -695,7 +698,12 @@ function renderPlugins(ir: IrChannelV0): {
     activateBoot: `  const __plugins = await activatePluginsOrStartWithout({
     names: ${JSON.stringify(names)},
   });`,
-    registerBoot: `  for (const __t of __plugins.tools) {
+    registerBoot: `  const __loopOwned = new Set(${JSON.stringify(LOOP_TOOL_NAMES)});
+  for (const __t of __plugins.tools) {
+    if (__loopOwned.has(__t.name)) {
+      process.stderr.write(\`[plugins] tool "\${__t.name}" is the run loop's own — plugin contribution skipped\\n\`);
+      continue;
+    }
     if (defaultCatalog.get(__t.name) !== undefined) {
       process.stderr.write(\`[plugins] tool "\${__t.name}" already registered — plugin contribution skipped\\n\`);
       continue;
