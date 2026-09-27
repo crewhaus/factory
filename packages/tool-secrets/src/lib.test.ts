@@ -681,90 +681,178 @@ describe("what may be written into a .env, and what is refused", () => {
     });
   }
 
-  // C137: characters a shell sourcing the file, or Bun's .env autoloader,
-  // interprets while the canonical reader keeps them literally. No quoting
-  // form reads the same in all three, so each is refused — and the refusal
-  // must not promise that the canonical (double-quoting) quoter would help.
-  const shellActive: [string, string][] = [
-    ["a dollar", "ab$HOME"],
-    ["a braced expansion", "p${X}q"],
-    ["a command substitution", "p4$(id)"],
-    ["a backtick", "a`id`b"],
-    ["a semicolon", "x;y"],
-    ["a pipe", "a|b"],
-    ["an ampersand", "a&b"],
-    ["a backslash", "a\\b"],
-    ["a bang", "a!b"],
-    ["a star", "a*b"],
-    ["a question mark", "a?b"],
-    ["a leading tilde", "~/x"],
-    ["a tilde after a colon", "a:~/x"],
-    ["an open paren", "a(b"],
-    ["a close paren", "a)b"],
-    ["a less-than", "a<b"],
-    ["a greater-than", "a>b"],
-    ["a mid-value single quote", "a'b"],
-    ["a mid-value double quote", 'a"b'],
+  // C137, and the regression review of it: a value is refused only for a
+  // character a real reader reads differently. Each row names readers that
+  // diverge on it, and the test below RUNS them — a refusal whose claimed
+  // divergence does not exist fails there, not just in review.
+  type Reader = "sh" | "dash" | "bash" | "zsh" | "bun";
+  const DIVERGENT: ReadonlyArray<{
+    what: string;
+    value: string;
+    exported?: boolean;
+    readers: readonly Reader[];
+  }> = [
+    { what: "a dollar", value: "ab$HOME", readers: ["sh", "bun"] },
+    { what: "a braced expansion", value: "p${X}q", readers: ["sh", "bun"] },
+    { what: "a command substitution", value: "p4$(id)", readers: ["sh"] },
+    { what: "a backtick", value: "a`id`b", readers: ["sh"] },
+    { what: "a semicolon", value: "x;y", readers: ["sh"] },
+    { what: "a pipe", value: "a|b", readers: ["sh"] },
+    { what: "an ampersand", value: "a&b", readers: ["sh"] },
+    { what: "a backslash", value: "a\\b", readers: ["sh"] },
+    { what: "a leading tilde", value: "~/x", readers: ["sh"] },
+    { what: "a tilde after a colon", value: "a:~/x", readers: ["sh"] },
+    { what: "an open paren", value: "a(b", readers: ["sh"] },
+    { what: "a close paren", value: "a)b", readers: ["sh"] },
+    { what: "a less-than", value: "a<b", readers: ["sh"] },
+    { what: "a greater-than", value: "a>b", readers: ["sh"] },
+    { what: "a mid-value single quote", value: "a'b", readers: ["sh"] },
+    { what: "a mid-value double quote", value: 'a"b', readers: ["sh"] },
+    { what: "a leading equals", value: "=ls", readers: ["zsh"] },
+    { what: "an equals after a colon", value: "a:=ls", readers: ["zsh"] },
+    { what: "braces on an export line", value: "a{x,y}b", exported: true, readers: ["bash"] },
+    {
+      what: "a brace range on an export line",
+      value: "v{1..3}",
+      exported: true,
+      readers: ["bash"],
+    },
   ];
-  for (const [what, value] of shellActive) {
-    test(`refuses ${what}: a shell or Bun would read it differently`, () => {
-      const encoded = encodeBare("K", value);
-      expect({ what, ok: encoded.ok }).toEqual({ what, ok: false });
+
+  // Ordinary values 0.7.0 wrote, which every reader reads literally: none of
+  // these may be refused (the regression review found all refused).
+  const ORDINARY: readonly string[] = [
+    "postgres://app:s3cret@db.example.com:5432/app?sslmode=require",
+    "Café",
+    "héllo",
+    "日本語",
+    "😀",
+    "https://*.example.com",
+    "https://example.com/cb?next=/home",
+    "3^2",
+    "[1,2]",
+    "pa!ss",
+    "a=~/x",
+    "a~b",
+    "x~",
+    "a=b",
+    "a%b",
+    "-leading-dash",
+    "",
+  ];
+
+  const READER_ARGV: Record<Reader, string[] | undefined> = {
+    sh: ["/bin/sh", "-c"],
+    dash: existsSync("/bin/dash") ? ["/bin/dash", "-c"] : undefined,
+    bash: existsSync("/bin/bash") ? ["/bin/bash", "-c"] : undefined,
+    zsh: existsSync("/bin/zsh") ? ["/bin/zsh", "-c"] : undefined,
+    bun: [process.execPath, "-e"],
+  };
+  const readerEnv: Record<string, string> = {
+    PATH: "/usr/bin:/bin",
+    HOME: "/nonexistent-home-for-env-test",
+    ...(process.env["LANG"] !== undefined ? { LANG: process.env["LANG"] } : {}),
+    ...(process.env["LC_ALL"] !== undefined ? { LC_ALL: process.env["LC_ALL"] } : {}),
+  };
+  /** What `reader` makes of a .env holding `line`, and whether sourcing it left files behind. */
+  const readBack = (reader: Reader, line: string): { read: string; sideEffects: string[] } => {
+    const argv = READER_ARGV[reader] as string[];
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-envbare-"));
+    try {
+      writeFileSync(join(dir, ".env"), `${line}\n`);
+      const script =
+        reader === "bun"
+          ? 'process.stdout.write(process.env.K ?? "<unset>")'
+          : 'set -a; . ./.env 2>/dev/null; printf %s "${K-<unset>}"';
+      const r = Bun.spawnSync([...argv, script], { cwd: dir, env: readerEnv });
+      return {
+        read: r.exitCode === 0 ? r.stdout.toString() : `<exit ${r.exitCode}>`,
+        sideEffects: readdirSync(dir).filter((n) => n !== ".env"),
+      };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  for (const row of DIVERGENT) {
+    test(`refuses ${row.what}, and names the reader that reads it differently`, () => {
+      const encoded = encodeBare("K", row.value, { exported: row.exported === true });
+      expect({ what: row.what, ok: encoded.ok }).toEqual({ what: row.what, ok: false });
       if (!encoded.ok) {
-        expect(encoded.message).toContain("shell");
-        expect(encoded.message).toContain(".env loader");
+        expect(encoded.message).toContain("sourcing the file");
         expect(encoded.message).not.toContain("encodeEnvValue");
       }
     });
   }
 
   test.skipIf(process.platform === "win32")(
-    "every value it accepts reads back the same through sh and through Bun's .env autoloader",
+    "every refused value really is read differently by a reader its row names",
     () => {
-      const corpus = [
-        ...shellActive.map(([, v]) => v),
-        SECRET,
-        "sk-live-abc_123.def/ghi+jkl=",
-        Buffer.from(SECRET).toString("base64"),
-        Buffer.from(SECRET).toString("base64url"),
-        Buffer.from(SECRET).toString("hex"),
-        "a-b_c.d:e@f/g+h=",
-        "a,b%c",
-        "-leading-dash",
-        "",
-      ];
-      let accepted = 0;
-      for (const value of corpus) {
-        const encoded = encodeBare("K", value);
-        if (!encoded.ok) continue;
-        accepted += 1;
-        const dir = mkdtempSync(join(tmpdir(), "crewhaus-envbare-"));
-        try {
-          writeFileSync(join(dir, ".env"), `K=${encoded.value}\n`);
-          const sh = Bun.spawnSync(["sh", "-c", 'set -a; . ./.env; printf %s "$K"'], {
-            cwd: dir,
-            env: { PATH: "/usr/bin:/bin" },
+      let proven = 0;
+      for (const row of DIVERGENT) {
+        const line = `${row.exported === true ? "export " : ""}K=${row.value}`;
+        for (const reader of row.readers) {
+          if (READER_ARGV[reader] === undefined) continue;
+          const { read } = readBack(reader, line);
+          expect({ what: row.what, reader, same: read === row.value }).toEqual({
+            what: row.what,
+            reader,
+            same: false,
           });
-          const bun = Bun.spawnSync(
-            [process.execPath, "-e", 'process.stdout.write(process.env.K ?? "<unset>")'],
-            { cwd: dir, env: { PATH: "/usr/bin:/bin" } },
-          );
-          expect({ value, sh: sh.stdout.toString(), bun: bun.stdout.toString() }).toEqual({
-            value,
-            sh: value,
-            bun: value,
-          });
-          // Sourcing ran nothing: no file appeared beside the .env.
-          expect(readdirSync(dir)).toEqual([".env"]);
-        } finally {
-          rmSync(dir, { recursive: true, force: true });
+          proven += 1;
         }
       }
-      // Every positive was accepted, and none of the shell-active ones.
-      expect(accepted).toBe(corpus.length - shellActive.length);
+      // sh and Bun exist everywhere this runs; zsh and bash rows add to it.
+      expect(proven).toBeGreaterThanOrEqual(DIVERGENT.length - 4);
     },
-    30_000,
+    60_000,
   );
+
+  test.skipIf(process.platform === "win32")(
+    "ordinary values are written, and every reader reads them back unchanged, export or not",
+    () => {
+      let checked = 0;
+      for (const value of ORDINARY) {
+        for (const exported of [false, true]) {
+          const encoded = encodeBare("K", value, { exported });
+          expect({ value, exported, ok: encoded.ok }).toEqual({ value, exported, ok: true });
+          const line = `${exported ? "export " : ""}K=${value}`;
+          expect(parseEnvText(line)["K"]).toBe(value);
+          for (const reader of Object.keys(READER_ARGV) as Reader[]) {
+            if (READER_ARGV[reader] === undefined) continue;
+            const got = readBack(reader, line);
+            expect({ value, exported, reader, ...got }).toEqual({
+              value,
+              exported,
+              reader,
+              read: value,
+              sideEffects: [],
+            });
+            checked += 1;
+          }
+        }
+      }
+      expect(checked).toBeGreaterThanOrEqual(ORDINARY.length * 2 * 3);
+    },
+    120_000,
+  );
+
+  test("braces are written on a plain line, refused on an export line", () => {
+    expect(encodeBare("K", "a{x,y}b").ok).toBe(true);
+    expect(encodeBare("K", "a{x,y}b", { exported: true }).ok).toBe(false);
+    const doc = parseEnvDoc("export K=old\nJ=old\n");
+    expect(planUpsert(doc, "K", "a{x,y}b").ok).toBe(false);
+    expect(planUpsert(doc, "J", "a{x,y}b").ok).toBe(true);
+  });
+
+  test("a control character or a lone surrogate is refused, for what it is", () => {
+    const esc = encodeBare("K", "a\u001b[31mb");
+    expect(esc.ok === false && esc.message).toContain("control character (U+001B)");
+    const half = encodeBare("K", "a\uD83Db");
+    expect(half.ok === false && half.message).toContain("surrogate");
+    // A whole emoji is two halves together, and is ordinary text.
+    expect(encodeBare("K", "a\uD83D\uDE00b").ok).toBe(true);
+  });
 
   test("everything this package writes round-trips through the CANONICAL reader", () => {
     const values = [

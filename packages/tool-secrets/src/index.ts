@@ -50,6 +50,7 @@ import {
   type Edit,
   type EnvDoc,
   encodeBare,
+  exportedAssignment,
   parseEnvDoc,
   planUnset,
   planUpsert,
@@ -924,7 +925,9 @@ export const secretRotate: RegisteredTool = buildTool({
       // the file: a refusal at write-new would leave KEY_PREVIOUS written
       // beside an unchanged KEY (C137).
       if (ref.kind === "envfile") {
-        const encodable = encodeBare(ref.key, newValue);
+        const current = readDocForEdit("SecretRotate", ref.path);
+        const exported = current.ok && exportedAssignment(current.value.doc, ref.key);
+        const encodable = encodeBare(ref.key, newValue, { exported });
         if (!encodable.ok) {
           return failed("new-value", `${encodable.message} Nothing was written.`);
         }

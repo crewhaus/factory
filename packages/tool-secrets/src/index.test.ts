@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseEnvText } from "@crewhaus/harness-supervisor";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   ENV_DUPLICATE,
@@ -478,6 +479,32 @@ describe("EnvFileUpsert", () => {
       // All or nothing: the ordinary entry beside it was not written either.
       expect(readEnv()).toBe(before);
     }
+  });
+
+  test("ordinary values a shell and Bun read literally are written (regression review)", async () => {
+    // The first C137 fix refused anything outside [A-Za-z0-9_@%+=:,./-]:
+    // every one of these, which 0.7.0 wrote and every reader reads as written.
+    writeFileSync(envFile(), "export CORS_ORIGIN=old\n");
+    const entries = [
+      {
+        key: "DATABASE_URL",
+        value: "postgres://app:s3cret@db.example.com:5432/app?sslmode=require",
+      },
+      { key: "APP_NAME", value: "Café" },
+      { key: "CORS_ORIGIN", value: "https://*.example.com" },
+      { key: "CALLBACK", value: "https://example.com/cb?next=/home" },
+      { key: "BANG", value: "pa!ss" },
+      { key: "LIST", value: "[1,2]" },
+    ];
+    // `call` throws on a refusal; this one must be JSON with every entry.
+    const result = await call(envFileUpsert, { entries });
+    expect(result.entries.length).toBe(entries.length);
+    const parsed = parseEnvText(readEnv());
+    for (const { key, value } of entries) {
+      expect({ key, value: parsed[key] }).toEqual({ key, value });
+    }
+    // The export prefix of the line that was there is kept.
+    expect(readEnv()).toContain("export CORS_ORIGIN=https://*.example.com");
   });
 
   test("an existing file keeps its comments, blanks and key order", async () => {
