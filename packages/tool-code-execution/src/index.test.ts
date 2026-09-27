@@ -21,10 +21,11 @@ class StubSandbox implements Sandbox {
   readonly backend = "noop" as const;
   readonly calls: SandboxExecOptions[] = [];
   result: Partial<SandboxExecResult> = {};
-  readonly defaultTimeoutMs: number | undefined;
+  readonly execDefaults: { readonly timeoutMs: number } | undefined;
   constructor(opts: Partial<SandboxExecResult> = {}, defaultTimeoutMs?: number) {
     this.result = opts;
-    this.defaultTimeoutMs = defaultTimeoutMs;
+    this.execDefaults =
+      defaultTimeoutMs === undefined ? undefined : { timeoutMs: defaultTimeoutMs };
   }
   async exec(opts: SandboxExecOptions): Promise<SandboxExecResult> {
     this.calls.push(opts);

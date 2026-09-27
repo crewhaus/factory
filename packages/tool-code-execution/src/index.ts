@@ -312,7 +312,7 @@ function readPositiveMs(override: unknown, camel: string, snake: string): number
  *
  * `timeoutMs` undefined means "the sandbox's own default", which is left to
  * the sandbox only when no cap applies. With a cap, the default is read from
- * the config or the sandbox (`Sandbox.defaultTimeoutMs`); an injected
+ * the config or the sandbox (`Sandbox.execDefaults`); an injected
  * sandbox that does not say its default runs such a call with the cap.
  */
 export function resolveEffectiveTimeout(
@@ -328,7 +328,9 @@ export function resolveEffectiveTimeout(
   const cap = Math.min(...caps);
   const knownDefault =
     config.defaultTimeoutMs ??
-    (config.sandbox === undefined ? SANDBOX_DEFAULT_TIMEOUT_MS : config.sandbox.defaultTimeoutMs);
+    (config.sandbox === undefined
+      ? SANDBOX_DEFAULT_TIMEOUT_MS
+      : config.sandbox.execDefaults?.timeoutMs);
   const base = requested ?? knownDefault;
   // A default nobody can read here may be longer than the cap: the cap is
   // the most the call may run, so it is the timeout.

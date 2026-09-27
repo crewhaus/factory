@@ -723,13 +723,13 @@ exit 125
   }, 20_000);
 
   test("a sandbox says the default timeout a call without one runs with", () => {
-    expect(createSandbox({ backend: "docker" }).defaultTimeoutMs).toBe(60_000);
-    expect(createSandbox({ backend: "podman", defaultTimeoutMs: 5_000 }).defaultTimeoutMs).toBe(
-      5_000,
-    );
-    expect(createSandbox({ backend: "noop", defaultTimeoutMs: 7_000 }).defaultTimeoutMs).toBe(
-      7_000,
-    );
+    expect(createSandbox({ backend: "docker" }).execDefaults).toEqual({ timeoutMs: 60_000 });
+    expect(createSandbox({ backend: "podman", defaultTimeoutMs: 5_000 }).execDefaults).toEqual({
+      timeoutMs: 5_000,
+    });
+    expect(createSandbox({ backend: "noop", defaultTimeoutMs: 7_000 }).execDefaults).toEqual({
+      timeoutMs: 7_000,
+    });
   });
 
   // C012: the timeout and the abort live in the host. A host that went away
@@ -859,6 +859,60 @@ exit 125
       expect(log().filter((l) => !l.startsWith("run "))).toEqual([]);
     }, 30_000);
   });
+});
+
+// A third-party backend written the way 0.7.0's own classes were — with a
+// private `defaultTimeoutMs` — must still implement Sandbox (a type-level
+// break of 0.7.1's first draft).
+describe("a Sandbox written against 0.7.0 still type-checks", () => {
+  test("a class with a private defaultTimeoutMs implements Sandbox", () => {
+    // Outside the package, so no concurrent lint or build ever sees it; tsc
+    // runs from here to find the workspace's types.
+    const fixtureDir = mkdtempSync(join(tmpdir(), "sandbox-compat-"));
+    try {
+      const fixture = join(fixtureDir, "backend.ts");
+      writeFileSync(
+        fixture,
+        [
+          `import type { Sandbox, SandboxExecOptions, SandboxExecResult } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+          "export class FirecrackerSandbox implements Sandbox {",
+          '  readonly backend = "docker" as const;',
+          "  private readonly defaultTimeoutMs: number = 30_000;",
+          "  async exec(opts: SandboxExecOptions): Promise<SandboxExecResult> {",
+          '    return { stdout: "", stderr: "", exitCode: 0, timedOut: false, durationMs: opts.timeoutMs ?? this.defaultTimeoutMs };',
+          "  }",
+          "  async close(): Promise<void> {}",
+          "}",
+        ].join("\n"),
+      );
+      const tsc = require.resolve("typescript/lib/tsc.js");
+      const r = Bun.spawnSync(
+        [
+          process.execPath,
+          tsc,
+          "--noEmit",
+          "--strict",
+          "--skipLibCheck",
+          "--target",
+          "esnext",
+          "--module",
+          "esnext",
+          "--moduleResolution",
+          "bundler",
+          "--allowImportingTsExtensions",
+          "--types",
+          "bun",
+          fixture,
+        ],
+        { stdout: "pipe", stderr: "pipe", cwd: import.meta.dir },
+      );
+      const out = new TextDecoder().decode(r.stdout);
+      expect(out.split("\n").filter((l) => l.includes("backend.ts"))).toEqual([]);
+      expect(r.exitCode).toBe(0);
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe.if(posix)("noop backend: a timeout or abort takes down what the program started", () => {

@@ -195,11 +195,13 @@ export class SandboxError extends CrewhausError {
 export interface Sandbox {
   readonly backend: SandboxBackend;
   /**
-   * The timeout an exec runs with when it passes none, in ms. The built-in
-   * backends always say; a caller that caps timeouts reads it to apply the
-   * cap to a call that sets no timeout of its own.
+   * What an exec runs with when it sets nothing itself: `timeoutMs`, in ms.
+   * The built-in backends always say; a caller that caps timeouts reads it
+   * to apply the cap to a call that sets no timeout of its own. Optional,
+   * and named so it cannot collide with a field an existing implementation
+   * already has (0.7.0's own classes kept a private `defaultTimeoutMs`).
    */
-  readonly defaultTimeoutMs?: number;
+  readonly execDefaults?: { readonly timeoutMs: number };
   exec(opts: SandboxExecOptions): Promise<SandboxExecResult>;
   /** Idempotent. */
   close(): Promise<void>;
@@ -603,10 +605,11 @@ async function superviseExec(o: SuperviseOptions): Promise<SandboxExecResult> {
 
 class DockerLikeSandbox implements Sandbox {
   readonly backend: SandboxBackend;
+  readonly execDefaults: { readonly timeoutMs: number };
   private readonly cli: string;
   private readonly allowedImages: ReadonlySet<string>;
   private readonly mountWhitelist: ReadonlyArray<string>;
-  readonly defaultTimeoutMs: number;
+  private readonly defaultTimeoutMs: number;
   private readonly maxOutputBytes: number;
   private readonly memory: string;
   private readonly cpus: string;
@@ -631,6 +634,7 @@ class DockerLikeSandbox implements Sandbox {
       return p;
     });
     this.defaultTimeoutMs = parseTimeoutMs(opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.execDefaults = { timeoutMs: this.defaultTimeoutMs };
     this.maxOutputBytes = parseMaxOutputBytes(opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
     this.memory = opts.memory ?? DEFAULT_MEMORY;
     this.cpus = opts.cpus ?? DEFAULT_CPUS;
@@ -717,9 +721,10 @@ class DockerLikeSandbox implements Sandbox {
 
 class NoopSandbox implements Sandbox {
   readonly backend: SandboxBackend = "noop";
+  readonly execDefaults: { readonly timeoutMs: number };
   private readonly allowedImages: ReadonlySet<string>;
   private readonly mountWhitelist: ReadonlyArray<string>;
-  readonly defaultTimeoutMs: number;
+  private readonly defaultTimeoutMs: number;
   private readonly maxOutputBytes: number;
   private closed = false;
 
@@ -739,6 +744,7 @@ class NoopSandbox implements Sandbox {
       return p;
     });
     this.defaultTimeoutMs = parseTimeoutMs(opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.execDefaults = { timeoutMs: this.defaultTimeoutMs };
     this.maxOutputBytes = parseMaxOutputBytes(opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
   }
 
