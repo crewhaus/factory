@@ -1,5 +1,6 @@
 import { onAbort } from "../signal";
 import { type CollectResult, collectBounded } from "./collect";
+import { readIgnoredSignals } from "./ignored-signals";
 import { byteBudget, deadlineMs, graceMs, optionalByteBudget } from "./limits";
 
 /**
@@ -27,8 +28,10 @@ import { byteBudget, deadlineMs, graceMs, optionalByteBudget } from "./limits";
  * for that signal — the host then dies of it as it would have. A host that
  * handles those signals itself keeps that policy; it should pass the turn's
  * abort signal to every call, and its own exit path is covered by the exit
- * hook. A child that is only a client of the process doing the work (a
- * `docker run` CLI) registers {@link addHostExitHook} for the work itself.
+ * hook. A signal the host was started ignoring (`nohup`, a shell's
+ * background job) is never listened for, so it stays ignored. A child that
+ * is only a client of the process doing the work (a `docker` CLI attached
+ * to a container) registers {@link addHostExitHook} for the work itself.
  * {@link setHostExitCleanup} turns all of this off.
  *
  * POSIX only for the group kill. On Windows the tree is stopped with
@@ -79,8 +82,8 @@ export type SpawnBoundedOptions = {
    * Called once when a timeout, an abort or an overflow starts the kill,
    * just before the group is signalled. For a child that is only a client
    * of the process doing the work, this is where that work is stopped: a
-   * `docker run` CLI can be killed while its container runs on, so the
-   * sandbox runs `docker kill <name>` from here. Not awaited; a caller that
+   * `docker` CLI attached to a container can be killed while the container
+   * runs on, so the sandbox runs `docker kill <name>` from here. Not awaited; a caller that
    * starts something waits for it itself. A throw is ignored.
    */
   readonly onKill?: (reason: "timeout" | "abort" | "overflow") => void;
@@ -183,6 +186,14 @@ const exitHooks = new Set<() => void>();
 let cleanupEnabled = true;
 let hooksInstalled = false;
 const HOST_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+/**
+ * The host signals the process ignored before this module first listened.
+ * Read once: a listener replaces SIG_IGN and removing it leaves SIG_DFL, so
+ * after the first install the process's own answer would be ours. Listening
+ * for one of these made a `nohup`ed host die of the SIGHUP it asked to
+ * ignore, during and after the command.
+ */
+let ignoredAtStart: ReadonlySet<NodeJS.Signals> | undefined;
 
 /**
  * The host is going away: SIGKILL every live group first, so nothing they
@@ -238,8 +249,11 @@ function onHostSignal(sig: NodeJS.Signals): void {
 function installHooks(): void {
   if (hooksInstalled || !cleanupEnabled || isWindows) return;
   hooksInstalled = true;
+  ignoredAtStart ??= readIgnoredSignals(HOST_SIGNALS);
   process.on("exit", onHostExit);
-  for (const sig of HOST_SIGNALS) process.prependListener(sig, onHostSignal);
+  for (const sig of HOST_SIGNALS) {
+    if (!ignoredAtStart.has(sig)) process.prependListener(sig, onHostSignal);
+  }
 }
 
 function uninstallHooks(): void {
@@ -253,9 +267,9 @@ function uninstallHooks(): void {
  * Registers synchronous work to do if the host goes away while something is
  * in flight: on `process.exit` (or the end of the event loop), and on
  * SIGINT, SIGTERM or SIGHUP when the host does not handle that signal
- * itself — the same moments a live group is killed, and after it is. For
- * work a killed child cannot stop on its own: the sandbox removes the
- * containers its `docker run` clients started. The hook must be synchronous
+ * itself (nor ignores it) — the same moments a live group is killed, and
+ * after it is. For work a killed child cannot stop on its own: the sandbox
+ * stops the containers its `docker` clients were attached to. The hook must be synchronous
  * and bounded (`Bun.spawnSync` with a `timeout`); a throw is ignored. It
  * runs at most once. Returns a function that unregisters it. POSIX only,
  * like the rest of the host-exit cleanup; a no-op while
