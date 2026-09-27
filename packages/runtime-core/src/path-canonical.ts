@@ -21,6 +21,15 @@
  * A path on a filesystem that ignores case (or where that cannot be told) is
  * marked `caseInsensitive`, so a deny or ask compares it ignoring case — the
  * name a tool is about to CREATE has no stored spelling to read.
+ *
+ * The workspace root can itself be reached another way — the shell's `$PWD`
+ * through a symlinked directory, or a top-level symlink such as macOS's
+ * `/tmp` → `/private/tmp` — and a rule may name it that way:
+ * `alwaysDeny Write(/tmp/ws/.crewhaus/**)` while the runtime's cwd reads
+ * `/private/tmp/ws`. The same location under each of those spellings of the
+ * root is a further spelling, so such a deny is not dodged by a relative
+ * path. (A spelling, not a canonical value: it widens what a deny or ask
+ * catches, never what an allow grants.)
  */
 import { lstatSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import * as path from "node:path";
@@ -30,6 +39,64 @@ type OperativeValue = ReturnType<PathCanonicalizer>[number];
 
 function toPosix(p: string): string {
   return path.sep === "\\" ? p.split(path.sep).join("/") : p;
+}
+
+/** Top-level symlinks and the directory each resolves to, read once per process. */
+let topLevelLinksRead: ReadonlyArray<readonly [string, string]> | undefined;
+
+function topLevelLinks(): ReadonlyArray<readonly [string, string]> {
+  if (topLevelLinksRead !== undefined) return topLevelLinksRead;
+  const out: Array<readonly [string, string]> = [];
+  const top = path.parse(path.resolve("/")).root;
+  try {
+    for (const entry of readdirSync(top, { withFileTypes: true })) {
+      if (!entry.isSymbolicLink()) continue;
+      const link = path.join(top, entry.name);
+      try {
+        out.push([link, realpathSync(link)]);
+      } catch {
+        // A dangling top-level link names no directory a workspace is in.
+      }
+    }
+  } catch {
+    // An unreadable root has no aliases to offer.
+  }
+  topLevelLinksRead = out;
+  return out;
+}
+
+/** Where the workspace root's other spellings come from; tests pass their own. */
+export type RootSpellingSources = {
+  /** The shell's logical working directory. Default `process.env.PWD`. */
+  readonly pwd?: string | undefined;
+  /** Top-level symlinks and their resolved targets. Default: read from `/`. */
+  readonly topLevelLinks?: ReadonlyArray<readonly [string, string]>;
+};
+
+/**
+ * The other absolute spellings of the workspace root `rootReal` (already
+ * realpath'd): the root as given, `$PWD` when it resolves to the root, and
+ * the root under each top-level symlink whose target contains it.
+ */
+function rootAliases(rootAbs: string, rootReal: string, sources: RootSpellingSources): string[] {
+  const out = new Set<string>();
+  if (rootAbs !== rootReal) out.add(rootAbs);
+  const pwd = "pwd" in sources ? sources.pwd : process.env["PWD"];
+  if (pwd !== undefined && path.isAbsolute(pwd)) {
+    try {
+      if (realpathSync(pwd) === rootReal) out.add(path.resolve(pwd));
+    } catch {
+      // A $PWD that no longer resolves names nothing.
+    }
+  }
+  for (const [link, target] of sources.topLevelLinks ?? topLevelLinks()) {
+    if (rootReal === target) out.add(link);
+    else if (rootReal.startsWith(target.endsWith(path.sep) ? target : `${target}${path.sep}`)) {
+      out.add(`${link}${rootReal.slice(target.length)}`);
+    }
+  }
+  out.delete(rootReal);
+  return [...out];
 }
 
 /** A relative path that leaves its base: `..`, `../x`, or another drive. */
@@ -161,7 +228,11 @@ function ignoresCase(dir: string): boolean | undefined {
  * has to cover both, and a deny fires on either. The name as written stays a
  * spelling a deny also fires on.
  */
-export function canonicalWorkspacePath(raw: string, root: string): OperativeValue[] {
+export function canonicalWorkspacePath(
+  raw: string,
+  root: string,
+  rootSpellings: RootSpellingSources = {},
+): OperativeValue[] {
   const rootAbs = path.resolve(root);
   let rootReal: string;
   try {
@@ -169,6 +240,7 @@ export function canonicalWorkspacePath(raw: string, root: string): OperativeValu
   } catch {
     rootReal = rootAbs;
   }
+  const aliases = rootAliases(rootAbs, rootReal, rootSpellings);
   // Lexical: `..` collapsed, symlinks untouched.
   const lexicalAbs = path.resolve(rootAbs, raw);
   const lexicalRel = path.relative(rootAbs, lexicalAbs);
@@ -184,11 +256,12 @@ export function canonicalWorkspacePath(raw: string, root: string): OperativeValu
     const rel = path.relative(rootReal, real);
     if (climbsOut(rel)) return outside;
     const relPosix = rel === "" ? "." : toPosix(rel);
+    const underAliases = aliases.map((a) => toPosix(rel === "" ? a : path.join(a, rel)));
     return {
       kind: "path",
       canonical:
         relPosix === "." ? [".", toPosix(real)] : [relPosix, `./${relPosix}`, toPosix(real)],
-      spellings,
+      spellings: underAliases.length === 0 ? spellings : [...spellings, ...underAliases],
       ...(caseInsensitive ? { caseInsensitive: true } : {}),
     };
   };

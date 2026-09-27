@@ -105,6 +105,71 @@ describe("canonicalWorkspacePath", () => {
   });
 });
 
+// The workspace can be reached through a symlinked spelling of its root —
+// the shell's $PWD, or a top-level link like macOS's /tmp → /private/tmp —
+// while the runtime's cwd is the physical path. A deny written through that
+// spelling was dodged by a relative path (0.7.1 review).
+describe("a rule that names the workspace through a symlinked spelling of its root", () => {
+  const decide = (raw: string, type: PermissionRule["type"], pattern: string, sources = {}) =>
+    evaluate(
+      {
+        toolName: "WriteLike",
+        input: { path: raw },
+        operativeValues: canonicalWorkspacePath(raw, ws, sources),
+        readOnly: false,
+        destructive: true,
+      },
+      "default",
+      { ...emptyRuleSet, yaml: [{ type, pattern, source: "yaml" }] },
+    );
+  let away: string;
+  beforeEach(() => {
+    away = realpathSync(mkdtempSync(path.join(tmpdir(), "perm-canonical-alias-")));
+  });
+  afterEach(() => {
+    rmSync(away, { recursive: true, force: true });
+  });
+
+  test("$PWD: a deny through the logical root fires on the relative spelling", () => {
+    const logical = path.join(away, "ws-link");
+    symlinkSync(ws, logical);
+    const sources = { pwd: logical, topLevelLinks: [] };
+    const deny = `WriteLike(${logical}/.crewhaus/**)`;
+    expect(decide(".crewhaus/settings.json", "alwaysDeny", deny, sources)).toBe("deny");
+    expect(decide("./.crewhaus/settings.json", "alwaysDeny", deny, sources)).toBe("deny");
+    expect(decide("src/app.ts", "alwaysDeny", deny, sources)).toBe("ask");
+    // A spelling, never a grant: an allow through the logical root still asks.
+    expect(decide("src/app.ts", "alwaysAllow", `WriteLike(${logical}/src/**)`, sources)).toBe(
+      "ask",
+    );
+    // Control: a $PWD that is not the workspace adds nothing.
+    expect(
+      decide(".crewhaus/settings.json", "alwaysDeny", deny, { pwd: away, topLevelLinks: [] }),
+    ).toBe("ask");
+  });
+
+  test("a top-level link over the root's ancestor: the deny fires through it", () => {
+    const top = "/crewhaus-alias-top";
+    const sources = { pwd: undefined, topLevelLinks: [[top, path.dirname(ws)] as const] };
+    const deny = `WriteLike(${top}/${path.basename(ws)}/.crewhaus/**)`;
+    expect(decide(".crewhaus/settings.json", "alwaysDeny", deny, sources)).toBe("deny");
+    expect(
+      decide(".crewhaus/settings.json", "alwaysDeny", deny, { pwd: undefined, topLevelLinks: [] }),
+    ).toBe("ask");
+  });
+
+  const logicalTmp = path.resolve(tmpdir());
+  test.if(realpathSync(logicalTmp) !== logicalTmp)(
+    "on this machine the temp dir is behind a real top-level link, and a deny through it fires",
+    () => {
+      const deny = `WriteLike(${path.join(logicalTmp, path.basename(ws))}/.crewhaus/**)`;
+      expect(decide(".crewhaus/settings.json", "alwaysDeny", deny, { pwd: undefined })).toBe(
+        "deny",
+      );
+    },
+  );
+});
+
 describe("workspacePathCanonicalizer", () => {
   test("defaults to the working directory, the root the tools resolve against", () => {
     const cwd = process.cwd();
