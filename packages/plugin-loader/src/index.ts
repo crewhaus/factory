@@ -1148,7 +1148,12 @@ export type ActivatePluginsOptions = {
  * - a tool the runtime registers itself (`ListTools`, `Skill`, `Task`, the
  *   Focus/Plan/Goal and memory tools, `Consult`, `Escalate`, …): a plugin one
  *   would displace it, and inherit its builtin alwaysAllow where it has one;
- * - an `mcp__` name, which everything reads as an MCP server's tool;
+ * - any of those names in another letter case (`grep`, `READ`,
+ *   `listtools`): a model profile's `tools` list matches names without
+ *   regard to case, so a profile that lists `Grep` would offer a plugin
+ *   `grep` to the model it is meant to restrict;
+ * - an `mcp__` name (in any case), which everything reads as an MCP server's
+ *   tool;
  * - a `<server>__<tool>` name, how an MCP server's tool was named before
  *   0.7.1: permission rules, skill and sub-agent tool lists and rate limits
  *   written that way still match `mcp__<server>__<tool>`, so a rule meant
@@ -1164,11 +1169,35 @@ export function reservedPluginToolNameReason(name: string): string | undefined {
   if (RUNTIME_TOOL_NAMES.includes(name)) {
     return "the crewhaus runtime registers a tool of that name itself";
   }
-  if (name.startsWith("mcp__")) return "names starting mcp__ belong to MCP servers' tools";
+  const folded = reservedNamesByCase().get(name.toLowerCase());
+  if (folded !== undefined) {
+    return `crewhaus has a tool named "${folded}", and a model profile's tools list matches names in any letter case, so a profile that lists ${folded} would offer this tool too`;
+  }
+  if (name.toLowerCase().startsWith("mcp__")) {
+    return "names starting mcp__ belong to MCP servers' tools";
+  }
   if (legacyMcpToolName(`mcp__${name}`) !== undefined) {
     return `a name of the form <server>__<tool> is how rules written before crewhaus 0.7.1 name an MCP server's tool, so a rule meant for mcp__${name} would govern this tool too`;
   }
   return undefined;
+}
+
+let reservedByCase: ReadonlyMap<string, string> | undefined;
+
+/**
+ * Every builtin and runtime tool name, lower-cased, to the name itself. A
+ * model profile's `tools` list (model-plan) matches a plain name without
+ * regard to case, so `grep` would be offered wherever `Grep` is.
+ */
+function reservedNamesByCase(): ReadonlyMap<string, string> {
+  if (reservedByCase === undefined) {
+    const map = new Map<string, string>();
+    for (const n of [...TOOL_FLAGS_BY_NAME.keys(), ...RUNTIME_TOOL_NAMES]) {
+      if (!map.has(n.toLowerCase())) map.set(n.toLowerCase(), n);
+    }
+    reservedByCase = map;
+  }
+  return reservedByCase;
 }
 
 /** A name a reserved plugin tool could take instead: prefixed with its plugin's, with no `__`. */

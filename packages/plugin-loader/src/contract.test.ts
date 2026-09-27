@@ -16,6 +16,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
+import { buildAdvertisement } from "@crewhaus/model-plan";
 import { BUILTIN_DEFAULT_RULES } from "@crewhaus/permission-engine";
 import { createPluginRegistry } from "@crewhaus/plugin-registry";
 import type { PluginManifest } from "@crewhaus/plugin-sdk";
@@ -260,12 +261,48 @@ describe("a plugin tool cannot take a crewhaus tool's name (C104)", () => {
     // not one of them since the review of 0.7.1: rules written for the MCP
     // tool mcp__gh__x in the pre-0.7.1 spelling would match it.)
     expect(reservedPluginToolNameReason("gh__x")).toMatch(/^a name of the form <server>__<tool>/);
-    for (const free of ["my_tool", "grep", "squatter_Grep", "Greet", "gh_x", "__lead", "trail__"]) {
+    for (const free of ["my_tool", "squatter_Grep", "Greet", "gh_x", "__lead", "trail__"]) {
       expect({ free, reason: reservedPluginToolNameReason(free) }).toEqual({
         free,
         reason: undefined,
       });
     }
+  });
+
+  test("a crewhaus name in another letter case is reserved too", async () => {
+    // A model profile's tools list matches plain names in any case, so a
+    // plugin `grep` was offered wherever a profile listed `Grep` (review of
+    // the C104 fix).
+    for (const [name, owner] of [
+      ["grep", "Grep"],
+      ["READ", "Read"],
+      ["bash", "Bash"],
+      ["listtools", "ListTools"],
+    ] as const) {
+      expect({ name, reason: reservedPluginToolNameReason(name) }).toEqual({
+        name,
+        reason: `crewhaus has a tool named "${owner}", and a model profile's tools list matches names in any letter case, so a profile that lists ${owner} would offer this tool too`,
+      });
+    }
+    expect(reservedPluginToolNameReason("MCP__gh__x")).toBe(
+      "names starting mcp__ belong to MCP servers' tools",
+    );
+    const registry = await install("squatter");
+    const activated = await activatePlugins({
+      names: ["squatter"],
+      registry,
+      warn: () => {},
+      loader: loaderFor(["Grep", "grep", "READ", "bash", "my_tool"].map((n) => tool(n))),
+    });
+    expect(activated.tools.map((t) => t.name)).toEqual(["my_tool"]);
+    expect(activated.warnings).toHaveLength(4);
+    // What the review saw: a read-only profile [Grep, Read] offered the
+    // destructive plugin tools grep and READ.
+    const advertised = buildAdvertisement(
+      [{ name: "Grep", readOnly: true } as never, ...activated.tools],
+      { tools: ["Grep", "Read"] },
+    );
+    expect(advertised.tools.map((t) => t.name)).toEqual(["Grep"]);
   });
 
   test("end to end: the model sees the runtime's ListTools, and a squatter never runs under its grant", async () => {

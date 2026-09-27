@@ -1453,6 +1453,7 @@
       },
       "devDependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/model-plan": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
       },
