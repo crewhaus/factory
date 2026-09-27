@@ -21,6 +21,7 @@ import { markdownOutline } from "@crewhaus/tool-text";
 import {
   type VERIFY_TOOLS,
   acceptanceCheck,
+  factCrossCheck,
   goldenCompare,
   goldenUpdate,
   markdownLinkCheck,
@@ -138,6 +139,43 @@ describe("the Markdown readers do linear work", () => {
     within(1_000, () => extractMarkdownLinks("[x\n".repeat(100_000)));
     // Link text holding a bracket still yields its link.
     expect(extractMarkdownLinks("[a [b](url)")[0]?.href).toBe("url");
+  }, 60_000);
+
+  test("a link opener followed by a long run of spaces, or by more openers", () => {
+    // Whitespace before the destination, before the title and before the `)`
+    // competed for one run of spaces: 40 000 took 2.2 s on the fix round's
+    // pattern, and 100 000 about fourteen.
+    expect(within(1_000, () => extractMarkdownLinks(`[](${" ".repeat(100_000)}`))).toEqual([]);
+    expect(within(1_000, () => extractMarkdownLinks(`[](${" ".repeat(100_000)}x)`))).toHaveLength(
+      1,
+    );
+    // A destination run that reaches into the next opener, from every opener.
+    within(1_000, () => extractMarkdownLinks("[](x".repeat(100_000)));
+    within(1_000, () => extractMarkdownLinks(`[](${"x".repeat(100_000)}`));
+    within(1_000, () => extractMarkdownLinks('[](x "'.repeat(50_000)));
+    // Each claim sentence loses its links by the same reader, not a pattern
+    // that let every `[](` read to the end of the line.
+    const claims = within(1_000, () => citedClaims(`Claim [^1] ${"[](".repeat(60_000)}\n`));
+    expect(claims).toHaveLength(1);
+  }, 60_000);
+
+  test("MarkdownLinkCheck and FactCrossCheck over openers and spaces", async () => {
+    // 4.8 s on 0.7.0 and 6.7 s on the fix round for this README.
+    writeFileSync(join(workspace, "README.md"), `# Title\n\nSee [](${" ".repeat(60_000)}\n`);
+    let t0 = performance.now();
+    const links = JSON.parse(await raw(markdownLinkCheck, {}));
+    expect(performance.now() - t0).toBeLessThan(2_000);
+    expect(links).toMatchObject({ ok: true, documents: 1, linksChecked: 0 });
+    // 9 s on the fix round: 180 KB of `[](` in one cited sentence.
+    writeFileSync(join(workspace, "src.md"), "Claim\n");
+    t0 = performance.now();
+    const facts = JSON.parse(
+      await raw(factCrossCheck, {
+        text: `Claim [^1] ${"[](".repeat(60_000)}\n\n[^1]: src.md\n`,
+      }),
+    );
+    expect(performance.now() - t0).toBeLessThan(2_000);
+    expect(facts).toMatchObject({ checked: 1, claimsFound: 1 });
   }, 60_000);
 
   test("trailing whitespace is found without retrying every space", async () => {

@@ -181,6 +181,36 @@ describe("Markdown links", () => {
     expect(extractMarkdownLinks("a\n\n[x](./y.md)")[0]?.line).toBe(3);
   });
 
+  test("an inline destination is read as CommonMark reads it", () => {
+    const hrefs = (doc: string) => extractMarkdownLinks(doc).map((l) => l.href);
+    // Balanced parentheses belong to the destination; 0.7.0 cut at the first `)`.
+    expect(hrefs("[w](https://w.test/Foo_(bar)) and [f](./a(1).md)")).toEqual([
+      "https://w.test/Foo_(bar)",
+      "./a(1).md",
+    ]);
+    // Unbalanced, it is not a link at all.
+    expect(hrefs("[f](./a(1.md)")).toEqual([]);
+    // Angle brackets may hold spaces; a title may use any of its three quotes.
+    expect(
+      hrefs("[a](<./my file.md>) [b](./b.md 'B') [c](./c.md (C)) [d]( ./d.md  \"D\" )"),
+    ).toEqual(["./my file.md", "./b.md", "./c.md", "./d.md"]);
+    // A quote with no space before it is part of the destination, and a second
+    // word that is not a title is not a link: 0.7.0 said the same of both.
+    expect(hrefs('[a](./a.md"t") [b](./b.md c)')).toEqual(['./a.md"t"']);
+    // An empty destination is no promise; an escaped `)` does not end one.
+    expect(hrefs("[a]() [b](<>) [c](./c\\).md)")).toEqual(["./c\\).md"]);
+    // An image and the line it sits on.
+    expect(extractMarkdownLinks("x\n![i](./i.png)")).toEqual([
+      { href: "./i.png", text: "i", line: 2, kind: "image" },
+    ]);
+  });
+
+  test("a claim loses its links' destinations, parentheses and titles included", () => {
+    expect(citedClaims('See [the report](./r(1).md "R") for this [1].\n')[0]?.text).toBe(
+      "See the report for this.",
+    );
+  });
+
   test("a reference with no definition is not reported as a link", () => {
     expect(extractMarkdownLinks("[x][missing]")).toEqual([]);
   });

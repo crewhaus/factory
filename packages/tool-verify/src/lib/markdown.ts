@@ -111,6 +111,108 @@ export function splitLinkTarget(href: string): {
   return { target, fragment };
 }
 
+/** An inline link or image, `[text](destination "title")`, and where it sits. */
+type InlineLink = {
+  readonly start: number;
+  readonly end: number;
+  readonly image: boolean;
+  readonly text: string;
+  readonly href: string;
+};
+
+/**
+ * Where an inline link can start: `[text](` or `![alt](`. The text excludes
+ * `[` as well as `]`, so each attempt stops where the next one would start.
+ */
+const INLINE_OPENER = /(!?)\[([^\[\]]*)\]\(/g;
+
+const isSpace = (ch: string): boolean => /\s/.test(ch);
+
+/**
+ * Every inline link and image, in one left-to-right pass.
+ *
+ * The destination and title are read by hand, not by a regex, and never past
+ * the next opener. A single pattern for `(dest "title")` has to let whitespace
+ * sit before the destination, before the title and before the `)`, and those
+ * runs compete for the same spaces: `[](` and 60 KB of spaces held
+ * MarkdownLinkCheck for seconds, and `[^)\n]*` let every `[](` on a line read
+ * to its end. Bounding each read by the next opener makes the reads disjoint,
+ * so the whole scan is linear. A link whose title holds another `[x](` is the
+ * one shape that costs: it is read as the inner link, not the outer one.
+ *
+ * The destination follows CommonMark rather than 0.7.0's pattern where they
+ * differ: parentheses in it must balance and are kept (`Foo_(bar)` was cut to
+ * `Foo_(bar`), `<…>` may hold spaces, and a title may be quoted with `"`, `'`
+ * or `(…)`.
+ */
+function inlineLinks(text: string): InlineLink[] {
+  const openers = [...text.matchAll(INLINE_OPENER)];
+  const out: InlineLink[] = [];
+  for (let k = 0; k < openers.length; k++) {
+    const m = openers[k] as RegExpMatchArray;
+    const start = m.index as number;
+    const limit =
+      k + 1 < openers.length ? ((openers[k + 1] as RegExpMatchArray).index as number) : text.length;
+    const read = readDestination(text, start + m[0].length, limit);
+    if (read === null) continue;
+    out.push({ start, end: read.end, image: m[1] === "!", text: m[2] as string, href: read.href });
+  }
+  return out;
+}
+
+/** The `destination "title")` after an opener, read no further than `limit`. */
+function readDestination(
+  text: string,
+  from: number,
+  limit: number,
+): { readonly href: string; readonly end: number } | null {
+  let i = from;
+  while (i < limit && isSpace(text[i] as string)) i++;
+  let href: string;
+  if (text[i] === "<") {
+    let j = i + 1;
+    while (j < limit && text[j] !== ">") {
+      if (text[j] === "\n" || text[j] === "<") return null;
+      j += text[j] === "\\" ? 2 : 1;
+    }
+    if (j >= limit) return null;
+    href = text.slice(i + 1, j);
+    i = j + 1;
+  } else {
+    const begin = i;
+    let depth = 0;
+    while (i < limit) {
+      const ch = text[i] as string;
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (isSpace(ch)) break;
+      if (ch === "(") depth++;
+      else if (ch === ")") {
+        if (depth === 0) break;
+        depth--;
+      }
+      i++;
+    }
+    if (depth !== 0 || i > limit) return null;
+    href = text.slice(begin, i);
+  }
+  const afterDestination = i;
+  while (i < limit && isSpace(text[i] as string)) i++;
+  const open = text[i];
+  if (i > afterDestination && (open === '"' || open === "'" || open === "(")) {
+    const close = open === "(" ? ")" : open;
+    let j = i + 1;
+    while (j < limit && text[j] !== close) j += text[j] === "\\" ? 2 : 1;
+    if (j >= limit) return null;
+    i = j + 1;
+    while (i < limit && isSpace(text[i] as string)) i++;
+  }
+  if (i >= limit || text[i] !== ")") return null;
+  return { href, end: i + 1 };
+}
+
 /** Every link a Markdown document points at, code blocks excluded. */
 export function extractMarkdownLinks(text: string): LinkRef[] {
   const spans = indexSpans(codeSpans(text));
@@ -127,15 +229,14 @@ export function extractMarkdownLinks(text: string): LinkRef[] {
     definitions.set((m[1] as string).toLowerCase(), m[2] as string);
   }
 
-  for (const m of text.matchAll(/(!?)\[([^\[\]]*)\]\(\s*<?([^)\s>]*)>?(?:\s+"[^"]*")?\s*\)/g)) {
-    if (m.index === undefined || inSpan(m.index, spans)) continue;
-    const href = m[3] as string;
-    if (href === "") continue;
+  for (const link of inlineLinks(text)) {
+    if (inSpan(link.start, spans)) continue;
+    if (link.href === "") continue;
     links.push({
-      href,
-      text: m[2] as string,
-      line: lineAt(m.index),
-      kind: m[1] === "!" ? "image" : "inline",
+      href: link.href,
+      text: link.text,
+      line: lineAt(link.start),
+      kind: link.image ? "image" : "inline",
     });
   }
 
@@ -363,12 +464,24 @@ export type CitedClaim = {
   readonly markers: ReadonlyArray<string>;
 };
 
+/** A sentence with each inline link replaced by its text, by the same reader
+ *  the link checker uses (a pattern of its own let every `[](` read to the end
+ *  of the line: 192 KB of them held FactCrossCheck for nine seconds). */
+function linksToText(sentence: string): string {
+  let out = "";
+  let at = 0;
+  for (const link of inlineLinks(sentence)) {
+    out += sentence.slice(at, link.start) + link.text;
+    at = link.end;
+  }
+  return out + sentence.slice(at);
+}
+
 /** Markdown down to the words the sentence actually asserts. */
 function plainClaim(sentence: string): string {
   return (
-    sentence
+    linksToText(sentence) // a link's URL is not part of the claim
       .replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "") // the bullet is not part of the claim
-      .replace(/!?\[([^\[\]]*)\]\([^)\n]*\)/g, "$1") // a link's URL is not part of the claim
       .replace(/\[\^?[\w.-]+\]/g, " ") // the markers themselves
       .replace(/[`*_>#|]/g, "")
       .replace(/\s+/g, " ")
