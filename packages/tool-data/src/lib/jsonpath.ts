@@ -34,6 +34,7 @@
  * position, never a silent empty result.
  */
 
+import { type RegexAnswers, testPatternSync } from "@crewhaus/tool-schema";
 import { getOwn, isPlainObject } from "./json";
 
 export type PathStep =
@@ -274,6 +275,18 @@ export type QueryResult = {
   truncated: boolean;
   /** Set when the query stopped at MAX_QUERY_VISITS rather than at the limit. */
   stoppedAtVisits?: number;
+  /**
+   * Nodes a `=~` filter could not be answered on (the regex worker's
+   * deadline, the engine giving up): left out, neither matched nor ruled
+   * out, with their paths. Absent when there were none.
+   */
+  undetermined?: { count: number; paths: string[] };
+};
+
+/** What a query reads its `=~` answers from, and where it notes the ones it could not have. */
+type FilterContext = {
+  readonly regex: RegexAnswers | undefined;
+  readonly undetermined: Node[];
 };
 
 /**
@@ -293,10 +306,12 @@ export function queryPath(
   steps: ReadonlyArray<PathStep>,
   limit: number,
   maxVisits = MAX_QUERY_VISITS,
+  regex?: RegexAnswers,
 ): QueryResult {
   const found: Node[] = [];
   const want = Math.max(limit, 0) + 1;
   const budget = { left: maxVisits };
+  const filters: FilterContext = { regex, undetermined: [] };
   const start: Node = { value: root, parent: null, seg: null };
   let stopped = false;
   if (steps.length === 0) {
@@ -305,7 +320,7 @@ export function queryPath(
     // One iterator per step: iterators[i] yields step i's outputs for the
     // node the level above handed it. An explicit stack, not recursion, so a
     // long path cannot overflow it.
-    const iterators: Array<Iterator<Node>> = [expand(steps[0] as PathStep, start, budget)];
+    const iterators: Array<Iterator<Node>> = [expand(steps[0] as PathStep, start, budget, filters)];
     while (iterators.length > 0) {
       const next = (iterators[iterators.length - 1] as Iterator<Node>).next();
       if (budget.left < 0) {
@@ -321,14 +336,23 @@ export function queryPath(
         if (found.length >= want) break;
         continue;
       }
-      iterators.push(expand(steps[iterators.length] as PathStep, next.value, budget));
+      iterators.push(expand(steps[iterators.length] as PathStep, next.value, budget, filters));
     }
   }
   const shown = found.slice(0, Math.max(limit, 0));
+  const open = filters.undetermined;
   return {
     matches: shown.map((n) => ({ path: renderPath(segmentsOf(n)), value: n.value })),
     truncated: stopped || found.length > shown.length,
     ...(stopped ? { stoppedAtVisits: maxVisits } : {}),
+    ...(open.length > 0
+      ? {
+          undetermined: {
+            count: open.length,
+            paths: open.slice(0, 50).map((n) => renderPath(segmentsOf(n))),
+          },
+        }
+      : {}),
   };
 }
 
@@ -341,7 +365,12 @@ function segmentsOf(node: Node): PathSegment[] {
 const child = (parent: Node, seg: PathSegment, value: unknown): Node => ({ value, parent, seg });
 
 /** The nodes one step produces from `node`, lazily, charging each to the budget. */
-function* expand(step: PathStep, node: Node, budget: { left: number }): Generator<Node> {
+function* expand(
+  step: PathStep,
+  node: Node,
+  budget: { left: number },
+  filters: FilterContext,
+): Generator<Node> {
   const v = node.value;
   switch (step.kind) {
     case "child": {
@@ -394,15 +423,20 @@ function* expand(step: PathStep, node: Node, budget: { left: number }): Generato
       return;
     }
     case "filter": {
+      const keep = (seg: PathSegment, value: unknown): boolean => {
+        const verdict = matchesFilter(value, step, filters.regex);
+        if (verdict === "undetermined") filters.undetermined.push(child(node, seg, value));
+        return verdict === true;
+      };
       if (Array.isArray(v)) {
         for (let i = 0; i < v.length; i++) {
           budget.left -= 1;
-          if (matchesFilter(v[i], step)) yield child(node, i, v[i]);
+          if (keep(i, v[i])) yield child(node, i, v[i]);
         }
       } else if (isPlainObject(v)) {
         for (const k of Object.keys(v)) {
           budget.left -= 1;
-          if (matchesFilter(v[k], step)) yield child(node, k, v[k]);
+          if (keep(k, v[k])) yield child(node, k, v[k]);
         }
       }
       return;
@@ -480,7 +514,19 @@ export function sliceIndices(
   return out;
 }
 
-function matchesFilter(value: unknown, step: Extract<PathStep, { kind: "filter" }>): boolean {
+/**
+ * Does `value` pass the filter? A `=~` pattern is never run here: its
+ * answer comes from `regex`, resolved in the worker by the tool, and one
+ * not answered yet reads as a miss for this pass (the tool runs the query
+ * again once it is answered). One that could not be answered is
+ * `"undetermined"`; one the screen refuses, or that does not compile, is a
+ * bad path, where 0.7.0 silently matched nothing.
+ */
+function matchesFilter(
+  value: unknown,
+  step: Extract<PathStep, { kind: "filter" }>,
+  regex: RegexAnswers | undefined,
+): boolean | "undetermined" {
   let cur: unknown = value;
   for (const seg of step.field) {
     if (isPlainObject(cur)) cur = getOwn(cur, seg);
@@ -495,11 +541,15 @@ function matchesFilter(value: unknown, step: Extract<PathStep, { kind: "filter" 
   if (step.op === "!=") return !looseEqual(cur, lit);
   if (step.op === "=~") {
     if (typeof lit !== "string") return false;
-    try {
-      return new RegExp(lit).test(String(cur));
-    } catch {
-      return false;
+    const subject = String(cur);
+    const answer =
+      regex === undefined ? testPatternSync(lit, "", subject) : regex.lookup(lit, "", subject);
+    if (answer === undefined) return false;
+    if (typeof answer === "boolean") return answer;
+    if ("refused" in answer) {
+      throw new PathError(`the filter's regex /${lit}/ was not run: ${answer.refused}`);
     }
+    return "undetermined";
   }
   if (typeof cur === "number" && typeof lit === "number") {
     return compare(cur < lit, cur > lit, step.op);

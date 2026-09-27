@@ -20,6 +20,7 @@
  */
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { RegexAnswers, regexRunContext, withRegexAnswers } from "@crewhaus/tool-schema";
 import { z } from "zod";
 import {
   CsvError,
@@ -66,6 +67,7 @@ import {
   type Record_,
   type SortKey,
   aggregate,
+  askPredicatePatterns,
   columnsToRecords as columnsToRecordsFn,
   dedupeRecords as dedupeRecordsFn,
   flattenObject as flattenObjectFn,
@@ -263,13 +265,22 @@ export const jsonQuery: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const doc = readJson(input.json, "json");
     if (!doc.ok) return doc.error;
     const limit = input.maxResults ?? 200;
     try {
       const steps = parsePath(input.path);
-      const result = queryPath(doc.value, steps, limit);
+      // A `=~` filter's pattern is answered in the regex worker, never run on
+      // this thread (C073): the query runs once to learn what each filter
+      // asks, and again with the answers (a filter under a filter takes one
+      // more round).
+      const run = await withRegexAnswers(
+        (regex) => queryPath(doc.value, steps, limit, undefined, regex),
+        regexRunContext(ctx),
+      );
+      if ("undetermined" in run) return `could not finish the query: ${run.undetermined}`;
+      const result = run.value;
       // Built by hand, one match at a time, so the result stops at the output
       // limit instead of being built whole and refused: `$..*` over a deep
       // document returns each subtree once per ancestor.
@@ -294,7 +305,8 @@ export const jsonQuery: RegisteredTool = buildTool({
             : result.truncated
               ? "maxResults"
               : null;
-      const head = `{"count":${parts.length},"truncated":${truncatedBy !== null}`;
+      // Nodes a filter could not answer on may be matches: not a complete list.
+      const head = `{"count":${parts.length},"truncated":${truncatedBy !== null || result.undetermined !== undefined}`;
       const why =
         truncatedBy === null
           ? ""
@@ -304,7 +316,15 @@ export const jsonQuery: RegisteredTool = buildTool({
                 : ""
             }`;
       const key = input.valuesOnly === true ? "values" : "matches";
-      return `${head}${why},"${key}":[${parts.join(",")}]}`;
+      const open =
+        result.undetermined === undefined
+          ? ""
+          : `,"undetermined":${JSON.stringify({
+              ...result.undetermined,
+              reason:
+                "a =~ filter could not be run to an answer on these nodes (the deadline, or the regex engine giving up), so they are neither matched nor ruled out",
+            })}`;
+      return `${head}${why}${open},"${key}":[${parts.join(",")}]}`;
     } catch (err) {
       if (err instanceof PathError) return `invalid path: ${err.message}`;
       throw err;
@@ -789,16 +809,42 @@ export const tableQuery: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     let rows: Record_[] = input.records as Record_[];
+    // Rows a `matches` pattern could not be answered on: neither returned
+    // nor excluded, and named, so the result is never read as complete.
+    const undeterminedRows: number[] = [];
     if (input.where !== undefined) {
+      const where = input.where;
       try {
-        rows = rows.filter((r) => testPredicate(r, input.where ?? {}));
+        // Every `matches` pattern is answered in the regex worker first, for
+        // every row, then the filter reads the answers (C073).
+        const regex = new RegexAnswers();
+        askPredicatePatterns(rows, where, regex);
+        await regex.resolve(regexRunContext(ctx));
+        const kept: Record_[] = [];
+        for (const [index, row] of rows.entries()) {
+          const verdict = testPredicate(row, where, regex);
+          if (verdict === true) kept.push(row);
+          else if (verdict === "undetermined") undeterminedRows.push(index);
+        }
+        rows = kept;
       } catch (err) {
         if (err instanceof PredicateError) return `invalid filter: ${err.message}`;
         throw err;
       }
     }
+    const undetermined =
+      undeterminedRows.length === 0
+        ? {}
+        : {
+            undetermined: {
+              count: undeterminedRows.length,
+              rows: undeterminedRows.slice(0, 50),
+              reason:
+                "a matches pattern could not be run to an answer on these rows (the deadline, or the regex engine giving up), so they are neither in the result nor ruled out",
+            },
+          };
     const matched = rows.length;
     if (input.sort !== undefined && input.sort.length > 0) {
       rows = sortRecordsFn(rows, input.sort as SortKey[]);
@@ -806,7 +852,7 @@ export const tableQuery: RegisteredTool = buildTool({
     const offset = input.offset ?? 0;
     const limit = input.limit ?? 1000;
     rows = rows.slice(offset, offset + limit);
-    if (input.countOnly === true) return json({ matched, returned: 0 });
+    if (input.countOnly === true) return json({ matched, returned: 0, ...undetermined });
     if (input.select !== undefined && input.select.length > 0) {
       const fields = input.select;
       rows = rows.map((r) => selectFields(r, fields));
@@ -815,7 +861,7 @@ export const tableQuery: RegisteredTool = buildTool({
       const fields = input.omit;
       rows = rows.map((r) => omitFields(r, fields));
     }
-    return json({ matched, returned: rows.length, records: rows });
+    return json({ matched, returned: rows.length, ...undetermined, records: rows });
   },
 });
 

@@ -77,6 +77,17 @@ a matched row once per partner. Past it the tool says so and builds nothing;
 (`truncatedBy: "visits"`), and a JSON Patch may add at most 2,000,000
 values.
 
+A caller's pattern (`TableQuery`'s `matches`, a JSONPath `=~` filter) never
+runs on the caller's thread. Every pattern question is answered first, in
+one `@crewhaus/tool-safety` regex worker under a five-second deadline, and
+the filter then reads the answers. A pattern that backtracks exponentially
+(`(a+)+`) is refused like an invalid one: `invalid filter` or `invalid path`
+(0.7.0 silently matched nothing on an invalid `=~`). A row or node whose
+pattern cannot be run to an answer (the deadline, or the engine giving up,
+which includes a no-match slower than 100 ms) is neither returned nor ruled
+out: it is listed under `undetermined`, so a `none` exclusion never passes
+the row it was written to stop.
+
 ## The parsers are hand-written, so here is exactly what they support
 
 There is no YAML, TOML, XML or CSV dependency behind these tools. That keeps

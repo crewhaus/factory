@@ -8,6 +8,7 @@
  * the same output every time.
  */
 
+import { type RegexAnswers, testPatternSync } from "@crewhaus/tool-schema";
 import {
   OutputLimitError,
   canonicalStringify,
@@ -89,8 +90,45 @@ export type Predicate = { all?: Condition[]; any?: Condition[]; none?: Condition
 
 export class PredicateError extends Error {}
 
-/** Evaluate one condition against a record. */
-export function testCondition(record: unknown, cond: Condition): boolean {
+/** A predicate's answer for one record: a verdict, or undetermined (a pattern had no answer). */
+export type PredicateVerdict = boolean | "undetermined";
+
+/**
+ * Ask `regex` about every `matches` condition in `predicate` for every
+ * record, so one resolve in the regex worker answers them all before
+ * {@link testPredicate} reads them.
+ */
+export function askPredicatePatterns(
+  records: ReadonlyArray<unknown>,
+  predicate: Predicate,
+  regex: RegexAnswers,
+): void {
+  const conditions = [
+    ...(predicate.all ?? []),
+    ...(predicate.any ?? []),
+    ...(predicate.none ?? []),
+  ].filter((c) => c.op === "matches" && typeof c.value === "string");
+  if (conditions.length === 0) return;
+  for (const record of records) {
+    for (const cond of conditions) {
+      const actual = getPath(record, cond.field);
+      if (actual !== undefined && actual !== null)
+        regex.lookup(cond.value as string, "", String(actual));
+    }
+  }
+}
+
+/**
+ * Evaluate one condition against a record. A `matches` pattern is never run
+ * here: its answer comes from `regex`, resolved in the worker by the tool
+ * (or, for a library caller with none, from the bounded fallback on this
+ * thread), and one with no answer is `"undetermined"`, never `false`.
+ */
+export function testCondition(
+  record: unknown,
+  cond: Condition,
+  regex?: RegexAnswers,
+): PredicateVerdict {
   const actual = getPath(record, cond.field);
   const expected = cond.value;
   switch (cond.op) {
@@ -122,13 +160,23 @@ export function testCondition(record: unknown, cond: Condition): boolean {
       if (typeof expected !== "string") {
         throw new PredicateError(`"matches" needs a regular-expression string for ${cond.field}`);
       }
-      let re: RegExp;
       try {
-        re = new RegExp(expected);
+        // Compiling reads only the pattern; the match is what is not run here.
+        new RegExp(expected);
       } catch (err) {
         throw new PredicateError(`invalid regex for ${cond.field}: ${(err as Error).message}`);
       }
-      return actual !== undefined && actual !== null && re.test(String(actual));
+      if (actual === undefined || actual === null) return false;
+      const subject = String(actual);
+      const answer =
+        regex === undefined
+          ? testPatternSync(expected, "", subject)
+          : regex.lookup(expected, "", subject);
+      if (typeof answer === "boolean") return answer;
+      if (answer !== undefined && "refused" in answer) {
+        throw new PredicateError(`invalid regex for ${cond.field}: ${answer.refused}`);
+      }
+      return "undetermined";
     }
     default:
       return compareOrdered(actual, expected, cond.op);
@@ -158,15 +206,49 @@ export function compareValues(a: unknown, b: unknown): number | null {
   return null;
 }
 
-/** Evaluate a whole predicate. An empty predicate matches everything. */
-export function testPredicate(record: unknown, predicate: Predicate): boolean {
+/**
+ * Evaluate a whole predicate. An empty predicate matches everything.
+ *
+ * Three-valued, so a condition with no answer cannot decide a record either
+ * way on its own: `all` fails on any definite miss, `none` excludes on any
+ * definite hit, `any` holds on any definite hit; otherwise a condition with
+ * no answer leaves the record `"undetermined"`. Reading it as a miss would
+ * let a `none` exclusion pass the very row it was written to stop.
+ */
+export function testPredicate(
+  record: unknown,
+  predicate: Predicate,
+  regex?: RegexAnswers,
+): PredicateVerdict {
   const all = predicate.all ?? [];
   const any = predicate.any ?? [];
   const none = predicate.none ?? [];
-  for (const c of all) if (!testCondition(record, c)) return false;
-  for (const c of none) if (testCondition(record, c)) return false;
-  if (any.length > 0 && !any.some((c) => testCondition(record, c))) return false;
-  return true;
+  let open = false;
+  for (const c of all) {
+    const v = testCondition(record, c, regex);
+    if (v === false) return false;
+    if (v === "undetermined") open = true;
+  }
+  for (const c of none) {
+    const v = testCondition(record, c, regex);
+    if (v === true) return false;
+    if (v === "undetermined") open = true;
+  }
+  if (any.length > 0) {
+    let hit = false;
+    let anyOpen = false;
+    for (const c of any) {
+      const v = testCondition(record, c, regex);
+      if (v === true) {
+        hit = true;
+        break;
+      }
+      if (v === "undetermined") anyOpen = true;
+    }
+    if (!hit && !anyOpen) return false;
+    if (!hit) open = true;
+  }
+  return open ? "undetermined" : true;
 }
 
 // ---------------------------------------------------------------------------
