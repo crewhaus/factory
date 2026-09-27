@@ -1456,8 +1456,10 @@
       },
       "devDependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/model-plan": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/plugin-registry": {
@@ -2969,6 +2971,7 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
+        "@crewhaus/prompt-injection-detector": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",

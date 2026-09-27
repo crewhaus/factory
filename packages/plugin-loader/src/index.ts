@@ -5,7 +5,6 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -17,6 +16,7 @@ import { basename, delimiter, dirname, join, resolve as resolvePath, sep } from 
 import { CrewhausError } from "@crewhaus/errors";
 import { type PluginRegistry, createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
+  MAX_PLUGIN_MANIFEST_BYTES,
   PLUGIN_TOOL_NAME_PATTERN,
   type PluginChannelAdapter,
   type PluginContributions,
@@ -44,7 +44,7 @@ import {
   probeKind,
   resolveContained,
 } from "@crewhaus/tool-safety/fs";
-import { readFileBounded } from "@crewhaus/tool-safety/streams";
+import { readFileBounded, readFileBoundedSync } from "@crewhaus/tool-safety/streams";
 import type { ZodType as Zod4Type } from "zod/v4";
 import pkg from "../package.json" with { type: "json" };
 
@@ -56,8 +56,8 @@ import pkg from "../package.json" with { type: "json" };
  */
 export const PLUGIN_HOST_VERSION: string = typeof pkg.version === "string" ? pkg.version : "0.0.0";
 
-/** The largest `plugin.json` the loader reads. A manifest is metadata; this is generous. */
-export const MAX_PLUGIN_MANIFEST_BYTES = 1024 * 1024;
+/** The largest `plugin.json` the loader reads (plugin-sdk's, so install holds to it too). */
+export { MAX_PLUGIN_MANIFEST_BYTES };
 /** The largest `index.js` the loader reads for its digest check (the marketplace's cap too). */
 export const MAX_PLUGIN_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
 
@@ -523,7 +523,19 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
           err,
         );
       }
-      const manifest = validatePluginManifest(raw);
+      // The full check, the fields 0.7.1 gave a meaning to included: the
+      // registry lists a record by 0.7.0's rules, and a manifest whose
+      // notAfter or provides is malformed is refused here, for this plugin
+      // only, naming its file.
+      let manifest: PluginManifest;
+      try {
+        manifest = validatePluginManifest(raw);
+      } catch (err) {
+        throw new PluginLoaderError(
+          `plugin manifest at ${realManifest} is not valid: ${err instanceof Error ? err.message : String(err)} — refusing to load it`,
+          err,
+        );
+      }
       const notExpected = pluginIdentityProblem(expected, manifest, realManifest);
       if (notExpected !== undefined) throw new PluginLoaderError(notExpected);
       // A plugin that says which crewhaus it runs on is held to it, before
@@ -805,6 +817,13 @@ export const PLUGIN_TRUST_ANCHORS_ENV = "CREWHAUS_PLUGIN_TRUST_ANCHORS";
 /** `1` loads unsigned plugins. Development only; every boot says so. */
 export const PLUGIN_ALLOW_UNSIGNED_ENV = "CREWHAUS_PLUGIN_ALLOW_UNSIGNED";
 
+/**
+ * The largest trust-anchor file read. An Ed25519 public key in PEM is about
+ * 113 bytes; this leaves room for comments and a certificate chain, and keeps
+ * a stray large file from being read whole on every boot.
+ */
+export const MAX_TRUST_ANCHOR_BYTES = 64 * 1024;
+
 /** The documented trust-anchor directory: `~/.crewhaus/plugin-trust`, one `*.pem` per publisher. */
 export function defaultTrustAnchorDir(homeDir: string = homedir()): string {
   return join(homeDir, ".crewhaus", "plugin-trust");
@@ -833,13 +852,24 @@ export function loadTrustAnchors(
     const abs = resolvePath(file);
     if (seen.has(abs)) return;
     seen.add(abs);
-    let pem: string;
-    try {
-      pem = readFileSync(abs, "utf8");
-    } catch (err) {
-      problems.push(`cannot read trust anchor ${abs}: ${(err as Error).message}`);
+    // A regular file only, and bounded: a FIFO named here would block every
+    // boot and install on a read that waits for a writer.
+    const read = readFileBoundedSync(abs, { maxBytes: MAX_TRUST_ANCHOR_BYTES });
+    if (!read.ok) {
+      problems.push(
+        read.code === "not-regular-file"
+          ? `trust anchor ${abs} is a ${read.kind ?? "special file"}, not a regular file`
+          : `cannot read trust anchor ${abs}: ${read.reason}`,
+      );
       return;
     }
+    if (read.truncated) {
+      problems.push(
+        `trust anchor ${abs} is larger than ${MAX_TRUST_ANCHOR_BYTES} bytes, so it is not a public key`,
+      );
+      return;
+    }
+    const pem = read.text;
     try {
       const key = createPublicKey(pem);
       if (key.asymmetricKeyType !== "ed25519") {
@@ -1016,23 +1046,35 @@ function pluginClassifierCatalog(
  * `tool`, whose `execute` sees {@link pluginBridgeView} in place of the
  * runtime's bridge, and whose `concurrencyClassifier`, if it has one, sees
  * {@link pluginClassifierCatalog} in place of the runtime's catalog.
+ *
+ * Both stay methods and pass their receiver on: the runtime calls
+ * `tool.execute(input, ctx)` on the registered tool, and on 0.7.0 a plugin
+ * tool written as an object literal could read its own `this.name` or
+ * `this.inputSchema` there. An arrow wrapper would call it with no `this`.
  */
 function withPluginBridge(tool: RegisteredTool, allowedTools: ReadonlySet<string>): RegisteredTool {
   const run = tool.execute;
   const classify = tool.concurrencyClassifier;
   return {
     ...tool,
-    execute: (input, ctx) =>
-      run(
+    execute(this: RegisteredTool, input, ctx) {
+      return run.call(
+        this,
         input,
         ctx?.bridge === undefined
           ? ctx
           : { ...ctx, bridge: pluginBridgeView(ctx.bridge, allowedTools, ctx) },
-      ),
+      );
+    },
     ...(classify !== undefined
       ? {
-          concurrencyClassifier: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) =>
-            classify(input, pluginClassifierCatalog(catalog, allowedTools)),
+          concurrencyClassifier(
+            this: RegisteredTool,
+            input: unknown,
+            catalog: ReadonlyArray<RegisteredTool>,
+          ) {
+            return classify.call(this, input, pluginClassifierCatalog(catalog, allowedTools));
+          },
         }
       : {}),
   };
@@ -1148,7 +1190,12 @@ export type ActivatePluginsOptions = {
  * - a tool the runtime registers itself (`ListTools`, `Skill`, `Task`, the
  *   Focus/Plan/Goal and memory tools, `Consult`, `Escalate`, …): a plugin one
  *   would displace it, and inherit its builtin alwaysAllow where it has one;
- * - an `mcp__` name, which everything reads as an MCP server's tool;
+ * - any of those names in another letter case (`grep`, `READ`,
+ *   `listtools`): a model profile's `tools` list matches names without
+ *   regard to case, so a profile that lists `Grep` would offer a plugin
+ *   `grep` to the model it is meant to restrict;
+ * - an `mcp__` name (in any case), which everything reads as an MCP server's
+ *   tool;
  * - a `<server>__<tool>` name, how an MCP server's tool was named before
  *   0.7.1: permission rules, skill and sub-agent tool lists and rate limits
  *   written that way still match `mcp__<server>__<tool>`, so a rule meant
@@ -1164,11 +1211,35 @@ export function reservedPluginToolNameReason(name: string): string | undefined {
   if (RUNTIME_TOOL_NAMES.includes(name)) {
     return "the crewhaus runtime registers a tool of that name itself";
   }
-  if (name.startsWith("mcp__")) return "names starting mcp__ belong to MCP servers' tools";
+  const folded = reservedNamesByCase().get(name.toLowerCase());
+  if (folded !== undefined) {
+    return `crewhaus has a tool named "${folded}", and a model profile's tools list matches names in any letter case, so a profile that lists ${folded} would offer this tool too`;
+  }
+  if (name.toLowerCase().startsWith("mcp__")) {
+    return "names starting mcp__ belong to MCP servers' tools";
+  }
   if (legacyMcpToolName(`mcp__${name}`) !== undefined) {
     return `a name of the form <server>__<tool> is how rules written before crewhaus 0.7.1 name an MCP server's tool, so a rule meant for mcp__${name} would govern this tool too`;
   }
   return undefined;
+}
+
+let reservedByCase: ReadonlyMap<string, string> | undefined;
+
+/**
+ * Every builtin and runtime tool name, lower-cased, to the name itself. A
+ * model profile's `tools` list (model-plan) matches a plain name without
+ * regard to case, so `grep` would be offered wherever `Grep` is.
+ */
+function reservedNamesByCase(): ReadonlyMap<string, string> {
+  if (reservedByCase === undefined) {
+    const map = new Map<string, string>();
+    for (const n of [...TOOL_FLAGS_BY_NAME.keys(), ...RUNTIME_TOOL_NAMES]) {
+      if (!map.has(n.toLowerCase())) map.set(n.toLowerCase(), n);
+    }
+    reservedByCase = map;
+  }
+  return reservedByCase;
 }
 
 /** A name a reserved plugin tool could take instead: prefixed with its plugin's, with no `__`. */

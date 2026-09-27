@@ -7,7 +7,7 @@ import {
   type PluginPermissions,
   type PluginSignature,
   manifestPayloadForSigning,
-  validatePluginManifest,
+  validatePluginManifestRecord,
 } from "@crewhaus/plugin-sdk";
 import type { Secrets } from "@crewhaus/secrets-manager";
 
@@ -92,6 +92,11 @@ export type PluginRegistryOptions = {
    * signatures. A signature that is present is still checked against the
    * anchors: one that does not verify is a tamper signal, not a missing
    * signature, and the loader would refuse it at boot anyway.
+   *
+   * With NO `trustAnchors`, nothing is verified: `register()` and
+   * `verifyManifest()` accept any manifest, signed or not, and a signature
+   * it carries is not checked. A caller that installs that way must say the
+   * install is unverified.
    */
   readonly allowUnsigned?: boolean;
   /**
@@ -163,13 +168,21 @@ function emptyShape(): RegistryFileShape {
   return { version: FILE_SHAPE_VERSION, entries: {} };
 }
 
-function parseRegistryFile(text: string): RegistryFileShape {
+/**
+ * The registry file's entries, each held to the record checks
+ * ({@link validatePluginManifestRecord}): what 0.7.0 required, so a record
+ * 0.7.0 wrote still reads. The fields 0.7.1 gave a meaning to are checked
+ * when the plugin loads, where a bad one refuses that plugin only. An entry
+ * that fails is named, with the file, so the message says which plugin to
+ * reinstall rather than blaming the one a spec asked for.
+ */
+function parseRegistryFile(text: string, registryPath: string): RegistryFileShape {
   let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch (err) {
     throw new PluginRegistryError(
-      `plugin-registry: failed to parse registry file as JSON: ${err instanceof Error ? err.message : String(err)}`,
+      `plugin-registry: failed to parse registry file ${registryPath} as JSON: ${err instanceof Error ? err.message : String(err)}`,
       err,
     );
   }
@@ -192,7 +205,15 @@ function parseRegistryFile(text: string): RegistryFileShape {
       throw new PluginRegistryError(`plugin-registry: entry "${name}" is not an object`);
     }
     const entry = value as Record<string, unknown>;
-    const manifest = validatePluginManifest(entry["manifest"]);
+    let manifest: PluginManifest;
+    try {
+      manifest = validatePluginManifestRecord(entry["manifest"]);
+    } catch (err) {
+      throw new PluginRegistryError(
+        `plugin-registry: entry "${name}" in ${registryPath}: ${err instanceof Error ? err.message : String(err)}. Remove or reinstall that plugin; the file's other entries cannot be read until then.`,
+        err,
+      );
+    }
     // register() keys every entry by its manifest's name; one that is not
     // would make list/outdated describe one plugin while another loads.
     if (manifest.name !== name) {
@@ -235,7 +256,7 @@ export function createPluginRegistry(opts: PluginRegistryOptions): PluginRegistr
 
   function load(): RegistryFileShape {
     if (!exists(opts.registryPath)) return emptyShape();
-    return parseRegistryFile(readFile(opts.registryPath));
+    return parseRegistryFile(readFile(opts.registryPath), opts.registryPath);
   }
 
   function save(shape: RegistryFileShape): void {

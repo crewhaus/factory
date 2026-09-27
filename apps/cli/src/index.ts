@@ -18237,12 +18237,18 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
     if (action === "install") {
       const name = args.positional[0];
       if (typeof name !== "string") die("missing <name>");
-      // The keys a boot trusts, so what install accepts is what will load.
+      // The keys a boot trusts, plus --trust-anchor. A manifest only the
+      // flag's key verifies installs, but a boot will refuse it, so install
+      // is told the boot's own keys to say so.
       const trustAnchorFlag = args.flags["trust-anchor"];
       const trustAnchors = resolveInstallTrustAnchors({
         allowUnsigned,
         ...(typeof trustAnchorFlag === "string" ? { trustAnchorFlag } : {}),
       });
+      const bootTrustAnchors =
+        typeof trustAnchorFlag === "string"
+          ? resolveInstallTrustAnchors({ allowUnsigned: true })
+          : undefined;
       const verifyingRegistry = createPluginRegistry({ registryPath, allowUnsigned, trustAnchors });
       const source = buildModuleRegistrySource(registryRef);
       const { createMarketplaceClient } = await import("@crewhaus/module-marketplace-client");
@@ -18250,6 +18256,7 @@ async function runPlugins(args: ParsedArgs, action: string): Promise<void> {
         registry: source,
         pluginRegistry: verifyingRegistry,
         pluginsDir,
+        ...(bootTrustAnchors !== undefined ? { bootTrustAnchors } : {}),
       });
       const versionFlag = args.flags["version"];
       const result = await client.install(

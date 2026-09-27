@@ -247,6 +247,12 @@ export type PluginManifest = {
 // Validation
 // ---------------------------------------------------------------------------
 
+/**
+ * The largest `plugin.json` crewhaus reads: the loader refuses a larger one,
+ * and install refuses to write one. A manifest is metadata; this is generous.
+ */
+export const MAX_PLUGIN_MANIFEST_BYTES = 1024 * 1024;
+
 const NAME_PATTERN = /^[a-z][a-z0-9-]{1,62}[a-z0-9]$/;
 /** A tool name every model provider accepts. */
 export const PLUGIN_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -284,8 +290,56 @@ function assertOptionalStringArray(
 /**
  * Throw `PluginSdkError` if `m` is not a valid `PluginManifest`. Returns
  * the input typed as `PluginManifest` on success (used as a type guard).
+ *
+ * This is the check for a manifest crewhaus is about to install or load:
+ * {@link validatePluginManifestRecord}'s, plus the fields 0.7.1 gave a
+ * meaning to (`notAfter`, `provides`), held to their exact shape.
  */
 export function validatePluginManifest(m: unknown): PluginManifest {
+  const manifest = validatePluginManifestRecord(m) as unknown as Record<string, unknown>;
+
+  if (manifest["notAfter"] !== undefined) {
+    const notAfter = manifest["notAfter"];
+    if (typeof notAfter !== "string" || parseOffsetDateTime(notAfter) === undefined) {
+      throw new PluginSdkError(
+        `plugin manifest: \`notAfter\` must be an RFC 3339 date-time with Z or an offset, such as "2027-01-01T00:00:00Z" (got ${JSON.stringify(notAfter)}); a date-time without one would be read as the host's local time`,
+      );
+    }
+  }
+
+  if (manifest["provides"] !== undefined) {
+    const provides = manifest["provides"];
+    if (provides === null || typeof provides !== "object" || Array.isArray(provides)) {
+      throw new PluginSdkError("plugin manifest: `provides` must be an object");
+    }
+    const tools = (provides as Record<string, unknown>)["tools"];
+    assertOptionalStringArray(tools, "provides.tools");
+    for (const tool of tools ?? []) {
+      if (!PLUGIN_TOOL_NAME_PATTERN.test(tool)) {
+        throw new PluginSdkError(
+          `plugin manifest: \`provides.tools\` entry ${JSON.stringify(tool)} must be 1-64 letters, digits, "_" or "-"`,
+        );
+      }
+    }
+    if (tools !== undefined && new Set(tools).size !== tools.length) {
+      throw new PluginSdkError("plugin manifest: `provides.tools` lists a tool twice");
+    }
+  }
+
+  return manifest as unknown as PluginManifest;
+}
+
+/**
+ * Throw `PluginSdkError` if `m` is not a manifest the plugin registry can
+ * list: the checks 0.7.0 applied. `notAfter` and `provides` meant nothing
+ * to 0.7.0, so an install record written then may carry them in any shape
+ * (`"provides": ["notes_search"]`, a date-only `notAfter`); reading the
+ * registry must not fail on that, or one such entry would stop every other
+ * plugin from loading. Those fields are held to their shape where they
+ * matter, when the plugin itself installs or loads
+ * ({@link validatePluginManifest}).
+ */
+export function validatePluginManifestRecord(m: unknown): PluginManifest {
   if (m === null || typeof m !== "object") {
     throw new PluginSdkError("plugin manifest must be an object");
   }
@@ -316,15 +370,6 @@ export function validatePluginManifest(m: unknown): PluginManifest {
     }
   }
 
-  if (manifest["notAfter"] !== undefined) {
-    const notAfter = manifest["notAfter"];
-    if (typeof notAfter !== "string" || parseOffsetDateTime(notAfter) === undefined) {
-      throw new PluginSdkError(
-        `plugin manifest: \`notAfter\` must be an RFC 3339 date-time with Z or an offset, such as "2027-01-01T00:00:00Z" (got ${JSON.stringify(notAfter)}); a date-time without one would be read as the host's local time`,
-      );
-    }
-  }
-
   if (manifest["engines"] !== undefined) {
     const engines = manifest["engines"];
     if (engines === null || typeof engines !== "object") {
@@ -343,25 +388,6 @@ export function validatePluginManifest(m: unknown): PluginManifest {
     assertOptionalStringArray(p["net"], "permissions.net");
     assertOptionalStringArray(p["tools"], "permissions.tools");
     assertOptionalStringArray(p["secrets"], "permissions.secrets");
-  }
-
-  if (manifest["provides"] !== undefined) {
-    const provides = manifest["provides"];
-    if (provides === null || typeof provides !== "object" || Array.isArray(provides)) {
-      throw new PluginSdkError("plugin manifest: `provides` must be an object");
-    }
-    const tools = (provides as Record<string, unknown>)["tools"];
-    assertOptionalStringArray(tools, "provides.tools");
-    for (const tool of tools ?? []) {
-      if (!PLUGIN_TOOL_NAME_PATTERN.test(tool)) {
-        throw new PluginSdkError(
-          `plugin manifest: \`provides.tools\` entry ${JSON.stringify(tool)} must be 1-64 letters, digits, "_" or "-"`,
-        );
-      }
-    }
-    if (tools !== undefined && new Set(tools).size !== tools.length) {
-      throw new PluginSdkError("plugin manifest: `provides.tools` lists a tool twice");
-    }
   }
 
   if (manifest["signature"] !== undefined) {
@@ -387,38 +413,71 @@ export function validatePluginManifest(m: unknown): PluginManifest {
 
 /** One version in a range: `1`, `1.2`, `1.2.3`, `1.x`, `*`, `1.2.3-beta.1+build`. */
 const RANGE_PARTIAL =
-  /^v?(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)?)?$/;
-const RANGE_OPERATOR = /^(?:<=|>=|<|>|=|~|\^)/;
+  /^(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)?)?$/;
+/** A comparator: an optional operator (npm's `~>` is `~`), npm's `v`/`=` prefix, a version. */
+const RANGE_COMPARATOR = /^(<=|>=|<|>|=|~>?|\^)?[v=]*(.*)$/;
 const MAX_RANGE_LENGTH = 256;
+
+/** `token` as a comparator Bun.semver reads as npm does, or undefined when it is not one. */
+function rangeComparator(token: string): string | undefined {
+  const m = RANGE_COMPARATOR.exec(token);
+  const op = m?.[1] ?? "";
+  const version = m?.[2] ?? "";
+  if (!RANGE_PARTIAL.test(version)) return undefined;
+  return `${op === "~>" ? "~" : op === "=" ? "" : op}${version}`;
+}
+
+/**
+ * `range` as crewhaus checks it, or undefined when it is not a semver range.
+ * The npm grammar, read the way npm reads it: comparator sets joined by
+ * `||`, each a space-separated list of versions with an optional `<`, `<=`,
+ * `>`, `>=`, `=`, `~` (or `~>`) or `^`, or a hyphen range `1.2.3 - 2.3.4`.
+ * Versions may be partial (`1.2`) or use `x`/`*`. An operator may be
+ * followed by spaces (`>= 1.2.3`), and an empty set — the empty range, or
+ * an empty side of `||` — matches every version, as it does for npm. The
+ * result is spelled so that `Bun.semver.satisfies` reads it the same way.
+ */
+function normalizedEngineRange(range: string): string | undefined {
+  if (typeof range !== "string" || range.length > MAX_RANGE_LENGTH) return undefined;
+  const sets: string[] = [];
+  for (const raw of range.split("||")) {
+    const set = raw.trim().replace(/(<=|>=|<|>|=|~>?|\^)\s+/g, "$1");
+    if (set === "") {
+      sets.push("*");
+      continue;
+    }
+    const hyphen = set.match(/^(\S+)\s+-\s+(\S+)$/);
+    if (hyphen !== null) {
+      const from = rangeComparator(hyphen[1] ?? "");
+      const to = rangeComparator(hyphen[2] ?? "");
+      // A hyphen range's ends are plain versions.
+      if (from === undefined || to === undefined || !RANGE_PARTIAL.test(from)) return undefined;
+      if (!RANGE_PARTIAL.test(to)) return undefined;
+      sets.push(`${from} - ${to}`);
+      continue;
+    }
+    const comparators: string[] = [];
+    for (const token of set.split(/\s+/)) {
+      const comparator = rangeComparator(token);
+      if (comparator === undefined) return undefined;
+      comparators.push(comparator);
+    }
+    sets.push(comparators.join(" "));
+  }
+  return sets.join(" || ");
+}
 
 /**
  * Is `range` a semver range crewhaus can check a version against? The npm
- * grammar: comparator sets joined by `||`, each a space-separated list of
- * versions with an optional `<`, `<=`, `>`, `>=`, `=`, `~` or `^`, or a
- * hyphen range `1.2.3 - 2.3.4`. Versions may be partial (`1.2`) or use `x`/`*`.
+ * grammar, as npm reads it (see {@link crewhausEngineProblem}): a range npm
+ * accepts is accepted, `~>0.7.0` and an empty side of `||` included.
  *
  * Checked on its own because `Bun.semver.satisfies` answers `true` for text
  * that is not a range at all ("not a range", "garbage>=1"), which would let a
  * plugin that declares nonsense run anywhere.
  */
 export function isValidEngineRange(range: string): boolean {
-  if (typeof range !== "string" || range.length > MAX_RANGE_LENGTH) return false;
-  for (const raw of range.split("||")) {
-    // `>= 1.2.3` is the same comparator as `>=1.2.3`.
-    // An empty set leaves one empty token, which is not a version.
-    const set = raw.trim().replace(/(<=|>=|<|>|=|~|\^)\s+/g, "$1");
-    const hyphen = set.match(/^(\S+)\s+-\s+(\S+)$/);
-    if (hyphen !== null) {
-      if (!RANGE_PARTIAL.test(hyphen[1] ?? "") || !RANGE_PARTIAL.test(hyphen[2] ?? "")) {
-        return false;
-      }
-      continue;
-    }
-    for (const token of set.split(/\s+/)) {
-      if (!RANGE_PARTIAL.test(token.replace(RANGE_OPERATOR, ""))) return false;
-    }
-  }
-  return true;
+  return normalizedEngineRange(range) !== undefined;
 }
 
 /**
@@ -435,11 +494,12 @@ export function crewhausEngineProblem(
   const range = manifest.engines?.crewhaus;
   if (range === undefined) return undefined;
   const who = `plugin "${manifest.name}" ${manifest.version}`;
-  if (!isValidEngineRange(range)) {
+  const normalized = normalizedEngineRange(range);
+  if (normalized === undefined) {
     return `${who} declares engines.crewhaus ${JSON.stringify(range)}, which is not a semver range, so crewhaus cannot tell whether it runs on ${hostVersion}`;
   }
   const release = hostVersion.match(/^\d+\.\d+\.\d+/)?.[0] ?? hostVersion;
-  if (Bun.semver.satisfies(release, range)) return undefined;
+  if (Bun.semver.satisfies(release, normalized)) return undefined;
   return `${who} requires crewhaus ${range}, and this is crewhaus ${hostVersion}`;
 }
 

@@ -35,9 +35,13 @@
  * plus `--trust-anchor`, before anything is written
  * ({@link resolveInstallTrustAnchors}). An unsigned or badly-signed manifest
  * is refused; with no key at all install refuses too, since nothing could be
- * verified. `--allow-unsigned` accepts an UNSIGNED manifest (dev only) and the
- * install line says it is unverified; a signature that is there must still
- * verify. Install delivers the manifest only: the plugin's index.js is placed
+ * verified. A manifest only a `--trust-anchor` key verifies installs, and is
+ * reported not runnable, since a boot does not read that key.
+ * `--allow-unsigned` accepts an UNSIGNED manifest (dev only) and the install
+ * line says it is unverified; when a key is configured, a signature that is
+ * there must still verify against it. With `--allow-unsigned` and no key at
+ * all, no signature is checked, and the install line says UNVERIFIED.
+ * Install delivers the manifest only: the plugin's index.js is placed
  * by hand. Templates carry their own `verifyingRegistry` wrapper (out of scope
  * here — install fetches the manifest verbatim).
  */

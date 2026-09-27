@@ -126,9 +126,16 @@ describe("crewhaus plugins install verifies what it installs (C015)", () => {
     expect(run.exitCode).toBe(0);
     const manifestPath = join(home, ".crewhaus", "plugins", "greeter", "plugin.json");
     expect(run.stdout).toBe(`installed greeter@1.0.0 → ${manifestPath}\n`);
+    const codeMissing = `[plugins] greeter@1.0.0 is installed as a manifest only: the registry delivers no code. Put the plugin's index.js at ${join(home, ".crewhaus", "plugins", "greeter", "index.js")} (its sha256 must equal the manifest's entrypointDigest) before a spec names it in plugins:.\n`;
+    // The flag's key is one no boot reads (review of C017).
     expect(run.stderr).toBe(
-      `[plugins] greeter@1.0.0 is installed as a manifest only: the registry delivers no code. Put the plugin's index.js at ${join(home, ".crewhaus", "plugins", "greeter", "index.js")} (its sha256 must equal the manifest's entrypointDigest) before a spec names it in plugins:.\n`,
+      `${codeMissing}[plugins] greeter@1.0.0: no key a boot trusts verifies its signature (it was verified against a key given only to this install), so every boot will refuse it. Put the publisher's .pem in ~/.crewhaus/plugin-trust, or list it in CREWHAUS_PLUGIN_TRUST_ANCHORS.\n`,
     );
+    // Once the boot trusts the key too, only the missing code is left to say.
+    trust(home, publisher.pem);
+    const again = await install(home, registry, ["--trust-anchor", pem]);
+    expect(again.exitCode).toBe(0);
+    expect(again.stderr).toBe(codeMissing);
   }, 30_000);
 
   test("--allow-unsigned installs an unsigned manifest and says it is unverified", async () => {

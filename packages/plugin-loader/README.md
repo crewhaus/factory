@@ -14,8 +14,13 @@ key you trust. Put the publisher's public key, as a `.pem` file, in:
 ```
 
 or list `.pem` files (or directories of them) in `CREWHAUS_PLUGIN_TRUST_ANCHORS`,
-separated the way `PATH` is. A listed path that cannot be read, or a file that
-is not an Ed25519 public key, stops the boot and names the file.
+separated the way `PATH` is. A listed path that cannot be read, a FIFO or
+other special file, a file over 64 KiB, or a file that is not an Ed25519
+public key stops the boot and names the file.
+
+`crewhaus plugins install --trust-anchor <pem>` verifies with that key too,
+but a boot reads only the places above: install says so when only the
+flag's key verifies a manifest.
 
 ## What a signature covers
 
@@ -82,21 +87,25 @@ A manifest may say which crewhaus versions it supports:
 ```
 
 A plugin whose range leaves out the running version is refused before it is
-verified or imported, and so is a range crewhaus cannot read. A manifest with
-no range loads on any version. A canary (`0.7.1-canary.2`) is checked as its
+verified or imported, and so is a range crewhaus cannot read. Ranges are read
+the way npm reads them (`~>0.7.0` is `~0.7.0`, and an empty side of `||`
+matches any version). A manifest with no range loads on any version. A canary (`0.7.1-canary.2`) is checked as its
 release (`0.7.1`).
 
 ## Tool names a plugin cannot use
 
 A plugin adds tools; it cannot take the name of one crewhaus defines. A plugin
 tool named like a builtin (`Grep`, `HttpRequest`, …), like a tool the runtime
-registers itself (`ListTools`, `Skill`, `Consult`, …), starting `mcp__`, or
-shaped `<server>__<tool>` is left out with a warning, and the plugin's other
-tools load. Permission rules and crewhaus's own grants key on tool names, so a
+registers itself (`ListTools`, `Skill`, `Consult`, …), either of those in
+another letter case (`grep`, `READ`), starting `mcp__`, or shaped
+`<server>__<tool>` is left out with a warning, and the plugin's other tools
+load. Permission rules and crewhaus's own grants key on tool names, so a
 plugin `Grep` would otherwise run under the grant crewhaus gives the builtin
-one — and rules written before 0.7.1 name an MCP tool `broker__paper_buy`, so
-a plugin tool of that name would run under a rule meant for the MCP one. Use
-single underscores (`acme_paper_buy`).
+one; a model profile's `tools` list matches names in any case, so a plugin
+`grep` would be offered wherever a profile lists `Grep`; and rules written
+before 0.7.1 name an MCP tool `broker__paper_buy`, so a plugin tool of that
+name would run under a rule meant for the MCP one. Use your plugin's prefix
+and single underscores (`acme_grep`, `acme_paper_buy`).
 
 ## What a plugin can reach
 
