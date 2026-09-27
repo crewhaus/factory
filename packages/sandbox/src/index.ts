@@ -53,10 +53,10 @@ import {
  *
  * If the HOST goes away mid-run, the containers still running are stopped
  * too: on `process.exit`, and on a SIGINT, SIGTERM or SIGHUP the host
- * neither handles nor ignores (a terminal Ctrl-C, a supervisor's stop), the
- * sandbox runs `<cli> kill` and `<cli> rm -f` for them synchronously before
- * the host is gone. The CLI leads its own process group, so a terminal
- * Ctrl-C no longer reaches it, and the timeout lived in the host.
+ * neither handles nor ignores, the sandbox runs `<cli> kill` for them
+ * synchronously (at most 2 s for all of them) and starts `<cli> rm -f`
+ * without waiting for it. The CLI leads its own process group, so a
+ * terminal Ctrl-C no longer reaches it, and the timeout lived in the host.
  * For a host killed outright (SIGKILL, a crash), every run with a timeout
  * also has a watchdog: a detached `sh` that, 10 s after the run's timeout,
  * runs `<cli> kill` and `<cli> rm -f` for its container. It is its own
@@ -263,11 +263,11 @@ const CREATE_OUTPUT_BYTES = 16 * 1024;
 /** `docker run`'s status for a container it could not create; kept from 0.7.0. */
 const CREATE_FAILED_EXIT_CODE = 125;
 /**
- * Bound on each `<cli> kill` / `<cli> rm -f` run while the host is exiting.
- * These block the exit, so they are shorter; a daemon that has taken the
- * request finishes it after the CLI is gone.
+ * The exit path's whole budget for `<cli> kill`, for every live container
+ * together: it holds the host's exit. `<cli> rm -f` after it is started and
+ * not waited for.
  */
-const HOST_EXIT_CONTROL_TIMEOUT_MS = 3_000;
+const HOST_EXIT_KILL_BUDGET_MS = 2_000;
 /**
  * Seconds past a run's timeout before its watchdog stops the container: the
  * host's own stop comes first while the host lives.
@@ -555,23 +555,37 @@ function stopLiveContainersNow(): void {
   const byCli = new Map<string, string[]>();
   for (const [name, cli] of liveContainers) byCli.set(cli, [...(byCli.get(cli) ?? []), name]);
   liveContainers.clear();
+  const until = performance.now() + HOST_EXIT_KILL_BUDGET_MS;
   for (const [cli, names] of byCli) {
-    // `kill` first (SIGKILL at once; podman's `rm -f` would wait 10 s on a
-    // PID 1 that ignores SIGTERM), then `rm -f` for one created but never
-    // started. Synchronous, because the host is exiting; detached, so a
-    // supervisor that SIGKILLs the host's group does not cut it short.
-    for (const verb of [["kill"], ["rm", "-f"]]) {
+    // `kill` stops a running container at once (podman's `rm -f` would wait
+    // 10 s on a PID 1 that ignores SIGTERM). Waited for, within one budget
+    // for all of them, since it holds the exit. Detached, so a supervisor
+    // that SIGKILLs the host's group does not cut it short.
+    const left = Math.floor(until - performance.now());
+    if (left > 0) {
       try {
-        Bun.spawnSync([cli, ...verb, ...names], {
+        Bun.spawnSync([cli, "kill", ...names], {
           stdin: "ignore",
           stdout: "ignore",
           stderr: "ignore",
-          timeout: HOST_EXIT_CONTROL_TIMEOUT_MS,
+          timeout: left,
           detached: true,
         });
       } catch {
         // The host is going away; the watchdog is still there.
       }
+    }
+    // `rm -f` removes one that was created but never started. Not waited
+    // for: it finishes after the host is gone.
+    try {
+      Bun.spawn([cli, "rm", "-f", ...names], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        detached: true,
+      }).unref();
+    } catch {
+      // As above.
     }
   }
 }

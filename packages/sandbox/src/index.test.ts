@@ -334,8 +334,8 @@ describe("docker backend (no daemon required for argv assembly)", () => {
 //     as Docker Desktop's wrapper does; the wrapper dies of SIGTERM, the
 //     client proxies it and lives on, and acts FAKE_CLI_CLIENT_DELAY seconds
 //     in — or at once after an `rm -f` has looked for its container.
-//   - FAKE_CLI_KILL_DELAY makes `kill` slow; FAKE_CLI_RM_FAIL makes `rm`
-//     fail.
+//   - FAKE_CLI_KILL_DELAY makes `kill` slow; FAKE_CLI_HANG_CONTROL makes
+//     `kill` and `rm` never answer; FAKE_CLI_RM_FAIL makes `rm` fail.
 const posix = process.platform !== "win32";
 const hasPerl = posix && Bun.spawnSync(["perl", "-e", "exit 0"]).exitCode === 0;
 
@@ -451,6 +451,7 @@ case "$verb" in
     ;;
   kill|rm)
     [ "$1" = "-f" ] && shift
+    [ -n "$FAKE_CLI_HANG_CONTROL" ] && exec sleep 8
     [ "$verb" = kill ] && [ -n "$FAKE_CLI_KILL_DELAY" ] && sleep "$FAKE_CLI_KILL_DELAY"
     if [ "$verb" = rm ] && [ -n "$FAKE_CLI_RM_FAIL" ]; then
       echo "Error response from daemon: $FAKE_CLI_RM_FAIL" >&2; exit 1
@@ -1097,7 +1098,7 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       writeFileSync(
         script,
         [
-          `import { readdirSync, readFileSync } from "node:fs";`,
+          `import { readdirSync, readFileSync, writeFileSync } from "node:fs";`,
           `import { createSandbox } from ${JSON.stringify(sandboxModule)};`,
           `const dir = ${JSON.stringify(dir)};`,
           `const mode = ${JSON.stringify(mode)};`,
@@ -1113,6 +1114,7 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
           "  const f = readdirSync(dir).find((n) => n.startsWith('container-'));",
           "  if (f === undefined || readFileSync(`${dir}/${f}`, 'utf8').trim() === '') return;",
           "  clearInterval(poll);",
+          "  writeFileSync(`${dir}/exit-at`, String(Date.now()));",
           "  if (mode === 'exit') process.exit(0);",
           // The second Ctrl-C of a REPL: exit while the first one's kill runs.
           "  if (mode === 'abort-exit') { controller.abort(); process.exit(130); }",
@@ -1151,8 +1153,11 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       await h.exited;
       expect(h.exitCode).toBe(0);
       const name = hostContainer();
+      // `kill` ran before the exit; the container is gone.
+      expect(cliLog()).toContain(`kill ${name}`);
       expect(await waitGone(containerPid(name), 5_000)).toBe(true);
-      expect(cliLog().slice(2)).toEqual([`kill ${name}`, `rm -f ${name}`]);
+      // `rm -f` was started, not waited for.
+      expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
     }, 30_000);
 
     test("an exit right after an abort still stops it, though the abort's own kill is cut off", async () => {
@@ -1163,7 +1168,21 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       expect(h.exitCode).toBe(130);
       const name = hostContainer();
       expect(await waitGone(containerPid(name), 5_000)).toBe(true);
-      expect(cliLog()).toContain(`rm -f ${name}`);
+      expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
+    }, 30_000);
+
+    // The exit path waits for `kill` within one budget and does not wait
+    // for `rm -f` at all: a daemon that never answers held process.exit for
+    // two full control timeouts (6 s).
+    test("a daemon that never answers holds the exit for at most the kill budget", async () => {
+      const h = startHost("exit", { FAKE_CLI_HANG_CONTROL: "1" });
+      await h.exited;
+      const heldMs = Date.now() - Number(readFileSync(join(dir, "exit-at"), "utf8"));
+      expect(h.exitCode).toBe(0);
+      expect(heldMs).toBeLessThan(4_500);
+      const name = hostContainer();
+      expect(cliLog()).toContain(`kill ${name}`);
+      expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
     }, 30_000);
 
     for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -1650,6 +1669,9 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
       expect(name).toMatch(/^crewhaus-sbx-[0-9a-f]{16}$/);
       await h.exited;
       expect(h.exitCode).toBe(0);
+      // `kill` ran before the exit; `rm -f` finishes after it.
+      const until = performance.now() + 10_000;
+      while (withToken(token).length > 0 && performance.now() < until) await Bun.sleep(200);
       expect(withToken(token)).toEqual([]);
     } finally {
       for (const leftover of withToken(token)) names.push(leftover);
