@@ -7,6 +7,7 @@
  * Reads followed links too. These cases each failed before the fix.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -20,7 +21,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ARTICLE_MAX_BYTES, WikiStoreError, createWikiStore } from "./index";
+import { ARTICLE_MAX_BYTES, WikiLockError, WikiStoreError, createWikiStore } from "./index";
 
 let tmp: string;
 let outside: string;
@@ -195,5 +196,35 @@ describe("the store writes nothing through a planted link", () => {
     expect(err).toBeInstanceOf(WikiStoreError);
     expect((err as Error).message).toContain("larger than");
     expect(existsSync(join(store, "articles", "huge.md"))).toBe(false);
+  });
+});
+
+// C070 residual (attacker review): the write path takes <store>/.lock, and
+// on contention the lock policy followed a link there and opened a FIFO
+// there, so a FIFO planted at .lock made every wiki_write hang for ever.
+describe.skipIf(process.platform === "win32")("the store's .lock leaf", () => {
+  test("a FIFO planted at .lock is refused at once, naming the store's lock", async () => {
+    const s = makeStore();
+    await s.write({ slug: "coffee", title: "Coffee", body: "grind size" });
+    execFileSync("mkfifo", [join(store, ".lock")]);
+    const err = await s.write({ slug: "tea", title: "Tea", body: "steep" }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(err).toBeInstanceOf(WikiLockError);
+    expect(err?.message).toContain(`wiki-store: ${join(store, ".lock")} is a FIFO`);
+    expect(existsSync(join(store, "articles", "tea.md"))).toBe(false);
+  });
+
+  test("a link planted at .lock is neither followed nor removed", async () => {
+    const s = makeStore();
+    await s.write({ slug: "coffee", title: "Coffee", body: "grind size" });
+    writeFileSync(join(outside, "victim"), "keep");
+    symlinkSync(join(outside, "victim"), join(store, ".lock"));
+    await expect(s.setSignals("coffee", { verified: true })).rejects.toThrow(
+      /is a symbolic link, not a lock file/,
+    );
+    expect(lstatSync(join(store, ".lock")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(outside, "victim"), "utf8")).toBe("keep");
   });
 });

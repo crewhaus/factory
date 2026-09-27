@@ -6,7 +6,17 @@
  * mechanics plus the `label`/`createError` seams the wrappers customize.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -144,4 +154,65 @@ describe("withFileLock", () => {
     ).rejects.toThrow("boom");
     expect(existsSync(lockPath)).toBe(false);
   });
+});
+
+// 0.7.1 (C070 residual, attacker review): the lock sits in a store directory
+// any agent with a write tool can reach. On contention the policy stat()ed
+// (following links) and readFile()d the holder, so a FIFO planted at the lock
+// path made every writer hang for ever and a link was read through.
+describe.skipIf(process.platform === "win32")("a lock path that is not a regular file", () => {
+  const kinds: Array<readonly [string, (lockPath: string) => void, RegExp]> = [
+    ["a FIFO", (p) => execFileSync("mkfifo", [p]), /is a FIFO, not a lock file/],
+    [
+      "a symlink to a regular file",
+      (p) => symlinkSync(join(tmp, "target.json"), p),
+      /is a symbolic link, not a lock file/,
+    ],
+    [
+      "a dangling symlink",
+      (p) => symlinkSync(join(tmp, "nowhere", "x"), p),
+      /is a symbolic link, not a lock file/,
+    ],
+    ["a directory", (p) => mkdirSync(p), /is a directory, not a lock file/],
+  ];
+
+  for (const [name, plant, reason] of kinds) {
+    test(`${name} is refused at once, naming the path, and left as it is`, async () => {
+      writeFileSync(join(tmp, "target.json"), '{"pid":1,"acquiredAt":"then"}\n');
+      const lockPath = join(tmp, ".lock");
+      plant(lockPath);
+      const started = Date.now();
+      const err = await acquireFileLock(lockPath, { waitMs: 60_000, label: "store" }).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err?.message).toMatch(reason);
+      expect(err?.message).toContain(`store: ${lockPath} is `);
+      // Refused, not waited out: far inside the minute it was allowed.
+      expect(Date.now() - started).toBeLessThan(30_000);
+      // Nothing was removed or written through.
+      expect(lstatSync(lockPath).isFile()).toBe(false);
+      expect(readFileSync(join(tmp, "target.json"), "utf8")).toBe(
+        '{"pid":1,"acquiredAt":"then"}\n',
+      );
+    });
+  }
+
+  test("every kind is exercised (guard)", () => {
+    expect(kinds.length).toBe(4);
+  });
+});
+
+test("a holder payload is read only up to 4 KiB", async () => {
+  const lockPath = join(tmp, ".lock");
+  writeFileSync(lockPath, JSON.stringify({ pid: 4242, pad: "x".repeat(8192) }));
+  const small = join(tmp, "small.lock");
+  writeFileSync(small, JSON.stringify({ pid: 4242, pad: "x".repeat(1024) }));
+  const fail = (p: string) =>
+    acquireFileLock(p, { waitMs: 30, pollMs: 10 }).then(
+      () => "",
+      (e: unknown) => (e as Error).message,
+    );
+  expect(await fail(small)).toContain("held by pid 4242");
+  expect(await fail(lockPath)).toContain("held by pid unknown");
 });
