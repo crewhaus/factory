@@ -14,6 +14,7 @@ import {
   defaultWorkLimit,
   validateValue,
 } from "./jsonschema";
+import type { RegexAnswers } from "./regex-answers";
 import { canonicalize, getPath, isPlainObject, preview, typeOf } from "./value";
 
 /** Joins a path and a keyword into one map key; a character no path contains. */
@@ -34,9 +35,10 @@ export type RecordsReport = {
   passed: number;
   failed: number;
   /**
-   * Rows with no verdict: the call's work budget ran out on or before them,
-   * so they are neither passed nor failed. Always 0 unless a schema's
-   * anyOf/oneOf/allOf over shared $refs multiplied past the budget.
+   * Rows with no verdict, neither passed nor failed: the call's work budget
+   * ran out on or before them (a schema's anyOf/oneOf/allOf over shared
+   * $refs multiplied past it), or a `pattern` could not be run to an answer
+   * on them.
    */
   undetermined: number;
   /** The first undetermined row and why, or null. */
@@ -58,6 +60,8 @@ export type ValidateRecordsOptions = {
   maxFailedRows: number;
   /** A field whose value identifies the row in the report. */
   idField: string | null;
+  /** Answers for the schema's patterns; see `ValidateOptions.regex`. */
+  regex?: RegexAnswers;
 };
 
 export const DEFAULT_RECORDS_OPTIONS: ValidateRecordsOptions = {
@@ -107,6 +111,7 @@ export function validateRecords(
       assertFormat: opts.assertFormat,
       maxErrors: opts.maxErrorsPerRow,
       budget,
+      ...(opts.regex === undefined ? {} : { regex: opts.regex }),
     });
     for (const keyword of result.unsupportedKeywords) unsupported.add(keyword);
     if (result.undetermined !== null) {

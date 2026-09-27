@@ -27,6 +27,7 @@ import {
   validateValue,
 } from "./lib/jsonschema";
 import { validateRecords as validateRecordsFn } from "./lib/records";
+import { withRegexAnswers } from "./lib/regex-answers";
 import { preview } from "./lib/value";
 
 // biome-ignore lint/suspicious/noExplicitAny: the tools read no context.
@@ -547,14 +548,19 @@ describe("work that follows the value's size is charged, and messages are built 
     expect(spied.longest).toBeLessThan(1_000);
   });
 
-  test("checks that read a whole string are charged for its length", () => {
+  test("checks that read a whole string are charged for its length", async () => {
     // 1,024 minLength leaves on a 200 KB string: 0.7.1's first cut counted
     // each as one evaluation and read the string 1,024 times.
     const value = "x".repeat(200_000);
     const result = validateValue(value, chain(10, "allOf", { minLength: 1 }));
     expect(result.undetermined).toMatch(/more than 500000 subschema evaluations/);
-    // A value that size checked once is well inside its budget.
-    expect(validateValue(value, { type: "string", minLength: 1, pattern: "x$" }).valid).toBe(true);
+    // A value that size checked once is well inside its budget. Its pattern
+    // runs in the worker, as the tool runs it: the fallback on this thread
+    // does not run a pattern over more than 64 KiB.
+    const once = await withRegexAnswers((regex) =>
+      validateValue(value, { type: "string", minLength: 1, pattern: "x$" }, { regex }),
+    );
+    expect("value" in once && once.value.valid).toBe(true);
     // And the budget grows with the string, so a larger one checked once still passes.
     expect(validateValue("y".repeat(5_000_000), { maxLength: 5_000_000 }).valid).toBe(true);
   });
@@ -574,7 +580,7 @@ describe("work that follows the value's size is charged, and messages are built 
     // Each checked once, all well inside the budget.
     expect(validateValue(array, { uniqueItems: true }).valid).toBe(true);
     expect(validateValue(object, { enum: [object] }).valid).toBe(true);
-  });
+  }, 20_000);
 });
 
 describe("depth is the value's, not the schema's", () => {

@@ -1,3 +1,4 @@
+import { type FormatName, checkFormat, isFormatName } from "./formats";
 /**
  * A JSON Schema Draft-07 validator, written out in full here so the package
  * has no runtime dependency and so its behaviour is auditable in one file.
@@ -85,7 +86,12 @@
  * `pattern` is an unanchored ECMA-262 match, per the spec — `"pattern": "a"`
  * matches `"banana"`.
  */
-import { type FormatName, checkFormat, isFormatName } from "./formats";
+import {
+  type RegexAnswers,
+  type ScreenedPattern,
+  runPatternSync,
+  screenCallerPattern,
+} from "./regex-answers";
 import {
   type JsonType,
   type PreviewCache,
@@ -129,6 +135,14 @@ export type ValidateOptions = {
    * one). When given, `maxWork` is ignored.
    */
   budget: WorkBudget;
+  /**
+   * Answers for the schema's `pattern` and `patternProperties` regexes,
+   * resolved in the worker by the calling tool (see `withRegexAnswers`). A
+   * question not answered yet is recorded there and read as "no match" for
+   * this pass, which the caller discards and runs again. Without it, each
+   * pattern runs on this thread through the bounded fallback.
+   */
+  regex: RegexAnswers;
 };
 
 /** Subschema evaluations allowed and spent; shared by reference. */
@@ -258,6 +272,11 @@ export type ValidationResult = {
    * before it did, and the value may be valid or invalid.
    */
   undetermined: string | null;
+  /**
+   * True when `undetermined` is the work budget running out: no pattern
+   * answer can change that, so a caller resolving patterns in rounds stops.
+   */
+  workExhausted: boolean;
   errors: ValidationError[];
   /** True when `maxErrors` cut the list short. */
   truncated: boolean;
@@ -359,6 +378,8 @@ type Ctx = {
   work: WorkBudget;
   /** Previews of the value's objects, reused across the walk. */
   previews: PreviewCache;
+  /** Where the schema's patterns are answered; see `ValidateOptions.regex`. */
+  regex: RegexAnswers | undefined;
 };
 
 /** Thrown when the work budget runs out; caught only in `validateValue`. */
@@ -507,8 +528,13 @@ function inEnum(candidates: unknown[], value: unknown, ctx: Ctx): boolean {
  * compiled list is kept whole, so an object with no keys costs nothing per
  * pattern either; only the invalid ones are looked at again, to report them.
  */
+type CompiledPattern = {
+  readonly source: string;
+  /** Screened for the fallback run on this thread, the first time it is needed. */
+  screened?: ScreenedPattern;
+};
 type CompiledPatterns = {
-  readonly valid: ReadonlyArray<readonly [string, RegExp]>;
+  readonly valid: ReadonlyArray<CompiledPattern>;
   readonly invalid: ReadonlyArray<{ readonly source: string; readonly error: string }>;
 };
 const compiledPatterns = new WeakMap<Record<string, unknown>, CompiledPatterns>();
@@ -516,12 +542,14 @@ const compiledPatterns = new WeakMap<Record<string, unknown>, CompiledPatterns>(
 function patternsOf(map: Record<string, unknown>, ctx: Ctx): CompiledPatterns {
   const known = compiledPatterns.get(map);
   if (known !== undefined) return known;
-  const valid: Array<readonly [string, RegExp]> = [];
+  const valid: CompiledPattern[] = [];
   const invalid: Array<{ source: string; error: string }> = [];
   for (const source of Object.keys(map)) {
     charge(ctx, 1 + Math.floor(source.length / CHARS_PER_UNIT));
     try {
-      valid.push([source, new RegExp(source)]);
+      // Compiling reads only the pattern; the match is what is not run here.
+      new RegExp(source);
+      valid.push({ source });
     } catch (err) {
       invalid.push({ source, error: (err as Error).message });
     }
@@ -529,6 +557,49 @@ function patternsOf(map: Record<string, unknown>, ctx: Ctx): CompiledPatterns {
   const out = { valid, invalid };
   compiledPatterns.set(map, out);
   return out;
+}
+
+/**
+ * Does the schema's `pattern` (or a `patternProperties` key) match `input`?
+ * The pattern is the caller's, so it is never run here: the answer comes
+ * from `ctx.regex`, resolved in the worker, or from the bounded fallback
+ * when there is none. A pattern that could not be run to an answer, or that
+ * the screen refuses as a shape that backtracks exponentially, leaves the
+ * whole result undetermined: the validator reports no verdict rather than
+ * "invalid" (or "valid"). A question not answered yet reads as "no match"
+ * for this pass; the caller runs the walk again once it is answered.
+ */
+function patternMatches(
+  ctx: Ctx,
+  pattern: string,
+  input: string,
+  where: string,
+  compiled?: CompiledPattern,
+): boolean {
+  // The read is charged by the caller: validateString per string, and
+  // validateObject per (key, pattern) test.
+  let answer: ReturnType<RegexAnswers["lookup"]>;
+  if (ctx.regex !== undefined) {
+    answer = ctx.regex.lookup(pattern, "", input);
+  } else {
+    let screened = compiled?.screened;
+    if (screened === undefined) {
+      screened = screenCallerPattern(pattern, "");
+      if (compiled !== undefined) compiled.screened = screened;
+    }
+    answer = screened.ok ? runPatternSync(screened.regex, input) : screened.answer;
+  }
+  if (answer === undefined) return false;
+  if (typeof answer === "boolean") return answer;
+  const shown = pattern.length > 80 ? `${pattern.slice(0, 79)}…` : pattern;
+  if ("refused" in answer) {
+    throw new Undetermined(
+      `the schema's pattern /${shown}/ at ${where} was not run: ${answer.refused}, so no verdict was reached`,
+    );
+  }
+  throw new Undetermined(
+    `the schema's pattern /${shown}/ at ${where} could not be run to an answer: ${answer.undetermined}, so no verdict was reached`,
+  );
 }
 
 /** Does `schema` reject `value`? Runs in a scratch context so no errors leak. */
@@ -551,6 +622,7 @@ function branchErrors(
     nesting: ctx.nesting,
     work: ctx.work,
     previews: ctx.previews,
+    regex: ctx.regex,
   };
   validateNode(value, schema, "", schemaPath, scratch);
   return scratch.errors;
@@ -707,10 +779,12 @@ function validateString(
     );
   }
   if (typeof pattern === "string") {
-    let re: RegExp | null = null;
+    let valid = true;
     try {
-      re = new RegExp(pattern);
+      // Compiling reads only the pattern; the match is what is not run here.
+      new RegExp(pattern);
     } catch (err) {
+      valid = false;
       fail(
         ctx,
         path,
@@ -719,7 +793,7 @@ function validateString(
         `the schema's pattern is not a valid regular expression: ${(err as Error).message}`,
       );
     }
-    if (re !== null && !re.test(value)) {
+    if (valid && !patternMatches(ctx, pattern, value, joinPointer(sp, "pattern"))) {
       fail(
         ctx,
         path,
@@ -963,8 +1037,10 @@ function validateObject(
     if (patterns.length > 0) {
       charge(ctx, patterns.length * (1 + Math.floor(key.length / CHARS_PER_UNIT)));
     }
-    for (const [source, re] of patterns) {
-      if (!re.test(key)) continue;
+    for (const compiled of patterns) {
+      const source = compiled.source;
+      const at = joinPointer(joinPointer(sp, "patternProperties"), source);
+      if (!patternMatches(ctx, source, key, at, compiled)) continue;
       covered = true;
       validateNode(
         value[key],
@@ -1253,12 +1329,15 @@ export function validateValue(
     nesting: 0,
     work,
     previews: new WeakMap(),
+    regex: options.regex,
   };
   let undetermined: string | null = null;
+  let workExhausted = false;
   try {
     validateNode(value, schema, "", "", ctx);
   } catch (err) {
     if (err instanceof WorkExhausted) {
+      workExhausted = true;
       undetermined = `the schema needed more than ${work.limit} subschema evaluations for this value, so no verdict was reached — anyOf, oneOf and allOf over shared $refs multiply, and so do many patternProperties over many keys`;
     } else if (err instanceof Undetermined) {
       undetermined = err.message;
@@ -1274,10 +1353,28 @@ export function validateValue(
   return {
     valid: undetermined === null && ctx.errors.length === 0,
     undetermined,
+    workExhausted,
     errors: ctx.errors,
     truncated: ctx.truncated,
     unsupportedKeywords: [...ctx.unsupported].sort(),
   };
+}
+
+/**
+ * Why a schema's pattern will not be run, or null: it does not compile, or
+ * the caller-pattern screen refuses it (a shape that backtracks
+ * exponentially, such as `(a+)+`, or one too long to analyse). Either way
+ * the schema is reported as malformed before anything is validated, rather
+ * than run and answered "no match" by an engine that gave up.
+ */
+function refusedPattern(pattern: string): string | null {
+  try {
+    new RegExp(pattern);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  const screened = screenCallerPattern(pattern, "");
+  return screened.ok ? null : screened.answer.refused;
 }
 
 /**
@@ -1336,11 +1433,8 @@ export function checkSchemaShape(schema: unknown, path = "", depth = 0): string[
     }
   }
   if (typeof schema["pattern"] === "string") {
-    try {
-      new RegExp(schema["pattern"]);
-    } catch (err) {
-      problems.push(`${joinPointer(path, "pattern")}: ${(err as Error).message}`);
-    }
+    const refused = refusedPattern(schema["pattern"]);
+    if (refused !== null) problems.push(`${joinPointer(path, "pattern")}: ${refused}`);
   }
 
   const descend = (child: unknown, childPath: string): void => {
@@ -1353,12 +1447,9 @@ export function checkSchemaShape(schema: unknown, path = "", depth = 0): string[
     if (!isPlainObject(map)) continue;
     if (keyword === "patternProperties") {
       for (const source of Object.keys(map)) {
-        try {
-          new RegExp(source);
-        } catch (err) {
-          problems.push(
-            `${joinPointer(joinPointer(path, keyword), source)}: ${(err as Error).message}`,
-          );
+        const refused = refusedPattern(source);
+        if (refused !== null) {
+          problems.push(`${joinPointer(joinPointer(path, keyword), source)}: ${refused}`);
         }
       }
     }

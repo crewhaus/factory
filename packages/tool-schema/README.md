@@ -94,6 +94,23 @@ with `ok: false`. A failing union's message is at most 1,000 characters:
 when its branches' reasons do not fit, each is cut to an equal share and a
 short one keeps all of it, so a nested union's decisive reason survives.
 
+**Patterns never run on the caller's thread.** A schema's `pattern` and
+`patternProperties`, and `Assert`'s `matches`/`notMatches`, are regexes the
+caller wrote, run over text the caller chose; a synchronous `RegExp` cannot be
+interrupted, and when JavaScriptCore gives up on a backtracking match it says
+"no match". So each tool asks every pattern question first, answers them all
+in one `@crewhaus/tool-safety` regex worker under a five-second deadline, and
+then evaluates with the answers (a schema whose later patterns depend on
+earlier answers, through `if` or a union, takes a few rounds). A pattern the
+screen refuses, because it backtracks exponentially (`(a+)+`, `(\w+\s?)*`) or
+is past 10,000 characters, makes the schema malformed (`schemaValid: false`),
+and fails an `Assert` check as an invalid regex does. One that cannot be run
+to an answer (the deadline, the engine giving up, which includes a no-match
+slower than 100 ms) leaves the value `undetermined`, never invalid or valid,
+and an `Assert` check `undetermined` and not ok. A library caller of `runChecks` or `validateValue` with no
+answers gets a bounded fallback on its own thread: the same screen, at most
+64 KiB of input per pattern, and a give-up read as undetermined.
+
 ## The formats
 
 Each format is a stated subset, not a full grammar, and each rejects the grey
