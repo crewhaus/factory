@@ -5,10 +5,14 @@
  *
  * The set is read from the code, never written out: every tool
  * `BUILTIN_TOOL_MAP` compiles in, loaded the way a bundle loads it, plus every
- * `export const …: RegisteredTool` in a `packages/tool-*` package. The second
- * half catches the builtins other targets emit and the CLI's map leaves out
- * (`SendMessage`, `EvmSendTransaction`, the chain readers). Test-only: nothing
- * in the CLI imports this.
+ * `export const …: RegisteredTool` or `export let …: RegisteredTool` in a
+ * `packages/tool-*` package. The second half catches the builtins other
+ * targets emit and the CLI's map leaves out (`SendMessage`,
+ * `EvmSendTransaction`, the chain readers, the pipeline's `Retrieve`).
+ * `export let` counts because a live binding is still an exported tool: the
+ * pipeline `Retrieve` is one (its config rebinds it), and a scan that read only
+ * `const` dropped it from every guard here without failing any of them.
+ * Test-only: nothing in the CLI imports this.
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -22,7 +26,7 @@ export type LoadedBuiltins = {
   readonly packageOf: ReadonlyMap<string, string>;
   /** How many the CLI's builtin map contributed — the sweep's hit count. */
   readonly fromMap: number;
-  /** How many `export const …: RegisteredTool` the package scan found. */
+  /** How many `export const|let …: RegisteredTool` the package scan found. */
   readonly fromPackages: number;
 };
 
@@ -44,7 +48,9 @@ export async function loadAllBuiltinTools(): Promise<LoadedBuiltins> {
     const entry = join(packagesDir, dir, "src", "index.ts");
     if (!existsSync(entry)) continue;
     const exported = [
-      ...readFileSync(entry, "utf-8").matchAll(/^export const ([A-Za-z0-9_]+): RegisteredTool\b/gm),
+      ...readFileSync(entry, "utf-8").matchAll(
+        /^export (?:const|let) ([A-Za-z0-9_]+): RegisteredTool\b/gm,
+      ),
     ].map((m) => m[1] as string);
     if (exported.length === 0) continue;
     const mod = (await import(entry)) as Record<string, unknown>;
