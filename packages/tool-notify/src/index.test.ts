@@ -1999,7 +1999,15 @@ describe("an instant means the same moment on every machine", () => {
       }
       // 0.7.0 read each of these as the host's local time (or, for the bare
       // date, UTC midnight) and answered: a decision, a message, a send.
-      expect(seen.filter((s) => !s.out.includes("not an instant with a UTC offset"))).toEqual([]);
+      expect(seen.filter((s) => !s.out.includes("is not an instant"))).toEqual([]);
+      // With no zone at all, the refusal says the offset is missing. The
+      // offset-shaped tails are refused as a spelling this tool does not read.
+      const zoneless = ["2026-09-17T23:30:00", "2026-09-17", "2026-09-17 23:30"];
+      expect(
+        seen.filter(
+          (s) => zoneless.includes(s.now) && !s.out.includes("not an instant with a UTC offset"),
+        ),
+      ).toEqual([]);
       expect(seen.filter((s) => s.out.includes('"allowed"') || s.out.includes("Date: "))).toEqual(
         [],
       );
@@ -2009,6 +2017,58 @@ describe("an instant means the same moment on every machine", () => {
     } finally {
       server.close();
     }
+  });
+
+  test("net regression review: every zone-naming spelling 0.7.0 read alike on every host is read again", async () => {
+    // 23:30 UTC on 17 Sep 2026, in each spelling: Date#toString(), RFC 5322's
+    // fixed US zones, long names, month-first, and ISO's 24:00.
+    const spellings = [
+      "Thu Sep 17 2026 23:30:00 GMT+0000 (Coordinated Universal Time)",
+      "Fri Sep 18 2026 08:30:00 GMT+0900 (Japan Standard Time)",
+      "Thu, 17 Sep 2026 18:30:00 EST",
+      "Thu, 17 Sep 2026 19:30:00 EDT",
+      "Thu, 17 Sep 2026 15:30:00 PST",
+      "Thursday, 17 Sep 2026 23:30:00 GMT",
+      "Thu, 17 September 2026 23:30:00 GMT",
+      "Sep 17, 2026 23:30:00 UTC",
+    ];
+    const seen: string[] = [];
+    for (const tz of ZONES) {
+      for (const now of spellings) {
+        seen.push(String(await inZone(tz, () => emailCompose.execute({ ...MAIL, date: now }))));
+      }
+      const midnight = String(
+        await inZone(tz, () =>
+          emailCompose.execute({ ...MAIL, date: "2026-09-17T24:00:00Z", subject: "eod" }),
+        ),
+      );
+      expect(JSON.parse(midnight).message).toContain("Date: Fri, 18 Sep 2026 00:00:00 +0000");
+    }
+    expect(seen).toHaveLength(spellings.length * ZONES.length);
+    let checked = 0;
+    for (const out of seen) {
+      expect(JSON.parse(out).message).toContain("Date: Thu, 17 Sep 2026 23:30:00 +0000");
+      checked++;
+    }
+    expect(checked).toBe(seen.length);
+  });
+
+  test("a spelling that names a zone this tool will not read is refused as that, not as offset-less", async () => {
+    let checked = 0;
+    for (const now of [
+      "Thu, 17 Sep 2026 23:30:00 CET",
+      "2026-09-17T23:30:00+25:00",
+      "Thu, 31 Sep 2026 23:30:00 GMT",
+    ]) {
+      const out = String(await quietHours.execute({ schedule: QUIET, now }));
+      expect({ now, out }).toMatchObject({
+        now,
+        out: expect.stringContaining("is not an instant in a spelling this tool reads"),
+      });
+      expect(out).not.toContain("without an offset");
+      checked++;
+    }
+    expect(checked).toBe(3);
   });
 
   test("EmailSendPreflight fails the date check for the same value, as the send would", async () => {

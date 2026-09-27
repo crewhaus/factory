@@ -490,11 +490,19 @@ describe("retry arithmetic", () => {
       "Wed, 23 Sep 2026 10:00 GMT",
       "23 Sep 2026 10:00:00 GMT",
       "Wed, 23-Sep-2026 10:00:00 GMT",
+      // Each names its zone and 0.7.0 read it on every host alike (net
+      // regression review): RFC 5322's fixed US zones, long names, the
+      // month-first spelling, and JavaScript's own Date#toString().
+      "Wed, 23 Sep 2026 03:00:00 PDT",
+      "Wed, 23 Sep 2026 02:00:00 PST",
+      "Wednesday, 23 September 2026 10:00:00 GMT",
+      "Sep 23, 2026 10:00:00 UTC",
+      "Wed Sep 23 2026 19:00:00 GMT+0900 (Japan Standard Time)",
     ];
     const unread = [
       "2026-09-23T10:00:00", // offset-less ISO: host-local per ECMAScript
       "Wed, 23 Sep 2026 10:00:00", // RFC 1123 with the zone left off
-      "Wed, 23 Sep 2026 10:00:00 PST", // an HTTP-date is GMT only
+      "Wed, 23 Sep 2026 10:00:00 CET", // an abbreviation RFC 5322 does not define
       "Wed, 31 Sep 2026 10:00:00 GMT", // a day September does not have
       "Sep 23 2026-10:00", // offset-shaped tail, host time to Date.parse
       "Wed, 23 Sep 2026 10:00:00", // no zone at all
@@ -512,7 +520,7 @@ describe("retry arithmetic", () => {
     // Asia/Tokyo and eight hours under America/Los_Angeles.
     expect(seen.filter((s) => read.includes(s.text) && s.ms !== 3_600_000)).toEqual([]);
     expect(seen.filter((s) => unread.includes(s.text) && s.ms !== null)).toEqual([]);
-    expect(seen).toHaveLength(51);
+    expect(seen).toHaveLength(66);
   });
 
   test("the server's Retry-After wins over the curve", () => {
