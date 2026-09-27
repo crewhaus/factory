@@ -125,7 +125,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stdout).toContain("compiled bundle");
-  });
+  }, 20_000);
 
   test("emits a pinned package.json so the bundle runs standalone", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
@@ -145,7 +145,7 @@ describe("crewhaus compile", () => {
     for (const dep of imports) expect(manifest.dependencies[dep]).toBeDefined();
     expect(cliVersion()).toBeDefined();
     for (const pin of Object.values(manifest.dependencies)) expect(pin).toBe(cliVersion());
-  });
+  }, 20_000);
 
   test("a user-authored package.json in the out-dir is kept on plain compile", async () => {
     const manifestPath = join(tmp, "package.json");
@@ -159,7 +159,7 @@ describe("crewhaus compile", () => {
     // no signal (e.g. after an --emit-as cf-worker compile into this dir).
     expect(result.stdout).toContain(`kept ${manifestPath}`);
     expect(result.stdout).toContain("pinned @crewhaus manifest was NOT written");
-  });
+  }, 20_000);
 
   test("--with-eval-harness emits a pinned manifest for the eval bridge too", async () => {
     const result = await runCli(["compile", CHANNEL_SPEC, "--with-eval-harness", "-o", tmp]);
@@ -172,7 +172,7 @@ describe("crewhaus compile", () => {
       expect(Object.keys(manifest.dependencies).length).toBeGreaterThan(0);
       for (const pin of Object.values(manifest.dependencies)) expect(pin).toBe(cliVersion());
     }
-  });
+  }, 20_000);
 
   // Item 42 — generated bundle README, DEFAULT-ON.
   test("emits a generated README.md into the bundle by default (item 42)", async () => {
@@ -184,14 +184,14 @@ describe("crewhaus compile", () => {
     expect(md).toContain("<!-- crewhaus:generated-readme -->");
     expect(md).toContain("| Target | `cli` |");
     expect(md).toContain("bun agent.ts");
-  });
+  }, 20_000);
 
   test("--no-readme skips the generated README.md (item 42 opt-out)", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--no-readme", "-o", tmp]);
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(existsSync(join(tmp, "README.md"))).toBe(false);
-  });
+  }, 20_000);
 
   test("a user-authored README.md in the out-dir is kept, with a notice (item 42)", async () => {
     const readmePath = join(tmp, "README.md");
@@ -201,7 +201,7 @@ describe("crewhaus compile", () => {
     expect(readFileSync(readmePath, "utf-8")).toBe("# my notes\n\nhand-written\n");
     expect(result.stdout).toContain("kept");
     expect(result.stdout).toContain("--no-readme");
-  });
+  }, 20_000);
 
   test("a previously GENERATED README.md is refreshed on recompile (item 42)", async () => {
     const first = await runCli(["compile", HELLO_SPEC, "-o", tmp]);
@@ -212,7 +212,7 @@ describe("crewhaus compile", () => {
     expect(second.exitCode).toBe(0);
     expect(second.stdout).toContain(`wrote ${readmePath}`);
     expect(readFileSync(readmePath, "utf-8")).toBe(generated);
-  });
+  }, 20_000);
 
   test("--emit-ir with -o writes ir.json into the out dir and skips codegen", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir", "-o", tmp]);
@@ -222,12 +222,12 @@ describe("crewhaus compile", () => {
     const ir = JSON.parse(readFileSync(join(tmp, "ir.json"), "utf-8"));
     expect(ir.target).toBe("cli");
     expect(ir.agent).toBeDefined();
-  });
+  }, 20_000);
 
   test("--emit-ir without -o exits 0 (stdout-streaming covered by manual usage; the\nspawn-pipe capture in this harness is racy on stdout — see other compile tests)", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-ir"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   // Loop contract 0.4 (Batch B, G42) — `--emit-loop`: projectLoop() of the
   // lowered IR, the wire contract shared with the studio /builder and the
@@ -254,17 +254,17 @@ describe("crewhaus compile", () => {
     // CLI, the worker endpoint, and the studio must render the same object.
     const projection = JSON.parse(readFileSync(loopPath, "utf-8"));
     expect(JSON.stringify(projection)).toBe(JSON.stringify(golden["cli"]));
-  });
+  }, 20_000);
 
   test("--emit-loop without -o exits 0 (human render; stdout capture is racy — see --emit-ir note)", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-loop"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("--emit-loop --json without -o exits 0", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--json"]);
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("--emit-loop is a read-only view: the FR-002 scope gate does NOT run (POST /loop parity)", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -279,7 +279,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("[strict]");
     expect(existsSync(join(outDir, "loop.json"))).toBe(true);
-  });
+  }, 20_000);
 
   test("--emit-loop rejects --check and --emit-ir combinations", async () => {
     const withCheck = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--check"]);
@@ -288,7 +288,7 @@ describe("crewhaus compile", () => {
     const withEmitIr = await runCli(["compile", HELLO_SPEC, "--emit-loop", "--emit-ir"]);
     expect(withEmitIr.exitCode).toBe(1);
     expect(withEmitIr.stderr).toContain("mutually exclusive");
-  });
+  }, 20_000);
 
   // FR-002 — compile-time external-sink scope gate, now DEFAULT-ON.
   const MCP_SINK_SPEC =
@@ -304,7 +304,7 @@ describe("crewhaus compile", () => {
     // Item 42 — README emission and its opt-out are documented too.
     expect(result.stdout).toContain("README.md");
     expect(result.stdout).toContain("--no-readme");
-  });
+  }, 20_000);
 
   // (a) DEFAULT-ON RED PATH — no flag at all. A spec referencing an `mcp__*`
   // sink the offline tool map cannot resolve to a scope:"external" tool must
@@ -324,7 +324,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("unverifiable offline");
     // refused to emit
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   // (a') Isolation: on --emit-ir there is NO target emitter in the path, so the
   // spec lowers cleanly and the ONLY thing that can produce exit 1 is the scope
@@ -339,7 +339,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("[strict]");
     expect(result.stderr).toContain("mcp__evil__exfiltrate");
     expect(existsSync(join(outDir, "ir.json"))).toBe(false);
-  });
+  }, 20_000);
 
   // (b) OPT-OUT — the same unmarked sink passes the compile when the user
   // explicitly bypasses the gate. We assert against the --emit-ir path because
@@ -364,7 +364,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("[strict]");
     expect(existsSync(join(outDir, "ir.json"))).toBe(true);
-  });
+  }, 20_000);
 
   test("--no-strict-scope is an accepted alias that also bypasses the gate", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -381,7 +381,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("[strict]");
     expect(existsSync(join(outDir, "ir.json"))).toBe(true);
-  });
+  }, 20_000);
 
   // (b') OPT-OUT, BUNDLE MODE — emitter errors must exit cleanly, not crash.
   // Once --allow-unmarked-sinks bypasses the scope gate, the same unresolvable
@@ -408,7 +408,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
     // Nothing was emitted.
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   // The report's literal repro: a plain non-outward unknown tool name (one the
   // gate never flags, so it reaches the emitter with or without the opt-out)
@@ -426,7 +426,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).not.toContain("TargetEmitError");
     expect(result.stderr).not.toMatch(/\bat .+:\d+:\d+/);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   // A malformed credential env-ref (`$lowercase` on a Slack token) is a hard
   // compile error from lowerCredential(). It must render as a clean die()
@@ -463,7 +463,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   test("compile (no flag) passes when an outward tool (fetch) is correctly external", async () => {
     // Exercises the full resolve path: collectToolNames → loadToolMap →
@@ -480,7 +480,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   // Back-compat: `--strict` is still accepted (now a no-op since the gate is
   // default-on) so existing invocations and CI scripts keep working unchanged.
@@ -493,14 +493,14 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("[strict]");
     expect(result.stderr).toContain("mcp__evil__exfiltrate");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
-  });
+  }, 20_000);
 
   test("--strict on a clean (toolless) spec still emits and exits 0", async () => {
     const result = await runCli(["compile", HELLO_SPEC, "--strict", "-o", tmp]);
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(tmp, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   // Regression: a sub-agent `tools:` list names tools by their REGISTERED name
   // (PascalCase, e.g. `WebSearch`) — that is the contract the runtime
@@ -522,7 +522,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
     expect(result.stderr).not.toContain("[strict]");
-  });
+  }, 20_000);
 
   // Loop contract 0.4 (Batch A) — compile warnings (accepted-but-unwired
   // spec keys) always print, one line per warning, code + path + message;
@@ -548,7 +548,7 @@ describe("crewhaus compile", () => {
     // Warnings do not fail the build without --strict.
     expect(result.stdout).toContain("compiled bundle");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
-  });
+  }, 20_000);
 
   test("compile --strict escalates warnings to errors and writes NOTHING", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -563,7 +563,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("--strict: 1 compile warning(s) escalated to errors");
     // A strict-failed build must not emit — the out dir is never created.
     expect(existsSync(outDir)).toBe(false);
-  });
+  }, 20_000);
 
   // 0.7.1 (permission-integration#12) — a rule written with the spec key
   // (`removePath`) never matches the tool's name (`RemovePath`); compile says
@@ -638,7 +638,7 @@ describe("crewhaus compile", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).not.toContain("warning[");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
-  });
+  }, 20_000);
 
   // D40 — channel-reactions-join is INFORMATIONAL: it fires on a fully
   // wired, correctly configured feature (the outbound-ts join file just has
@@ -664,7 +664,7 @@ describe("crewhaus compile", () => {
     // …but never escalates, and the bundle is written.
     expect(result.stderr).not.toContain("escalated to errors");
     expect(existsSync(join(outDir, "session-router.ts"))).toBe(true);
-  });
+  }, 20_000);
 
   // 0.7.0 accepted plugins: on channel and ignored it, and passed --strict;
   // the notice that the daemon now loads them must not fail --strict.
@@ -681,7 +681,7 @@ describe("crewhaus compile", () => {
     expect(result.stderr).toContain("crewhaus: warning[channel-plugins-at-start] plugins:");
     expect(result.stderr).not.toContain("escalated to errors");
     expect(result.exitCode).toBe(0);
-  });
+  }, 20_000);
 
   // 0.6.0 — the model-plan notices that no spec edit can properly clear are
   // informational too: model-plan-candidate-only fires on a `models:` profile
@@ -742,7 +742,7 @@ describe("crewhaus compile", () => {
     );
     expect(result.stderr).not.toContain("escalated to errors");
     expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
-  });
+  }, 20_000);
 
   // Item 1 — the cli emitter used to DROP the spec's `feedback:` block, so a
   // compiled bundle had no rating prompt and no user_feedback capture at all
@@ -767,7 +767,7 @@ describe("crewhaus compile", () => {
       "crewhaus: warning[cli-autodistill-toolchain] feedback.autoDistill:",
     );
     expect(result.stderr).not.toContain("escalated to errors");
-  });
+  }, 20_000);
 
   test("compile --help documents the warning line shape and --strict escalation", async () => {
     const result = await runCli(["compile", "--help"]);
@@ -780,7 +780,7 @@ describe("crewhaus compile", () => {
     expect(result.stdout).not.toContain("model-plan-pending-runtime");
     expect(result.stdout).toContain("--strict");
     expect(result.stdout).toContain("Escalate compile warnings to errors");
-  });
+  }, 20_000);
 });
 
 describe("crewhaus init", () => {

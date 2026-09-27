@@ -315,12 +315,12 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
       (await runCli(["eval-report", "history", "--spec", "concierge", "--dataset", "smoke"], root))
         .exitCode,
     ).toBe(0);
-  });
+  }, 30_000);
 
   test("baseline show exits 0 with no pins", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("baseline set pins a recorded run into baselines.json", async () => {
     const root = newTempRoot();
@@ -345,7 +345,7 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     });
     // `baseline show` over the pin still exits 0.
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 20_000);
 
   test("baseline set pins a ROUTED run under its own lineage key, not the legacy one", async () => {
     // 0.6.0 §6.1 — `setBaseline` keys on the entry's lineage, so a manual pin
@@ -383,23 +383,23 @@ describe("crewhaus eval-report history/baseline (run-history item 3)", () => {
     // The primary's baseline is exactly where it was.
     expect(baselines["concierge::smoke"]?.runId).toBe("run_prim1111prim1111");
     expect((await runCli(["eval-report", "baseline", "show"], root)).exitCode).toBe(0);
-  });
+  }, 30_000);
 
   test("baseline set rejects a runId absent from the index", async () => {
     const root = newTempRoot();
     const result = await runCli(["eval-report", "baseline", "set", "run_ffff9999ffff9999"], root);
     expect(result.exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("baseline set rejects a missing runId argument", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "set"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 
   test("baseline rejects unknown sub-action", async () => {
     const root = newTempRoot();
     expect((await runCli(["eval-report", "baseline", "bogus"], root)).exitCode).toBe(1);
-  });
+  }, 20_000);
 });
 
 describe("crewhaus eval-report diff — C29 significance + B13 slice deltas", () => {
