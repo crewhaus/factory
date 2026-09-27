@@ -107,6 +107,15 @@ const SPEC_NAME_REGEX = /^[a-zA-Z0-9_\-.]+$/;
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,127}$/;
 
 /**
+ * Whether `value` is a wiki slug: kebab-case, 1–128 characters. Every slug
+ * the store returns is one; a caller that prints a slug outside a classified
+ * unit (tool-wiki's redaction notice) checks it again.
+ */
+export function isWikiSlug(value: unknown): value is string {
+  return typeof value === "string" && SLUG_REGEX.test(value);
+}
+
+/**
  * What an article's `createdAt` / `updatedAt` reads as when the file holds
  * no timestamp the store can read. It is printed as it stands
  * (`updated: unknown`), sorts after every real timestamp in `list()`, and
@@ -793,22 +802,54 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
     return { version: 1, articles };
   }
 
-  function isIndexFile(value: unknown): value is WikiIndexFile {
+  /**
+   * Whether `value` is an index this store could have written for the
+   * articles in `slugs`. index.json is a file any agent with a write tool
+   * can edit, and its entries become the rows every list tool prints, so
+   * each one is held to what {@link toIndexEntry} produces from a parsed
+   * article: the key is a slug with an article file behind it, the version a
+   * positive whole number, the status one of the four, the title, tags and
+   * links strings (each link a slug), the confidence a number in [0, 1],
+   * `verified` a boolean and `updatedAt` a normalised timestamp. Anything
+   * else — a planted key
+   * carrying text, a string version, an entry for an article that is not
+   * there — sends the load to a rebuild from the articles, which
+   * parseArticle validates.
+   *
+   * An article with no entry is not a reason to rebuild: the rebuild leaves
+   * out a malformed article, and whoever can leave one out of index.json can
+   * as well delete the article itself.
+   */
+  function isIndexFile(value: unknown, slugs: ReadonlyArray<string>): value is WikiIndexFile {
     if (typeof value !== "object" || value === null) return false;
     const v = value as Record<string, unknown>;
     if (v["version"] !== 1 || typeof v["articles"] !== "object" || v["articles"] === null) {
       return false;
     }
-    // An entry whose timestamp is not one (a planted or hand-edited
-    // index.json) sends the load to a rebuild from the articles, which
-    // parseArticle validates.
-    return Object.values(v["articles"] as Record<string, unknown>).every(
-      (entry) =>
-        typeof entry === "object" &&
-        entry !== null &&
-        isoTimestampOr((entry as Record<string, unknown>)["updatedAt"]) ===
-          (entry as Record<string, unknown>)["updatedAt"],
-    );
+    const entries = Object.entries(v["articles"] as Record<string, unknown>);
+    const onDisk = new Set(slugs);
+    const strings = (x: unknown): boolean =>
+      Array.isArray(x) && x.every((s) => typeof s === "string");
+    return entries.every(([slug, raw]) => {
+      if (!onDisk.has(slug) || typeof raw !== "object" || raw === null) return false;
+      const e = raw as Record<string, unknown>;
+      const { version, confidence, updatedAt } = e;
+      return (
+        typeof e["title"] === "string" &&
+        strings(e["tags"]) &&
+        strings(e["links"]) &&
+        (e["links"] as unknown[]).every(isWikiSlug) &&
+        typeof confidence === "number" &&
+        confidence >= 0 &&
+        confidence <= 1 &&
+        typeof e["verified"] === "boolean" &&
+        typeof version === "number" &&
+        Number.isSafeInteger(version) &&
+        version >= 1 &&
+        ARTICLE_STATUSES.includes(e["status"] as WikiArticleStatus) &&
+        isoTimestampOr(updatedAt) === updatedAt
+      );
+    });
   }
 
   /** Load index.json; on a missing/corrupt file, rebuild from the articles
@@ -822,7 +863,7 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
       const raw = await readStoreFile(indexPath, INDEX_MAX_BYTES);
       if (raw !== null) {
         const parsed = JSON.parse(raw) as unknown;
-        if (isIndexFile(parsed)) return parsed;
+        if (isIndexFile(parsed, await listArticleSlugs())) return parsed;
       }
     } catch {
       // missing, corrupt, oversized or not a regular file: fall through to rebuild
