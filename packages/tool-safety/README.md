@@ -37,7 +37,7 @@ The match runs in a Bun Worker. At the deadline, or when `signal` fires, the wor
 | `matchAll` | Finds every match (`g` implied), up to `maxMatches` | `{ matches, truncated, truncatedBy? }` |
 | `replace` | Replaces with a string replacement, supporting `$&` `$1` `$<n>` `` $` `` `$'` `$$` | `{ output, replacements }` |
 | `split` | Behaves like `String.prototype.split`, captures included | `{ pieces, truncated, truncatedBy? }` |
-| `testEach` | Runs one pattern over many inputs | `{ matched: indexes, scanned, truncated, undetermined }` |
+| `testEach` | Runs one pattern over many inputs: an array, or `{ lines: text }` (the text's `\n`-separated lines) | `{ matched: indexes, scanned, truncated, undetermined }` |
 | `firstMatchingRule` | Runs many patterns over many inputs and finds the first rule that hits each input | `{ ruleIndexes, undetermined }` (-1 = none, null = undetermined) |
 | `testMatrix` | Runs every pattern against every input | `{ matched, undetermined }`, one index list per pattern |
 | `replaceEach` | Runs one `replace` over many inputs; `maxOutputChars` caps all outputs together | `{ outputs, replacements, undetermined }` |
@@ -56,7 +56,7 @@ For warm reuse, open a session: `const s = openRegexSession(); … await s.run(r
 
 - A warm session run costs about **0.02 ms**, or **0.07 ms** under `i`. The pattern's screen is cached after its first run; that first screen costs 0.01–0.3 ms for everyday patterns and at most a few milliseconds (see the screen below).
 - A one-shot `runRegex`, which starts a worker, costs about **2.3 ms**.
-- `testEach` over 10 000 log lines takes **4.3 ms**, against 0.3 ms for a synchronous loop. Most of the difference is copying the inputs to the worker.
+- `testEach` over 10 000 log lines takes **1.8 ms**, or **0.9 ms** given as one text (`inputs: { lines }`, which crosses to the worker in one copy), against 0.2 ms for a synchronous loop. Most of the difference is copying the inputs to the worker.
 
 `runRegex` is a one-run session.
 
@@ -83,7 +83,7 @@ Only `status: "ok"` carries a definite answer. Every other status means the help
 
 JavaScriptCore stops a match after a fixed backtracking budget and returns `null`, the same value as "no match". Measured on Bun 1.3.14, it throws no exception, and it leaves `lastIndex` and `RegExp.lastMatch` exactly as a genuine failure would. This holds under every flag (`"" g y d u v`). **A give-up can't be detected from the return value.**
 
-The only difference is cost. Every give-up measured took 0.4–3 s, while a genuine no-match over the input sizes admitted here takes microseconds to milliseconds. So the worker times every `exec`, and reports a `null` that took at least `giveUpMs` (default 100) as `gave-up`, never as a no-match. This is a heuristic, and it errs in one direction: a genuinely slow no-match is also reported `gave-up`. That outcome is undetermined, which is safe. Every give-up measured was far above the threshold.
+The only difference is cost. Every give-up measured took 0.4–3 s, while a genuine no-match over the input sizes admitted here takes microseconds to milliseconds. So the worker times every `exec`, and reports a `null` that took at least `giveUpMs` (default 100) as `gave-up`, never as a no-match. `testEach` reads the clock once per group of up to 64 inputs, since a clock read costs about as much as matching a short line: a group quicker than `giveUpMs` holds no slow input, and in a slower one each no-match is run again alone and timed. This is a heuristic, and it errs in one direction: a genuinely slow no-match is also reported `gave-up`. That outcome is undetermined, which is safe. Every give-up measured was far above the threshold.
 
 ### The static screen: `screenUserRegex` and `compileUserRegex`
 
@@ -219,9 +219,11 @@ This creates a new file and returns its open descriptor. Anything already at the
 
 This is the one walk. It never follows a symlink. Every entry is `lstat`ed and reported with its `kind` (`file`, `directory`, `symlink`, `fifo`, `socket` …). A link carries its target text and whether it physically leads inside the root. A directory swapped for a link while it was listed is reported in `unreadable`, and so is one that could not be read. A truncated walk says why (`max-entries`, `max-depth` or `max-visited`). The order is depth-first and sorted by raw name, so it is the same on every machine.
 
-### Copying: `copyTreeSafe(srcRoot, src, dstRoot, dst, { symlinks, maxEntries, maxBytes?, overwrite?, specials?, createParents?, dryRun? })`
+### Copying: `copyTreeSafe(srcRoot, src, dstRoot, dst, { symlinks, maxEntries, maxBytes?, overwrite?, fileModes?, specials?, createParents?, dryRun? })`
 
 The whole copy is planned before a byte is written. Every source entry is `lstat`ed, never followed. Every destination path is checked, not just the destination root: an existing link anywhere on it is refused (security-11#0, flag-truth-6#0). With `symlinks: "copy-contained"`, each link is resolved from its NEW location, the way the kernel will, taking into account the directories and links the copy is about to create. A link that would lead outside the destination root is refused (security-11#2). `"copy-no-new-reach"` also keeps a link that leads outside from its new location when it leads to exactly where its source leads (an absolute link to an interpreter in a virtualenv, say), so the copy reaches nothing the source did not; it applies only when source and destination share one root, and those links are listed in `outsideLinks`. `"skip"` leaves links out and lists them; `"refuse"` fails the copy. Budgets and conflicts fail the copy before anything is written.
+
+A copied file's permission bits follow `fileModes`. With `"keep-replaced"` (the default, as `cp` does), a replaced file keeps its own bits and a new one gets the source's less the umask. With `"source"` (as `fs.copyFileSync` does), every copied file gets the source's bits exactly, so a 0600 secret copied over a 0644 file stays 0600. CopyPath uses `"source"`, which is what 0.7.0 did. Set-id and sticky bits are never copied.
 
 During the write, each entry is checked against the directory that was planned. If a directory is swapped for a link mid-copy, the copy stops, removes the entry it had just made through the swap, and reports how many entries were already copied.
 

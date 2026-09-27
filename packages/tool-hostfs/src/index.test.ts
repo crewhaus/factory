@@ -797,8 +797,9 @@ describe("WatchPath: what it reports", () => {
      * sub-millisecond part; HFS+ (whole seconds) and a test's coarse tick
      * do not.
      */
-    function fixedStampProbe(stampMs: number, subMsNs: bigint): void {
-      const ns = `${BigInt(stampMs) * 1_000_000n + subMsNs}`;
+    function fixedStampProbe(stampMs: number, subMsNs: bigint, ctimeSubMsNs = subMsNs): void {
+      const mtime = `${BigInt(stampMs) * 1_000_000n + subMsNs}`;
+      const ctime = `${BigInt(stampMs) * 1_000_000n + ctimeSubMsNs}`;
       _setPathProbe((p): PathFacts | undefined => {
         const st = lstatSync(p, { bigint: true, throwIfNoEntry: false });
         if (st === undefined) return undefined;
@@ -811,7 +812,7 @@ describe("WatchPath: what it reports", () => {
           mode: Number(st.mode),
           mtimeMs: dir ? Number(st.mtimeMs) : stampMs,
           ctimeMs: dir ? Number(st.ctimeMs) : stampMs,
-          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${ns}:${ns}`,
+          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${mtime}:${ctime}`,
           sizeBytes: Number(st.size),
           uid: Number(st.uid),
         };
@@ -856,6 +857,51 @@ describe("WatchPath: what it reports", () => {
       fixedStampProbe(Math.floor(Date.now() / 1000) * 1000, 0n);
       const result = await bigWriteThenWatch();
       expect(result["eventCount"]).toBe(1);
+    }, 15_000);
+
+    // Both stamps must be fine. A same-size rewrite that leaves the stamps
+    // equal is caught only if the file is compared by content, so each case
+    // below reports it; trusting the stamps would drop it as "unchanged".
+    test.each([
+      ["mtime fine, ctime whole milliseconds", 123_457n, 0n],
+      ["ctime fine, mtime whole milliseconds", 0n, 123_457n],
+    ] as const)(
+      "on macOS, %s: the file is still compared by content",
+      async (_label, mtimeSubMs, ctimeSubMs) => {
+        const clock = holdMonotonicClock();
+        _setPlatform("darwin");
+        fixedStampProbe(Date.now(), mtimeSubMs, ctimeSubMs);
+        writeFileSync(join(workspace, "a.txt"), "aa");
+        scriptedWatcher((emit) => {
+          writeFileSync(join(workspace, "a.txt"), "bb");
+          emit("change", "a.txt");
+          clock.advance(1_000);
+        });
+        const result = await callJson(watchPath, {
+          path: ".",
+          timeoutMs: 5_000,
+          maxEvents: 1,
+          settleMs: 20,
+        });
+        expect(result["eventCount"]).toBe(1);
+        expect((result["events"] as Array<Record<string, unknown>>)[0]?.["kind"]).toBe("modified");
+      },
+      20_000,
+    );
+
+    test("on macOS, with both stamps fine, the same rewrite is trusted as 0.7.0 trusted it", async () => {
+      // The control for the two cases above: the stamps alone decide, so a
+      // rewrite that (in this fake) kept them equal is not an event.
+      _setPlatform("darwin");
+      fixedStampProbe(Date.now(), 123_457n, 654_321n);
+      writeFileSync(join(workspace, "a.txt"), "aa");
+      scriptedWatcher((emit) => {
+        writeFileSync(join(workspace, "a.txt"), "bb");
+        emit("change", "a.txt");
+      });
+      const result = await callJson(watchPath, { path: ".", timeoutMs: 300, settleMs: 20 });
+      expect(result["eventCount"]).toBe(0);
+      expect(result["stoppedBy"]).toBe("deadline");
     }, 15_000);
   });
 

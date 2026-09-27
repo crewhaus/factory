@@ -12,6 +12,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -19,13 +20,19 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { _setMoveRenameForTest, copyPath, movePath } from "./index";
+import {
+  _setMoveCrossesFilesystemForTest,
+  _setMoveRenameForTest,
+  copyPath,
+  movePath,
+} from "./index";
 
 const originalCwd = process.cwd();
 /** The workspace's PARENT, so a link climbing out of the workspace has somewhere to land. */
@@ -45,6 +52,7 @@ beforeEach(() => {
 
 afterEach(() => {
   _setMoveRenameForTest(undefined);
+  _setMoveCrossesFilesystemForTest(undefined);
   process.chdir(originalCwd);
   rmSync(parent, { recursive: true, force: true });
 });
@@ -234,6 +242,26 @@ describe("a link that leads out exactly where it did adds no reach, so it copies
     expect(lstatSync(path.join(ws, "proj2/.venv/bin/python")).isSymbolicLink()).toBe(true);
   });
 
+  test("a rename in place that must cross a filesystem names it in dryRun, as the move does", async () => {
+    // A rename within one directory skips the link walk, unless it will be
+    // a copy (the moved entry is a mount point): then dryRun still lists
+    // what the copy will report.
+    _setMoveCrossesFilesystemForTest(() => true);
+    _setMoveRenameForTest(() => {
+      throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
+    });
+    for (const dryRun of [true, false]) {
+      const result = JSON.parse(
+        await call(movePath, { source: "proj", destination: "proj2", dryRun }),
+      );
+      expect(result).toMatchObject({
+        moved: !dryRun,
+        outsideLinks: ["proj2/.venv/bin/python"],
+      });
+      if (dryRun) expect(result.crossesFilesystem).toBe(true);
+    }
+  });
+
   test("a relative link that already led out is refused where it would lead further out", async () => {
     // a/esc/up -> ../../.. leads to the workspace's parent; with a/esc moved
     // or copied to the root, it would lead one level above that.
@@ -310,5 +338,60 @@ describe("a copied file never replaces a directory", () => {
     );
     expect(result).toMatchObject({ copied: true, overwrites: 1 });
     expect(readFileSync(path.join(ws, "dst/sub/file.txt"), "utf8")).toBe("payload");
+  });
+});
+
+describe("a copy keeps the source's permission bits, as 0.7.0's did (0.7.1 review)", () => {
+  const mode = (rel: string): number => statSync(path.join(ws, rel)).mode & 0o777;
+  let umask: number;
+  beforeEach(() => {
+    umask = process.umask(0o022);
+  });
+  afterEach(() => {
+    process.umask(umask);
+  });
+
+  test("a 0600 secret copied over a 0644 file stays 0600", async () => {
+    // 0.7.1 before this kept the replaced file's 0644: the secret's content
+    // became readable by everyone.
+    write("secret.env", "TOKEN=1");
+    chmodSync(path.join(ws, "secret.env"), 0o600);
+    write("public.txt", "p");
+    chmodSync(path.join(ws, "public.txt"), 0o644);
+    const result = JSON.parse(
+      await call(copyPath, { source: "secret.env", destination: "public.txt", overwrite: true }),
+    );
+    expect(result).toMatchObject({ copied: true, overwrites: 1 });
+    expect(readFileSync(path.join(ws, "public.txt"), "utf8")).toBe("TOKEN=1");
+    expect(mode("public.txt")).toBe(0o600);
+  });
+
+  test("a 0755 script copied over a 0644 one keeps its execute bits, and a new 0664 file is not narrowed by the umask", async () => {
+    write("template/bin/run.sh", "#!/bin/sh\necho v2\n");
+    chmodSync(path.join(ws, "template/bin/run.sh"), 0o755);
+    write("template/shared.txt", "group-writable");
+    chmodSync(path.join(ws, "template/shared.txt"), 0o664);
+    write("app/bin/run.sh", "#!/bin/sh\necho v1\n");
+    chmodSync(path.join(ws, "app/bin/run.sh"), 0o644);
+    const result = JSON.parse(
+      await call(copyPath, { source: "template", destination: "app", overwrite: true }),
+    );
+    expect(result).toMatchObject({ copied: true, files: 2, overwrites: 1 });
+    expect(mode("app/bin/run.sh")).toBe(0o755);
+    expect(mode("app/shared.txt")).toBe(0o664);
+  });
+
+  test("a move that falls back to a copy keeps each file's bits too", async () => {
+    write("pkg/tool.sh", "#!/bin/sh\n");
+    chmodSync(path.join(ws, "pkg/tool.sh"), 0o775);
+    write("pkg/key.pem", "k");
+    chmodSync(path.join(ws, "pkg/key.pem"), 0o600);
+    _setMoveRenameForTest(() => {
+      throw Object.assign(new Error("EXDEV"), { code: "EXDEV" });
+    });
+    const result = JSON.parse(await call(movePath, { source: "pkg", destination: "moved" }));
+    expect(result).toMatchObject({ moved: true });
+    expect(mode("moved/tool.sh")).toBe(0o775);
+    expect(mode("moved/key.pem")).toBe(0o600);
   });
 });

@@ -119,6 +119,50 @@ describe("copyTreeSafe", () => {
     expect(mode(join(f.ws, "bigdst", "blob.bin"))).toBe(0o600);
   });
 
+  test('fileModes "source" gives every copied file the source\'s bits, new or replaced', () => {
+    // As fs.copyFileSync (and 0.7.0's CopyPath) did. The default keeps a
+    // replaced file's bits, so a 0600 secret copied over a 0644 file became
+    // readable by all, and a 0755 script copied over a 0644 one lost its
+    // execute bits; a new file lost whatever the umask strips.
+    const umask = process.umask(0o022);
+    try {
+      mkdirSync(join(f.ws, "modes-src"));
+      mkdirSync(join(f.ws, "modes-dst"));
+      const cases = [
+        ["secret.env", 0o600, 0o644],
+        ["run.sh", 0o755, 0o644],
+        ["shared.txt", 0o664, undefined],
+        ["locked.txt", 0o400, 0o666],
+      ] as const;
+      for (const [name, srcMode, dstMode] of cases) {
+        writeFileSync(join(f.ws, "modes-src", name), `new ${name}`);
+        chmodSync(join(f.ws, "modes-src", name), srcMode);
+        if (dstMode !== undefined) {
+          writeFileSync(join(f.ws, "modes-dst", name), "old");
+          chmodSync(join(f.ws, "modes-dst", name), dstMode);
+        }
+      }
+      // Set-id bits are never carried over: only the permission bits. (Linux
+      // lets the owner set one; macOS clears it here, which leaves that half
+      // of the check to CI.)
+      chmodSync(join(f.ws, "modes-src", "run.sh"), 0o4755);
+      const r = copyTreeSafe(f.ws, "modes-src", f.ws, "modes-dst", {
+        ...opts,
+        overwrite: true,
+        fileModes: "source",
+      });
+      expect(r).toMatchObject({ ok: true, files: 4 });
+      if (r.ok) expect([...r.replaced].sort()).toHaveLength(3);
+      for (const [name, srcMode] of cases) {
+        expect([name, mode(join(f.ws, "modes-dst", name))]).toEqual([name, srcMode]);
+        expect(statSync(join(f.ws, "modes-dst", name)).mode & 0o7000).toBe(0);
+        expect(readFileSync(join(f.ws, "modes-dst", name), "utf8")).toBe(`new ${name}`);
+      }
+    } finally {
+      process.umask(umask);
+    }
+  });
+
   test("a tree cannot be copied into itself", () => {
     expect(copyTreeSafe(f.ws, "src", f.ws, "src/inner", opts)).toMatchObject({
       ok: false,

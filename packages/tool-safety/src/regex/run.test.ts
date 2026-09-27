@@ -557,6 +557,154 @@ describe("batch ops", () => {
   }, 90_000);
 });
 
+describe("testEach times inputs in groups, and a slow group one input at a time", () => {
+  // The clock is read once per group of inputs; a group slower than
+  // giveUpMs has each no-match run again alone, so only the slow input is
+  // undetermined, and a match beside it still counts.
+  test("one slow no-match among quick ones is the only undetermined input", async () => {
+    const slow = `${" ".repeat(20_000)}y`;
+    const inputs: string[] = [];
+    for (let i = 0; i < 200; i++) inputs.push(i % 7 === 0 ? `row ${i} ends  ` : `row ${i}`);
+    inputs[101] = slow;
+    for (const form of ["array", "lines"] as const) {
+      const outcome = await runRegex({
+        op: "testEach",
+        pattern: "\\s+$",
+        inputs: form === "array" ? inputs : { lines: inputs.join("\n") },
+        onGiveUp: "skip",
+        giveUpMs: 20,
+        deadlineMs: 60_000,
+        maxInputChars: 1_000_000,
+      });
+      expect(outcome.status).toBe("ok");
+      if (outcome.status !== "ok") return;
+      expect(outcome.result.undetermined).toEqual([101]);
+      expect(outcome.result.matched).toEqual(
+        inputs.flatMap((s, i) => (i !== 101 && /\s+$/.test(s) ? [i] : [])),
+      );
+      expect(outcome.result.scanned).toBe(inputs.length);
+    }
+  }, 90_000);
+
+  test("maxMatches stops at the input past the cap, as before", async () => {
+    const inputs = Array.from({ length: 300 }, (_, i) => (i % 3 === 0 ? "hit" : "miss"));
+    const outcome = await runRegex({ op: "testEach", pattern: "hit", inputs, maxMatches: 50 });
+    expect(outcome).toMatchObject({ status: "ok", result: { truncated: true, scanned: 150 } });
+    if (outcome.status === "ok") {
+      expect(outcome.result.matched).toEqual(Array.from({ length: 50 }, (_, i) => i * 3));
+    }
+  });
+
+  test("a timed-out batch's partial answers cover only the inputs it counts as done", async () => {
+    await settleWorkers(60_000);
+    // Groups of 1, 2 and then 4 inputs: the third holds a match that takes
+    // some 20 ms (every start but the last backtracks through the spaces)
+    // and then a no-match that outlasts the deadline. A match reported while
+    // its group was still running came back as partial.matched [3] with
+    // completed 3: an answer for an input the caller was told was not reached.
+    const inputs = ["x", "x", "x", `${" ".repeat(6_000)}y `, `${" ".repeat(40_000)}y`, "x"];
+    const outcome = await runRegex({
+      op: "testEach",
+      pattern: "\\s+$",
+      inputs,
+      deadlineMs: 300,
+      runawayKey: "testEach-partial-within-count",
+    });
+    expect(outcome.status).toBe("timeout");
+    if (outcome.status !== "timeout") return;
+    const partial = outcome.partial as { matched: number[]; scanned: number };
+    expect(partial.scanned).toBe(outcome.completed ?? -1);
+    expect(partial.matched.filter((i) => i >= partial.scanned)).toEqual([]);
+    expect(await settleWorkers(60_000)).toEqual({ live: 0, runaway: 0 });
+  }, 90_000);
+});
+
+describe("testEach over one text's lines ({ lines })", () => {
+  // Exactly the answers testEach gives the same lines as an array; only the
+  // way they cross to the worker differs.
+  const lines = ["ERR: disk", "", "warn: cpu\r", "fine", "xx err", "warning", "  ", ""];
+  const text = lines.join("\n");
+
+  test.each([
+    ["err", "i"],
+    ["^warn", ""],
+    ["^\\s*$", ""],
+    ["\\r$", ""],
+    ["x+", "g"],
+    ["$", "y"],
+  ] as const)("%p/%p answers as the array does", async (pattern, flags) => {
+    const asArray = await runRegex({ op: "testEach", pattern, flags, inputs: lines });
+    const asText = await runRegex({ op: "testEach", pattern, flags, inputs: { lines: text } });
+    expect(asArray.status).toBe("ok");
+    expect(asText.status).toBe("ok");
+    if (asArray.status !== "ok" || asText.status !== "ok") return;
+    expect(asText.result).toEqual(asArray.result);
+    const native = lines.flatMap((l, i) =>
+      new RegExp(pattern, flags.replace("g", "")).test(l) ? [i] : [],
+    );
+    expect(asText.result.matched).toEqual(native);
+    expect(asText.result.scanned).toBe(lines.length);
+  });
+
+  test("a line over maxItemChars is refused at its index, or skipped as undetermined", async () => {
+    const long = "a".repeat(101);
+    const block = { lines: ["a", "b", long, "a"].join("\n") };
+    const stopped = await runRegex({
+      op: "testEach",
+      pattern: "a",
+      inputs: block,
+      maxItemChars: 100,
+    });
+    expect(stopped).toMatchObject({ status: "input-too-large", index: 2 });
+    if (stopped.status === "input-too-large")
+      expect(stopped.reason).toContain("input 2 is 101 characters");
+    const skipped = await runRegex({
+      op: "testEach",
+      pattern: "a",
+      inputs: block,
+      maxItemChars: 100,
+      onGiveUp: "skip",
+    });
+    expect(skipped).toMatchObject({
+      status: "ok",
+      result: { matched: [0, 3], undetermined: [2], scanned: 4 },
+    });
+  });
+
+  test("its size is counted as the array's: each line and one for its end", async () => {
+    // 11 empty lines: 10 separators, 11 characters as an array counts them.
+    const block = { lines: "\n".repeat(10) };
+    expect(
+      (await runRegex({ op: "testEach", pattern: "a", inputs: block, maxInputChars: 10 })).status,
+    ).toBe("input-too-large");
+    expect(
+      (await runRegex({ op: "testEach", pattern: "a", inputs: block, maxInputChars: 11 })).status,
+    ).toBe("ok");
+  });
+
+  test("a slow no-match is still undetermined, never a miss", async () => {
+    const slow = `${" ".repeat(40_000)}y`;
+    const outcome = await runRegex({
+      op: "testEach",
+      pattern: "\\s+$",
+      inputs: { lines: ["trailing  ", "none", slow, "also  "].join("\n") },
+      onGiveUp: "skip",
+      giveUpMs: 20,
+      deadlineMs: 60_000,
+    });
+    expect(outcome).toMatchObject({
+      status: "ok",
+      result: { matched: [0, 3], undetermined: [2], scanned: 4 },
+    });
+  }, 90_000);
+
+  test("anything but a string of lines is a caller error", async () => {
+    await expect(
+      runRegex({ op: "testEach", pattern: "a", inputs: { lines: 5 } as never }),
+    ).rejects.toThrow(TypeError);
+  });
+});
+
 describe("abort and busy", () => {
   test("a signal aborts before or during a run, and the verdict is undetermined", async () => {
     await settleWorkers(60_000);

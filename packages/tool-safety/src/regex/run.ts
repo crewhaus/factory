@@ -145,11 +145,21 @@ export type SplitRequest = OnePattern & {
   readonly maxOutputChars?: number;
 };
 
+/**
+ * Many inputs given as one text: its `"\n"`-separated lines, in order (a
+ * trailing `"\n"` ends with an empty last line, as `split` gives). Result
+ * indexes are line indexes. One string crosses to the worker in a single
+ * copy, where an array is copied one string at a time: for a million
+ * characters of short lines, 2.5 ms of the caller's thread against 0.3 ms
+ * (measured on an Apple-silicon Mac, Bun 1.3.14).
+ */
+export type LineBlock = { readonly lines: string };
+
 /** One pattern over many inputs (lines, records): which of them match. */
 export type TestEachRequest = OnePattern &
   BatchOptions & {
     readonly op: "testEach";
-    readonly inputs: ReadonlyArray<string>;
+    readonly inputs: ReadonlyArray<string> | LineBlock;
     /** Stop after this many matching inputs and set `truncated`. Default 10 000. */
     readonly maxMatches?: number;
   };
@@ -532,6 +542,28 @@ function option(name: string, value: number | undefined, fallback: number, min: 
   return value;
 }
 
+/** The text of a {@link LineBlock}, or undefined for an array. */
+function lineBlockText(inputs: ReadonlyArray<string> | LineBlock): string | undefined {
+  if (Array.isArray(inputs)) return undefined;
+  const lines = (inputs as { lines?: unknown } | null)?.lines;
+  if (typeof lines !== "string") {
+    throw new TypeError("inputs must be an array of strings or { lines: string }");
+  }
+  return lines;
+}
+
+/** The index of the first line of `text` longer than `max`, or -1. */
+function firstLongLine(text: string, max: number): { index: number; length: number } | undefined {
+  let start = 0;
+  for (let index = 0; ; index++) {
+    const end = text.indexOf("\n", start);
+    const length = (end === -1 ? text.length : end) - start;
+    if (length > max) return { index, length };
+    if (end === -1) return undefined;
+    start = end + 1;
+  }
+}
+
 function sizeOf(inputs: ReadonlyArray<unknown>, batch: boolean): number | string {
   if (!Array.isArray(inputs)) return "inputs must be an array of strings";
   let total = 0;
@@ -651,7 +683,7 @@ async function prepare(request: RegexRequest): Promise<Prepared | RegexOutcome<n
 
   const batchOptions = (
     options: BatchOptions,
-    inputs: ReadonlyArray<string>,
+    inputs: ReadonlyArray<string> | string,
   ): { skip: boolean; maxItemChars: number } | RegexOutcome<never> => {
     const onGiveUp = options.onGiveUp ?? "stop";
     if (onGiveUp !== "stop" && onGiveUp !== "skip") {
@@ -664,12 +696,18 @@ async function prepare(request: RegexRequest): Promise<Prepared | RegexOutcome<n
       0,
     );
     if (onGiveUp === "stop") {
-      const index = inputs.findIndex((s) => s.length > maxItemChars);
-      if (index !== -1) {
+      let long: { index: number; length: number } | undefined;
+      if (typeof inputs === "string") {
+        long = firstLongLine(inputs, maxItemChars);
+      } else {
+        const index = inputs.findIndex((s) => s.length > maxItemChars);
+        if (index !== -1) long = { index, length: (inputs[index] as string).length };
+      }
+      if (long !== undefined) {
         return {
           status: "input-too-large",
-          reason: `input ${index} is ${(inputs[index] as string).length} characters; the limit per input is ${maxItemChars} (onGiveUp "skip" would report it as undetermined instead)`,
-          index,
+          reason: `input ${long.index} is ${long.length} characters; the limit per input is ${maxItemChars} (onGiveUp "skip" would report it as undetermined instead)`,
+          index: long.index,
         };
       }
     }
@@ -734,23 +772,33 @@ async function prepare(request: RegexRequest): Promise<Prepared | RegexOutcome<n
   const maxOutputChars = (value: number | undefined): number =>
     option("maxOutputChars", value, REGEX_RUN_DEFAULTS.maxOutputChars, 0);
 
-  if (request.op === "testEach" || request.op === "replaceEach") {
+  if (request.op === "testEach") {
+    // As many characters as the same lines given as an array: each line and
+    // one for its end.
+    const text = lineBlockText(request.inputs);
+    const inputs = text ?? (request.inputs as ReadonlyArray<string>);
+    const size =
+      text === undefined ? sizeOf(inputs as ReadonlyArray<string>, true) : text.length + 1;
+    if (typeof size === "string") throw new TypeError(size);
+    if (size > maxInputChars) return tooLarge(size);
+    const batch = batchOptions(request, inputs);
+    if ("status" in batch) return batch;
+    return done(
+      {
+        ...withPattern,
+        ...batch,
+        ...(text === undefined ? { inputs } : { lines: text }),
+        maxMatches: maxMatches(request.maxMatches),
+      },
+      "testEach",
+    );
+  }
+  if (request.op === "replaceEach") {
     const size = sizeOf(request.inputs, true);
     if (typeof size === "string") throw new TypeError(size);
     if (size > maxInputChars) return tooLarge(size);
     const batch = batchOptions(request, request.inputs);
     if ("status" in batch) return batch;
-    if (request.op === "testEach") {
-      return done(
-        {
-          ...withPattern,
-          ...batch,
-          inputs: request.inputs,
-          maxMatches: maxMatches(request.maxMatches),
-        },
-        "testEach",
-      );
-    }
     if (typeof request.replacement !== "string") {
       throw new TypeError("replacement must be a string");
     }

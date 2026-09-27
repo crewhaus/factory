@@ -1066,6 +1066,12 @@ const copyMoveSchema = {
  * a virtualenv's interpreter: the copy reaches nothing the source did not). Files are created with `O_EXCL|O_NOFOLLOW`, and a
  * replaced file goes through a temp and a rename. FIFOs, sockets and
  * devices are refused, since opening one to copy it can block for ever.
+ *
+ * Every copied file gets the source's permission bits, replaced or new, as
+ * 0.7.0's `copyFileSync` gave them: a 0600 secret copied over a 0644 file
+ * stays 0600, and a script keeps its execute bits. Keeping the replaced
+ * file's bits (the helper's default, as `cp` does) made the secret readable
+ * by all (0.7.1 review). Set-id and sticky bits are not copied.
  */
 function copyContained(
   source: SafePath,
@@ -1076,6 +1082,7 @@ function copyContained(
   return copyTreeSafe(root, relArg(source), root, relArg(destination), {
     symlinks: "copy-no-new-reach",
     specials: "refuse",
+    fileModes: "source",
     maxEntries: options.maxEntries,
     overwrite: options.overwrite,
     createParents: true,
@@ -1237,6 +1244,39 @@ function moveLinkCaps(maxEntries: number | undefined): { maxLinks: number; maxVi
 
 const MOVE_TOO_LARGE_HINT = "raise maxEntries (up to 500000), or move subdirectories one at a time";
 
+/** Whether `a` and `b` are one directory, however each is spelled. */
+function sameDirectory(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    const x = lstatSync(a);
+    const y = lstatSync(b);
+    return x.isDirectory() && y.isDirectory() && x.dev === y.dev && x.ino === y.ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether `a` and `b` (physical paths, leaves not followed) are ONE
+ * directory entry spelled two ways: `README.md` and `readme.md` on a
+ * filesystem that folds case (APFS and NTFS by default), or two Unicode
+ * normalisations of one name. Same inode in the same directory, and not two
+ * entries of their own there: two hard links to one file are both listed,
+ * and a move between them is an ordinary overwrite.
+ */
+function sameEntryRespelled(a: string, b: string): boolean {
+  try {
+    const x = lstatSync(a);
+    const y = lstatSync(b);
+    if (x.dev !== y.dev || x.ino !== y.ino) return false;
+    if (!sameDirectory(path.dirname(a), path.dirname(b))) return false;
+    const names = new Set(readdirSync(path.dirname(a)));
+    return !(names.has(path.basename(a)) && names.has(path.basename(b)));
+  } catch {
+    return false;
+  }
+}
+
 export const movePath: RegisteredTool = buildTool({
   name: "MovePath",
   operativeArgs: [
@@ -1280,7 +1320,14 @@ export const movePath: RegisteredTool = buildTool({
         reason: `${JSON.stringify(destination.rel)} holds ${JSON.stringify(source.rel)}: moving onto it would delete the source with it; nothing was moved`,
       });
     }
-    const destExisting = peek(dstTop);
+    // One entry spelled two ways, such as a case-only rename (README.md ->
+    // readme.md) where the filesystem folds case, as APFS and NTFS do by
+    // default: the destination is the source, not an entry in the way. 0.7.1
+    // before this said "destination exists", and with overwrite it set the
+    // entry aside, failed ENOENT and put it back under the new spelling
+    // while reporting failure; 0.7.0 deleted it.
+    const respelled = sameEntryRespelled(srcTop, dstTop);
+    const destExisting = respelled ? undefined : peek(dstTop);
     if (destExisting !== undefined && input.overwrite !== true) {
       return json({
         moved: false,
@@ -1290,6 +1337,9 @@ export const movePath: RegisteredTool = buildTool({
         hint: "pass overwrite: true to replace it",
       });
     }
+    const maxEntries = input.maxEntries ?? 50_000;
+    const dstDir = path.dirname(dstTop);
+    const crossing = crossesFilesystem(srcTop, dstDir);
     // A rename moves every link in the tree to a new depth, where a relative
     // target means something else: `a/b/up -> ../..` is the workspace root
     // where it is, and the workspace's parent once `a/b` moves one level up.
@@ -1300,14 +1350,25 @@ export const movePath: RegisteredTool = buildTool({
     // caller's maxEntries raises them for a tree with more links still
     // (a large pnpm node_modules), where fixed caps refused a rename 0.7.0
     // made with no way through.
-    const maxEntries = input.maxEntries ?? 50_000;
-    const relocated = checkRelocatedLinks(root, relArg(source), root, relArg(destination), {
-      outsideLinks: "keep-unchanged",
-      ...moveLinkCaps(input.maxEntries),
-    });
-    if (!relocated.ok) {
-      const hint = relocated.code === "too-large" ? `; ${MOVE_TOO_LARGE_HINT}` : "";
-      return refusal("moved", relocated, `; nothing was moved${hint}`);
+    //
+    // A rename within one directory moves nothing to a new depth: every link
+    // keeps its text and its depth, so it leads where it led. The walk is
+    // skipped there, since it blocks the thread (735 ms for a 67 000-entry
+    // node_modules renamed in place, 0.7.1 review). The one thing such a
+    // rename can change is a dangling link whose text passes through the new
+    // name; creating that name any other way (MakeDirectory, Write) changes
+    // it the same, so the walk was never what guarded it.
+    let outsideLinks: readonly string[] = [];
+    if (crossing || !(respelled || sameDirectory(path.dirname(srcTop), dstDir))) {
+      const relocated = checkRelocatedLinks(root, relArg(source), root, relArg(destination), {
+        outsideLinks: "keep-unchanged",
+        ...moveLinkCaps(input.maxEntries),
+      });
+      if (!relocated.ok) {
+        const hint = relocated.code === "too-large" ? `; ${MOVE_TOO_LARGE_HINT}` : "";
+        return refusal("moved", relocated, `; nothing was moved${hint}`);
+      }
+      outsideLinks = relocated.outsideLinks;
     }
 
     // A rename that will cross a filesystem becomes a copy, and a copy can
@@ -1317,8 +1378,6 @@ export const movePath: RegisteredTool = buildTool({
     // "wouldOverwrite" and then refused mid-move. The plan is made against a
     // name beside the destination when the destination exists, because the
     // real copy goes into a destination the move has set aside.
-    const dstDir = path.dirname(dstTop);
-    const crossing = crossesFilesystem(srcTop, dstDir);
     const copyOptions = (dryRun: boolean) => ({ maxEntries, overwrite: false, dryRun });
     if (crossing) {
       const planTarget =
@@ -1339,7 +1398,7 @@ export const movePath: RegisteredTool = buildTool({
         moved: false,
         wouldOverwrite: destExisting !== undefined,
         ...(crossing ? { crossesFilesystem: true } : {}),
-        ...outsideLinkFields(relocated.outsideLinks),
+        ...outsideLinkFields(outsideLinks),
       });
     }
     const parent = ensureDirContained(root, path.posix.dirname(relArg(destination)));
@@ -1386,6 +1445,9 @@ export const movePath: RegisteredTool = buildTool({
         const restored = putBack();
         return crossRefusal(source, copied, restored);
       }
+      // The copy judged every link from its new place itself: its list is
+      // what this move left behind.
+      outsideLinks = copied.outsideLinks;
       rmSync(srcTop, { recursive: true, force: true });
     }
     if (aside !== undefined) rmSync(aside, { recursive: true, force: true });
@@ -1395,7 +1457,7 @@ export const movePath: RegisteredTool = buildTool({
       dryRun: false,
       moved: true,
       overwrote: destExisting !== undefined,
-      ...outsideLinkFields(relocated.outsideLinks),
+      ...outsideLinkFields(outsideLinks),
     });
   },
 });

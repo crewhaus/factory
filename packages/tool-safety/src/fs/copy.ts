@@ -93,6 +93,15 @@ export type CopyOptions = {
   readonly specials?: "refuse" | "skip";
   /** Replace existing regular files. Directories are merged into either way. */
   readonly overwrite?: boolean;
+  /**
+   * The permission bits (`0o777`; set-id and sticky bits are never copied)
+   * a copied file ends with. `keep-replaced` (the default), as `cp` does: a
+   * replaced file keeps its own, and a new one gets the source's less the
+   * umask. `source`, as `fs.copyFileSync` does: every copied file gets the
+   * source's exactly, so a 0600 secret copied over a 0644 file stays 0600
+   * and a 0755 script copied over a 0644 one keeps its execute bits.
+   */
+  readonly fileModes?: "keep-replaced" | "source";
   /** Create the destination's missing parent directories, each contained. */
   readonly createParents?: boolean;
   /** Most entries under the source. More fails the copy; it is never partial. */
@@ -556,7 +565,7 @@ export function copyTreeSafe(
         : p.kind === "directory"
           ? makeDir(p, parent, dirs, madeDirs)
           : p.kind === "file"
-            ? copyFile(p, parent, dRoot.physical)
+            ? copyFile(p, parent, dRoot.physical, options.fileModes === "source")
             : makeLink(p, parent, links);
     if (failed !== undefined) return afterProgress(failed, i, planned.length);
   }
@@ -712,7 +721,12 @@ function kernelCopy(srcFd: number, destFd: number): number | undefined {
   return fstatSync(destFd).size;
 }
 
-function copyFile(p: Planned, parent: CheckedDir, rootPhysical: string): SafeFsFailure | undefined {
+function copyFile(
+  p: Planned,
+  parent: CheckedDir,
+  rootPhysical: string,
+  sourceModes: boolean,
+): SafeFsFailure | undefined {
   let srcFd: number;
   try {
     srcFd = openSync(p.srcReal, constants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
@@ -727,14 +741,16 @@ function copyFile(p: Planned, parent: CheckedDir, rootPhysical: string): SafeFsF
     if (!now.isFile() || now.dev !== p.stats.dev || now.ino !== p.stats.ino) {
       return fail("changed", p.srcPath, `${quote(p.srcPath)} was replaced during the copy`);
     }
-    let mode: number | undefined;
+    // `fileModes: "source"`: the source's bits, whatever was there and
+    // whatever the umask would strip from a new file.
+    let mode: number | undefined = sourceModes ? now.mode & PRESERVED_MODE_BITS : undefined;
     if (p.replaces) {
       const existing = lstatSync(p.destReal);
       if (!existing.isFile()) {
         return fail("changed", p.destPath, `${quote(p.destPath)} changed during the copy`);
       }
       // As `cp` does, a replaced file keeps its own permission bits.
-      mode = existing.mode & PRESERVED_MODE_BITS;
+      mode ??= existing.mode & PRESERVED_MODE_BITS;
       writing = path.join(path.dirname(p.destReal), tempName(path.basename(p.destReal)));
       try {
         destFd = openSync(writing, EXCLUSIVE, 0o600);

@@ -10,7 +10,9 @@ import {
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 import {
+  type RegexOutcome,
   type RegexRejectCode,
+  type TestEachResult,
   describeRegexOutcome,
   openRegexSession,
   screenUserRegex,
@@ -19,7 +21,7 @@ import { readFileBoundedSync, readOpenedFileSync } from "@crewhaus/tool-safety/s
 import { z } from "zod";
 import { renderEditDiff } from "./diff";
 import { requiredLiterals } from "./literals";
-import { BASE_LINE_CAP, REFUSED_CHAIN, lineCapForChain, repeatChainLength } from "./repeat-chain";
+import { BASE_LINE_CAP, type LineBudget, lineBudgetOf } from "./repeat-chain";
 
 /**
  * Built-in filesystem tools, sandboxed to the process's current working
@@ -361,12 +363,13 @@ const grepSchema = z.object({
 //     input limit changes what is searched (one call per file cost a round
 //     trip each, and a file over the limit ended the whole scan). A line
 //     without any of the literals every match must contain (`./literals`)
-//     is a definite miss and never goes to the worker, which keeps a search
-//     for a word as fast as 0.7.0's;
-//  3. one match attempt cannot be interrupted, so the longest line a pattern
+//     is a definite miss and never goes to the worker (nor does a file
+//     without one), which keeps a search for a word as fast as 0.7.0's. With
+//     no literal, each file's text goes as it is, while the next is read;
+//  3. one match attempt cannot be interrupted, so how long a line a pattern
 //     runs on is chosen from how many of its repeats can split the same text
-//     (`./repeat-chain`), which bounds how long an abandoned worker keeps a
-//     core busy; a pattern with too many is refused;
+//     and from what the line holds (`./repeat-chain`), which bounds how long
+//     an abandoned worker keeps a core busy;
 //  4. an answer the engine gave up on (a slow "no match") is UNDETERMINED,
 //     and so is a line too long to run: the result lists what it could not
 //     search and never says a bare "no matches" when anything went unsearched.
@@ -424,7 +427,7 @@ const REJECTION_LABELS: Partial<Record<RegexRejectCode, string>> = {
  * and say how long a line the rest may run on. Throws the tool's usual
  * "invalid regex pattern" error.
  */
-function screenGrepPattern(pattern: string): { lineCap: number; chain: number } {
+function screenGrepPattern(pattern: string): LineBudget {
   if (pattern.length > GREP_MAX_PATTERN_LENGTH) {
     throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
   }
@@ -438,13 +441,10 @@ function screenGrepPattern(pattern: string): { lineCap: number; chain: number } 
       "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
     );
   }
-  const chain = repeatChainLength(pattern);
-  if (chain >= REFUSED_CHAIN) {
-    throw new Error(
-      `invalid regex pattern: stacked repeats — ${chain} repeats (such as \\w* or .*) can split the same text one after another, which backtracks for minutes on an ordinary line; put something between them that they cannot both match, or use a negated class such as [^,]*`,
-    );
-  }
-  return { lineCap: lineCapForChain(chain), chain };
+  // A chain of repeats is never refused: a line that gives it too many ways
+  // to split is named as not searched, and every other line is searched
+  // (0.7.1 before this refused four or more, `^.*:.*:.*:.*$` included).
+  return lineBudgetOf(pattern);
 }
 
 /**
@@ -560,7 +560,7 @@ function unsearchedNote(u: Unsearched, lineCap: number, chain: number): string {
   if (u.tooLong > 0) {
     const why =
       lineCap < GREP_MAX_LINE_LENGTH
-        ? ` — this pattern has ${chain} repeats that can split the same text one after another, which is too slow to run on longer lines; put something between them that they cannot both match to search up to ${GREP_MAX_LINE_LENGTH}`
+        ? ` — this pattern has ${chain} repeats or optional parts that can split the same text one after another, and these lines give them too many ways to do it; put something between them that they cannot both match (or use a negated class such as [^,]*) to search lines up to ${GREP_MAX_LINE_LENGTH}`
         : "";
     parts.push(
       `\n[grep: ${u.tooLong} line(s) longer than ${lineCap} characters were not searched${why}]`,
@@ -576,20 +576,61 @@ function unsearchedNote(u: Unsearched, lineCap: number, chain: number): string {
   return parts.join("");
 }
 
-/** Lines waiting to go to the regex worker, and where each came from. */
+/**
+ * Lines of one file waiting to go to the regex worker: either a run of
+ * whole lines, as the file's own text from the start of the first to the
+ * end of the last (`text`, split only if one of them is reported), or the
+ * lines a filter let through, each with its number (`lines`, `numbers`).
+ */
+type Segment = {
+  readonly file: string;
+  /** The index of its first line in the batch. */
+  readonly firstIndex: number;
+  /** A run: the number of its first line, 1-based. */
+  readonly firstLine: number;
+  readonly text: string | undefined;
+  lines: string[] | undefined;
+  readonly numbers: number[] | undefined;
+  count: number;
+};
+
+/** Lines waiting to go to the regex worker, in segments. */
 type GrepBatch = {
-  inputs: string[];
-  /** Per input: its index in `files`. */
-  fileOf: number[];
-  /** Per input: its 1-based line number. */
-  lineOf: number[];
-  files: string[];
-  /** Characters plus one per input, as the worker counts them. */
+  segments: Segment[];
+  /** Lines in all segments. */
+  count: number;
+  /** Characters plus one per line, as the worker counts them. */
   chars: number;
 };
 
 function emptyBatch(): GrepBatch {
-  return { inputs: [], fileOf: [], lineOf: [], files: [], chars: 0 };
+  return { segments: [], count: 0, chars: 0 };
+}
+
+/** The segment holding line `index` of a batch, and the line's place in it. */
+function segmentAt(b: GrepBatch, index: number): { seg: Segment; offset: number } {
+  let lo = 0;
+  let hi = b.segments.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if ((b.segments[mid] as Segment).firstIndex <= index) lo = mid;
+    else hi = mid - 1;
+  }
+  const seg = b.segments[lo] as Segment;
+  return { seg, offset: index - seg.firstIndex };
+}
+
+/** `path:line` of line `index` of a batch. */
+function lineRef(b: GrepBatch, index: number): string {
+  const { seg, offset } = segmentAt(b, index);
+  return `${seg.file}:${seg.numbers?.[offset] ?? seg.firstLine + offset}`;
+}
+
+/** The text of line `index` of a batch. */
+function lineText(b: GrepBatch, index: number): string {
+  const { seg, offset } = segmentAt(b, index);
+  seg.lines ??= (seg.text as string).split("\n");
+  return seg.lines[offset] ?? "";
 }
 
 export const grep: RegisteredTool = buildTool({
@@ -615,8 +656,12 @@ export const grep: RegisteredTool = buildTool({
       baseAbs = resolveSafe("Grep", input.path, root);
       baseRel = path.relative(root, baseAbs);
     }
-    const { lineCap, chain } = screenGrepPattern(input.pattern);
+    const { lineCap, chain, admits } = screenGrepPattern(input.pattern);
     const literals = requiredLiterals(input.pattern);
+    /** A line too long to run this pattern on (see `./repeat-chain`). */
+    const tooLong = (line: string): boolean =>
+      line.length > lineCap &&
+      !(line.length <= GREP_MAX_LINE_LENGTH && admits !== undefined && admits(line));
 
     const limits = grepLimits;
     const deadline = limits.now() + limits.deadlineMs;
@@ -638,38 +683,31 @@ export const grep: RegisteredTool = buildTool({
     let hidden = 0;
     const session = openRegexSession();
     let batch = emptyBatch();
-    const where = (b: GrepBatch, index: number): string =>
-      `${b.files[b.fileOf[index] as number]}:${b.lineOf[index]}`;
+    const where = lineRef;
 
     /**
-     * Run the pending lines. True to keep scanning; false when the scan must
-     * stop (the deadline, an abort, a worker that cannot run), with
-     * `unsearched.stopped` saying why and from where.
+     * The batch the worker is running while the caller reads the next one.
+     * Reading files and splitting lines is the caller's work, matching is
+     * the worker's: overlapped, a search with no literal to pre-filter on
+     * costs about what the slower of the two costs, where waiting for each
+     * batch in turn cost the sum (0.7.1 review: 3x 0.7.0's time on a hex
+     * search of 58 MB, which then stopped at the deadline under load). At
+     * most one batch is in flight, and the next is sent only after it is
+     * answered, so each run's deadline is set as it starts, not while it
+     * waits in the session's queue.
      */
-    const flush = async (): Promise<boolean> => {
-      const b = batch;
-      batch = emptyBatch();
-      if (b.inputs.length === 0) return true;
-      const remainingMs = deadline - limits.now();
-      if (remainingMs <= 0) {
-        unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed before ${where(b, 0)} was searched; it and everything after it were not searched`;
-        return false;
-      }
-      const outcome = await session.run({
-        op: "testEach",
-        pattern: input.pattern,
-        inputs: b.inputs,
-        onGiveUp: "skip",
-        maxItemChars: lineCap,
-        maxInputChars: limits.workerInputChars,
-        maxMatches: b.inputs.length,
-        deadlineMs: remainingMs,
-        ...(limits.giveUpMs !== undefined ? { giveUpMs: limits.giveUpMs } : {}),
-        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-        ...(ctx?.runContext?.sessionId !== undefined
-          ? { runawayKey: ctx.runContext.sessionId }
-          : {}),
-      });
+    let inFlight: { batch: GrepBatch; outcome: Promise<RegexOutcome<TestEachResult>> } | undefined;
+
+    /**
+     * Take in the answers for the batch in flight. True to keep scanning;
+     * false when the scan must stop (the deadline, an abort, a worker that
+     * cannot run), with `unsearched.stopped` saying why and from where.
+     */
+    const settle = async (): Promise<boolean> => {
+      if (inFlight === undefined) return true;
+      const b = inFlight.batch;
+      const outcome = await inFlight.outcome;
+      inFlight = undefined;
       const answered = outcome.status === "ok" ? outcome.result : undefined;
       const partial =
         answered ??
@@ -677,7 +715,7 @@ export const grep: RegisteredTool = buildTool({
           ? outcome.partial
           : undefined);
       for (const index of partial?.matched ?? []) {
-        hits.push(`${where(b, index)}:${b.inputs[index] ?? ""}`);
+        hits.push(`${where(b, index)}:${lineText(b, index)}`);
       }
       for (const index of partial?.undetermined ?? []) {
         unsearched.gaveUp++;
@@ -691,27 +729,72 @@ export const grep: RegisteredTool = buildTool({
         // worker is told; if it ever does, these lines are named as
         // unsearched and the scan goes on, rather than ending at them.
         unsearched.refused = {
-          lines: (unsearched.refused?.lines ?? 0) + b.inputs.length,
+          lines: (unsearched.refused?.lines ?? 0) + b.count,
           reason: outcome.reason,
         };
         return true;
       }
       // Anything else ends the scan: the deadline, an abort, a worker that
-      // could not run. The lines not answered and every file after them
-      // were not searched, and the note says so.
+      // could not run. The lines not answered, the batch read after them
+      // and every file after that were not searched, and the note says so.
       const first =
         outcome.status === "timeout"
           ? (outcome.completed ?? outcome.partial?.scanned ?? 0)
           : outcome.status === "gave-up"
             ? (outcome.partial?.scanned ?? 0)
             : 0;
-      const from = where(b, Math.min(first, b.inputs.length - 1));
+      const from = where(b, Math.min(first, b.count - 1));
       unsearched.stopped =
         outcome.status === "timeout"
           ? `the ${limits.deadlineMs} ms deadline passed while searching ${from}; it and everything after it were not searched`
           : `${describeRegexOutcome(outcome)} (at ${from}); it and everything after it were not searched`;
       return false;
     };
+
+    /**
+     * Send the pending lines to the worker, once the batch before them is
+     * answered. True to keep scanning; false when the scan must stop.
+     */
+    const flush = async (): Promise<boolean> => {
+      const b = batch;
+      batch = emptyBatch();
+      if (!(await settle())) return false;
+      if (b.count === 0) return true;
+      const remainingMs = deadline - limits.now();
+      if (remainingMs <= 0) {
+        unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed before ${where(b, 0)} was searched; it and everything after it were not searched`;
+        return false;
+      }
+      inFlight = {
+        batch: b,
+        outcome: session.run({
+          op: "testEach",
+          pattern: input.pattern,
+          // One string crosses to the worker in a single copy; an array of
+          // this many short strings cost more of the caller's thread than
+          // reading the files did.
+          inputs: {
+            lines: b.segments
+              .map((seg) => seg.text ?? (seg.lines as string[]).join("\n"))
+              .join("\n"),
+          },
+          onGiveUp: "skip",
+          maxItemChars: GREP_MAX_LINE_LENGTH,
+          maxInputChars: limits.workerInputChars,
+          maxMatches: b.count,
+          deadlineMs: remainingMs,
+          ...(limits.giveUpMs !== undefined ? { giveUpMs: limits.giveUpMs } : {}),
+          ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+          ...(ctx?.runContext?.sessionId !== undefined
+            ? { runawayKey: ctx.runContext.sessionId }
+            : {}),
+        }),
+      };
+      return true;
+    };
+
+    /** Send what is pending and wait for every answer. */
+    const finish = async (): Promise<boolean> => (await flush()) && (await settle());
 
     try {
       scan: for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
@@ -725,7 +808,7 @@ export const grep: RegisteredTool = buildTool({
         if (deadline - limits.now() <= 0) {
           // Lines read but not yet searched are named by flush(), which
           // finds the deadline passed; with none pending, this file is.
-          if (await flush()) {
+          if (await finish()) {
             unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed; ${display} and the files after it were not searched`;
           }
           break;
@@ -742,31 +825,102 @@ export const grep: RegisteredTool = buildTool({
           continue;
         }
         if (read.truncated) {
-          if (await flush()) {
+          if (await finish()) {
             unsearched.stopped = `the ${GREP_MAX_TOTAL_BYTES / (1024 * 1024)} MiB scan budget ran out at ${display}; it and the files after it were not searched`;
           }
           break;
         }
         scannedBytes += read.bytes.length;
-        const lines = read.text.split("\n");
+        const text = read.text;
+        if (literals === undefined && admits === undefined) {
+          // Every line goes to the worker unless it is too long, so the
+          // file's text goes as it is, in runs of whole lines, and is split
+          // there: splitting it here and joining it again cost this thread
+          // more than the match costs the worker.
+          let start = 0;
+          let number = 1;
+          let runStart = 0;
+          let runEnd = 0;
+          let runFirst = 1;
+          let runCount = 0;
+          const endRun = (): void => {
+            if (runCount === 0) return;
+            batch.segments.push({
+              file: display,
+              firstIndex: batch.count,
+              firstLine: runFirst,
+              text: text.slice(runStart, runEnd),
+              lines: undefined,
+              numbers: undefined,
+              count: runCount,
+            });
+            batch.count += runCount;
+            runCount = 0;
+          };
+          for (;;) {
+            const nl = text.indexOf("\n", start);
+            const end = nl === -1 ? text.length : nl;
+            if (end - start > lineCap) {
+              endRun();
+              unsearched.tooLong++;
+            } else {
+              if (batch.chars + (end - start) + 1 > limits.batchChars) {
+                endRun();
+                if (!(await flush())) break scan;
+              }
+              if (runCount === 0) {
+                runStart = start;
+                runFirst = number;
+              }
+              runCount++;
+              runEnd = end;
+              batch.chars += end - start + 1;
+            }
+            if (nl === -1) break;
+            start = nl + 1;
+            number++;
+          }
+          endRun();
+          continue;
+        }
+        // A file holding none of the pattern's required literals cannot
+        // match anywhere: a definite answer, with no line split out.
+        if (literals !== undefined && !literals.some((l) => text.includes(l))) continue;
+        const lines = text.split("\n");
+        let seg: Segment | undefined;
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i] as string;
           // A line holding none of the pattern's required literals cannot
           // match: a definite answer, however long the line, with no worker.
           if (literals !== undefined && !literals.some((l) => line.includes(l))) continue;
-          if (line.length > lineCap) {
+          if (tooLong(line)) {
             unsearched.tooLong++;
             continue;
           }
-          if (batch.chars + line.length + 1 > limits.batchChars && !(await flush())) break scan;
-          if (batch.files[batch.files.length - 1] !== display) batch.files.push(display);
-          batch.inputs.push(line);
-          batch.fileOf.push(batch.files.length - 1);
-          batch.lineOf.push(i + 1);
+          if (batch.chars + line.length + 1 > limits.batchChars) {
+            if (!(await flush())) break scan;
+            seg = undefined;
+          }
+          if (seg === undefined) {
+            seg = {
+              file: display,
+              firstIndex: batch.count,
+              firstLine: 0,
+              text: undefined,
+              lines: [],
+              numbers: [],
+              count: 0,
+            };
+            batch.segments.push(seg);
+          }
+          (seg.lines as string[]).push(line);
+          (seg.numbers as number[]).push(i + 1);
+          seg.count++;
+          batch.count++;
           batch.chars += line.length + 1;
         }
       }
-      if (unsearched.stopped === undefined) await flush();
+      if (unsearched.stopped === undefined) await finish();
     } finally {
       session.close();
     }
