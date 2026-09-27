@@ -14,8 +14,13 @@ key you trust. Put the publisher's public key, as a `.pem` file, in:
 ```
 
 or list `.pem` files (or directories of them) in `CREWHAUS_PLUGIN_TRUST_ANCHORS`,
-separated the way `PATH` is. A listed path that cannot be read, or a file that
-is not an Ed25519 public key, stops the boot and names the file.
+separated the way `PATH` is. A listed path that cannot be read, a FIFO or
+other special file, a file over 64 KiB, or a file that is not an Ed25519
+public key stops the boot and names the file.
+
+`crewhaus plugins install --trust-anchor <pem>` verifies with that key too,
+but a boot reads only the places above: install says so when only the
+flag's key verifies a manifest.
 
 ## What a signature covers
 
@@ -82,8 +87,9 @@ A manifest may say which crewhaus versions it supports:
 ```
 
 A plugin whose range leaves out the running version is refused before it is
-verified or imported, and so is a range crewhaus cannot read. A manifest with
-no range loads on any version. A canary (`0.7.1-canary.2`) is checked as its
+verified or imported, and so is a range crewhaus cannot read. Ranges are read
+the way npm reads them (`~>0.7.0` is `~0.7.0`, and an empty side of `||`
+matches any version). A manifest with no range loads on any version. A canary (`0.7.1-canary.2`) is checked as its
 release (`0.7.1`).
 
 ## Tool names a plugin cannot use
