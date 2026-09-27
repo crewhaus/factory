@@ -31,7 +31,7 @@ import {
   write,
 } from "./index";
 import { requiredLiterals } from "./literals";
-import { REFUSED_CHAIN, lineCapForChain, repeatChainLength } from "./repeat-chain";
+import { lineBudgetOf, repeatChainLength, staticLineCap } from "./repeat-chain";
 
 let tmp: string;
 let originalCwd: string;
@@ -758,35 +758,68 @@ describe("Grep keeps 0.7.0's pace with no literal to pre-filter on (0.7.1 review
 });
 
 describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 review)", () => {
-  test("a pattern whose repeats split the same text one after another is refused before it runs", async () => {
-    await writeFile(path.join(tmp, "a.txt"), `${"a".repeat(9_000)}\n`);
+  test("a line a chained pattern could take minutes on is named, and leaves no worker spinning", async () => {
+    // Six repeats that can split one run of word characters: on the
+    // 9 000-character line that is C(9 006, 6) ways from each of 9 000
+    // places. 0.7.1 first ran it and left two workers spinning for minutes
+    // (the session's next Grep answered "busy"), then refused the pattern
+    // outright. Now the line is not run, and the short one is.
+    await writeFile(path.join(tmp, "a.txt"), `${"a".repeat(9_000)} zzz\nab!\n`);
     await writeFile(path.join(tmp, "b.txt"), "has NEEDLE\n");
     const ctx = { runContext: { sessionId: "grep-runaway" } } as never;
     const before = regexWorkerCounts().runaway;
-    // 0.7.1 before this fix ran it: two calls left two workers spinning for
-    // minutes, and the session's next Grep answered "busy".
     for (let i = 0; i < 2; i++) {
-      await expect(grep.execute({ pattern: "\\w*\\w*\\w*\\w*\\w*\\w*!|zzz" }, ctx)).rejects.toThrow(
-        /invalid regex pattern: stacked repeats — 6 repeats/,
+      const result = String(await grep.execute({ pattern: "\\w*\\w*\\w*\\w*\\w*\\w*!|zzz" }, ctx));
+      expect(result.split("\n")[0]).toBe("a.txt:2:ab!");
+      expect(result).toContain(
+        "[grep: 1 line(s) longer than 64 characters were not searched — this pattern has 6 repeats or optional parts that can split the same text one after another, and these lines give them too many ways to do it",
       );
     }
     expect(regexWorkerCounts().runaway).toBe(before);
     expect(String(await grep.execute({ pattern: "NEEDLE" }, ctx))).toBe("b.txt:1:has NEEDLE");
   });
 
-  test("a chained pattern runs only on lines short enough to finish, and names the rest", async () => {
-    // `z\w*\w*!` links two repeats (chain 2): a 9 000-character line is not
-    // run at all, a short one is, and the note says why and how to widen it.
+  test("a chained pattern runs on a long line where it has few ways to split it", async () => {
+    // `z\w*\w*!` can begin only at a `z`: on a 6 000-character line with
+    // one, its two repeats split the rest some 18 million ways, about
+    // 20 ms. From every place on a line of word characters, `\w*\w*!`
+    // would take minutes, so that line is not run. Line 1 is a no-match
+    // that takes real time, so the give-up threshold and the deadline are
+    // raised: a loaded machine must not turn "run" into "gave up".
+    _setGrepLimitsForTest({ giveUpMs: 30_000, deadlineMs: 60_000 });
     await writeFile(
       path.join(tmp, "f.txt"),
-      `z${"a".repeat(9_000)}\nzab!\nz${"a".repeat(1_998)}!\n`,
+      `z${"a".repeat(6_000)}\nzab!\nz${"a".repeat(2_500)}!\n`,
     );
-    const result = String(await grep.execute({ pattern: "z\\w*\\w*!" }));
-    const lines = result.split("\n");
-    // Line 3 is exactly 2 000 characters: at the cap, so it is run.
-    expect(lines.slice(0, 2)).toEqual(["f.txt:2:zab!", `f.txt:3:z${"a".repeat(1_998)}!`]);
-    expect(result).toContain(
-      "[grep: 1 line(s) longer than 2000 characters were not searched — this pattern has 2 repeats that can split the same text one after another",
+    expect(String(await grep.execute({ pattern: "z\\w*\\w*!" }))).toBe(
+      `f.txt:2:zab!\nf.txt:3:z${"a".repeat(2_500)}!`,
+    );
+    await writeFile(path.join(tmp, "f.txt"), `${"a".repeat(2_500)}!?\nab!\n`);
+    const unanchored = String(await grep.execute({ pattern: "\\w*\\w*!\\?|q" }));
+    expect(unanchored.split("\n")[0]).toBe("no matches in the lines searched");
+    expect(unanchored).toContain(
+      "[grep: 1 line(s) longer than 2000 characters were not searched — this pattern has 2 repeats",
+    );
+  });
+
+  test("a chain with a character between its repeats runs on a long line holding few of it", async () => {
+    // 0.7.1 before this refused `^.*:.*:.*:.*$` outright (four repeats)
+    // and ran `<h2.*>.*</h2>` only on lines up to 2 000 characters; 0.7.0
+    // answered both on these lines in milliseconds.
+    const log = `2026-09-26 12:34:56 INFO server: listening on :8080 ${"x".repeat(5_000)}`;
+    const html = `<ul>${"<li>item</li>".repeat(400)}</ul><h2 class="t">Title</h2>`;
+    const colons = ":".repeat(3_000);
+    await writeFile(path.join(tmp, "app.log"), `${log}\n${colons}\n`);
+    await writeFile(path.join(tmp, "page.html"), `${html}\n`);
+    const logHits = String(await grep.execute({ pattern: "^.*:.*:.*:.*$" }));
+    expect(logHits.split("\n")[0]).toBe(`app.log:1:${log}`);
+    // A line of nothing but colons splits billions of ways: named, not run.
+    expect(logHits).toContain(
+      "[grep: 1 line(s) longer than 420 characters were not searched — this pattern has 4 repeats",
+    );
+    expect(String(await grep.execute({ pattern: "<h2.*>.*</h2>" }))).toBe(`page.html:1:${html}`);
+    expect(String(await grep.execute({ pattern: ".*/.*/.*/.*\\.ts", path: "." }))).toBe(
+      "no matches",
     );
   });
 
@@ -796,12 +829,121 @@ describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 rev
     expect(String(await grep.execute({ pattern: "needle" }))).toBe("min.js:2:needle here");
   });
 
-  test("the line cap follows the chain length, and a chain of four is refused", () => {
-    expect(lineCapForChain(0)).toBe(10_000);
-    expect(lineCapForChain(1)).toBe(10_000);
-    expect(lineCapForChain(2)).toBe(2_000);
-    expect(lineCapForChain(3)).toBe(400);
-    expect(REFUSED_CHAIN).toBe(4);
+  test("the line cap follows the chain and whether every alternative is anchored", () => {
+    expect([0, 1, 2, 3, 4, 5, 6].map((c) => staticLineCap(c, false))).toEqual([
+      10_000, 10_000, 2_000, 420, 171, 95, 64,
+    ]);
+    // Anchored, a match attempt begins at one place, not at every one.
+    expect([2, 3, 4, 5].map((c) => staticLineCap(c, true))).toEqual([10_000, 2_000, 420, 171]);
+    expect(lineBudgetOf("^.*:.*:.*:.*$").lineCap).toBe(420);
+    expect(lineBudgetOf("^a.*b.*c|x.*y.*z").lineCap).toBe(2_000);
+    expect(lineBudgetOf("^a.*b.*c|^x.*y.*z").lineCap).toBe(10_000);
+    expect(lineBudgetOf("a.*b.*c.*d").lineCap).toBe(420);
+    // A chain is never refused, however long: its cap only shrinks.
+    expect(lineBudgetOf(`${"a*".repeat(40)}!`).lineCap).toBeGreaterThan(0);
+  });
+
+  test.each([
+    // pattern, a line it may run on, a line of the same length it may not
+    ["^.*:.*:.*:.*$", `a:b:c:${"x".repeat(4_000)}`, ":".repeat(4_006)],
+    [".*,.*,.*,.*,x", `${"f,".repeat(10)}${"v".repeat(200)}`, ",".repeat(220)],
+    ["<h2.*>.*</h2>", `<h2>${"<p>t</p>".repeat(750)}`, "<h2>".repeat(1_501)],
+    ["\\b\\d+.\\d+.\\d+.\\d+\\b", `ip 10.0.0.1 ${"z".repeat(600)}`, "1".repeat(612)],
+  ] as const)("%p runs on a long line only where it splits few ways", (pattern, cheap, costly) => {
+    const budget = lineBudgetOf(pattern);
+    expect(cheap.length).toBeGreaterThan(budget.lineCap);
+    expect(costly.length).toBe(cheap.length);
+    expect(budget.admits?.(cheap)).toBe(true);
+    expect(budget.admits?.(costly)).toBe(false);
+  });
+
+  test("a set it cannot count exactly is taken to be every character", () => {
+    // `\s` holds non-ASCII spaces: every character of a run `\s+` can take
+    // counts as a place it can hand over, so a long run of them is not run.
+    expect(lineBudgetOf("\\s+x?\\s+!").admits?.(" ".repeat(5_000))).toBe(false);
+    // A chain between two classes of CJK: not ASCII, so the same.
+    const cjk = lineBudgetOf("[\\u4e00-\\u9fff]+[\\u4e00-\\u9fff]+!");
+    expect(cjk.admits?.("\u4e2d".repeat(5_000))).toBe(false);
+  });
+
+  test("a line is costed run by run: an attempt never reads past what the pattern can take", () => {
+    // `\S+@\S+\.\S+` cannot take a space, so a match attempt stays inside
+    // one word: prose with many addresses splits few ways in each. Costed as
+    // one run, the line was not searched (0.7.1 first: 316 of 704 hits on a
+    // site's built HTML; now all 704).
+    const budget = lineBudgetOf("\\S+@\\S+\\.\\S+");
+    const prose = "mail a@b.io or c.d@e.org now ".repeat(200);
+    const word = "a@b.io".repeat(prose.length / 6 + 1).slice(0, prose.length);
+    expect(prose.length).toBeGreaterThan(budget.lineCap);
+    expect(budget.admits?.(prose)).toBe(true);
+    expect(budget.admits?.(word)).toBe(false);
+    // The same holds where the pattern's own sets are not all ASCII.
+    expect(lineBudgetOf("\\s+x?\\s+!").admits?.("word ".repeat(1_000))).toBe(true);
+    // A pattern that can take any character has one run: the whole line.
+    expect(lineBudgetOf(".*@.*\\..*!").admits?.(prose)).toBe(false);
+  });
+
+  test("a line where a lookahead's search could begin anywhere is not run past the cap", () => {
+    // The lookahead is tried at every place before `x` is, and on a line of
+    // word characters each try splits the rest three ways (600 characters
+    // took 6.6 s). 0.7.1's first count read the pattern as beginning only at
+    // an `x`, found none, and ran a 5 000-character line (hours).
+    const budget = lineBudgetOf("(?=\\w*\\w*\\w*!)x");
+    const line = "a".repeat(5_000);
+    expect(budget).toMatchObject({ chain: 3, lineCap: 420 });
+    expect(budget.admits?.(line) ?? false).toBe(false);
+    // A lookaround with no choice inside is a few steps wherever it is tried.
+    expect(lineBudgetOf("(?!\\d)z\\w*\\w*!").admits?.(`z${"a".repeat(5_000)}`)).toBe(true);
+  });
+
+  test("a run between two repeats is counted by where it occurs, not by its first character", () => {
+    // `.*` can stop before any `foo`: a line of `foo` splits a thousand
+    // ways, one with a couple of them only a few.
+    const budget = lineBudgetOf(".*foo.*bar");
+    const cheap = `${"f".repeat(300)} foo ${"x".repeat(2_000)} foo ${"f".repeat(691)}`;
+    const costly = "foo".repeat(1_000).padEnd(cheap.length, "x");
+    expect(cheap.length).toBe(costly.length);
+    expect(cheap.length).toBeGreaterThan(budget.lineCap);
+    expect(budget.admits?.(cheap)).toBe(true);
+    expect(budget.admits?.(costly)).toBe(false);
+  });
+
+  test("a longer line is run only within a tenth of the budget, counted per chain step", () => {
+    // `^.*:.*:.*:.*$` begins once and hands over at a `:`: on a 5 000-
+    // character line with k colons that is C(k + 3, 3) splits × 5 001 × 4
+    // steps against a tenth of C(2 003, 3), so 32 colons pass and 33 do not.
+    // A tenth, because a no-match slower than the worker's 100 ms give-up
+    // is undetermined anyway: running the line would only spend the deadline.
+    const budget = lineBudgetOf("^.*:.*:.*:.*$");
+    const line = (colons: number): string => ":".repeat(colons).padEnd(5_000, "x");
+    expect(budget.admits?.(line(32))).toBe(true);
+    expect(budget.admits?.(line(33))).toBe(false);
+    // Where no match can begin at all, nothing is costly: `<h2` never occurs.
+    expect(lineBudgetOf("<h2.*>.*</h2>").admits?.(">".repeat(5_000))).toBe(true);
+  });
+
+  test("a pattern with a lookbehind gets a shorter line, as the engine runs it slower", () => {
+    // JavaScriptCore runs a lookbehind pattern in its interpreter: 5.5
+    // times as long a step as `\w*\w*\w*!` on the same line.
+    expect(staticLineCap(2, false, 8)).toBeLessThan(staticLineCap(2, false));
+    expect(lineBudgetOf("(?<=b)\\w*\\w*!").lineCap).toBe(staticLineCap(2, false, 8));
+    expect(lineBudgetOf("(?=b)\\w*\\w*!").lineCap).toBe(staticLineCap(2, false));
+  });
+
+  test("a run of repeats split by a repeated pair of characters is bounded like any chain", async () => {
+    // 0.7.1's first count linked two repeats only through ONE character
+    // every element between them could take, so `.*ab.*ab.*x` was no chain
+    // at all and ran on lines up to 10 000 characters: 13 s on 1 000
+    // characters of `abab…`, hours on 10 000. The line is now named.
+    await writeFile(path.join(tmp, "f.txt"), `${"ab".repeat(500)}\nab ab x\n`);
+    const ctx = { runContext: { sessionId: "grep-separator-chain" } } as never;
+    const before = regexWorkerCounts().runaway;
+    const result = String(await grep.execute({ pattern: ".*ab.*ab.*x" }, ctx));
+    expect(result.split("\n")[0]).toBe("f.txt:2:ab ab x");
+    expect(result).toContain(
+      "[grep: 1 line(s) longer than 420 characters were not searched — this pattern has 3 repeats",
+    );
+    expect(regexWorkerCounts().runaway).toBe(before);
   });
 });
 
@@ -837,6 +979,30 @@ describe("repeatChainLength", () => {
     ["a.*b.*c.*d", 3],
     ["\\d+\\d+\\d+x", 3],
     ["\\w*\\w*\\w*\\w*\\w*\\w*!|zzz", 6],
+    // Two repeats link across a run of several characters when each is one
+    // both can take: `.*` can stop before any `foo` (0.7.1 counted one).
+    [".*foo.*bar", 2],
+    [".*ab.*ab.*x", 3],
+    ["\\w*foo-\\w*!", 1],
+    // `:` is one `[a-z:]*` can take but `[a-z]*` cannot: the split is fixed.
+    ["[a-z:]*:[a-z]*!", 1],
+    // A bounded repeat is a choice point too.
+    ["\\w{0,30}\\w{0,30}\\w{0,30}!", 3],
+    ["a?a?a?aaa!", 3],
+    ["\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}", 1],
+    ["colou?r", 1],
+    // So is an alternation whose branches can begin alike, and only that.
+    ["(?:a|ab)(?:b|bc)x", 2],
+    ["(?:a|ab)(?:c|bc)x", 1],
+    ["(?:a|a)(?:a|a)(?:a|a)!", 3],
+    ["(foo|bar)(baz|qux)!", 0],
+    // A lookaround re-run after each choice before it ends a chain.
+    ["a+(?=[^:]+x)", 2],
+    ["(?=\\w*\\w*\\w*!)x", 3],
+    // A backreference compares the capture's length after each choice.
+    ["(a+)\\1x", 2],
+    ["(?<n>a+)\\k<n>x", 2],
+    ["(ab)\\1x", 0],
   ] as const)("%p has chain %p", (pattern, chain) => {
     expect(repeatChainLength(pattern)).toBe(chain);
   });

@@ -21,7 +21,7 @@ import { readFileBoundedSync, readOpenedFileSync } from "@crewhaus/tool-safety/s
 import { z } from "zod";
 import { renderEditDiff } from "./diff";
 import { requiredLiterals } from "./literals";
-import { BASE_LINE_CAP, REFUSED_CHAIN, lineCapForChain, repeatChainLength } from "./repeat-chain";
+import { BASE_LINE_CAP, type LineBudget, lineBudgetOf } from "./repeat-chain";
 
 /**
  * Built-in filesystem tools, sandboxed to the process's current working
@@ -366,10 +366,10 @@ const grepSchema = z.object({
 //     is a definite miss and never goes to the worker (nor does a file
 //     without one), which keeps a search for a word as fast as 0.7.0's. With
 //     no literal, each file's text goes as it is, while the next is read;
-//  3. one match attempt cannot be interrupted, so the longest line a pattern
+//  3. one match attempt cannot be interrupted, so how long a line a pattern
 //     runs on is chosen from how many of its repeats can split the same text
-//     (`./repeat-chain`), which bounds how long an abandoned worker keeps a
-//     core busy; a pattern with too many is refused;
+//     and from what the line holds (`./repeat-chain`), which bounds how long
+//     an abandoned worker keeps a core busy;
 //  4. an answer the engine gave up on (a slow "no match") is UNDETERMINED,
 //     and so is a line too long to run: the result lists what it could not
 //     search and never says a bare "no matches" when anything went unsearched.
@@ -427,7 +427,7 @@ const REJECTION_LABELS: Partial<Record<RegexRejectCode, string>> = {
  * and say how long a line the rest may run on. Throws the tool's usual
  * "invalid regex pattern" error.
  */
-function screenGrepPattern(pattern: string): { lineCap: number; chain: number } {
+function screenGrepPattern(pattern: string): LineBudget {
   if (pattern.length > GREP_MAX_PATTERN_LENGTH) {
     throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
   }
@@ -441,13 +441,10 @@ function screenGrepPattern(pattern: string): { lineCap: number; chain: number } 
       "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
     );
   }
-  const chain = repeatChainLength(pattern);
-  if (chain >= REFUSED_CHAIN) {
-    throw new Error(
-      `invalid regex pattern: stacked repeats — ${chain} repeats (such as \\w* or .*) can split the same text one after another, which backtracks for minutes on an ordinary line; put something between them that they cannot both match, or use a negated class such as [^,]*`,
-    );
-  }
-  return { lineCap: lineCapForChain(chain), chain };
+  // A chain of repeats is never refused: a line that gives it too many ways
+  // to split is named as not searched, and every other line is searched
+  // (0.7.1 before this refused four or more, `^.*:.*:.*:.*$` included).
+  return lineBudgetOf(pattern);
 }
 
 /**
@@ -563,7 +560,7 @@ function unsearchedNote(u: Unsearched, lineCap: number, chain: number): string {
   if (u.tooLong > 0) {
     const why =
       lineCap < GREP_MAX_LINE_LENGTH
-        ? ` — this pattern has ${chain} repeats that can split the same text one after another, which is too slow to run on longer lines; put something between them that they cannot both match to search up to ${GREP_MAX_LINE_LENGTH}`
+        ? ` — this pattern has ${chain} repeats or optional parts that can split the same text one after another, and these lines give them too many ways to do it; put something between them that they cannot both match (or use a negated class such as [^,]*) to search lines up to ${GREP_MAX_LINE_LENGTH}`
         : "";
     parts.push(
       `\n[grep: ${u.tooLong} line(s) longer than ${lineCap} characters were not searched${why}]`,
@@ -659,8 +656,12 @@ export const grep: RegisteredTool = buildTool({
       baseAbs = resolveSafe("Grep", input.path, root);
       baseRel = path.relative(root, baseAbs);
     }
-    const { lineCap, chain } = screenGrepPattern(input.pattern);
+    const { lineCap, chain, admits } = screenGrepPattern(input.pattern);
     const literals = requiredLiterals(input.pattern);
+    /** A line too long to run this pattern on (see `./repeat-chain`). */
+    const tooLong = (line: string): boolean =>
+      line.length > lineCap &&
+      !(line.length <= GREP_MAX_LINE_LENGTH && admits !== undefined && admits(line));
 
     const limits = grepLimits;
     const deadline = limits.now() + limits.deadlineMs;
@@ -831,7 +832,7 @@ export const grep: RegisteredTool = buildTool({
         }
         scannedBytes += read.bytes.length;
         const text = read.text;
-        if (literals === undefined) {
+        if (literals === undefined && admits === undefined) {
           // Every line goes to the worker unless it is too long, so the
           // file's text goes as it is, in runs of whole lines, and is split
           // there: splitting it here and joining it again cost this thread
@@ -892,7 +893,7 @@ export const grep: RegisteredTool = buildTool({
           // A line holding none of the pattern's required literals cannot
           // match: a definite answer, however long the line, with no worker.
           if (literals !== undefined && !literals.some((l) => line.includes(l))) continue;
-          if (line.length > lineCap) {
+          if (tooLong(line)) {
             unsearched.tooLong++;
             continue;
           }
