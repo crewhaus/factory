@@ -43,6 +43,7 @@ import {
   waitForOutput,
   waitForPort,
 } from "./index";
+import { unspecifiedDial } from "./lib/addr";
 import { _setPlatform, searchPath } from "./lib/which";
 
 let originalCwd: string;
@@ -1063,6 +1064,86 @@ describe("WaitForPort", () => {
       });
       expect(closed.attempts).toBeGreaterThan(1);
       expect(lookups).toEqual(["db.internal"]);
+    });
+
+    test("a listed name that does not resolve yet is waited for, then pinned", async () => {
+      // A compose service's name exists only once its container does: the
+      // wait must keep looking it up, not give up on the first empty answer
+      // (regression review). Once it answers, that address is dialled on.
+      registerProcConfig({ wait_for_port_hosts: ["db"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 3 ? ["127.0.0.1"] : [];
+      });
+      const out = await call(waitForPort, {
+        host: "db",
+        port,
+        timeoutMs: 5_000,
+        intervalMs: 20,
+      });
+      expect({ satisfied: out.satisfied, attempts: out.attempts, note: out.note }).toEqual({
+        satisfied: true,
+        attempts: 3,
+        note: undefined,
+      });
+      expect(lookups).toEqual(["db", "db", "db"]);
+    });
+
+    test("a listed name that never resolves is closed: a closed wait is met, an open one is not", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["gone.invalid"] });
+      const closed = await call(waitForPort, {
+        host: "gone.invalid",
+        port,
+        state: "closed",
+        timeoutMs: 2_000,
+      });
+      expect({ satisfied: closed.satisfied, state: closed.state }).toEqual({
+        satisfied: true,
+        state: "closed",
+      });
+      expect(String(closed.note)).toContain("did not resolve");
+      const open = await call(waitForPort, {
+        host: "gone.invalid",
+        port,
+        timeoutMs: 200,
+        intervalMs: 50,
+      });
+      expect({ satisfied: open.satisfied, reason: open.reason }).toEqual({
+        satisfied: false,
+        reason: "deadline",
+      });
+      expect(open.attempts).toBeGreaterThan(1);
+      expect(String(open.note)).toContain("did not resolve");
+    });
+
+    test("a listed name that later resolves to link-local is refused mid-wait", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["flaky.example"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 2 ? ["169.254.169.254"] : [];
+      });
+      const out = await call(waitForPort, {
+        host: "flaky.example",
+        port: 80,
+        timeoutMs: 2_000,
+        intervalMs: 20,
+      });
+      expect(String(out)).toContain("link-local");
+    });
+
+    test("0.0.0.0 and :: — what a dev server prints — are probed as loopback", async () => {
+      const out = await call(waitForPort, { host: "0.0.0.0", port, timeoutMs: 3_000 });
+      expect(out.satisfied).toBe(true);
+      expect(unspecifiedDial("0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("::")).toBe("::1");
+      expect(unspecifiedDial("0:0:0:0:0:0:0:0")).toBe("::1");
+      expect(unspecifiedDial("::ffff:0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("10.0.0.1")).toBeNull();
+      expect(lookups).toEqual([]);
     });
 
     test("a listed name that resolves to link-local is refused; a listed literal is probed", async () => {

@@ -241,33 +241,54 @@ export function _setDnsLookup(fn: DnsLookup | undefined): void {
   dnsLookup = fn ?? systemLookup;
 }
 
+/**
+ * True for the unspecified address in any spelling (0.0.0.0, ::, an
+ * IPv4-mapped 0.0.0.0). A server that binds it prints it ("running on
+ * http://0.0.0.0:8000"), and dialling it reaches only this machine on Linux
+ * and macOS, so WaitForPort treats it as loopback and dials loopback itself,
+ * which also works where connecting to 0.0.0.0 does not (Windows).
+ */
+export function unspecifiedDial(address: string): string | null {
+  const v4 = normalizeIpv4(address);
+  if (v4 !== null) return v4 === "0.0.0.0" ? "127.0.0.1" : null;
+  const groups = parseIpv6(address);
+  if (groups === null) return null;
+  if (groups.every((g) => g === 0)) return "::1";
+  const mapped = groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff;
+  return mapped && groups[6] === 0 && groups[7] === 0 ? "127.0.0.1" : null;
+}
+
 export type PortTarget =
   | { readonly ok: true; readonly dial: string }
+  /** A listed name, resolved at probe time by {@link resolveListedHost}. */
+  | { readonly ok: true; readonly resolve: string }
   | { readonly ok: false; readonly message: string };
 
 /**
  * Decide what one WaitForPort call dials for `host`, or why it may not.
+ * Nothing here touches DNS.
  *
  * - `localhost`, and any IP literal that is loopback in any spelling, is
- *   allowed with no configuration and no DNS (a literal is dialled in its
- *   canonical form, so `0x7f.1` dials 127.0.0.1).
+ *   allowed with no configuration (a literal is dialled in its canonical
+ *   form, so `0x7f.1` dials 127.0.0.1). So is the unspecified address
+ *   (0.0.0.0, ::), dialled as 127.0.0.1 / ::1.
  * - Any other host must be listed in `allowed` (the operator's
  *   `tool_config.proc.wait_for_port_hosts`), and is refused BEFORE any DNS
  *   query, so an unlisted name is not a way to send one either.
- * - A listed NAME is resolved once, and the address is what is dialled for
- *   every probe, so a resolver that answers differently later cannot move the
- *   probe. A name that resolves to a link-local address (the cloud metadata
- *   service) is refused unless that address itself is listed.
+ * - A listed literal is dialled as written; a listed NAME is resolved at probe
+ *   time (`resolveListedHost`).
  */
-export async function portTarget(
+export function portTarget(
   host: string,
   allowed: ReadonlyArray<string>,
   configKey: string,
-): Promise<PortTarget> {
+): PortTarget {
   const lower = host.toLowerCase();
   if (lower === "localhost" || lower === "localhost.") return { ok: true, dial: "localhost" };
   const literal = canonicalIp(host);
   if (literal !== null && isLoopbackIp(host)) return { ok: true, dial: literal };
+  const unspecified = unspecifiedDial(host);
+  if (unspecified !== null) return { ok: true, dial: unspecified };
   const listed = allowed.includes(lower) || (literal !== null && allowed.includes(literal));
   if (!listed) {
     return {
@@ -276,6 +297,30 @@ export async function portTarget(
     };
   }
   if (literal !== null) return { ok: true, dial: literal };
+  return { ok: true, resolve: host };
+}
+
+export type ListedResolution =
+  | { readonly ok: true; readonly dial: string }
+  /** No address yet: a name that does not resolve accepts no connections. */
+  | { readonly ok: true; readonly unresolved: true }
+  | { readonly ok: false; readonly message: string };
+
+/**
+ * Resolve a listed name for one probe. An empty answer, or a failed lookup,
+ * is "not accepting connections" for that probe, not a refusal: a compose
+ * service's name exists only once its container does, and a torn-down one
+ * stops resolving — which is exactly "closed". Every answer is checked: a
+ * name that resolves to a link-local address (the cloud metadata service) is
+ * refused unless that address itself is listed. The caller dials the address
+ * returned, and keeps dialling it for the rest of the call, so a resolver
+ * that answers differently later cannot move the probe.
+ */
+export async function resolveListedHost(
+  host: string,
+  allowed: ReadonlyArray<string>,
+  configKey: string,
+): Promise<ListedResolution> {
   let answers: ReadonlyArray<string>;
   try {
     answers = await dnsLookup(host);
@@ -283,9 +328,7 @@ export async function portTarget(
     answers = [];
   }
   const first = answers[0];
-  if (first === undefined) {
-    return { ok: false, message: `[WaitForPort error] "${host}" does not resolve.` };
-  }
+  if (first === undefined) return { ok: true, unresolved: true };
   for (const address of answers) {
     const canonical = canonicalIp(address) ?? address.toLowerCase();
     if (isLinkLocalIp(address) && !allowed.includes(canonical)) {

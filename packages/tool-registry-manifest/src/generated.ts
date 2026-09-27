@@ -8176,7 +8176,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "waitForPort",
     name: "WaitForPort",
     description:
-      "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline. It probes loopback (localhost, 127.0.0.1, ::1); any other host is refused unless the operator lists it in tool_config.proc.wait_for_port_hosts.",
+      "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline. It probes loopback (localhost, 127.0.0.1, ::1; 0.0.0.0 and :: are probed as loopback); any other host is refused unless the operator lists it in tool_config.proc.wait_for_port_hosts, and a listed name that does not resolve yet counts as not accepting connections.",
     readOnly: true,
     destructive: false,
     scope: "external",

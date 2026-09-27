@@ -30,7 +30,7 @@ import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog"
 import { checkEnvReveal } from "@crewhaus/tool-safety/env";
 import { describeRegexOutcome, openRegexSession } from "@crewhaus/tool-safety/regex";
 import { z } from "zod";
-import { portTarget } from "./lib/addr";
+import { portTarget, resolveListedHost } from "./lib/addr";
 import { type BackoffPolicy, backoffDelayMs, totalBackoffMs } from "./lib/backoff";
 import { ENV_REVEAL_KEY, PORT_HOSTS_KEY, portHostsFor, revealAllowFor } from "./lib/config";
 import { FALLBACK_PATH, buildSpawnEnv, inspectEnv } from "./lib/env";
@@ -694,7 +694,7 @@ export const waitForPort: RegisteredTool = buildTool({
   name: "WaitForPort",
   operativeArgs: [{ field: "host", kind: "recipient", default: "127.0.0.1" }],
   description:
-    "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline. It probes loopback (localhost, 127.0.0.1, ::1); any other host is refused unless the operator lists it in tool_config.proc.wait_for_port_hosts.",
+    "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline. It probes loopback (localhost, 127.0.0.1, ::1; 0.0.0.0 and :: are probed as loopback); any other host is refused unless the operator lists it in tool_config.proc.wait_for_port_hosts, and a listed name that does not resolve yet counts as not accepting connections.",
   inputSchema: z.object({
     port: z.number().int().min(1).max(65_535),
     host: z.string().max(255).optional().describe("default 127.0.0.1"),
@@ -715,7 +715,8 @@ export const waitForPort: RegisteredTool = buildTool({
     }
     // Loopback, or a host the operator listed — decided before any DNS or
     // socket, and dialled by the address checked (C144).
-    const target = await portTarget(host, portHostsFor(ctx?.toolConfig), PORT_HOSTS_KEY);
+    const allowed = portHostsFor(ctx?.toolConfig);
+    const target = portTarget(host, allowed, PORT_HOSTS_KEY);
     if (!target.ok) return target.message;
     const want = input.state ?? "open";
     const interval = input.intervalMs ?? DEFAULT_POLL_MS;
@@ -723,10 +724,26 @@ export const waitForPort: RegisteredTool = buildTool({
     const deadline = startedAt + input.timeoutMs;
     let attempts = 0;
     let open = false;
+    // A listed name is looked up at each probe until it answers, then that
+    // address is dialled for the rest of the call. Until then the host
+    // accepts no connections: "not open yet", or already "closed".
+    let dial: string | undefined = "dial" in target ? target.dial : undefined;
+    const unresolvedNote = (): Record<string, string> =>
+      dial === undefined
+        ? { note: `"${host}" did not resolve; a name with no address accepts no connections` }
+        : {};
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       attempts++;
-      open = await probePort(target.dial, input.port, Math.max(1, Math.min(1_000, remaining)));
+      if (dial === undefined && "resolve" in target) {
+        const resolved = await resolveListedHost(target.resolve, allowed, PORT_HOSTS_KEY);
+        if (!resolved.ok) return resolved.message;
+        if ("dial" in resolved) dial = resolved.dial;
+      }
+      open =
+        dial === undefined
+          ? false
+          : await probePort(dial, input.port, Math.max(1, Math.min(1_000, remaining)));
       if ((want === "open") === open) {
         return json({
           satisfied: true,
@@ -735,6 +752,7 @@ export const waitForPort: RegisteredTool = buildTool({
           port: input.port,
           attempts,
           waitedMs: Date.now() - startedAt,
+          ...unresolvedNote(),
         });
       }
       if (ctx?.signal?.aborted === true) break;
@@ -751,6 +769,7 @@ export const waitForPort: RegisteredTool = buildTool({
       attempts,
       waitedMs: Date.now() - startedAt,
       reason: ctx?.signal?.aborted === true ? "aborted" : "deadline",
+      ...unresolvedNote(),
     });
   },
 });
