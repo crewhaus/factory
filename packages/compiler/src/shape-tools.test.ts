@@ -101,6 +101,21 @@ describe("0.7.0 tools and categories compile on every host shape", () => {
       /nodes\.plan\.tools: unknown tool "jsonQury" — Did you mean "jsonQuery"\?/,
     );
   });
+
+  // security-12#14's sibling: 0.7.0 compiled this to `import {  } from
+  // "undefined"` and `defaultCatalog.register(undefined)`.
+  test("an Object.prototype name is an unknown tool, not an empty import", () => {
+    for (const yaml of [cli("[read, constructor]"), graph("[read, __proto__]")]) {
+      let message = "";
+      try {
+        compile(yaml);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toMatch(/tools: unknown tool "(constructor|__proto__)"/);
+      expect(message).not.toContain("undefined");
+    }
+  });
 });
 
 describe("toolSitesOf", () => {

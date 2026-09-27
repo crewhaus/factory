@@ -86,6 +86,45 @@ describe("checkBuiltinTool", () => {
     );
   });
 
+  // security-12#14's sibling: 0.7.0's emitters indexed their tool map with
+  // the spec's name, so `tools: [read, constructor]` found Object and compiled
+  // to `import {  } from "undefined"` on ten shapes. Every lookup now reads
+  // own keys; this holds it for every Object.prototype name on every shape:
+  // a bundle that runs tools refuses the name as an unknown tool, and the
+  // edge leaves it unwired (the compiler has already refused it there).
+  test("an Object.prototype name is an unknown tool on every shape, never a wired one", () => {
+    const inherited = Object.getOwnPropertyNames(Object.prototype);
+    expect(inherited).toContain("constructor");
+    expect(inherited.length).toBeGreaterThanOrEqual(12);
+    const wrong: string[] = [];
+    let refused = 0;
+    let leftOut = 0;
+    for (const shape of SHAPES) {
+      const edge = SHAPE_TOOL_PROFILES[shape].runtime === "edge";
+      // A builtin the shape does wire, beside the name under test.
+      const known = edge ? "todoWrite" : "jsonQuery";
+      for (const name of inherited) {
+        if (registeredToolName(name) !== undefined) wrong.push(`${name} has a registered name`);
+        try {
+          const { unwired, sites } = resolveBuiltinTools(shape, [{ tools: [known, name] }]);
+          if (edge && unwired.includes(name) && sites[0]?.length === 1) leftOut++;
+          else wrong.push(`${shape} wired ${name}`);
+        } catch (err) {
+          const message = err instanceof BuiltinToolError ? err.message : String(err);
+          if (!edge && message.startsWith(`unknown tool "${name}"`)) refused++;
+          else wrong.push(`${shape}: ${message}`);
+        }
+      }
+    }
+    expect(wrong).toEqual([]);
+    const edgeShapes = SHAPES.filter((s) => SHAPE_TOOL_PROFILES[s].runtime === "edge").length;
+    expect(edgeShapes).toBe(1);
+    expect({ refused, leftOut }).toEqual({
+      refused: (SHAPES.length - edgeShapes) * inherited.length,
+      leftOut: edgeShapes * inherited.length,
+    });
+  }, 30_000);
+
   test("an MCP name is told where MCP tools come from", () => {
     expect(unknownToolMessage("mcp__gh__search")).toContain("mcp_servers");
   });
