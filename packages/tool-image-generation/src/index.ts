@@ -188,8 +188,10 @@ export function resolveOpenAIBaseUrl(
   try {
     url = new URL(raw);
   } catch {
+    // Not quoted: text that does not parse cannot be told apart from a
+    // credential in it (a query, a userinfo, a password holding "/").
     throw new ImageGenerationError(
-      `the OpenAI base URL "${raw}" is not an absolute URL. Write it as https://host/v1.`,
+      "tool_config.imageGenerate.openaiBaseUrl is not an absolute URL (it is not quoted here, since a URL can carry a credential). Write it as https://host/v1.",
     );
   }
   if (url.username !== "" || url.password !== "") {

@@ -70,6 +70,31 @@ describe("resolveOpenAIBaseUrl", () => {
     }
   });
 
+  // Attacker review (C008 residual): the parse-failure message quoted the
+  // whole value, so a base URL that did not parse (a bad port) echoed a
+  // credential in its query; a model-pool block reaches this per call.
+  test("a base URL that does not parse is refused without quoting any of it", () => {
+    const token = ["sk", "proj", "SECRET", "123"].join("-");
+    for (const openaiBaseUrl of [
+      `https://proxy.example.com:99999/v1?api_key=${token}`,
+      `https://user:${token}@exa mple.com/v1`,
+      `${token}`,
+      `https://[${token}]/v1`,
+    ]) {
+      let message = "";
+      try {
+        resolveOpenAIBaseUrl({ openaiBaseUrl }, {});
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(`${openaiBaseUrl}: ${message.includes("is not an absolute URL")}`).toBe(
+        `${openaiBaseUrl}: true`,
+      );
+      expect(message).not.toContain(token);
+      expect(message).not.toContain("SECRET");
+    }
+  });
+
   test("userinfo in the URL is refused", () => {
     expect(() =>
       resolveOpenAIBaseUrl({ openaiBaseUrl: "https://u:p@api.openai.com/v1" }, {}),
