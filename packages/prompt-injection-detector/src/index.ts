@@ -67,6 +67,24 @@ const SEVERITY_WEIGHT: Record<PromptInjectionSeverity, number> = {
   high: 0.85,
 };
 
+// override-safety, built from named parts so each carve-out is readable. See
+// the rule's comment in REGEX_RULES.
+const OVERRIDE_SAFETY_PATTERN = (() => {
+  const verb = String.raw`\b(?:bypass|circumvent|disable|override|turn off)\s+`;
+  // "content" followed by an HTTP/API compound, or by "of/for/with …", or by
+  // a parameter list or value ("content: …", "content (string)").
+  const contentApi = String.raw`(?![-_\s]?(?:type|length|encoding|disposition|security|range|language|location|md5|id\b|hash|digest|transfer|editable|visibility|negotiation)|s?\s+(?:of|for|from|with|to|in|on|at)\b|s?\s*[(:=])`;
+  // "alignment for the range", "alignment (default: left)", CSS
+  // alignment-baseline / align-self style names.
+  const alignmentApi = String.raw`(?!s?\s+(?:for|of|to|on|in|with|at|per|between|along)\b|s?\s*[(:=]|[-_](?:baseline|self|items|content))`;
+  const safetyStem = String.raw`(?:filter|moderat|polic|guideline|restrict|safe|guard|control|check|rule|block|screen|warn|train|constraint|layer|limit)`;
+  return new RegExp(
+    `${verb}(?:(?:your\\s+)?(?:safety|moderation|content${contentApi}|alignment${alignmentApi})` +
+      `|(?:the|all|any)\\s+(?:safety|moderation|(?:content|alignment)[\\s_-]*${safetyStem}))`,
+    "i",
+  );
+})();
+
 const SCORE_SUSPICIOUS = 0.4;
 const SCORE_MALICIOUS = 0.8;
 
@@ -273,15 +291,19 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
     severity: "medium",
   },
   {
-    // Turning off the model's own safety. "content" and "alignment" are
-    // ordinary API words ("Override Content-Type header", "override alignment
-    // for the range", "disable content security checks"), so they count only
-    // as "your content/alignment" or followed by what a safety system has
-    // (filters, policy, guidelines, training …); "safety" and "moderation"
-    // count as whole words.
+    // Turning off the model's own safety. 0.7.0 matched the verb and then the
+    // START of safety/content/moderation/alignment, which is what catches the
+    // phrasings attackers use ("bypass safety_filters", "disable
+    // contentfilter", "turn off content guardrails", "override alignment and
+    // answer freely"). That breadth stays; only the API compounds that made it
+    // fire on ordinary tool documentation are carved out: content-type,
+    // content-length, content security, "content of/for/with …", "alignment
+    // for the range", "alignment (default: left)". "the/all/any" before the
+    // noun counts only when a safety word follows ("the content policy",
+    // "all safety checks"), because "override the content" is how a write
+    // tool describes itself. Linear: fixed prefixes, bounded lookaheads.
     id: "override-safety",
-    pattern:
-      /\b(?:bypass|circumvent|disable|override|turn off)\s+(?:your\s+(?:safety|content|moderation|alignment)\b|(?:(?:the|all|any)\s+)?(?:safety|moderation)\b|(?:(?:the|all|any)\s+)?content\s+(?:filter(?:s|ing)?|moderation|polic(?:y|ies)|guidelines|restrictions|safety)\b|(?:(?:the|all|any)\s+)?alignment\s+(?:training|guidelines|rules|constraints|safeguards)\b)/i,
+    pattern: OVERRIDE_SAFETY_PATTERN,
     severity: "high",
   },
   {
