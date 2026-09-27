@@ -104,6 +104,7 @@ import {
   filterJobs,
   jobView,
   ledgerBlockedBy,
+  parseIsoInstant,
   probeLedger,
   sortJobs,
 } from "./lib/jobs";
@@ -817,7 +818,9 @@ export const harnessJobStatus: RegisteredTool = buildTool({
       .string()
       .min(1)
       .optional()
-      .describe("only jobs enqueued at or after this ISO 8601 instant"),
+      .describe(
+        "only jobs enqueued at or after this ISO 8601 instant; one without Z or an offset is read as UTC",
+      ),
     limit: z
       .number()
       .int()
@@ -848,11 +851,12 @@ export const harnessJobStatus: RegisteredTool = buildTool({
       // Both spellings: the manager records whichever path it was handed.
       harnessDirs = spellings(safe.value);
     }
-    if (input.since !== undefined && Number.isNaN(Date.parse(input.since))) {
+    const since = input.since === undefined ? undefined : parseIsoInstant(input.since);
+    if (input.since !== undefined && since === undefined) {
       return refusal(
         tool,
         "bad-input",
-        `"${renderPath(input.since)}" is not an ISO 8601 instant — filtering on it would have silently kept every record`,
+        `"${renderPath(input.since)}" is not an ISO 8601 instant (2026-09-26, 2026-09-26T10:00:00Z or 2026-09-26T10:00:00+02:00) — filtering on it would have silently kept every record`,
         base,
       );
     }
@@ -873,6 +877,15 @@ export const harnessJobStatus: RegisteredTool = buildTool({
       status: "ok",
       // Three different questions: how many records the fold produced, how
       // many survived the filter, how many are shown.
+      ...(since !== undefined
+        ? {
+            // The instant actually filtered on, so a reader can check it.
+            sinceUtc: new Date(since.ms).toISOString(),
+            ...(since.offsetGiven
+              ? {}
+              : { sinceNote: "since had no Z or offset, so it was read as UTC" }),
+          }
+        : {}),
       recordsInLedger: records.length,
       matched: ordered.length,
       shown: Math.min(ordered.length, limit),

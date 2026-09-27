@@ -621,6 +621,23 @@ test("HarnessJobStatus refuses a ledger it cannot open instead of reporting no j
   expect(String(r["reason"])).toContain("empty list");
 });
 
+test("HarnessJobStatus says which instant it filtered on, and that an offset-less since is UTC", async () => {
+  ledger();
+  const utc = await call(harnessJobStatus, { since: "2026-09-02T00:00:00" });
+  expect({ sinceUtc: utc["sinceUtc"], note: utc["sinceNote"] }).toEqual({
+    sinceUtc: "2026-09-02T00:00:00.000Z",
+    note: "since had no Z or offset, so it was read as UTC",
+  });
+  const offset = await call(harnessJobStatus, { since: "2026-09-02T02:00:00+02:00" });
+  expect({ sinceUtc: offset["sinceUtc"], note: offset["sinceNote"] }).toEqual({
+    sinceUtc: "2026-09-02T00:00:00.000Z",
+    note: undefined,
+  });
+  // A form Date.parse would read in the host's zone is not an instant here.
+  const local = await call(harnessJobStatus, { since: "Sep 2 2026 00:00" });
+  expect(local["status"]).toBe("refused");
+});
+
 test("HarnessJobStatus refuses a `since` that is not a timestamp rather than ignoring it", async () => {
   ledger();
   const r = await call(harnessJobStatus, { since: "yesterday" });

@@ -15,7 +15,7 @@ import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import type { BundleFreshness } from "@crewhaus/harness-supervisor";
 import { classify, spawnEnv } from "./lib/bundle";
-import { countByState, filterJobs, probeLedger, sortJobs } from "./lib/jobs";
+import { countByState, filterJobs, parseIsoInstant, probeLedger, sortJobs } from "./lib/jobs";
 import { mutationBlockedBy, probeRegistryFile } from "./lib/registry";
 import { probeName } from "./lib/result";
 import { jobLedgerPath, registryFilePath, resolveHangarRoot } from "./lib/roots";
@@ -318,4 +318,65 @@ test("spawnEnv forwards a minimal base plus the names it was given, and nothing 
   expect(forwarded).toEqual(["WANTED"]);
   expect(env["ANTHROPIC_API_KEY"]).toBeUndefined();
   expect(env["NPM_TOKEN"]).toBeUndefined();
+});
+
+/**
+ * An offset-less `since` was read with Date.parse, which reads it in the
+ * HOST's zone: the same filter kept a 12:00Z job on a UTC host and dropped it
+ * in Los Angeles (C189's defect class, attacker review). It is read as UTC
+ * now, on every host. Bun honours a TZ change at runtime.
+ */
+test("filterJobs reads an offset-less since the same on every host, as UTC", () => {
+  const records = [record({ jobId: "noon", enqueuedAt: "2026-09-26T12:00:00Z" })];
+  const savedTz = process.env["TZ"];
+  const kept: Record<string, string[]> = {};
+  try {
+    for (const tz of ["UTC", "America/Los_Angeles", "Asia/Tokyo"]) {
+      process.env["TZ"] = tz;
+      kept[`${tz} 10:00`] = filterJobs(records, { sinceIso: "2026-09-26T10:00:00" }).kept.map(
+        (r) => r.jobId,
+      );
+      kept[`${tz} 13:00`] = filterJobs(records, { sinceIso: "2026-09-26T13:00:00" }).kept.map(
+        (r) => r.jobId,
+      );
+    }
+  } finally {
+    if (savedTz === undefined) Reflect.deleteProperty(process.env, "TZ");
+    else process.env["TZ"] = savedTz;
+  }
+  expect(kept).toEqual({
+    "UTC 10:00": ["noon"],
+    "UTC 13:00": [],
+    "America/Los_Angeles 10:00": ["noon"],
+    "America/Los_Angeles 13:00": [],
+    "Asia/Tokyo 10:00": ["noon"],
+    "Asia/Tokyo 13:00": [],
+  });
+});
+
+test("parseIsoInstant: ISO forms only, offsets honoured, nothing read host-local", () => {
+  const iso = (t: string) => {
+    const p = parseIsoInstant(t);
+    return p === undefined ? undefined : [new Date(p.ms).toISOString(), p.offsetGiven];
+  };
+  expect(iso("2026-09-26T10:00:00Z")).toEqual(["2026-09-26T10:00:00.000Z", true]);
+  expect(iso("2026-09-26T10:00:00+02:00")).toEqual(["2026-09-26T08:00:00.000Z", true]);
+  expect(iso("2026-09-26T10:00-0530")).toEqual(["2026-09-26T15:30:00.000Z", true]);
+  expect(iso("2026-09-26T10:00:00.25")).toEqual(["2026-09-26T10:00:00.250Z", false]);
+  expect(iso("2026-09-26 10:00:00")).toEqual(["2026-09-26T10:00:00.000Z", false]);
+  expect(iso("2026-09-26")).toEqual(["2026-09-26T00:00:00.000Z", false]);
+  expect(iso("2024-02-29")).toEqual(["2024-02-29T00:00:00.000Z", false]);
+  // Forms Date.parse accepts and reads in the host's zone, and impossible dates.
+  for (const bad of [
+    "Sep 26 2026 10:00",
+    "2026/09/26",
+    "yesterday",
+    "2026-02-30",
+    "2025-02-29",
+    "2026-09-26T24:00:00Z",
+    "2026-13-01",
+    "2026-09-26T10:00:00+25:00",
+  ]) {
+    expect({ bad, parsed: parseIsoInstant(bad) }).toEqual({ bad, parsed: undefined });
+  }
 });
