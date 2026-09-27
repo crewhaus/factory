@@ -140,12 +140,15 @@ describe("a compiled cli bundle whose plugin reuses a first-party tool name (ext
     ]);
     expect(stderr).not.toContain("already registered\n    at");
     expect(stderr).not.toContain("ToolCatalogError");
-    expect(stderr).toContain(
-      '[plugins] tool "FocusRead" already registered — plugin contribution skipped',
-    );
-    expect(stderr).toContain(
-      '[plugins] tool "Task" already registered — plugin contribution skipped',
-    );
+    // The plugin loader refuses a name the runtime registers itself before
+    // the tool reaches the catalog (@crewhaus/plugin-loader's reserved-name
+    // check); the registration-order skip behind it is covered by the
+    // target-cli codegen test.
+    for (const name of ["FocusRead", "Task"]) {
+      expect(stderr).toContain(
+        `[plugins] plugin "clash" tool "${name}" was left out: the crewhaus runtime registers a tool of that name itself.`,
+      );
+    }
     expect(exitCode).toBe(0);
   }, 120_000);
 });
@@ -224,9 +227,11 @@ async function loopClashHome(port: number): Promise<{ home: string; env: Record<
 
 /** What a run printed about the clash, and what the model was offered. */
 function expectLoopToolsKept(output: string, offered: Offered | undefined): void {
+  // Refused by the plugin loader's reserved-name check, before the run loop's
+  // own skip (covered by runtime-core's list-tools test) would see it.
   for (const name of ["ListTools", "Consult"]) {
     expect(output).toContain(
-      `[plugins] tool "${name}" is the run loop's own — plugin contribution skipped`,
+      `[plugins] plugin "clash" tool "${name}" was left out: the crewhaus runtime registers a tool of that name itself.`,
     );
   }
   const names = (offered ?? []).map((t) => t.name);
