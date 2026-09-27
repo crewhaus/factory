@@ -200,9 +200,12 @@ A leaf joined onto a contained directory is spelled with `joinRel(dir.rel, "pack
 
 The temp needs a place beside the destination, so `writeFileSafe` refuses a file in a directory it cannot write, with `permission-denied`, even when the file itself is writable. This is by design: that write could only be done in place, which is neither atomic nor safe from a link swapped in at the leaf.
 
-### Appending: `appendContained(root, path, data, { createParents?, create?, mode? })`
+### Appending: `appendContained(root, path, data, { createParents?, create?, mode?, leafSymlink?, hardLinks? })`
 
 This appends in place: to a JSONL index that every run adds to, or to touch a file. A rewrite through a temp would cost O(n) and race other appenders. A link or special file at the leaf is refused. An existing file is opened without `O_CREAT`, with `O_NOFOLLOW|O_NONBLOCK`, and must be the very file that was checked, in the directory that was checked. A missing one is created with `O_EXCL`. Nothing is written until those checks pass; a file created in the wrong place is removed there, and one that already existed is left alone. One `write` is atomic against other appenders, so keep a record to one append.
+
+- `leafSymlink: "follow-contained"` appends to where a link at the leaf leads, when that is inside the root, as `writeFileSafe` can.
+- `hardLinks: "refuse"` refuses an existing file with more than one name. An append in place changes the file under every name, and the others need not be inside the root; a temp-and-rename write replaces the name instead, so it has no such problem. The default is `"allow"`, which is 0.7.0's behaviour.
 
 ### New files at exact names: `createExclusive(root, path, { mode?, createParents? })`
 

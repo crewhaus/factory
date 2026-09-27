@@ -521,6 +521,34 @@ describe.if(posix)("appendContained", () => {
     expect(readFileSync(join(f.outside, "victim.log"), "utf8")).toBe("victim");
   });
 
+  test("with leafSymlink follow-contained, a link inside the root is appended through, one out is not", () => {
+    mkdirSync(join(f.ws, "real-logs"), { recursive: true });
+    writeFileSync(join(f.ws, "real-logs", "kept.log"), "a");
+    symlinkSync(join(f.ws, "real-logs", "kept.log"), join(f.ws, "follow.log"));
+    writeFileSync(join(f.outside, "victim2.log"), "victim");
+    symlinkSync(join(f.outside, "victim2.log"), join(f.ws, "follow-out.log"));
+    const opts = { leafSymlink: "follow-contained" } as const;
+    expect(appendContained(f.ws, "follow.log", "b", opts)).toMatchObject({ ok: true, size: 2 });
+    expect(readFileSync(join(f.ws, "real-logs", "kept.log"), "utf8")).toBe("ab");
+    expect(appendContained(f.ws, "follow-out.log", "INJECTED", opts)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+    });
+    expect(readFileSync(join(f.outside, "victim2.log"), "utf8")).toBe("victim");
+  });
+
+  test("with hardLinks refuse, a file with a second name is not appended to (net attacker review)", () => {
+    writeFileSync(join(f.outside, "victim3.log"), "victim");
+    linkSync(join(f.outside, "victim3.log"), join(f.ws, "hard.log"));
+    const refused = appendContained(f.ws, "hard.log", "INJECTED", { hardLinks: "refuse" });
+    expect(refused).toMatchObject({ ok: false, code: "escapes-root" });
+    expect(refused.ok ? "" : refused.reason).toContain("hard link");
+    expect(readFileSync(join(f.outside, "victim3.log"), "utf8")).toBe("victim");
+    // The default is unchanged: an append in place reaches every name.
+    expect(appendContained(f.ws, "hard.log", "+", {})).toMatchObject({ ok: true });
+    expect(readFileSync(join(f.outside, "victim3.log"), "utf8")).toBe("victim+");
+  });
+
   test("a FIFO is refused, not blocked on", () => {
     mkfifo(join(f.ws, "append.fifo"));
     expect(appendContained(f.ws, "append.fifo", "x")).toMatchObject({

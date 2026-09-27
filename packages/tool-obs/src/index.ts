@@ -39,20 +39,11 @@
  * string rather than an exception.
  */
 import { Buffer } from "node:buffer";
-import {
-  appendFileSync,
-  closeSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readSync,
-  readdirSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { closeSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { appendContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { budgetCheck as budgetCheckFn } from "./lib/budget";
 import { costReport as costReportFn } from "./lib/cost";
@@ -101,7 +92,7 @@ import {
   safeUrlLabel,
   startDeadline,
 } from "./net";
-import { type SafePath, ToolPermissionError, resolveSafe, toPosix } from "./paths";
+import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot } from "./paths";
 
 export {
   ObsCorruptBodyError,
@@ -807,25 +798,26 @@ export const incidentBundle: RegisteredTool = buildTool({
     if (bytes > MAX_BUNDLE_BYTES) {
       return `the bundle would be ${bytes} bytes, over the ${MAX_BUNDLE_BYTES} limit — lower maxEntries or maxPayloadChars`;
     }
-    try {
-      // The parent is created because `reports/incident.json` is the obvious
-      // thing to ask for and failing on it teaches nothing. It is created
-      // through the already-validated real path, so the directory that appears
-      // is inside the workspace by the same check the file is.
-      const parent = path.dirname(out.real);
-      if (parent !== out.real) mkdirSync(parent, { recursive: true });
-      // "wx" is an atomic create-or-fail, so the no-clobber promise is kept by
-      // the filesystem rather than by a stat that something could race.
-      writeFileSync(out.real, text, {
-        encoding: "utf8",
-        flag: input.overwrite === true ? "w" : "wx",
-      });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") {
+    // The parent is created because `reports/incident.json` is the obvious
+    // thing to ask for and failing on it teaches nothing; each directory is
+    // created contained. The bytes go to an exclusive temp that is renamed
+    // into place, so without overwrite an existing name is refused by the
+    // filesystem, and with it a hard link at the name is replaced, never
+    // written through to the file's other names. A link at the name is
+    // followed only while it stays in the workspace, and a FIFO, device or
+    // directory there is refused rather than opened (net attacker review:
+    // `writeFileSync` blocked the event loop on a FIFO, and wrote through a
+    // hard link to a file outside the workspace).
+    const written = writeFileSafe(workspaceRoot(), input.out, text, {
+      overwrite: input.overwrite === true,
+      createParents: true,
+      leafSymlink: "follow-contained",
+    });
+    if (!written.ok) {
+      if (written.code === "exists") {
         return `"${renderPath(input.out)}" already exists — pass overwrite: true to replace it`;
       }
-      return `"${renderPath(input.out)}" could not be written${code !== undefined ? ` (${code})` : ""}`;
+      return `${written.reason} — nothing was written`;
     }
     return json({
       wrote: toPosix(out.rel),
@@ -1102,19 +1094,21 @@ export const emitTraceEvent: RegisteredTool = buildTool({
     // something else.
     if (input.dryRun === true) return json({ dryRun: true, ...report, line: text });
 
-    try {
-      if (size === undefined) {
-        const parent = path.dirname(target.real);
-        if (parent !== target.real) mkdirSync(parent, { recursive: true });
-      }
-      // Mode and append semantics are `@crewhaus/event-log`'s: owner-only, and
-      // one O_APPEND write per line so a runtime appending to the same log
-      // concurrently cannot end up interleaved with this one.
-      appendFileSync(target.real, text, { mode: 0o600 });
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      return `"${shown}" could not be appended to${code !== undefined ? ` (${code})` : ""}`;
-    }
+    // Mode and append semantics are `@crewhaus/event-log`'s: owner-only, and
+    // one O_APPEND write per line so a runtime appending to the same log
+    // concurrently cannot end up interleaved with this one. The open never
+    // follows a link out of the workspace (a contained one is followed, as
+    // before), refuses a FIFO or any other special file, and refuses a file
+    // with a second name: an append in place would change it under every
+    // name, one of which may be outside the workspace (net attacker review).
+    const appended = appendContained(workspaceRoot(), rel, text, {
+      createParents: size === undefined,
+      create: input.create === true,
+      mode: 0o600,
+      leafSymlink: "follow-contained",
+      hardLinks: "refuse",
+    });
+    if (!appended.ok) return `${appended.reason} — "${shown}" was not appended to`;
     return json({ appended: true, ...report });
   },
 });
