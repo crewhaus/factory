@@ -295,6 +295,8 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       const outcome = await settle(read);
       expect(outcome).toBeInstanceOf(ChainAdapterError);
       expect((outcome as Error).message).toContain("eth_getLogs: the read was cancelled");
+      // The caller's cancel is not the adapter's deadline.
+      expect((outcome as ChainAdapterError).timedOut).toBe(false);
     } finally {
       node.stop();
     }
@@ -311,6 +313,8 @@ describe("a read is bounded in time and in bytes (C041)", () => {
       const outcome = await settle(adapter.rpcRead("eth_blockNumber", [], { timeoutMs: 100 }));
       expect(outcome).toBeInstanceOf(ChainAdapterError);
       expect((outcome as Error).message).toContain("eth_blockNumber: no answer within 100 ms");
+      // Marked, so a caller does not read a timeout as the node's answer.
+      expect((outcome as ChainAdapterError).timedOut).toBe(true);
     } finally {
       node.stop();
     }
@@ -436,11 +440,14 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     expect((outcome as Error).message).toContain(
       "quorum failed: no value reached threshold 2/3 — 1 of 3 answered within 300 ms",
     );
+    expect((outcome as ChainAdapterError).timedOut).toBe(true);
     // The caller's cancel is not a quorum verdict.
     const cancel = new AbortController();
     const cancelled = adapter.rpcRead("eth_blockNumber", [], { signal: cancel.signal });
     cancel.abort();
-    expect(((await settle(cancelled)) as Error).message).toContain("the read was cancelled");
+    const stopped = (await settle(cancelled)) as ChainAdapterError;
+    expect(stopped.message).toContain("the read was cancelled");
+    expect(stopped.timedOut).toBe(false);
   });
 
   test("a body past the cap is refused, not parsed from a prefix", async () => {

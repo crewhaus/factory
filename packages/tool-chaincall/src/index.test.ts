@@ -11,6 +11,7 @@
  * say no to, or qualify, out loud and with the reason.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { ChainAdapterError } from "@crewhaus/chain-adapter-base";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { MULTICALL3_ADDRESS, encodeAggregate3 } from "@crewhaus/tool-onchain";
 import { z } from "zod";
@@ -877,6 +878,29 @@ describe("EvmSimulateBundle", () => {
     await expect(run(evmSimulateBundle, { chainId: CHAIN, calls: bundle })).rejects.toThrow(
       /cancelled .*NOT treated as an unimplemented method/s,
     );
+    expect(stub.count("eth_call")).toBe(0);
+  });
+
+  test("the chain adapter's own deadline is a timeout, not the node refusing the bundle", async () => {
+    // The adapter's deadline error is neither an AbortError nor a
+    // TimeoutError by name, and the tool's own signal had not fired, so it
+    // was reported as "the node refused this bundle … an answer about the
+    // bundle": false on both counts.
+    const stub = use({
+      eth_simulateV1: () => {
+        throw new ChainAdapterError(
+          CHAIN,
+          "eth_simulateV1",
+          "no answer within 30000 ms",
+          undefined,
+          { timedOut: true },
+        );
+      },
+      eth_call: () => word(1n),
+    });
+    const refusal = run(evmSimulateBundle, { chainId: CHAIN, calls: bundle });
+    await expect(refusal).rejects.toThrow(/the deadline elapsed.*NOT treated as an unimplemented/s);
+    await expect(refusal).rejects.not.toThrow(/refused this bundle/);
     expect(stub.count("eth_call")).toBe(0);
   });
 

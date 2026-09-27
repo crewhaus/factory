@@ -30,11 +30,24 @@ export class ChainAdapterError extends CrewhausError {
   override readonly name = "ChainAdapterError";
   readonly chainId: string;
   readonly method: string;
+  /**
+   * True when the read's own deadline passed before a node answered. That
+   * is a timeout, not an answer: a caller must not read it as the node
+   * refusing the request (or not implementing the method).
+   */
+  readonly timedOut: boolean;
 
-  constructor(chainId: string, method: string, message: string, cause?: unknown) {
+  constructor(
+    chainId: string,
+    method: string,
+    message: string,
+    cause?: unknown,
+    opts: { readonly timedOut?: boolean } = {},
+  ) {
     super("adapter", `[${chainId}] ${method}: ${message}`, cause);
     this.chainId = chainId;
     this.method = method;
+    this.timedOut = opts.timedOut === true;
   }
 }
 

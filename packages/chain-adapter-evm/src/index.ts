@@ -226,7 +226,15 @@ function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unkn
     };
     const onStop = (): void =>
       finish(() =>
-        reject(new ChainAdapterError(chainId, method, call.cancelled() ?? "the read was stopped")),
+        reject(
+          new ChainAdapterError(
+            chainId,
+            method,
+            call.cancelled() ?? "the read was stopped",
+            undefined,
+            { timedOut: !call.callerCancelled() },
+          ),
+        ),
       );
     const launch = (): void => {
       clearTimeout(hedge);
@@ -301,8 +309,8 @@ function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknow
       for (const stop of stops) if (stop !== winner) stop();
       settle();
     };
-    const fail = (why: string): void =>
-      finish(() => reject(new ChainAdapterError(chainId, method, why)));
+    const fail = (why: string, timedOut = false): void =>
+      finish(() => reject(new ChainAdapterError(chainId, method, why, undefined, { timedOut })));
     const noQuorum = (): string =>
       answered === 0
         ? "quorum failed: every RPC URL rejected"
@@ -316,6 +324,7 @@ function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknow
         answered === 0
           ? `no answer within ${call.timeoutMs} ms`
           : `${noQuorum()} — ${answered} of ${urls.length} answered within ${call.timeoutMs} ms`,
+        true,
       );
     };
     /** Settle once no value can reach the threshold with the voters still out. */

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
 import { _setRpc, bindChainCallChains } from "./index";
-import { chainRpcFromAdapter, resolveRpc } from "./lib/rpc";
+import { chainRpcFromAdapter, resolveRpc, rpcRead, startDeadline } from "./lib/rpc";
 
 let server: ReturnType<typeof Bun.serve>;
 let origin = "";
@@ -57,4 +57,42 @@ test("the adapter seam passes the call's signal down, so a cancel reaches the re
   const { signal } = new AbortController();
   await chainRpcFromAdapter(adapter)("eth_blockNumber", [], { signal });
   expect(seen).toEqual([{ signal }]);
+});
+
+test("the adapter gets the rest of the tool's deadline, not its own 30 s default", async () => {
+  // chainRpcFromAdapter forwarded only the signal, so the adapter applied
+  // DEFAULT_RPC_TIMEOUT_MS to every read and a `timeoutMs: 60000` call
+  // failed at 30 s.
+  const seen: Array<{ signal?: AbortSignal; timeoutMs?: number } | undefined> = [];
+  const adapter: ChainAdapter = {
+    chainId: "1",
+    config: {
+      chainId: "1",
+      rpcUrls: [origin],
+      rpcPolicy: "single",
+      finality: { kind: "finalized" },
+      reorgTolerant: true,
+    },
+    rpcRead: async (_method, _params, opts) => {
+      seen.push(opts);
+      return "0x1";
+    },
+  };
+  const deadline = startDeadline(60_000);
+  try {
+    await rpcRead(chainRpcFromAdapter(adapter), "1", "eth_blockNumber", [], deadline.signal);
+  } finally {
+    deadline.cancel();
+  }
+  expect(seen[0]?.signal).toBe(deadline.signal);
+  const forwarded = seen[0]?.timeoutMs ?? 0;
+  expect({ over30s: forwarded > 30_000, atMost60s: forwarded <= 60_000 }).toEqual({
+    over30s: true,
+    atMost60s: true,
+  });
+  // A caller-supplied signal with no deadline of this package's leaves the
+  // adapter its own default.
+  const { signal } = new AbortController();
+  await rpcRead(chainRpcFromAdapter(adapter), "1", "eth_blockNumber", [], signal);
+  expect(seen[1]).toEqual({ signal });
 });
