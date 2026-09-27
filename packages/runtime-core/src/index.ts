@@ -1549,10 +1549,11 @@ export type RunChatLoopOptions = {
    * Only `tools` are the chat loop's to bind: they are APPENDED to `opts.tools`
    * and advertised to the model, with first-party tools winning any name
    * collision (a plugin can augment the catalog but not silently shadow a
-   * built-in). The other contribution kinds bind at their own hosts — channels
-   * at the channel daemon, models at the model-router, graders at the eval
-   * stack, target emitters at the compiler — so they are deliberately not
-   * accepted here. A compiled bundle instead registers plugin tools directly on
+   * built-in). The other contribution kinds (channels, models, graders,
+   * target emitters) are bound by no host in this release —
+   * `activatePlugins` collects them and says at boot that they have no effect
+   * (plugin-loader's `UNBOUND_CONTRIBUTION_KINDS`) — so they are not accepted
+   * here. A compiled bundle instead registers plugin tools directly on
    * its `defaultCatalog`; this option is the interpreter path's equivalent so a
    * `runChatLoop` caller need not mutate a global catalog. Absent → the run is
    * byte-identical to a pre-G32 runtime.

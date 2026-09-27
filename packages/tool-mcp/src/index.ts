@@ -111,13 +111,44 @@ export type RegisterMcpServerOptions = {
   /** Logger callback fired once per registered tool. Useful for boot banners. */
   readonly onRegister?: (info: { fullName: string; remoteName: string }) => void;
   /**
-   * Fired for a remote tool that is left out because its registered name
-   * would be longer than model providers accept (see
-   * {@link mcpToolNameLengthProblem}). The server's other tools are
-   * registered either way. Default: `console.warn(reason)`.
+   * Fired for a remote tool that is left out: its name is not one a model
+   * provider accepts ({@link mcpToolNameProblem}), or its definition is too
+   * large to screen or reads as a prompt injection
+   * ({@link mcpToolDefinitionProblem}). The server's other tools are
+   * registered either way. `reason` never quotes the definition's text.
+   * Default: `console.warn(reason)`.
    */
   readonly onSkip?: (info: { fullName: string; remoteName: string; reason: string }) => void;
+  /**
+   * Fired for a remote tool that IS registered, but with part of its
+   * definition withheld from the model: its description, or the descriptive
+   * text of its input schema (descriptions, titles, defaults, examples),
+   * read as a prompt injection ({@link screenMcpToolDefinition}). `reason`
+   * names the rules that fired, never the text. Default:
+   * `console.warn(reason)`.
+   */
+  readonly onWithhold?: (info: { fullName: string; remoteName: string; reason: string }) => void;
 };
+
+/**
+ * The longest description a remote tool carries into the model's context. A
+ * longer one is cut here and marked as cut, so a server cannot fill the
+ * context window through its tool list.
+ */
+export const MAX_MCP_DESCRIPTION_CHARS = 4096;
+
+/**
+ * The largest input schema, measured as JSON, a remote tool may carry. A
+ * larger one leaves the tool out: a schema cut short is a broken schema.
+ *
+ * With the description cap and the name, a whole definition fits inside the
+ * window the prompt-injection detector reads in full, so no part of what the
+ * model is shown goes unscreened.
+ */
+export const MAX_MCP_SCHEMA_CHARS = 32 * 1024;
+
+/** How deep a remote tool's input schema may nest before it is left out. */
+export const MAX_MCP_SCHEMA_DEPTH = 64;
 
 /**
  * Why the remote tool `remoteName` on `serverName` cannot be registered under
@@ -139,44 +170,413 @@ export function mcpToolNameLengthProblem(
 }
 
 /**
- * Register one remote tool, or — when its name cannot fit — report it through
- * `onSkip` and register nothing. A too-long name only drops that tool: the
- * 0.7.1 `mcp__` prefix made a few names that fitted before too long, and one
- * of them must not take the server's other tools down with it.
+ * Why the remote tool named `remoteName` cannot be offered to a model, or
+ * undefined when it can: the name is missing, uses a character outside
+ * letters, digits, `-` and `_`, or makes a registered name longer than
+ * {@link MAX_TOOL_NAME_LENGTH}.
  */
-function registerOne(
+export function mcpToolNameProblem(serverName: string, remoteName: unknown): string | undefined {
+  if (typeof remoteName !== "string" || remoteName.length === 0) {
+    return `mcp server "${serverName}" returned a tool with an empty/missing name.`;
+  }
+  if (!TOOL_NAME_PATTERN.test(remoteName)) {
+    return `mcp server "${serverName}" returned a tool with an invalid name ${shownName(remoteName)} (must match ${TOOL_NAME_PATTERN.source}), which no model provider accepts.`;
+  }
+  return mcpToolNameLengthProblem(serverName, remoteName);
+}
+
+/** What {@link screenMcpToolDefinition} decided about a remote tool's definition. */
+export type McpDefinitionScreen =
+  | {
+      /** The tool is left out; `reason` says why, never quoting the definition. */
+      readonly kind: "refused";
+      readonly reason: string;
+    }
+  | {
+      /**
+       * The tool may be registered with `definition` — the remote one, or a
+       * copy with its flagged description and schema text withheld.
+       * `withheld`, when set, says what was withheld and which rules fired.
+       */
+      readonly kind: "shown";
+      readonly definition: McpToolDefinition;
+      readonly withheld?: string;
+    };
+
+/**
+ * What the model may be shown of a remote tool's DEFINITION. A tool's name,
+ * description and input schema are shown to the model on every request, so
+ * they cross the same trust boundary as the tool's results and go through the
+ * same classifier (origin `"mcp"`), once, at registration:
+ *
+ * - a schema larger than {@link MAX_MCP_SCHEMA_CHARS} as JSON, or nested
+ *   deeper than {@link MAX_MCP_SCHEMA_DEPTH}, is refused unscreened;
+ * - otherwise the name, the description as the model will see it (cut to
+ *   {@link MAX_MCP_DESCRIPTION_CHARS}) and every key and string value in the
+ *   schema are classified together. Most tools stop here, shown as they are.
+ *
+ * When that whole reads as a prompt injection, the parts are screened apart:
+ *
+ * - the name, the schema's property names and its other values (types,
+ *   enums, patterns, …) are what the tool IS — if they read as an injection
+ *   the tool is refused;
+ * - the description, and the schema's descriptive text (`description`,
+ *   `title`, `$comment`, `markdownDescription`, `default`, `examples`), only
+ *   describe it — whichever part is flagged is withheld, and the tool is
+ *   registered without it. (When only the two together read as an
+ *   injection, both are withheld.)
+ *
+ * Tool prose that is ordinary API documentation can trip a rule written for
+ * tool OUTPUT ("Override Content-Type", "rm -rf / is refused"), so a flagged
+ * description costs the tool its description, not its place. A suspicious
+ * verdict withholds nothing. Reasons name the rules that fired, never the text.
+ */
+export async function screenMcpToolDefinition(
+  serverName: string,
+  remote: McpToolDefinition,
+): Promise<McpDefinitionScreen> {
+  const label = `mcp server "${serverName}" tool ${shownName(remote.name)}`;
+  const parts = schemaParts(remote.inputSchema);
+  if ("problem" in parts) {
+    return { kind: "refused", reason: `${label} was left out: ${parts.problem}.` };
+  }
+  const name = String(remote.name);
+  const description = sanitizeDescription(remote.description) ?? "";
+  const screen = async (text: string) => classifyBoundary(text, { origin: "mcp" });
+  const whole = await screen([name, description, ...parts.structural, ...parts.prose].join("\n"));
+  if (whole.action !== "redact") return { kind: "shown", definition: remote };
+
+  const structural = await screen([name, ...parts.structural].join("\n"));
+  if (structural.action === "redact") {
+    return {
+      kind: "refused",
+      reason: `${label} was left out: its name or input schema reads as a prompt injection (${rulesOf(structural)}), so none of it is shown to the model.`,
+    };
+  }
+  const descFlag = description === "" ? undefined : await screen(description).then(flaggedRules);
+  const proseFlag =
+    parts.prose.length === 0 ? undefined : await screen(parts.prose.join("\n")).then(flaggedRules);
+  // Neither part alone reads as an injection, only the two together: withhold both.
+  const both = descFlag === undefined && proseFlag === undefined;
+  let withholdDesc = both ? description !== "" : descFlag !== undefined;
+  let withholdProse = both ? parts.prose.length > 0 : proseFlag !== undefined;
+  const shownAs = (): McpToolDefinition => ({
+    ...remote,
+    ...(withholdDesc
+      ? {
+          // Names the server's own tool, not a catalog name: an alias is
+          // registered under the bare name, so this reads true either way.
+          description: `Tool "${name}" of MCP server "${serverName}" (its description was withheld by crewhaus).`,
+        }
+      : {}),
+    ...(withholdProse ? { inputSchema: withoutProse(remote.inputSchema) } : {}),
+  });
+  let definition = shownAs();
+  let recheck = await screen(definitionText(definition));
+  if (recheck.action === "redact" && !(withholdDesc && withholdProse)) {
+    withholdDesc = description !== "";
+    withholdProse = parts.prose.length > 0;
+    definition = shownAs();
+    recheck = await screen(definitionText(definition));
+  }
+  if (recheck.action === "redact") {
+    return {
+      kind: "refused",
+      reason: `${label} was left out: its definition reads as a prompt injection (${rulesOf(recheck)}) even with its descriptions withheld, so none of it is shown to the model.`,
+    };
+  }
+  const what = [
+    ...(withholdDesc ? ["its description"] : []),
+    ...(withholdProse
+      ? ["the descriptions, titles, defaults and examples in its input schema"]
+      : []),
+  ].join(" and ");
+  const rules = [descFlag, proseFlag].filter((r): r is string => r !== undefined).join(", ");
+  return {
+    kind: "shown",
+    definition,
+    withheld: `${label}: ${what} ${withholdProse ? "read" : "reads"} as a prompt injection (${rules || rulesOf(whole)}), so crewhaus withheld ${withholdProse ? "them" : "it"} from the model. The tool is registered without ${withholdProse ? "them" : "it"}.`,
+  };
+}
+
+/**
+ * Why a remote tool must be left out, or undefined when it may be registered
+ * (possibly with part of its definition withheld — see
+ * {@link screenMcpToolDefinition}, which says which).
+ */
+export async function mcpToolDefinitionProblem(
+  serverName: string,
+  remote: McpToolDefinition,
+): Promise<string | undefined> {
+  const screened = await screenMcpToolDefinition(serverName, remote);
+  return screened.kind === "refused" ? screened.reason : undefined;
+}
+
+type BoundaryVerdict = Awaited<ReturnType<typeof classifyBoundary>>;
+
+/** The rules that fired, for a reason line: at most six, never the text. */
+function rulesOf(verdict: BoundaryVerdict): string {
+  return [...new Set(verdict.verdict.hits.map((h) => h.rule))].slice(0, 6).join(", ");
+}
+
+/** The rules behind a malicious verdict, or undefined when it is not one. */
+function flaggedRules(verdict: BoundaryVerdict): string | undefined {
+  return verdict.action === "redact" ? rulesOf(verdict) : undefined;
+}
+
+/** Everything the model is shown of `definition`, as one text. */
+function definitionText(definition: McpToolDefinition): string {
+  const parts = schemaParts(definition.inputSchema);
+  const schema = "problem" in parts ? [] : [...parts.structural, ...parts.prose];
+  return [
+    String(definition.name),
+    sanitizeDescription(definition.description) ?? "",
+    ...schema,
+  ].join("\n");
+}
+
+/**
+ * Register one remote tool, or — when it cannot be offered to a model — report
+ * it through `onSkip` and register nothing. One bad tool only drops that tool:
+ * the server's others are registered, and a name or definition that cannot be
+ * used never leaves half a server on the catalog (0.7.0 threw part-way through
+ * the list, after registering the tools before it).
+ *
+ * A server name that is itself invalid still fails the server: that is the
+ * operator's configuration, not one of the server's tools.
+ */
+async function registerOne(
   host: McpHost,
   serverName: string,
   catalog: ToolCatalog,
   remote: McpToolDefinition,
   opts: RegisterMcpServerOptions,
-): void {
-  // Only a name that is otherwise valid is skipped for its length; anything
-  // else wrong with it still fails the server, as it always has.
-  const reason =
-    typeof remote.name === "string" &&
-    TOOL_NAME_PATTERN.test(remote.name) &&
-    mcpServerNameProblem(serverName) === undefined
-      ? mcpToolNameLengthProblem(serverName, remote.name)
-      : undefined;
-  if (reason !== undefined) {
-    const info = {
-      fullName: namespacedToolName(serverName, remote.name),
-      remoteName: remote.name,
-      reason,
-    };
-    if (opts.onSkip !== undefined) opts.onSkip(info);
-    else console.warn(`[mcp] ${reason} The server's other tools are registered.`);
+): Promise<void> {
+  const serverProblem = mcpServerNameProblem(serverName);
+  if (serverProblem !== undefined) throw new McpError(serverProblem);
+  const badName = mcpToolNameProblem(serverName, remote.name);
+  if (badName !== undefined) {
+    reportSkip(serverName, remote, badName, opts);
     return;
   }
+  const fullName = namespacedToolName(serverName, remote.name);
+  if (catalog.has(fullName)) {
+    reportSkip(
+      serverName,
+      remote,
+      `mcp server "${serverName}" tool ${shownName(remote.name)} was left out: a tool named "${fullName}" is already registered.`,
+      opts,
+    );
+    return;
+  }
+  const screened = await screenMcpToolDefinition(serverName, remote);
+  if (screened.kind === "refused") {
+    reportSkip(serverName, remote, screened.reason, opts);
+    return;
+  }
+  if (screened.withheld !== undefined) reportWithheld(fullName, remote, screened.withheld, opts);
   const tool = buildMcpRegisteredTool(
     host,
     serverName,
-    remote,
+    screened.definition,
     resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
   );
   catalog.register(tool);
   opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
+}
+
+/** Report a remote tool registered with part of its definition withheld. */
+function reportWithheld(
+  fullName: string,
+  remote: Pick<McpToolDefinition, "name">,
+  reason: string,
+  opts: RegisterMcpServerOptions,
+): void {
+  const info = { fullName, remoteName: String(remote.name), reason };
+  if (opts.onWithhold !== undefined) opts.onWithhold(info);
+  else console.warn(`[mcp] ${reason}`);
+}
+
+/**
+ * A server's listing with each name kept once — the first definition, as
+ * every registration path keeps it — and each later one reported through
+ * `onSkip`. Registering the second would throw "already registered" part-way
+ * through the list and leave the server half-registered.
+ */
+function firstOfEachName(
+  serverName: string,
+  remoteTools: ReadonlyArray<McpToolDefinition>,
+  opts: RegisterMcpServerOptions,
+  report: (remote: McpToolDefinition) => boolean = () => true,
+): McpToolDefinition[] {
+  const seen = new Set<unknown>();
+  const kept: McpToolDefinition[] = [];
+  for (const remote of remoteTools) {
+    if (seen.has(remote.name)) {
+      if (report(remote)) {
+        reportSkip(
+          serverName,
+          remote,
+          `mcp server "${serverName}" lists tool ${shownName(remote.name)} more than once; the first definition was kept and this one left out.`,
+          opts,
+        );
+      }
+      continue;
+    }
+    seen.add(remote.name);
+    kept.push(remote);
+  }
+  return kept;
+}
+
+/**
+ * Report a remote tool that is left out through `onSkip`, or stderr by
+ * default. `fullName` is the name it would have been registered under.
+ */
+function reportSkip(
+  serverName: string,
+  remote: Pick<McpToolDefinition, "name">,
+  reason: string,
+  opts: RegisterMcpServerOptions,
+  fullName: string = namespacedToolName(serverName, String(remote.name)),
+): void {
+  const remoteName = String(remote.name);
+  const info = { fullName, remoteName, reason };
+  if (opts.onSkip !== undefined) opts.onSkip(info);
+  else console.warn(`[mcp] ${reason} The server's other tools are registered.`);
+}
+
+/** A remote tool name as a log line shows it: quoted, and cut when long. */
+function shownName(name: unknown): string {
+  const s = String(name);
+  return JSON.stringify(s.length > 80 ? `${s.slice(0, 80)}…` : s);
+}
+
+/**
+ * Schema keywords whose value only describes: shown to the model as prose,
+ * and safe to withhold. `default` and `examples` may hold any JSON; the
+ * others are text.
+ */
+const SCHEMA_PROSE_KEYWORDS: ReadonlySet<string> = new Set([
+  "description",
+  "title",
+  "$comment",
+  "markdownDescription",
+  "default",
+  "examples",
+]);
+
+/** Keywords whose value maps NAMES (property names, definition names) to schemas. */
+const SCHEMA_MAP_KEYWORDS: ReadonlySet<string> = new Set([
+  "properties",
+  "patternProperties",
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+]);
+
+/**
+ * Whether `key: value`, in a schema object, is descriptive prose: a text
+ * keyword holding text, `examples` holding a list, or any `default`. A
+ * property that happens to be NAMED `description` sits under `properties`,
+ * which is walked as a map, so it is never mistaken for one.
+ */
+function isProse(key: string, value: unknown): boolean {
+  if (!SCHEMA_PROSE_KEYWORDS.has(key)) return false;
+  if (key === "default") return true;
+  if (key === "examples") return Array.isArray(value);
+  return typeof value === "string";
+}
+
+/** Every string in `value`, object keys included (bounded by the caller's depth check). */
+function stringsIn(value: unknown, out: string[]): void {
+  if (typeof value === "string") out.push(value);
+  else if (Array.isArray(value)) for (const item of value) stringsIn(item, out);
+  else if (value !== null && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      out.push(k);
+      stringsIn(v, out);
+    }
+  }
+}
+
+/**
+ * A remote tool's input schema as the model reads it — `structural`, what
+ * the tool is (property names, types, enums, patterns, every other key and
+ * value), and `prose`, what only describes it ({@link isProse}) — or why the
+ * schema is refused before it is read: too large as JSON, nested too deep,
+ * or not JSON at all. Depth is checked with an explicit stack first, so a
+ * hostile nesting cannot exhaust the call stack.
+ */
+function schemaParts(
+  schema: unknown,
+): { readonly structural: string[]; readonly prose: string[] } | { readonly problem: string } {
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(schema);
+  } catch (err) {
+    return { problem: `its input schema cannot be read as JSON (${firstLineOf(err)})` };
+  }
+  const size = json?.length ?? 0;
+  if (size > MAX_MCP_SCHEMA_CHARS) {
+    return {
+      problem: `its input schema is ${size} characters as JSON, more than the ${MAX_MCP_SCHEMA_CHARS} a tool may carry`,
+    };
+  }
+  const stack: Array<{ readonly value: unknown; readonly depth: number }> = [
+    { value: schema, depth: 0 },
+  ];
+  for (let next = stack.pop(); next !== undefined; next = stack.pop()) {
+    const { value, depth } = next;
+    if (value === null || typeof value !== "object") continue;
+    if (depth >= MAX_MCP_SCHEMA_DEPTH) {
+      return { problem: `its input schema nests deeper than ${MAX_MCP_SCHEMA_DEPTH} levels` };
+    }
+    for (const item of Array.isArray(value) ? value : Object.values(value)) {
+      stack.push({ value: item, depth: depth + 1 });
+    }
+  }
+  const structural: string[] = [];
+  const prose: string[] = [];
+  const walk = (value: unknown, isMap: boolean): void => {
+    if (typeof value === "string") {
+      structural.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, false);
+      return;
+    }
+    if (value === null || typeof value !== "object") return;
+    for (const [key, item] of Object.entries(value)) {
+      structural.push(key);
+      if (isMap) walk(item, false);
+      else if (isProse(key, item)) {
+        structural.pop();
+        stringsIn(item, prose);
+      } else walk(item, SCHEMA_MAP_KEYWORDS.has(key) && item !== null && typeof item === "object");
+    }
+  };
+  walk(schema, false);
+  return { structural, prose };
+}
+
+/** `schema` without its descriptive prose ({@link isProse}); property names are kept. */
+function withoutProse(schema: unknown, isMap = false): unknown {
+  if (Array.isArray(schema)) return schema.map((item) => withoutProse(item));
+  if (schema === null || typeof schema !== "object") return schema;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(schema)) {
+    if (isMap) out[key] = withoutProse(item);
+    else if (isProse(key, item)) continue;
+    else {
+      out[key] = withoutProse(
+        item,
+        SCHEMA_MAP_KEYWORDS.has(key) && item !== null && typeof item === "object",
+      );
+    }
+  }
+  return out;
 }
 
 /**
@@ -229,6 +629,15 @@ export function buildMcpRegisteredTool(
         ? `mcp server "${serverName}" tool "${remote.name}" cannot be registered as "${fullName}": ${fullName.length} characters, and model providers accept at most ${MAX_TOOL_NAME_LENGTH}.`
         : undefined;
   if (lengthProblem !== undefined) throw new McpError(lengthProblem);
+  // The size caps hold for a direct caller too. Screening the definition's
+  // text needs the (async) classifier, so it runs where tools are registered:
+  // a direct caller screens with `mcpToolDefinitionProblem` first.
+  const schema = schemaParts(remote.inputSchema);
+  if ("problem" in schema) {
+    throw new McpError(
+      `mcp server "${serverName}" tool ${shownName(remote.name)} cannot be registered: ${schema.problem}.`,
+    );
+  }
   const description = sanitizeDescription(remote.description) ?? `MCP tool ${fullName}`;
   return buildTool({
     name: fullName,
@@ -320,9 +729,9 @@ export async function registerMcpServer(
 ): Promise<void> {
   const client = host.getClient(serverName);
   await client.connect();
-  const remoteTools = await client.listTools();
+  const remoteTools = firstOfEachName(serverName, await client.listTools(), opts);
   for (const remote of remoteTools) {
-    registerOne(host, serverName, catalog, remote, opts);
+    await registerOne(host, serverName, catalog, remote, opts);
   }
 }
 
@@ -390,6 +799,8 @@ export function hashToolSchema(schema: unknown): string {
 export function snapshotTools(tools: ReadonlyArray<McpToolDefinition>): McpToolSnapshot {
   const map = new Map<string, string>();
   for (const t of tools) {
+    // A name listed twice keeps its first definition, as registration does.
+    if (map.has(t.name)) continue;
     map.set(
       t.name,
       hashToolSchema(
@@ -453,9 +864,16 @@ export async function reconcileMcpServer(
   const client = host.getClient(serverName);
   await client.connect();
   const remoteTools = await client.refreshTools();
-  const byName = new Map(remoteTools.map((t) => [t.name, t] as const));
   const snapshot = snapshotTools(remoteTools);
   const drift = diffToolSnapshots(previous, snapshot);
+  // First definition of each name, as the boot listing keeps it; a repeat is
+  // reported when its name is (re)registered in this pass.
+  const touched = new Set([...drift.added, ...drift.schemaChanged]);
+  const byName = new Map(
+    firstOfEachName(serverName, remoteTools, opts, (t) => touched.has(t.name)).map(
+      (t) => [t.name, t] as const,
+    ),
+  );
 
   // Removed + schema-changed leave the catalog first, so a schema-changed
   // tool can be re-registered under its (unchanged) name without tripping the
@@ -467,7 +885,7 @@ export async function reconcileMcpServer(
   for (const remoteName of [...drift.added, ...drift.schemaChanged]) {
     const remote = byName.get(remoteName);
     if (remote === undefined) continue;
-    registerOne(host, serverName, catalog, remote, opts);
+    await registerOne(host, serverName, catalog, remote, opts);
   }
   return { drift, snapshot };
 }
@@ -871,6 +1289,12 @@ export function resolveMcpToolFlags(
 export type McpAliasRegistration = {
   readonly registered: readonly string[];
   readonly missing: readonly string[];
+  /**
+   * Requested aliases the server advertises but whose definition must not
+   * reach the model ({@link mcpToolDefinitionProblem}): left off the catalog
+   * and reported through `onSkip` (stderr by default), like a namespaced tool.
+   */
+  readonly refused: readonly string[];
 };
 
 /**
@@ -886,7 +1310,8 @@ export type McpAliasRegistration = {
  * `ioCapability: "network"`, boundary classification + `dataLineage` tagging
  * on every response — the Pillar 3 fabric does not care what a sink is
  * called. Requested aliases the server does not advertise are returned in
- * `missing` rather than thrown, so a caller can degrade with a warning.
+ * `missing` rather than thrown, so a caller can degrade with a warning; one
+ * whose definition is refused at the boundary is returned in `refused`.
  */
 export async function registerMcpToolAliases(
   host: McpHost,
@@ -897,9 +1322,11 @@ export async function registerMcpToolAliases(
 ): Promise<McpAliasRegistration> {
   const client = host.getClient(serverName);
   await client.connect();
-  const remoteTools = await client.listTools();
+  const listed = await client.listTools();
   const wanted = new Set(aliasNames);
+  const remoteTools = firstOfEachName(serverName, listed, opts, (t) => wanted.has(t.name));
   const registered: string[] = [];
+  const refused: string[] = [];
   for (const remote of remoteTools) {
     if (!wanted.has(remote.name)) continue;
     if (catalog.has(remote.name)) {
@@ -907,10 +1334,19 @@ export async function registerMcpToolAliases(
         `mcp server "${serverName}" tool "${remote.name}" cannot be aliased onto its bare name — a tool named "${remote.name}" is already registered on the catalog (the local twin must not be registered when the ${serverName} backend owns the vocabulary)`,
       );
     }
+    const screened = await screenMcpToolDefinition(serverName, remote);
+    if (screened.kind === "refused") {
+      refused.push(remote.name);
+      reportSkip(serverName, remote, screened.reason, opts, remote.name);
+      continue;
+    }
+    if (screened.withheld !== undefined) {
+      reportWithheld(remote.name, remote, screened.withheld, opts);
+    }
     const tool = buildMcpRegisteredTool(
       host,
       serverName,
-      remote,
+      screened.definition,
       resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
       { registeredName: remote.name },
     );
@@ -920,7 +1356,7 @@ export async function registerMcpToolAliases(
   }
   const advertised = new Set(remoteTools.map((t) => t.name));
   const missing = aliasNames.filter((name) => !advertised.has(name));
-  return { registered, missing };
+  return { registered, missing, refused };
 }
 
 /**
@@ -940,13 +1376,19 @@ function resolveRunContext(ctx: ToolExecuteContext | undefined): RunContext | un
 }
 
 /**
- * Strip C0 control chars and trim whitespace. Anthropic's API tolerates
- * Unicode in descriptions but stripping control chars protects against
- * pathological server output.
+ * Strip C0 control chars and trim whitespace, then cut to
+ * {@link MAX_MCP_DESCRIPTION_CHARS} with a marker that says so. Anthropic's
+ * API tolerates Unicode in descriptions but stripping control chars protects
+ * against pathological server output. The cut never splits a surrogate pair.
  */
 function sanitizeDescription(raw: string | undefined): string | undefined {
-  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") return undefined;
   // biome-ignore lint/suspicious/noControlCharactersInRegex: explicit C0/DEL strip
-  const stripped = raw.replace(/[\x00-\x1f\x7f]/g, "").trim();
-  return stripped.length > 0 ? stripped : undefined;
+  const stripped = raw.replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  if (stripped.length === 0) return undefined;
+  if (stripped.length <= MAX_MCP_DESCRIPTION_CHARS) return stripped;
+  const last = stripped.charCodeAt(MAX_MCP_DESCRIPTION_CHARS - 1);
+  const end =
+    last >= 0xd800 && last <= 0xdbff ? MAX_MCP_DESCRIPTION_CHARS - 1 : MAX_MCP_DESCRIPTION_CHARS;
+  return `${stripped.slice(0, end)}… [description cut by crewhaus: ${stripped.length - end} more characters]`;
 }

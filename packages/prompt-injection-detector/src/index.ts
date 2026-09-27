@@ -273,9 +273,15 @@ export const REGEX_RULES: ReadonlyArray<PromptInjectionRule> = [
     severity: "medium",
   },
   {
+    // Turning off the model's own safety. "content" and "alignment" are
+    // ordinary API words ("Override Content-Type header", "override alignment
+    // for the range", "disable content security checks"), so they count only
+    // as "your content/alignment" or followed by what a safety system has
+    // (filters, policy, guidelines, training …); "safety" and "moderation"
+    // count as whole words.
     id: "override-safety",
     pattern:
-      /\b(?:bypass|circumvent|disable|override|turn off)\s+(?:your\s+)?(?:safety|content|moderation|alignment)/i,
+      /\b(?:bypass|circumvent|disable|override|turn off)\s+(?:your\s+(?:safety|content|moderation|alignment)\b|(?:(?:the|all|any)\s+)?(?:safety|moderation)\b|(?:(?:the|all|any)\s+)?content\s+(?:filter(?:s|ing)?|moderation|polic(?:y|ies)|guidelines|restrictions|safety)\b|(?:(?:the|all|any)\s+)?alignment\s+(?:training|guidelines|rules|constraints|safeguards)\b)/i,
     severity: "high",
   },
   {

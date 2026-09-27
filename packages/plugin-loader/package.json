@@ -2,7 +2,7 @@
   "name": "@crewhaus/plugin-loader",
   "version": "0.7.0",
   "type": "module",
-  "description": "Runtime activation of third-party plugins — path allow-list, Ed25519 signature verification, capability gating, sandboxed import (Section 41)",
+  "description": "Runtime activation of third-party plugins \u2014 path allow-list, Ed25519 signature and code-digest verification, tool-definition checks; plugin code runs in-process with full authority (Section 41)",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
@@ -15,10 +15,16 @@
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/plugin-registry": "workspace:*",
     "@crewhaus/plugin-sdk": "workspace:*",
-    "@crewhaus/tool-builder": "workspace:*"
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-registry-manifest": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
-    "zod": "^3.23.8"
+    "@crewhaus/adapter-anthropic": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

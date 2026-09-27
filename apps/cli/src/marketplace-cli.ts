@@ -30,16 +30,26 @@
  * on that); the default is a `?? DEFAULT_*_REGISTRY_URL` fallback the CLI
  * applies before calling in for plugins/templates.
  *
- * SIGNING — install respects `plugin-registry`'s fail-closed verification:
- * when trust anchors are configured (via `--trust-anchor` / env), an unsigned
- * or badly-signed plugin is refused; `--allow-unsigned` is the explicit dev
- * opt-out. Templates carry their own `verifyingRegistry` wrapper (out of scope
+ * SIGNING — install verifies a manifest against the same publisher keys a
+ * boot trusts (`~/.crewhaus/plugin-trust/*.pem`, CREWHAUS_PLUGIN_TRUST_ANCHORS)
+ * plus `--trust-anchor`, before anything is written
+ * ({@link resolveInstallTrustAnchors}). An unsigned or badly-signed manifest
+ * is refused; with no key at all install refuses too, since nothing could be
+ * verified. `--allow-unsigned` accepts an UNSIGNED manifest (dev only) and the
+ * install line says it is unverified; a signature that is there must still
+ * verify. Install delivers the manifest only: the plugin's index.js is placed
+ * by hand. Templates carry their own `verifyingRegistry` wrapper (out of scope
  * here — install fetches the manifest verbatim).
  */
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import type { ModuleRegistrySource, PluginMetadata } from "@crewhaus/module-marketplace-client";
-import type { PluginRegistryEntry } from "@crewhaus/plugin-registry";
+import {
+  PLUGIN_TRUST_ANCHORS_ENV,
+  defaultTrustAnchorDir,
+  loadTrustAnchors,
+} from "@crewhaus/plugin-loader";
+import type { PluginRegistryEntry, TrustAnchorSource } from "@crewhaus/plugin-registry";
 import type { PluginManifest } from "@crewhaus/plugin-sdk";
 
 /** Thrown for operational failures (no registry configured, bad ref, driver
@@ -67,6 +77,60 @@ export function defaultPluginRegistryPath(): string {
  *  (a template is scaffolded into the working directory). */
 export function defaultTemplateWorkspaceDir(): string {
   return process.cwd();
+}
+
+/**
+ * The publisher keys `plugins install` verifies a manifest against: the ones
+ * a boot trusts (`~/.crewhaus/plugin-trust/*.pem` and
+ * CREWHAUS_PLUGIN_TRUST_ANCHORS), plus `--trust-anchor` (a .pem file or a
+ * directory of them, several separated like PATH). A listed key that cannot
+ * be read stops the install, as it stops a boot. With no key at all nothing
+ * can be verified, so install refuses unless `--allow-unsigned` says an
+ * unverified manifest is acceptable.
+ */
+export function resolveInstallTrustAnchors(opts: {
+  readonly allowUnsigned: boolean;
+  readonly trustAnchorFlag?: string;
+  readonly env?: Readonly<Record<string, string | undefined>>;
+  readonly homeDir?: string;
+}): ReadonlyArray<TrustAnchorSource> {
+  const env = opts.env ?? process.env;
+  const listed = [opts.trustAnchorFlag, env[PLUGIN_TRUST_ANCHORS_ENV]]
+    .filter((v): v is string => v !== undefined && v !== "")
+    .join(delimiter);
+  const { anchors, problems } = loadTrustAnchors({
+    env: { ...env, [PLUGIN_TRUST_ANCHORS_ENV]: listed },
+    ...(opts.homeDir !== undefined ? { homeDir: opts.homeDir } : {}),
+  });
+  if (problems.length > 0) {
+    throw new MarketplaceCliError(`plugin trust anchors: ${problems.join("; ")}`);
+  }
+  if (anchors.length === 0 && !opts.allowUnsigned) {
+    throw new MarketplaceCliError(
+      `no plugin trust anchor is configured, so no manifest can be verified. Put the publisher's Ed25519 public key (a .pem file) in ${defaultTrustAnchorDir(opts.homeDir)}, list .pem files in ${PLUGIN_TRUST_ANCHORS_ENV}, or pass --trust-anchor <pem>. --allow-unsigned installs an unverified manifest (development only).`,
+    );
+  }
+  return anchors.map((a) => ({ kind: "pem", name: a.name, publicKeyPem: a.publicKeyPem }));
+}
+
+/**
+ * The notice for an install outside the directories a boot reads: `crewhaus
+ * run` and compiled bundles load plugins only from `~/.crewhaus/plugins` and
+ * `~/.crewhaus/plugin-registry.json`, so no spec would load it. Undefined when
+ * the install is where a boot looks.
+ */
+export function installLocationNotice(
+  pluginsDir: string,
+  registryPath: string,
+): string | undefined {
+  const defaults = { pluginsDir: defaultPluginsDir(), registryPath: defaultPluginRegistryPath() };
+  if (
+    resolve(pluginsDir) === defaults.pluginsDir &&
+    resolve(registryPath) === defaults.registryPath
+  ) {
+    return undefined;
+  }
+  return `this install is not where a boot looks: crewhaus run and compiled bundles load plugins only from ${defaults.pluginsDir} and ${defaults.registryPath}, so no spec will load it from here.`;
 }
 
 // ---------------------------------------------------------------------------

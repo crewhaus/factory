@@ -60,7 +60,11 @@ export type PluginRegistryEntry = {
   readonly sourcePath: string;
   /** ISO-8601 timestamp. */
   readonly installedAt: string;
-  /** Optional explicit version pin. When empty, follows the manifest's `version`. */
+  /**
+   * Optional explicit version pin. A plugin that is pinned loads only at that
+   * version (activation refuses any other), and the marketplace's `update`
+   * leaves it where it is. When empty, follows the manifest's `version`.
+   */
   readonly pinnedVersion?: string;
 };
 
@@ -83,8 +87,11 @@ export type PluginRegistryOptions = {
   /**
    * When `trustAnchors` are configured, `register()` verifies each manifest's
    * signature and refuses to persist an unsigned or invalidly-signed plugin
-   * (fail closed). Set `allowUnsigned: true` to opt out — e.g. local
-   * development or tests that register fixtures without real signatures.
+   * (fail closed). Set `allowUnsigned: true` to accept an UNSIGNED manifest —
+   * e.g. local development or tests that register fixtures without real
+   * signatures. A signature that is present is still checked against the
+   * anchors: one that does not verify is a tamper signal, not a missing
+   * signature, and the loader would refuse it at boot anyway.
    */
   readonly allowUnsigned?: boolean;
   /**
@@ -103,6 +110,13 @@ export type PluginRegistryOptions = {
 };
 
 export interface PluginRegistry {
+  /**
+   * Throw `PluginRegistryError` when `register()` would refuse `manifest` for
+   * its signature, without writing anything. An installer calls it before it
+   * writes the manifest to disk, so a refused manifest never replaces a
+   * working one there.
+   */
+  verifyManifest?(manifest: PluginManifest): Promise<void>;
   /** Register (or replace) a plugin entry. Throws on duplicate name with different sourcePath unless `replace: true`. */
   register(args: {
     readonly manifest: PluginManifest;
@@ -179,6 +193,13 @@ function parseRegistryFile(text: string): RegistryFileShape {
     }
     const entry = value as Record<string, unknown>;
     const manifest = validatePluginManifest(entry["manifest"]);
+    // register() keys every entry by its manifest's name; one that is not
+    // would make list/outdated describe one plugin while another loads.
+    if (manifest.name !== name) {
+      throw new PluginRegistryError(
+        `plugin-registry: entry "${name}" holds the manifest of plugin "${manifest.name}"; an entry must be keyed by its plugin's name`,
+      );
+    }
     if (typeof entry["sourcePath"] !== "string" || entry["sourcePath"].length === 0) {
       throw new PluginRegistryError(`plugin-registry: entry "${name}" missing sourcePath`);
     }
@@ -255,26 +276,35 @@ export function createPluginRegistry(opts: PluginRegistryOptions): PluginRegistr
     return false;
   }
 
+  // Verify the signature at register time when trust anchors are configured.
+  // Previously any manifest was persisted after schema validation only, so a
+  // forged/unsigned manifest could land in the on-disk registry and be
+  // surfaced to hosts — and folded into aggregatedPermissions — as a trusted,
+  // installed plugin. `allowUnsigned` accepts a manifest with NO signature; a
+  // signature that is there must verify either way.
+  async function assertRegistrable(manifest: PluginManifest): Promise<void> {
+    if (anchors.length === 0) return;
+    const sig = manifest.signature;
+    if (sig === undefined) {
+      if (allowUnsigned) return;
+      throw new PluginRegistryError(
+        `plugin-registry: refusing to register unsigned plugin "${manifest.name}" — trustAnchors are configured (pass allowUnsigned: true to override)`,
+      );
+    }
+    if (!(await verifyManifestSignature(manifest, sig))) {
+      throw new PluginRegistryError(
+        `plugin-registry: signature verification failed for plugin "${manifest.name}" — not registered`,
+      );
+    }
+  }
+
   return {
+    async verifyManifest(manifest): Promise<void> {
+      await assertRegistrable(manifest);
+    },
+
     async register(args): Promise<PluginRegistryEntry> {
-      // Verify the signature at register time when trust anchors are
-      // configured. Previously any manifest was persisted after schema
-      // validation only, so a forged/unsigned manifest could land in the
-      // on-disk registry and be surfaced to hosts — and folded into
-      // aggregatedPermissions — as a trusted, installed plugin.
-      if (anchors.length > 0 && !allowUnsigned) {
-        const sig = args.manifest.signature;
-        if (sig === undefined) {
-          throw new PluginRegistryError(
-            `plugin-registry: refusing to register unsigned plugin "${args.manifest.name}" — trustAnchors are configured (pass allowUnsigned: true to override)`,
-          );
-        }
-        if (!(await verifyManifestSignature(args.manifest, sig))) {
-          throw new PluginRegistryError(
-            `plugin-registry: signature verification failed for plugin "${args.manifest.name}" — not registered`,
-          );
-        }
-      }
+      await assertRegistrable(args.manifest);
       const shape = load();
       const existing = shape.entries[args.manifest.name];
       if (existing && !args.replace && existing.sourcePath !== args.sourcePath) {

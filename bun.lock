@@ -1387,6 +1387,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/otel-exporter": {
@@ -1446,9 +1447,15 @@
         "@crewhaus/plugin-registry": "workspace:*",
         "@crewhaus/plugin-sdk": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+        "zod": "^3.25.0",
       },
       "devDependencies": {
-        "zod": "^3.23.8",
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
       },
     },
     "packages/plugin-registry": {
@@ -1771,6 +1778,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
       },
@@ -2945,6 +2953,12 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/adapter-anthropic": "workspace:*",
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tool-registry-manifest": "workspace:*",
       },
     },
     "packages/tool-media": {
