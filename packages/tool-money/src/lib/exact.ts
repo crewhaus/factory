@@ -70,26 +70,82 @@ export function mathRound(num: bigint, den: bigint): bigint {
 }
 
 /**
- * A fractional money figure — a fractional quantity times an integer price —
- * rounded to whole minor units: to the nearest, a half away from zero. The
- * binary floating-point noise below fifteen significant digits is discarded
- * first, so 2.3 × 1001 is 2302.3 (and rounds to 2302) rather than
- * 2302.2999999999997, and a true half is not read as just under one.
+ * A quantity as the decimal it is written as: `units / 10^scale`, exactly.
+ *
+ * Quantities (kilograms, hours, 0.37 of a coin) are decimals, and a double
+ * cannot hold most of them: 2.3 × 1001 is 2302.2999999999997 in binary. So a
+ * quantity is read as the SHORTEST text that reads back as the same double —
+ * which is the decimal the caller wrote (0.1, 1e-7, 10000000000) — and
+ * counted as a bigint on a decimal scale, where sums, differences and
+ * products with an integer price are exact however many digits they carry.
  */
-export function roundFractionalMinor(value: number, what: string): number {
-  if (!Number.isFinite(value)) throw new InexactAmountError(`${what} is not a finite amount`);
-  const clean = Number(value.toPrecision(15));
-  const rounded = Math.sign(clean) * Math.round(Math.abs(clean));
-  if (!Number.isSafeInteger(rounded)) {
-    throw new InexactAmountError(
-      `${what} comes to about ${clean}, past ±${LIMIT_TEXT}, so it cannot be reported exactly as a number`,
-    );
+export type Decimal = { readonly units: bigint; readonly scale: number };
+
+export function decimalOf(value: number, what: string): Decimal {
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/.exec(String(value));
+  if (match === null) throw new InexactAmountError(`${what} (${value}) is not a finite decimal`);
+  const fraction = match[3] ?? "";
+  let digits = `${match[2]}${fraction}`;
+  let scale = fraction.length - Number(match[4] ?? 0);
+  if (scale < 0) {
+    digits += "0".repeat(-scale);
+    scale = 0;
   }
-  return rounded === 0 ? 0 : rounded;
+  const units = BigInt(digits);
+  return { units: match[1] === "-" ? -units : units, scale };
 }
 
-/** A difference of two decimal quantities without the binary noise (0.3 − 0.1 is 0.2). */
-export function quantityDifference(a: number, b: number): number {
-  const diff = Number((a - b).toPrecision(15));
-  return diff === 0 ? 0 : diff;
+/** `d`'s units on a finer (or equal) `scale`. */
+export function atScale(d: Decimal, scale: number): bigint {
+  return d.units * 10n ** BigInt(scale - d.scale);
+}
+
+/** The exact sum (or, with `sign` −1, difference) of two decimals. */
+export function addDecimal(a: Decimal, b: Decimal, sign: 1n | -1n = 1n): Decimal {
+  const scale = Math.max(a.scale, b.scale);
+  return { units: atScale(a, scale) + sign * atScale(b, scale), scale };
+}
+
+/** Negative, zero or positive as `a` is below, equal to or above `b`. */
+export function compareDecimal(a: Decimal, b: Decimal): number {
+  const scale = Math.max(a.scale, b.scale);
+  const left = atScale(a, scale);
+  const right = atScale(b, scale);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * A decimal back as a JSON number — or a refusal when no double is exactly
+ * it. A quantity is reported as a number, and one that would come back as a
+ * different decimal (1234567890123457 − 0.1) is refused by name rather than
+ * reported off by what the double could not hold.
+ */
+export function decimalNumber(d: Decimal, what: string): number {
+  const negative = d.units < 0n;
+  const magnitude = (negative ? -d.units : d.units).toString();
+  const text =
+    d.scale === 0
+      ? magnitude
+      : `${magnitude.padStart(d.scale + 1, "0").slice(0, -d.scale)}.${magnitude
+          .padStart(d.scale + 1, "0")
+          .slice(-d.scale)}`;
+  const value = Number(`${negative ? "-" : ""}${text}`);
+  if (!Number.isFinite(value) || compareDecimal(decimalOf(value, what), d) !== 0) {
+    throw new InexactAmountError(
+      `${what} comes to ${negative ? "-" : ""}${text}, which a JSON number cannot hold exactly — express the quantities in a coarser unit`,
+    );
+  }
+  return value === 0 ? 0 : value;
+}
+
+/**
+ * `num / den` rounded to whole minor units: to the nearest, a half away from
+ * zero, exactly. A fractional quantity times an integer price is a fraction
+ * of a minor unit; this is how it becomes a whole one.
+ */
+export function roundHalfAwayFromZero(num: bigint, den: bigint): bigint {
+  if (den === 0n) throw new Error("denominator must not be zero");
+  const [n, d] = den < 0n ? [-num, -den] : [num, den];
+  const magnitude = (2n * (n < 0n ? -n : n) + d) / (2n * d);
+  return n < 0n ? -magnitude : magnitude;
 }

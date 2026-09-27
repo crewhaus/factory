@@ -1146,6 +1146,103 @@ describe("amounts are exact, or refused — never silently rounded (C218)", () =
     }
   });
 
+  test("a safe-integer exposure is exact to the unit, not rounded to fifteen digits", () => {
+    // The review's cases: every input a safe integer and every quantity whole,
+    // and the exposure came back 1234567890123460 and 6004799503160660 —
+    // `toPrecision(15)` dropped the digits a double still held exactly.
+    const a = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 1, unitPriceMinor: 1_234_567_890_123_457 }],
+      [{ id: "p", quantity: 1, unitPriceMinor: 1 }],
+    );
+    expect(a.pairs[0]?.exposureMinor).toBe(1_234_567_890_123_456);
+    expect(a.totalExposureMinor).toBe(1_234_567_890_123_456);
+    const b = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 3, unitPriceMinor: 3_002_399_751_580_331 }],
+      [{ id: "p", quantity: 3, unitPriceMinor: 3_002_399_751_580_331 }],
+      [{ poLineId: "p", quantity: 1 }],
+    );
+    expect(b.pairs[0]?.status).toBe("over-receipt");
+    expect(b.pairs[0]?.exposureMinor).toBe(6_004_799_503_160_662);
+    const c = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 3, unitPriceMinor: 1_000_000_000_000_001 }],
+      [{ id: "p", quantity: 3, unitPriceMinor: 1_000_000_000_000_001 }],
+      [{ poLineId: "p", quantity: 1 }],
+    );
+    expect(c.pairs[0]?.exposureMinor).toBe(2_000_000_000_000_002);
+    // The quantity delta too: 1234567890123457 − 1 is 1234567890123456.
+    const d = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 1_234_567_890_123_457, unitPriceMinor: 1 }],
+      [{ id: "p", quantity: 1, unitPriceMinor: 1 }],
+    );
+    expect(d.pairs[0]?.quantityDelta).toBe(1_234_567_890_123_456);
+    // A fractional quantity whose exposure has sixteen digits is exact too:
+    // 1.5 × 1200000000000001 − 1 × 1 = 1800000000000000.5, a half, rounded
+    // away from zero (fifteen digits made it 1800000000000000).
+    const e = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 1.5, unitPriceMinor: 1_200_000_000_000_001 }],
+      [{ id: "p", quantity: 1.5, unitPriceMinor: 1 }],
+      [{ poLineId: "p", quantity: 1 }],
+    );
+    expect(e.pairs[0]?.exposureMinor).toBe(1_800_000_000_000_001);
+  });
+
+  test("an exposure or a quantity no number holds exactly is refused, by name", () => {
+    expect(() =>
+      matchInvoiceToPurchaseOrder(
+        [{ id: "i", poLineId: "p", quantity: 3, unitPriceMinor: 4_000_000_000_000_000 }],
+        [{ id: "p", quantity: 3, unitPriceMinor: 1 }],
+      ),
+    ).toThrow(/invoice line "i" exposure comes to 11999999999999997, past/);
+    // 5000000000000001 − 0.5 is 5000000000000000.5; past 2^52 no double is.
+    expect(() =>
+      matchInvoiceToPurchaseOrder(
+        [{ id: "i", poLineId: "p", quantity: 5_000_000_000_000_001, unitPriceMinor: 1 }],
+        [{ id: "p", quantity: 0.5, unitPriceMinor: 1 }],
+      ),
+    ).toThrow(
+      /invoice line "i" quantity delta comes to 5000000000000000\.5, which a JSON number cannot hold exactly/,
+    );
+  });
+
+  test("receipts and tolerances are compared as the decimals written", () => {
+    // 0.1 + 0.2 received is 0.3 received, so an invoice for 0.3 is not an
+    // over-receipt (in doubles the receipts come to 0.30000000000000004).
+    const received = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [
+        { poLineId: "p", quantity: 0.1 },
+        { poLineId: "p", quantity: 0.2 },
+      ],
+    ).pairs[0];
+    expect(received?.receivedQuantity).toBe(0.3);
+    expect(received?.status).toBe("matched");
+    // 0.33 against 0.3 at 10% is exactly on the bound: within. In doubles
+    // 0.3 × 1000 is 300 and |0.33 − 0.3| × 10 000 is 300.00000000000027.
+    const onBound = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.33, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [],
+      { quantityPercentBps: 1000 },
+    ).pairs[0];
+    expect(onBound?.status).toBe("matched");
+    // And the absolute bound: 0.3 − 0.1 is within 0.2.
+    const absolute = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.3, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.1, unitPriceMinor: 100 }],
+      [],
+      { quantityAbsolute: 0.2 },
+    ).pairs[0];
+    expect(absolute?.status).toBe("matched");
+    const outside = matchInvoiceToPurchaseOrder(
+      [{ id: "i", poLineId: "p", quantity: 0.31, unitPriceMinor: 100 }],
+      [{ id: "p", quantity: 0.1, unitPriceMinor: 100 }],
+      [],
+      { quantityAbsolute: 0.2 },
+    ).pairs[0];
+    expect(outside?.status).toBe("quantity-variance");
+  });
+
   test("ten disposals of 0.1 consume a lot of 1 completely, and its cost to the unit", () => {
     const disposals = Array.from({ length: 10 }, (_, i) => ({
       id: `d${i}`,

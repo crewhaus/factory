@@ -20,7 +20,7 @@
  * tolerance for binary noise would have to guess which remainders are real.
  */
 
-import { addExact, big, mathRound, sumExact, toNumber } from "./exact";
+import { addExact, big, decimalOf, mathRound, sumExact, toNumber } from "./exact";
 
 export const LOT_METHODS = ["fifo", "lifo", "hifo", "specific"] as const;
 export type LotMethod = (typeof LOT_METHODS)[number];
@@ -80,24 +80,6 @@ const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
  * read as consuming them: a caller's own float sum (0.1 + 0.2 is
  * 0.30000000000000004) is not a claim to hold more than was bought.
  */
-
-/** A quantity as the decimal it is written as: `units / 10^scale`. */
-type DecimalQuantity = { readonly units: bigint; readonly scale: number };
-
-function decimalOf(value: number, what: string): DecimalQuantity {
-  // The shortest text that reads back as the same double is the decimal the
-  // caller wrote: 0.1, 1e-7, 10000000000.
-  const match = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/.exec(String(value));
-  if (match === null) throw new Error(`${what} (${value}) is not a positive decimal quantity`);
-  const fraction = match[2] ?? "";
-  let digits = `${match[1]}${fraction}`;
-  let scale = fraction.length - Number(match[3] ?? 0);
-  if (scale < 0) {
-    digits += "0".repeat(-scale);
-    scale = 0;
-  }
-  return { units: BigInt(digits), scale };
-}
 
 /** `units / 10^scale` back as a number: the double nearest the exact decimal. */
 function quantityNumber(units: bigint, scale: number): number {
