@@ -288,7 +288,7 @@ describe("credentials", () => {
     const encoded = Buffer.from("ada:pw").toString("base64");
     expect(
       applyAuth(basic, { type: "basic", envVar: "PASS", username: "ada" }, cfg, env),
-    ).toMatchObject({ ok: true, secrets: ["pw", "ada:pw", encoded] });
+    ).toMatchObject({ ok: true, secrets: ["pw", { publicPrefix: "ada:", secret: "pw" }] });
     expect(basic["Authorization"]).toBe(`Basic ${encoded}`);
 
     const custom: Record<string, string> = {};

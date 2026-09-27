@@ -54,6 +54,80 @@ describe("a secret a cut left at a string's edge (C050, net review)", () => {
   });
 });
 
+describe("a composite whose start is not secret (net regression review)", () => {
+  // A Basic header sends `user:secret`. The username is the account's
+  // public name: results show it as a login, an assignee, an email, a URL.
+  const USER = "deploybot";
+  const PASSWORD = "Xk9-quartz-lantern-77";
+  const values = [PASSWORD, { publicPrefix: `${USER}:`, secret: PASSWORD }];
+
+  test("text that is or ends with the username is left alone", () => {
+    const doc = {
+      login: USER,
+      greeting: `Logged in as ${USER}`,
+      link: `https://x.example/user?name=${USER}`,
+      email: "ci-bot@company.com",
+      issues: [{ key: "OPS-1", assignee: USER }],
+    };
+    expect(redactKnownSecretsDeep(doc, values)).toEqual(doc);
+    const email = "ci-bot@company.com";
+    const emailValues = [PASSWORD, { publicPrefix: `${email}:`, secret: PASSWORD }];
+    expect(redactKnownSecrets(`reporter ${email}`, emailValues)).toBe(`reporter ${email}`);
+    // Up to the colon is still the username's.
+    expect(redactKnownSecrets(`as ${USER}:`, values)).toBe(`as ${USER}:`);
+    expect(trimSecretTail(`cut at ${USER}:`, values)).toBe(`cut at ${USER}:`);
+  });
+
+  test("every spelling of the pair is still redacted whole, and a cut past the username is caught", () => {
+    const pair = `${USER}:${PASSWORD}`;
+    const b64 = Buffer.from(pair).toString("base64");
+    let checked = 0;
+    for (const leak of [
+      pair,
+      b64,
+      encodeURIComponent(pair),
+      Buffer.from(pair).toString("base64url"),
+    ]) {
+      expect(redactKnownSecrets(`echo ${leak} end`, values)).toBe(`echo ${REDACTED} end`);
+      checked += 1;
+    }
+    expect(checked).toBe(4);
+    // The backstop: six characters of the secret past `user:` at the end.
+    expect(redactKnownSecrets(`echo ${pair.slice(0, USER.length + 1 + 6)}`, values)).toBe(
+      `echo ${REDACTED}`,
+    );
+    expect(redactKnownSecrets(`Basic ${b64.slice(0, -2)}`, values)).toBe(`Basic ${REDACTED}`);
+    // A caller that cut the text trims one character past the username.
+    expect(trimSecretTail(`cut ${pair.slice(0, USER.length + 2)}`, values)).toBe("cut ");
+    expect(trimSecretTail(`Basic ${b64.slice(0, 16)}`, values)).toBe("Basic ");
+    // ...but not a base64 run that spells only the username's bytes.
+    const userOnly = Buffer.from(`${USER}:`).toString("base64").slice(0, 13);
+    expect(trimSecretTail(`Basic ${userOnly}`, values)).toBe(`Basic ${userOnly}`);
+  });
+
+  test("secretForms of a composite are the whole value's spellings", () => {
+    const forms = secretForms({ publicPrefix: "ada:", secret: "pw-123456" });
+    expect(forms).toContain("ada:pw-123456");
+    expect(forms).toContain(Buffer.from("ada:pw-123456").toString("base64"));
+    expect(forms).not.toContain("pw-123456");
+  });
+});
+
+describe("the JSON spelling of '/' as '\\/' (net attacker review)", () => {
+  // PHP's json_encode, among others, writes every solidus as `\/`.
+  const KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+  const php = (v: unknown): string => JSON.stringify(v).replaceAll("/", "\\/");
+
+  test("an echo in that spelling is redacted, whole and cut", () => {
+    const echoed = php({ key: KEY });
+    expect(echoed).toContain("wJalrXUtnFEMI\\/K7MDENG");
+    expect(redactKnownSecrets(echoed, [KEY])).toBe(`{"key":"${REDACTED}"}`);
+    const cut = echoed.slice(0, -4);
+    expect(trimSecretTail(cut, [KEY])).toBe('{"key":"');
+    expect(secretForms(KEY)).toContain(KEY.replaceAll("/", "\\/"));
+  });
+});
+
 describe("redactKnownSecrets", () => {
   test("a secret echoed in a response body is replaced (config-delivery#4, security-8#4)", () => {
     const body = `{"headers":{"x-anything":"${SECRET}"},"ok":true}`;

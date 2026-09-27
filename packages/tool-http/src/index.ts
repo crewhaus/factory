@@ -52,6 +52,7 @@ import type { DetailedPeerCertificate } from "node:tls";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import {
+  type SecretValue,
   redactKnownSecrets,
   redactKnownSecretsDeep,
   secretForms,
@@ -222,7 +223,7 @@ function prepareHeaders(
   raw: Record<string, string> | undefined,
   auth: AuthProfile | undefined,
   cfg: HttpConfig,
-  secrets: string[],
+  secrets: SecretValue[],
 ): PreparedHeaders {
   const headers: Record<string, string> = { ...(raw ?? {}) };
   const inline = rejectInlineCredentials(headers);
@@ -251,10 +252,14 @@ function prepareHeaders(
  * still parses.
  */
 function scrubbing<TInput>(
-  run: (input: TInput, ctx: ToolExecuteContext | undefined, secrets: string[]) => Promise<string>,
+  run: (
+    input: TInput,
+    ctx: ToolExecuteContext | undefined,
+    secrets: SecretValue[],
+  ) => Promise<string>,
 ): (input: TInput, ctx?: ToolExecuteContext) => Promise<string> {
   return async (input, ctx) => {
-    const secrets: string[] = [];
+    const secrets: SecretValue[] = [];
     const out = await run(input, ctx, secrets);
     if (secrets.length === 0) return out;
     try {
@@ -281,7 +286,7 @@ function setDefaultHeader(headers: Record<string, string>, name: string, value: 
  */
 function parseJsonBody(
   text: string,
-  secrets: readonly string[],
+  secrets: readonly SecretValue[],
 ): { ok: true; value: unknown } | { ok: false; message: string } {
   try {
     return { ok: true, value: JSON.parse(text) };
@@ -300,10 +305,10 @@ function parseJsonBody(
  * scrubbed on its way out; a file written to the workspace is not, and any
  * later Read would return it whole (C050).
  */
-function holdsSecret(bytes: Uint8Array, secrets: readonly string[]): boolean {
+function holdsSecret(bytes: Uint8Array, secrets: readonly SecretValue[]): boolean {
   const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   for (const value of secrets) {
-    if (value.trim().length < 6) continue;
+    if ((typeof value === "string" ? value : value.secret).trim().length < 6) continue;
     for (const form of secretForms(value)) {
       if (form.length >= 6 && buf.includes(form)) return true;
     }

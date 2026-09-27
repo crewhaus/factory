@@ -40,7 +40,9 @@ export {
 export {
   REDACTED,
   REDACTED_URL_PART,
+  type ComposedSecret,
   type RedactOptions,
+  type SecretValue,
   createSecretRedactor,
   isCredentialParam,
   redactKnownSecrets,

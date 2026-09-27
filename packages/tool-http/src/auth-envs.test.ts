@@ -16,7 +16,7 @@
  * every spelling of a resolved secret is scrubbed from what comes back.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -55,6 +55,23 @@ function recorder(name: string) {
     }
     if (url.pathname === "/notjson") {
       return new Response(`oops ${authorization} and ${encodeURIComponent(authorization ?? "")}`);
+    }
+    if (url.pathname === "/whoami") {
+      // An API that answers with the account the Basic header named.
+      const basic = (authorization ?? "").replace(/^Basic /, "");
+      const user = Buffer.from(basic, "base64").toString("utf8").split(":")[0] ?? "";
+      return Response.json({
+        login: user,
+        greeting: `Logged in as ${user}`,
+        link: `https://x.example/user?name=${user}`,
+        issues: [{ key: "OPS-1", assignee: user }],
+        echo: authorization,
+      });
+    }
+    if (url.pathname === "/php" || url.pathname === "/php.html") {
+      // PHP's json_encode writes every "/" as "\/", a legal JSON escape.
+      const php = JSON.stringify({ authorization, apiKey }).replaceAll("/", "\\/");
+      return new Response(url.pathname === "/php" ? php : `<pre>${php}</pre>`);
     }
     if (url.pathname === "/sse") {
       return new Response(`data: ${authorization}\n\n`, {
@@ -251,6 +268,71 @@ describe("what a server echoes of a listed credential is scrubbed", () => {
     expect(seen[0]?.authorization).toBe(`Basic ${Buffer.from(pair).toString("base64")}`);
     for (const form of [...forms(LISTED_VALUE), ...forms(pair)]) expect(out).not.toContain(form);
     expect(out).toContain("Basic <redacted>");
+  });
+});
+
+describe("a basic profile's username is not a secret (net regression review)", () => {
+  test("a result that shows the account keeps its name, and still carries no spelling of the password", async () => {
+    registerHttpConfig({ allowed_origins: [originA], allowed_auth_envs: [LISTED] });
+    let checked = 0;
+    for (const username of ["deploybot", "ci-bot@company.com"]) {
+      const out = JSON.parse(
+        await call(httpRequest, {
+          url: `${originA}/whoami`,
+          parseJson: true,
+          auth: { type: "basic", envVar: LISTED, username },
+        }),
+      );
+      expect(out.json).toMatchObject({
+        login: username,
+        greeting: `Logged in as ${username}`,
+        link: `https://x.example/user?name=${username}`,
+        issues: [{ key: "OPS-1", assignee: username }],
+        echo: "Basic <redacted>",
+      });
+      const text = JSON.stringify(out);
+      const pair = `${username}:${LISTED_VALUE}`;
+      for (const leak of [LISTED_VALUE, pair, Buffer.from(pair).toString("base64")]) {
+        expect(text).not.toContain(leak);
+      }
+      checked += 1;
+    }
+    expect(checked).toBe(2);
+  });
+});
+
+describe("a credential echoed with '/' written as '\\/' is scrubbed (net attacker review)", () => {
+  const auth = { type: "header", headerName: "X-Api-Key", envVar: LISTED } as const;
+  const escaped = LISTED_VALUE.replaceAll("/", "\\/");
+
+  test("HttpRequest and the read-only HttpWaitFor return none of it", async () => {
+    registerHttpConfig({ allowed_origins: [originA], allowed_auth_envs: [LISTED] });
+    const request = await call(httpRequest, { url: `${originA}/php`, auth });
+    const waited = await call(httpWaitFor, {
+      url: `${originA}/php.html`,
+      auth,
+      expectJson: { path: "x", op: "exists" },
+      timeoutMs: 1_000,
+      intervalMs: 5_000,
+    });
+    expect(seen.length).toBe(2);
+    let checked = 0;
+    for (const out of [request, waited]) {
+      expect(out).not.toContain(escaped);
+      expect(out).not.toContain(escaped.replaceAll("\\", "\\\\"));
+      expect(out).toContain("<redacted>");
+      checked += 1;
+    }
+    expect(checked).toBe(2);
+  });
+
+  test("DownloadFile refuses to write it", async () => {
+    registerHttpConfig({ allowed_origins: [originA], allowed_auth_envs: [LISTED] });
+    const out = await call(downloadFile, { url: `${originA}/php`, path: "k.json", auth });
+    expect(seen.length).toBe(1);
+    expect(existsSync(path.join(workspace, "k.json"))).toBe(false);
+    expect(out).not.toContain(escaped);
+    expect(out).toContain("credential");
   });
 });
 

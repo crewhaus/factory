@@ -44,6 +44,7 @@ import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
 import {
+  type SecretValue,
   isEnvName,
   looksLikePastedSecret,
   resolveCredentialEnv,
@@ -854,11 +855,13 @@ export type AppliedAuth =
       /** Lowercased names of the headers the profile set. */
       readonly secretHeaders: ReadonlySet<string>;
       /**
-       * Every spelling of the credential a server could echo back, for the
-       * redactor: the secret, and for `basic` the `user:secret` pair and its
-       * base64 (which cannot be derived from the secret alone).
+       * The credential values a server could echo back, for the redactor:
+       * the secret, and for `basic` the `user:secret` pair (whose base64
+       * cannot be derived from the secret alone). The pair's `user:` is the
+       * account name, not a secret: a result that ends with it is left
+       * alone (net regression review).
        */
-      readonly secrets: readonly string[];
+      readonly secrets: readonly SecretValue[];
       /** The origins the credential may be sent to, when the operator bound it. */
       readonly credentialOrigins: ReadonlySet<string> | undefined;
     }
@@ -907,13 +910,13 @@ export function applyAuth(
         message: 'auth type "basic" needs a username; the password comes from envVar',
       };
     }
-    const pair = `${auth.username}:${secret}`;
-    const encoded = Buffer.from(pair, "utf8").toString("base64");
+    const publicPrefix = `${auth.username}:`;
+    const encoded = Buffer.from(`${publicPrefix}${secret}`, "utf8").toString("base64");
     headers["Authorization"] = `Basic ${encoded}`;
     return {
       ok: true,
       secretHeaders: new Set(["authorization"]),
-      secrets: [secret, pair, encoded],
+      secrets: [secret, { publicPrefix, secret }],
       credentialOrigins,
     };
   }
@@ -1266,7 +1269,7 @@ export async function readCapped(
   res: Response,
   maxBytes: number,
   signal?: AbortSignal,
-  secrets: readonly string[] = [],
+  secrets: readonly SecretValue[] = [],
 ): Promise<CappedBody> {
   const raw = await readBytesCapped(res, maxBytes, signal);
   return {
