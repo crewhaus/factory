@@ -50,8 +50,9 @@
  *     in its error: a repository's config could have a read echo the first
  *     line of a file outside the workspace. `-c blame.ignoreRevsFile=` does
  *     not clear it (git applies the reset before the repository's value);
- *     the flag does. A reader who wants those revisions skipped passes them
- *     as `ref` ranges instead.
+ *     the flag does. GitBlame then reads the configured files itself, under
+ *     containment, and hands git a private copy (`./blame-ignore`), so the
+ *     `.git-blame-ignore-revs` convention still works.
  *   - Every read: `core.hooksPath=/dev/null`. A read can still WRITE the
  *     index: `git diff` that finds a tracked file whose stat data changed
  *     but whose bytes did not refreshes the index and writes it back, with

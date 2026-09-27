@@ -27,6 +27,7 @@ import * as nodePath from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { blameIgnoreRevs } from "./blame-ignore";
 import {
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
@@ -390,28 +391,38 @@ export const gitBlame: RegisteredTool = buildTool({
       input.startLine === undefined
         ? []
         : ["-L", `${input.startLine},${input.endLine ?? input.startLine}`];
-    const run = await repo.run(
-      [
-        "blame",
-        "--line-porcelain",
-        ...range,
-        ...(input.ref !== undefined ? [input.ref] : []),
-        "--",
-        input.path,
-      ],
-      { readOnly: true },
-    );
-    if (run.code !== 0) return failure("GitBlame", run);
-    const all = parseBlamePorcelain(run.stdout);
-    const max = input.maxLines ?? 500;
-    const lines = all.slice(0, max);
-    return json({
-      path: input.path,
-      count: lines.length,
-      truncated: all.length > max || run.truncated,
-      lines,
-      ...repoConfigNote(repo),
-    });
+    // blame.ignoreRevsFile, read under containment and handed to git as a
+    // private copy (see ./blame-ignore); git itself never opens the path.
+    const ignore = await blameIgnoreRevs(repo);
+    try {
+      const run = await repo.run(
+        [
+          "blame",
+          "--line-porcelain",
+          ...ignore.args,
+          ...range,
+          ...(input.ref !== undefined ? [input.ref] : []),
+          "--",
+          input.path,
+        ],
+        { readOnly: true },
+      );
+      if (run.code !== 0) return failure("GitBlame", run);
+      const all = parseBlamePorcelain(run.stdout);
+      const max = input.maxLines ?? 500;
+      const lines = all.slice(0, max);
+      return json({
+        path: input.path,
+        count: lines.length,
+        truncated: all.length > max || run.truncated,
+        lines,
+        ...(ignore.honoured.length > 0 ? { ignoringRevisionsFrom: ignore.honoured } : {}),
+        ...(ignore.notHonoured.length > 0 ? { ignoreRevsNote: ignore.notHonoured.join(" ") } : {}),
+        ...repoConfigNote(repo),
+      });
+    } finally {
+      ignore.cleanup();
+    }
   },
 });
 

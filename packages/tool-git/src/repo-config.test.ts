@@ -19,14 +19,17 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { parseIgnoreRevs } from "./blame-ignore";
 import { GLOBAL_ARGS, runGit } from "./git-run";
 import {
   hardenReadArgs,
@@ -769,5 +772,184 @@ describe("the hardening, piece by piece", () => {
     const result = neutraliseRepositoryFilters(listing(["local", "filter.a=b.clean", "x"]), true);
     expect(result.ok).toBe(false);
     expect(!result.ok && result.reason).toContain("cannot switch off");
+  });
+});
+
+/**
+ * blame.ignoreRevsFile (reviewer finding beside C007): every read passes
+ * `--no-ignore-revs-file`, so git never opens a path the config names, and
+ * GitBlame reads the configured files itself and hands git a private copy.
+ * The convention — a committed `.git-blame-ignore-revs` listing a formatting
+ * commit — must still see through that commit; a repository's config must
+ * still not choose a file outside the workspace, a link out of it or a FIFO.
+ */
+describe("GitBlame honours blame.ignoreRevsFile, contained (reviewer finding)", () => {
+  let fmt: string;
+  let styleSha: string;
+  const who = (name: string) => ["-c", `user.name=${name}`, "-c", `user.email=${name}@x.test`];
+  const authors = async (input: Record<string, unknown> = {}) => {
+    const out = JSON.parse(
+      await call(gitBlame, { cwd: "fmt", path: "a.py", timeout: 10_000, ...input }),
+    ) as Record<string, unknown>;
+    const lines = out["lines"] as Array<Record<string, unknown>>;
+    return { out, authors: lines.map((l) => l["author"]) };
+  };
+
+  beforeEach(() => {
+    fmt = join(workspace, "fmt");
+    mkdirSync(join(fmt, "sub"), { recursive: true });
+    git(["init", "-q", "-b", "main"], fmt);
+    writeFileSync(join(fmt, "a.py"), "x=1\ny=2\n");
+    writeFileSync(join(fmt, "sub", "c.py"), "z=3\n");
+    git([...who("alice"), "add", "-A"], fmt);
+    git([...who("alice"), "commit", "-q", "-m", "code"], fmt);
+    writeFileSync(join(fmt, "a.py"), "x = 1\ny = 2\n");
+    writeFileSync(join(fmt, "sub", "c.py"), "z = 3\n");
+    git([...who("bot"), "commit", "-q", "-am", "style: reformat"], fmt);
+    styleSha = git(["rev-parse", "HEAD"], fmt).out.trim();
+    writeFileSync(join(fmt, ".git-blame-ignore-revs"), `# formatting\n${styleSha}\n`);
+  });
+
+  test("the fixture is live: git honours the file, and --no-ignore-revs-file does not", () => {
+    git(["config", "blame.ignoreRevsFile", ".git-blame-ignore-revs"], fmt);
+    const plain = git(["blame", "--line-porcelain", "a.py"], fmt).out;
+    const off = git(["blame", "--no-ignore-revs-file", "--line-porcelain", "a.py"], fmt).out;
+    const names = (text: string) =>
+      text
+        .split("\n")
+        .filter((l) => l.startsWith("author "))
+        .map((l) => l.slice(7));
+    expect({ plain: names(plain), off: names(off) }).toEqual({
+      plain: ["alice", "alice"],
+      off: ["bot", "bot"],
+    });
+  });
+
+  test("the repository's own config naming the committed file", async () => {
+    git(["config", "blame.ignoreRevsFile", ".git-blame-ignore-revs"], fmt);
+    const { out, authors: got } = await authors();
+    expect({ got, from: out["ignoringRevisionsFrom"], note: out["ignoreRevsNote"] }).toEqual({
+      got: ["alice", "alice"],
+      from: [".git-blame-ignore-revs"],
+      note: undefined,
+    });
+    // Run from a subdirectory: the name resolves against the top level, as git does.
+    const sub = await authors({ cwd: "fmt/sub", path: "c.py" });
+    expect(sub.authors).toEqual(["alice"]);
+  });
+
+  test("the operator's global config naming it by a bare relative name", async () => {
+    const global = join(workspace, "global.gitconfig");
+    writeFileSync(global, "[blame]\n\tignoreRevsFile = .git-blame-ignore-revs\n");
+    process.env["GIT_CONFIG_GLOBAL"] = global;
+    try {
+      const { authors: got } = await authors();
+      expect(got).toEqual(["alice", "alice"]);
+    } finally {
+      process.env["GIT_CONFIG_GLOBAL"] = "/dev/null";
+    }
+  });
+
+  test("a file outside the workspace: the operator's config may name it, the repository's may not", async () => {
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-ignore-revs-")));
+    try {
+      const file = join(outside, "revs");
+      writeFileSync(file, `${styleSha}\n`);
+      git(["config", "blame.ignoreRevsFile", file], fmt);
+      const repoNamed = await authors();
+      expect(repoNamed.authors).toEqual(["bot", "bot"]);
+      expect(String(repoNamed.out["ignoreRevsNote"])).toContain("outside the workspace");
+      expect(repoNamed.out["ignoringRevisionsFrom"]).toBeUndefined();
+
+      git(["config", "--unset", "blame.ignoreRevsFile"], fmt);
+      const global = join(workspace, "global.gitconfig");
+      writeFileSync(global, `[blame]\n\tignoreRevsFile = ${file}\n`);
+      process.env["GIT_CONFIG_GLOBAL"] = global;
+      try {
+        expect((await authors()).authors).toEqual(["alice", "alice"]);
+      } finally {
+        process.env["GIT_CONFIG_GLOBAL"] = "/dev/null";
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a committed name linked out of the workspace is not read, even when the operator names it", async () => {
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-ignore-revs-")));
+    try {
+      writeFileSync(join(outside, "revs"), `${styleSha}\n`);
+      rmSync(join(fmt, ".git-blame-ignore-revs"));
+      symlinkSync(join(outside, "revs"), join(fmt, ".git-blame-ignore-revs"));
+      const global = join(workspace, "global.gitconfig");
+      writeFileSync(global, "[blame]\n\tignoreRevsFile = .git-blame-ignore-revs\n");
+      process.env["GIT_CONFIG_GLOBAL"] = global;
+      try {
+        const { out, authors: got } = await authors();
+        expect(got).toEqual(["bot", "bot"]);
+        expect(String(out["ignoreRevsNote"])).toContain(".git-blame-ignore-revs");
+      } finally {
+        process.env["GIT_CONFIG_GLOBAL"] = "/dev/null";
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a FIFO the repository names is refused without being opened",
+    async () => {
+      Bun.spawnSync(["mkfifo", join(fmt, "pipe")]);
+      git(["config", "blame.ignoreRevsFile", "pipe"], fmt);
+      const { out, authors: got } = await authors();
+      expect(got).toEqual(["bot", "bot"]);
+      expect(String(out["ignoreRevsNote"])).toContain('"pipe"');
+    },
+    20_000,
+  );
+
+  test("a file git could not parse is not used, and its content is never echoed", async () => {
+    writeFileSync(join(fmt, "revs"), `${styleSha}\nhunter2-not-an-object\n`);
+    git(["config", "blame.ignoreRevsFile", "revs"], fmt);
+    const { out, authors: got } = await authors();
+    expect(got).toEqual(["bot", "bot"]);
+    expect(String(out["ignoreRevsNote"])).toContain("line 2");
+    expect(JSON.stringify(out)).not.toContain("hunter2");
+  });
+
+  test("a missing file is named, and the blame still answers", async () => {
+    git(["config", "blame.ignoreRevsFile", "nope.txt"], fmt);
+    const { out, authors: got } = await authors();
+    expect(got).toEqual(["bot", "bot"]);
+    expect(String(out["ignoreRevsNote"])).toContain('"nope.txt"');
+  });
+
+  test("the private copy is gone after the call", async () => {
+    git(["config", "blame.ignoreRevsFile", ".git-blame-ignore-revs"], fmt);
+    // A temp directory of this test's own, so nothing else writing to the
+    // shared one can make the listing lie either way.
+    const scratch = join(workspace, "tmp");
+    mkdirSync(scratch);
+    const savedTmp = process.env["TMPDIR"];
+    process.env["TMPDIR"] = scratch;
+    try {
+      const { authors: got } = await authors();
+      expect({ got, left: readdirSync(scratch) }).toEqual({ got: ["alice", "alice"], left: [] });
+    } finally {
+      if (savedTmp === undefined) Reflect.deleteProperty(process.env, "TMPDIR");
+      else process.env["TMPDIR"] = savedTmp;
+    }
+  });
+});
+
+describe("parseIgnoreRevs reads git's format", () => {
+  test("comments, blank lines and both hash lengths", () => {
+    const sha1 = "a".repeat(40);
+    const sha256 = "B".repeat(64);
+    expect(parseIgnoreRevs(`# header\n\n  ${sha1}  # trailing\n${sha256}\n`)).toEqual({
+      ok: true,
+      names: [sha1, "b".repeat(64)],
+    });
+    expect(parseIgnoreRevs(`${sha1}\nabc123\n`)).toEqual({ ok: false, line: 2 });
   });
 });
