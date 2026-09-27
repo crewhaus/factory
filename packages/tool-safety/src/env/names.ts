@@ -50,6 +50,10 @@ const ANYWHERE: readonly string[] = [
   "SIGNINGKEY",
   "CONNECTIONSTRING",
   "CONNSTR",
+  // A wallet's seed words are its private key.
+  "MNEMONIC",
+  "SEEDPHRASE",
+  "RECOVERYPHRASE",
 ];
 
 /**

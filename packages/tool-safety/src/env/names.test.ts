@@ -51,6 +51,11 @@ describe("isCredentialShapedName", () => {
       "x-api-key",
       "Authorization",
       "pwd",
+      "WALLET_MNEMONIC",
+      "mnemonic",
+      "SEED_PHRASE",
+      "seedPhrase",
+      "RECOVERY_PHRASE",
     ];
     const missed = credentials.filter((n) => !isCredentialShapedName(n));
     expect(missed).toEqual([]);
@@ -81,6 +86,9 @@ describe("isCredentialShapedName", () => {
       "NEXT_PUBLIC_SITE_URL",
       "OAUTH_CLIENT_ID",
       "CREWHAUS_SESSION_DIR",
+      // A random seed is not a seed phrase.
+      "RANDOM_SEED",
+      "SEED",
     ];
     const flagged = ordinary.filter((n) => isCredentialShapedName(n));
     expect(flagged).toEqual([]);
