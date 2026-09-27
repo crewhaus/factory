@@ -595,6 +595,30 @@ describe("DatasetInspect", () => {
     expect(result.sources).toEqual({ human_authored: 1, weird: 1, "(none)": 1 });
     expect(result.offTaxonomySources).toEqual([{ source: "weird", count: 1 }]);
   });
+
+  test("a source named like an Object.prototype member is counted like any other", async () => {
+    const sources = ["__proto__", "__proto__", "constructor", "toString", "human_authored"];
+    await ok(datasetPut, {
+      name: "qa",
+      samples: sources.map((source, i) => ({ id: `s${i}`, input: `x${i}`, metadata: { source } })),
+    });
+    const result = await ok(datasetInspect, { dataset: "qa" });
+    // 0.7.0 lost both __proto__ samples and wrote constructor's count as a
+    // string of function source, so the histogram did not sum to sampleCount.
+    // (Asserted as entries: an object literal with a __proto__ key would set
+    // the literal's prototype instead of naming a key.)
+    expect(Object.entries(result.sources).sort()).toEqual([
+      ["__proto__", 2],
+      ["constructor", 1],
+      ["human_authored", 1],
+      ["toString", 1],
+    ]);
+    const total = Object.values(result.sources as Record<string, number>).reduce(
+      (a, b) => a + b,
+      0,
+    );
+    expect(total).toBe(result.sampleCount);
+  });
 });
 
 // ---------------------------------------------------------------------------

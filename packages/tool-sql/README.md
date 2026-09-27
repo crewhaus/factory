@@ -110,6 +110,13 @@ result unless the caller selected the column holding it.
 - **`TableStats` row counts are exact**, which means a full scan of every
   table. On a large database that is the expensive call; it stops at the
   timeout and says how far it got.
+- **CSV cells are written verbatim, formulas included.** A text value that
+  starts with `=`, `+`, `-`, `@`, a tab or a carriage return is a formula to
+  Excel and Google Sheets, and user-submitted text is the classic source. The
+  file stays byte-for-byte what the database holds, so it round-trips through
+  `ImportCsv`; when the data is untrusted and a person will open the file,
+  neutralize it in the query:
+  `CASE WHEN substr(t,1,1) IN ('=','+','-','@',char(9),char(13)) THEN '''' || t ELSE t END AS t`.
 - **CSV cannot distinguish NULL from an empty string.** `ExportCsv` writes
   both as an empty field and says so; `ImportCsv` reads an empty cell as NULL
   by default and as `""` when asked.

@@ -1384,3 +1384,16 @@ describe("recurrence: expansion", () => {
     }
   });
 });
+
+describe("cron: a macro name is looked up in its own table only", () => {
+  test("a prototype member's name is an ordinary unknown expression, not a crash", () => {
+    // MACROS["constructor"] read Object, and parsing threw
+    // "expanded.startsWith is not a function".
+    const unknown = parseCron("nosuch");
+    expect(unknown.ok).toBe(false);
+    for (const name of ["constructor", "toString", "valueOf", "__proto__", "hasOwnProperty"]) {
+      expect({ name, result: parseCron(name) }).toEqual({ name, result: unknown });
+    }
+    expect(parseCron("@daily").ok).toBe(true);
+  });
+});

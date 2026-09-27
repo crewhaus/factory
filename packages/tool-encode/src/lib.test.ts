@@ -1235,3 +1235,14 @@ describe("keccak256, against published vectors", () => {
     expect(keccak256Hex("a".repeat(136))).not.toBe(keccak256Hex("a".repeat(137)));
   });
 });
+
+describe("a UUID namespace name is looked up in its own table only", () => {
+  test("a prototype member's name is refused as not a UUID, not a crash", async () => {
+    // UUID_NAMESPACES["constructor"] read Object, and parseUuid threw
+    // "text.trim is not a function".
+    for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      await expect(uuidNamed(5, name, "x")).rejects.toThrow(/is neither a UUID nor one of/);
+    }
+    expect(await uuidNamed(5, "url", "https://example.com")).toMatch(/^[0-9a-f-]{36}$/);
+  });
+});

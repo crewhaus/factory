@@ -10,6 +10,7 @@
  * that quietly rewrote output would let a real regression hide inside a
  * masked span, which is the one failure worse than a brittle golden.
  */
+import { type RegexSession, describeRegexOutcome, runRegex } from "@crewhaus/tool-safety/regex";
 
 export const NORMALIZERS = [
   "timestamps",
@@ -35,7 +36,33 @@ export type NormalizeOptions = {
     readonly with: string;
     readonly flags?: string;
   }>;
+  /**
+   * Where caller rules run. A caller's pattern runs in a terminable worker
+   * under a deadline (`@crewhaus/tool-safety/regex`), never synchronously on
+   * this thread: `^(a+)+$` over 40 characters, or `a*a*a*b` over 1,000,
+   * held the harness for seconds to minutes. Pass a session to reuse one
+   * worker across many texts (a tree compare), and the tool's abort signal.
+   */
+  readonly regex?: {
+    readonly session?: RegexSession;
+    readonly signal?: AbortSignal;
+    readonly runawayKey?: string;
+  };
 };
+
+/** Longest text a caller's replace rule runs over: GoldenCompare's own input cap. */
+export const MAX_REPLACE_INPUT_CHARS = 16 * 1024 * 1024;
+/** How long one caller rule may take over one text before it is undetermined. */
+export const REPLACE_DEADLINE_MS = 5_000;
+
+/**
+ * A caller's replace rule that could not be applied: refused as invalid or
+ * catastrophic, or not finished in time. The text it would have produced is
+ * unknown, so nothing may be compared or stored from it.
+ */
+export class ReplaceRuleError extends Error {
+  override readonly name = "ReplaceRuleError";
+}
 
 export type NormalizeResult = {
   readonly text: string;
@@ -76,12 +103,17 @@ const RULES: ReadonlyArray<{ name: Normalizer; pattern: RegExp; with: string }> 
   { name: "hashes", pattern: /\b[0-9a-f]{32,128}\b/g, with: "<hash>" },
   { name: "ports", pattern: /:\d{4,5}\b/g, with: ":<port>" },
   { name: "ansi", pattern: ANSI, with: "" },
-  { name: "trailingWhitespace", pattern: /[ \t]+$/gm, with: "" },
+  // Tried only from the start of a run: `/[ \t]+$/gm` retried from every
+  // space of a long run that does not end the line, which is quadratic.
+  { name: "trailingWhitespace", pattern: /(?<![ \t])[ \t]+$/gm, with: "" },
   { name: "crlf", pattern: /\r\n/g, with: "\n" },
   { name: "blankLines", pattern: /\n{3,}/g, with: "\n\n" },
 ];
 
-export function normalizeOutput(text: string, options: NormalizeOptions): NormalizeResult {
+export async function normalizeOutput(
+  text: string,
+  options: NormalizeOptions,
+): Promise<NormalizeResult> {
   const applied: Record<string, number> = {};
   let out = text;
 
@@ -110,18 +142,33 @@ export function normalizeOutput(text: string, options: NormalizeOptions): Normal
   }
 
   for (const [i, rule] of (options.replace ?? []).entries()) {
-    let re: RegExp;
-    try {
-      re = new RegExp(rule.pattern, rule.flags ?? "g");
-    } catch (err) {
-      throw new Error(`replace rule ${i} has an invalid pattern: ${(err as Error).message}`);
+    const request = {
+      op: "replace" as const,
+      pattern: rule.pattern,
+      flags: rule.flags ?? "g",
+      input: out,
+      // `with` is literal text, as it always was: `$` has no meaning in it.
+      replacement: rule.with.replaceAll("$", "$$$$"),
+      deadlineMs: REPLACE_DEADLINE_MS,
+      maxInputChars: MAX_REPLACE_INPUT_CHARS,
+      maxOutputChars: 2 * MAX_REPLACE_INPUT_CHARS,
+      ...(options.regex?.signal === undefined ? {} : { signal: options.regex.signal }),
+      ...(options.regex?.runawayKey === undefined ? {} : { runawayKey: options.regex.runawayKey }),
+    };
+    const outcome =
+      options.regex?.session === undefined
+        ? await runRegex(request)
+        : await options.regex.session.run(request);
+    if (outcome.status === "rejected") {
+      throw new ReplaceRuleError(`replace rule ${i} has an invalid pattern: ${outcome.reason}`);
     }
-    let count = 0;
-    out = out.replace(re, () => {
-      count++;
-      return rule.with;
-    });
-    if (count > 0) applied[`replace[${i}]`] = count;
+    if (outcome.status !== "ok") {
+      throw new ReplaceRuleError(
+        `replace rule ${i} could not be applied, so the normalized text is unknown: ${describeRegexOutcome(outcome)}`,
+      );
+    }
+    out = outcome.result.output;
+    if (outcome.result.replacements > 0) applied[`replace[${i}]`] = outcome.result.replacements;
   }
 
   return { text: out, applied };

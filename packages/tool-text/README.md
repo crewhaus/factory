@@ -48,6 +48,20 @@ recognition. `TextSimilarity` is lexical, with no embeddings.
 Where a deterministic first pass exists, it belongs first and the model is the
 escalation path.
 
+## Caller patterns
+
+`RegexExtract`'s pattern and `RuleClassify`'s regex rules are the caller's,
+run over the caller's text, so neither runs on the caller's thread: each call
+runs them in one `@crewhaus/tool-safety` regex worker under a five-second
+deadline (a synchronous `RegExp` cannot be interrupted; `a*a*a*a*b` over 400
+characters held the whole process for 108 s). A pattern that backtracks
+exponentially (`(a+)+`, `(\w+\s?)*`) is refused with the reason, as an invalid
+one is. A run that cannot finish is never "no match": `RegexExtract` returns
+the matches it found with `undetermined` and the reason, and `RuleClassify`
+returns no label, not the default, listing the patterns it could not answer.
+The engine giving up is detected by time, so a genuine no-match slower than
+100 ms is reported the same way.
+
 ## Layout
 
 `src/lib/` holds the pure functions and is where the behaviour is tested;

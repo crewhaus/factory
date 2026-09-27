@@ -55,37 +55,43 @@ const norm = (text: string, apply: string[], root?: string) =>
   normalizeOutput(text, { apply: apply as never, root });
 
 describe("normalization", () => {
-  test("nothing is masked unless it is asked for", () => {
+  test("nothing is masked unless it is asked for", async () => {
     const text = "at 2026-01-02T03:04:05Z";
-    expect(norm(text, []).text).toBe(text);
-    expect(norm(text, []).applied).toEqual({});
+    expect((await norm(text, [])).text).toBe(text);
+    expect((await norm(text, [])).applied).toEqual({});
   });
 
-  test("each rule masks its own shape and reports a count", () => {
-    expect(norm("at 2026-01-02T03:04:05.123Z done", ["timestamps"])).toEqual({
+  test("each rule masks its own shape and reports a count", async () => {
+    expect(await norm("at 2026-01-02T03:04:05.123Z done", ["timestamps"])).toEqual({
       text: "at <timestamp> done",
       applied: { timestamps: 1 },
     });
-    expect(norm("took 1.5s and 240ms", ["durations"]).text).toBe("took <duration> and <duration>");
-    expect(norm("id 7f3e4d2a-1b9c-4e5f-8a7b-6c5d4e3f2a1b", ["uuids"]).text).toBe("id <uuid>");
-    expect(norm(`sha ${"a".repeat(40)}`, ["hashes"]).text).toBe("sha <hash>");
-    expect(norm("http://localhost:3000/x", ["ports"]).text).toBe("http://localhost:<port>/x");
+    expect((await norm("took 1.5s and 240ms", ["durations"])).text).toBe(
+      "took <duration> and <duration>",
+    );
+    expect((await norm("id 7f3e4d2a-1b9c-4e5f-8a7b-6c5d4e3f2a1b", ["uuids"])).text).toBe(
+      "id <uuid>",
+    );
+    expect((await norm(`sha ${"a".repeat(40)}`, ["hashes"])).text).toBe("sha <hash>");
+    expect((await norm("http://localhost:3000/x", ["ports"])).text).toBe(
+      "http://localhost:<port>/x",
+    );
   });
 
-  test("a mask never eats the text beside it", () => {
+  test("a mask never eats the text beside it", async () => {
     // A rule that took more than its shape would hide a regression inside
     // the mask, which is worse than a golden that fails too often.
-    expect(norm("before 2026-01-02T03:04:05Z after", ["timestamps"]).text).toBe(
+    expect((await norm("before 2026-01-02T03:04:05Z after", ["timestamps"])).text).toBe(
       "before <timestamp> after",
     );
-    expect(norm("v1.2.3 released", ["durations"]).text).toBe("v1.2.3 released");
-    expect(norm("the word deadbeef here", ["hashes"]).text).toBe("the word deadbeef here");
+    expect((await norm("v1.2.3 released", ["durations"])).text).toBe("v1.2.3 released");
+    expect((await norm("the word deadbeef here", ["hashes"])).text).toBe("the word deadbeef here");
   });
 
-  test("absolute paths are replaced before the rules that would mangle them", () => {
+  test("absolute paths are replaced before the rules that would mangle them", async () => {
     // A temp directory carries digits a later rule would mask, leaving the
     // path unrecognisable.
-    const result = norm(
+    const result = await norm(
       "/tmp/run-12345/out.txt failed",
       ["absolutePaths", "ports"],
       "/tmp/run-12345",
@@ -94,19 +100,19 @@ describe("normalization", () => {
     expect(result.applied["absolutePaths"]).toBe(1);
   });
 
-  test("ANSI escapes are stripped without touching the text", () => {
+  test("ANSI escapes are stripped without touching the text", async () => {
     const esc = String.fromCharCode(27);
-    expect(norm(`${esc}[31mred${esc}[0m text`, ["ansi"]).text).toBe("red text");
+    expect((await norm(`${esc}[31mred${esc}[0m text`, ["ansi"])).text).toBe("red text");
   });
 
-  test("whitespace rules are separate, so one can be applied without the others", () => {
-    expect(norm("a  \nb", ["trailingWhitespace"]).text).toBe("a\nb");
-    expect(norm("a\r\nb", ["crlf"]).text).toBe("a\nb");
-    expect(norm("a\n\n\n\n\nb", ["blankLines"]).text).toBe("a\n\nb");
+  test("whitespace rules are separate, so one can be applied without the others", async () => {
+    expect((await norm("a  \nb", ["trailingWhitespace"])).text).toBe("a\nb");
+    expect((await norm("a\r\nb", ["crlf"])).text).toBe("a\nb");
+    expect((await norm("a\n\n\n\n\nb", ["blankLines"])).text).toBe("a\n\nb");
   });
 
-  test("caller rules run after the builtins and are counted separately", () => {
-    const result = normalizeOutput("build 42 in 3s", {
+  test("caller rules run after the builtins and are counted separately", async () => {
+    const result = await normalizeOutput("build 42 in 3s", {
       apply: ["durations"],
       replace: [{ pattern: "\\d+", with: "<n>" }],
     });
@@ -114,10 +120,10 @@ describe("normalization", () => {
     expect(result.applied).toEqual({ durations: 1, "replace[0]": 1 });
   });
 
-  test("an invalid caller pattern names which rule it was", () => {
-    expect(() =>
+  test("an invalid caller pattern names which rule it was", async () => {
+    await expect(
       normalizeOutput("x", { apply: [], replace: [{ pattern: "([a-", with: "" }] }),
-    ).toThrow(/replace rule 0/);
+    ).rejects.toThrow(/replace rule 0/);
   });
 });
 
@@ -173,6 +179,36 @@ describe("Markdown links", () => {
 
   test("line numbers point at the link", () => {
     expect(extractMarkdownLinks("a\n\n[x](./y.md)")[0]?.line).toBe(3);
+  });
+
+  test("an inline destination is read as CommonMark reads it", () => {
+    const hrefs = (doc: string) => extractMarkdownLinks(doc).map((l) => l.href);
+    // Balanced parentheses belong to the destination; 0.7.0 cut at the first `)`.
+    expect(hrefs("[w](https://w.test/Foo_(bar)) and [f](./a(1).md)")).toEqual([
+      "https://w.test/Foo_(bar)",
+      "./a(1).md",
+    ]);
+    // Unbalanced, it is not a link at all.
+    expect(hrefs("[f](./a(1.md)")).toEqual([]);
+    // Angle brackets may hold spaces; a title may use any of its three quotes.
+    expect(
+      hrefs("[a](<./my file.md>) [b](./b.md 'B') [c](./c.md (C)) [d]( ./d.md  \"D\" )"),
+    ).toEqual(["./my file.md", "./b.md", "./c.md", "./d.md"]);
+    // A quote with no space before it is part of the destination, and a second
+    // word that is not a title is not a link: 0.7.0 said the same of both.
+    expect(hrefs('[a](./a.md"t") [b](./b.md c)')).toEqual(['./a.md"t"']);
+    // An empty destination is no promise; an escaped `)` does not end one.
+    expect(hrefs("[a]() [b](<>) [c](./c\\).md)")).toEqual(["./c\\).md"]);
+    // An image and the line it sits on.
+    expect(extractMarkdownLinks("x\n![i](./i.png)")).toEqual([
+      { href: "./i.png", text: "i", line: 2, kind: "image" },
+    ]);
+  });
+
+  test("a claim loses its links' destinations, parentheses and titles included", () => {
+    expect(citedClaims('See [the report](./r(1).md "R") for this [1].\n')[0]?.text).toBe(
+      "See the report for this.",
+    );
   });
 
   test("a reference with no definition is not reported as a link", () => {

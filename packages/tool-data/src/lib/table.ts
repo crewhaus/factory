@@ -8,17 +8,29 @@
  * the same output every time.
  */
 
-import { canonicalStringify, deepEqual, isPlainObject } from "./json";
+import { type RegexAnswers, testPatternSync } from "@crewhaus/tool-schema";
+import {
+  OutputLimitError,
+  canonicalStringify,
+  deepEqual,
+  getOwn,
+  isPlainObject,
+  setOwn,
+} from "./json";
 
 export type Record_ = Record<string, unknown>;
 
-/** Read a dotted path out of a record. Returns undefined for any miss. */
+/**
+ * Read a dotted path out of a record. Returns undefined for any miss. Only
+ * the record's own fields are read: `constructor` on a record that has no
+ * such field is a miss, not `Object.prototype.constructor`.
+ */
 export function getPath(record: unknown, path: string): unknown {
   if (path === "") return record;
   let cur: unknown = record;
   for (const seg of path.split(".")) {
     if (isPlainObject(cur)) {
-      cur = cur[seg];
+      cur = getOwn(cur, seg);
       continue;
     }
     if (Array.isArray(cur) && /^\d+$/.test(seg)) {
@@ -30,22 +42,27 @@ export function getPath(record: unknown, path: string): unknown {
   return cur;
 }
 
-/** Write a dotted path into a record, creating intermediate objects. */
+/**
+ * Write a dotted path into a record, creating intermediate objects. Every
+ * segment is an own field of the object it names — descent never follows an
+ * inherited member, so `__proto__.x` writes a field called `__proto__`, not
+ * into `Object.prototype`.
+ */
 export function setPath(target: Record_, path: string, value: unknown): void {
   const segs = path.split(".");
   let cur: Record_ = target;
   for (let i = 0; i < segs.length - 1; i++) {
     const seg = segs[i] as string;
-    const next = cur[seg];
+    const next = getOwn(cur, seg);
     if (!isPlainObject(next)) {
       const fresh: Record_ = {};
-      cur[seg] = fresh;
+      setOwn(cur, seg, fresh);
       cur = fresh;
     } else {
       cur = next as Record_;
     }
   }
-  cur[segs[segs.length - 1] as string] = value;
+  setOwn(cur, segs[segs.length - 1] as string, value);
 }
 
 // ---------------------------------------------------------------------------
@@ -73,8 +90,45 @@ export type Predicate = { all?: Condition[]; any?: Condition[]; none?: Condition
 
 export class PredicateError extends Error {}
 
-/** Evaluate one condition against a record. */
-export function testCondition(record: unknown, cond: Condition): boolean {
+/** A predicate's answer for one record: a verdict, or undetermined (a pattern had no answer). */
+export type PredicateVerdict = boolean | "undetermined";
+
+/**
+ * Ask `regex` about every `matches` condition in `predicate` for every
+ * record, so one resolve in the regex worker answers them all before
+ * {@link testPredicate} reads them.
+ */
+export function askPredicatePatterns(
+  records: ReadonlyArray<unknown>,
+  predicate: Predicate,
+  regex: RegexAnswers,
+): void {
+  const conditions = [
+    ...(predicate.all ?? []),
+    ...(predicate.any ?? []),
+    ...(predicate.none ?? []),
+  ].filter((c) => c.op === "matches" && typeof c.value === "string");
+  if (conditions.length === 0) return;
+  for (const record of records) {
+    for (const cond of conditions) {
+      const actual = getPath(record, cond.field);
+      if (actual !== undefined && actual !== null)
+        regex.lookup(cond.value as string, "", String(actual));
+    }
+  }
+}
+
+/**
+ * Evaluate one condition against a record. A `matches` pattern is never run
+ * here: its answer comes from `regex`, resolved in the worker by the tool
+ * (or, for a library caller with none, from the bounded fallback on this
+ * thread), and one with no answer is `"undetermined"`, never `false`.
+ */
+export function testCondition(
+  record: unknown,
+  cond: Condition,
+  regex?: RegexAnswers,
+): PredicateVerdict {
   const actual = getPath(record, cond.field);
   const expected = cond.value;
   switch (cond.op) {
@@ -106,13 +160,23 @@ export function testCondition(record: unknown, cond: Condition): boolean {
       if (typeof expected !== "string") {
         throw new PredicateError(`"matches" needs a regular-expression string for ${cond.field}`);
       }
-      let re: RegExp;
       try {
-        re = new RegExp(expected);
+        // Compiling reads only the pattern; the match is what is not run here.
+        new RegExp(expected);
       } catch (err) {
         throw new PredicateError(`invalid regex for ${cond.field}: ${(err as Error).message}`);
       }
-      return actual !== undefined && actual !== null && re.test(String(actual));
+      if (actual === undefined || actual === null) return false;
+      const subject = String(actual);
+      const answer =
+        regex === undefined
+          ? testPatternSync(expected, "", subject)
+          : regex.lookup(expected, "", subject);
+      if (typeof answer === "boolean") return answer;
+      if (answer !== undefined && "refused" in answer) {
+        throw new PredicateError(`invalid regex for ${cond.field}: ${answer.refused}`);
+      }
+      return "undetermined";
     }
     default:
       return compareOrdered(actual, expected, cond.op);
@@ -142,15 +206,49 @@ export function compareValues(a: unknown, b: unknown): number | null {
   return null;
 }
 
-/** Evaluate a whole predicate. An empty predicate matches everything. */
-export function testPredicate(record: unknown, predicate: Predicate): boolean {
+/**
+ * Evaluate a whole predicate. An empty predicate matches everything.
+ *
+ * Three-valued, so a condition with no answer cannot decide a record either
+ * way on its own: `all` fails on any definite miss, `none` excludes on any
+ * definite hit, `any` holds on any definite hit; otherwise a condition with
+ * no answer leaves the record `"undetermined"`. Reading it as a miss would
+ * let a `none` exclusion pass the very row it was written to stop.
+ */
+export function testPredicate(
+  record: unknown,
+  predicate: Predicate,
+  regex?: RegexAnswers,
+): PredicateVerdict {
   const all = predicate.all ?? [];
   const any = predicate.any ?? [];
   const none = predicate.none ?? [];
-  for (const c of all) if (!testCondition(record, c)) return false;
-  for (const c of none) if (testCondition(record, c)) return false;
-  if (any.length > 0 && !any.some((c) => testCondition(record, c))) return false;
-  return true;
+  let open = false;
+  for (const c of all) {
+    const v = testCondition(record, c, regex);
+    if (v === false) return false;
+    if (v === "undetermined") open = true;
+  }
+  for (const c of none) {
+    const v = testCondition(record, c, regex);
+    if (v === true) return false;
+    if (v === "undetermined") open = true;
+  }
+  if (any.length > 0) {
+    let hit = false;
+    let anyOpen = false;
+    for (const c of any) {
+      const v = testCondition(record, c, regex);
+      if (v === true) {
+        hit = true;
+        break;
+      }
+      if (v === "undetermined") anyOpen = true;
+    }
+    if (!hit && !anyOpen) return false;
+    if (!hit) open = true;
+  }
+  return open ? "undetermined" : true;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,9 +364,10 @@ export function omitFields(record: Record_, fields: ReadonlyArray<string>): Reco
     let cur: unknown = out;
     for (let i = 0; i < segs.length - 1; i++) {
       if (!isPlainObject(cur)) break;
-      cur = cur[segs[i] as string];
+      cur = getOwn(cur, segs[i] as string);
     }
-    if (isPlainObject(cur)) delete cur[segs[segs.length - 1] as string];
+    const last = segs[segs.length - 1] as string;
+    if (isPlainObject(cur) && Object.hasOwn(cur, last)) delete cur[last];
   }
   return out;
 }
@@ -277,7 +376,7 @@ function structuredCloneish(value: Record_): Record_ {
   const out: Record_ = {};
   for (const k of Object.keys(value)) {
     const v = value[k];
-    out[k] = isPlainObject(v) ? structuredCloneish(v as Record_) : v;
+    setOwn(out, k, isPlainObject(v) ? structuredCloneish(v as Record_) : v);
   }
   return out;
 }
@@ -304,7 +403,7 @@ export function aggregate(
   const buckets = new Map<string, { key: Record_; rows: Record_[] }>();
   for (const rec of records) {
     const key: Record_ = {};
-    for (const field of groupBy) key[field] = getPath(rec, field) ?? null;
+    for (const field of groupBy) setOwn(key, field, getPath(rec, field) ?? null);
     const id = canonicalStringify(key);
     const existing = buckets.get(id);
     if (existing === undefined) buckets.set(id, { key, rows: [rec] });
@@ -319,37 +418,49 @@ export function aggregate(
       const values = bucket.rows.map((r) => getPath(r, field));
       switch (agg.fn) {
         case "count":
-          out[agg.as] = field === "" ? bucket.rows.length : values.filter(isPresent).length;
+          setOwn(out, agg.as, field === "" ? bucket.rows.length : values.filter(isPresent).length);
           break;
         case "sum":
         case "avg": {
           const nums = values.filter((v): v is number => typeof v === "number");
           skipped += values.filter(isPresent).length - nums.length;
           const total = nums.reduce((a, b) => a + b, 0);
-          out[agg.as] = agg.fn === "sum" ? total : nums.length === 0 ? null : total / nums.length;
+          setOwn(
+            out,
+            agg.as,
+            agg.fn === "sum" ? total : nums.length === 0 ? null : total / nums.length,
+          );
           break;
         }
         case "min":
         case "max": {
           const present = values.filter(isPresent);
           if (present.length === 0) {
-            out[agg.as] = null;
+            setOwn(out, agg.as, null);
             break;
           }
-          out[agg.as] = present.reduce((best, v) => {
-            const cmp = totalCompare(v, best);
-            return (agg.fn === "min" ? cmp < 0 : cmp > 0) ? v : best;
-          });
+          setOwn(
+            out,
+            agg.as,
+            present.reduce((best, v) => {
+              const cmp = totalCompare(v, best);
+              return (agg.fn === "min" ? cmp < 0 : cmp > 0) ? v : best;
+            }),
+          );
           break;
         }
         case "first":
-          out[agg.as] = values[0] ?? null;
+          setOwn(out, agg.as, values[0] ?? null);
           break;
         case "last":
-          out[agg.as] = values[values.length - 1] ?? null;
+          setOwn(out, agg.as, values[values.length - 1] ?? null);
           break;
         case "distinct":
-          out[agg.as] = new Set(values.filter(isPresent).map((v) => canonicalStringify(v))).size;
+          setOwn(
+            out,
+            agg.as,
+            new Set(values.filter(isPresent).map((v) => canonicalStringify(v))).size,
+          );
           break;
         default:
           break;
@@ -381,13 +492,24 @@ export type JoinOptions = {
  * how a join quietly loses rows.
  *
  * Every right-hand match is emitted, so a one-to-many join multiplies rows,
- * as SQL does. `maxRows` bounds that.
+ * as SQL does. `maxRows` bounds that — the WORK as well as the output: a row
+ * past the cap is counted, never built, so a join on a low-cardinality key
+ * (every row `status: "open"`) costs the rows it returns plus one pass over
+ * each side, not |left| x |right| merges thrown away. `totalRows` is the size
+ * the uncapped join would have had, counted arithmetically, so a caller can
+ * tell ten rows cut from eleven apart from ten cut from millions.
  */
 export function joinRecords(
   left: ReadonlyArray<Record_>,
   right: ReadonlyArray<Record_>,
   options: JoinOptions,
-): { rows: Record_[]; truncated: boolean; unmatchedLeft: number; unmatchedRight: number } {
+): {
+  rows: Record_[];
+  truncated: boolean;
+  totalRows: number;
+  unmatchedLeft: number;
+  unmatchedRight: number;
+} {
   const index = new Map<string, Record_[]>();
   for (const r of right) {
     const key = getPath(r, options.rightKey);
@@ -400,14 +522,14 @@ export function joinRecords(
   const rows: Record_[] = [];
   const matchedRight = new Set<string>();
   let unmatchedLeft = 0;
-  let truncated = false;
+  let totalRows = 0;
 
-  const push = (row: Record_): void => {
-    if (rows.length >= options.maxRows) {
-      truncated = true;
-      return;
-    }
-    rows.push(row);
+  // The cap is checked BEFORE a row is built. Building it first and then
+  // discarding it (the 0.7.0 shape) made maxRows bound the answer but not
+  // the work: every matching pair was merged whatever the cap said.
+  const keep = (build: () => Record_): void => {
+    totalRows += 1;
+    if (rows.length < options.maxRows) rows.push(build());
   };
 
   for (const l of left) {
@@ -416,11 +538,15 @@ export function joinRecords(
     const matches = id === null ? undefined : index.get(id);
     if (matches === undefined || matches.length === 0) {
       unmatchedLeft += 1;
-      if (options.kind === "left" || options.kind === "full") push({ ...l });
+      if (options.kind === "left" || options.kind === "full") keep(() => ({ ...l }));
       continue;
     }
     if (id !== null) matchedRight.add(id);
-    for (const r of matches) push(mergeRow(l, r, options.rightPrefix));
+    const take = Math.min(Math.max(options.maxRows - rows.length, 0), matches.length);
+    for (let i = 0; i < take; i++) {
+      rows.push(mergeRow(l, matches[i] as Record_, options.rightPrefix));
+    }
+    totalRows += matches.length;
   }
 
   let unmatchedRight = 0;
@@ -429,16 +555,22 @@ export function joinRecords(
     const id = isPresent(key) ? canonicalStringify(key) : null;
     if (id === null || !matchedRight.has(id)) {
       unmatchedRight += 1;
-      if (options.kind === "right" || options.kind === "full") push({ ...r });
+      if (options.kind === "right" || options.kind === "full") keep(() => ({ ...r }));
     }
   }
-  return { rows, truncated, unmatchedLeft, unmatchedRight };
+  return {
+    rows,
+    truncated: totalRows > rows.length,
+    totalRows,
+    unmatchedLeft,
+    unmatchedRight,
+  };
 }
 
 function mergeRow(left: Record_, right: Record_, prefix: string): Record_ {
   const out: Record_ = { ...left };
   for (const k of Object.keys(right)) {
-    out[Object.hasOwn(left, k) ? `${prefix}${k}` : k] = right[k];
+    setOwn(out, Object.hasOwn(left, k) ? `${prefix}${k}` : k, right[k]);
   }
   return out;
 }
@@ -459,7 +591,12 @@ export function recordsToColumns(records: ReadonlyArray<Record_>): Record<string
     }
   }
   const out: Record<string, unknown[]> = {};
-  for (const k of keys) out[k] = records.map((r) => (Object.hasOwn(r, k) ? r[k] : null));
+  for (const k of keys)
+    setOwn(
+      out,
+      k,
+      records.map((r) => (Object.hasOwn(r, k) ? r[k] : null)),
+    );
   return out;
 }
 
@@ -480,7 +617,7 @@ export function columnsToRecords(columns: Record<string, ReadonlyArray<unknown>>
     const rec: Record_ = {};
     for (const k of keys) {
       const col = columns[k] ?? [];
-      rec[k] = i < col.length ? col[i] : null;
+      setOwn(rec, k, i < col.length ? col[i] : null);
     }
     records.push(rec);
   }
@@ -493,17 +630,27 @@ export function flattenObject(
   separator: string,
   expandArrays: boolean,
   maxDepth: number,
+  maxKeyChars = Number.POSITIVE_INFINITY,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+  // Every flattened key spells its whole path, so the keys alone are
+  // depth x leaves characters; `maxKeyChars` stops the walk (throwing
+  // OutputLimitError) before they are all built.
+  let keyChars = 0;
+  const put = (key: string, v: unknown): void => {
+    keyChars += key.length;
+    if (keyChars > maxKeyChars) throw new OutputLimitError(maxKeyChars, "the flattened keys");
+    setOwn(out, key, v);
+  };
   const walk = (node: unknown, prefix: string, depth: number): void => {
     if (depth >= maxDepth) {
-      out[prefix] = node;
+      put(prefix, node);
       return;
     }
     if (isPlainObject(node)) {
       const keys = Object.keys(node);
       if (keys.length === 0) {
-        if (prefix !== "") out[prefix] = {};
+        if (prefix !== "") put(prefix, {});
         return;
       }
       for (const k of keys)
@@ -512,7 +659,7 @@ export function flattenObject(
     }
     if (Array.isArray(node) && expandArrays) {
       if (node.length === 0) {
-        if (prefix !== "") out[prefix] = [];
+        if (prefix !== "") put(prefix, []);
         return;
       }
       node.forEach((el, i) =>
@@ -520,7 +667,7 @@ export function flattenObject(
       );
       return;
     }
-    out[prefix] = node;
+    put(prefix, node);
   };
   walk(value, "", 0);
   return out;
@@ -543,16 +690,16 @@ export function unflattenObject(
     let cur: Record_ = root;
     for (let i = 0; i < segs.length - 1; i++) {
       const seg = segs[i] as string;
-      const next = cur[seg];
+      const next = getOwn(cur, seg);
       if (!isPlainObject(next)) {
         const fresh: Record_ = {};
-        cur[seg] = fresh;
+        setOwn(cur, seg, fresh);
         cur = fresh;
       } else {
         cur = next as Record_;
       }
     }
-    cur[segs[segs.length - 1] as string] = flat[key];
+    setOwn(cur, segs[segs.length - 1] as string, flat[key]);
   }
   return arraysFromNumericKeys ? arrayify(root) : root;
 }
@@ -561,7 +708,7 @@ function arrayify(node: unknown): unknown {
   if (!isPlainObject(node)) return node;
   const keys = Object.keys(node);
   const converted: Record_ = {};
-  for (const k of keys) converted[k] = arrayify(node[k]);
+  for (const k of keys) setOwn(converted, k, arrayify(node[k]));
   if (keys.length === 0) return converted;
   const allNumeric = keys.every((k) => /^(0|[1-9][0-9]*)$/.test(k));
   if (!allNumeric) return converted;

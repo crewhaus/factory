@@ -12,8 +12,8 @@
  * would be a crawler, and would leak which documents are being reviewed.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { lstatSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
+import { dirname, join, posix, resolve } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
@@ -28,8 +28,22 @@ import {
   readableText,
   textOf,
 } from "@crewhaus/tool-html";
+import {
+  type FileKind,
+  fileKind,
+  joinRel,
+  openForReadSync,
+  resolveContained,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
+import {
+  type RegexSession,
+  describeRegexOutcome,
+  openRegexSession,
+} from "@crewhaus/tool-safety/regex";
 import { textSimilarity } from "@crewhaus/tool-text";
 import { z } from "zod";
+import { integrityLimits, integrityWalk } from "./integrity";
 import {
   citationDefinitions,
   citedClaims,
@@ -39,7 +53,14 @@ import {
   lintCitations,
   splitLinkTarget,
 } from "./lib/markdown";
-import { NORMALIZERS, type Normalizer, firstDifferences, normalizeOutput } from "./lib/normalize";
+import {
+  NORMALIZERS,
+  type NormalizeOptions,
+  type Normalizer,
+  ReplaceRuleError,
+  firstDifferences,
+  normalizeOutput,
+} from "./lib/normalize";
 import {
   LONG_SENTENCE_WORDS,
   SCHEMA_RULES,
@@ -79,6 +100,11 @@ import { type SafePath, ToolPermissionError, resolveSafe, toPosix, workspaceRoot
 
 const json = (value: unknown): string => JSON.stringify(value);
 
+/** Longest file body a caller's `fileMatches` pattern runs over, in characters. */
+const MATCH_INPUT_CHARS = 16 * 1024 * 1024;
+/** How long one `fileMatches` pattern may run before the check is undetermined. */
+const MATCH_DEADLINE_MS = 5_000;
+
 const LIMITS = {
   files: 20_000,
   fileBytes: 256 * 1024 * 1024,
@@ -115,11 +141,24 @@ function filesUnder(root: string, rel = "", out: string[] = []): string[] {
 const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
 
 function readCapped(abs: string, what: string): Buffer {
-  const size = statSync(abs).size;
+  const stat = statSync(abs);
+  // Opening a FIFO blocks until something writes to it, and a directory
+  // throws an error nobody catches: neither is a file to compare or hash.
+  if (!stat.isFile()) throw new Error(`${what} is not a regular file`);
+  const size = stat.size;
   if (size > LIMITS.fileBytes) {
     throw new Error(`${what} is ${size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
   }
   return readFileSync(abs);
+}
+
+/** The regex context a tool call hands to caller patterns: its abort signal and session. */
+function regexContext(ctx: unknown): NonNullable<NormalizeOptions["regex"]> {
+  const c = ctx as { signal?: AbortSignal; runContext?: { sessionId?: string } } | undefined;
+  return {
+    ...(c?.signal === undefined ? {} : { signal: c.signal }),
+    ...(c?.runContext?.sessionId === undefined ? {} : { runawayKey: c.runContext.sessionId }),
+  };
 }
 
 const normalizerField = z
@@ -155,92 +194,168 @@ export const goldenCompare: RegisteredTool = buildTool({
     }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const root = workspaceRoot();
-    const apply = (input.normalize ?? []) as ReadonlyArray<Normalizer>;
-    const goldenAt = resolveSafe("GoldenCompare", input.golden);
-    const maxDiffLines = input.maxDiffLines ?? 20;
-
-    const isTree =
-      input.actualFile !== undefined &&
-      (() => {
-        try {
-          return statSync(
-            resolveSafe("GoldenCompare", input.actualFile as string).real,
-          ).isDirectory();
-        } catch {
-          return false;
-        }
-      })();
-
-    if (isTree) {
-      const actualAt = resolveSafe("GoldenCompare", input.actualFile as string);
-      let goldenFiles: string[];
-      try {
-        goldenFiles = filesUnder(goldenAt.real);
-      } catch {
-        return `the golden directory "${goldenAt.rel}" does not exist — create it with GoldenUpdate once the output is right`;
-      }
-      const actualFiles = filesUnder(actualAt.real);
-      const added = actualFiles.filter((f) => !goldenFiles.includes(f));
-      const removed = goldenFiles.filter((f) => !actualFiles.includes(f));
-      const changed: string[] = [];
-      for (const file of goldenFiles.filter((f) => actualFiles.includes(f))) {
-        const a = normalizeOutput(readCapped(join(goldenAt.real, file), file).toString("utf-8"), {
-          apply,
-          root,
-          replace: input.replace,
-        }).text;
-        const b = normalizeOutput(readCapped(join(actualAt.real, file), file).toString("utf-8"), {
-          apply,
-          root,
-          replace: input.replace,
-        }).text;
-        if (a !== b) changed.push(file);
-      }
-      return json({
-        mode: "tree",
-        golden: goldenAt.rel,
-        actual: actualAt.rel,
-        match: added.length === 0 && removed.length === 0 && changed.length === 0,
-        fileCount: actualFiles.length,
-        added,
-        removed,
-        changed,
-      });
-    }
-
-    let goldenText: string;
+  execute: async (input, ctx) => {
+    // One worker for every caller rule over every file of this call.
+    const session = input.replace === undefined ? undefined : openRegexSession();
     try {
-      goldenText = readCapped(goldenAt.real, goldenAt.rel).toString("utf-8");
-    } catch {
-      return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+      return await goldenCompareRun(input, {
+        ...regexContext(ctx),
+        ...(session === undefined ? {} : { session }),
+      });
+    } catch (err) {
+      if (err instanceof ReplaceRuleError) {
+        return `GoldenCompare could not compare, so this is not a verdict: ${err.message}`;
+      }
+      throw err;
+    } finally {
+      session?.close();
     }
-    const actualRaw =
-      input.actual ??
-      readCapped(resolveSafe("GoldenCompare", input.actualFile as string).real, "actual").toString(
-        "utf-8",
-      );
-
-    const expected = normalizeOutput(goldenText, { apply, root, replace: input.replace });
-    const actual = normalizeOutput(actualRaw, { apply, root, replace: input.replace });
-    const match = expected.text === actual.text;
-
-    return json({
-      mode: "text",
-      golden: goldenAt.rel,
-      match,
-      normalized: actual.applied,
-      ...(match
-        ? {}
-        : {
-            differences: firstDifferences(expected.text, actual.text, maxDiffLines),
-            expectedLines: expected.text.split("\n").length,
-            actualLines: actual.text.split("\n").length,
-          }),
-    });
   },
 });
+
+async function goldenCompareRun(
+  input: {
+    actual?: string | undefined;
+    actualFile?: string | undefined;
+    golden: string;
+    normalize?: ReadonlyArray<string> | undefined;
+    replace?: NormalizeOptions["replace"] | undefined;
+    maxDiffLines?: number | undefined;
+  },
+  regex: NonNullable<NormalizeOptions["regex"]>,
+): Promise<string> {
+  const root = workspaceRoot();
+  const apply = (input.normalize ?? []) as ReadonlyArray<Normalizer>;
+  const goldenAt = resolveSafe("GoldenCompare", input.golden);
+  const maxDiffLines = input.maxDiffLines ?? 20;
+  const options: NormalizeOptions = {
+    apply,
+    root,
+    ...(input.replace === undefined ? {} : { replace: input.replace }),
+    regex,
+  };
+
+  const isTree =
+    input.actualFile !== undefined &&
+    (() => {
+      try {
+        return statSync(
+          resolveSafe("GoldenCompare", input.actualFile as string).real,
+        ).isDirectory();
+      } catch {
+        return false;
+      }
+    })();
+
+  if (isTree) {
+    const actualAt = resolveSafe("GoldenCompare", input.actualFile as string);
+    // Both trees walked completely: dotfiles, node_modules and links
+    // included, since a tampered `.github/workflows/ci.yml` or a stray
+    // `.env` is exactly the change a tree golden exists to catch.
+    const golden = integrityWalk(root, goldenAt.rel);
+    if (!golden.ok) {
+      return `the golden directory "${goldenAt.rel}" could not be read (${golden.reason}) — create it with GoldenUpdate once the output is right`;
+    }
+    const actual = integrityWalk(root, actualAt.rel);
+    if (!actual.ok) return `GoldenCompare could not walk "${actualAt.rel}": ${actual.reason}`;
+    const goldenByRel = new Map(golden.entries.map((e) => [e.rel, e]));
+    const actualByRel = new Map(actual.entries.map((e) => [e.rel, e]));
+    const added = actual.entries.filter((e) => !goldenByRel.has(e.rel)).map((e) => e.rel);
+    const removed = golden.entries.filter((e) => !actualByRel.has(e.rel)).map((e) => e.rel);
+    const changed: string[] = [];
+    const unreadable: string[] = [
+      ...golden.unreadableDirs.map((d) => `golden ${d} (a directory that could not be listed)`),
+      ...actual.unreadableDirs.map((d) => `actual ${d} (a directory that could not be listed)`),
+    ];
+    const readText = (real: string, rel: string): string | null => {
+      const read = openForReadSync(root, real, {
+        maxBytes: LIMITS.fileBytes,
+        followLeafSymlink: false,
+      });
+      if (!read.ok || read.truncated) {
+        unreadable.push(`${rel}: ${read.ok ? "over the size limit" : read.reason}`);
+        return null;
+      }
+      return read.text;
+    };
+    for (const g of golden.entries) {
+      const a = actualByRel.get(g.rel);
+      if (a === undefined) continue;
+      if (g.kind !== a.kind) {
+        changed.push(g.rel);
+        continue;
+      }
+      if (g.kind === "symlink") {
+        // A link is compared by where it points, not by what is there:
+        // retargeting one is a change even when both targets match.
+        if (g.link?.text !== a.link?.text) changed.push(g.rel);
+        continue;
+      }
+      if (g.kind !== "file") {
+        unreadable.push(`${g.rel}: a ${g.kind}, not a regular file; not opened`);
+        continue;
+      }
+      const goldenText = readText(g.real, g.rel);
+      const actualText = readText(a.real, a.rel);
+      if (goldenText === null || actualText === null) continue;
+      const left = (await normalizeOutput(goldenText, options)).text;
+      const right = (await normalizeOutput(actualText, options)).text;
+      if (left !== right) changed.push(g.rel);
+    }
+    const truncated = golden.truncated || actual.truncated;
+    return json({
+      mode: "tree",
+      golden: goldenAt.rel,
+      actual: actualAt.rel,
+      match:
+        added.length === 0 &&
+        removed.length === 0 &&
+        changed.length === 0 &&
+        unreadable.length === 0 &&
+        !truncated,
+      fileCount: actual.entries.length,
+      added,
+      removed,
+      changed,
+      truncated,
+      ...(unreadable.length > 0 ? { unreadable } : {}),
+    });
+  }
+
+  let goldenText: string;
+  try {
+    goldenText = readCapped(goldenAt.real, goldenAt.rel).toString("utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return `the golden "${goldenAt.rel}" does not exist yet — run GoldenUpdate once the output is right, then compare against it`;
+    }
+    // A FIFO, a directory or an oversized file is not "missing"; say what it is.
+    return `GoldenCompare could not read the golden "${goldenAt.rel}", so this is not a verdict: ${(err as Error).message}`;
+  }
+  const actualRaw =
+    input.actual ??
+    readCapped(resolveSafe("GoldenCompare", input.actualFile as string).real, "actual").toString(
+      "utf-8",
+    );
+
+  const expected = await normalizeOutput(goldenText, options);
+  const actual = await normalizeOutput(actualRaw, options);
+  const match = expected.text === actual.text;
+
+  return json({
+    mode: "text",
+    golden: goldenAt.rel,
+    match,
+    normalized: actual.applied,
+    ...(match
+      ? {}
+      : {
+          differences: firstDifferences(expected.text, actual.text, maxDiffLines),
+          expectedLines: expected.text.split("\n").length,
+          actualLines: actual.text.split("\n").length,
+        }),
+  });
+}
 
 export const goldenUpdate: RegisteredTool = buildTool({
   name: "GoldenUpdate",
@@ -259,38 +374,143 @@ export const goldenUpdate: RegisteredTool = buildTool({
   destructive: true,
   requireJustification: true,
   concurrencySafe: false,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const at = resolveSafe("GoldenUpdate", input.golden);
-    const normalized = normalizeOutput(input.actual, {
-      apply: (input.normalize ?? []) as ReadonlyArray<Normalizer>,
-      root: workspaceRoot(),
-      replace: input.replace,
-    });
-    let previous: string | null = null;
+    let normalized: Awaited<ReturnType<typeof normalizeOutput>>;
     try {
-      previous = readFileSync(at.real, "utf-8");
-    } catch {
-      previous = null;
+      normalized = await normalizeOutput(input.actual, {
+        apply: (input.normalize ?? []) as ReadonlyArray<Normalizer>,
+        root: workspaceRoot(),
+        ...(input.replace === undefined ? {} : { replace: input.replace }),
+        regex: regexContext(ctx),
+      });
+    } catch (err) {
+      if (err instanceof ReplaceRuleError) return `GoldenUpdate wrote nothing: ${err.message}`;
+      throw err;
     }
-    // Temp file plus rename: an interrupted write leaves the old golden in
-    // place rather than a truncated one that passes nothing.
-    const temp = `${at.real}.tmp-${process.pid}`;
-    writeFileSync(temp, normalized.text);
-    renameSync(temp, at.real);
+    const root = workspaceRoot();
+    // The old golden, read no further than one byte past the new one: that is
+    // enough to say whether it changed, and a FIFO or a link out of the
+    // workspace at the golden's name is refused here instead of read.
+    const bytes = Buffer.byteLength(normalized.text);
+    const before = openForReadSync(root, at.rel, { maxBytes: bytes + 1 });
+    if (!before.ok && before.code !== "not-found") {
+      return `GoldenUpdate wrote nothing: ${before.reason}`;
+    }
+    const previous = before.ok ? before.text : null;
+    const changed = !before.ok || before.truncated || before.text !== normalized.text;
+    // Through a randomly named temp created with O_EXCL beside the golden,
+    // then a rename: an interrupted write leaves the old golden in place
+    // rather than a truncated one that passes nothing, and a link planted at
+    // a temp name is never written through. An in-workspace link AT the
+    // golden is written through and stays a link, as editing a linked file
+    // does; one that leads out of the workspace is refused.
+    const written = writeFileSafe(root, at.rel, normalized.text, {
+      overwrite: true,
+      leafSymlink: "follow-contained",
+    });
+    if (!written.ok) return `GoldenUpdate wrote nothing: ${written.reason}`;
     return json({
       golden: at.rel,
       created: previous === null,
-      changed: previous !== normalized.text,
+      changed,
       bytes: Buffer.byteLength(normalized.text),
       normalized: normalized.applied,
     });
   },
 });
 
+/**
+ * One spelling for a path in a manifest and a path a caller asks about, so
+ * `./a.txt` (what `find . | xargs sha256sum` writes) and `a.txt` (what the
+ * walk and `files` produce) name the same entry instead of one missing and
+ * one unexpected.
+ */
+function manifestKey(rel: string): string {
+  return rel === "" ? rel : posix.normalize(rel);
+}
+
+/**
+ * What ChecksumVerify leaves out when it walks the workspace root with no
+ * exclude list: the version-control store and the installed dependencies. At
+ * a project root they are nearly every entry (a repo's 400 files became 13,000
+ * entries and a 2 MB manifest), and neither is what "has this project
+ * changed" means. Decided on the directory walked, not on whether the field
+ * was sent, so `{}` and `{directory: "."}` give one answer. Always echoed back
+ * in `excluded`; `exclude: []` walks everything.
+ */
+const DEFAULT_ROOT_EXCLUDE: ReadonlyArray<string> = [".git", "node_modules"];
+
+/**
+ * What a manifest records for one entry: a file's digest, or, for an entry
+ * that is not hashed, what it is. A link that leads to a directory, out of the
+ * workspace or nowhere, and a FIFO, socket or device, have no content this
+ * tool reads; recorded by kind and link text, an unchanged tree verifies
+ * against its own manifest (it could never be ok while every such entry was
+ * "unreadable" and then "unexpected"), and a link retargeted or a pipe
+ * swapped for a file is still a change.
+ */
+type Recorded =
+  | { readonly digest: string }
+  | { readonly kind: Exclude<FileKind, "file" | "directory">; readonly target?: string };
+
+/** One comparable string per recorded entry. */
+function recordedSignature(r: Recorded): string {
+  if ("digest" in r) return r.digest;
+  return r.target === undefined ? r.kind : `${r.kind} -> ${JSON.stringify(r.target)}`;
+}
+
+/**
+ * A manifest line. A digest line is what `sha256sum` writes; an entry that is
+ * not hashed is a `#` line, which `sha256sum -c` skips as a comment, with the
+ * path and link text JSON-quoted so no name can forge a line or a field.
+ */
+function manifestLine(rel: string, r: Recorded): string {
+  if ("digest" in r) return `${r.digest}  ${rel}`;
+  return `# ${r.kind} ${JSON.stringify(rel)}${r.target === undefined ? "" : ` -> ${JSON.stringify(r.target)}`}`;
+}
+
+const RECORDED_LINE =
+  /^# (symlink|fifo|socket|character-device|block-device|unknown) ("(?:[^"\\]|\\.)*")(?: -> ("(?:[^"\\]|\\.)*"))?$/;
+
+/** A `#` line of {@link manifestLine}, or undefined for any other comment. */
+function parseRecordedLine(line: string): { rel: string; signature: string } | undefined {
+  const m = RECORDED_LINE.exec(line);
+  if (m === null) return undefined;
+  try {
+    const rel = JSON.parse(m[2] as string) as string;
+    const target = m[3] === undefined ? undefined : (JSON.parse(m[3]) as string);
+    const kind = m[1] as Exclude<FileKind, "file" | "directory">;
+    return {
+      rel,
+      signature: recordedSignature(target === undefined ? { kind } : { kind, target }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What a named entry is, asked without following its last component: for a
+ * `files` entry the read refused, so a link or a pipe is recorded like the
+ * walk records it. `undefined` when nothing is there or it cannot be asked.
+ */
+function describeUnhashed(root: string, rel: string): Recorded | "absent" | undefined {
+  const at = resolveContained(root, rel, { followLeaf: false });
+  if (!at.ok) return undefined;
+  try {
+    const kind = fileKind(lstatSync(at.real));
+    if (kind === "file" || kind === "directory") return undefined;
+    return kind === "symlink" ? { kind, target: readlinkSync(at.real) } : { kind };
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : undefined;
+  }
+}
+
 export const checksumVerify: RegisteredTool = buildTool({
   name: "ChecksumVerify",
   description:
-    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and a file on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship.",
+    "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that when the workspace root is walked with no exclude, its .git and node_modules are left out and listed as excluded. A link to a file in the workspace is hashed through, like sha256sum; any other link, and a FIFO, socket or device, is never opened and is recorded by kind and link text on a # line sha256sum skips. A walk that stops early is not ok.",
   inputSchema: z
     .object({
       directory: z.string().optional().describe("what to hash; defaults to the workspace root"),
@@ -298,7 +518,21 @@ export const checksumVerify: RegisteredTool = buildTool({
         .string()
         .optional()
         .describe("workspace-relative SHA256SUMS file to check against"),
-      files: z.array(z.string()).max(LIMITS.files).optional().describe("hash just these"),
+      files: z
+        .array(z.string())
+        .min(1)
+        .max(LIMITS.files)
+        .optional()
+        .describe(
+          "hash just these, and check the manifest for these entries only; its other entries are counted as notChecked",
+        ),
+      exclude: z
+        .array(z.string().min(1).max(1_024))
+        .max(64)
+        .optional()
+        .describe(
+          "paths under the directory to leave out with everything below them, e.g. .git; listed back as excluded. When the directory is the workspace root and no exclude is given, .git and node_modules at the root are left out",
+        ),
       write: z
         .boolean()
         .optional()
@@ -308,74 +542,224 @@ export const checksumVerify: RegisteredTool = buildTool({
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
+    const root = workspaceRoot();
     const base = resolveSafe("ChecksumVerify", input.directory ?? ".");
-    const relatives =
-      input.files ??
-      (() => {
-        try {
-          return filesUnder(base.real);
-        } catch {
-          return [];
-        }
-      })();
+    const manifestAt =
+      input.manifest === undefined ? undefined : resolveSafe("ChecksumVerify", input.manifest);
+    const writing = input.manifest === undefined || input.write === true;
 
-    const digests = new Map<string, string>();
+    /** Every entry the manifest will list or is checked against, by path. */
+    const recorded = new Map<string, Recorded>();
     const unreadable: string[] = [];
-    for (const rel of relatives) {
-      try {
-        const at = resolveSafe("ChecksumVerify", join(input.directory ?? ".", rel));
-        digests.set(rel, sha256(readCapped(at.real, rel)));
-      } catch (err) {
-        unreadable.push(`${rel}: ${(err as Error).message}`);
+    /** Everything the walk found, hashable or not: what "unexpected" is measured against. */
+    const onDisk = new Set<string>();
+    /**
+     * With `files`, the entries this run is about. A manifest entry outside
+     * it is not checked (and counted as such), rather than reported missing
+     * while it sits on disk untouched.
+     */
+    const requested = input.files === undefined ? null : new Set<string>();
+    /** Requested files that are not on disk at all. */
+    const absent = new Set<string>();
+    const symlinks: Array<{ path: string; target: string }> = [];
+    let truncated = false;
+    const exclude =
+      input.exclude ??
+      (base.rel === "" && input.files === undefined ? DEFAULT_ROOT_EXCLUDE : undefined);
+    const excludedByDefault = input.exclude === undefined && exclude !== undefined;
+
+    /** Hash `rel` through to its file; `link` is recorded instead when that is not a file. */
+    const hash = (rel: string, link?: string): void => {
+      const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
+      if (!read.ok && link !== undefined && read.code === "not-regular-file") {
+        // A link to a directory (every workspace package under
+        // node_modules/@scope is one) has no content to hash.
+        recorded.set(rel, { kind: "symlink", target: link });
+      } else if (!read.ok) {
+        unreadable.push(`${rel}: ${read.reason}`);
+      } else if (read.truncated) {
+        unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
+      } else {
+        recorded.set(rel, { digest: sha256(Buffer.from(read.bytes)) });
+      }
+    };
+
+    if (requested !== null) {
+      for (const given of input.files ?? []) {
+        if (posix.isAbsolute(given)) {
+          unreadable.push(`${given}: an absolute path; files are relative to the directory`);
+          continue;
+        }
+        const rel = manifestKey(given);
+        if (requested.has(rel)) continue;
+        requested.add(rel);
+        // Read like every walked file: contained, never through a link that
+        // leads out, and a FIFO or device is refused instead of opened.
+        const read = openForReadSync(root, joinRel(base.rel, rel), { maxBytes: LIMITS.fileBytes });
+        if (read.ok) {
+          onDisk.add(rel);
+          if (read.truncated) unreadable.push(`${rel}: over the ${LIMITS.fileBytes}-byte limit`);
+          else recorded.set(rel, { digest: sha256(Buffer.from(read.bytes)) });
+          continue;
+        }
+        // Refused, or not there: a link that leads to a directory, out of
+        // the workspace or nowhere, or a pipe, is recorded as the walk
+        // records it, never opened.
+        const unhashed =
+          read.code === "not-found" ||
+          read.code === "not-regular-file" ||
+          read.code === "escapes-root"
+            ? describeUnhashed(root, joinRel(base.rel, rel))
+            : undefined;
+        if (unhashed === "absent" || (unhashed === undefined && read.code === "not-found")) {
+          absent.add(rel);
+          continue;
+        }
+        onDisk.add(rel);
+        if (unhashed === undefined) unreadable.push(`${rel}: ${read.reason}`);
+        else recorded.set(rel, unhashed);
+      }
+    } else {
+      const walk = integrityWalk(root, base.rel, {
+        ...(exclude === undefined ? {} : { exclude }),
+      });
+      if (!walk.ok) return `ChecksumVerify could not walk "${base.rel || "."}": ${walk.reason}`;
+      truncated = walk.truncated;
+      if (truncated) {
+        // Refused before any file is hashed: a partial manifest would later
+        // verify a partial tree, and a check of a partial walk is not ok
+        // whatever the hashes say, so hashing it all first only cost time.
+        return json({
+          directory: base.rel,
+          ...(writing ? { manifest: null } : { manifest: manifestAt?.rel, ok: false }),
+          truncated: true,
+          ...(exclude !== undefined && exclude.length > 0 ? { excluded: exclude } : {}),
+          reason: `the directory holds more than the ${integrityLimits().maxEntries} entries (or ${integrityLimits().maxDepth} levels) one walk covers, so ${writing ? "no manifest was written" : "it could not be checked"} and nothing was hashed; narrow the directory or exclude part of it`,
+        });
+      }
+      for (const dir of walk.unreadableDirs)
+        unreadable.push(`${dir} (a directory that could not be listed)`);
+      // The manifest itself, when it sits inside the directory it describes,
+      // is neither listed in itself nor unexpected.
+      const self =
+        manifestAt === undefined
+          ? undefined
+          : base.rel === ""
+            ? manifestAt.rel
+            : manifestAt.rel.startsWith(`${base.rel}/`)
+              ? manifestAt.rel.slice(base.rel.length + 1)
+              : undefined;
+      for (const entry of walk.entries) {
+        if (entry.rel === self) continue;
+        onDisk.add(entry.rel);
+        if (entry.kind === "file") {
+          hash(entry.rel);
+        } else if (entry.kind === "symlink") {
+          const target = entry.link?.text ?? "";
+          symlinks.push({ path: entry.rel, target });
+          // A link is hashed as `sha256sum` would, through to its file, but
+          // only when that file is inside the workspace. One that leads out,
+          // or nowhere, is never read: it is recorded by its link text.
+          if (entry.link?.inside !== true || entry.link.dangling) {
+            recorded.set(entry.rel, { kind: "symlink", target });
+          } else {
+            hash(entry.rel, target);
+          }
+        } else if (entry.kind !== "directory") {
+          // A FIFO, socket or device: named, never opened.
+          recorded.set(entry.rel, { kind: entry.kind });
+        }
       }
     }
 
-    if (input.manifest === undefined || input.write === true) {
-      const body = [...digests.entries()].map(([rel, hash]) => `${hash}  ${rel}`).join("\n");
+    const walkReport = {
+      truncated,
+      ...(symlinks.length > 0 ? { symlinks } : {}),
+      ...(exclude !== undefined && exclude.length > 0 ? { excluded: exclude } : {}),
+      ...(excludedByDefault
+        ? {
+            excludedNote:
+              "the workspace root was walked without its .git and node_modules; pass exclude: [] to walk everything",
+          }
+        : {}),
+    };
+
+    if (writing) {
+      for (const rel of absent) unreadable.push(`${rel}: does not exist`);
+      const body = [...recorded].map(([rel, r]) => manifestLine(rel, r)).join("\n");
+      let fileCount = 0;
+      for (const r of recorded.values()) if ("digest" in r) fileCount += 1;
       return json({
         directory: base.rel,
-        fileCount: digests.size,
+        fileCount,
+        ...(recorded.size > fileCount ? { recordedByKind: recorded.size - fileCount } : {}),
+        ...walkReport,
         unreadable,
         manifest: `${body}\n`,
       });
     }
 
-    const manifestAt = resolveSafe("ChecksumVerify", input.manifest);
+    const at = manifestAt as SafePath;
     let manifestText: string;
     try {
-      manifestText = readCapped(manifestAt.real, manifestAt.rel).toString("utf-8");
+      manifestText = readCapped(at.real, at.rel).toString("utf-8");
     } catch {
-      return `the manifest "${manifestAt.rel}" does not exist; run with write:true to produce one`;
+      return `the manifest "${at.rel}" does not exist; run with write:true to produce one`;
     }
     const expected = new Map<string, string>();
     for (const line of manifestText.split("\n")) {
-      const m = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(line.trim());
+      const trimmed = line.trim();
+      if (trimmed.startsWith("#")) {
+        const entry = parseRecordedLine(trimmed);
+        if (entry !== undefined) expected.set(manifestKey(entry.rel), entry.signature);
+        continue;
+      }
+      const m = /^([0-9a-fA-F]{64})\s+\*?(.+)$/.exec(trimmed);
       if (m === null) continue;
-      expected.set((m[2] as string).trim(), (m[1] as string).toLowerCase());
+      expected.set(manifestKey((m[2] as string).trim()), (m[1] as string).toLowerCase());
     }
 
     const mismatched: string[] = [];
     const missing: string[] = [];
     const unexpected: string[] = [];
+    let checked = 0;
     for (const [rel, want] of expected) {
-      const got = digests.get(rel);
-      if (got === undefined) missing.push(rel);
-      else if (got !== want) mismatched.push(rel);
+      if (requested !== null && !requested.has(rel)) continue;
+      checked += 1;
+      const got = recorded.get(rel);
+      // Listed and on disk but not hashable is in `unreadable` already.
+      if (got === undefined) {
+        if (!onDisk.has(rel)) missing.push(rel);
+      } else if (recordedSignature(got) !== want) mismatched.push(rel);
     }
-    for (const rel of digests.keys()) if (!expected.has(rel)) unexpected.push(rel);
+    for (const rel of onDisk) if (!expected.has(rel)) unexpected.push(rel);
+    // Asked for, not on disk, and not listed either: not "missing" (the
+    // manifest never promised it), but not a pass.
+    for (const rel of absent) {
+      if (!expected.has(rel))
+        unreadable.push(`${rel}: does not exist, and the manifest does not list it`);
+    }
 
     return json({
       directory: base.rel,
-      manifest: manifestAt.rel,
+      manifest: at.rel,
       // Each failure mode is separate: missing, changed and extra need
       // different action, and an extra file is how something ships that
-      // nobody meant to ship.
-      ok: mismatched.length === 0 && missing.length === 0 && unexpected.length === 0,
-      checked: expected.size,
+      // nobody meant to ship. Anything that could not be read, and a walk
+      // that stopped early, leave the answer open, so they are not ok.
+      ok:
+        mismatched.length === 0 &&
+        missing.length === 0 &&
+        unexpected.length === 0 &&
+        unreadable.length === 0 &&
+        !truncated,
+      checked,
+      ...(requested === null ? {} : { notChecked: expected.size - checked }),
       mismatched,
       missing,
       unexpected,
       unreadable,
+      ...walkReport,
     });
   },
 });
@@ -415,8 +799,33 @@ export const acceptanceCheck: RegisteredTool = buildTool({
     .strict(),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
-    const results = input.checks.map((check, index) => {
+  execute: async (input, ctx) => {
+    const regex = regexContext(ctx);
+    type CheckResult = {
+      index: number;
+      check: string;
+      ok: boolean;
+      detail: string;
+      undetermined?: true;
+    };
+    // One worker for every pattern in the call: a one-shot run starts its
+    // own, about 2 ms each, which made 150 checks take half a second.
+    const session = input.checks.some((c) => c.kind === "fileMatches")
+      ? openRegexSession()
+      : undefined;
+    const results: CheckResult[] = [];
+    try {
+      for (const [index, check] of input.checks.entries()) {
+        results.push(await runCheck(check, index));
+      }
+    } finally {
+      session?.close();
+    }
+
+    async function runCheck(
+      check: (typeof input.checks)[number],
+      index: number,
+    ): Promise<CheckResult> {
       const label = `${check.kind}(${check.path})`;
       let exists = false;
       let body: string | null = null;
@@ -466,22 +875,44 @@ export const acceptanceCheck: RegisteredTool = buildTool({
         default: {
           if (body === null)
             return { index, check: label, ok: false, detail: "the file could not be read" };
-          let re: RegExp;
-          try {
-            re = new RegExp(check.pattern, check.flags ?? "");
-          } catch (err) {
+          // The caller's pattern runs in a worker under a deadline, never on
+          // this thread; a check it cannot answer fails closed and says so,
+          // never "does not match".
+          if (body.length > MATCH_INPUT_CHARS) {
             return {
               index,
               check: label,
               ok: false,
-              detail: `invalid pattern: ${(err as Error).message}`,
+              undetermined: true,
+              detail: `could not verify: the file has ${body.length} characters, more than the ${MATCH_INPUT_CHARS} a pattern is run over`,
             };
           }
-          const hit = re.test(body);
+          const outcome = await (session as RegexSession).run({
+            op: "test",
+            pattern: check.pattern,
+            flags: check.flags ?? "",
+            input: body,
+            deadlineMs: MATCH_DEADLINE_MS,
+            maxInputChars: MATCH_INPUT_CHARS,
+            ...regex,
+          });
+          if (outcome.status === "rejected") {
+            return { index, check: label, ok: false, detail: `invalid pattern: ${outcome.reason}` };
+          }
+          if (outcome.status !== "ok") {
+            return {
+              index,
+              check: label,
+              ok: false,
+              undetermined: true,
+              detail: `could not verify: ${describeRegexOutcome(outcome)}`,
+            };
+          }
+          const hit = outcome.result.matched;
           return { index, check: label, ok: hit, detail: hit ? "" : "the pattern does not match" };
         }
       }
-    });
+    }
 
     const failed = results.filter((r) => !r.ok);
     return json({
@@ -519,6 +950,9 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
     const root = isDir ? at.real : dirname(at.real);
 
     const broken: Array<{ file: string; line: number; href: string; reason: string }> = [];
+    // Anchors of each target document, computed once however many links
+    // point at it: fifty links into one README used to parse it fifty times.
+    const anchorsOf = new Map<string, Set<string>>();
     let checked = 0;
     let external = 0;
     const limit = input.limit ?? 500;
@@ -592,7 +1026,21 @@ export const markdownLinkCheck: RegisteredTool = buildTool({
           continue;
         }
         if (input.checkAnchors && fragment !== undefined && /\.(md|mdx|markdown)$/i.test(target)) {
-          const targetAnchors = headingAnchors(readCapped(targetAt.real, target).toString("utf-8"));
+          let targetAnchors = anchorsOf.get(targetAt.real);
+          if (targetAnchors === undefined) {
+            try {
+              targetAnchors = headingAnchors(readCapped(targetAt.real, target).toString("utf-8"));
+            } catch (err) {
+              broken.push({
+                file: label,
+                line: link.line,
+                href: link.href,
+                reason: `the target could not be read: ${(err as Error).message}`,
+              });
+              continue;
+            }
+            anchorsOf.set(targetAt.real, targetAnchors);
+          }
           if (!targetAnchors.has(fragment.toLowerCase())) {
             broken.push({
               file: label,

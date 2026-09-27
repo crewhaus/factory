@@ -991,7 +991,16 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     ],
   },
   compute: {
-    title: "Everything a harness can do with no I/O at all — pure, in-process, zero tokens",
+    // Only what holds: every member is in-process, but five read the clock,
+    // the CSPRNG or the host's zone when a call leaves the input out. Named
+    // here so a spec built on all-compute knows which calls to pin for a
+    // replay. And a caller's regex (Assert, JsonSchemaValidate, Branch,
+    // RegexExtract, TableQuery and the rest) runs in a worker under a time
+    // limit, so a pattern slow enough on this host answers undetermined,
+    // never a different verdict. compute-purity.test.ts fails if another
+    // package starts to read the clock.
+    title:
+      "In-process and zero tokens: no network, disk or subprocess. Deterministic unless a call leaves out now (DeadlineCheck, ErrorClassify, SequenceRun), seed (Uuid v4) or timeZone (LocalTime); a caller's regex runs under a time limit, and one too slow answers undetermined",
     includes: ["text", "data", "encode", "datetime", "schema", "math", "flow", "onchain"],
   },
   content: {

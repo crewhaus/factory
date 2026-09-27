@@ -14,6 +14,39 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Read `key` only when it is the object's OWN property. A key taken from the
+ * data (a dotted path segment, a TOML table name, an XML element name) must
+ * never reach an inherited member: `constructor` would read
+ * `Object.prototype.constructor`, and `__proto__` would hand back
+ * `Object.prototype` itself as something to write into — which is how one
+ * hostile document polluted every object in the process.
+ */
+export function getOwn(obj: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
+/**
+ * Write `key` as an own data property. For every key but `__proto__` plain
+ * assignment already does that; `__proto__` alone is an accessor inherited
+ * from `Object.prototype`, whose setter would replace the object's prototype
+ * (dropping the key) instead of storing it. `defineProperty` stores it as the
+ * data it is, so `{"__proto__": …}` round-trips like any other key — the
+ * way `JSON.parse` itself reads it.
+ */
+export function setOwn(obj: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === "__proto__") {
+    Object.defineProperty(obj, key, {
+      value,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  } else {
+    obj[key] = value;
+  }
+}
+
 /** Structural equality over JSON values. Key order is irrelevant; NaN never appears in JSON. */
 export function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -42,7 +75,7 @@ export function deepClone<T>(value: T): T {
   if (Array.isArray(value)) return value.map((v) => deepClone(v)) as unknown as T;
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
-    for (const k of Object.keys(value)) out[k] = deepClone(value[k]);
+    for (const k of Object.keys(value)) setOwn(out, k, deepClone(value[k]));
     return out as T;
   }
   return value;
@@ -71,7 +104,7 @@ export function sortKeysDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeysDeep);
   if (isPlainObject(value)) {
     const out: Record<string, unknown> = {};
-    for (const k of Object.keys(value).sort()) out[k] = sortKeysDeep(value[k]);
+    for (const k of Object.keys(value).sort()) setOwn(out, k, sortKeysDeep(value[k]));
     return out;
   }
   return value;
@@ -131,4 +164,130 @@ export function typeOf(value: unknown): string {
   if (value === null) return "null";
   if (Array.isArray(value)) return "array";
   return typeof value;
+}
+
+// ---------------------------------------------------------------------------
+// Bounds on nesting and on output.
+//
+// A document's cost here is not its length. Every tool that walks a value
+// does work per level as well as per node — a merge that cloned the rest of
+// the tree at each level, a query that copied the path at each level, a
+// pretty-printer that writes depth x indent spaces on every line — so a
+// 48 KB document nested 8,000 deep cost gigabytes. Depth is capped at the
+// door, and every result is measured before it is built.
+
+/**
+ * The deepest nesting a document may have: each `[` or `{` is one level, a
+ * scalar document is depth 0. XmlParse's own ceiling, and far past any real
+ * configuration, API response or AST dump.
+ */
+export const MAX_NESTING_DEPTH = 256;
+
+/**
+ * Whether JSON text nests deeper than `limit`, from one linear pass over the
+ * characters: brackets inside string literals (escapes honoured) do not
+ * count, and nothing is parsed, so a hostile document is refused before a
+ * deep tree exists. Malformed text may be over-counted; it would fail to
+ * parse anyway.
+ */
+export function jsonTextNestsDeeper(text: string, limit: number): boolean {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inString) {
+      // A backslash escapes the character after it.
+      if (c === 0x5c) i += 1;
+      else if (c === 0x22) inString = false;
+      continue;
+    }
+    if (c === 0x22) inString = true;
+    else if (c === 0x5b || c === 0x7b) {
+      depth += 1;
+      if (depth > limit) return true;
+    } else if (c === 0x5d || c === 0x7d) {
+      if (depth > 0) depth -= 1;
+    }
+  }
+  return false;
+}
+
+/** Whether a parsed value nests deeper than `limit`. Iterative: no recursion to overflow. */
+export function nestingDepthExceeds(value: unknown, limit: number): boolean {
+  const stack: Array<[unknown, number]> = [[value, 0]];
+  while (stack.length > 0) {
+    const [node, depth] = stack.pop() as [unknown, number];
+    const children = Array.isArray(node) ? node : isPlainObject(node) ? Object.values(node) : null;
+    if (children === null) continue;
+    if (depth + 1 > limit) return true;
+    for (const child of children) {
+      if (typeof child === "object" && child !== null) stack.push([child, depth + 1]);
+    }
+  }
+  return false;
+}
+
+/** A result, or a part of one, that would be larger than its tool may return. */
+export class OutputLimitError extends Error {
+  readonly limit: number;
+  constructor(limit: number, what = "the result") {
+    super(`${what} would be more than ${limit} characters`);
+    this.limit = limit;
+  }
+}
+
+/** Nothing a value's JSON form renders as: skipped in an object, `null` in an array. */
+const renders = (v: unknown): boolean =>
+  v !== undefined && typeof v !== "function" && typeof v !== "symbol";
+
+/**
+ * The length of `JSON.stringify(value, null, indent)`, computed without
+ * building it, and abandoned as soon as it passes `cap` (the answer is then
+ * some number above `cap`). Iterative and exact for JSON values; a
+ * non-plain object (none of this package's readers make one) is measured by
+ * serializing it.
+ *
+ * Measured first so that a result too large to return is refused before it
+ * exists: pretty-printing multiplies every line by depth x indent, and a
+ * record set can repeat a long key once per row.
+ */
+export function jsonTextLength(value: unknown, indent: number, cap: number): number {
+  if (!renders(value)) return 0;
+  const k = Math.min(10, Math.max(0, Math.floor(indent)));
+  let total = 0;
+  const stack: Array<[unknown, number]> = [[value, 0]];
+  while (stack.length > 0) {
+    const [node, depth] = stack.pop() as [unknown, number];
+    if (node === null || !renders(node)) {
+      total += 4; // null, or a non-rendering array element, which becomes null
+    } else if (typeof node === "string") {
+      total += (JSON.stringify(node) as string).length;
+    } else if (typeof node === "number") {
+      total += Number.isFinite(node) ? String(node).length : 4;
+    } else if (typeof node === "boolean") {
+      total += node ? 4 : 5;
+    } else if (Array.isArray(node)) {
+      const n = node.length;
+      if (n === 0) total += 2;
+      else {
+        total += 2 + (n - 1) + (k === 0 ? 0 : n * (1 + (depth + 1) * k) + 1 + depth * k);
+        for (let i = n - 1; i >= 0; i--) stack.push([node[i], depth + 1]);
+      }
+    } else if (isPlainObject(node)) {
+      let m = 0;
+      for (const key of Object.keys(node)) {
+        const v = node[key];
+        if (!renders(v)) continue;
+        m += 1;
+        total += (JSON.stringify(key) as string).length + (k === 0 ? 1 : 2);
+        stack.push([v, depth + 1]);
+      }
+      if (m === 0) total += 2;
+      else total += 2 + (m - 1) + (k === 0 ? 0 : m * (1 + (depth + 1) * k) + 1 + depth * k);
+    } else {
+      total += (JSON.stringify(node) ?? "null").length;
+    }
+    if (total > cap) return total;
+  }
+  return total;
 }

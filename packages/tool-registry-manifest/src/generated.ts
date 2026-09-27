@@ -644,7 +644,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "checksumVerify",
     name: "ChecksumVerify",
     description:
-      "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and a file on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship.",
+      "Hash files and check them against a SHA256SUMS-style manifest, or write one. Use it to prove an artifact is the one you built, or that a directory has not changed. A file listed in the manifest and missing from disk is reported separately from one whose contents differ, and anything on disk that the manifest does not mention is reported too — an unexpected extra file is how something gets shipped that nobody meant to ship. Every entry is walked, dotfiles and node_modules included — except that when the workspace root is walked with no exclude, its .git and node_modules are left out and listed as excluded. A link to a file in the workspace is hashed through, like sha256sum; any other link, and a FIFO, socket or device, is never opened and is recorded by kind and link text on a # line sha256sum skips. A walk that stops early is not ok.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -2554,7 +2554,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "exifRead",
     name: "ExifRead",
     description:
-      "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at.",
+      "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read (a file past 64 MiB up to that point), so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too, and so does GPS written in XMP; when it cannot tell, hasGps is null with the reason.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -2568,7 +2568,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "exifStrip",
     name: "ExifStrip",
     description:
-      "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality.",
+      "Write a copy of a JPEG with its metadata segments removed, keeping the image data byte for byte. Use before publishing a photograph, to drop the GPS coordinates, camera serial and capture time without re-encoding and losing quality. Metadata between scans is removed too, and so is anything appended after the image (a preview, gain map or motion-photo video, each of which can carry its own location).",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -2605,7 +2605,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "exportCsv",
     name: "ExportCsv",
     description:
-      "Write a query's rows to a CSV file inside the workspace, streaming them rather than holding them in memory. Use to hand a result set to a spreadsheet or another tool without paying for the rows in context. NULL is written as an empty field, which CSV cannot tell from an empty string on the way back, and a BLOB is written as base64 with a marker; the query runs on a read-only connection.",
+      "Write a query's rows to a CSV file inside the workspace, streaming them rather than holding them in memory. Use to hand a result set to a spreadsheet or another tool without paying for the rows in context. NULL is written as an empty field, which CSV cannot tell from an empty string on the way back, and a BLOB is written as base64 with a marker; the query runs on a read-only connection. Cells are written verbatim, so text starting with =, +, - or @ opens as a formula in a spreadsheet: prefix such values with ' in the query when the data is untrusted.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -3832,7 +3832,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "htmlTable",
     name: "HtmlTable",
     description:
-      "Lift HTML tables into headers and rows, with colspan and rowspan expanded. Use it to read a pricing grid, an order history or a financial statement as data instead of as markup. Spans are expanded because a table that uses them reads as ragged rows otherwise, and every column after the span is off by one — which is invisible in the output and wrong in every row.",
+      "Lift HTML tables into headers and rows, with colspan and rowspan expanded. Use it to read a pricing grid, an order history or a financial statement as data instead of as markup. Spans are expanded because a table that uses them reads as ragged rows otherwise, and every column after the span is off by one — which is invisible in the output and wrong in every row. Expansion stops at maxRows rows, 1,000 columns and 2M characters per call, and a table cut short says so in truncatedBy.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -6274,7 +6274,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "regexExtract",
     name: "RegexExtract",
     description:
-      "Extract every regex match from text, with named capture groups, character offsets and line numbers. Use to pull ids, versions, paths or fields out of logs and documents without reading the whole thing into context.",
+      "Extract every regex match from text, with named capture groups, character offsets and line numbers. Use to pull ids, versions, paths or fields out of logs and documents without reading the whole thing into context. The pattern runs under a time limit; a pattern that backtracks exponentially is refused, and a run that cannot finish says so rather than reporting the matches it found as all of them.",
     readOnly: true,
     destructive: false,
     scope: "internal",

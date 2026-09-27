@@ -13,6 +13,7 @@ import { jaccard, normalizeValue, tallyVotes } from "./lib/consensus";
 import { checkDeadline } from "./lib/deadline";
 import { evaluateTable, hashTable } from "./lib/decision";
 import { classifyError, parseRetryAfter } from "./lib/errors";
+import { parseHttpDate } from "./lib/http-date";
 import { scoreValue } from "./lib/score";
 import { planSequence } from "./lib/sequence";
 import { detectStall } from "./lib/stall";
@@ -398,6 +399,173 @@ describe("classifyError", () => {
     expect(parseRetryAfter("")).toEqual({ waitMs: null, retryAt: null });
     expect(parseRetryAfter("soon")).toEqual({ waitMs: null, retryAt: null });
   });
+
+  describe("an HTTP-date Retry-After is the same instant on every machine", () => {
+    const now = Date.parse("2026-09-23T09:00:00Z");
+    /**
+     * Run `body` with the process's zone set to `tz`, and put it back. Never
+     * by deleting TZ: in Bun that freezes the zone for the rest of the
+     * process. `bun test` runs in UTC when TZ is unset, so that is what an
+     * unset TZ is restored as.
+     */
+    const inZone = <T>(tz: string, body: () => T): T => {
+      const previous = process.env["TZ"];
+      process.env["TZ"] = tz;
+      try {
+        return body();
+      } finally {
+        process.env["TZ"] = previous === undefined || previous === "" ? "Etc/UTC" : previous;
+      }
+    };
+    const ZONES = ["UTC", "America/New_York", "Asia/Tokyo"];
+
+    test("all three RFC 9110 forms are GMT, whatever the host zone", () => {
+      const forms = [
+        "Wed, 23 Sep 2026 10:00:00 GMT", // IMF-fixdate
+        "Wednesday, 23-Sep-26 10:00:00 GMT", // rfc850-date
+        "Wed Sep 23 10:00:00 2026", // asctime-date, GMT by definition
+        "Wed Sep  3 10:00:00 2026".replace(" 3", "23"), // asctime spacing, two digits
+        "wed, 23 sep 2026 10:00:00 gmt", // names are not case-sensitive here
+      ];
+      const seen: Array<{ tz: string; form: string; waitMs: number | null }> = [];
+      for (const tz of ZONES) {
+        // Proves the zone really changed, so the assertion below is not vacuous.
+        const localHour = inZone(tz, () => new Date(now).getHours());
+        expect({ tz, differs: tz === "UTC" || localHour !== 9 }).toEqual({ tz, differs: true });
+        for (const form of forms) {
+          seen.push({ tz, form, waitMs: inZone(tz, () => parseRetryAfter(form, now).waitMs) });
+        }
+      }
+      // 0.7.0: the asctime form waited 0 under Asia/Tokyo and 8 h under
+      // America/Los_Angeles, because Date.parse read it as host-local time.
+      expect(seen.filter((s) => s.waitMs !== 3_600_000)).toEqual([]);
+      expect(seen).toHaveLength(ZONES.length * forms.length);
+      expect(parseRetryAfter("Wed Sep 23 10:00:00 2026", now).retryAt).toBe(
+        "2026-09-23T10:00:00.000Z",
+      );
+    });
+
+    test("a date with no zone is not read at all, rather than read as local time", () => {
+      const refused = [
+        "2026-09-23T10:00:00", // offset-less ISO: local time per ECMAScript
+        "Wed, 23 Sep 2026 10:00:00", // RFC 1123 with the zone left off
+        "23 Sep 2026 10:00", // prose
+        "Wed, 31 Nov 2026 10:00:00 GMT", // a day November does not have
+        "Foo, 23 Sep 2026 10:00:00 GMT", // not a weekday
+        "Wed, 23 Sep 2026 24:00:00 GMT", // not an hour
+        "Wed, 23 Sep 2026 10:00:00 A", // a military zone: RFC 5322 says its sign is unknown
+        "Wed, 23 Sep 2026 10:00:00 +2400", // not an offset
+        "23 Sep 26 10:00:00 GMT", // a two-digit year outside rfc850's form
+      ];
+      for (const text of refused) {
+        expect({ text, got: inZone("Asia/Tokyo", () => parseRetryAfter(text, now)) }).toEqual({
+          text,
+          got: { waitMs: null, retryAt: null },
+        });
+      }
+    });
+
+    test("an RFC 5322 date with its zone written is read as 0.7.0 read it, on every host", () => {
+      // 0.7.1's first cut dropped these, and a 429 fell back to the client's
+      // own backoff instead of the wait the server asked for.
+      const forms = [
+        "Wed, 23 Sep 2026 10:00:00 UTC",
+        "Wed, 23 Sep 2026 10:00:00 UT",
+        "Wed, 23 Sep 2026 10:00:00 +0000",
+        "Wed, 23 Sep 2026 12:00:00 +0200",
+        "Wed, 23 Sep 2026 06:00:00 -0400",
+        "Wed, 23 Sep 2026 10:00:00 -0000", // what Python's email.utils.formatdate writes
+        "23 Sep 2026 10:00:00 GMT", // no weekday
+        "Wed, 23 Sep 2026 10:00 GMT", // no seconds
+        "Wed, 23 Sep 2026 03:00:00 PDT", // an RFC 5322 named zone, a fixed -0700
+      ];
+      const seen: Array<{ tz: string; form: string; waitMs: number | null }> = [];
+      for (const tz of ZONES) {
+        for (const form of forms) {
+          seen.push({ tz, form, waitMs: inZone(tz, () => parseRetryAfter(form, now).waitMs) });
+        }
+      }
+      expect(seen.filter((s) => s.waitMs !== 3_600_000)).toEqual([]);
+      expect(seen).toHaveLength(ZONES.length * forms.length);
+      // A single-digit day.
+      expect(parseRetryAfter("Thu, 1 Oct 2026 10:00:00 GMT", now).retryAt).toBe(
+        "2026-10-01T10:00:00.000Z",
+      );
+      // Still refused without the zone, and the weekday must be one.
+      expect(parseRetryAfter("23 Sep 2026 10:00:00", now)).toEqual({ waitMs: null, retryAt: null });
+      expect(parseRetryAfter("Xyz, 23 Sep 2026 10:00:00 UTC", now).waitMs).toBeNull();
+    });
+
+    test("an ISO instant that carries its own offset is still read", () => {
+      const forms = [
+        "2026-09-23T10:00:00Z",
+        "2026-09-23T19:00:00+09:00",
+        "2026-09-23T19:00:00+0900",
+        // RFC 3339 allows a space for the T; Python's str(datetime) writes
+        // it, with microseconds. 0.7.0 read all three on every host.
+        "2026-09-23 10:00:00+00:00",
+        "2026-09-23 10:00:00.000000+00:00",
+        "2026-09-23 10:00:00Z",
+      ];
+      for (const text of forms) {
+        expect({
+          text,
+          waitMs: inZone("America/New_York", () => parseRetryAfter(text, now).waitMs),
+        }).toEqual({ text, waitMs: 3_600_000 });
+      }
+      expect(parseRetryAfter("2026-09-23 10:00:00.123456+00:00", now).waitMs).toBe(3_600_123);
+      // Still refused without the offset, whichever separator.
+      expect(parseRetryAfter("2026-09-23 10:00:00", now)).toEqual({ waitMs: null, retryAt: null });
+    });
+
+    test("a date that does not exist is refused, not rolled over, and a year is read as written", () => {
+      // Date.parse rolled 30 Feb over to 2 March and read hour 24 as the
+      // next day; each is a malformed header, not a time to wait for.
+      for (const text of [
+        "2026-02-30T10:00:00Z",
+        "2026-13-01T10:00:00Z",
+        "2026-09-23T24:00:00Z",
+        "2026-09-23T10:60:00Z",
+        "2026-09-23T10:00:00+24:00",
+        "Mon, 29 Feb 2027 10:00:00 GMT",
+      ]) {
+        expect({ text, got: parseRetryAfter(text, now) }).toEqual({
+          text,
+          got: { waitMs: null, retryAt: null },
+        });
+      }
+      expect(parseRetryAfter("2028-02-29T10:00:00Z", now).retryAt).toBe("2028-02-29T10:00:00.000Z");
+      // Date.UTC maps the years 0-99 to 1900-1999; the header said 0026.
+      expect(parseRetryAfter("Sat, 26 Sep 0026 10:00:00 GMT", now)).toEqual({
+        waitMs: 0,
+        retryAt: "0026-09-26T10:00:00.000Z",
+      });
+      expect(parseHttpDate("Sat, 26 Sep 0026 10:00:00 GMT")).toBe(
+        Date.parse("0026-09-26T10:00:00Z"),
+      );
+    });
+
+    test("an rfc850 two-digit year is placed by the RFC's 50-year rule, and needs a now", () => {
+      expect(parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT", now)).toBe(
+        Date.parse("1994-11-06T08:49:37Z"),
+      );
+      expect(parseHttpDate("Wednesday, 23-Sep-26 10:00:00 GMT", now)).toBe(
+        Date.parse("2026-09-23T10:00:00Z"),
+      );
+      // 2076 is within 50 years of 2026; 2077 is not, so '77 is 1977.
+      expect(parseHttpDate("Monday, 01-Jan-76 00:00:00 GMT", now)).toBe(
+        Date.parse("2076-01-01T00:00:00Z"),
+      );
+      expect(parseHttpDate("Monday, 01-Jan-77 00:00:00 GMT", now)).toBe(
+        Date.parse("1977-01-01T00:00:00Z"),
+      );
+      // Without a reference year the century is unknown: no guess.
+      expect(parseHttpDate("Sunday, 06-Nov-94 08:49:37 GMT")).toBeUndefined();
+      expect(parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT")).toBe(
+        Date.parse("1994-11-06T08:49:37Z"),
+      );
+    });
+  });
 });
 
 describe("checkDeadline", () => {
@@ -749,6 +917,71 @@ describe("scoreValue", () => {
   test("the band is chosen from the clamped score", () => {
     const capped = { ...model, max: 10 };
     expect(scoreValue({ seats: 500, plan: "ent" }, capped).band).toBe("cold");
+  });
+
+  test("decimal points sum the way a person adds them: 0.7 + 0.1 reaches a band at 0.8", () => {
+    const bands = [
+      { name: "hot", min: 0.8 },
+      { name: "warm", min: 0.5 },
+    ];
+    const result = scoreValue(
+      { title: "VP", employees: 900 },
+      {
+        rules: [
+          { id: "a", when: [{ path: "title", op: "equals", expected: "VP" }], points: 0.7 },
+          { id: "b", when: [{ path: "employees", op: "greaterThan", expected: 499 }], points: 0.1 },
+        ],
+        bands,
+      },
+    );
+    // 0.7.0: 0.7999999999999999 and "warm".
+    expect({ score: result.score, rawScore: result.rawScore, band: result.band }).toEqual({
+      score: 0.8,
+      rawScore: 0.8,
+      band: "hot",
+    });
+  });
+
+  test("the band does not depend on the order the rules are declared in", () => {
+    const bands = [{ name: "hot", min: 0.8 }];
+    const out: Array<{ pts: number[]; score: number; band: string | null }> = [];
+    for (const pts of [
+      [0.1, 0.1, 0.6],
+      [0.6, 0.1, 0.1],
+      [0.1, 0.6, 0.1],
+    ]) {
+      const r = scoreValue(1, {
+        rules: pts.map((p, i) => ({ id: `r${i}`, when: [{ op: "exists" as const }], points: p })),
+        bands,
+      });
+      out.push({ pts, score: r.score, band: r.band });
+    }
+    // 0.7.0: the second order summed to 0.7999999999999999 and missed "hot".
+    expect(out).toEqual([
+      { pts: [0.1, 0.1, 0.6], score: 0.8, band: "hot" },
+      { pts: [0.6, 0.1, 0.1], score: 0.8, band: "hot" },
+      { pts: [0.1, 0.6, 0.1], score: 0.8, band: "hot" },
+    ]);
+  });
+
+  test("cancellation leaves no float residue, and a clamp at a decimal bound is exact", () => {
+    const rules = (pts: number[]) =>
+      pts.map((p, i) => ({ id: `r${i}`, when: [{ op: "exists" as const }], points: p }));
+    // 0.7.0: 0.10000000000002274.
+    expect(scoreValue(1, { rules: rules([1000.1, -1000]) }).score).toBe(0.1);
+    expect(scoreValue(1, { rules: rules([0.1, 0.2]) }).score).toBe(0.3);
+    // 0.1 + 0.2 is exactly 0.3, so it is NOT above a 0.3 cap and is not clamped.
+    const capped = scoreValue(1, { rules: rules([0.1, 0.2]), max: 0.3 });
+    expect({ score: capped.score, rawScore: capped.rawScore }).toEqual({
+      score: 0.3,
+      rawScore: 0.3,
+    });
+    const floored = scoreValue(1, {
+      rules: rules([0.1, 0.2]),
+      min: 0.35,
+      bands: [{ name: "b", min: 0.35 }],
+    });
+    expect({ score: floored.score, band: floored.band }).toEqual({ score: 0.35, band: "b" });
   });
 
   test("a rule with no checks would always fire, so it is rejected", () => {

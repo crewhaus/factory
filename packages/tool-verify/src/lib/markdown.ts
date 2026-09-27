@@ -4,7 +4,15 @@
  * A link that 404s and a citation marker with no source behind it are both
  * mechanical to find and embarrassing to ship. Neither needs a model, and a
  * model asked to check them will miss one in a long document.
+ *
+ * Every scan here is linear in the document. These run synchronously on
+ * workspace Markdown anyone can put in a checkout, and 0.7.0's were not: the
+ * heading regex was cubic (a 10 KB README with one long heading took
+ * minutes), and the sentence splitter, the line lookup and the code-span test
+ * each rescanned from the start per hit. A pattern here either cannot scan
+ * past the next place it could start again, or starts only once per run.
  */
+import { lineStarts, offsetToLineCol, parseAtxHeading } from "@crewhaus/tool-text";
 
 export type LinkRef = {
   readonly href: string;
@@ -35,10 +43,42 @@ function codeSpans(text: string): Array<[number, number]> {
   return spans;
 }
 
-const inSpan = (at: number, spans: ReadonlyArray<[number, number]>): boolean =>
-  spans.some(([a, b]) => at >= a && at < b);
+/** A membership test over spans, built once: sorted starts plus a running max end. */
+type SpanIndex = { readonly starts: number[]; readonly maxEnd: number[] };
 
-const lineAt = (text: string, index: number): number => text.slice(0, index).split("\n").length;
+function indexSpans(spans: ReadonlyArray<[number, number]>): SpanIndex {
+  const sorted = [...spans].sort((x, y) => x[0] - y[0]);
+  const starts: number[] = [];
+  const maxEnd: number[] = [];
+  let furthest = Number.NEGATIVE_INFINITY;
+  for (const [a, b] of sorted) {
+    furthest = Math.max(furthest, b);
+    starts.push(a);
+    maxEnd.push(furthest);
+  }
+  return { starts, maxEnd };
+}
+
+/** Is `at` inside any span? O(log spans), where a scan of every span was O(spans) per hit. */
+function inSpan(at: number, index: SpanIndex): boolean {
+  let lo = 0;
+  let hi = index.starts.length - 1;
+  let last = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if ((index.starts[mid] as number) <= at) {
+      last = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return last >= 0 && at < (index.maxEnd[last] as number);
+}
+
+/** 1-based line of an offset, from one pass over the text rather than one per lookup. */
+function lineIndex(text: string): (index: number) => number {
+  const starts = lineStarts(text);
+  return (index) => offsetToLineCol(starts, index).line;
+}
 
 /**
  * True when a link destination names a scheme rather than a path.
@@ -71,41 +111,146 @@ export function splitLinkTarget(href: string): {
   return { target, fragment };
 }
 
+/** An inline link or image, `[text](destination "title")`, and where it sits. */
+type InlineLink = {
+  readonly start: number;
+  readonly end: number;
+  readonly image: boolean;
+  readonly text: string;
+  readonly href: string;
+};
+
+/**
+ * Where an inline link can start: `[text](` or `![alt](`. The text excludes
+ * `[` as well as `]`, so each attempt stops where the next one would start.
+ */
+const INLINE_OPENER = /(!?)\[([^\[\]]*)\]\(/g;
+
+const isSpace = (ch: string): boolean => /\s/.test(ch);
+
+/**
+ * Every inline link and image, in one left-to-right pass.
+ *
+ * The destination and title are read by hand, not by a regex, and never past
+ * the next opener. A single pattern for `(dest "title")` has to let whitespace
+ * sit before the destination, before the title and before the `)`, and those
+ * runs compete for the same spaces: `[](` and 60 KB of spaces held
+ * MarkdownLinkCheck for seconds, and `[^)\n]*` let every `[](` on a line read
+ * to its end. Bounding each read by the next opener makes the reads disjoint,
+ * so the whole scan is linear. A link whose title holds another `[x](` is the
+ * one shape that costs: it is read as the inner link, not the outer one.
+ *
+ * The destination follows CommonMark rather than 0.7.0's pattern where they
+ * differ: parentheses in it must balance and are kept (`Foo_(bar)` was cut to
+ * `Foo_(bar`), `<…>` may hold spaces, and a title may be quoted with `"`, `'`
+ * or `(…)`.
+ */
+function inlineLinks(text: string): InlineLink[] {
+  const openers = [...text.matchAll(INLINE_OPENER)];
+  const out: InlineLink[] = [];
+  for (let k = 0; k < openers.length; k++) {
+    const m = openers[k] as RegExpMatchArray;
+    const start = m.index as number;
+    const limit =
+      k + 1 < openers.length ? ((openers[k + 1] as RegExpMatchArray).index as number) : text.length;
+    const read = readDestination(text, start + m[0].length, limit);
+    if (read === null) continue;
+    out.push({ start, end: read.end, image: m[1] === "!", text: m[2] as string, href: read.href });
+  }
+  return out;
+}
+
+/** The `destination "title")` after an opener, read no further than `limit`. */
+function readDestination(
+  text: string,
+  from: number,
+  limit: number,
+): { readonly href: string; readonly end: number } | null {
+  let i = from;
+  while (i < limit && isSpace(text[i] as string)) i++;
+  let href: string;
+  if (text[i] === "<") {
+    let j = i + 1;
+    while (j < limit && text[j] !== ">") {
+      if (text[j] === "\n" || text[j] === "<") return null;
+      j += text[j] === "\\" ? 2 : 1;
+    }
+    if (j >= limit) return null;
+    href = text.slice(i + 1, j);
+    i = j + 1;
+  } else {
+    const begin = i;
+    let depth = 0;
+    while (i < limit) {
+      const ch = text[i] as string;
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (isSpace(ch)) break;
+      if (ch === "(") depth++;
+      else if (ch === ")") {
+        if (depth === 0) break;
+        depth--;
+      }
+      i++;
+    }
+    if (depth !== 0 || i > limit) return null;
+    href = text.slice(begin, i);
+  }
+  const afterDestination = i;
+  while (i < limit && isSpace(text[i] as string)) i++;
+  const open = text[i];
+  if (i > afterDestination && (open === '"' || open === "'" || open === "(")) {
+    const close = open === "(" ? ")" : open;
+    let j = i + 1;
+    while (j < limit && text[j] !== close) j += text[j] === "\\" ? 2 : 1;
+    if (j >= limit) return null;
+    i = j + 1;
+    while (i < limit && isSpace(text[i] as string)) i++;
+  }
+  if (i >= limit || text[i] !== ")") return null;
+  return { href, end: i + 1 };
+}
+
 /** Every link a Markdown document points at, code blocks excluded. */
 export function extractMarkdownLinks(text: string): LinkRef[] {
-  const spans = codeSpans(text);
+  const spans = indexSpans(codeSpans(text));
+  const lineAt = lineIndex(text);
   const links: LinkRef[] = [];
 
+  // Every bracket class below excludes `[` as well as `]`, and the HTML ones
+  // exclude `<`: a scan then stops where the next attempt would start, where
+  // `[^\]]*` from every `[` of a long `[[[[…` run read to the end each time.
   // Reference definitions: `[id]: https://…`
   const definitions = new Map<string, string>();
-  for (const m of text.matchAll(/^\s{0,3}\[([^\]]+)\]:\s*(\S+)/gm)) {
+  for (const m of text.matchAll(/^\s{0,3}\[([^\[\]\n]+)\]:\s*(\S+)/gm)) {
     if (m.index !== undefined && inSpan(m.index, spans)) continue;
     definitions.set((m[1] as string).toLowerCase(), m[2] as string);
   }
 
-  for (const m of text.matchAll(/(!?)\[([^\]]*)\]\(\s*<?([^)\s>]*)>?(?:\s+"[^"]*")?\s*\)/g)) {
-    if (m.index === undefined || inSpan(m.index, spans)) continue;
-    const href = m[3] as string;
-    if (href === "") continue;
+  for (const link of inlineLinks(text)) {
+    if (inSpan(link.start, spans)) continue;
+    if (link.href === "") continue;
     links.push({
-      href,
-      text: m[2] as string,
-      line: lineAt(text, m.index),
-      kind: m[1] === "!" ? "image" : "inline",
+      href: link.href,
+      text: link.text,
+      line: lineAt(link.start),
+      kind: link.image ? "image" : "inline",
     });
   }
 
-  for (const m of text.matchAll(/\[([^\]]+)\]\[([^\]]*)\]/g)) {
+  for (const m of text.matchAll(/\[([^\[\]]+)\]\[([^\[\]]*)\]/g)) {
     if (m.index === undefined || inSpan(m.index, spans)) continue;
     const id = ((m[2] as string) || (m[1] as string)).toLowerCase();
     const href = definitions.get(id);
     if (href === undefined) continue;
-    links.push({ href, text: m[1] as string, line: lineAt(text, m.index), kind: "reference" });
+    links.push({ href, text: m[1] as string, line: lineAt(m.index), kind: "reference" });
   }
 
-  for (const m of text.matchAll(/<(?:a[^>]*href|img[^>]*src)\s*=\s*["']([^"']+)["']/gi)) {
+  for (const m of text.matchAll(/<(?:a[^<>]*href|img[^<>]*src)\s*=\s*["']([^"']+)["']/gi)) {
     if (m.index === undefined || inSpan(m.index, spans)) continue;
-    links.push({ href: m[1] as string, text: "", line: lineAt(text, m.index), kind: "html" });
+    links.push({ href: m[1] as string, text: "", line: lineAt(m.index), kind: "html" });
   }
 
   return links;
@@ -113,12 +258,16 @@ export function extractMarkdownLinks(text: string): LinkRef[] {
 
 /** GitHub-style anchors: lowercased, punctuation dropped, spaces to dashes. */
 export function headingAnchors(text: string): Set<string> {
-  const spans = codeSpans(text);
+  const spans = indexSpans(codeSpans(text));
   const anchors = new Set<string>();
   const seen = new Map<string, number>();
-  for (const m of text.matchAll(/^(#{1,6})\s+(.+?)\s*#*\s*$/gm)) {
+  // Candidate lines only; `parseAtxHeading` (shared with MarkdownOutline)
+  // decides, in linear time, whether each is a heading and what it says.
+  for (const m of text.matchAll(/^#{1,6}[ \t][^\n]*/gm)) {
     if (m.index !== undefined && inSpan(m.index, spans)) continue;
-    const slug = (m[2] as string)
+    const heading = parseAtxHeading(m[0]);
+    if (heading === null) continue;
+    const slug = heading.title
       .toLowerCase()
       .replace(/[^\p{L}\p{N}\s-]/gu, "")
       .trim()
@@ -130,7 +279,7 @@ export function headingAnchors(text: string): Set<string> {
     anchors.add(count === 0 ? slug : `${slug}-${count}`);
     anchors.add(slug);
   }
-  for (const m of text.matchAll(/<a[^>]+(?:name|id)\s*=\s*["']([^"']+)["']/gi)) {
+  for (const m of text.matchAll(/<a[^<>]+(?:name|id)\s*=\s*["']([^"'<>]+)["']/gi)) {
     anchors.add((m[1] as string).toLowerCase());
   }
   return anchors;
@@ -187,7 +336,8 @@ export type CitationReport = {
  * reported, separately, so a caller can gate on the first alone.
  */
 export function lintCitations(text: string): CitationReport {
-  const spans = codeSpans(text);
+  const spans = indexSpans(codeSpans(text));
+  const lineAt = lineIndex(text);
   const markers: Citation[] = [];
   // Asked of `citationDefinitions`, never worked out again here: this tool
   // says whether a marker has a source and FactCrossCheck then reads that
@@ -198,7 +348,7 @@ export function lintCitations(text: string): CitationReport {
 
   for (const m of text.matchAll(CITATION_MARKER)) {
     if (m.index === undefined || inSpan(m.index, spans)) continue;
-    markers.push({ marker: m[1] as string, line: lineAt(text, m.index) });
+    markers.push({ marker: m[1] as string, line: lineAt(m.index) });
   }
 
   const cited = new Set(markers.map((c) => c.marker));
@@ -217,7 +367,7 @@ export function lintCitations(text: string): CitationReport {
 /** Every marker's declared source, by the one `DEFINITION` rule above. First
  *  definition wins, as a renderer does. */
 export function citationDefinitions(text: string): Map<string, string> {
-  const spans = codeSpans(text);
+  const spans = indexSpans(codeSpans(text));
   const definitions = new Map<string, string>();
   for (const m of text.matchAll(DEFINITION)) {
     if (m.index !== undefined && inSpan(m.index, spans)) continue;
@@ -279,10 +429,17 @@ export function splitSentences(text: string): Array<{ start: number; end: number
   for (const m of text.matchAll(/^[ \t]{0,3}(?:[-*+]|\d+[.)])[ \t]+/gm)) {
     if (m.index !== undefined) bounds.add(m.index);
   }
-  for (const m of text.matchAll(/[.!?]+["')\]]*(?=[ \t\n]|$)/g)) {
+  // The lookbehind lets a run of `.!?` be tried only from its first
+  // character; every later start ends where the first does, so trying them
+  // too made a long run of `!` quadratic.
+  for (const m of text.matchAll(/(?<![.!?])[.!?]+["')\]]*(?=[ \t\n]|$)/g)) {
     if (m.index === undefined) continue;
-    const upto = text.slice(0, m.index + m[0].length);
-    const word = (/(\S+)$/.exec(upto)?.[1] ?? "").toLowerCase();
+    // The word that ends here, found by walking back to the whitespace
+    // before it — not by copying the whole text up to here per match.
+    const end = m.index + m[0].length;
+    let from = end;
+    while (from > 0 && !/\s/.test(text[from - 1] as string)) from--;
+    const word = text.slice(from, end).toLowerCase();
     if (ABBREVIATIONS.has(word)) continue;
     // "J. Smith" — a single letter and a dot is an initial, not an end.
     if (/^[\p{L}]\.$/u.test(word)) continue;
@@ -307,12 +464,24 @@ export type CitedClaim = {
   readonly markers: ReadonlyArray<string>;
 };
 
+/** A sentence with each inline link replaced by its text, by the same reader
+ *  the link checker uses (a pattern of its own let every `[](` read to the end
+ *  of the line: 192 KB of them held FactCrossCheck for nine seconds). */
+function linksToText(sentence: string): string {
+  let out = "";
+  let at = 0;
+  for (const link of inlineLinks(sentence)) {
+    out += sentence.slice(at, link.start) + link.text;
+    at = link.end;
+  }
+  return out + sentence.slice(at);
+}
+
 /** Markdown down to the words the sentence actually asserts. */
 function plainClaim(sentence: string): string {
   return (
-    sentence
+    linksToText(sentence) // a link's URL is not part of the claim
       .replace(/^\s*(?:[-*+]|\d+[.)])\s+/, "") // the bullet is not part of the claim
-      .replace(/!?\[([^\]]*)\]\([^)\n]*\)/g, "$1") // a link's URL is not part of the claim
       .replace(/\[\^?[\w.-]+\]/g, " ") // the markers themselves
       .replace(/[`*_>#|]/g, "")
       .replace(/\s+/g, " ")
@@ -331,15 +500,30 @@ function plainClaim(sentence: string): string {
  * enough for it to have been said.
  */
 export function citedClaims(text: string): CitedClaim[] {
-  const spans = codeSpans(text);
+  const spans = indexSpans(codeSpans(text));
+  const lineAt = lineIndex(text);
   const sentences = splitSentences(text);
+  // Sentences are ordered and do not overlap: find one by binary search, not
+  // by a scan per marker.
+  const sentenceAt = (at: number): { start: number; end: number } | undefined => {
+    let lo = 0;
+    let hi = sentences.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const s = sentences[mid] as { start: number; end: number };
+      if (at < s.start) hi = mid - 1;
+      else if (at >= s.end) lo = mid + 1;
+      else return s;
+    }
+    return undefined;
+  };
   const byStart = new Map<number, { markers: string[]; start: number; end: number }>();
   const order: number[] = [];
 
   for (const m of text.matchAll(CITATION_MARKER)) {
     if (m.index === undefined || inSpan(m.index, spans)) continue;
     const at = m.index;
-    const sentence = sentences.find((s) => at >= s.start && at < s.end);
+    const sentence = sentenceAt(at);
     if (sentence === undefined) continue;
     let bucket = byStart.get(sentence.start);
     if (bucket === undefined) {
@@ -355,7 +539,7 @@ export function citedClaims(text: string): CitedClaim[] {
     const bucket = byStart.get(start) as { markers: string[]; start: number; end: number };
     claims.push({
       text: plainClaim(text.slice(bucket.start, bucket.end)),
-      line: lineAt(text, bucket.start),
+      line: lineAt(bucket.start),
       markers: bucket.markers,
     });
   }

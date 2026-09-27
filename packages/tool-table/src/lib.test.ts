@@ -599,6 +599,32 @@ describe("chi-square test of homogeneity", () => {
     expect(result.p).toBe(1);
   });
 
+  test("a new category named like an Object.prototype member stays in the table", () => {
+    // The reference is what JSON.parse gives back for a stored profile: a
+    // plain object. On 0.7.0 each of these read the inherited member, the
+    // category dropped out, and the test said categories 2, df 1, p = 1.
+    let checked = 0;
+    for (const name of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+      const reference = JSON.parse('{"engineer":50,"architect":50}') as Record<string, number>;
+      const current: Record<string, number> = Object.create(null);
+      current["engineer"] = 10;
+      current["architect"] = 10;
+      current[name] = 80;
+      const r = chiSquareHomogeneity(reference, current);
+      expect({ name, categories: r.categories, df: r.df, significant: (r.p ?? 1) < 1e-20 }).toEqual(
+        { name, categories: 3, df: 2, significant: true },
+      );
+      // And when the prototype-named value is the one that disappeared.
+      const dropped = chiSquareHomogeneity(
+        JSON.parse(`{"engineer":10,"architect":10,${JSON.stringify(name)}:80}`),
+        JSON.parse('{"engineer":50,"architect":50}'),
+      );
+      expect({ name, categories: dropped.categories }).toEqual({ name, categories: 3 });
+      checked += 1;
+    }
+    expect(checked).toBe(5);
+  });
+
   test("a category on one side only stays in the table", () => {
     // Dropping it to avoid the zero is how a column that gained a whole new
     // value tests as unchanged.

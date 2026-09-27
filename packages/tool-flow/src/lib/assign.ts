@@ -21,7 +21,7 @@
  *   "Nobody is eligible" and "I could not work out who is" are different
  *   answers, and only the first one uses `fallback`.
  */
-import { type Check, runChecks } from "@crewhaus/tool-schema";
+import { type Check, type RegexAnswers, checksVerdict, runChecks } from "@crewhaus/tool-schema";
 import type { MatchMode } from "./branch";
 
 /** How the winner is picked from the owners that are eligible. */
@@ -139,7 +139,11 @@ const specificityOf = (owner: Owner): number =>
  *   it false and so reads as the lowest load in the roster. A cursor that is
  *   not a whole position goes the same way.
  */
-export function assignOwner(value: unknown, roster: Roster): AssignResult {
+export function assignOwner(
+  value: unknown,
+  roster: Roster,
+  options: { readonly regex?: RegexAnswers } = {},
+): AssignResult {
   if (roster.owners.length === 0) throw new Error("the roster has no owners");
 
   const seen = new Set<string>();
@@ -173,11 +177,27 @@ export function assignOwner(value: unknown, roster: Roster): AssignResult {
   const undetermined: string[] = [];
 
   for (const [index, owner] of roster.owners.entries()) {
-    const report = runChecks(value, owner.when as Check[]);
-    const passes = (owner.match ?? "all") === "all" ? report.ok : report.passed > 0;
+    const report = runChecks(
+      value,
+      owner.when as Check[],
+      options.regex === undefined ? {} : { regex: options.regex },
+    );
+    const verdict = checksVerdict(report, owner.match ?? "all");
+    const passes = verdict === "pass";
     const out = (reason: string): void => {
       considered.push({ id: owner.id, eligible: false, reason, matched: report.passed });
     };
+
+    // A territory whose pattern had no answer is neither in nor out, like an
+    // owner missing a fact the strategy needs, and the answer refuses rather
+    // than hand the lead to someone else.
+    if (verdict === "undetermined") {
+      const why = report.failures.find((f) => f.undetermined === true)?.reason ?? "";
+      const reason = `owner "${owner.id}" could not be decided: ${why}`;
+      undetermined.push(reason);
+      considered.push({ id: owner.id, eligible: null, reason, matched: report.passed });
+      continue;
+    }
 
     if (!passes) {
       out(report.failures[0]?.reason ?? "no condition held");

@@ -292,7 +292,9 @@ export function parseMailDate(value: string | undefined): string | undefined {
     );
   if (match === null) return undefined;
   const day = Number.parseInt(match[1] as string, 10);
-  const month = MONTHS[(match[2] as string).toLowerCase()];
+  const monthName = (match[2] as string).toLowerCase();
+  // Own entries only, like every table keyed by a message's text.
+  const month = Object.hasOwn(MONTHS, monthName) ? MONTHS[monthName] : undefined;
   if (month === undefined) return undefined;
   let year = Number.parseInt(match[3] as string, 10);
   // Two-digit years: 0-49 are 2000s, 50-99 are 1900s (RFC 5322 section 4.3).
@@ -308,7 +310,8 @@ export function parseMailDate(value: string | undefined): string | undefined {
     offsetMinutes =
       sign * (Number.parseInt(zone.slice(1, 3), 10) * 60 + Number.parseInt(zone.slice(3, 5), 10));
   } else if (zone !== undefined) {
-    offsetMinutes = OBSOLETE_ZONES[zone.toLowerCase()] ?? 0;
+    const name = zone.toLowerCase();
+    offsetMinutes = (Object.hasOwn(OBSOLETE_ZONES, name) ? OBSOLETE_ZONES[name] : undefined) ?? 0;
   }
   const ms = Date.UTC(year, month, day, hour, minute, second) - offsetMinutes * 60_000;
   if (Number.isNaN(ms)) return undefined;

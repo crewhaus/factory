@@ -192,7 +192,8 @@ const GLYPH_CODES: Readonly<Record<string, number>> = {
 };
 
 function glyphToUnicode(name: string): string | undefined {
-  const known = GLYPH_CODES[name];
+  // Own entries only: the name is the PDF's, and `/constructor` read Object.
+  const known = Object.hasOwn(GLYPH_CODES, name) ? GLYPH_CODES[name] : undefined;
   if (known !== undefined) return String.fromCodePoint(known);
   const uni = /^uni([0-9A-Fa-f]{4,6})$/.exec(name);
   if (uni?.[1] !== undefined) return String.fromCodePoint(Number.parseInt(uni[1], 16));

@@ -196,7 +196,9 @@ export function parseCron(expression: string): CronParseResult {
       error: "@reboot is an event, not a schedule, so it has no next firing time",
     };
   }
-  const expanded = MACROS[trimmed.toLowerCase()] ?? trimmed;
+  // Own entries only: `constructor` read Object and crashed on startsWith.
+  const macro = trimmed.toLowerCase();
+  const expanded = Object.hasOwn(MACROS, macro) ? (MACROS[macro] as string) : trimmed;
   if (expanded.startsWith("@")) {
     return {
       ok: false,
