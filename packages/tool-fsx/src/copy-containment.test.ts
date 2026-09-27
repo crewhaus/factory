@@ -27,7 +27,12 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { _setMoveRenameForTest, copyPath, movePath } from "./index";
+import {
+  _setMoveCrossesFilesystemForTest,
+  _setMoveRenameForTest,
+  copyPath,
+  movePath,
+} from "./index";
 
 const originalCwd = process.cwd();
 /** The workspace's PARENT, so a link climbing out of the workspace has somewhere to land. */
@@ -47,6 +52,7 @@ beforeEach(() => {
 
 afterEach(() => {
   _setMoveRenameForTest(undefined);
+  _setMoveCrossesFilesystemForTest(undefined);
   process.chdir(originalCwd);
   rmSync(parent, { recursive: true, force: true });
 });
@@ -234,6 +240,26 @@ describe("a link that leads out exactly where it did adds no reach, so it copies
     expect(moved).toMatchObject({ moved: true, outsideLinks: ["proj2/.venv/bin/python"] });
     expect(existsSync(path.join(ws, "proj"))).toBe(false);
     expect(lstatSync(path.join(ws, "proj2/.venv/bin/python")).isSymbolicLink()).toBe(true);
+  });
+
+  test("a rename in place that must cross a filesystem names it in dryRun, as the move does", async () => {
+    // A rename within one directory skips the link walk, unless it will be
+    // a copy (the moved entry is a mount point): then dryRun still lists
+    // what the copy will report.
+    _setMoveCrossesFilesystemForTest(() => true);
+    _setMoveRenameForTest(() => {
+      throw Object.assign(new Error("cross-device link not permitted"), { code: "EXDEV" });
+    });
+    for (const dryRun of [true, false]) {
+      const result = JSON.parse(
+        await call(movePath, { source: "proj", destination: "proj2", dryRun }),
+      );
+      expect(result).toMatchObject({
+        moved: !dryRun,
+        outsideLinks: ["proj2/.venv/bin/python"],
+      });
+      if (dryRun) expect(result.crossesFilesystem).toBe(true);
+    }
   });
 
   test("a relative link that already led out is refused where it would lead further out", async () => {

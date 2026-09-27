@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -217,10 +218,12 @@ describe("maxEntries raises the link check's caps", () => {
     for (let i = 0; i < 6; i++) symlinkSync("d/t.txt", path.join(ws, `tree/l${i}`));
   }
 
+  // Each move below goes one level down, to a new depth: a rename within one
+  // directory does not walk the tree at all (see the next describe).
   test("past the base cap the move is refused, and the refusal says how to go on", async () => {
     sixLinks();
     _setMoveLinkCapsForTest({ maxLinks: 5, maxVisited: 1_000 });
-    const result = JSON.parse(await call(movePath, { source: "tree", destination: "moved" }));
+    const result = JSON.parse(await call(movePath, { source: "tree", destination: "sub/moved" }));
     expect(result).toMatchObject({ moved: false, code: "too-large" });
     expect(result.reason).toContain("holds more than 5 links");
     expect(result.reason).toContain("raise maxEntries (up to 500000)");
@@ -231,22 +234,114 @@ describe("maxEntries raises the link check's caps", () => {
     sixLinks();
     _setMoveLinkCapsForTest({ maxLinks: 5, maxVisited: 1_000 });
     const result = JSON.parse(
-      await call(movePath, { source: "tree", destination: "moved", maxEntries: 6 }),
+      await call(movePath, { source: "tree", destination: "sub/moved", maxEntries: 6 }),
     );
     expect(result).toMatchObject({ moved: true });
-    expect(readFileSync(path.join(ws, "moved/l5"), "utf8")).toBe("x");
+    expect(readFileSync(path.join(ws, "sub/moved/l5"), "utf8")).toBe("x");
   });
 
   test("the entry cap is raised too, at twenty entries for each one allowed", async () => {
     write("tree/d/t.txt", "x");
     for (let i = 0; i < 30; i++) write(`tree/f${i}.txt`, "x");
     _setMoveLinkCapsForTest({ maxLinks: 5, maxVisited: 10 });
-    const refused = JSON.parse(await call(movePath, { source: "tree", destination: "moved" }));
+    const refused = JSON.parse(await call(movePath, { source: "tree", destination: "sub/moved" }));
     expect(refused).toMatchObject({ moved: false, code: "too-large" });
     expect(refused.reason).toContain("has more than 10 entries");
     const moved = JSON.parse(
-      await call(movePath, { source: "tree", destination: "moved", maxEntries: 2 }),
+      await call(movePath, { source: "tree", destination: "sub/moved", maxEntries: 2 }),
     );
     expect(moved).toMatchObject({ moved: true });
   });
 });
+
+describe("a rename within one directory is a rename (0.7.1 review)", () => {
+  test("it does not walk the tree: its links keep their text and depth", async () => {
+    // Caps a walk would hit at once. 0.7.1 before this walked a 67 000-entry
+    // node_modules for 735 ms before renaming it in place (1 ms on 0.7.0),
+    // and a tree past the caps was refused.
+    write("tree/d/t.txt", "x");
+    for (let i = 0; i < 6; i++) symlinkSync("d/t.txt", path.join(ws, `tree/l${i}`));
+    symlinkSync("../tree-sibling.txt", path.join(ws, "tree/up"));
+    write("tree-sibling.txt", "beside");
+    _setMoveLinkCapsForTest({ maxLinks: 1, maxVisited: 1 });
+    for (const dryRun of [true, false]) {
+      const result = JSON.parse(
+        await call(movePath, { source: "tree", destination: "renamed", dryRun }),
+      );
+      expect(result).toMatchObject({ moved: !dryRun, dryRun });
+      expect("outsideLinks" in result).toBe(false);
+    }
+    expect(readFileSync(path.join(ws, "renamed/l5"), "utf8")).toBe("x");
+    expect(readFileSync(path.join(ws, "renamed/up"), "utf8")).toBe("beside");
+    // One level down is a new depth: the same caps refuse it.
+    const deeper = JSON.parse(
+      await call(movePath, { source: "renamed", destination: "sub/renamed" }),
+    );
+    expect(deeper).toMatchObject({ moved: false, code: "too-large" });
+  });
+
+  test("a link that would lead out from one level up is still refused", async () => {
+    // a/esc/up -> ../.. is the workspace root where it is; renamed within
+    // a/ it still is, and moved to the root it would be the parent.
+    mkdirSync(path.join(ws, "a/esc"), { recursive: true });
+    symlinkSync("../..", path.join(ws, "a/esc/up"));
+    const inPlace = JSON.parse(await call(movePath, { source: "a/esc", destination: "a/esc2" }));
+    expect(inPlace).toMatchObject({ moved: true });
+    const up = JSON.parse(await call(movePath, { source: "a/esc2", destination: "esc" }));
+    expect(up).toMatchObject({ moved: false, code: "escapes-root" });
+  });
+
+  test("two hard links to one file are two entries: the move is an ordinary overwrite", async () => {
+    write("a.txt", "shared");
+    linkSync(path.join(ws, "a.txt"), path.join(ws, "b.txt"));
+    const refused = JSON.parse(await call(movePath, { source: "a.txt", destination: "b.txt" }));
+    expect(refused).toMatchObject({ moved: false, reason: "destination exists" });
+    const moved = JSON.parse(
+      await call(movePath, { source: "a.txt", destination: "b.txt", overwrite: true }),
+    );
+    expect(moved).toMatchObject({ moved: true, overwrote: true });
+    expect(readdirSync(ws)).toEqual(["b.txt"]);
+    expect(readFileSync(path.join(ws, "b.txt"), "utf8")).toBe("shared");
+  });
+
+  // APFS and NTFS fold case by default; Linux filesystems do not, and there
+  // README.md and readme.md are two names.
+  test.if(caseFolds())("a case-only rename renames, where the filesystem folds case", async () => {
+    write("README.md", "hello\n");
+    write("Src/a.ts", "x");
+    // 0.7.1 before this: "destination exists"; with overwrite it failed
+    // ENOENT and said readme.md "was left as it was" after renaming it.
+    const dry = JSON.parse(
+      await call(movePath, { source: "README.md", destination: "readme.md", dryRun: true }),
+    );
+    expect(dry).toMatchObject({ dryRun: true, moved: false, wouldOverwrite: false });
+    expect(readdirSync(ws)).toContain("README.md");
+    for (const [from, to] of [
+      ["README.md", "readme.md"],
+      ["Src", "src"],
+    ] as const) {
+      const result = JSON.parse(await call(movePath, { source: from, destination: to }));
+      expect(result).toMatchObject({ moved: true, overwrote: false });
+    }
+    expect(readdirSync(ws).sort()).toEqual(["readme.md", "src"]);
+    expect(readFileSync(path.join(ws, "readme.md"), "utf8")).toBe("hello\n");
+    expect(readdirSync(path.join(ws, "src"))).toEqual(["a.ts"]);
+    // With overwrite too, and back: nothing is set aside or lost.
+    const back = JSON.parse(
+      await call(movePath, { source: "readme.md", destination: "README.md", overwrite: true }),
+    );
+    expect(back).toMatchObject({ moved: true, overwrote: false });
+    expect(readdirSync(ws).sort()).toEqual(["README.md", "src"]);
+  });
+});
+
+/** Whether this host's temp directory folds case (APFS and NTFS by default). */
+function caseFolds(): boolean {
+  const dir = mkdtempSync(path.join(tmpdir(), "crewhaus-fsx-case-"));
+  try {
+    writeFileSync(path.join(dir, "probe"), "");
+    return existsSync(path.join(dir, "PROBE"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
