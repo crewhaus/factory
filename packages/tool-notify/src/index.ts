@@ -1356,6 +1356,39 @@ export const emailCompose: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * A retry of an EmailSend whose message can no longer be built — most often
+ * because an attachment was a temp file cleaned up after the first send —
+ * under a key that already sent a message agreeing on everything but the
+ * attachments' bytes. Answering "nothing was sent" there would read as the
+ * FIRST message being unsent, and invite a second send (net regression
+ * review). So the recorded answer is given, with a note that this call sent
+ * nothing and could not confirm the attachments are the same. Undefined when
+ * the key recorded nothing like it.
+ */
+function unconfirmedEmailReplay(
+  args: ComposeArgs & { idempotencyKey?: string },
+  reason: string,
+): string | undefined {
+  const answer = ledgerLookup(
+    "EmailSend",
+    args.idempotencyKey,
+    requestFingerprint({ ...args, date: undefined }),
+    ["attachmentContent"],
+  );
+  if (answer?.kind !== "replay") return undefined;
+  const note = `idempotencyKey "${args.idempotencyKey}" already sent this message, and this is what that send returned. This call sent nothing: its message could not be built again (${reason}), so whether its attachments are the same as the ones sent is not known`;
+  try {
+    const recorded = JSON.parse(answer.result) as unknown;
+    if (typeof recorded === "object" && recorded !== null && !Array.isArray(recorded)) {
+      return json({ ...(recorded as Record<string, unknown>), replayNote: note });
+    }
+  } catch {
+    // not JSON: the note goes on a line of its own
+  }
+  return `${answer.result}\n${note}`;
+}
+
 export const emailSend: RegisteredTool = buildTool({
   name: "EmailSend",
   operativeArgs: [
@@ -1459,7 +1492,10 @@ export const emailSend: RegisteredTool = buildTool({
     }
 
     const built = buildMessage("EmailSend", args);
-    if (!built.ok) return notSentBecause(built.message);
+    if (!built.ok) {
+      const replay = unconfirmedEmailReplay(args, built.message);
+      return replay ?? notSentBecause(built.message);
+    }
 
     // The ledger is asked about the message that would be SENT, so it is
     // consulted after the build. `date` only stamps the message, so a retry

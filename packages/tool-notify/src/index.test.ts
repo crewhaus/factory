@@ -980,6 +980,39 @@ describe("EmailSend", () => {
     }
   });
 
+  test("net regression review: a retry after the attachment was cleaned up replays the send, never 'nothing was sent'", async () => {
+    const { server, port, log } = await startSmtpServer();
+    try {
+      const call = {
+        ...base,
+        port,
+        idempotencyKey: "nightly-cleaned",
+        attachments: [{ path: "tmp-report.txt", contentType: "text/plain" }],
+      };
+      writeFileSync(path.join(tmp, "tmp-report.txt"), "nightly: all green");
+      const first = JSON.parse(String(await emailSend.execute(call)));
+      expect(first.sent).toBe(true);
+      // A temp report, removed once it was sent.
+      rmSync(path.join(tmp, "tmp-report.txt"));
+      const retry = String(await emailSend.execute(call));
+      expect(retry).not.toContain("nothing was sent");
+      const replayed = JSON.parse(retry);
+      expect(replayed).toMatchObject({ sent: true, messageId: first.messageId });
+      expect(replayed.replayNote).toContain("This call sent nothing");
+      expect(replayed.replayNote).toContain('"tmp-report.txt" could not be read');
+      expect(log.commands.filter((c) => c === "DATA")).toHaveLength(1);
+      // Without a key, or under a key that sent something else, the build
+      // failure is what it always was.
+      const unkeyed = String(await emailSend.execute({ ...call, idempotencyKey: undefined }));
+      expect(unkeyed).toBe('nothing was sent: "tmp-report.txt" could not be read');
+      const otherSubject = String(await emailSend.execute({ ...call, subject: "Other" }));
+      expect(otherSubject).toBe('nothing was sent: "tmp-report.txt" could not be read');
+      expect(log.commands.filter((c) => c === "DATA")).toHaveLength(1);
+    } finally {
+      server.close();
+    }
+  });
+
   test("authenticates with AUTH PLAIN and never returns the password", async () => {
     const { server, port, log } = await startSmtpServer();
     try {

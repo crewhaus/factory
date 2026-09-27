@@ -1694,15 +1694,24 @@ export type LedgerAnswer =
 const LEDGER_LIMIT = 512;
 const ledger = new Map<string, LedgerEntry>();
 
+/**
+ * `ignoring` names fields left out of the comparison: EmailSend asks with
+ * `attachmentContent` ignored when an attachment can no longer be read, so
+ * a retry after a temp file was cleaned up finds the message it already
+ * sent instead of reporting it unsent.
+ */
 export function ledgerLookup(
   tool: string,
   key: string | undefined,
   fingerprint: RequestFingerprint,
+  ignoring: readonly string[] = [],
 ): LedgerAnswer | undefined {
   if (key === undefined || key === "") return undefined;
   const entry = ledger.get(`${tool}\u0000${key}`);
   if (entry === undefined) return undefined;
-  const differs = differingFields(entry.fingerprint, fingerprint);
+  const differs = differingFields(entry.fingerprint, fingerprint).filter(
+    (name) => !ignoring.includes(name),
+  );
   return differs.length === 0
     ? { kind: "replay", result: entry.result }
     : { kind: "conflict", differs };
