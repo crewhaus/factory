@@ -17,9 +17,13 @@ import { describe, expect, test } from "bun:test";
 import { jsonSchemaValidate, validateRecords } from "./index";
 import {
   DEFAULT_MAX_WORK,
+  MAX_DEFAULT_WORK,
+  MAX_MESSAGE_CHARS,
   MAX_NESTING,
   MAX_VALUE_DEPTH,
   type Schema,
+  defaultWorkLimit,
+  schemaFanout,
   validateValue,
 } from "./lib/jsonschema";
 import { validateRecords as validateRecordsFn } from "./lib/records";
@@ -216,6 +220,243 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     expect(result.valid).toBe(true);
     expect(20_000 * 31).toBeGreaterThan(DEFAULT_MAX_WORK);
   }, 20_000);
+});
+
+describe("the default budget answers honest wide and nested unions", () => {
+  // Chat-message rows whose content blocks are one of ten kinds, each with a
+  // source that is one of ten kinds: 0.7.0 answered in 0.4 s, and the fix
+  // round's flat 64 units per value node left rows 985-999 undetermined.
+  const K = 10;
+  const source = {
+    oneOf: Array.from({ length: K }, (_, i) => ({
+      type: "object",
+      required: ["kind"],
+      properties: { kind: { const: `s${i}` }, url: { type: "string" }, size: { type: "integer" } },
+      additionalProperties: false,
+    })),
+  };
+  const block = {
+    oneOf: Array.from({ length: K }, (_, i) => ({
+      type: "object",
+      required: ["type"],
+      properties: { type: { const: `b${i}` }, text: { type: "string" }, source },
+      additionalProperties: false,
+    })),
+  };
+  const message: Schema = {
+    type: "object",
+    required: ["id", "content"],
+    properties: {
+      id: { type: "string" },
+      role: { enum: ["user", "assistant"] },
+      content: { type: "array", items: block },
+    },
+  };
+  const rows = Array.from({ length: 1_000 }, (_, i) => ({
+    id: `m${i}`,
+    role: "user",
+    content: Array.from({ length: 3 }, (_, j) => ({
+      type: `b${(i + j) % K}`,
+      text: "hello world",
+      source: { kind: `s${(i * 7 + j) % K}`, url: "https://x.test/a", size: 10 },
+    })),
+  }));
+  // Through JSON, as a tool receives it: the shared `source` becomes ten copies.
+  const nested = JSON.parse(JSON.stringify(message)) as Schema;
+
+  test("a 10 x 10 nested oneOf over 1,000 valid rows", async () => {
+    const records = await call(validateRecords as typeof jsonSchemaValidate, {
+      records: rows,
+      schema: nested,
+      summaryOnly: true,
+    });
+    expect(records).toMatchObject({ ok: true, passed: 1_000, failed: 0 });
+    expect(records.undetermined ?? 0).toBe(0);
+    const whole = await call(jsonSchemaValidate, {
+      value: rows,
+      schema: { type: "array", items: nested },
+    });
+    expect(whole).toMatchObject({ valid: true });
+  }, 30_000);
+
+  test("a flat 64- and 100-way discriminated union over 2,000 valid rows", async () => {
+    for (const width of [64, 100]) {
+      const schema = {
+        oneOf: Array.from({ length: width }, (_, i) => ({
+          type: "object",
+          required: ["kind"],
+          properties: { kind: { const: `k${i}` }, a: { type: "string" }, b: { type: "number" } },
+          additionalProperties: false,
+        })),
+      };
+      const records = Array.from({ length: 2_000 }, (_, i) => ({
+        kind: `k${i % width}`,
+        a: "x",
+        b: i,
+      }));
+      const out = await call(validateRecords as typeof jsonSchemaValidate, {
+        records,
+        schema,
+        summaryOnly: true,
+      });
+      expect({ width, ok: out.ok, passed: out.passed }).toEqual({ width, ok: true, passed: 2_000 });
+    }
+  }, 30_000);
+
+  test("the allowance per value node is the schema's subschema count, between a floor and a ceiling", () => {
+    expect(schemaFanout({ type: "string" })).toBe(1);
+    expect(schemaFanout(nested)).toBeGreaterThan(400);
+    // A $ref is not followed: the shared-ref shape that multiplies earns its
+    // written size (31 definitions, 60 branches and the root), not 2^30.
+    expect(schemaFanout(chain(30, "anyOf"))).toBe(92);
+    expect(defaultWorkLimit("x", chain(30, "anyOf"))).toBe(DEFAULT_MAX_WORK);
+    expect(defaultWorkLimit(rows, nested)).toBeGreaterThan(25_000 * 400);
+    expect(defaultWorkLimit(Array(1_000_000).fill(1), nested)).toBe(MAX_DEFAULT_WORK);
+  });
+});
+
+describe("enum candidates and patternProperties tests cost what they do", () => {
+  test("an enum is one lookup per value, and still sameJson's answer", () => {
+    // 20,000 values against 20,000 candidates compared every pair.
+    const candidates = Array.from({ length: 20_000 }, (_, i) => i);
+    const budget = { used: 0, limit: 10_000_000 };
+    const value = Array.from({ length: 20_000 }, (_, i) => i);
+    expect(
+      validateValue(value, { type: "array", items: { enum: candidates } }, { budget }).valid,
+    ).toBe(true);
+    expect(budget.used).toBeLessThan(100_000);
+    // Each candidate is read once to build the index, not once per value.
+    let reads = 0;
+    const counted = new Proxy(
+      Array.from({ length: 2_000 }, (_, i) => i),
+      {
+        get(target, key, receiver) {
+          if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    );
+    const values = Array.from({ length: 2_000 }, (_, i) => 1_999 - i);
+    expect(validateValue(values, { type: "array", items: { enum: counted } }).valid).toBe(true);
+    expect(reads).toBeLessThanOrEqual(2 * 2_000);
+    const mixed: Schema = { enum: [1, "1", null, true, { a: [1, "x"] }, [1, 2], ""] };
+    const verdicts = [
+      1,
+      1.0,
+      "1",
+      null,
+      true,
+      false,
+      0,
+      { a: [1, "x"] },
+      { a: [1] },
+      [1, 2],
+      [2, 1],
+      "",
+    ].map((v) => validateValue(v, mixed).valid);
+    expect(verdicts).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+    ]);
+  });
+
+  test("patternProperties compiles once per map and charges every (key, pattern) test", () => {
+    // 8,000 keys under 8,000 patterns ran 64 million tests and answered valid.
+    const wide = (n: number) => ({
+      value: Object.fromEntries(Array.from({ length: n }, (_, i) => [`k${i}`, 1])),
+      schema: {
+        type: "object",
+        patternProperties: Object.fromEntries(
+          Array.from({ length: n }, (_, i) => [`^z${i}$`, true]),
+        ),
+      },
+    });
+    const small = wide(200);
+    const budget = { used: 0, limit: 10_000_000 };
+    expect(validateValue(small.value, small.schema, { budget }).valid).toBe(true);
+    expect(budget.used).toBeGreaterThanOrEqual(200 * 200);
+    const big = wide(8_000);
+    const out = validateValue(big.value, big.schema);
+    expect(out.valid).toBe(false);
+    expect(out.undetermined).toMatch(/patternProperties over many keys/);
+    // One compile per map, not one per object checked.
+    let listed = 0;
+    const map = new Proxy(
+      Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`^z${i}$`, true])),
+      {
+        ownKeys(target) {
+          listed += 1;
+          return Reflect.ownKeys(target);
+        },
+      },
+    );
+    const objects = Array.from({ length: 1_000 }, () => ({}));
+    expect(validateValue(objects, { type: "array", items: { patternProperties: map } }).valid).toBe(
+      true,
+    );
+    expect(listed).toBeLessThanOrEqual(3);
+  });
+});
+
+describe("a union's message keeps each branch's decisive reason", () => {
+  test("a nested union failure still names the misspelled property", () => {
+    const notify = {
+      anyOf: [
+        { type: "boolean" },
+        { type: "string" },
+        {
+          type: "object",
+          properties: { api_key: { type: "string" }, channel: { type: "string" } },
+          additionalProperties: false,
+        },
+      ],
+    };
+    const schema: Schema = {
+      anyOf: [
+        { type: "object", properties: { target: { const: "cli" }, notify }, required: ["target"] },
+        {
+          type: "object",
+          properties: { target: { const: "bot" }, token: { type: "string" } },
+          required: ["target", "token"],
+        },
+      ],
+    };
+    const value = {
+      target: "cli",
+      notify: { api_key: "$KEY", channel: "#ops-alerts-production", chanel_fallback: "#ops" },
+    };
+    const message = validateValue(value, schema).errors[0]?.message ?? "";
+    // The fix round cut every branch at 200 characters, and this fact with it.
+    expect(message).toContain('property "chanel_fallback" is not allowed here');
+    expect(message).toContain('required property "token" is missing');
+  });
+
+  test("when the branches do not fit, each is cut to a share and short ones stay whole", () => {
+    const long = (i: number) => ({
+      type: "object",
+      required: [`${"very_long_property_name_".repeat(12)}${i}`],
+    });
+    const branches = [...Array.from({ length: 5 }, (_, i) => long(i)), { type: "string" }];
+    const message = validateValue({}, { anyOf: branches }).errors[0]?.message ?? "";
+    expect(message.length).toBeLessThanOrEqual(MAX_MESSAGE_CHARS);
+    for (let i = 0; i < 5; i++) expect(message).toContain(`[${i}] required property`);
+    expect(message).toContain("[5] expected string, found object ({})");
+    // Too many to show at the shortest share: the rest are counted, not dropped silently.
+    const many = validateValue({}, { anyOf: Array.from({ length: 60 }, (_, i) => long(i)) });
+    const text = many.errors[0]?.message ?? "";
+    expect(text.length).toBeLessThanOrEqual(MAX_MESSAGE_CHARS);
+    expect(text).toMatch(/… \(\+\d+ more\)$/);
+  });
 });
 
 describe("work that follows the value's size is charged, and messages are built only when kept", () => {

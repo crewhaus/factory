@@ -53,17 +53,25 @@
  *
  * `anyOf`/`oneOf`/`allOf` over `$ref`s that share a target multiply: a
  * 1.3 KB schema can ask for 2^30 subschema evaluations, and the walk is
- * synchronous. Every subschema evaluation is counted against a budget
- * (`maxWork`; by default the larger of {@link DEFAULT_MAX_WORK} and
- * {@link WORK_PER_VALUE_NODE} per unit of the value's weight: a node, or
- * 256 characters of a string or key). So is every check whose cost follows
- * the value's size rather than the schema's — a string's length or
- * pattern, uniqueItems, an object's keys, an enum or const comparison, and
+ * synchronous. Every subschema evaluation is counted against a budget. So
+ * is every check whose cost follows the value's size rather than the
+ * schema's — a string's length or pattern, uniqueItems, an object's keys,
+ * each enum candidate and each (key, patternProperties pattern) test, and
  * each error message built — so a small schema cannot spend the value's
  * size once per leaf. When the budget runs out the walk stops and the
  * result is `undetermined`, with `valid: false` and the reason — never a
  * verdict either way. A failing branch is summarised in a bounded message,
  * and a message is built only when it will be kept.
+ *
+ * The default budget ({@link defaultWorkLimit}) follows what an honest walk
+ * can cost. A schema written out as a tree (no `$ref` reached twice at one
+ * place) evaluates each of its subschemas at most once per value node, so a
+ * value node is allowed as many units as the schema has subschemas (at
+ * least {@link WORK_PER_VALUE_NODE}, at most {@link MAX_SCHEMA_FANOUT}); a
+ * wide or nested union over thousands of valid rows is answered. Only
+ * repeating a `$ref` at one place goes past that, which is the shape that
+ * multiplies. The floor is {@link DEFAULT_MAX_WORK} and the ceiling
+ * {@link MAX_DEFAULT_WORK}, a few seconds of the worst schemas measured.
  *
  * ## Depth is the value's
  *
@@ -128,8 +136,21 @@ export type WorkBudget = { used: number; readonly limit: number };
 
 /** The budget floor: about a third of a second of the worst schemas measured (Apple silicon). */
 export const DEFAULT_MAX_WORK = 500_000;
-/** Work allowed per unit of the value's weight, so a large document is not refused for its size. */
+/**
+ * The least work allowed per unit of the value's weight, so a large document
+ * is not refused for its size. A schema with more subschemas than this is
+ * allowed its subschema count instead.
+ */
 export const WORK_PER_VALUE_NODE = 64;
+/** The most work per unit of weight a schema's size earns. */
+export const MAX_SCHEMA_FANOUT = 1_024;
+/**
+ * The most work a default budget allows, however large the value: about
+ * seven seconds of the worst schemas measured (Apple silicon, 0.3-0.5 us a
+ * unit). The walk is synchronous, so this is how long one call can hold the
+ * harness's thread.
+ */
+export const MAX_DEFAULT_WORK = 20_000_000;
 /** Characters of a string (or key) that weigh, and cost, one unit. */
 const CHARS_PER_UNIT = 256;
 /** Keys or items that cost one unit to list or compare. */
@@ -171,11 +192,61 @@ export function valueWeight(value: unknown): number {
   return weight;
 }
 
-/** The default budget for validating `value`. */
-export function defaultWorkLimit(value: unknown): number {
-  const floor = Math.ceil(DEFAULT_MAX_WORK / WORK_PER_VALUE_NODE);
-  const weight = valueWeight(value);
-  return weight <= floor ? DEFAULT_MAX_WORK : weight * WORK_PER_VALUE_NODE;
+/**
+ * Subschemas in `schema` written out as a tree, `$ref`s not followed, up to
+ * `cap`: what one value node can honestly be checked against. Counted
+ * iteratively, since a schema may nest deeper than the stack.
+ */
+export function schemaFanout(schema: unknown, cap = MAX_SCHEMA_FANOUT): number {
+  let count = 0;
+  const stack: unknown[] = [schema];
+  while (stack.length > 0 && count < cap) {
+    const node = stack.pop();
+    if (typeof node === "boolean") {
+      count += 1;
+      continue;
+    }
+    if (!isPlainObject(node)) continue;
+    count += 1;
+    for (const keyword of ["properties", "patternProperties", "$defs", "definitions"]) {
+      const map = node[keyword];
+      if (isPlainObject(map)) for (const key of Object.keys(map)) stack.push(map[key]);
+    }
+    for (const keyword of ["allOf", "anyOf", "oneOf"]) {
+      const list = node[keyword];
+      if (Array.isArray(list)) for (const branch of list) stack.push(branch);
+    }
+    const items = node["items"];
+    if (Array.isArray(items)) for (const item of items) stack.push(item);
+    else if (items !== undefined) stack.push(items);
+    for (const keyword of [
+      "additionalItems",
+      "additionalProperties",
+      "contains",
+      "propertyNames",
+      "not",
+      "if",
+      "then",
+      "else",
+    ]) {
+      if (node[keyword] !== undefined) stack.push(node[keyword]);
+    }
+  }
+  return Math.min(count, cap);
+}
+
+/**
+ * The default budget for validating `value` against `schema`: the value's
+ * weight times what the schema allows per unit of it, between
+ * DEFAULT_MAX_WORK and MAX_DEFAULT_WORK.
+ */
+export function defaultWorkLimit(value: unknown, schema?: unknown): number {
+  const perUnit = Math.max(
+    WORK_PER_VALUE_NODE,
+    schema === undefined ? 0 : schemaFanout(schema, MAX_SCHEMA_FANOUT),
+  );
+  const weighted = valueWeight(value) * perUnit;
+  return Math.max(DEFAULT_MAX_WORK, Math.min(weighted, MAX_DEFAULT_WORK));
 }
 
 export type ValidationResult = {
@@ -314,9 +385,9 @@ function preview(ctx: Ctx, value: unknown, maxChars: number): string {
 }
 
 /** Longest message one error carries; nested branch reasons are cut here. */
-const MAX_MESSAGE_CHARS = 1_000;
-/** Longest summary of one failing branch inside an anyOf/oneOf message. */
-const MAX_BRANCH_SUMMARY_CHARS = 200;
+export const MAX_MESSAGE_CHARS = 1_000;
+/** The shortest a branch's reason is cut to before later branches are dropped instead. */
+const MIN_REASON_CHARS = 48;
 
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
@@ -387,6 +458,76 @@ function sameJson(a: unknown, b: unknown, ctx: Ctx): boolean {
   return false;
 }
 
+/**
+ * An enum's candidates, split into a set of its primitive values and a list
+ * of the rest. Built once per enum array (a schema's arrays live as long as
+ * the call that parsed it), so each value is one set lookup: comparing each
+ * value against every candidate cost 20,000 values x 20,000 candidates for
+ * nothing but the lengths of the schema and the value.
+ */
+type EnumIndex = { readonly primitives: Set<unknown>; readonly others: unknown[] };
+const enumIndexes = new WeakMap<unknown[], EnumIndex>();
+
+function enumIndex(candidates: unknown[], ctx: Ctx): EnumIndex {
+  const known = enumIndexes.get(candidates);
+  if (known !== undefined) return known;
+  charge(ctx, 1 + Math.floor(candidates.length / MEMBERS_PER_UNIT));
+  const primitives = new Set<unknown>();
+  const others: unknown[] = [];
+  for (const candidate of candidates) {
+    if (candidate === null || typeof candidate !== "object") {
+      if (typeof candidate === "string") {
+        charge(ctx, Math.floor(candidate.length / CHARS_PER_UNIT));
+      }
+      primitives.add(candidate);
+    } else others.push(candidate);
+  }
+  const index = { primitives, others };
+  enumIndexes.set(candidates, index);
+  return index;
+}
+
+/** `sameJson(candidate, value)` for some candidate, charged for what it compares. */
+function inEnum(candidates: unknown[], value: unknown, ctx: Ctx): boolean {
+  const index = enumIndex(candidates, ctx);
+  if (value === null || typeof value !== "object") {
+    // Hashing a string reads it; everything else is one lookup. A primitive
+    // equals only a primitive, and a Set's equality is sameJson's for JSON.
+    if (typeof value === "string") charge(ctx, Math.floor(value.length / CHARS_PER_UNIT));
+    return index.primitives.has(value);
+  }
+  charge(ctx, Math.floor(index.others.length / MEMBERS_PER_UNIT));
+  return index.others.some((candidate) => sameJson(candidate, value, ctx));
+}
+
+/**
+ * The patterns of one `patternProperties` map, compiled once per map, not
+ * once per object the map is checked on: 4,000 empty objects under 4,000
+ * patterns compiled 16 million regexes and charged nothing for it.
+ */
+type CompiledPatterns = ReadonlyArray<{
+  readonly source: string;
+  readonly re: RegExp | null;
+  readonly error?: string;
+}>;
+const compiledPatterns = new WeakMap<Record<string, unknown>, CompiledPatterns>();
+
+function patternsOf(map: Record<string, unknown>, ctx: Ctx): CompiledPatterns {
+  const known = compiledPatterns.get(map);
+  if (known !== undefined) return known;
+  const out: Array<{ source: string; re: RegExp | null; error?: string }> = [];
+  for (const source of Object.keys(map)) {
+    charge(ctx, 1 + Math.floor(source.length / CHARS_PER_UNIT));
+    try {
+      out.push({ source, re: new RegExp(source) });
+    } catch (err) {
+      out.push({ source, re: null, error: (err as Error).message });
+    }
+  }
+  compiledPatterns.set(map, out);
+  return out;
+}
+
 /** Does `schema` reject `value`? Runs in a scratch context so no errors leak. */
 function branchErrors(
   value: unknown,
@@ -416,20 +557,48 @@ function summarizeBranch(errors: ValidationError[]): string {
   if (errors.length === 0) return "no error";
   const first = errors[0] as ValidationError;
   const where = first.path === "" ? "" : ` at ${first.path}`;
-  return clip(`${first.message}${where}`, MAX_BRANCH_SUMMARY_CHARS);
+  return `${first.message}${where}`;
 }
 
-/** The reasons of every failing alternative, joined, within MAX_MESSAGE_CHARS. */
+/**
+ * The reasons of every failing alternative, joined, within MAX_MESSAGE_CHARS.
+ *
+ * When they do not all fit, each is cut to an equal share rather than the
+ * last ones dropped, and a reason shorter than its share keeps all of it. A
+ * nested union's reason is itself a joined list whose decisive entry is
+ * often last: cutting every branch to a fixed 200 characters took
+ * `property "chanel_fallback" is not allowed` off the end of the only reason
+ * that named the mistake. Past MIN_REASON_CHARS a share, later branches are
+ * counted instead of shown.
+ */
 function joinReasons(reasons: ReadonlyArray<string>): string {
-  let out = "";
-  for (let i = 0; i < reasons.length; i++) {
-    const next = out === "" ? (reasons[i] as string) : `${out}; ${reasons[i]}`;
-    if (next.length > MAX_MESSAGE_CHARS - 40) {
-      return `${out} … (+${reasons.length - i} more)`;
+  const room = MAX_MESSAGE_CHARS - 80;
+  const separators = 2 * Math.max(0, reasons.length - 1);
+  let total = separators;
+  for (const reason of reasons) total += reason.length;
+  if (total <= room) return reasons.join("; ");
+  // How many fit at the shortest share, and the share they each get.
+  const shown = Math.max(
+    1,
+    Math.min(reasons.length, Math.floor((room + 2) / (MIN_REASON_CHARS + 2))),
+  );
+  const kept = reasons.slice(0, shown);
+  // Water-fill: short reasons keep their length, the rest share what is left.
+  let left = room - 2 * (kept.length - 1);
+  const sorted = kept.map((r) => r.length).sort((a, b) => a - b);
+  let share = Math.floor(left / kept.length);
+  for (let i = 0; i < sorted.length; i++) {
+    const length = sorted[i] as number;
+    const fair = Math.floor(left / (sorted.length - i));
+    if (length <= fair) {
+      left -= length;
+      continue;
     }
-    out = next;
+    share = fair;
+    break;
   }
-  return out;
+  const out = kept.map((r) => clip(r, Math.max(share, MIN_REASON_CHARS))).join("; ");
+  return shown < reasons.length ? `${out} … (+${reasons.length - shown} more)` : out;
 }
 
 function validateNumber(
@@ -761,18 +930,18 @@ function validateObject(
 
   const patterns: Array<[string, RegExp]> = [];
   if (isPlainObject(patternProperties)) {
-    for (const source of Object.keys(patternProperties)) {
-      try {
-        patterns.push([source, new RegExp(source)]);
-      } catch (err) {
-        fail(
-          ctx,
-          path,
-          "patternProperties",
-          joinPointer(joinPointer(sp, "patternProperties"), source),
-          `the schema's pattern is not a valid regular expression: ${(err as Error).message}`,
-        );
+    for (const compiled of patternsOf(patternProperties, ctx)) {
+      if (compiled.re !== null) {
+        patterns.push([compiled.source, compiled.re]);
+        continue;
       }
+      fail(
+        ctx,
+        path,
+        "patternProperties",
+        joinPointer(joinPointer(sp, "patternProperties"), compiled.source),
+        `the schema's pattern is not a valid regular expression: ${compiled.error}`,
+      );
     }
   }
 
@@ -787,6 +956,11 @@ function validateObject(
         joinPointer(joinPointer(sp, "properties"), key),
         ctx,
       );
+    }
+    // Every (key, pattern) test is charged: 8,000 keys under 8,000 patterns
+    // ran 64 million tests for 11 s and then answered valid.
+    if (patterns.length > 0) {
+      charge(ctx, patterns.length * (1 + Math.floor(key.length / CHARS_PER_UNIT)));
     }
     for (const [source, re] of patterns) {
       if (!re.test(key)) continue;
@@ -1024,7 +1198,7 @@ function checkNode(value: unknown, schema: Schema, path: string, sp: string, ctx
 
   if (Array.isArray(schema["enum"])) {
     const candidates = schema["enum"];
-    if (!candidates.some((candidate) => sameJson(candidate, value, ctx))) {
+    if (!inEnum(candidates, value, ctx)) {
       fail(
         ctx,
         path,
@@ -1064,7 +1238,7 @@ export function validateValue(
 ): ValidationResult {
   const work: WorkBudget = options.budget ?? {
     used: 0,
-    limit: options.maxWork ?? defaultWorkLimit(value),
+    limit: options.maxWork ?? defaultWorkLimit(value, schema),
   };
   const ctx: Ctx = {
     root: schema,
@@ -1084,7 +1258,7 @@ export function validateValue(
     validateNode(value, schema, "", "", ctx);
   } catch (err) {
     if (err instanceof WorkExhausted) {
-      undetermined = `the schema needed more than ${work.limit} subschema evaluations for this value, so no verdict was reached — anyOf, oneOf and allOf over shared $refs multiply`;
+      undetermined = `the schema needed more than ${work.limit} subschema evaluations for this value, so no verdict was reached — anyOf, oneOf and allOf over shared $refs multiply, and so do many patternProperties over many keys`;
     } else if (err instanceof Undetermined) {
       undetermined = err.message;
     } else if (err instanceof RangeError && /call stack/i.test(err.message)) {

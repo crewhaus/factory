@@ -100,7 +100,7 @@ export function validateRecords(
   let undeterminedFrom: RecordsReport["undeterminedFrom"] = null;
   // One budget for the whole call, sized by all the rows together: a
   // per-row budget would let 20,000 hostile rows each spend a full one.
-  const budget: WorkBudget = { used: 0, limit: defaultWorkLimit(rows) };
+  const budget: WorkBudget = { used: 0, limit: defaultWorkLimit(rows, schema) };
 
   rows.forEach((row, index) => {
     const result = validateValue(row, schema, {

@@ -73,18 +73,26 @@ walk would overflow the stack, is `undetermined` rather than a verdict.
 
 **The work is bounded.** `anyOf`, `oneOf` and `allOf` over `$ref`s that share
 a target multiply, so a small schema can ask for billions of evaluations.
-Each call gets a budget of subschema evaluations, sized to the value (at
-least 500,000, and 64 per node of the value, a long string or key counting
-as a node per 256 characters). A check whose cost follows the value's size —
-a string's length, pattern or format, `uniqueItems`, listing an object's
-keys, an `enum` or `const` comparison — is charged for that size, and an
-error message is built only when it is kept, from a preview that reads just
-the part it shows. When a schema needs more, `JsonSchemaValidate` answers
+Each call gets a budget of subschema evaluations, sized to the value and the
+schema: each node of the value (a long string or key counting as a node per
+256 characters) is allowed as many evaluations as the schema has subschemas
+written out, at least 64 and at most 1,024, and a call gets at least 500,000
+and at most 20 million (a few seconds). A schema written as a tree checks each
+of its subschemas at most once per value node, so a wide or nested union over
+thousands of valid rows is answered; only a `$ref` reached again at the same
+place goes past it. A check whose cost follows the value's size — a string's
+length, pattern or format, `uniqueItems`, listing an object's keys, each
+`enum` candidate (an enum is indexed once, so a value is one lookup), each
+key tested against each `patternProperties` pattern (compiled once per
+schema), a `const` comparison — is charged for that size, and an error
+message is built only when it is kept, from a preview that reads just the
+part it shows. When a schema needs more, `JsonSchemaValidate` answers
 `valid: null` with `undetermined: true` and the reason, never a verdict
 either way; `ValidateRecords` shares one budget across its rows and counts
 the rows it could not decide as `undetermined`, neither passed nor failed,
-with `ok: false`. A failing alternative's reason is summarised in a bounded
-message, so nested alternatives cannot grow the result either.
+with `ok: false`. A failing union's message is at most 1,000 characters:
+when its branches' reasons do not fit, each is cut to an equal share and a
+short one keeps all of it, so a nested union's decisive reason survives.
 
 ## The formats
 
