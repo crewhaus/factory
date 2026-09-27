@@ -194,3 +194,75 @@ describe("a plugin's unenforced permissions are called that (C107)", () => {
     ).toBe(1);
   });
 });
+
+describe("an install record 0.7.0 wrote breaks only its own plugin (review of 0.7.1)", () => {
+  // 0.7.0 ignored `provides` and `notAfter`; a registry holding one such
+  // record made every plugin fail to load, naming neither the record nor
+  // the file. Now the registry reads it, the other plugins load, and the
+  // plugin itself is refused when a spec names it, naming its manifest.
+  async function setUp() {
+    const registryPath = join(root, "registry.json");
+    const write = (manifest: Record<string, unknown>) => {
+      const dir = join(root, String(manifest["name"]));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "index.js"), "export default {};\n");
+      writeFileSync(join(dir, "plugin.json"), JSON.stringify(manifest));
+      return {
+        manifest,
+        sourcePath: join(dir, "plugin.json"),
+        installedAt: "2026-09-01T00:00:00Z",
+      };
+    };
+    // The file as 0.7.0's install wrote it.
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        version: "1",
+        entries: {
+          "acme-notes": write({ name: "acme-notes", version: "1.0.0", provides: ["notes_search"] }),
+          "acme-dated": write({ name: "acme-dated", version: "1.0.0", notAfter: "2027-01-01" }),
+          "weather-tools": write({ name: "weather-tools", version: "1.0.0" }),
+        },
+      }),
+    );
+    const registry = createPluginRegistry({ registryPath, allowUnsigned: true });
+    const loader = createPluginLoader({
+      trustedRoots: [root],
+      allowUnsigned: true,
+      warn: () => {},
+      importEntrypoint: async (p) => ({
+        default: {
+          contributions: { tools: p.includes("weather-tools") ? [tool("forecast")] : [] },
+        },
+      }),
+    });
+    return { registry, loader };
+  }
+
+  test("a spec that names another plugin loads it", async () => {
+    const { registry, loader } = await setUp();
+    const activated = await activatePlugins({ names: ["weather-tools"], registry, loader });
+    expect(activated.tools.map((t) => t.name)).toEqual(["forecast"]);
+    expect((await registry.list()).map((e) => e.manifest.name)).toEqual([
+      "acme-dated",
+      "acme-notes",
+      "weather-tools",
+    ]);
+  });
+
+  test("the plugin with the malformed field is refused, naming its manifest and the field", async () => {
+    const { registry, loader } = await setUp();
+    for (const [name, field] of [
+      ["acme-notes", "`provides` must be an object"],
+      ["acme-dated", "`notAfter` must be an RFC 3339 date-time with Z or an offset"],
+    ] as const) {
+      const run = activatePlugins({ names: [name], registry, loader });
+      await expect(run).rejects.toThrow(PluginLoaderError);
+      await expect(run).rejects.toThrow(
+        new RegExp(
+          `^plugin manifest at .*${name}/plugin\\.json is not valid: plugin manifest: ${field.replace(/[`()]/g, "\\$&")}`,
+        ),
+      );
+    }
+  });
+});

@@ -4,7 +4,12 @@
  * code does not match it.
  */
 import { describe, expect, test } from "bun:test";
-import { PLUGIN_TOOL_NAME_PATTERN, PluginSdkError, validatePluginManifest } from "./index";
+import {
+  PLUGIN_TOOL_NAME_PATTERN,
+  PluginSdkError,
+  validatePluginManifest,
+  validatePluginManifestRecord,
+} from "./index";
 
 const base = { name: "my-plugin", version: "1.0.0" };
 
@@ -45,5 +50,51 @@ describe("provides.tools", () => {
     expect(
       ["", "a b", "a.b", "a(b", "x".repeat(65)].some((n) => PLUGIN_TOOL_NAME_PATTERN.test(n)),
     ).toBe(false);
+  });
+});
+
+describe("an install record is read by 0.7.0's rules (review of 0.7.1)", () => {
+  // 0.7.0 ignored `provides` and `notAfter`, so a record it wrote may carry
+  // them in any shape. The registry reads records with
+  // validatePluginManifestRecord; the loader and install hold the plugin
+  // itself to validatePluginManifest.
+  const old = [
+    { ...base, provides: ["notes_search"] },
+    { ...base, provides: "notes_search" },
+    { ...base, notAfter: "2027-01-01" },
+    { ...base, notAfter: 20270101 },
+  ];
+
+  test("the record check accepts what 0.7.0 accepted", () => {
+    for (const manifest of old) {
+      expect(validatePluginManifestRecord(manifest)).toBe(manifest as never);
+    }
+  });
+
+  test("the full check still refuses each one, naming the field", () => {
+    const why = old.map((m) => {
+      try {
+        validatePluginManifest(m);
+        return "accepted";
+      } catch (err) {
+        return err instanceof PluginSdkError ? err.message.split(" must ")[0] : String(err);
+      }
+    });
+    expect(why).toEqual([
+      "plugin manifest: `provides`",
+      "plugin manifest: `provides`",
+      "plugin manifest: `notAfter`",
+      "plugin manifest: `notAfter`",
+    ]);
+  });
+
+  test("both still refuse what 0.7.0 refused", () => {
+    for (const bad of [
+      { ...base, version: "one" },
+      { ...base, engines: { crewhaus: "" } },
+    ]) {
+      expect(() => validatePluginManifestRecord(bad)).toThrow(PluginSdkError);
+      expect(() => validatePluginManifest(bad)).toThrow(PluginSdkError);
+    }
   });
 });

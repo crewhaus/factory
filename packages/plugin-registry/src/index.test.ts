@@ -591,3 +591,65 @@ describe("parseRegistryFile edge cases", () => {
     expect(caught).toBeInstanceOf(PluginRegistryError);
   });
 });
+
+// Review of 0.7.1: validatePluginManifest learned `provides` and `notAfter`,
+// fields 0.7.0 ignored, and the registry read every entry with it. One
+// install record written by 0.7.0 with `"provides": [...]` or a date-only
+// `notAfter` made the whole file unreadable, so every plugin failed to load,
+// and the message named neither the entry nor the file.
+describe("a record 0.7.0 wrote still reads (review of 0.7.1)", () => {
+  const record = (manifest: Record<string, unknown>) => ({
+    manifest,
+    sourcePath: `/plugins/${String(manifest["name"])}/plugin.json`,
+    installedAt: "2026-01-01T00:00:00Z",
+  });
+  const registry = () =>
+    createPluginRegistry({
+      registryPath: REG_PATH,
+      readFileImpl: mem.read,
+      writeFileImpl: mem.write,
+      existsImpl: mem.exists,
+    });
+
+  test("fields 0.7.0 ignored, in any shape, do not stop the file from being read", async () => {
+    mem.store.set(
+      REG_PATH,
+      JSON.stringify({
+        version: "1",
+        entries: {
+          "acme-notes": record({
+            name: "acme-notes",
+            version: "1.0.0",
+            provides: ["notes_search"],
+            notAfter: "2027-01-01",
+          }),
+          "weather-tools": record({ name: "weather-tools", version: "2.0.0" }),
+        },
+      }),
+    );
+    const reg = registry();
+    expect((await reg.list()).map((e) => e.manifest.name)).toEqual(["acme-notes", "weather-tools"]);
+    expect((await reg.get("weather-tools"))?.manifest.version).toBe("2.0.0");
+    // Kept as written: the loader, not the registry, refuses the plugin for them.
+    expect((await reg.get("acme-notes"))?.manifest).toMatchObject({
+      provides: ["notes_search"],
+      notAfter: "2027-01-01",
+    });
+  });
+
+  test("an entry the registry cannot read is named, with the file", async () => {
+    mem.store.set(
+      REG_PATH,
+      JSON.stringify({
+        version: "1",
+        entries: {
+          "acme-notes": record({ name: "acme-notes", version: "one" }),
+          "weather-tools": record({ name: "weather-tools", version: "2.0.0" }),
+        },
+      }),
+    );
+    await expect(registry().list()).rejects.toThrow(
+      `plugin-registry: entry "acme-notes" in ${REG_PATH}: plugin manifest: \`version\` must be semver-shaped (got "one"). Remove or reinstall that plugin`,
+    );
+  });
+});

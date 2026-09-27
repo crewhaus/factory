@@ -523,7 +523,19 @@ export function createPluginLoader(opts: PluginLoaderOptions): PluginLoader {
           err,
         );
       }
-      const manifest = validatePluginManifest(raw);
+      // The full check, the fields 0.7.1 gave a meaning to included: the
+      // registry lists a record by 0.7.0's rules, and a manifest whose
+      // notAfter or provides is malformed is refused here, for this plugin
+      // only, naming its file.
+      let manifest: PluginManifest;
+      try {
+        manifest = validatePluginManifest(raw);
+      } catch (err) {
+        throw new PluginLoaderError(
+          `plugin manifest at ${realManifest} is not valid: ${err instanceof Error ? err.message : String(err)} — refusing to load it`,
+          err,
+        );
+      }
       const notExpected = pluginIdentityProblem(expected, manifest, realManifest);
       if (notExpected !== undefined) throw new PluginLoaderError(notExpected);
       // A plugin that says which crewhaus it runs on is held to it, before
