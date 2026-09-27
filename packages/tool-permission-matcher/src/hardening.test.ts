@@ -615,6 +615,29 @@ describe("a restrict rule reads every spelling of a destination", () => {
 // MCP names (flag-truth-1#1)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// A tool named after an Object.prototype member (C202, in the matcher)
+// ---------------------------------------------------------------------------
+
+describe("a tool named after an Object.prototype member", () => {
+  // The name table was read with `OPERATIVE_ARG_FIELDS[toolName]`, so
+  // `toString` found the inherited function and `for … of` threw. The engine
+  // caught it and failed closed: every deny or ask on the name fired and no
+  // scoped allow ever matched.
+  test("falls back to the input's string values, like any undeclared tool", () => {
+    const names = ["toString", "valueOf", "constructor", "hasOwnProperty", "__proto__"];
+    for (const name of names) {
+      const secret = { a: "secret.txt" };
+      expect({
+        name,
+        restrict: matchesPattern(compilePattern(`${name}(secret*)`), name, secret, restrict),
+        allow: matchesPattern(compilePattern(`${name}(secret*)`), name, secret, allow),
+        other: matchesPattern(compilePattern(`${name}(secret*)`), name, { a: "public" }, restrict),
+      }).toEqual({ name, restrict: true, allow: true, other: false });
+    }
+  });
+});
+
 describe("MCP tool names", () => {
   test("a documented mcp__ rule and a pre-0.7.1 rule both govern the registered name", () => {
     const name = "mcp__github__create_issue";

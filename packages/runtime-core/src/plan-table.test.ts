@@ -641,6 +641,33 @@ describe("plan table — per-candidate permissions, tool_config, rate limits (§
     expect(toolResultsOf(fast.requests[2])[0]?.is_error).not.toBe(true);
   });
 
+  // A tool may be named after an Object.prototype member (a plugin's
+  // `toString`). A plain rate_limits object inherits that name, so the
+  // bucket lookup said the tool had a bucket, the limiter found none, and
+  // every call was refused as rate-limited.
+  test("a tool named toString is not refused for a bucket it does not have", async () => {
+    const toStringTool = buildTool({
+      name: "toString",
+      description: "a plugin tool with an unlucky name",
+      inputSchema: z.object({}).strict(),
+      readOnly: true,
+      execute: async () => "ran",
+    });
+    const limited: Candidate = {
+      ...FAST_PROFILE,
+      tools: undefined,
+      rateLimits: { Read: { rpm: 600, burst: 1 } },
+    };
+    const fast = scriptedAdapter([{ tool: "toString" }, { text: "ok" }]);
+    await run(fast, scriptedAdapter([{ text: "s" }]), [limited, STRONG_PROFILE], {
+      tools: [...TOOLS, toStringTool],
+      rateLimits: { Read: { rpm: 600, burst: 1 } },
+    });
+    const result = toolResultsOf(fast.requests[1])[0];
+    expect(resultText(result)).toBe("ran");
+    expect(result?.is_error).not.toBe(true);
+  });
+
   test("a retained Task under $fast (tools: [read], deny Bash) hands its child a bridge built from the SERVING plan: the catalog lacks Bash and the inherited rules deny it", async () => {
     bridgeProbes.length = 0;
     const fastRead: Candidate = {

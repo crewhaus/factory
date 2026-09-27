@@ -3183,6 +3183,15 @@ function mergeEffectiveTools(
   return merged;
 }
 
+/**
+ * Does `limits` set a limit for `toolName` itself? Own keys only: a tool may
+ * be named after an Object.prototype member (`toString`, `constructor`),
+ * which a plain `rate_limits` object inherits but never sets.
+ */
+function ownLimit(limits: Readonly<Record<string, unknown>>, toolName: string): boolean {
+  return Object.hasOwn(limits, toolName) && limits[toolName] !== undefined;
+}
+
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // Item 3 (G32) — resolve the advertised tool set ONCE, up front, folding in
   // any plugin-contributed tools so the tool-capable-model feature gate and the
@@ -5215,7 +5224,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
   const hasToolRateBucket = (toolName: string): boolean =>
     runRateLimits !== undefined &&
-    (runRateLimits[toolName] !== undefined || runRateLimits["*"] !== undefined);
+    (ownLimit(runRateLimits, toolName) || ownLimit(runRateLimits, "*"));
 
   // -------------------------------------------------------------------------
   // 0.6.0 §4.4 — the per-candidate plan table. One plan per enabled pool
@@ -5321,7 +5330,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(planLimiter !== undefined ? { toolRateLimiter: planLimiter } : {}),
       hasToolRateBucket: (toolName: string): boolean =>
         planRateLimits !== undefined &&
-        (planRateLimits[toolName] !== undefined || planRateLimits["*"] !== undefined),
+        (ownLimit(planRateLimits, toolName) || ownLimit(planRateLimits, "*")),
       // `$VAR` values in a candidate's tool_config are read from the
       // environment here, when the loop starts, as the boot registrations
       // read theirs — never compiled into the bundle. An unset one fails

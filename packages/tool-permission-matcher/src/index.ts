@@ -505,7 +505,11 @@ function undeclaredValue(value: string): OperativeValue {
 }
 
 function fallbackValues(toolName: string, input: unknown): OperativeValue[] {
-  const fields = OPERATIVE_ARG_FIELDS[toolName];
+  // Own keys only: a tool may be named after an Object.prototype member
+  // (`toString`, `constructor`), which is not in the table.
+  const fields = Object.hasOwn(OPERATIVE_ARG_FIELDS, toolName)
+    ? OPERATIVE_ARG_FIELDS[toolName]
+    : undefined;
   if (fields !== undefined && input !== null && typeof input === "object") {
     const record = input as Record<string, unknown>;
     const present: string[] = [];
