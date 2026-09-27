@@ -29,11 +29,12 @@
  * `_setClock`, so a test can fix `postedAt` — which is inside the hash chain,
  * so a wall-clock read would make the same posting hash differently twice.
  */
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { type Transaction, parseStatement } from "@crewhaus/tool-money";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   LedgerError,
@@ -71,7 +72,7 @@ import {
 import { POST_LIMITS, ensureAccounts, postBatch } from "./lib/post";
 import { FORMATS, VIEWS, renderRows, runQuery } from "./lib/query";
 import { RECONCILE_LIMITS, reconcile } from "./lib/reconcile";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 // ---------------------------------------------------------------------------
 // the one seam
@@ -447,6 +448,8 @@ export const ledgerQuery: RegisteredTool = buildTool({
 // ---------------------------------------------------------------------------
 
 const MAX_STATEMENT_BYTES = 64 * 1024 * 1024;
+/** A template file, like an inline `template`, is at most 256 KiB. */
+const MAX_TEMPLATE_BYTES = 256 * 1024;
 
 /** The row shape is `@crewhaus/tool-money`'s, so the schema mirrors it exactly. */
 const transactionSchema = z
@@ -511,19 +514,12 @@ function loadSide(
   if (side.kind === "statement") {
     if (side.file === undefined)
       throw new LedgerError(`${label}.kind is "statement" but no file was given`);
-    const at = resolveSafe("LedgerReconcile", side.file);
-    const size = statSync(at.real).size;
-    if (size > MAX_STATEMENT_BYTES) {
-      throw new LedgerError(
-        `${at.rel} is ${size} bytes, over the ${MAX_STATEMENT_BYTES}-byte limit`,
-      );
-    }
     // tool-money's parser, not a second one: it is the thing that refuses a
     // file whose dates could be day-first or month-first, and a reconciliation
     // run on months guessed the wrong way balances to twice the error. It
     // holds one row past the side limit, so an over-long file is refused by
     // its true count without every row of it in memory first.
-    const parsed = parseStatement(readTextFile(at.real), {
+    const parsed = parseStatement(readTextFile("LedgerReconcile", side.file, MAX_STATEMENT_BYTES), {
       dateOrder: side.dateOrder,
       decimalComma: side.decimalComma,
       decimals: side.decimals,
@@ -554,9 +550,28 @@ function loadSide(
   }
 }
 
-/** One place that reads a file, so one place decides how much of it is held. */
-function readTextFile(path: string): string {
-  return readFileSync(path, "utf-8");
+/**
+ * One place that reads a caller-named file, so one place decides where it
+ * may be, what kind of file it may be and how much of it is held.
+ *
+ * The path is contained first, with the refusal every path here gives. The
+ * file is then opened without blocking and must be a regular file: a FIFO
+ * with no writer blocks an ordinary open for ever, and this read is
+ * synchronous, so a named pipe planted in the workspace used to stop the
+ * whole harness, heartbeats and other sessions included. And the byte limit
+ * is enforced while reading, not by a size the file reported before it was
+ * opened.
+ */
+function readTextFile(toolName: string, given: string, maxBytes: number): string {
+  resolveSafe(toolName, given);
+  const read = openForReadSync(workspaceRoot(), given, { maxBytes });
+  if (!read.ok) throw new LedgerError(`${toolName}: ${read.reason}`);
+  if (read.truncated) {
+    throw new LedgerError(
+      `${toolName}: ${JSON.stringify(given)} is over the ${maxBytes}-byte limit, so it was not read`,
+    );
+  }
+  return read.text;
 }
 
 /**
@@ -876,7 +891,7 @@ export const invoiceRender: RegisteredTool = buildTool({
     const custom =
       input.templateFile === undefined
         ? input.template
-        : readTextFile(resolveSafe("InvoiceRender", input.templateFile).real);
+        : readTextFile("InvoiceRender", input.templateFile, MAX_TEMPLATE_BYTES);
 
     // The hash covers everything that determines the rendered bytes, so a
     // replay under the same key can be checked for being the same document —

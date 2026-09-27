@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
  * since a money tool that guesses is worse than one that stops.
  */
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -461,6 +461,41 @@ describe("StatementParse", () => {
   test("a path outside the workspace is refused", async () => {
     await expect(raw(statementParse, { file: "../outside.csv" })).rejects.toThrow(
       /escapes the workspace/,
+    );
+  });
+
+  test("a FIFO is refused without being opened, so the harness does not stall", async () => {
+    // With no writer, opening a FIFO blocks for ever, and the read was
+    // synchronous: the whole process stopped. A writer is kept waiting on
+    // the pipe here so the test stays bounded even against that code — an
+    // open would complete, and the writer would exit.
+    const fifo = join(workspace, "statement.ofx");
+    expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+    const writer = Bun.spawn(["sh", "-c", `printf x > '${fifo}'`], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    try {
+      await Bun.sleep(100);
+      await expect(raw(statementParse, { file: "statement.ofx" })).rejects.toThrow(
+        '"statement.ofx" is a fifo, not a regular file',
+      );
+      await Bun.sleep(200);
+      // Still blocked in its open: nothing opened the pipe.
+      expect(writer.exitCode).toBeNull();
+    } finally {
+      writer.kill("SIGKILL");
+      await writer.exited;
+    }
+  }, 10_000);
+
+  test("a file past the byte limit is refused, not cut short", async () => {
+    // The limit is enforced while reading: 64 MiB of sparse file, one byte over.
+    const path = join(workspace, "huge.csv");
+    writeFileSync(path, "Date,Amount\n");
+    truncateSync(path, 64 * 1024 * 1024 + 1);
+    await expect(raw(statementParse, { file: "huge.csv" })).rejects.toThrow(
+      /over the 67108864-byte limit/,
     );
   });
 });

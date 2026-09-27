@@ -14,9 +14,9 @@
  * Nothing here moves money, reaches a payment provider, or decides that
  * somebody is committing fraud. It computes, checks and reports.
  */
-import { readFileSync, statSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForRead } from "@crewhaus/tool-safety/fs";
 import { ASSERT_OPS } from "@crewhaus/tool-schema";
 import { z } from "zod";
 import {
@@ -38,7 +38,7 @@ import { type MatchLine, matchInvoiceToPurchaseOrder } from "./lib/match";
 import { DATE_ORDERS, STATEMENT_FORMATS, parseStatement } from "./lib/statement";
 import { ROUNDING_MODES, ROUNDING_SCOPES, calculateTax } from "./lib/tax";
 import { verifyWebhookSignature } from "./lib/webhook";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -484,15 +484,25 @@ export const statementParse: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const at = resolveSafe("StatementParse", input.file);
-    const size = statSync(at.real).size;
-    if (size > LIMITS.statementBytes) {
-      throw new Error(`${at.rel} is ${size} bytes, over the ${LIMITS.statementBytes}-byte limit`);
+    // Opened without blocking and only as a regular file: a FIFO with no
+    // writer blocks an ordinary open for ever, and the read here was
+    // synchronous, so a named pipe in the workspace stopped the whole
+    // harness. The byte limit is enforced while reading, not by a size the
+    // file reported before it was opened.
+    const read = await openForRead(workspaceRoot(), input.file, {
+      maxBytes: LIMITS.statementBytes,
+    });
+    if (!read.ok) throw new Error(`StatementParse: ${read.reason}`);
+    if (read.truncated) {
+      throw new Error(
+        `StatementParse: ${JSON.stringify(input.file)} is over the ${LIMITS.statementBytes}-byte limit, so it was not read`,
+      );
     }
     const limit = input.limit ?? 500;
     // Only what is returned is held: the counts and the totals still cover
     // every row, but a file of a million unreadable blocks is not a million
     // objects in memory on the way to showing five hundred of them.
-    const result = parseStatement(readFileSync(at.real, "utf-8"), {
+    const result = parseStatement(read.text, {
       ...input,
       keep: { transactions: limit, rejected: limit },
     });
