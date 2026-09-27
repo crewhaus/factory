@@ -27,11 +27,24 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { statsKernel } from "@crewhaus/tool-math";
+import {
+  describeRegexOutcome,
+  openRegexSession,
+  runRegex,
+  screenUserRegex,
+} from "@crewhaus/tool-safety/regex";
 import { z } from "zod";
 import { type BenchmarkInput, MIN_SAMPLES_FOR_SIGNIFICANCE, compareBenchmarks } from "./lib/bench";
-import { TEST_STATUSES, detectFlaky } from "./lib/flaky";
+import {
+  type Mask,
+  type RunInput,
+  TEST_STATUSES,
+  detectFlaky,
+  foldWhitespace,
+  maskSubjects,
+} from "./lib/flaky";
 import {
   COMPRESSION_ALGORITHMS,
   type CompressionParameters,
@@ -69,6 +82,9 @@ const ZLIB_VERSION: string = process.versions.zlib ?? "unknown";
 
 // --- BundleSizeCheck --------------------------------------------------------
 
+/** Longest artifact path accepted in a baseline row. */
+const MAX_PATH_CHARS = 4_096;
+
 // Not `.strict()`: a stored baseline is a previous REPORT, which carries the
 // derived `comparabilityKey` alongside the parameters. Rejecting the report
 // this tool just produced would make "store it and pass it back" a lie.
@@ -86,7 +102,9 @@ const baselineSchema = z.object({
   entries: z
     .array(
       z.object({
-        path: z.string().min(1),
+        // A baseline path is a file path: longer than any PATH_MAX is not
+        // one, and it is also a subject for the caller's joinPattern.
+        path: z.string().min(1).max(MAX_PATH_CHARS),
         bytes: z.number().int().nonnegative(),
         compressedBytes: z.number().int().nonnegative().nullable().optional(),
       }),
@@ -96,6 +114,62 @@ const baselineSchema = z.object({
 });
 
 type BaselineInput = z.infer<typeof baselineSchema>;
+
+/**
+ * The screen a caller-supplied regex gets before it is accepted: length,
+ * flags, syntax and the catastrophic-backtracking shapes, with a reason the
+ * model can act on (C073). `g` is what a join or mask applies.
+ */
+function patternIssue(pattern: string, flags: string): string | undefined {
+  const verdict = screenUserRegex(pattern, flags);
+  return verdict.ok ? undefined : verdict.reason;
+}
+
+/**
+ * Normalise paths with the caller's joinPattern (every match becomes
+ * `[hash]`), in @crewhaus/tool-safety's regex worker under a deadline — never
+ * with a synchronous `replace` on this thread, which a pathological pattern
+ * could hold for seconds per path, and which JavaScriptCore can abandon and
+ * report as "no match". Any path whose key could not be determined fails the
+ * whole call: a size gate that joined some rows by an unnormalised key would
+ * report a renamed chunk as removed-and-added.
+ */
+async function customJoinKeys(
+  pattern: string,
+  paths: ReadonlyArray<string>,
+  ctx: ToolExecuteContext | undefined,
+): Promise<{ ok: true; keys: Map<string, string> } | { ok: false; message: string }> {
+  const distinct = [...new Set(paths)];
+  const keys = new Map<string, string>();
+  if (distinct.length === 0) return { ok: true, keys };
+  const outcome = await runRegex({
+    op: "replaceEach",
+    pattern,
+    flags: "g",
+    inputs: distinct,
+    replacement: "[hash]",
+    onGiveUp: "skip",
+    deadlineMs: 2_000,
+    ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+    ...(ctx?.runContext !== undefined ? { runawayKey: ctx.runContext.sessionId } : {}),
+  });
+  if (outcome.status !== "ok") {
+    return {
+      ok: false,
+      message: `BundleSizeCheck could not normalise the artifact paths with joinPattern /${pattern}/: ${describeRegexOutcome(outcome)}. No comparison was made.`,
+    };
+  }
+  const { outputs, undetermined } = outcome.result;
+  if (undetermined.length > 0) {
+    const first = distinct[undetermined[0] as number] ?? "";
+    return {
+      ok: false,
+      message: `BundleSizeCheck could not determine the joinPattern key of ${undetermined.length} path(s) (first: "${first}") — the pattern engine gave up on them. Simplify joinPattern; no comparison was made.`,
+    };
+  }
+  for (const [i, path] of distinct.entries()) keys.set(path, outputs[i] as string);
+  return { ok: true, keys };
+}
 
 type MeasuredEntry = {
   path: string;
@@ -139,7 +213,6 @@ function measure(
   paths: ReadonlyArray<string>,
   parameters: CompressionParameters,
   mode: JoinMode,
-  custom: RegExp | undefined,
 ): MeasuredEntry[] {
   return paths.map((path) => {
     const at = resolveSafe("BundleSizeCheck", path);
@@ -151,7 +224,8 @@ function measure(
     const bytes = readFileSync(at.real);
     return {
       path: at.rel,
-      key: joinKey(at.rel, mode, custom).key,
+      // A custom join is keyed afterwards, in the regex worker.
+      key: mode === "custom" ? at.rel : joinKey(at.rel, mode).key,
       bytes: bytes.byteLength,
       compressedBytes: parameters.algorithm === "none" ? null : compressedSize(bytes, parameters),
     };
@@ -204,6 +278,11 @@ export const bundleSizeCheck: RegisteredTool = buildTool({
       joinPattern: z
         .string()
         .optional()
+        .superRefine((pattern, ctx) => {
+          if (pattern === undefined) return;
+          const issue = patternIssue(pattern, "g");
+          if (issue !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, message: issue });
+        })
         .describe("with join=custom: a regex whose matches are replaced by [hash]"),
       baseline: baselineSchema.optional().describe("a previous report, inline"),
       baselineFile: z
@@ -246,7 +325,7 @@ export const bundleSizeCheck: RegisteredTool = buildTool({
     }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const warnings: string[] = [];
     let parameters: CompressionParameters;
     try {
@@ -255,12 +334,11 @@ export const bundleSizeCheck: RegisteredTool = buildTool({
       return (err as Error).message;
     }
     const mode: JoinMode = input.join ?? "exact";
-    let custom: RegExp | undefined;
     if (input.joinPattern !== undefined) {
-      try {
-        custom = new RegExp(input.joinPattern, "g");
-      } catch (err) {
-        return `joinPattern /${input.joinPattern}/ is not a valid regular expression: ${(err as Error).message}`;
+      // Screened here too: the schema's refine is skipped by a direct call.
+      const issue = patternIssue(input.joinPattern, "g");
+      if (issue !== undefined) {
+        return `joinPattern /${input.joinPattern}/ was refused: ${issue}`;
       }
     }
 
@@ -297,7 +375,16 @@ export const bundleSizeCheck: RegisteredTool = buildTool({
       return "no files matched — there is nothing to weigh, which is not the same as a build of zero bytes";
     }
 
-    const entries = measure(paths, parameters, mode, custom);
+    const entries = measure(paths, parameters, mode);
+    if (mode === "custom") {
+      const keyed = await customJoinKeys(
+        input.joinPattern as string,
+        entries.map((e) => e.path),
+        ctx,
+      );
+      if (!keyed.ok) return keyed.message;
+      for (const entry of entries) entry.key = keyed.keys.get(entry.path) as string;
+    }
     const totals = entries.reduce(
       (acc, e) => ({
         bytes: acc.bytes + e.bytes,
@@ -449,8 +536,21 @@ export const bundleSizeCheck: RegisteredTool = buildTool({
           string,
           Array<{ path: string; bytes: number; compressed: number | null }>
         >();
+        let baselineKeys: Map<string, string> | undefined;
+        if (mode === "custom") {
+          const keyed = await customJoinKeys(
+            input.joinPattern as string,
+            baseline.entries.map((e) => e.path),
+            ctx,
+          );
+          if (!keyed.ok) return keyed.message;
+          baselineKeys = keyed.keys;
+        }
         for (const entry of baseline.entries) {
-          const key = joinKey(entry.path, mode, custom).key;
+          const key =
+            baselineKeys !== undefined
+              ? (baselineKeys.get(entry.path) as string)
+              : joinKey(entry.path, mode).key;
           baselineGroups.set(key, [
             ...(baselineGroups.get(key) ?? []),
             { path: entry.path, bytes: entry.bytes, compressed: entry.compressedBytes ?? null },
@@ -718,6 +818,72 @@ export const benchmarkCompare: RegisteredTool = buildTool({
 
 // --- FlakyTestDetect --------------------------------------------------------
 
+/** A mask always replaces every match, so `g` is added to its flags. */
+const maskFlags = (mask: Mask): string => {
+  const flags = mask.flags ?? "";
+  return flags.includes("g") ? flags : `${flags}g`;
+};
+
+/** Total failure text the masks may run over in one call. */
+const MAX_MASKED_CHARS = 16_000_000;
+
+/**
+ * Apply the caller's masks to every failure text in @crewhaus/tool-safety's
+ * regex worker, in order, each mask over what the previous one left (C073).
+ * One text per failing observation, so each mask's hit count is summed over
+ * every failure, exactly as the synchronous path counted. A mask that could
+ * not be applied to every text fails the call: grouping some failures by a
+ * masked key and others by a raw one would split one failure mode in two,
+ * which reads as "it fails different ways".
+ */
+async function applyMasksOffThread(
+  runs: ReadonlyArray<RunInput>,
+  masks: ReadonlyArray<Mask>,
+  ctx: ToolExecuteContext | undefined,
+): Promise<{ keys: Map<string, string>; counts: Record<string, number> } | string> {
+  for (const mask of masks) {
+    const issue = patternIssue(mask.pattern, maskFlags(mask));
+    if (issue !== undefined) return `mask /${mask.pattern}/ was refused: ${issue}`;
+  }
+  const raw = maskSubjects(runs);
+  let texts: Array<string> = [...raw];
+  const counts: Record<string, number> = {};
+  const session = openRegexSession();
+  try {
+    for (const mask of masks) {
+      if (texts.length === 0) break;
+      const outcome = await session.run({
+        op: "replaceEach",
+        pattern: mask.pattern,
+        flags: maskFlags(mask),
+        inputs: texts,
+        replacement: mask.with ?? "<masked>",
+        onGiveUp: "skip",
+        deadlineMs: 2_000,
+        maxInputChars: MAX_MASKED_CHARS,
+        maxOutputChars: MAX_MASKED_CHARS,
+        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        ...(ctx?.runContext !== undefined ? { runawayKey: ctx.runContext.sessionId } : {}),
+      });
+      if (outcome.status !== "ok") {
+        return `FlakyTestDetect could not apply mask /${mask.pattern}/: ${describeRegexOutcome(outcome)}. The failures were not grouped; simplify the mask, or pass a precomputed \`signature\` per failure.`;
+      }
+      if (outcome.result.undetermined.length > 0) {
+        return `FlakyTestDetect could not apply mask /${mask.pattern}/ to ${outcome.result.undetermined.length} failure text(s): the pattern engine gave up on them. The failures were not grouped; simplify the mask, or pass a precomputed \`signature\` per failure.`;
+      }
+      if (outcome.result.replacements > 0) {
+        counts[mask.pattern] = (counts[mask.pattern] ?? 0) + outcome.result.replacements;
+      }
+      texts = outcome.result.outputs as string[];
+    }
+  } finally {
+    session.close();
+  }
+  const keys = new Map<string, string>();
+  for (const [i, text] of raw.entries()) keys.set(text, foldWhitespace(texts[i] ?? text));
+  return { keys, counts };
+}
+
 export const flakyTestDetect: RegisteredTool = buildTool({
   name: "FlakyTestDetect",
   description:
@@ -776,7 +942,13 @@ export const flakyTestDetect: RegisteredTool = buildTool({
               with: z.string().optional(),
               flags: z.string().max(8).optional(),
             })
-            .strict(),
+            .strict()
+            .superRefine((mask, ctx) => {
+              const issue = patternIssue(mask.pattern, maskFlags(mask));
+              if (issue !== undefined) {
+                ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["pattern"], message: issue });
+              }
+            }),
         )
         .max(LIMITS.masks)
         .optional()
@@ -787,10 +959,16 @@ export const flakyTestDetect: RegisteredTool = buildTool({
     .strict(),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     // The kernel's table is the only place a confidence level is defined in
     // this repository; a literal 1.96 here would be a fourth copy.
     const z = statsKernel.TWO_SIDED_Z[input.confidence ?? "0.95"];
+    let maskedText: { keys: Map<string, string>; counts: Record<string, number> } | undefined;
+    if (input.masks !== undefined && input.masks.length > 0) {
+      const applied = await applyMasksOffThread(input.runs, input.masks, ctx);
+      if (typeof applied === "string") return applied;
+      maskedText = applied;
+    }
     try {
       return json(
         detectFlaky(input.runs, {
@@ -799,6 +977,7 @@ export const flakyTestDetect: RegisteredTool = buildTool({
             ? {}
             : { quarantineLowerBound: input.quarantineLowerBound }),
           ...(input.masks === undefined ? {} : { masks: input.masks }),
+          ...(maskedText === undefined ? {} : { maskedText }),
         }),
       );
     } catch (err) {

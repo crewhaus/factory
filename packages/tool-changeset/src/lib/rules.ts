@@ -102,17 +102,52 @@ export type LintResult = {
   readonly skipped: ReadonlyArray<SkippedFile>;
   /** True when `maxFindings` cut the list; the counts above are still whole. */
   readonly truncated: boolean;
+  /**
+   * Lines a caller-pattern check could not be answered for (the pattern
+   * engine gave up, or the deadline passed): neither a finding nor clean.
+   * Capped at `MAX_UNDETERMINED`; `undeterminedCount` is whole.
+   */
+  readonly undetermined: ReadonlyArray<UndeterminedCheck>;
+  readonly undeterminedCount: number;
 };
+
+/** A caller-pattern check on one added line whose answer is unknown. */
+export type UndeterminedCheck = {
+  readonly rule: RuleId;
+  readonly file: string;
+  readonly line: number;
+  /** The caller's pattern source. */
+  readonly pattern: string;
+};
+
+const MAX_UNDETERMINED = 50;
+
+/**
+ * A caller-pattern answer computed off this thread: true or false, or
+ * undefined when it could not be determined. DiffLint runs the caller's
+ * patterns in @crewhaus/tool-safety's regex worker before linting (C073),
+ * because this loop is synchronous and a pattern run here could hold the
+ * process for seconds per line, or be abandoned by the engine and read as
+ * "no match".
+ */
+export type PatternAnswer = (subject: string) => boolean | undefined;
 
 export type LintOptions = {
   /** Turn opt-in rules on. */
   readonly enable?: ReadonlyArray<RuleId>;
   /** Turn default rules off. */
   readonly disable?: ReadonlyArray<RuleId>;
-  /** What counts as a ticket reference on a TODO. */
+  /** What counts as a ticket reference on a TODO (a trusted, in-process pattern). */
   readonly ticketPattern?: RegExp;
-  /** Extra machine-specific path shapes, on top of the built-in ones. */
+  /** Extra machine-specific path shapes, on top of the built-in ones (trusted, in-process). */
   readonly machinePathPatterns?: ReadonlyArray<RegExp>;
+  /** The caller's ticket pattern, answered off-thread; wins over `ticketPattern`. */
+  readonly ticketTest?: { readonly source: string; readonly test: PatternAnswer };
+  /** The caller's machine-path patterns, answered off-thread; used instead of `machinePathPatterns`. */
+  readonly machinePathTests?: ReadonlyArray<{
+    readonly source: string;
+    readonly test: PatternAnswer;
+  }>;
   /** An added line longer than this is reported once; default 500. */
   readonly maxLineChars?: number;
   /** A file adding more lines than this is reported once; default 800. */
@@ -317,6 +352,54 @@ const CONFLICT_WEAK = /^={7}\s*$/;
 const TODO_MARKER = /\b(TODO|FIXME|HACK|XXX)\b/;
 
 /**
+ * The text a ticket pattern is tested against, for an added line that is a
+ * TODO note, or undefined for any other line.
+ *
+ * The marker must OPEN the comment: `// TODO: x` is a note to a maintainer,
+ * and "a TODO with no ticket" in the middle of a sentence is prose about
+ * todos. With the whole file a mask would decide this; with one line, where
+ * the marker sits is the signal there is.
+ */
+export function todoBody(text: string, lang: Lang): string | undefined {
+  const comment = commentStart(text, lang);
+  const marker = TODO_MARKER.exec(text);
+  if (marker === null || !inComment(comment, marker.index)) return undefined;
+  const between = text.slice(comment ?? 0, marker.index);
+  if (!/^(?:\/\/+|\/\*+|#+|\*+|--|<!--)?[\s\-*>]*$/.test(between)) return undefined;
+  return text.slice(marker.index).replace(/\*\/\s*$/, "");
+}
+
+/**
+ * Every subject the caller's patterns will be asked about, in the order the
+ * lint visits them: the TODO bodies (for a ticket pattern) and the added
+ * lines (for machine-path patterns) of every file the lint scans. DiffLint
+ * answers these in the regex worker, then lints with the answers.
+ */
+export function callerPatternSubjects(
+  parsed: ParsedDiff,
+  options: LintOptions = {},
+): { readonly todoBodies: string[]; readonly lines: string[] } {
+  const active = activeRules(options);
+  const todoBodies: string[] = [];
+  const lines: string[] = [];
+  for (const file of parsed.files) {
+    if (skipReason(file) !== undefined || file.hunks.length === 0) continue;
+    const lang = languageOf(file.newPath ?? file.oldPath ?? "(unknown path)");
+    for (const hunk of file.hunks) {
+      for (const parsedLine of hunk.lines) {
+        if (parsedLine.kind !== "added" || parsedLine.newLine === null) continue;
+        if (active.has("machinePath")) lines.push(parsedLine.text);
+        if (active.has("ticketlessTodo")) {
+          const body = todoBody(parsedLine.text, lang);
+          if (body !== undefined) todoBodies.push(body);
+        }
+      }
+    }
+  }
+  return { todoBodies, lines };
+}
+
+/**
  * Suppressions worth reporting when they are NEW.
  *
  * `@ts-expect-error` is deliberately absent: it fails once the error it
@@ -460,6 +543,7 @@ function lineHits(
   active: ReadonlySet<RuleId>,
   opts: LintOptions,
   fileHasStrongConflict: boolean,
+  onUndetermined: (rule: RuleId, pattern: string) => void = () => undefined,
 ): Hit[] {
   const hits: Hit[] = [];
   const comment = commentStart(text, lang);
@@ -522,23 +606,19 @@ function lineHits(
   }
 
   if (active.has("ticketlessTodo")) {
-    const marker = TODO_MARKER.exec(text);
-    // The marker must OPEN the comment: `// TODO: x` is a note to a
-    // maintainer, and "a TODO with no ticket" in the middle of a sentence is
-    // prose about todos. With the whole file a mask would decide this; with
-    // one line, where the marker sits is the signal there is.
-    if (marker !== null && inComment(comment, marker.index)) {
-      const between = text.slice(comment ?? 0, marker.index);
-      if (/^(?:\/\/+|\/\*+|#+|\*+|--|<!--)?[\s\-*>]*$/.test(between)) {
-        const body = text.slice(marker.index).replace(/\*\/\s*$/, "");
-        const ticket = opts.ticketPattern ?? DEFAULT_TICKET;
-        if (!ticket.test(body)) {
-          hits.push({
-            rule: "ticketlessTodo",
-            message:
-              "a TODO/FIXME/HACK with no ticket or issue reference — nobody will ever find it",
-          });
-        }
+    const body = todoBody(text, lang);
+    if (body !== undefined) {
+      const hasTicket =
+        opts.ticketTest !== undefined
+          ? opts.ticketTest.test(body)
+          : (opts.ticketPattern ?? DEFAULT_TICKET).test(body);
+      if (hasTicket === undefined) {
+        onUndetermined("ticketlessTodo", opts.ticketTest?.source ?? "");
+      } else if (!hasTicket) {
+        hits.push({
+          rule: "ticketlessTodo",
+          message: "a TODO/FIXME/HACK with no ticket or issue reference — nobody will ever find it",
+        });
       }
     }
   }
@@ -553,8 +633,19 @@ function lineHits(
       });
       break; // one path finding per line is enough to act on
     }
-    for (const extra of opts.machinePathPatterns ?? []) {
-      if (!extra.test(text)) continue;
+    const extras =
+      opts.machinePathTests ??
+      (opts.machinePathPatterns ?? []).map((re) => ({
+        source: re.source,
+        test: (t: string): boolean | undefined => re.test(t),
+      }));
+    for (const extra of extras) {
+      const hit = extra.test(text);
+      if (hit === undefined) {
+        onUndetermined("machinePath", extra.source);
+        continue;
+      }
+      if (!hit) continue;
       hits.push({
         rule: "machinePath",
         message: `matches the operator's machine-path pattern /${extra.source}/`,
@@ -599,6 +690,8 @@ export function lintParsedDiff(parsed: ParsedDiff, options: LintOptions = {}): L
   const byRule: Record<string, number> = {};
   const bySeverity: Record<Severity, number> = { error: 0, warning: 0 };
   const skipped: SkippedFile[] = [];
+  const undetermined: UndeterminedCheck[] = [];
+  let undeterminedCount = 0;
   let filesScanned = 0;
   let addedLinesScanned = 0;
   let total = 0;
@@ -654,7 +747,20 @@ export function lintParsedDiff(parsed: ParsedDiff, options: LintOptions = {}): L
         crlfSeen++;
         if (crlfSeen === 1) crlfFirst = line.line;
       }
-      for (const hit of lineHits(line.text, lang, active, options, strongConflict)) {
+      const onUndetermined = (rule: RuleId, pattern: string): void => {
+        undeterminedCount++;
+        if (undetermined.length < MAX_UNDETERMINED) {
+          undetermined.push({ rule, file: path, line: line.line, pattern });
+        }
+      };
+      for (const hit of lineHits(
+        line.text,
+        lang,
+        active,
+        options,
+        strongConflict,
+        onUndetermined,
+      )) {
         record({
           rule: hit.rule,
           severity: hit.severity ?? DEFAULT_SEVERITY[hit.rule],
@@ -685,5 +791,7 @@ export function lintParsedDiff(parsed: ParsedDiff, options: LintOptions = {}): L
     counts: { byRule, bySeverity },
     skipped,
     truncated: total > findings.length,
+    undetermined,
+    undeterminedCount,
   };
 }

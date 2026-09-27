@@ -258,12 +258,19 @@ describe("DiffLint refusals", () => {
   });
 
   test("an unusable ticketPattern is a caller mistake, not an empty result", async () => {
-    const out = await callRaw(diffLint, { diff: "", ticketPattern: "([unclosed" });
+    // The schema refuses it with the reason; a direct call says the same.
+    const input = { diff: "", ticketPattern: "([unclosed" };
+    const parsed = diffLint.inputSchema.safeParse(input);
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.message).toContain("not a valid regular expression");
+    const out = await diffLint.execute(input as never, ctx);
     expect(out).toContain("could not use ticketPattern");
   });
 
   test("an unusable machine-path pattern is reported the same way", async () => {
-    const out = await callRaw(diffLint, { diff: "", machinePathPatterns: ["(("] });
+    const input = { diff: "", machinePathPatterns: ["(("] };
+    expect(diffLint.inputSchema.safeParse(input).success).toBe(false);
+    const out = await diffLint.execute(input as never, ctx);
     expect(out).toContain("machine-path pattern");
   });
 
@@ -650,5 +657,100 @@ describe("DocsSymbolCheck", () => {
     const first = await callRaw(docsSymbolCheck, { docs: ["docs"], source: "src" });
     const second = await callRaw(docsSymbolCheck, { docs: ["docs"], source: "src" });
     expect(first).toBe(second);
+  });
+});
+
+/**
+ * C073: ticketPattern and machinePathPatterns are caller regexes. They are
+ * screened for the catastrophic shapes, then run in @crewhaus/tool-safety's
+ * regex worker under a deadline. A line the worker could not answer is
+ * reported as undetermined — never as a clean line, and never as a finding
+ * the pattern did not establish.
+ */
+describe("DiffLint's caller patterns (C073)", () => {
+  const patch = (...added: string[]): string =>
+    [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      `@@ -0,0 +1,${added.length} @@`,
+      ...added.map((l) => `+${l}`),
+      "",
+    ].join("\n");
+  const aborted = (): typeof ctx => {
+    const controller = new AbortController();
+    controller.abort();
+    return { signal: controller.signal };
+  };
+
+  test("the caller's patterns still decide, run in the worker", async () => {
+    const out = await call<LintResponse & { undetermined?: unknown }>(diffLint, {
+      diff: patch(
+        "// TODO: JIRA-12 wire it",
+        "// TODO: tidy this",
+        'const p = "//buildserver-7/cache";',
+      ),
+      ticketPattern: "JIRA-\\d+",
+      machinePathPatterns: ["//buildserver-\\d+/"],
+    });
+    const byRule = out.findings.map((f) => `${f.rule}@${f.line}`).sort();
+    expect(byRule).toEqual(["machinePath@3", "ticketlessTodo@2"]);
+    expect(out.undetermined).toBeUndefined();
+  });
+
+  test("a catastrophic pattern is refused by the schema and by execute, never a clean result", async () => {
+    for (const input of [
+      { diff: patch("// TODO: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"), ticketPattern: "^(a|a)*b$" },
+      { diff: patch("x"), machinePathPatterns: ["(\\w+\\s?)*$"] },
+    ]) {
+      expect(diffLint.inputSchema.safeParse(input).success).toBe(false);
+      const out = String(await diffLint.execute(input as never, ctx));
+      expect(out).toContain("could not use");
+      expect(out).not.toContain('"clean":true');
+    }
+  });
+
+  test("a check the worker could not run is undetermined: not a finding, not clean", async () => {
+    const out = JSON.parse(
+      String(
+        await diffLint.execute(
+          {
+            diff: patch("// TODO: tidy this", 'const p = "//buildserver-7/cache";'),
+            ticketPattern: "JIRA-\\d+",
+            machinePathPatterns: ["//buildserver-\\d+/"],
+          } as never,
+          aborted(),
+        ),
+      ),
+    ) as LintResponse & {
+      undetermined: Array<{ rule: string; line: number }>;
+      undeterminedCount: number;
+      warnings: string[];
+      clean?: boolean;
+    };
+    expect(out.findings.filter((f) => f.rule === "ticketlessTodo")).toEqual([]);
+    expect(out.undetermined.map((u) => `${u.rule}@${u.line}`).sort()).toEqual([
+      "machinePath@1",
+      "machinePath@2",
+      "ticketlessTodo@1",
+    ]);
+    expect(out.undeterminedCount).toBe(3);
+    expect(out.warnings.join(" ")).toContain("could not be checked");
+    expect(out.clean).toBeUndefined();
+  });
+
+  test("a line too long for the worker is undetermined for the caller's pattern alone", async () => {
+    const long = `const s = "${"x".repeat(70_000)}";`;
+    const out = await call<LintResponse & { undetermined: Array<{ rule: string; line: number }> }>(
+      diffLint,
+      {
+        diff: patch(long, 'const p = "//buildserver-7/cache";'),
+        machinePathPatterns: ["//buildserver-\\d+/"],
+      },
+    );
+    expect(out.undetermined).toEqual([
+      expect.objectContaining({ rule: "machinePath", line: 1, pattern: "//buildserver-\\d+/" }),
+    ]);
+    expect(out.findings.some((f) => f.rule === "machinePath" && f.line === 2)).toBe(true);
   });
 });

@@ -22,6 +22,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseEnvText } from "@crewhaus/harness-supervisor";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   ENV_DUPLICATE,
@@ -151,6 +152,52 @@ describe("SecretLookup", () => {
     const [a, b, c] = result.results;
     expect(a.fingerprint).toBe(b.fingerprint);
     expect(a.fingerprint).not.toBe(c.fingerprint);
+  });
+
+  test("a name Object.prototype carries is not a set variable (C216)", async () => {
+    // _setEnv's plain object inherits Object.prototype exactly as process.env
+    // does. On 0.7.0 `env:constructor` read a FUNCTION as the value, the
+    // fingerprint threw, and the good reference in the same batch was lost.
+    _setEnv({ GOOD: SECRET });
+    const inherited = [
+      "env:constructor",
+      "env:toString",
+      "env:valueOf",
+      "env:hasOwnProperty",
+      "env:__proto__",
+      "constructor",
+    ];
+    const result = await call(secretLookup, { refs: ["env:GOOD", ...inherited] });
+    expect(result.checked).toBe(inherited.length + 1);
+    expect(result.results[0].resolved).toBe(true);
+    expect(result.results.slice(1).map((r: Json) => r.status)).toEqual(
+      inherited.map(() => "absent"),
+    );
+    expect(result.results[1].reason).toContain("is not set");
+    expect(result.allResolved).toBe(false);
+  });
+
+  test("the real process.env inherits the same names, and they are absent too (C216)", async () => {
+    _setEnv(undefined);
+    const result = await call(secretLookup, { refs: ["env:constructor", "env:valueOf"] });
+    expect(result.results.map((r: Json) => r.status)).toEqual(["absent", "absent"]);
+  });
+
+  test("one reference that throws does not discard the others, and its message is not echoed", async () => {
+    _setEnv(
+      new Proxy({} as Record<string, string | undefined>, {
+        get(_target, name) {
+          if (name === "BOOM") throw new Error(`backend said ${SECRET}`);
+          return name === "GOOD" ? SECRET : undefined;
+        },
+      }),
+    );
+    const result = await call(secretLookup, { refs: ["env:BOOM", "env:GOOD"] });
+    expect(result.checked).toBe(2);
+    expect(result.results[0]).toMatchObject({ status: "error", resolved: false });
+    expect(result.results[0].reason).toContain("failed unexpectedly (Error)");
+    expect(result.results[1].resolved).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(SECRET);
   });
 
   test("an invalid reference is reported per-reference, not as a whole-call failure", async () => {
@@ -349,6 +396,18 @@ describe("EnvFileUpsert", () => {
     expect(statSync(envFile()).mode & 0o077).toBe(0);
   });
 
+  test("valueFrom an inherited name is absent, not a value with a newline in it (C216)", async () => {
+    // 0.7.0 read Object.prototype.valueOf as the value, and the refusal
+    // blamed a newline in its source text — for a variable that is not set.
+    const text = await refusal(envFileUpsert, {
+      entries: [{ key: "X", valueFrom: "env:valueOf" }],
+      dryRun: true,
+    });
+    expect(text).toContain("did not resolve (absent)");
+    expect(text).not.toContain("newline");
+    expect(existsSync(envFile())).toBe(false);
+  });
+
   test("a value taken from a reference never appears in the result", async () => {
     _setEnv({ SOURCE: SECRET });
     const result = await call(envFileUpsert, {
@@ -400,6 +459,52 @@ describe("EnvFileUpsert", () => {
   test("an ordinary key gets no warning", async () => {
     const result = await call(envFileUpsert, { entries: [{ key: "LOG_LEVEL", value: "debug" }] });
     expect(result.warnings).toBeUndefined();
+  });
+
+  test("a value a shell would run or expand is refused, and the file is untouched (C137)", async () => {
+    writeFileSync(envFile(), "LOG_LEVEL=info\n");
+    const before = readEnv();
+    // No whitespace in any of them: whitespace had its own refusal already.
+    for (const value of ["p4$(id)", "a`id`b", "x;y", "$HOME/x", "a&b"]) {
+      const text = await raw(envFileUpsert, {
+        entries: [
+          { key: "LOG_LEVEL", value: "debug" },
+          { key: "DB_PASSWORD", value },
+        ],
+      });
+      expect({ value, refused: text.includes("a shell sourcing the file") }).toEqual({
+        value,
+        refused: true,
+      });
+      // All or nothing: the ordinary entry beside it was not written either.
+      expect(readEnv()).toBe(before);
+    }
+  });
+
+  test("ordinary values a shell and Bun read literally are written (regression review)", async () => {
+    // The first C137 fix refused anything outside [A-Za-z0-9_@%+=:,./-]:
+    // every one of these, which 0.7.0 wrote and every reader reads as written.
+    writeFileSync(envFile(), "export CORS_ORIGIN=old\n");
+    const entries = [
+      {
+        key: "DATABASE_URL",
+        value: "postgres://app:s3cret@db.example.com:5432/app?sslmode=require",
+      },
+      { key: "APP_NAME", value: "Café" },
+      { key: "CORS_ORIGIN", value: "https://*.example.com" },
+      { key: "CALLBACK", value: "https://example.com/cb?next=/home" },
+      { key: "BANG", value: "pa!ss" },
+      { key: "LIST", value: "[1,2]" },
+    ];
+    // `call` throws on a refusal; this one must be JSON with every entry.
+    const result = await call(envFileUpsert, { entries });
+    expect(result.entries.length).toBe(entries.length);
+    const parsed = parseEnvText(readEnv());
+    for (const { key, value } of entries) {
+      expect({ key, value: parsed[key] }).toEqual({ key, value });
+    }
+    // The export prefix of the line that was there is kept.
+    expect(readEnv()).toContain("export CORS_ORIGIN=https://*.example.com");
   });
 
   test("an existing file keeps its comments, blanks and key order", async () => {
@@ -630,6 +735,23 @@ describe("SecretRotate", () => {
     expect(result.note).toContain("stays valid at that provider until you revoke it");
   });
 
+  test("a new value the .env cannot hold fails before KEY_PREVIOUS is written (C137)", async () => {
+    writeFileSync(envFile(), "API_TOKEN=old\n");
+    _setEnv({ NEXT_TOKEN: "n3w&x" });
+    const result = await call(secretRotate, {
+      ref: "envfile:.env#API_TOKEN",
+      newValueFrom: "env:NEXT_TOKEN",
+    });
+    expect({ ok: result.ok, failedAt: result.failedAt }).toEqual({
+      ok: false,
+      failedAt: "new-value",
+    });
+    expect(String(result.reason)).toContain("a shell sourcing the file");
+    expect(JSON.stringify(result)).not.toContain("n3w&x");
+    // Untouched: no rotated value, and no KEY_PREVIOUS left behind.
+    expect(readEnv()).toBe("API_TOKEN=old\n");
+  });
+
   test("the rotation is recorded, with fingerprints and no values", async () => {
     writeFileSync(envFile(), `TOKEN=${OTHER_SECRET}\n`);
     await call(secretRotate, {
@@ -783,6 +905,18 @@ describe("SecretRotate", () => {
       expect(result.ok).toBe(false);
       expect(result.failedAt).toBe("new-value");
       expect(result.reason).toContain("identical");
+    });
+
+    test("a new value from an inherited name is refused as absent (C216)", async () => {
+      writeFileSync(envFile(), `TOKEN=${OTHER_SECRET}\n`);
+      const result = await call(secretRotate, {
+        ref: "envfile:.env#TOKEN",
+        newValueFrom: "env:toString",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.failedAt).toBe("new-value");
+      expect(result.reason).toContain("did not resolve (absent)");
+      expect(readEnv()).toBe(`TOKEN=${OTHER_SECRET}\n`);
     });
 
     test("a source for the new value that does not resolve", async () => {

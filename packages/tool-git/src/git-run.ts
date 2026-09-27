@@ -15,9 +15,47 @@
  * 2. Boundedness. Every spawn carries a deadline and forwards the caller's
  *    abort signal, and every result is capped. A tool that can hang forever, or
  *    return a gigabyte of patch, is a defect.
+ *    Containing the `cwd` is not enough, because git works on the repository
+ *    it DISCOVERS from there: `openRepo` also proves that repository's working
+ *    tree and git dir are the workspace's (C071, see `./repo-bounds`), and
+ *    every run carries GIT_CEILING_DIRECTORIES so discovery never climbs above
+ *    the workspace root, with the inherited variables that name a repository
+ *    (GIT_DIR, GIT_WORK_TREE …) dropped.
+ * 3. A read runs no program the repository names (C007). See `./hardening`:
+ *    every invocation switches off the fsmonitor hook, signature display and
+ *    implicit bare repositories; a read also switches off every hook,
+ *    external diff drivers, textconv, submodule recursion and the
+ *    repository's own filter drivers, and gets the environment without the
+ *    harness's credentials.
+ *
+ * This module is also `@crewhaus/tool-git/run`, so tool-changeset's DiffLint
+ * spawns git through the same hardened runner instead of a copy of it.
  */
 import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import * as path from "node:path";
+import { redactUrlCredentialsInText, withoutCredentials } from "@crewhaus/tool-safety/env";
+import {
+  FILTER_PROBE_ARGS,
+  FILTER_PROBE_ARGS_LEGACY,
+  HARDENED_CONFIG_ARGS,
+  READ_CONFIG_ARGS,
+  hardenReadArgs,
+  neutraliseRepositoryFilters,
+} from "./hardening";
+import {
+  alternateLeadingOut,
+  isInside,
+  isWorktreeOf,
+  linkLeadingOut,
+  realOrUndefined,
+} from "./repo-bounds";
+
+export {
+  HARDENED_CONFIG_ARGS,
+  hardenReadArgs,
+  neutraliseRepositoryFilters,
+  neutralisedNote,
+} from "./hardening";
 
 /** Default wall-clock budget for one git invocation. */
 export const DEFAULT_TIMEOUT_MS = 30_000;
@@ -221,10 +259,29 @@ export type RunOptions = {
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
   readonly stdin?: string;
-  /** Adds GIT_OPTIONAL_LOCKS=0 so a read never contends for the index lock. */
+  /**
+   * A read: adds GIT_OPTIONAL_LOCKS=0 so status takes no index lock, adds
+   * READ_CONFIG_ARGS (no hook runs, even when `git diff` writes a refreshed
+   * index), inserts the read switches of `hardenReadArgs`, and spawns git
+   * without the harness's credentials (a read needs none: nothing here talks
+   * to a remote or signs).
+   */
   readonly readOnly?: boolean;
+  /**
+   * `-c` pairs placed before the subcommand, after the global ones: the
+   * filter drivers `probeRepositoryFilters` switched off for a read.
+   */
+  readonly configArgs?: readonly string[];
   readonly env?: Readonly<Record<string, string>>;
   readonly maxOutputChars?: number;
+  /**
+   * Let discovery climb above the workspace root. Only `locateRepository`'s
+   * probe sets it, so an enclosing repository is found and refused BY NAME
+   * rather than reported as "not a git repository"; every other run carries
+   * GIT_CEILING_DIRECTORIES, so a `.git` removed after the check cannot
+   * hand the next command to an enclosing repository.
+   */
+  readonly discoverAboveRoot?: boolean;
 };
 
 /**
@@ -236,8 +293,10 @@ export type RunOptions = {
  *   in a path, so a file named `café.txt` comes back mangled.
  * - `advice.detachedHead=false`: advice text is help for a human at a terminal
  *   and only adds noise to a tool result.
+ * - `HARDENED_CONFIG_ARGS`: no fsmonitor hook, no signature program, no
+ *   implicit bare repository (see `./hardening`).
  */
-const GLOBAL_ARGS: readonly string[] = [
+export const GLOBAL_ARGS: readonly string[] = Object.freeze([
   "--no-pager",
   "-c",
   "core.quotepath=false",
@@ -245,7 +304,8 @@ const GLOBAL_ARGS: readonly string[] = [
   "color.ui=false",
   "-c",
   "advice.detachedHead=false",
-];
+  ...HARDENED_CONFIG_ARGS,
+]);
 
 /** Ceiling on how much of a run's stderr is kept. */
 const MAX_STDERR_CHARS = 8_000;
@@ -312,20 +372,77 @@ async function drain(
   }
 }
 
+/**
+ * Environment variables that tell git which repository, work tree, index or
+ * object store to use instead of the one it discovers. None of them is
+ * passed on — the repository is the one openRepo checked — except an
+ * inherited GIT_INDEX_FILE that {@link inheritedIndexEnv} proves is that
+ * repository's own (the index a commit hook is handed).
+ */
+export const REPOSITORY_LOCATOR_ENV: readonly string[] = Object.freeze([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+  "GIT_SHALLOW_FILE",
+  "GIT_GRAFT_FILE",
+]);
+
+function withoutRepositoryLocators(
+  env: Readonly<Record<string, string | undefined>>,
+): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = { ...env };
+  for (const name of REPOSITORY_LOCATOR_ENV) Reflect.deleteProperty(out, name);
+  return out;
+}
+
+/**
+ * GIT_CEILING_DIRECTORIES for a run: the workspace root's parent, so git
+ * looks for a repository in the root and below and never climbs above it.
+ */
+function discoveryCeiling(): string | undefined {
+  const rootReal = realOrUndefined(process.cwd());
+  return rootReal === undefined ? undefined : path.dirname(rootReal);
+}
+
 /** Run git once, bounded by a deadline and the caller's abort signal. */
 export async function runGit(args: readonly string[], opts: RunOptions): Promise<GitRun> {
-  const argv = ["git", ...GLOBAL_ARGS, ...args];
+  const readOnly = opts.readOnly === true;
+  const argv = [
+    "git",
+    ...GLOBAL_ARGS,
+    ...(readOnly ? READ_CONFIG_ARGS : []),
+    ...(opts.configArgs ?? []),
+    ...(readOnly ? hardenReadArgs(args) : args),
+  ];
   const cap = opts.maxOutputChars ?? MAX_OUTPUT_CHARS;
   // LC_ALL=C pins git's own diagnostics to one language, so a message this
   // package matches on does not change with the operator's locale.
   // GIT_TERMINAL_PROMPT=0 guarantees git never blocks waiting on a terminal.
-  const env: Record<string, string | undefined> = {
-    ...process.env,
+  const ceiling = discoveryCeiling();
+  const pinned: Record<string, string> = {
     LC_ALL: "C",
     GIT_TERMINAL_PROMPT: "0",
-    ...(opts.readOnly === true ? { GIT_OPTIONAL_LOCKS: "0" } : {}),
+    ...(readOnly ? { GIT_OPTIONAL_LOCKS: "0" } : {}),
+    ...(opts.discoverAboveRoot !== true && ceiling !== undefined
+      ? { GIT_CEILING_DIRECTORIES: ceiling }
+      : {}),
     ...opts.env,
   };
+  // The repository is the one discovered from `cwd` and checked by openRepo,
+  // never one an inherited GIT_DIR or GIT_WORK_TREE names (a harness started
+  // from a git hook inherits both).
+  const inherited = withoutRepositoryLocators(process.env);
+  // A write keeps the full environment: a commit may sign through an agent,
+  // and its hooks are the repository's, approved with the write.
+  const env: Record<string, string | undefined> = readOnly
+    ? withoutCredentials(inherited, pinned).env
+    : { ...inherited, ...pinned };
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {
@@ -392,6 +509,12 @@ export type Repo = {
   readonly root: string;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  /**
+   * The repository's own filter drivers a read switches off (`filter.<name>`
+   * each). Empty for almost every repository; a tool whose result a filter
+   * could change says so with `neutralisedNote` when it is not.
+   */
+  readonly neutralised: readonly string[];
   run(args: readonly string[], opts?: Partial<RunOptions>): Promise<GitRun>;
 };
 
@@ -426,23 +549,20 @@ export async function openRepo(
     return refuse(`${toolName} refused "${requested}": it is not an existing directory.`);
   }
 
-  const top = await runGit(["rev-parse", "--show-toplevel"], {
-    cwd,
+  const located = await locateRepository(toolName, requested, cwd, {
     timeoutMs,
-    readOnly: true,
     ...(signal !== undefined ? { signal } : {}),
   });
-  if (top.code !== 0) {
-    if (top.code === 127) return refuse(top.stderr);
-    // A killed-on-the-deadline probe says nothing about whether this is a
-    // repository, and reporting it as "not a git repository" would send the
-    // caller looking for the wrong problem.
-    if (top.timedOut) return refuse(failure(toolName, top));
-    return refuse(
-      `${toolName} refused "${requested}": it is not a git repository (no .git found from there). git said: ${firstLine(top.stderr)}`,
-    );
-  }
-  const root = top.stdout.trim();
+  if (!located.ok) return located;
+  const root = located.value.root;
+  const indexEnv = inheritedIndexEnv(located.value);
+
+  const filters = await probeRepositoryFilters(toolName, cwd, {
+    timeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (!filters.ok) return filters;
+  const { configArgs, neutralised } = filters.value;
 
   return {
     ok: true,
@@ -450,6 +570,7 @@ export async function openRepo(
       cwd,
       root,
       timeoutMs,
+      neutralised,
       ...(signal !== undefined ? { signal } : {}),
       run: (args, opts) =>
         runGit(args, {
@@ -457,8 +578,222 @@ export async function openRepo(
           timeoutMs,
           ...(signal !== undefined ? { signal } : {}),
           ...opts,
+          env: { ...indexEnv, ...opts?.env },
+          // Only a read loses the repository's filters: a write that skipped
+          // a clean filter would store the wrong bytes.
+          ...(opts?.readOnly === true && configArgs.length > 0 ? { configArgs } : {}),
         }),
     },
+  };
+}
+
+/** Where a proved repository keeps its working tree and history, all real paths. */
+export type LocatedRepository = {
+  readonly root: string;
+  readonly gitDir: string;
+  readonly commonDir: string;
+};
+
+/**
+ * The inherited GIT_INDEX_FILE to keep for a run in `repo`, as an absolute
+ * path, or nothing.
+ *
+ * Every other variable naming a repository is dropped (REPOSITORY_LOCATOR_ENV),
+ * and so is this one by default. But git hands a hook the index it is
+ * COMMITTING: during `git commit -a`, `git commit <paths>` or `--only`, that
+ * is `index.lock` or a `next-index-*.lock` in the git dir, not the index
+ * file. A harness started from prepare-commit-msg or pre-commit that asks
+ * "what is staged?" must read that one, or it reports the commit as empty.
+ * So an inherited GIT_INDEX_FILE is kept when it lies inside the git dir or
+ * common dir that locateRepository proved for this very repository, and
+ * dropped when it points anywhere else (another repository's hook, a
+ * planted value).
+ */
+export function inheritedIndexEnv(repo: LocatedRepository): Record<string, string> {
+  const raw = process.env["GIT_INDEX_FILE"];
+  if (raw === undefined || raw === "") return {};
+  // git resolves a relative GIT_INDEX_FILE against where it runs; a hook
+  // runs at the top level of the working tree.
+  const candidates = path.isAbsolute(raw)
+    ? [raw]
+    : [path.resolve(process.cwd(), raw), path.resolve(repo.root, raw)];
+  for (const candidate of candidates) {
+    const leaf = realOrUndefined(candidate);
+    const dir = realOrUndefined(path.dirname(candidate));
+    const abs = leaf ?? (dir === undefined ? undefined : path.join(dir, path.basename(candidate)));
+    if (abs === undefined) continue;
+    if (isInside(repo.gitDir, abs) || isInside(repo.commonDir, abs)) {
+      return { GIT_INDEX_FILE: abs };
+    }
+  }
+  return {};
+}
+
+/**
+ * Find the repository git will work on from `cwd`, and refuse it unless it is
+ * the workspace's (C071, see `./repo-bounds`). Returns its real top level.
+ *
+ * One probe asks for the three places git will use. The common dir comes
+ * back relative to `cwd` on some layouts, so it is resolved against `cwd`
+ * (which also makes `--path-format`, git 2.31+, unnecessary). A refusal names
+ * the caller's `cwd` and the reason, never the outside path it led to.
+ */
+export async function locateRepository(
+  toolName: string,
+  requested: string,
+  cwd: string,
+  opts: { readonly timeoutMs: number; readonly signal?: AbortSignal },
+): Promise<Resolved<LocatedRepository>> {
+  const probe = await runGit(
+    ["rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir"],
+    {
+      cwd,
+      timeoutMs: opts.timeoutMs,
+      readOnly: true,
+      discoverAboveRoot: true,
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+    },
+  );
+  if (probe.code !== 0) {
+    if (probe.code === 127) return refuse(probe.stderr);
+    // A killed-on-the-deadline probe says nothing about whether this is a
+    // repository, and reporting it as "not a git repository" would send the
+    // caller looking for the wrong problem.
+    if (probe.timedOut) return refuse(failure(toolName, probe));
+    if (/cannot use bare repository/i.test(probe.stderr))
+      return refuse(bareRefusal(toolName, requested));
+    // "Not a git repository" only when git says so: any other failure (a
+    // config git cannot read, a dubious-ownership refusal) is passed on as
+    // git's own words, so the caller looks for the right problem.
+    if (/not a git repository/i.test(probe.stderr)) {
+      return refuse(
+        `${toolName} refused "${requested}": it is not a git repository (no .git found from there). git said: ${firstLine(probe.stderr)}`,
+      );
+    }
+    return refuse(failure(toolName, probe));
+  }
+  const lines = probe.stdout.split("\n").map((l) => l.trim());
+  const [topRaw, gitDirRaw, commonRaw] = lines;
+  const rootReal = realOrUndefined(process.cwd());
+  if (
+    rootReal === undefined ||
+    topRaw === undefined ||
+    topRaw === "" ||
+    gitDirRaw === undefined ||
+    gitDirRaw === "" ||
+    commonRaw === undefined ||
+    commonRaw === ""
+  ) {
+    return refuse(
+      `${toolName} refused "${requested}": git did not say where this repository keeps its working tree and history, so it cannot be shown to lie inside the workspace.`,
+    );
+  }
+  const outside = (why: string): Refusal =>
+    refuse(
+      `${toolName} refused "${requested}": ${why}. The git tools work only on a repository whose working tree and history are inside the workspace root, the directory the harness runs from: keep the harness at the repository's top level, or give the harness directory a repository of its own.`,
+    );
+
+  const top = realOrUndefined(topRaw);
+  if (top === undefined || !isInside(rootReal, top)) {
+    return outside(
+      "the git repository it belongs to has its working tree outside the workspace (a repository enclosing the workspace, or one whose core.worktree points out of it)",
+    );
+  }
+  const gitDir = realOrUndefined(gitDirRaw);
+  const commonDir = realOrUndefined(path.resolve(cwd, commonRaw));
+  if (gitDir === undefined || commonDir === undefined) {
+    return outside("its git directory could not be resolved");
+  }
+
+  if (isInside(rootReal, gitDir)) {
+    if (!isInside(rootReal, commonDir)) {
+      // A git dir inside with its history outside is a `commondir` redirect
+      // written inside the workspace: git never lays a worktree out that way.
+      return outside(
+        "its .git directory takes its history from a repository outside the workspace",
+      );
+    }
+    for (const dir of gitDir === commonDir ? [gitDir] : [gitDir, commonDir]) {
+      const link = linkLeadingOut(dir, rootReal);
+      if (link !== undefined) {
+        return outside(`its .git directory holds a link (${link}) leading outside the workspace`);
+      }
+    }
+    if (alternateLeadingOut(commonDir, rootReal) !== undefined) {
+      return outside(
+        "its object store borrows from a repository outside the workspace (objects/info/alternates)",
+      );
+    }
+    return { ok: true, value: { root: top, gitDir, commonDir } };
+  }
+
+  // The git dir is outside. Only git's own bookkeeping in that directory,
+  // which nothing inside the workspace can write, may tie it to this tree.
+  if (isWorktreeOf(gitDir, commonDir, top))
+    return { ok: true, value: { root: top, gitDir, commonDir } };
+  if (commonDir === gitDir) {
+    const wt = await runGit(
+      ["config", "--file", path.join(gitDir, "config"), "--get", "core.worktree"],
+      {
+        cwd,
+        timeoutMs: opts.timeoutMs,
+        readOnly: true,
+        ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+      },
+    );
+    const value = wt.code === 0 ? wt.stdout.trim() : "";
+    if (value !== "" && realOrUndefined(path.resolve(gitDir, value)) === top) {
+      return { ok: true, value: { root: top, gitDir, commonDir } };
+    }
+  }
+  return outside(
+    "its .git points at a git directory outside the workspace that does not name this directory as its working tree (a linked worktree or submodule does; a planted .git file does not — for a checkout made with --separate-git-dir, set core.worktree in that repository's config)",
+  );
+}
+
+/** The refusal for a repository directory git found by being run inside it. */
+export function bareRefusal(toolName: string, requested: string): string {
+  return `${toolName} refused "${requested}": it is a repository directory itself (a bare repository, or a directory laid out like one) that git found by being run inside it. A read-only tool does not run git there, because that directory's own config can name programs git would run. Run it from a working tree instead.`;
+}
+
+/**
+ * List the filter drivers the repository's own config defines, and the `-c`
+ * pairs that switch them off for a read (see `./hardening`). The listing
+ * itself runs nothing: reading config executes no helper.
+ */
+export async function probeRepositoryFilters(
+  toolName: string,
+  cwd: string,
+  opts: { readonly timeoutMs: number; readonly signal?: AbortSignal },
+): Promise<Resolved<{ configArgs: readonly string[]; neutralised: readonly string[] }>> {
+  const runOpts = { cwd, readOnly: true, ...opts };
+  let withScope = true;
+  let probe = await runGit(FILTER_PROBE_ARGS, runOpts);
+  // 129 is git's usage error: a git older than 2.26 has no --show-scope.
+  if (probe.code === 129 && /show-scope/.test(probe.stderr)) {
+    withScope = false;
+    probe = await runGit(FILTER_PROBE_ARGS_LEGACY, runOpts);
+  }
+  // Exit 1 is "no key matched": no filter configured anywhere.
+  if (probe.code === 1 && probe.stdout === "")
+    return { ok: true, value: { configArgs: [], neutralised: [] } };
+  if (probe.code !== 0 || probe.timedOut || probe.truncated) {
+    return refuse(
+      `${toolName} could not list this repository's filter configuration, so it cannot promise a read runs no program the repository names: ${
+        probe.timedOut
+          ? "the listing timed out"
+          : probe.truncated
+            ? "the listing was cut at the output cap"
+            : `git exit ${probe.code}: ${firstLine(probe.stderr)}`
+      }`,
+    );
+  }
+  const neutralisation = neutraliseRepositoryFilters(probe.stdout, withScope);
+  if (!neutralisation.ok)
+    return refuse(`${toolName} refused this repository: ${neutralisation.reason}.`);
+  return {
+    ok: true,
+    value: { configArgs: neutralisation.configArgs, neutralised: neutralisation.neutralised },
   };
 }
 
@@ -482,10 +817,135 @@ export function firstLine(text: string): string {
  */
 export function failure(toolName: string, run: GitRun): string {
   if (run.timedOut) {
-    return `${toolName} timed out: \`git ${run.args.join(" ")}\` did not finish in time and was killed. Narrow the request or raise \`timeout\`.`;
+    return redactUrlCredentialsInText(
+      `${toolName} timed out: \`git ${run.args.join(" ")}\` did not finish in time and was killed. Narrow the request or raise \`timeout\`.`,
+    );
   }
   const detail = run.stderr.trim() === "" ? run.stdout.trim() : run.stderr.trim();
-  return `${toolName} failed (git exit ${run.code}): ${detail === "" ? "no output" : detail}`;
+  // git quotes a remote's URL in some errors, userinfo and all; a
+  // credential never reaches a result, even inside an error (C051).
+  return redactUrlCredentialsInText(
+    `${toolName} failed (git exit ${run.code}): ${detail === "" ? "no output" : detail}`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// what `git apply -v` says it did
+
+const C_ESCAPES: Readonly<Record<string, number>> = {
+  a: 7,
+  b: 8,
+  t: 9,
+  n: 10,
+  v: 11,
+  f: 12,
+  r: 13,
+  '"': 34,
+  "\\": 92,
+};
+
+/**
+ * A path as git prints it: bare, or C-quoted (`"tab\tname"`) when it holds a
+ * control character, a quote or a backslash. `core.quotepath=false` keeps
+ * other non-ASCII bytes unescaped; an octal escape is still decoded, as the
+ * UTF-8 bytes git wrote.
+ */
+export function unquoteGitPath(text: string): string {
+  if (text.length < 2 || !text.startsWith('"') || !text.endsWith('"')) return text;
+  const bytes: number[] = [];
+  const body = text.slice(1, -1);
+  for (let i = 0; i < body.length; i++) {
+    const ch = String.fromCodePoint(body.codePointAt(i) as number);
+    if (ch !== "\\") {
+      for (const byte of Buffer.from(ch, "utf8")) bytes.push(byte);
+      i += ch.length - 1;
+      continue;
+    }
+    const next = body[i + 1] ?? "";
+    const octal = /^[0-7]{3}/.exec(body.slice(i + 1, i + 4));
+    if (octal !== null) {
+      bytes.push(Number.parseInt(octal[0], 8) & 0xff);
+      i += 3;
+    } else if (C_ESCAPES[next] !== undefined) {
+      bytes.push(C_ESCAPES[next] as number);
+      i += 1;
+    } else {
+      // Not a quoting git does; keep it as written rather than guess.
+      return text;
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/** The name inside `<prefix>'NAME'<suffix>` on one line of `git apply` output. */
+function applyLineName(line: string, prefix: string, suffix: string): string | undefined {
+  if (!line.startsWith(prefix) || !line.endsWith(suffix)) return undefined;
+  if (line.length < prefix.length + suffix.length) return undefined;
+  return unquoteGitPath(line.slice(prefix.length, line.length - suffix.length));
+}
+
+/**
+ * The patch paths `git apply -v` skipped — every path outside the directory
+ * git runs in. Without `-v` git skips them in silence and exits 0, so a
+ * patch applied from a subdirectory can change nothing, or half of what it
+ * says, and still look applied (C219). Matched on git's English text, which
+ * `runGit` pins with LC_ALL=C; paths are relative to the repository root.
+ */
+export function skippedPatchPaths(stderr: string): string[] {
+  const out: string[] = [];
+  for (const line of stderr.split("\n")) {
+    const name = applyLineName(line.replace(/\r$/, ""), "Skipped patch '", "'.");
+    if (name !== undefined) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * The paths a `git apply --3way` merged WITH CONFLICTS. `--check --3way`
+ * prints this and still exits 0, while the real apply leaves conflict
+ * markers and exits 1 — so a check that ignored it said "would apply" to a
+ * patch the real call reports as failed.
+ */
+export function conflictedPatchPaths(stderr: string): string[] {
+  const out: string[] = [];
+  for (const line of stderr.split("\n")) {
+    const name = applyLineName(line.replace(/\r$/, ""), "Applied patch to '", "' with conflicts.");
+    if (name !== undefined) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * The paths a real `git apply --3way` WROTE with conflicts: git prints
+ * `U <path>` for each only after writing the merged result (conflict markers
+ * in the file, unmerged stages in the index), and exits 1. The "with
+ * conflicts." line comes earlier, from the check phase, so on its own it
+ * does not prove anything was written.
+ */
+export function unmergedApplyPaths(stderr: string): string[] {
+  const out: string[] = [];
+  for (const raw of stderr.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("U ") && line.length > 2) out.push(line.slice(2));
+  }
+  return out;
+}
+
+/**
+ * The run with the progress lines `-v` adds taken out of stderr, so a
+ * failure still reads as git's own error first. What git prints without
+ * `-v` — a three-way merge's "with conflicts" line and its `U path` list —
+ * stays.
+ */
+export function withoutApplyProgress(run: GitRun): GitRun {
+  const kept = run.stderr.split("\n").filter((raw) => {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("Checking patch ") && line.endsWith("...")) return false;
+    if (line.startsWith("Skipped patch '") && line.endsWith("'.")) return false;
+    if (line.startsWith("Applied patch ") && line.endsWith(" cleanly.")) return false;
+    return true;
+  });
+  return { ...run, stderr: kept.join("\n") };
 }
 
 /** Append a truncation note when a run's stdout hit the cap. */

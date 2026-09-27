@@ -136,14 +136,100 @@ export function stubIndex(doc: EnvDoc, key: string): number | undefined {
 }
 
 /**
+ * Why a bare `KEY=value` line would not read back as `value` in a shell that
+ * sources the file, or in Bun's `.env` autoloader, or undefined when it would.
+ *
+ * Only characters that really DIVERGE are listed, each proven against sh,
+ * dash, bash, zsh and Bun (lib.test.ts runs them). In an assignment a shell
+ * does no pathname expansion and no word splitting, so `?`, `*`, `!`, `^`,
+ * `[ ]`, `%` and every non-ASCII letter are read literally by all of them —
+ * 0.7.0 wrote those, and so does this. What diverges:
+ *
+ *   - `$` expands (a shell, and Bun, which expands even in single quotes);
+ *   - a backtick runs a command; `\` escapes; `;` `|` `&` end the
+ *     assignment; `<` `>` redirect (`>` creates a file); `(` `)` are a syntax
+ *     error; a quote opens a quoted string;
+ *   - `~` at the start or after a `:` expands to a home directory;
+ *   - `=` at the start or after a `:` is zsh's `=command` expansion;
+ *   - `{` with `}` on an `export` line: bash brace-expands an export argument
+ *     (`{a,b}`, `{1..3}`), though not a plain assignment.
+ *
+ * Whitespace, `#`, newlines and NULs are refused before this, with their own
+ * reasons.
+ */
+export function shellDivergence(value: string, exported: boolean): string | undefined {
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i] as string;
+    const shown = JSON.stringify(c);
+    switch (c) {
+      case "$":
+        return `contains ${shown}, which a shell sourcing the file and Bun's .env loader both expand`;
+      case "`":
+        return `contains ${shown}, which runs a command in a shell sourcing the file`;
+      case "\\":
+        return `contains ${shown}, which a shell sourcing the file reads as an escape`;
+      case ";":
+      case "|":
+      case "&":
+        return `contains ${shown}, which ends the assignment in a shell sourcing the file`;
+      case "<":
+      case ">":
+        return `contains ${shown}, which is a redirection in a shell sourcing the file (">" creates a file)`;
+      case "(":
+      case ")":
+        return `contains ${shown}, which is a syntax error in a shell sourcing the file`;
+      case "'":
+      case '"':
+        return `contains ${shown}, which a shell sourcing the file reads as quoting`;
+      case "~":
+      case "=":
+        if (i === 0 || value[i - 1] === ":") {
+          return c === "~"
+            ? `has a "~" at the start or after a ":", which a shell sourcing the file expands to a home directory`
+            : `has an "=" at the start or after a ":", which zsh sourcing the file expands to a program's path`;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  if (exported && value.includes("{") && value.includes("}")) {
+    return 'has "{" and "}" on an export line, where bash sourcing the file reads them as a brace expansion ({a,b} or {1..3})';
+  }
+  return undefined;
+}
+
+/** The first C0 or C1 control character, or DEL, in `value`. */
+function firstControl(value: string): string | undefined {
+  for (const ch of value) {
+    const code = ch.codePointAt(0) as number;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return ch;
+  }
+  return undefined;
+}
+/** Half of a surrogate pair on its own: not text, and not writable as UTF-8. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+export type EncodeOptions = {
+  /** The line keeps an `export ` prefix, which bash reads differently (braces). */
+  readonly exported?: boolean;
+};
+
+/**
  * Can this value be written as bare text, and is that provably lossless?
  *
  * The check is the canonical reader itself: the candidate line is parsed with
  * `parseEnvText` and the decoded result must equal the value exactly. The
  * cheap tests before it exist only to name WHICH property fails, so the
- * refusal tells an operator what to change.
+ * refusal tells an operator what to change — and each names a real reason:
+ * a reader that would read the value differently (`shellDivergence`), a byte
+ * a .env cannot hold, or a character an editor showing the file would hide.
  */
-export function encodeBare(key: string, value: string): Resolved<string> {
+export function encodeBare(
+  key: string,
+  value: string,
+  options: EncodeOptions = {},
+): Resolved<string> {
   const why = (what: string): Refusal =>
     refuse(
       `the value for ${key} ${what}, so it would have to be quoted on the way into the file. This package deliberately has no .env quoter: the canonical one (encodeEnvValue) is private to @crewhaus/hangar-server and @crewhaus/service-setup, and a second copy that disagreed with the canonical reader by one character is the round-trip bug factory#452 fixed. Export encodeEnvValue and this refusal goes away; until then, write this value by hand or use one without the offending character.`,
@@ -158,9 +244,32 @@ export function encodeBare(key: string, value: string): Resolved<string> {
   if (/\s/.test(value))
     return why("contains whitespace, which a shell that sources the file would split on");
   if (value.startsWith('"') || value.startsWith("'")) return why("starts with a quote");
+  // Bun's loader strips from a `#` even with no space before it.
   if (value.includes("#")) return why('contains "#", which a reader may strip as a comment');
+  if (LONE_SURROGATE.test(value)) {
+    return refuse(
+      `the value for ${key} is not valid Unicode text (it holds half of a surrogate pair), so it cannot be written as UTF-8 without changing.`,
+    );
+  }
+  const control = firstControl(value);
+  if (control !== undefined) {
+    const code = (control.codePointAt(0) as number).toString(16).toUpperCase().padStart(4, "0");
+    return refuse(
+      `the value for ${key} contains a control character (U+${code}), which an editor or a terminal showing the file hides or acts on. Write this value by hand, or use one without control characters.`,
+    );
+  }
+  // C137: a character a shell sourcing the file, or Bun's .env autoloader,
+  // reads differently from the canonical reader. No quoting form reads the
+  // same in all of them, so such a value is refused — never quoted, never
+  // written bare.
+  const divergence = shellDivergence(value, options.exported === true);
+  if (divergence !== undefined) {
+    return refuse(
+      `the value for ${key} ${divergence}, while the canonical reader keeps it literally, so its meaning would depend on which reader opens the file. Write this value by hand, or use one without that character (a generated base64, base64url or hex value always qualifies).`,
+    );
+  }
 
-  const line = `${key}=${value}`;
+  const line = `${options.exported === true ? "export " : ""}${key}=${value}`;
   // The proof, not a guess: the bytes about to be written, read back by the
   // single canonical reader. Anything that does not survive is refused rather
   // than written and hoped for.
@@ -169,6 +278,14 @@ export function encodeBare(key: string, value: string): Resolved<string> {
     return why("does not survive a read-back through the canonical .env reader unchanged");
   }
   return { ok: true, value };
+}
+
+/** True when `key`'s one live assignment carries an `export ` prefix. */
+export function exportedAssignment(doc: EnvDoc, key: string): boolean {
+  const live = liveAssignments(doc, key);
+  if (live.length !== 1) return false;
+  const line = doc.lines[live[0] as number] as EnvLine;
+  return (line.raw.trim().match(ASSIGN_RE)?.[1] ?? "") !== "";
 }
 
 export type UpsertHow = "replaced" | "uncommented" | "appended" | "unchanged";
@@ -202,9 +319,6 @@ export function planUpsert(doc: EnvDoc, key: string, value: string): Resolved<Ed
       `"${key}" is not a .env key (letters, digits and underscore, not starting with a digit).`,
     );
   }
-  const encoded = encodeBare(key, value);
-  if (!encoded.ok) return encoded;
-
   const live = liveAssignments(doc, key);
   if (live.length > 1) {
     const where = live.map((index) => index + 1).join(" and ");
@@ -219,8 +333,21 @@ export function planUpsert(doc: EnvDoc, key: string, value: string): Resolved<Ed
     const current = lines[index] as EnvLine;
     const previous = decodeAssignment(current.raw);
     if (previous === value) {
+      // Nothing is written, so there is nothing to encode: a value an
+      // operator quoted by hand stays as they wrote it.
       return { ok: true, value: { how: "unchanged", doc, previous } };
     }
+  }
+  // Every path below WRITES the value, so it must encode losslessly first.
+  // Only a replaced line keeps an `export ` prefix; a stub is uncommented,
+  // and a new line appended, without one.
+  const encoded = encodeBare(key, value, { exported: exportedAssignment(doc, key) });
+  if (!encoded.ok) return encoded;
+
+  if (live.length === 1) {
+    const index = live[0] as number;
+    const current = lines[index] as EnvLine;
+    const previous = decodeAssignment(current.raw);
     const match = current.raw.trim().match(ASSIGN_RE);
     const prefix = match?.[1] ?? "";
     const indent = current.raw.slice(0, current.raw.length - current.raw.trimStart().length);

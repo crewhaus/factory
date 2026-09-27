@@ -35,7 +35,15 @@ import {
   MACOS_PLIST_INTERVAL,
   MACOS_PLUTIL_ERROR_STDERR,
 } from "./__fixtures__/host-output";
-import { _setClock, _setFs, _setRunner, cronDelete, cronList, defaultSources } from "./index";
+import {
+  _setClock,
+  _setFs,
+  _setPlatform,
+  _setRunner,
+  cronDelete,
+  cronList,
+  defaultSources,
+} from "./index";
 import type { HostCommand, HostResult } from "./lib/run";
 
 // ---------------------------------------------------------------------------
@@ -62,6 +70,7 @@ function installRunner(handler: Handler): void {
       ...(reply.stdoutTruncated === true ? { stdoutTruncated: true } : {}),
       ...(reply.stderrTruncated === true ? { stderrTruncated: true } : {}),
       ...(reply.abandoned === true ? { abandoned: true } : {}),
+      ...(reply.outputIncomplete === true ? { outputIncomplete: true } : {}),
       ...(reply.spawnError !== undefined ? { spawnError: reply.spawnError } : {}),
     };
   });
@@ -123,6 +132,7 @@ afterEach(() => {
   _setRunner(undefined);
   _setFs(undefined);
   _setClock(undefined);
+  _setPlatform(undefined);
 });
 
 /** The shapes the two tools return, so the assertions below read as documentation. */
@@ -152,6 +162,11 @@ type Entry = {
 
 type ListOut = {
   ok: boolean;
+  /** false when no scheduler could be read: then there is no `count` and no `entries`. */
+  determined: boolean;
+  outcome?: "unsupported" | "unavailable";
+  reason?: string;
+  count?: number;
   platform: string;
   now: string;
   timeZone: string;
@@ -335,6 +350,58 @@ describe("CronList over a crontab", () => {
     expect(await cronList.execute({ sources: ["crontab"], now: "half past tuesday" })).toContain(
       "could not read 'now'",
     );
+  });
+
+  test("an offset-less 'now' does not depend on the host's zone (C189)", async () => {
+    // 0.7.0 read it with Date.parse, i.e. on the HOST's clock: 16:30Z in Los
+    // Angeles, 23:30Z the day before in Tokyo — while claiming timeZone UTC.
+    // Bun honours a TZ change at runtime, so one process shows both hosts.
+    installRunner(crontabHost("0 9 * * * /usr/bin/backup\n"));
+    const savedTz = process.env["TZ"];
+    try {
+      process.env["TZ"] = "America/Los_Angeles";
+      const a = await cronList.execute({ sources: ["crontab"], now: "2026-01-01T08:30:00" });
+      process.env["TZ"] = "Asia/Tokyo";
+      const b = await cronList.execute({ sources: ["crontab"], now: "2026-01-01T08:30:00" });
+      expect(a).toBe(b);
+      const out = JSON.parse(a as string) as ListOut;
+      // Read in timeZone, which defaults to UTC.
+      expect(out.now).toBe("2026-01-01T08:30:00.000Z");
+      expect(out.entries[0]?.nextRun).toEqual({
+        at: "2026-01-01T09:00:00.000Z",
+        source: "computed",
+      });
+      // The zone the caller names is the zone the wall clock is read in,
+      // exactly as CronNext reads its `after`.
+      const ny = await list({
+        sources: ["crontab"],
+        now: "2026-01-01T08:30:00",
+        timeZone: "America/New_York",
+      });
+      expect(ny.now).toBe("2026-01-01T13:30:00.000Z");
+      expect(ny.entries[0]?.nextRun?.at).toBe("2026-01-01T14:00:00.000Z");
+      // An explicit offset names one instant whatever the zones.
+      const zulu = await list({ sources: ["crontab"], now: "2026-01-01T08:30:00Z" });
+      expect(zulu.now).toBe("2026-01-01T08:30:00.000Z");
+      const offset = await list({
+        sources: ["crontab"],
+        now: "2026-01-01T08:30:00+02:00",
+        timeZone: "Asia/Tokyo",
+      });
+      expect(offset.now).toBe("2026-01-01T06:30:00.000Z");
+    } finally {
+      if (savedTz === undefined) Reflect.deleteProperty(process.env, "TZ");
+      else process.env["TZ"] = savedTz;
+    }
+  });
+
+  test("a 'now' the date grammar reads two ways is refused with both readings (C189)", async () => {
+    installRunner(crontabHost(LINUX_CRONTAB_L));
+    const out = await cronList.execute({ sources: ["crontab"], now: "03/04/2026 10:00" });
+    expect(out).toContain("could not read 'now'");
+    expect(out).toContain("MDY");
+    expect(out).toContain("DMY");
+    expect(calls).toEqual([]);
   });
 
   test("no command is ever a shell string", async () => {
@@ -530,6 +597,58 @@ describe("CronList platform defaults", () => {
     expect(defaultSources("linux")).toEqual(["crontab", "systemd"]);
     expect(defaultSources("freebsd")).toEqual(["crontab", "systemd"]);
     expect(defaultSources("win32")).toEqual([]);
+  });
+
+  test("a platform with no reader says it could not look (C196)", async () => {
+    // 0.7.0 answered ok:true, count:0 — "nothing is scheduled" — having
+    // looked at nothing.
+    installRunner(() => ({ exitCode: 127, spawnError: "ENOENT" }));
+    _setPlatform("win32");
+    const out = await list({});
+    expect(out.ok).toBe(false);
+    expect(out.determined).toBe(false);
+    expect(out.outcome).toBe("unsupported");
+    expect(out.reason).toContain("Windows Task Scheduler");
+    expect(out.count).toBeUndefined();
+    expect(out.entries).toBeUndefined();
+    expect(out.sources).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  test("every requested reader unavailable is not an empty answer (C196)", async () => {
+    installRunner(() => ({ exitCode: 127, spawnError: "ENOENT" }));
+    _setPlatform("linux");
+    const out = await list({ sources: ["crontab", "systemd"] });
+    expect(out.ok).toBe(false);
+    expect(out.determined).toBe(false);
+    expect(out.outcome).toBe("unavailable");
+    expect(out.reason).toContain("no requested scheduler could be read (crontab, systemd)");
+    expect(out.count).toBeUndefined();
+    expect(out.entries).toBeUndefined();
+    // Each source still says why.
+    expect(out.sources.map((report) => report.available)).toEqual([false, false]);
+    expect(out.sources.every((report) => typeof report.reason === "string")).toBe(true);
+  });
+
+  test("one reader unavailable is a partial answer that names what is missing (C196)", async () => {
+    installRunner((argv) =>
+      argv[0] === "systemctl" ? { stdout: "" } : { exitCode: 127, spawnError: "ENOENT" },
+    );
+    const out = await list({ sources: ["crontab", "systemd"] });
+    expect(out.ok).toBe(true);
+    expect(out.determined).toBe(true);
+    expect(out.outcome).toBeUndefined();
+    expect(out.count).toBe(0);
+    expect(out.notes?.join(" ")).toContain("crontab could not be read");
+  });
+
+  test("a normal read is determined and carries no outcome", async () => {
+    installRunner(crontabHost(LINUX_CRONTAB_L));
+    const out = await list({ sources: ["crontab"] });
+    expect(out.ok).toBe(true);
+    expect(out.determined).toBe(true);
+    expect(out.outcome).toBeUndefined();
+    expect(out.count).toBe(2);
   });
 });
 
@@ -955,7 +1074,25 @@ describe("what the tools say when a probe FAILED", () => {
     const out = await list({ sources: ["crontab"], nextRuns: 0 });
     expect(out["sources"][0]?.available).toBe(false);
     expect(out["sources"][0]?.reason).toContain("PREFIX");
-    expect(out["entries"]).toEqual([]);
+    // Not even an empty listing: nothing was read, so nothing is claimed (C196).
+    expect(out["determined"]).toBe(false);
+    expect(out["entries"]).toBeUndefined();
+  });
+
+  test("a listing whose output a leftover process held open is not a crontab (C078)", async () => {
+    // The command exited, but a child it started kept the pipe open past the
+    // drain grace. 0.7.0 returned "" here, which read as "no jobs".
+    installRunner((argv) =>
+      argv[1] === "-l" ? { stdout: "0 3 * * * /usr/local/bin/a.sh\n", outputIncomplete: true } : {},
+    );
+    const out = await list({ sources: ["crontab"], nextRuns: 0 });
+    expect(out["sources"][0]?.available).toBe(false);
+    expect(out["sources"][0]?.reason).toContain("incomplete");
+    expect(out["determined"]).toBe(false);
+    expect(out["entries"]).toBeUndefined();
+    const removed = await remove({ source: "crontab", id: "line:1" });
+    expect(removed).toMatchObject({ ok: false, deleted: false });
+    expect(fsLog.written).toEqual([]);
   });
 
   test("a delete REFUSES to rewrite a crontab it only half read", async () => {

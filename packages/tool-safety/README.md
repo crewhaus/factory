@@ -272,7 +272,7 @@ A package whose config has one `token_env` passes `[cfg.tokenEnv, ...cfg.tokenEn
 
 ### `checkEnvReveal(name, { allowed, configKey })`
 
-Answers whether a tool that reports on variables (EnvInspect) may show a value. The name must be listed, and never credential-shaped, listed or not (flag-truth-4#1, security-8#3, docs-claims#6). Presence and length are all a model learns about a key. `tool_config.proc.env_reveal` needs a config channel that tool-proc does not have yet (it registers no config), so EnvInspect adopts this together with one.
+Answers whether a tool that reports on variables (EnvInspect) may show a value. The name must be listed, and never credential-shaped, listed or not (flag-truth-4#1, security-8#3, docs-claims#6). Presence and length are all a model learns about a key. EnvInspect adopts it with `tool_config.proc.env_reveal`, delivered by tool-proc's `registerProcConfig` boot registrar.
 
 ### `isCredentialShapedName(name)` and `credentialShapeOf(name)`
 

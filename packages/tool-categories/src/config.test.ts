@@ -42,10 +42,37 @@ describe("every configurable package is in the registrar table", () => {
     expect([...named].sort()).toEqual(Object.keys(TOOL_BOOT_REGISTRARS).sort());
   });
 
+  /**
+   * Registrars that configure only SOME of their package's tools, each with
+   * exactly the rows that read its block. Named by every row, a registrar
+   * labels the others "configured by" it in a compiled README and takes their
+   * own keys (`tool_config.runCommand`) as its block. This list is checked in
+   * both directions below, so it cannot drift from the table.
+   */
+  const PER_TOOL_REGISTRARS: Readonly<Record<string, readonly string[]>> = {
+    // tool-proc: EnvInspect reads env_reveal, WaitForPort wait_for_port_hosts;
+    // RunCommand and the rest of the package read nothing from it.
+    registerProcConfig: ["envInspect", "waitForPort"],
+  };
+
+  test("a per-tool registrar is named by exactly the rows listed for it", () => {
+    let checked = 0;
+    for (const [symbol, rows] of Object.entries(PER_TOOL_REGISTRARS)) {
+      const named = Object.entries(BUILTIN_TOOLS)
+        .filter(([, e]) => e.initSymbol === symbol)
+        .map(([key]) => key)
+        .sort();
+      expect({ symbol, named }).toEqual({ symbol, named: [...rows].sort() });
+      checked += 1;
+    }
+    expect(checked).toBe(1);
+  });
+
   test("a registrar more than one row of a package names is named by every row of it", () => {
     // Derived, not listed: a package-wide registrar (registerHttpConfig for
     // tool-http) must reach every tool the package's block configures, so a
-    // new tool that forgot it fails here.
+    // new tool that forgot it fails here. A per-tool registrar is held to
+    // its own list above instead.
     const byPackage = new Map<string, Array<{ key: string; init?: string; chain?: string }>>();
     for (const [key, e] of Object.entries(BUILTIN_TOOLS)) {
       const rows = byPackage.get(e.package) ?? [];
@@ -61,6 +88,7 @@ describe("every configurable package is in the registrar table", () => {
       for (const field of ["init", "chain"] as const) {
         const named = rows.filter((r) => r[field] !== undefined);
         if (named.length < 2) continue;
+        if (field === "init" && Object.hasOwn(PER_TOOL_REGISTRARS, named[0]?.init ?? "")) continue;
         packageWide += 1;
         const symbol = named[0]?.[field];
         expect({ pkg, missing: rows.filter((r) => r[field] !== symbol).map((r) => r.key) }).toEqual(
@@ -72,8 +100,8 @@ describe("every configurable package is in the registrar table", () => {
       }
     }
     // http, codehost, notify, obs, defi, chainread, token (x2), chaincall,
-    // evm, evm-tx and code-execution today.
-    expect(packageWide).toBeGreaterThanOrEqual(12);
+    // evm, evm-tx and code-execution today (proc is per-tool, above).
+    expect(packageWide).toBeGreaterThanOrEqual(11);
   });
 });
 

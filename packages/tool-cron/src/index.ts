@@ -38,17 +38,18 @@ import { basename, dirname, join } from "node:path";
  *    back.
  *
  * The seams are `_setRunner` (every child process), `_setFs` (the two places
- * a file is read or written) and `_setClock` (the reference instant for a
- * next-firing walk). The whole suite drives them: no test asks the real host
- * what it has scheduled, because the answer differs on every machine and CI
- * is not the machine this was written on.
+ * a file is read or written), `_setClock` (the reference instant for a
+ * next-firing walk) and `_setPlatform` (which schedulers are read by
+ * default). The whole suite drives them: no test asks the real host what it
+ * has scheduled, because the answer differs on every machine and CI is not
+ * the machine this was written on.
  */
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import { type ParsedCrontab, crontabEntries, parseCrontab, planRemoval } from "./lib/crontab";
 import { type JobEntry, type JobSource, byEntry, selectEntries } from "./lib/entries";
-import { fs, _setClock, _setFs, currentUid, now } from "./lib/host";
+import { fs, _setClock, _setFs, _setPlatform, currentPlatform, currentUid, now } from "./lib/host";
 import {
   type LaunchdDefinition,
   type PlistFailure,
@@ -65,7 +66,7 @@ import {
   runHost,
   unreadableReason,
 } from "./lib/run";
-import { readCronExpression } from "./lib/schedule";
+import { readCronExpression, readReferenceInstant } from "./lib/schedule";
 import {
   SHOW_PROPERTIES,
   type ShowBlock,
@@ -76,7 +77,7 @@ import {
 } from "./lib/systemd";
 import { isInside, resolveSafe } from "./paths";
 
-export { _setRunner, _setFs, _setClock };
+export { _setRunner, _setFs, _setClock, _setPlatform };
 export type { JobEntry, JobSource };
 
 /** Compact JSON — the reader is a model, and every byte is context. */
@@ -634,7 +635,7 @@ const sourcesField = z
   .max(3)
   .optional()
   .describe(
-    "which schedulers to read; defaults to the ones this platform has (crontab + launchd on macOS, crontab + systemd elsewhere)",
+    "which schedulers to read; defaults to the ones this platform has (crontab + launchd on macOS, crontab + systemd elsewhere, none on Windows, which is answered as unsupported)",
   );
 
 const timeoutField = z
@@ -678,7 +679,9 @@ export const cronList: RegisteredTool = buildTool({
       .min(1)
       .max(100)
       .optional()
-      .describe("reference instant for the next-firing walk; defaults to the current time"),
+      .describe(
+        "reference instant for the next-firing walk, e.g. 2026-01-01T08:30:00Z; a value with no UTC offset is read on the wall clock of timeZone, never the host's. Defaults to the current time",
+      ),
     maxEntries: z.number().int().min(1).max(5_000).optional(),
     timeoutMs: timeoutField,
   }),
@@ -691,24 +694,40 @@ export const cronList: RegisteredTool = buildTool({
     const timeZone = input.timeZone ?? "UTC";
     const badZone = zoneError(timeZone);
     if (badZone !== undefined) return `[CronList error] ${badZone}`;
-    const nowMs = input.now === undefined ? now() : Date.parse(input.now);
-    if (!Number.isFinite(nowMs)) {
-      return `[CronList error] could not read 'now': ${JSON.stringify(input.now)} is not a date this tool can parse`;
+    const notes: string[] = [];
+    let nowMs = now();
+    if (input.now !== undefined) {
+      const reference = await readReferenceInstant(input.now, timeZone);
+      if (!reference.ok) {
+        return `[CronList error] could not read 'now': ${JSON.stringify(input.now)} — ${reference.error}`;
+      }
+      nowMs = reference.epochMs;
+      notes.push(...reference.notes);
     }
     const after = new Date(nowMs).toISOString();
     const timeoutMs = input.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
-    const requested = input.sources ?? defaultSources(process.platform);
+    const platform = currentPlatform();
+    const requested = input.sources ?? defaultSources(platform);
     const nextRuns = input.nextRuns ?? 1;
     const maxEntries = input.maxEntries ?? DEFAULT_MAX_ENTRIES;
 
+    if (requested.length === 0) {
+      // Nothing was read, so there is no listing to report — an empty one
+      // would read as "nothing is scheduled here", which nobody looked at.
+      return json({
+        ok: false,
+        determined: false,
+        outcome: "unsupported",
+        platform,
+        now: after,
+        reason: `no scheduler reader exists for platform ${platform} — Windows Task Scheduler is not read by this package, so what is scheduled here is unknown`,
+        sources: [],
+        ...(notes.length > 0 ? { notes } : {}),
+      });
+    }
+
     const reports: SourceReport[] = [];
     let collected: JobEntry[] = [];
-    const notes: string[] = [];
-    if (requested.length === 0) {
-      notes.push(
-        `no scheduler reader exists for platform ${process.platform} — Windows Task Scheduler is not read by this package`,
-      );
-    }
     const unparsedLines: { source: "crontab"; line: number; text: string; reason: string }[] = [];
     for (const source of [...new Set(requested)].sort()) {
       const read = await readSource(source, { systemScope: input.systemScope === true, timeoutMs });
@@ -726,6 +745,27 @@ export const cronList: RegisteredTool = buildTool({
       }
     }
 
+    const unread = reports.filter((report) => !report.available).map((report) => report.source);
+    if (unread.length === reports.length) {
+      // Every scheduler asked for failed to answer. Each report says why; an
+      // `ok` listing with no entries would say "nothing is scheduled" instead.
+      return json({
+        ok: false,
+        determined: false,
+        outcome: "unavailable",
+        platform,
+        now: after,
+        reason: `no requested scheduler could be read (${unread.join(", ")}), so what is scheduled here is unknown — each source below says why`,
+        sources: reports,
+        ...(notes.length > 0 ? { notes } : {}),
+      });
+    }
+    if (unread.length > 0) {
+      notes.push(
+        `${unread.join(", ")} could not be read (see sources), so this listing does not include what ${unread.length === 1 ? "it schedules" : "they schedule"}`,
+      );
+    }
+
     const sorted = [...collected].sort(byEntry);
     const capped = sorted.slice(0, maxEntries);
     if (sorted.length > capped.length) {
@@ -735,7 +775,8 @@ export const cronList: RegisteredTool = buildTool({
 
     return json({
       ok: true,
-      platform: process.platform,
+      determined: true,
+      platform,
       now: after,
       timeZone,
       timeZoneNote:

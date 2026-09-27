@@ -239,7 +239,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "astQuery",
     name: "AstQuery",
     description:
-      "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run.",
+      "Find declarations across a directory by kind, name or export status, with the line span of each one. Use it to answer 'where is X defined' or 'what classes are in this package' without reading files into context. It is a lexical SCANNER, not a parser: it reads code with comments and strings masked out, and it does not understand JSX bodies, destructured declarations, classes nested inside functions, or computed member names — see the package README for the full list. A `pattern` that nests one repetition inside another is refused rather than run, and a name the pattern could not be checked against is listed as unchecked, never dropped as a non-match.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -693,7 +693,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "cliVersionPin",
     name: "CliVersionPin",
     description:
-      "Show which crewhaus CLI each harness would run and which version its bundle was COMPILED WITH, and roll the fleet up by version so a harness left behind on an old CLI is visible. The harnesses come from this machine's registry unless directories are given; the compiledWith stamp is @crewhaus/harness-supervisor's, the binary is its resolver's (harness node_modules/.bin first, then PATH). This tool does NOT install, switch or pin a version — that is @crewhaus/chvm talking to the npm registry, and this package has neither the dependency nor a network call — so the result names the command instead of pretending. With probe:true it runs `<bin> --version` once per DISTINCT binary, with a timeout, and only for a binary inside the workspace unless allowExternalCli is set. A version it could not read is reported as unknown WITH the reason, never as agreeing with the others. It writes NOTHING: the registry is enumerated through @crewhaus/harness-registry's own CREWHAUS_NO_REGISTRY switch, so the missing-directory stamps a plain list() would persist are computed and reported but not written. At most 500 harnesses are inspected; past that the result carries truncated:true and every count describes that subset rather than the fleet. A spec or bundle that a symlink puts outside the workspace is reported as undetermined with the reason, never opened.",
+      "Show which crewhaus CLI each harness would run and which version its bundle was COMPILED WITH, and roll the fleet up by version so a harness left on an old CLI is visible. Harnesses come from this machine's registry unless dirs are given; the binary is @crewhaus/harness-supervisor's choice (harness node_modules/.bin first, then PATH). It does NOT install, switch or pin a version — that is @crewhaus/chvm — so the result names the command instead. With probe:true it reads each distinct CLI's version from the package.json of the crewhaus package it belongs to; a CLI inside the workspace is never run. A CLI outside the workspace is read only with allowExternalCli, and run with --version only when it has no package.json. A version it could not read is unknown, with the reason. It writes nothing. At most 500 harnesses are inspected (truncated:true past that). A spec or bundle a symlink puts outside the workspace is reported as undetermined, never opened.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -839,7 +839,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "commandExists",
     name: "CommandExists",
     description:
-      "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match.",
+      "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match; on Windows it tries PATHEXT's extensions (git finds git.exe) as the shell does.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -897,7 +897,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "compileBundle",
     name: "CompileBundle",
     description:
-      "Compare a harness's compiled bundle against its spec with @crewhaus/harness-supervisor's spec-hash stamp — the exact comparison the manager gates a start on — and recompile it when it is stale, by running the same `crewhaus compile` (plus `bun install` in the bundle) that `daemon start --compile` runs. THREE verdicts, not two: fresh, stale, and UNDETERMINED. A bundle with no stamp and no usable mtimes, or one whose spec cannot be read or parsed, is undetermined — the supervisor treats that as 'not stale' and carries on, so a tool that reported its success as 'the bundle is current' is exactly how a fleet ends up running last month's CLI with every line green. A real run on an undetermined verdict is refused, with the command that fixes it. The compile spawns with a minimal environment (no .env chain) and, afterwards, the freshness is re-read and reported: a compile that exited 0 and left the bundle stale says so. Every file it opens is contained, including the ones the supervisor's own locators hand back — a crewhaus.yaml or a bundle directory that a symlink puts outside the workspace is refused in the preview and in the real call alike, because the recompile writes into that directory. dryRun defaults to true.",
+      "Compare a harness's compiled bundle against its spec using @crewhaus/harness-supervisor's spec-hash stamp — the check the manager gates a start on — and recompile it when stale, running the same `crewhaus compile` (and `bun install` in the bundle) as `daemon start --compile`. Three verdicts: fresh, stale and UNDETERMINED (no stamp and no usable mtimes, or a spec that cannot be read or parsed). The supervisor treats undetermined as not stale; this tool says so, and refuses a real run on it with the command that fixes it. The compile runs with a minimal environment (no .env chain), and freshness is re-read afterwards: a compile that exited 0 and left the bundle stale says so. Every file it opens is contained, so a crewhaus.yaml or bundle directory a symlink puts outside the workspace is refused, in the preview and the real call alike. dryRun defaults to true.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -1787,7 +1787,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "diagnostics",
     name: "Diagnostics",
     description:
-      "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and nothing is written.",
+      "Run the project's type checker, linter and formatter check and return every finding in ONE normalized shape: file, line, column, severity, rule, message, source. Use it as the single 'is this code healthy' call, so a harness decides on one schema instead of three tools' formats. Each step is skipped, with a reason, when the project has no configuration for it, `timeout` is the budget for the whole call rather than for each step, and no source file is rewritten; tsc's, mypy's and ruff's caches are kept out of the project. Each checker is the project's own code (a cargo build may also write its target directory), so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -2200,7 +2200,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "envInspect",
     name: "EnvInspect",
     description:
-      "Report whether named environment variables are set, and how long their values are, revealing a value only when the caller names it. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
+      "Report whether named environment variables are set, and how long their values are. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. A value is shown only for a variable named in `reveal` that the operator listed in tool_config.proc.env_reveal, and never for one whose name looks like a credential (a key, token, secret, password or credential URL), listed or not; any other name in `reveal` comes back with `withheld` and the reason. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -2835,7 +2835,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "format",
     name: "Format",
     description:
-      "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the read-only counterpart.",
+      "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the counterpart that only reports.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -2854,7 +2854,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "formatCheck",
     name: "FormatCheck",
     description:
-      "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program.",
+      "Ask the project's formatter which files are not formatted, without changing any of them. Use it as a gate before committing, or to decide whether Format needs to run at all. It returns the file list rather than a diff, because the diff is the formatter's job to produce and nobody needs it in context to make the decision; the formatter is the one this project configures and cannot be swapped for another program. The formatter and its config (a prettier.config.js and its plugins) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -3001,7 +3001,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "gitApplyPatch",
     name: "GitApplyPatch",
     description:
-      "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything.",
+      "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything. A patch naming any path outside `cwd` is refused whole, since git would skip that path without a word.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -3199,7 +3199,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "gitRemoteList",
     name: "GitRemoteList",
     description:
-      "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote.",
+      "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote. Everything before the @ in an http(s) URL (a user name, token or password: a bare token often sits in the user name) and a token query parameter are replaced with ***, an ssh URL keeps its login and loses only a password or token, and that remote is marked credentialsRedacted, so a masked URL is not usable as-is.",
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -3577,7 +3577,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "harnessRegister",
     name: "HarnessRegister",
     description:
-      "Add, remove, relocate, list and annotate the harnesses in this machine's registry (<registryRoot>/harnesses.json, from CREWHAUS_REGISTRY_ROOT or ~/.crewhaus — never a caller-supplied path). Every write goes through @crewhaus/harness-registry's own atomic tmp+rename with its read-merge-write retry, so a concurrent session or a running manager cannot lose your edit or you theirs. A relocate keeps the hrn_ id and changes only the directory, and the result proves it: the tool re-reads the registry and reports how many entries carry that id. It REFUSES to mutate a registry file that exists but did not parse (the library reads it as empty and the next write replaces it), refuses when CREWHAUS_NO_REGISTRY has turned writes into silent no-ops, refuses an `id` that is not an hrn_ id, and refuses to add a second row for a directory already registered under its other spelling. A register reads the harness's crewhaus.yaml for its name and shape and refuses one that a symlink puts outside the workspace, rather than recording another harness's identity. A write that the filesystem refuses is REPORTED, and a multi-field update — which is one atomic write per field — names which fields landed and which did not. dryRun defaults to true.",
+      "Add, remove, relocate, list and annotate the harnesses in this machine's registry (<registryRoot>/harnesses.json, from CREWHAUS_REGISTRY_ROOT or ~/.crewhaus — never a caller-supplied path). Writes go through @crewhaus/harness-registry's atomic read-merge-write, so a concurrent session or a running manager cannot lose an edit. A relocate keeps the hrn_ id, and the result re-reads the registry to prove it. It refuses to write a registry file that exists but does not parse, a registry CREWHAUS_NO_REGISTRY has made read-only, an id that is not an hrn_ id, and a second row for a directory already registered under another spelling. A register reads the harness's crewhaus.yaml for its name and shape, and refuses one a symlink puts outside the workspace. A write the filesystem refuses is reported, and a multi-field update names which fields landed. dryRun defaults to true.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -3744,7 +3744,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "hooksManage",
     name: "HooksManage",
     description:
-      "List, set and remove the MANAGER hooks in a harness's .crewhaus/settings.json — the postCompile and preSpawn steps @crewhaus/harness-supervisor runs between a compile and a spawn — and report what each declaration actually PARSES to. It never executes a hook. The grammar is the supervisor's: a string is ONE command with no arguments (deliberately never word-split), an array is an argv vector — so \"bun run prep.ts\" declares a command whose FILENAME contains spaces and will refuse every start with ENOENT, and that shape is refused here with the array form spelled out. A command that resolves to a path is probed for existence and the execute bit; a bare name is reported as resolved by the OS at spawn time rather than guessed at. A command that is a directory or a dangling symlink is `not-executable`/`absent` rather than executable, because access(X_OK) says yes to a directory and a hook that cannot spawn refuses every start. Writes preserve every other key in the file (the runtime's own hooks and permissions blocks live there too), are atomic, keep the file's mode, and are refused outright when the existing file does not parse. The settings file and the hook run log are contained before they are READ, so a symlinked .crewhaus/settings.json is refused — on `list` too — instead of reporting another file's hooks as this harness's. After a write the file is re-read THROUGH the supervisor's own reader and the result says whether the hook came back as the argv you asked for. dryRun defaults to true.",
+      "List, set and remove the MANAGER hooks (postCompile, preSpawn) in a harness's .crewhaus/settings.json — the steps @crewhaus/harness-supervisor runs between a compile and a spawn — and report what each declaration PARSES to. It never executes a hook. The grammar is the supervisor's: a string is ONE command with no arguments, never word-split; an array is an argv. So \"bun run prep.ts\" names a file with spaces in it and is refused, with the array form spelled out. A command path is checked for existence and the execute bit (a directory or a dangling link is not executable); a bare name is left to the OS at spawn time. Writes keep every other key, are atomic, keep the file's mode, and are refused when the existing file does not parse. The settings file is contained before it is read, so a symlinked one is refused, on list too. After a write the file is re-read through the supervisor's own reader to confirm the argv came back. dryRun defaults to true.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -4735,7 +4735,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "lint",
     name: "Lint",
     description:
-      "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, so nothing is rewritten and no caller can substitute another program — Format is the tool that writes.",
+      "Run the project's linter and return its findings as structured diagnostics with file, line, column, rule and message. Use it to check a change against the project's own rules without reading a linter's framed, coloured output. The linter is the one this project configures and is never passed a fix flag, and no caller can substitute another program — Format is the tool that rewrites files. The linter and its config (an eslint.config.js, a cargo build script) are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -5329,7 +5329,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "packageInstall",
     name: "PackageInstall",
     description:
-      "Install a package through the system package manager, or report exactly what installing it would do. DESTRUCTIVE: an install can replace a version that is already working, so the plan names the versions currently on disk before anything runs. Pass dryRun to get that plan and install nothing — it is resolved by the same code the real install uses, and includes the transitive packages the manager says it would add (complete from apt and pacman, resolved-then-declined from dnf, derived from `brew deps` for Homebrew, which has no dry run). THIS TOOL NEVER ACQUIRES PRIVILEGE. It runs no sudo, doas, runas or pkexec and raises no UAC prompt. Homebrew needs no root and is the case that genuinely works unattended; apt, dnf and pacman need root, so they work only when this process is ALREADY root and are otherwise refused with the exact command an operator would run themselves; winget and chocolatey installs are refused outright, because both end in an elevation prompt. A version can only be pinned where the manager can express one — apt can, and every other manager here is refused with the reason rather than quietly installing latest. A package name beginning with '-' is refused, because a manager would read it as a flag.",
+      "Install a package through the system package manager, or report what installing it would do. DESTRUCTIVE: an install can replace a working version, so the plan names the versions on disk first. dryRun returns that plan and installs nothing; it runs the same code as the real install and lists the packages the manager would add. It never acquires privilege: no sudo, doas, runas, pkexec or UAC prompt. Homebrew needs no root; apt, dnf and pacman work only when this process is already root, and otherwise return the command to run yourself; winget and chocolatey installs are refused. Only apt can pin a version; the other managers refuse one rather than install latest. It never removes anything: a plan that would remove a package is refused, and apt must know the exact name (and version) asked for. A name beginning with '-' is refused.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -5408,7 +5408,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "packageQuery",
     name: "PackageQuery",
     description:
-      'Ask the system package manager whether a package is installed, at what version, and what its already-downloaded index says is available. Supports Homebrew, apt/dpkg, dnf/rpm, pacman, winget and chocolatey, detecting the manager from the platform unless you name one; a host with none of them is reported as unknown rather than guessed at. It makes NO network call: every answer comes from a local index, which is why winget and chocolatey report installed state only — their available version lives on a remote source. Nothing is ever defaulted: a manager that is not on this host, a probe that timed out, an empty dnf metadata cache or a winget row whose columns could not be split all come back as status "unknown" with the reason and the exact command that was run, never as "not installed". Read-only: it runs only query commands and changes nothing.',
+      'Ask the system package manager whether a package is installed, at what version, and what its already-downloaded index says is available. Supports Homebrew, apt/dpkg, dnf/rpm, pacman, winget and chocolatey, detecting the manager from the platform unless you name one; a host with none of them is reported as unknown rather than guessed at. It asks for nothing over the network: every answer comes from a local index, which is why winget and chocolatey report installed state only — their available version lives on a remote source (winget may still refresh its own source cache when a list opens it; no source agreement is ever accepted for you). Nothing is ever defaulted: a manager that is not on this host, a probe that timed out, an empty dnf metadata cache or a winget row whose columns could not be split all come back as status "unknown" with the reason and the exact command that was run, never as "not installed". Read-only: it runs only query commands and changes nothing.',
     readOnly: true,
     destructive: false,
     scope: "external",
@@ -6457,7 +6457,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "retry",
     name: "Retry",
     description:
-      "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported.",
+      "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported. Each attempt runs with no terminal, so one that prompts fails instead of waiting.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -6565,7 +6565,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "runCommand",
     name: "RunCommand",
     description:
-      "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, and always has a timeout.",
+      "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, always has a timeout, and runs in a session of its own with no terminal: a program that prompts (sudo, ssh, gpg) fails instead of waiting for input.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -6581,7 +6581,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "runPipeline",
     name: "RunPipeline",
     description:
-      "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout.",
+      "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout, and runs with no terminal, so a step that prompts fails instead of waiting.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -7027,7 +7027,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "specPatchApply",
     name: "SpecPatchApply",
     description:
-      "Apply structured patches to a CrewHaus spec as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path. Use to change a tunable field - a token cap, a threshold, a pool policy - in a spec a human maintains, without reformatting their file. Defaults to a DRY RUN: it returns the patched YAML and the field-level diff and writes nothing until you pass dryRun: false with a path. The batch is applied in memory and re-validated after every patch, so a batch that breaks the schema never reaches the file. It refuses the identity, security and roster fields by design - model rosters, permissions, credentials and prompts are human-owned, and the refusal says which rule owns them.",
+      "Apply structured patches to a CrewHaus spec as a comment-preserving CST edit, refusing any path the optimizer allow-list does not admit and naming the reason per path. Use to change a tunable field - a token cap, a threshold, a pool policy - in a spec a human maintains, without reformatting their file. Defaults to a DRY RUN: it returns the patched YAML and the field-level diff and writes nothing until you pass dryRun: false with a path. The batch is applied in memory and re-validated after every patch, so a batch that breaks the schema never reaches the file. Human-owned fields are refused with the reason, at any depth: every prompt (the agent's, and each step's, node's and role's instructions), tool grants and tool_config, permissions, MCP servers, sub-agents, hitl gates, the model roster, the security block, credentials, and the on-chain spend surface (transaction_policy, chains, wallets, contracts). A whole steps, nodes, roles or game patch that would change one is refused too.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -7816,7 +7816,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "typecheck",
     name: "Typecheck",
     description:
-      "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode so nothing is written, and there is no way to point this tool at a different program — that is what keeps it a read; RunBuild is where an arbitrary command belongs.",
+      "Type-check the project and return the errors as structured diagnostics with file, line, column and code. Use it after an edit to learn whether the types still hold, in a form a harness can act on directly. The checker is the one this project configures, always run in no-emit mode with its incremental cache in a temp directory rather than the project, and there is no way to point this tool at a different program; RunBuild is where an arbitrary command belongs. The checker and its plugins are the project's own code, so this is not a read-only tool, and it runs without the harness's credentials in its environment.",
     readOnly: false,
     destructive: false,
     scope: "external",
@@ -8162,7 +8162,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "waitForOutput",
     name: "WaitForOutput",
     description:
-      "Watch a background process's output until a pattern matches, a failure pattern matches first, or a required deadline passes. Use it to wait for the line that means ready — 'Listening on', 'compiled successfully' — and to give up early when the line that means broken shows up instead. It reads without consuming, so ProcessOutput still returns everything afterwards.",
+      "Watch a background process's output until a pattern matches, a failure pattern matches first, or a required deadline passes. Use it to wait for the line that means ready — 'Listening on', 'compiled successfully' — and to give up early when the line that means broken shows up instead. It reads without consuming, so ProcessOutput still returns everything afterwards. A pattern that could not be evaluated ends the wait as undetermined (matched: null), never as a miss.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -8176,7 +8176,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "waitForPort",
     name: "WaitForPort",
     description:
-      "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline.",
+      "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline. It probes loopback (localhost, 127.0.0.1, ::1; 0.0.0.0 and :: are probed as loopback); any other host is refused unless the operator lists it in tool_config.proc.wait_for_port_hosts, and a listed name that does not resolve yet counts as not accepting connections.",
     readOnly: true,
     destructive: false,
     scope: "external",

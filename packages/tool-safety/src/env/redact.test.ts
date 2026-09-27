@@ -280,6 +280,16 @@ describe("redactUrlCredentialsInText", () => {
     expect(redactUrlCredentialsInText("no urls here: a://")).toBe("no urls here: a://");
   });
 
+  test("a scheme with a digit in it is still a scheme", () => {
+    // The backward scan used to stop at the `5`, and the URL went unmasked.
+    expect(redactUrlCredentialsInText("proxy socks5://u:pw@socks.corp:1080 down")).toBe(
+      "proxy socks5://REDACTED@socks.corp:1080 down",
+    );
+    expect(redactUrlCredentialsInText("socks5h://u:pw@h")).toBe("socks5h://REDACTED@h");
+    // A scheme starts with a letter: leading digits are not part of it.
+    expect(redactUrlCredentialsInText("x=9svn+ssh://u:pw@h/r")).toBe("x=9svn+ssh://REDACTED@h/r");
+  });
+
   test("a scan of caller-sized text is linear", () => {
     // A pattern like /[a-z][a-z0-9+.-]*:\/\//g backtracks through every
     // long run of letters; the scan here never does.

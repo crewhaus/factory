@@ -621,6 +621,23 @@ test("HarnessJobStatus refuses a ledger it cannot open instead of reporting no j
   expect(String(r["reason"])).toContain("empty list");
 });
 
+test("HarnessJobStatus says which instant it filtered on, and that an offset-less since is UTC", async () => {
+  ledger();
+  const utc = await call(harnessJobStatus, { since: "2026-09-02T00:00:00" });
+  expect({ sinceUtc: utc["sinceUtc"], note: utc["sinceNote"] }).toEqual({
+    sinceUtc: "2026-09-02T00:00:00.000Z",
+    note: "since had no Z or offset, so it was read as UTC",
+  });
+  const offset = await call(harnessJobStatus, { since: "2026-09-02T02:00:00+02:00" });
+  expect({ sinceUtc: offset["sinceUtc"], note: offset["sinceNote"] }).toEqual({
+    sinceUtc: "2026-09-02T00:00:00.000Z",
+    note: undefined,
+  });
+  // A form Date.parse would read in the host's zone is not an instant here.
+  const local = await call(harnessJobStatus, { since: "Sep 2 2026 00:00" });
+  expect(local["status"]).toBe("refused");
+});
+
 test("HarnessJobStatus refuses a `since` that is not a timestamp rather than ignoring it", async () => {
   ledger();
   const r = await call(harnessJobStatus, { since: "yesterday" });
@@ -840,20 +857,46 @@ test("CliVersionPin refuses to enumerate a fleet from a registry it could not re
   expect(String(r["reason"])).toContain("not an empty one");
 });
 
-test("CliVersionPin probes each distinct binary once and reports the PARSED version", async () => {
+test("every description fits OpenAI's 1024-character function.description limit (C014)", () => {
+  expect(ALL.length).toBe(5);
+  const over = ALL.filter((t) => [...t.description].length > 1024).map(
+    (t) => `${t.name}(${t.description.length})`,
+  );
+  expect(over).toEqual([]);
+});
+
+/** A harness-local CLI that records any run of it in `marker`. */
+function recordingCli(rel: string, marker: string, version = "9.9.9"): string {
+  return fakeCli(
+    rel,
+    `#!/bin/sh\necho ran >> ${JSON.stringify(marker)}\necho "crewhaus ${version}"\n`,
+  );
+}
+
+test("CliVersionPin reads a harness CLI's version from its package.json and never runs it (C048)", async () => {
+  // A cloned repository can commit node_modules/.bin/crewhaus; auto mode runs
+  // this tool unasked. The planted CLI would print 9.9.9 and leave a marker.
   harness("a");
   harness("b");
-  compilingCli("a", "sha256:unused", "1.2.3");
+  const marker = path.join(tmp, "RAN");
+  recordingCli("a", marker);
+  write(
+    "a/node_modules/crewhaus/package.json",
+    JSON.stringify({ name: "crewhaus", version: "1.2.3" }),
+  );
   const r = await call(cliVersionPin, { dirs: ["a", "b"], probe: true });
-  console.log(`PROBE ${JSON.stringify(r["probes"])}`);
   const probes = r["probes"] as Record<string, Json>;
   const binA = path.join(tmp, "a", "node_modules", ".bin", "crewhaus");
-  expect(probes[binA]).toEqual({ state: "known", version: "1.2.3" });
+  expect(existsSync(marker)).toBe(false);
+  expect(probes[binA]).toEqual({
+    state: "known",
+    version: "1.2.3",
+    source: "a/node_modules/crewhaus/package.json",
+  });
   // `b` has no CLI of its own, so the resolver falls through to PATH. On a
   // machine that HAS a crewhaus installed that is a second distinct binary —
-  // and it is one this tool refuses to execute, because it sits outside the
-  // workspace. Asserted as a property rather than as a count, so the test
-  // says the same thing on a machine with no crewhaus on PATH.
+  // and one this tool does not touch without allowExternalCli. Asserted as a
+  // property, so the test says the same thing with no crewhaus on PATH.
   for (const [bin, probe] of Object.entries(probes)) {
     if (bin === binA) continue;
     expect(probe["state"]).toBe("not-probed");
@@ -861,24 +904,107 @@ test("CliVersionPin probes each distinct binary once and reports the PARSED vers
   }
 }, 30_000);
 
-test("CliVersionPin reports a version it could not parse as unparsed, not as a version", async () => {
+test("CliVersionPin follows npm's .bin link to the package it belongs to", async () => {
   harness("a");
-  fakeCli("a", ["#!/bin/sh", 'echo "crewhaus (development build)"', "exit 0", ""].join("\n"));
+  write(
+    "a/node_modules/crewhaus/package.json",
+    JSON.stringify({ name: "crewhaus", version: "2.0.1" }),
+  );
+  const entry = write("a/node_modules/crewhaus/dist/index.js", "#!/usr/bin/env bun\n");
+  chmodSync(entry, 0o755);
+  mkdirSync(path.join(tmp, "a", "node_modules", ".bin"), { recursive: true });
+  symlinkSync("../crewhaus/dist/index.js", path.join(tmp, "a", "node_modules", ".bin", "crewhaus"));
   const r = await call(cliVersionPin, { dirs: ["a"], probe: true });
-  console.log(`PROBE_UNPARSED ${JSON.stringify(r["probes"])}`);
   const probe = Object.values(r["probes"] as Record<string, Json>)[0];
-  expect(probe?.["state"]).toBe("unparsed");
-  expect(JSON.stringify(probe?.["output"])).toContain("development build");
+  expect(probe).toEqual({
+    state: "known",
+    version: "2.0.1",
+    source: "a/node_modules/crewhaus/package.json",
+  });
 }, 30_000);
 
-test("CliVersionPin reports a binary that fails as unknown, with the exit code", async () => {
+test("CliVersionPin reports a version it could not parse as unparsed, not as a version", async () => {
   harness("a");
-  fakeCli("a", ["#!/bin/sh", 'echo "boom" >&2', "exit 7", ""].join("\n"));
+  const marker = path.join(tmp, "RAN");
+  recordingCli("a", marker);
+  write(
+    "a/node_modules/crewhaus/package.json",
+    JSON.stringify({ name: "crewhaus", version: "development build" }),
+  );
   const r = await call(cliVersionPin, { dirs: ["a"], probe: true });
-  console.log(`PROBE_FAILED ${JSON.stringify(r["probes"])}`);
+  const probe = Object.values(r["probes"] as Record<string, Json>)[0];
+  expect(probe?.["state"]).toBe("unparsed");
+  expect(String(probe?.["reason"])).toContain("development build");
+  expect(existsSync(marker)).toBe(false);
+}, 30_000);
+
+test("CliVersionPin says unknown, with the reason, for a workspace CLI with no package.json", async () => {
+  harness("a");
+  const marker = path.join(tmp, "RAN");
+  recordingCli("a", marker);
+  // A package.json that is not crewhaus's does not count.
+  write(
+    "a/node_modules/package.json",
+    JSON.stringify({ name: "something-else", version: "7.7.7" }),
+  );
+  const r = await call(cliVersionPin, { dirs: ["a"], probe: true });
   const probe = Object.values(r["probes"] as Record<string, Json>)[0];
   expect(probe?.["state"]).toBe("unknown");
-  expect(String(probe?.["reason"])).toContain("7");
+  expect(String(probe?.["reason"])).toContain("not run");
+  expect(JSON.stringify(probe)).not.toContain("7.7.7");
+  expect(existsSync(marker)).toBe(false);
+}, 30_000);
+
+test("CliVersionPin does not read a package.json a link puts outside the workspace", async () => {
+  harness("a");
+  const marker = path.join(tmp, "RAN");
+  recordingCli("a", marker);
+  const elsewhere = outsideDir();
+  writeFileSync(
+    path.join(elsewhere, "package.json"),
+    JSON.stringify({ name: "crewhaus", version: "6.6.6" }),
+  );
+  mkdirSync(path.join(tmp, "a", "node_modules", "crewhaus"), { recursive: true });
+  symlinkSync(
+    path.join(elsewhere, "package.json"),
+    path.join(tmp, "a", "node_modules", "crewhaus", "package.json"),
+  );
+  const r = await call(cliVersionPin, { dirs: ["a"], probe: true });
+  const probe = Object.values(r["probes"] as Record<string, Json>)[0];
+  expect(probe?.["state"]).toBe("unknown");
+  expect(String(probe?.["reason"])).toContain("a/node_modules/crewhaus/package.json");
+  expect(JSON.stringify(r)).not.toContain("6.6.6");
+  expect(JSON.stringify(r)).not.toContain(elsewhere);
+  expect(existsSync(marker)).toBe(false);
+}, 30_000);
+
+test("CliVersionPin asks the operator's own standalone CLI outside the workspace only when allowed", async () => {
+  // PATH is the operator's: a CLI there is their install, not the
+  // workspace's. With no package.json beside it (a brew or scoop binary),
+  // `--version` is the only way to ask, and it needs allowExternalCli.
+  harness("a"); // no CLI of its own, so the resolver falls through to PATH
+  const bin = outsideDir();
+  const cli = path.join(bin, "crewhaus");
+  writeFileSync(cli, '#!/bin/sh\necho "crewhaus 3.4.5"\n');
+  chmodSync(cli, 0o755);
+  const saved = process.env["PATH"];
+  process.env["PATH"] = `${bin}${path.delimiter}${saved ?? ""}`;
+  try {
+    const denied = await call(cliVersionPin, { dirs: ["a"], probe: true });
+    expect((denied["probes"] as Record<string, Json>)[cli]?.["state"]).toBe("not-probed");
+    const asked = await call(cliVersionPin, { dirs: ["a"], probe: true, allowExternalCli: true });
+    expect((asked["probes"] as Record<string, Json>)[cli]).toEqual({
+      state: "known",
+      version: "3.4.5",
+    });
+    writeFileSync(cli, '#!/bin/sh\necho "boom" >&2\nexit 7\n');
+    const failed = await call(cliVersionPin, { dirs: ["a"], probe: true, allowExternalCli: true });
+    const probe = (failed["probes"] as Record<string, Json>)[cli];
+    expect(probe?.["state"]).toBe("unknown");
+    expect(String(probe?.["reason"])).toContain("7");
+  } finally {
+    process.env["PATH"] = saved;
+  }
 }, 30_000);
 
 // ---------------------------------------------------------------------------

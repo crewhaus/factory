@@ -27,16 +27,22 @@ import * as nodePath from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { blameIgnoreRevs } from "./blame-ignore";
 import {
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   checkPathspecs,
   checkRefArgs,
+  conflictedPatchPaths,
   failure,
   json,
+  neutralisedNote,
   openRepo,
   resolveInsideRoot,
+  skippedPatchPaths,
   truncationNote,
+  unmergedApplyPaths,
+  withoutApplyProgress,
 } from "./git-run";
 import {
   COMMIT_FORMAT,
@@ -56,6 +62,7 @@ import {
   parseWorktrees,
   splitNul,
 } from "./lib/parse";
+import { realOrUndefined } from "./repo-bounds";
 
 // ---------------------------------------------------------------------------
 // shared schema fragments and flag sets
@@ -81,9 +88,13 @@ const pathsField = z
 
 /**
  * Safety flags for a tool that only interrogates the repository. Reading still
- * spawns a process, so `scope`/`ioCapability` say so; `concurrencySafe` is
- * honest because these runs also set GIT_OPTIONAL_LOCKS=0 and so never contend
- * for the index lock with a sibling.
+ * spawns a process, so `scope`/`ioCapability` say so. `concurrencySafe` holds
+ * because a read never FAILS on a sibling's lock: these runs set
+ * GIT_OPTIONAL_LOCKS=0, so status takes no lock, and the one read that can
+ * write the index — `git diff` refreshing stat data it found stale — skips
+ * that write when the lock is held. Concurrency-safe tools run only beside
+ * each other, never beside a write. No read runs a hook on that write
+ * (`./hardening`, core.hooksPath).
  */
 const READ_FLAGS = {
   readOnly: true,
@@ -103,6 +114,18 @@ const WRITE_FLAGS = {
   scope: "external",
   ioCapability: "process",
 } as const;
+
+/**
+ * `repoConfigNote`, when a read switched off filter drivers the repository's
+ * own config names (see `./hardening`): the tools whose answer a filter
+ * could change say so, and say nothing for every other repository.
+ */
+function repoConfigNote(repo: { readonly neutralised: readonly string[] }): {
+  repoConfigNote?: string;
+} {
+  const note = neutralisedNote(repo.neutralised);
+  return note === undefined ? {} : { repoConfigNote: note };
+}
 
 /** Largest patch `GitApplyPatch` will accept, so one call cannot be unbounded. */
 const MAX_PATCH_CHARS = 4_000_000;
@@ -142,7 +165,7 @@ export const gitStatus: RegisteredTool = buildTool({
       { readOnly: true },
     );
     if (run.code !== 0) return failure("GitStatus", run);
-    return json(parseStatusV2(run.stdout));
+    return json({ ...parseStatusV2(run.stdout), ...repoConfigNote(opened.value) });
   },
 });
 
@@ -202,19 +225,26 @@ export const gitDiff: RegisteredTool = buildTool({
     const run = await repo.run(args, { readOnly: true });
     if (run.code !== 0) return failure("GitDiff", run);
     const note = truncationNote(run);
+    const config = repoConfigNote(repo);
 
     if (mode === "numstat") {
       const files = parseNumstat(run.stdout);
       const added = files.reduce((sum, f) => sum + (f.added ?? 0), 0);
       const removed = files.reduce((sum, f) => sum + (f.removed ?? 0), 0);
-      return json({ mode, files: files.length, added, removed, changes: files, note });
+      return json({ mode, files: files.length, added, removed, changes: files, note, ...config });
     }
     if (mode === "nameOnly") {
       const files = splitNul(run.stdout).sort();
-      return json({ mode, files: files.length, paths: files, note });
+      return json({ mode, files: files.length, paths: files, note, ...config });
     }
     const body = run.stdout.replace(/\n+$/, "");
-    return json({ mode, empty: body === "", [mode === "patch" ? "patch" : "stat"]: body, note });
+    return json({
+      mode,
+      empty: body === "",
+      [mode === "patch" ? "patch" : "stat"]: body,
+      note,
+      ...config,
+    });
   },
 });
 
@@ -361,27 +391,38 @@ export const gitBlame: RegisteredTool = buildTool({
       input.startLine === undefined
         ? []
         : ["-L", `${input.startLine},${input.endLine ?? input.startLine}`];
-    const run = await repo.run(
-      [
-        "blame",
-        "--line-porcelain",
-        ...range,
-        ...(input.ref !== undefined ? [input.ref] : []),
-        "--",
-        input.path,
-      ],
-      { readOnly: true },
-    );
-    if (run.code !== 0) return failure("GitBlame", run);
-    const all = parseBlamePorcelain(run.stdout);
-    const max = input.maxLines ?? 500;
-    const lines = all.slice(0, max);
-    return json({
-      path: input.path,
-      count: lines.length,
-      truncated: all.length > max || run.truncated,
-      lines,
-    });
+    // blame.ignoreRevsFile, read under containment and handed to git as a
+    // private copy (see ./blame-ignore); git itself never opens the path.
+    const ignore = await blameIgnoreRevs(repo);
+    try {
+      const run = await repo.run(
+        [
+          "blame",
+          "--line-porcelain",
+          ...ignore.args,
+          ...range,
+          ...(input.ref !== undefined ? [input.ref] : []),
+          "--",
+          input.path,
+        ],
+        { readOnly: true },
+      );
+      if (run.code !== 0) return failure("GitBlame", run);
+      const all = parseBlamePorcelain(run.stdout);
+      const max = input.maxLines ?? 500;
+      const lines = all.slice(0, max);
+      return json({
+        path: input.path,
+        count: lines.length,
+        truncated: all.length > max || run.truncated,
+        lines,
+        ...(ignore.honoured.length > 0 ? { ignoringRevisionsFrom: ignore.honoured } : {}),
+        ...(ignore.notHonoured.length > 0 ? { ignoreRevsNote: ignore.notHonoured.join(" ") } : {}),
+        ...repoConfigNote(repo),
+      });
+    } finally {
+      ignore.cleanup();
+    }
   },
 });
 
@@ -471,7 +512,7 @@ export const gitRemoteList: RegisteredTool = buildTool({
   name: "GitRemoteList",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote.",
+    "List the repository's configured remotes with their fetch and push URLs, sorted by name. Use it to learn where a checkout came from; it reads local config only and never contacts a remote. Everything before the @ in an http(s) URL (a user name, token or password: a bare token often sits in the user name) and a token query parameter are replaced with ***, an ssh URL keeps its login and loses only a password or token, and that remote is marked credentialsRedacted, so a masked URL is not usable as-is.",
   inputSchema: z.object({ cwd: cwdField, timeout: timeoutField }),
   ...READ_FLAGS,
   execute: async (input, ctx) => {
@@ -700,6 +741,7 @@ export const gitConflicts: RegisteredTool = buildTool({
       truncated: paths.length > max,
       clean: paths.length === 0,
       files,
+      ...repoConfigNote(repo),
     });
   },
 });
@@ -1066,11 +1108,21 @@ export const gitTagCreate: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * A name `git apply -R -v` printed, put back the way the patch wrote it:
+ * git shows a rename or copy as `old => new`, and reversed that is the
+ * patch's `new => old`.
+ */
+function unreverseRename(shown: string): string {
+  const parts = shown.split(" => ");
+  return parts.length === 2 ? `${parts[1]} => ${parts[0]}` : shown;
+}
+
 export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
   description:
-    "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything.",
+    "Apply a unified diff to the working tree, optionally to the index as well. Use `check: true` first to find out whether a patch applies cleanly without changing anything. A patch naming any path outside `cwd` is refused whole, since git would skip that path without a word.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
@@ -1086,33 +1138,112 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     if (!opened.ok) return opened.message;
     const repo = opened.value;
     // `--unsafe-paths` is deliberately never passed: without it git refuses a
-    // patch whose paths leave the working tree, which is the containment rule
-    // of this package enforced by git itself.
+    // patch whose paths leave the working tree. openRepo has proved that
+    // working tree lies inside the workspace (C071), so git's rule keeps the
+    // patch inside it too.
     // A unified diff must end in a newline; a patch that reached us through a
     // model or a JSON field very often has had it stripped, and git answers
     // that with "corrupt patch at line N" rather than anything actionable.
     const patchText = input.patch.endsWith("\n") ? input.patch : `${input.patch}\n`;
-    const run = await repo.run(
-      [
-        "apply",
-        ...(input.check === true ? ["--check"] : []),
-        ...(input.index === true ? ["--index"] : []),
-        ...(input.threeWay === true ? ["--3way"] : []),
-        ...(input.strip !== undefined ? [`-p${input.strip}`] : []),
-        "-",
-      ],
-      { stdin: patchText },
-    );
-    if (run.code !== 0) {
+    const checkedOnly = input.check === true;
+    const strip = input.strip !== undefined ? [`-p${input.strip}`] : [];
+    // git applies only the paths under the directory it runs in and skips
+    // the rest in silence, exit 0 (C219). Which paths it skips depends on
+    // nothing but the path and `-p`, so a plain `--check -v` names them
+    // before anything is written — and a patch with any is refused whole,
+    // never half-applied. Running from the repository root with
+    // `--directory` instead would move the patch, not report it.
+    const preflight = await repo.run(["apply", "--check", "-v", ...strip, "-"], {
+      stdin: patchText,
+    });
+    const refuseSkipped = (skipped: readonly string[]): string => {
+      const here = nodePath.relative(repo.root, realOrUndefined(repo.cwd) ?? repo.cwd) || ".";
       return json({
         applied: false,
-        checkedOnly: input.check === true,
-        reason: failure("GitApplyPatch", run),
+        checkedOnly,
+        wouldApply: false,
+        skipped,
+        reason: `GitApplyPatch: ${skipped.length} path(s) in the patch lie outside "${here}", the directory git runs in, and git would skip them without a word. Nothing was applied. Paths in a patch with \`diff --git\` headers are relative to the repository root: run it with cwd at the repository root (or at a directory holding every path), or drop those files from the patch.`,
+      });
+    };
+    const skippedFirst = skippedPatchPaths(preflight.stderr);
+    if (skippedFirst.length > 0) return refuseSkipped(skippedFirst);
+    // git decides "outside cwd" on a file's NEW name only, so a rename or
+    // copy whose SOURCE lies outside is never skipped: renaming `top.txt`
+    // into cwd deleted `top.txt`. Reversed, a patch's old names are its new
+    // ones, so the same parse run with `-R` makes git name every source
+    // outside cwd the same way. `--numstat` only parses; it reads no file.
+    const sources = await repo.run(["apply", "--numstat", "-R", "-v", ...strip, "-"], {
+      stdin: patchText,
+      readOnly: true,
+    });
+    if (sources.code !== 0) {
+      return json({
+        applied: false,
+        checkedOnly,
+        reason: failure("GitApplyPatch", withoutApplyProgress(sources)),
+      });
+    }
+    const skippedSources = skippedPatchPaths(sources.stderr).map(unreverseRename);
+    if (skippedSources.length > 0) return refuseSkipped(skippedSources);
+
+    const args = [
+      "apply",
+      ...(checkedOnly ? ["--check"] : []),
+      ...(input.index === true ? ["--index"] : []),
+      ...(input.threeWay === true ? ["--3way"] : []),
+      ...strip,
+      "-v",
+      "-",
+    ];
+    const run = await repo.run(args, { stdin: patchText });
+    if (run.code !== 0) {
+      // A three-way apply that merged WITH CONFLICTS exits 1 after writing:
+      // the files hold conflict markers and the index holds them unmerged.
+      // "applied: false" would say nothing changed.
+      const unmerged = checkedOnly ? [] : unmergedApplyPaths(run.stderr);
+      if (unmerged.length > 0) {
+        return json({
+          applied: true,
+          checkedOnly,
+          conflicted: true,
+          conflicts: unmerged,
+          reason: `GitApplyPatch: the patch was applied as a three-way merge WITH CONFLICTS in ${unmerged.length} file(s). Conflict markers were written into them and the index holds them unmerged; resolve them as after a merge (GitConflicts lists them), then stage the result.`,
+        });
+      }
+      return json({
+        applied: false,
+        checkedOnly,
+        reason: failure("GitApplyPatch", withoutApplyProgress(run)),
+      });
+    }
+    const skipped = skippedPatchPaths(run.stderr);
+    if (skipped.length > 0) {
+      // Only if the tree moved between the two runs; say exactly what landed.
+      if (checkedOnly) return refuseSkipped(skipped);
+      return json({
+        applied: true,
+        partial: true,
+        checkedOnly,
+        skipped,
+        reason: `GitApplyPatch: git skipped ${skipped.length} path(s) that lie outside the directory it ran in; the rest of the patch was applied.`,
+      });
+    }
+    const conflicted = checkedOnly ? conflictedPatchPaths(run.stderr) : [];
+    if (conflicted.length > 0) {
+      // `--check --3way` exits 0 here; the real apply would leave conflict
+      // markers and fail, so "would apply" is not the answer.
+      return json({
+        applied: false,
+        checkedOnly,
+        wouldApply: false,
+        conflicts: conflicted,
+        reason: `GitApplyPatch: the patch applies only as a three-way merge WITH CONFLICTS in ${conflicted.length} file(s); a real apply would leave conflict markers there.`,
       });
     }
     return json({
-      applied: input.check !== true,
-      checkedOnly: input.check === true,
+      applied: !checkedOnly,
+      checkedOnly,
       wouldApply: true,
     });
   },

@@ -865,14 +865,27 @@ function tomlSections(text: string): Array<[string, string]> {
   return out;
 }
 
+/**
+ * A line with its trailing `# comment` cut: from the first `#` that follows
+ * whitespace. A scan, where `/\s+#.*$/` retried a long run of spaces from
+ * every position of it.
+ */
+function withoutTomlComment(line: string): string {
+  let from = 0;
+  for (;;) {
+    const hash = line.indexOf("#", from);
+    if (hash < 0) return line;
+    const before = line[hash - 1];
+    if (hash > 0 && (before === " " || before === "\t")) return line.slice(0, hash);
+    from = hash + 1;
+  }
+}
+
 /** `key = "value"` and `key = { version = "value", … }` pairs in a section body. */
 function tomlKeyValues(body: string): Array<[string, string]> {
   const out: Array<[string, string]> = [];
   for (const raw of body.split("\n")) {
-    const line = raw
-      .replace(/\r$/, "")
-      .replace(/\s+#.*$/, "")
-      .trim();
+    const line = withoutTomlComment(raw.replace(/\r$/, "")).trim();
     if (line === "" || line.startsWith("#")) continue;
     const m = /^(?<key>[A-Za-z0-9._-]+)\s*=\s*(?<value>.+)$/.exec(line);
     if (m === null) continue;
@@ -901,37 +914,97 @@ function tomlKeyValues(body: string): Array<[string, string]> {
   return out;
 }
 
-/** A `key = ["a", "b"]` array, possibly spanning lines. */
-function tomlStringArray(body: string, key: string): string[] {
-  const start = new RegExp(`^\\s*${key}\\s*=\\s*\\[`, "m").exec(body);
-  if (start === null) return [];
-  const from = (start.index as number) + start[0].length - 1;
+/**
+ * The `key = [` lines of a section body, in order, with the offset of each
+ * `[`. One line at a time, each matched anchored: the 0.7.0 patterns ran
+ * `^\s*` in multiline mode, which spans newlines and retried a run of blank
+ * lines from every line start (quadratic in a file the repository supplies),
+ * and built a pattern from the key unescaped.
+ */
+function tomlArrayStarts(body: string): Array<{ readonly key: string; readonly open: number }> {
+  const out: Array<{ key: string; open: number }> = [];
+  let lineStart = 0;
+  while (lineStart <= body.length) {
+    const nl = body.indexOf("\n", lineStart);
+    const lineEnd = nl < 0 ? body.length : nl;
+    const m = /^[ \t]*([A-Za-z0-9._-]+)[ \t]*=[ \t]*\[/.exec(body.slice(lineStart, lineEnd));
+    if (m !== null) out.push({ key: m[1] as string, open: lineStart + m[0].length - 1 });
+    if (nl < 0) break;
+    lineStart = nl + 1;
+  }
+  return out;
+}
+
+/** The index of the `]` closing the `[` at `open`, or undefined when none does. */
+function closingBracket(body: string, open: number): number | undefined {
   let depth = 0;
-  let end = from;
-  for (let i = from; i < body.length; i++) {
+  for (let i = open; i < body.length; i++) {
     if (body[i] === "[") depth += 1;
     else if (body[i] === "]") {
       depth -= 1;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
+      if (depth === 0) return i;
     }
   }
-  const inner = body.slice(from + 1, end);
+  return undefined;
+}
+
+/** The quoted strings between `open` and `close`. */
+function tomlQuotedItems(body: string, open: number, close: number): string[] {
   const out: string[] = [];
-  for (const m of inner.matchAll(/"([^"]*)"|'([^']*)'/g)) {
+  for (const m of body.slice(open + 1, close).matchAll(/"([^"]*)"|'([^']*)'/g)) {
     out.push((m[1] ?? m[2] ?? "").trim());
   }
   return out;
 }
 
-/** Every `key = [...]` array in a section body, for optional-dependency groups. */
+/** A `key = ["a", "b"]` array, possibly spanning lines. Unclosed reads as empty. */
+function tomlStringArray(body: string, key: string): string[] {
+  const start = tomlArrayStarts(body).find((s) => s.key === key);
+  if (start === undefined) return [];
+  const close = closingBracket(body, start.open);
+  return close === undefined ? [] : tomlQuotedItems(body, start.open, close);
+}
+
+/**
+ * For each offset in `opens`, the `]` that closes the `[` there, found in one
+ * pass with a stack: the same answer a depth count from each `[` gives, since
+ * brackets before it are matched or stay below it on the stack.
+ */
+function closingBrackets(body: string, opens: ReadonlySet<number>): Map<number, number> {
+  const out = new Map<number, number>();
+  const stack: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "[") stack.push(i);
+    else if (c === "]") {
+      const o = stack.pop();
+      if (o !== undefined && opens.has(o)) out.set(o, i);
+    }
+  }
+  return out;
+}
+
+/**
+ * Every `key = [...]` array in a section body, for optional-dependency
+ * groups. Each `[` is closed from one shared pass, and a `key = [` line
+ * inside an array already read is part of that array, not a key of its own,
+ * so the work is linear however the arrays nest or fail to close. An
+ * unclosed array reads as empty.
+ */
 function tomlAllStringArrays(body: string): Array<[string, string[]]> {
+  const starts = tomlArrayStarts(body);
+  const closes = closingBrackets(body, new Set(starts.map((s) => s.open)));
   const out: Array<[string, string[]]> = [];
-  for (const m of body.matchAll(/^\s*([A-Za-z0-9._-]+)\s*=\s*\[/gm)) {
-    const key = m[1] as string;
-    out.push([key, tomlStringArray(body, key)]);
+  let readUpTo = -1;
+  for (const { key, open } of starts) {
+    if (open <= readUpTo) continue;
+    const close = closes.get(open);
+    if (close === undefined) {
+      out.push([key, []]);
+      continue;
+    }
+    out.push([key, tomlQuotedItems(body, open, close)]);
+    readUpTo = close;
   }
   return out;
 }
@@ -1267,21 +1340,137 @@ function namesPrereleaseOf(alternative: string, version: SemVer): boolean {
 // workspace globs
 
 /**
- * Match a workspace glob (`packages/*`, `apps/**`, `packages/tool-*`) against
- * a directory path relative to the workspace root.
+ * The `packages:` list of a pnpm-workspace.yaml — the block form pnpm writes,
+ * one `- glob` per line, quotes and trailing comments dropped.
  *
- * Only the two wildcards npm, bun, pnpm and yarn workspaces actually use are
- * supported: `*` within one segment and `**` across segments. Negations
- * (`!packages/private`) are not, and a caller passing one gets no match rather
- * than a wrong one.
+ * Read line by line rather than with one multi-line pattern: the file is the
+ * repository's, and `^\s*-\s*["']?([^"'\n]+)["']?\s*$` over it backtracked
+ * quadratically (a line of spaces before a stray quote, or a run of blank
+ * lines). Only items under the top-level `packages:` key count: another
+ * list in the same file (`onlyBuiltDependencies:`) names packages, not
+ * directories.
+ */
+export function parsePnpmWorkspacePackages(text: string): string[] {
+  const globs: string[] = [];
+  let inPackages = false;
+  for (const raw of text.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    if (line[0] !== " " && line[0] !== "\t" && line[0] !== "-") {
+      // A top-level key starts (or ends) the block.
+      inPackages = /^packages:[ \t]*(?:#.*)?$/.test(trimmed);
+      continue;
+    }
+    if (!inPackages || !trimmed.startsWith("-")) continue;
+    let item = trimmed.slice(1).trim();
+    const quote = item[0];
+    if (quote === '"' || quote === "'") {
+      const close = item.indexOf(quote, 1);
+      item = close === -1 ? item.slice(1) : item.slice(1, close);
+    } else {
+      const comment = item.search(/\s#/);
+      if (comment !== -1) item = item.slice(0, comment);
+      item = item.trim();
+    }
+    if (item !== "") globs.push(item);
+  }
+  return globs;
+}
+
+/** Split a workspace-relative path or glob into its segments, `./` and trailing `/` dropped. */
+function globSegments(text: string): string[] {
+  return text.split("/").filter((segment) => segment !== "" && segment !== ".");
+}
+
+/**
+ * Why a workspace glob cannot be evaluated here, or undefined when it can.
+ *
+ * Character classes (`[ab]`) and brace sets (`{a,b}`) are real glob syntax in
+ * npm, pnpm and yarn workspaces, and reading them as literal text would drop
+ * the packages they name without a word. A caller is told instead.
+ */
+export function unsupportedWorkspaceGlob(pattern: string): string | undefined {
+  const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
+  if (/[[\]{}]/.test(body)) {
+    return "character classes ([...]) and brace sets ({a,b}) are not evaluated by this tool";
+  }
+  return undefined;
+}
+
+/**
+ * One path segment against one glob segment: `*` is any run of characters,
+ * `?` exactly one. The classic two-pointer walk that backs up only to the
+ * last `*` — at most length × length steps, whatever the pattern, so a
+ * repository's glob cannot make it backtrack exponentially the way a
+ * translated regular expression could.
+ */
+function matchSegment(name: string, glob: string): boolean {
+  let n = 0;
+  let g = 0;
+  let starAt = -1;
+  let resumeAt = 0;
+  while (n < name.length) {
+    const want = glob[g];
+    if (want === "*") {
+      starAt = g++;
+      resumeAt = n;
+    } else if (want !== undefined && (want === "?" || want === name[n])) {
+      g++;
+      n++;
+    } else if (starAt !== -1) {
+      g = starAt + 1;
+      n = ++resumeAt;
+    } else {
+      return false;
+    }
+  }
+  while (glob[g] === "*") g++;
+  return g === glob.length;
+}
+
+/**
+ * Match a workspace glob (`packages/*`, `apps/**`, `packages/tool-?`) against
+ * a directory path relative to the workspace root, the way npm, bun, pnpm and
+ * yarn read it:
+ *
+ * - `*` is any run of characters within one segment, `?` exactly one
+ *   character within one segment — never a `/`;
+ * - `**` as a whole segment is any number of segments, including none;
+ *   anywhere else it is just `*`;
+ * - a leading `./` and a trailing `/` are ignored;
+ * - every other character is itself.
+ *
+ * It is matched segment by segment, not compiled to a regular expression:
+ * the glob comes from the repository, and a translated `**` / `**` / `**`
+ * chain was a polynomial backtracker. Negations (`!packages/private`) are the
+ * caller's to apply — here they match nothing — and a glob
+ * `unsupportedWorkspaceGlob` names matches nothing either.
  */
 export function matchWorkspaceGlob(dir: string, pattern: string): boolean {
   if (pattern.startsWith("!")) return false;
-  const cleaned = pattern.replace(/\/+$/, "");
-  const escaped = cleaned.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  const body = escaped
-    .replace(/\*\*/g, "@@GLOBSTAR@@")
-    .replace(/\*/g, "[^/]*")
-    .replace(/@@GLOBSTAR@@/g, ".*");
-  return new RegExp(`^${body}$`).test(dir.replace(/\/+$/, ""));
+  if (unsupportedWorkspaceGlob(pattern) !== undefined) return false;
+  const globs = globSegments(pattern);
+  const names = globSegments(dir);
+  if (globs.length === 0) return false;
+  // reach[j]: the glob segments so far match the first j path segments.
+  let reach = new Array<boolean>(names.length + 1).fill(false);
+  reach[0] = true;
+  for (const glob of globs) {
+    const next = new Array<boolean>(names.length + 1).fill(false);
+    if (glob === "**") {
+      let seen = false;
+      for (let j = 0; j <= names.length; j++) {
+        seen = seen || (reach[j] as boolean);
+        next[j] = seen;
+      }
+    } else {
+      const segment = glob.replace(/\*{2,}/g, "*");
+      for (let j = 0; j < names.length; j++) {
+        if (reach[j] === true && matchSegment(names[j] as string, segment)) next[j + 1] = true;
+      }
+    }
+    reach = next;
+  }
+  return reach[names.length] === true;
 }

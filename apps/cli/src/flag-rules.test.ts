@@ -150,10 +150,11 @@ describe("readOnly (permission-integration#7)", () => {
    * Plan mode runs every read-only tool without asking, so a read-only tool
    * that ran the project's linter ran a cloned repository's code in a plan.
    *
-   * Each entry names the program. The git readers run the system git; a
-   * repository's own .git/config can still name programs git runs (an
-   * fsmonitor hook, a diff driver); switching those off in tool-git's
-   * invocation is follow-up work, not done in 0.7.1.
+   * Each entry names the program. The git readers (and DiffLint) run the
+   * system git, with every program a repository's own config could name —
+   * the fsmonitor hook, diff drivers, textconv, its filter drivers, a
+   * signature program — switched off for the read, and an embedded bare
+   * repository refused (tool-git/src/hardening.ts, 0.7.1 C007).
    */
   const READ_ONLY_SPAWNS: Readonly<Record<string, string>> = {
     ClipboardRead: "pbpaste / wl-paste / xclip",
@@ -205,7 +206,8 @@ describe("what auto mode runs without asking (permission-integration#13)", () =>
    */
   const AUTO_ALLOWED: Readonly<Record<string, string>> = {
     BashOutput: "reads output from a shell this session started",
-    CliVersionPin: "runs `--version` on a harness's CLI; reports, changes nothing",
+    CliVersionPin:
+      "reads a harness CLI's version from its package.json and never runs a workspace CLI; runs `--version` only on the operator's own standalone install outside the workspace, with allowExternalCli; changes nothing",
     DesktopNotify: "shows a local notification",
     Diagnostics: "runs the project's type checker and linter to report; changes nothing",
     Fetch:

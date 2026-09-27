@@ -35,7 +35,7 @@ tools:
 | `SymbolOutline` | What one file declares, with line ranges — read the outline, then the part you need |
 | `TestFailureSummary` | The failures out of test output you already have; runs nothing |
 | `TodoScan` | TODO / FIXME / HACK / XXX notes from comments, with author and position |
-| `Typecheck` | Type check in no-emit mode, as diagnostics |
+| `Typecheck` | Type check in no-emit mode, as diagnostics; tsc's build info goes to a temp file, not the project |
 | `WorkspacePackages` | Monorepo members and their interdependencies, with cycles |
 
 ## Machine-readable by preference
@@ -126,11 +126,32 @@ returns `undefined` for it rather than an empty list — "no reader for this"
 and "no dependencies" are different answers, and only one of them is safe to
 report as a clean result.
 
+## Workspace globs
+
+`WorkspacePackages` reads membership from the root `package.json`'s
+`workspaces`, or from the `packages:` list of `pnpm-workspace.yaml` (other
+lists in that file name packages, not directories). A glob is read the way
+npm, bun, pnpm and yarn read it: `*` is any run of characters within one path
+segment, `?` exactly one, `**` as a whole segment any number of segments, and
+a `!` glob removes what the others include. Character classes (`[ab]`) and
+brace sets (`{a,b}`) are not evaluated; a glob that uses them is listed under
+`unsupportedGlobs` with `complete: false`, never silently read as literal
+text. Globs are matched segment by segment, not compiled to a regular
+expression, so a repository's glob cannot make the match backtrack.
+
 ## Containment, arguments, bounds
 
 - **Containment.** Every caller-supplied path goes through `src/paths.ts`
   `resolveSafe` and is refused if it leaves the workspace root — including via
-  a symlink inside the tree that points outside it.
+  a symlink inside the tree that points outside it. So does every file a tool
+  opens on its own: the fixed names it looks for in a directory
+  (`package.json`, `requirements.txt`, `pyproject.toml`, the lockfiles,
+  `pnpm-workspace.yaml`, a coverage report) are read through
+  `@crewhaus/tool-safety`'s contained reader. One linked out of the
+  workspace, or a FIFO or device under that name, is not read, and the
+  result lists it under `skipped` with the reason, so a refused manifest is
+  never reported as a missing one. A link to another file inside the
+  workspace is followed as before.
 - **Arguments.** Nothing reaches a shell; argv is always an array. That stops
   a caller reaching `sh`, not a program's own option parser, so every caller
   value that lands in argv as a bare word is refused when it begins with `-`,
@@ -141,9 +162,29 @@ report as a clean result.
   `destructive` — take an explicit `command`. `Typecheck`, `Lint`,
   `FormatCheck` and `Diagnostics` run what `src/detect.ts` works out from the
   project's own files and nothing else. That is not a convenience: a permission
-  engine allows a `readOnly` tool without asking in auto mode, and allows
-  nothing else at all in plan mode, so a read-only tool that let a caller pick
-  the program would be an unreviewed `sh -c` wearing a checker's badge.
+  engine allows a tool that is not destructive without asking in auto mode, so
+  a checker that let a caller pick the program would be an unreviewed `sh -c`
+  wearing a checker's badge.
+- **Whose code runs.** Even without a caller-chosen program, a checker runs
+  the PROJECT's code: `node_modules/.bin/eslint`, an `eslint.config.js`, a
+  prettier plugin, a `build.rs` that `cargo clippy` compiles and runs. So none
+  of the four is read-only (plan mode refuses them), and each runs with the
+  harness's credentials removed from its environment — every variable whose
+  name looks like a credential (`*_API_KEY`, `*_TOKEN`, `PGPASSWORD`,
+  `DATABASE_URL` …) or whose value is a token in a known format. Everything a
+  toolchain needs (`PATH`, `CARGO_HOME`, `GOPATH`, `VIRTUAL_ENV`, proxies, CA
+  bundles) is kept. The destructive runners keep the full environment: a
+  person approved them, and a test suite may need its `DATABASE_URL`.
+- **What a checker writes.** No-emit is not no-write: `tsc --noEmit` still
+  writes `.tsbuildinfo` for an incremental or composite project — beside the
+  tsconfig, into a `dist/` it creates, or wherever a committed
+  `tsBuildInfoFile` points, which can be outside the workspace. `Typecheck`
+  and `Diagnostics` therefore pass tsc `--incremental --tsBuildInfoFile` with
+  a per-user temp file keyed by the project (so a repeat run stays
+  incremental), mypy `--cache-dir=/dev/null`, and ruff `--no-cache`. The
+  `command` in a result shows the temp file as
+  `<tmp>/crewhaus-typecheck.tsbuildinfo`. TypeScript older than 4.0 rejects
+  `--incremental` with `--noEmit`, and reports that as a diagnostic.
 - **Bounds.** Every spawn carries a deadline (SIGTERM, then SIGKILL) and reads
   its pipes through a cap, so a runner that prints a gigabyte costs a bounded
   amount of *memory*, not just bounded output. `Diagnostics` spends ONE
@@ -153,9 +194,15 @@ report as a clean result.
   running, so the places where caller text meets a pattern are bounded up
   front: the stack and test-output parsers cap a single LINE before matching
   it (an unbounded line made frame splitting quadratic — twelve seconds for
-  four thousand characters), and `AstQuery` refuses a `pattern` that repeats a
-  group which itself repeats or branches (`(a+)+`, `(a|a)*`) rather than
-  running it against every name in a tree.
+  four thousand characters), and the bun status-line parse is linear. A
+  caller's `AstQuery` `pattern` is screened by `@crewhaus/tool-safety`'s
+  shared regex screen, which refuses a group that repeats or branches
+  ambiguously (`(a+)+`, `(a|a)*`, `^(\w+){2,64}$`), and then runs over the
+  declaration names in its regex worker under a deadline. A name it could
+  not answer for (the engine gave up, or it is longer than 1,024
+  characters) is listed under `uncheckedNames`, never dropped as a
+  non-match; a run that could not finish at all is reported as such, with
+  no list.
 - **No implicit downloads.** A node tool is only ever used from the project's
   own `node_modules/.bin`. `bunx`/`npx` without a local install would fetch
   from the registry, which is an outbound call these tools do not declare; a
@@ -183,17 +230,20 @@ all of it as tools.
 | Tools | Flags |
 |---|---|
 | `RunTests`, `RunBuild`, `Format` | `destructive`, `scope: "external"`, `ioCapability: "process"` — the only three that take an explicit `command` |
-| `Typecheck`, `Lint`, `FormatCheck`, `Diagnostics` | `readOnly`, `scope: "external"`, `ioCapability: "process"` — detected commands only |
+| `Typecheck`, `Lint`, `FormatCheck`, `Diagnostics` | not read-only and not destructive: each runs the checker this project configures, and that checker runs the project's own code; `scope: "external"`, `ioCapability: "process"`; detected commands only, without the harness's credentials |
 | everything else | `readOnly`, `concurrencySafe`, `scope: "internal"`, no io capability |
 
 `RunTests` is destructive because a test suite runs the project's own code and
 may write anything at all; calling it read-only would be a lie a permission
-engine would believe. `Typecheck` always passes `--noEmit` for the same reason
-in reverse — that is what lets it stay a read, and it is also why it takes no
-`command`: a read-only tool is auto-allowed, so it must not be able to spawn a
-program a caller chose. No tool here requires a justification, because none has
-an outward side effect: nothing is posted, pushed or sent. `src/index.test.ts`
-asserts all of this per tool — including that the read-only checkers advertise
-no `command` field, and that one smuggled past the schema still never becomes a
-process — so a future addition that forgets a flag fails the suite rather than
-the review.
+engine would believe. The checkers are not destructive — `Typecheck` always
+passes `--noEmit` and `Lint` never passes a fix flag — so auto mode runs them
+without asking, which is why they take no `command`: a tool auto mode runs
+unasked must not be able to spawn a program a caller chose. They are not
+read-only either, because the checker is the project's code (see "Whose code
+runs" above), so plan mode refuses them. No tool here requires a
+justification, because none has an outward side effect: nothing is posted,
+pushed or sent. `src/index.test.ts` asserts all of this per tool — the plan,
+auto and default decisions for each checker, that no checker advertises a
+`command` field, that one smuggled past the schema still never becomes a
+process, and that a checker's child never sees a credential — so a future
+addition that forgets a flag fails the suite rather than the review.

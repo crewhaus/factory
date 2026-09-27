@@ -163,6 +163,92 @@ describe("the compiled bundle's boot lines, executed against this checkout", () 
   });
 });
 
+describe("tool_config.proc reaches EnvInspect (0.7.1 C052)", () => {
+  test("only the operator-listed variable's value is shown; a key never is", async () => {
+    const source = [
+      "name: env-reveal",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: Check which deployment mode this harness runs in.",
+      "tools:",
+      "  - envInspect",
+      "tool_config:",
+      "  proc:",
+      "    env_reveal: [E2E_PROC_MODE]",
+      "",
+    ].join("\n");
+    const agentTs = compile(source).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('registerProcConfig({"env_reveal":["E2E_PROC_MODE"]});');
+    const key = ["sk-ant-api03-", "E2E0123456789abcdef"].join("");
+    process.env["E2E_PROC_MODE"] = "staging";
+    process.env["E2E_PROC_API_KEY"] = key;
+    process.env["E2E_PROC_OTHER"] = "unlisted";
+    try {
+      const envInspect = (await bootEmitted(agentTs))["EnvInspect"] as RegisteredTool;
+      const names = ["E2E_PROC_MODE", "E2E_PROC_API_KEY", "E2E_PROC_OTHER"];
+      const out = (await envInspect.execute({ names, reveal: names })) as string;
+      expect(out).not.toContain(key);
+      expect(out).not.toContain("unlisted");
+      const views = (JSON.parse(out) as { variables: Array<Record<string, unknown>> }).variables;
+      expect(views.map((v) => [v["name"], v["value"] ?? v["withheld"]])).toEqual([
+        ["E2E_PROC_API_KEY", "credential-shaped"],
+        ["E2E_PROC_MODE", "staging"],
+        ["E2E_PROC_OTHER", "not-allowed"],
+      ]);
+    } finally {
+      for (const n of ["E2E_PROC_MODE", "E2E_PROC_API_KEY", "E2E_PROC_OTHER"]) {
+        Reflect.deleteProperty(process.env, n);
+      }
+      const { _resetProcConfig } = await importToolPackage("@crewhaus/tool-proc");
+      (_resetProcConfig as () => void)();
+    }
+  });
+});
+
+describe("tool_config.proc reaches WaitForPort (0.7.1 C144)", () => {
+  test("a spec with only WaitForPort still boots the registrar, and only listed hosts are probed", async () => {
+    const source = [
+      "name: port-hosts",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: Wait for the database to accept connections.",
+      "tools:",
+      "  - waitForPort",
+      "tool_config:",
+      "  proc:",
+      "    wait_for_port_hosts: [db.e2e]",
+      "",
+    ].join("\n");
+    const agentTs = compile(source).files.find((f) => f.path === "agent.ts")?.content ?? "";
+    expect(agentTs).toContain('registerProcConfig({"wait_for_port_hosts":["db.e2e"]});');
+    const proc = await importToolPackage("@crewhaus/tool-proc");
+    const setLookup = proc["_setDnsLookup"] as (
+      fn: ((host: string) => Promise<string[]>) | undefined,
+    ) => void;
+    setLookup(async (host) => (host === "db.e2e" ? ["127.0.0.1"] : []));
+    const { createServer } = await import("node:net");
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const port = (server.address() as { port: number }).port;
+    try {
+      const waitForPort = (await bootEmitted(agentTs))["WaitForPort"] as RegisteredTool;
+      const listed = JSON.parse(
+        (await waitForPort.execute({ host: "db.e2e", port, timeoutMs: 3_000 })) as string,
+      ) as { satisfied: boolean };
+      expect(listed.satisfied).toBe(true);
+      expect(await waitForPort.execute({ host: "other.e2e", port, timeoutMs: 100 })).toContain(
+        "is not a loopback address",
+      );
+    } finally {
+      setLookup(undefined);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      (proc["_resetProcConfig"] as () => void)();
+    }
+  });
+});
+
 // ---- crewhaus run, driven by an OpenAI-compatible stub ----------------------
 
 const sse = (o: unknown): string => `data: ${JSON.stringify(o)}\n\n`;

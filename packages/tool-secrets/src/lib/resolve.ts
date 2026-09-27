@@ -163,7 +163,17 @@ export async function resolveOne(ref: SecretRef, options: ResolveOptions): Promi
     case "auto":
       return resolveAuto(ref.name, options);
     case "env": {
-      const value = envSource()[ref.name];
+      // An own STRING value, nothing else. `process.env` inherits from
+      // Object.prototype, and a name the env grammar accepts —
+      // `constructor`, `valueOf`, `__proto__` — would otherwise read a
+      // function or an object as a set variable: the fingerprint then threw
+      // and took the whole SecretLookup batch with it, and EnvFileUpsert
+      // blamed a newline in a variable that is not set. Every inherited
+      // member is a function or an object, and every real value is a string,
+      // so the type test alone is exact — and unlike an own-property test it
+      // cannot disagree with Windows' case-insensitive environment.
+      const raw: unknown = envSource()[ref.name];
+      const value = typeof raw === "string" ? raw : undefined;
       return value === undefined
         ? {
             status: "absent",

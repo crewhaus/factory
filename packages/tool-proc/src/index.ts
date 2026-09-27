@@ -27,10 +27,15 @@ import { connect } from "node:net";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { checkEnvReveal } from "@crewhaus/tool-safety/env";
+import { describeRegexOutcome, openRegexSession } from "@crewhaus/tool-safety/regex";
 import { z } from "zod";
+import { portTarget, resolveListedHost } from "./lib/addr";
 import { type BackoffPolicy, backoffDelayMs, totalBackoffMs } from "./lib/backoff";
+import { ENV_REVEAL_KEY, PORT_HOSTS_KEY, portHostsFor, revealAllowFor } from "./lib/config";
 import { FALLBACK_PATH, buildSpawnEnv, inspectEnv } from "./lib/env";
 import { capText, compileSafePattern, formatArgv } from "./lib/format";
+import { hostPlatform, searchPath } from "./lib/which";
 import {
   type BgProc,
   __resetRegistryForTest,
@@ -44,6 +49,8 @@ import { recheckContainment, resolveSafe, resolveSafeDir } from "./safe-path";
 import { runOnce, sleep } from "./spawn";
 
 export { __resetRegistryForTest };
+export { _resetProcConfig, registerProcConfig } from "./lib/config";
+export { _setDnsLookup } from "./lib/addr";
 
 /** Compact JSON — the reader is a model, not a person. */
 const json = (value: unknown): string => JSON.stringify(value);
@@ -55,6 +62,8 @@ const MAX_WAIT_MS = 600_000;
 const DEFAULT_MAX_OUTPUT = 100_000;
 const MAX_MAX_OUTPUT = 1_000_000;
 const DEFAULT_POLL_MS = 100;
+/** The longest one WaitForOutput match may run in the regex worker. */
+const MATCH_BUDGET_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // shared schema pieces
@@ -175,6 +184,9 @@ function outcomeJson(outcome: Awaited<ReturnType<typeof runOnce>>): Record<strin
     stderr: outcome.stderr,
     ...(outcome.stdoutTruncated ? { stdoutTruncated: true } : {}),
     ...(outcome.stderrTruncated ? { stderrTruncated: true } : {}),
+    // The child exited, but a process it started held its output open past
+    // the drain grace: what came back is what arrived, perhaps not all of it.
+    ...(outcome.outputIncomplete === true ? { outputIncomplete: true } : {}),
   };
 }
 
@@ -186,7 +198,7 @@ export const runCommand: RegisteredTool = buildTool({
   name: "RunCommand",
   operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
   description:
-    "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, and always has a timeout.",
+    "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, always has a timeout, and runs in a session of its own with no terminal: a program that prompts (sudo, ssh, gpg) fails instead of waiting for input.",
   inputSchema: z.object({
     argv: argvSchema,
     cwd: z.string().optional().describe("working directory, inside the workspace root"),
@@ -223,7 +235,7 @@ export const runPipeline: RegisteredTool = buildTool({
   name: "RunPipeline",
   operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd" }],
   description:
-    "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout.",
+    "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout, and runs with no terminal, so a step that prompts fails instead of waiting.",
   inputSchema: z.object({
     steps: z
       .array(
@@ -326,7 +338,7 @@ export const retry: RegisteredTool = buildTool({
   name: "Retry",
   operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
   description:
-    "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported.",
+    "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported. Each attempt runs with no terminal, so one that prompts fails instead of waiting.",
   inputSchema: z.object({
     argv: argvSchema,
     maxAttempts: z.number().int().min(1).max(10),
@@ -682,7 +694,7 @@ export const waitForPort: RegisteredTool = buildTool({
   name: "WaitForPort",
   operativeArgs: [{ field: "host", kind: "recipient", default: "127.0.0.1" }],
   description:
-    "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline.",
+    "Poll a TCP host and port until it is accepting connections, or until it stops, within a required deadline. Use it to wait for a server the harness just started to be ready, instead of guessing with a sleep. It reports whether the condition was met and how many probes it took, and never waits past the deadline. It probes loopback (localhost, 127.0.0.1, ::1; 0.0.0.0 and :: are probed as loopback); any other host is refused unless the operator lists it in tool_config.proc.wait_for_port_hosts, and a listed name that does not resolve yet counts as not accepting connections.",
   inputSchema: z.object({
     port: z.number().int().min(1).max(65_535),
     host: z.string().max(255).optional().describe("default 127.0.0.1"),
@@ -701,16 +713,37 @@ export const waitForPort: RegisteredTool = buildTool({
     if (!HOSTNAME.test(host)) {
       return `[WaitForPort error] "${host}" is not a hostname or address.`;
     }
+    // Loopback, or a host the operator listed — decided before any DNS or
+    // socket, and dialled by the address checked (C144).
+    const allowed = portHostsFor(ctx?.toolConfig);
+    const target = portTarget(host, allowed, PORT_HOSTS_KEY);
+    if (!target.ok) return target.message;
     const want = input.state ?? "open";
     const interval = input.intervalMs ?? DEFAULT_POLL_MS;
     const startedAt = Date.now();
     const deadline = startedAt + input.timeoutMs;
     let attempts = 0;
     let open = false;
+    // A listed name is looked up at each probe until it answers, then that
+    // address is dialled for the rest of the call. Until then the host
+    // accepts no connections: "not open yet", or already "closed".
+    let dial: string | undefined = "dial" in target ? target.dial : undefined;
+    const unresolvedNote = (): Record<string, string> =>
+      dial === undefined
+        ? { note: `"${host}" did not resolve; a name with no address accepts no connections` }
+        : {};
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       attempts++;
-      open = await probePort(host, input.port, Math.max(1, Math.min(1_000, remaining)));
+      if (dial === undefined && "resolve" in target) {
+        const resolved = await resolveListedHost(target.resolve, allowed, PORT_HOSTS_KEY);
+        if (!resolved.ok) return resolved.message;
+        if ("dial" in resolved) dial = resolved.dial;
+      }
+      open =
+        dial === undefined
+          ? false
+          : await probePort(dial, input.port, Math.max(1, Math.min(1_000, remaining)));
       if ((want === "open") === open) {
         return json({
           satisfied: true,
@@ -719,6 +752,7 @@ export const waitForPort: RegisteredTool = buildTool({
           port: input.port,
           attempts,
           waitedMs: Date.now() - startedAt,
+          ...unresolvedNote(),
         });
       }
       if (ctx?.signal?.aborted === true) break;
@@ -735,6 +769,7 @@ export const waitForPort: RegisteredTool = buildTool({
       attempts,
       waitedMs: Date.now() - startedAt,
       reason: ctx?.signal?.aborted === true ? "aborted" : "deadline",
+      ...unresolvedNote(),
     });
   },
 });
@@ -846,7 +881,7 @@ export const waitForFile: RegisteredTool = buildTool({
 export const waitForOutput: RegisteredTool = buildTool({
   name: "WaitForOutput",
   description:
-    "Watch a background process's output until a pattern matches, a failure pattern matches first, or a required deadline passes. Use it to wait for the line that means ready — 'Listening on', 'compiled successfully' — and to give up early when the line that means broken shows up instead. It reads without consuming, so ProcessOutput still returns everything afterwards.",
+    "Watch a background process's output until a pattern matches, a failure pattern matches first, or a required deadline passes. Use it to wait for the line that means ready — 'Listening on', 'compiled successfully' — and to give up early when the line that means broken shows up instead. It reads without consuming, so ProcessOutput still returns everything afterwards. A pattern that could not be evaluated ends the wait as undetermined (matched: null), never as a miss.",
   inputSchema: z.object({
     id: procIdSchema,
     pattern: z.string().min(1).describe("a JavaScript regular expression source"),
@@ -867,13 +902,13 @@ export const waitForOutput: RegisteredTool = buildTool({
   execute: async (input, ctx?: ToolExecuteContext) => {
     const bg = getProc(input.id);
     if (bg === undefined) return noSuchProc("WaitForOutput", input.id);
-    const success = compileSafePattern(input.pattern, input.flags ?? "");
+    const flags = input.flags ?? "";
+    // Screened up front so a refused pattern never runs (C079)…
+    const success = compileSafePattern(input.pattern, flags);
     if (!success.ok) return `[WaitForOutput error] ${success.message}`;
-    let failure: RegExp | undefined;
     if (input.failurePattern !== undefined) {
-      const compiled = compileSafePattern(input.failurePattern, input.flags ?? "");
+      const compiled = compileSafePattern(input.failurePattern, flags);
       if (!compiled.ok) return `[WaitForOutput error] failurePattern — ${compiled.message}`;
-      failure = compiled.regex;
     }
     const which = input.stream ?? "both";
     const interval = input.intervalMs ?? DEFAULT_POLL_MS;
@@ -887,64 +922,115 @@ export const waitForOutput: RegisteredTool = buildTool({
           ? bg.stderr
           : `${bg.stdout}\n${bg.stderr}`;
 
-    for (;;) {
-      const text = haystack();
-      const failed = failure?.exec(text) ?? null;
-      if (failed !== null) {
-        return json({
-          matched: false,
-          matchedFailure: true,
-          id: bg.id,
-          match: failed[0],
-          status: bg.status,
-          exitCode: bg.exitCode,
-          waitedMs: Date.now() - startedAt,
-        });
+    // …and every match runs in @crewhaus/tool-safety's regex worker, under
+    // a deadline: a synchronous exec over this buffer could not be
+    // interrupted, and JavaScriptCore abandons a runaway one as "no match".
+    // An answer the worker could not give ends the wait as undetermined —
+    // never as "deadline", and never as a match that did not happen.
+    const session = openRegexSession();
+    const firstMatch = async (
+      pattern: string,
+      text: string,
+    ): Promise<{ ok: true; match: string | undefined } | { ok: false; why: string }> => {
+      const outcome = await session.run({
+        op: "matchAll",
+        pattern,
+        flags,
+        input: text,
+        maxMatches: 1,
+        deadlineMs: Math.max(100, Math.min(MATCH_BUDGET_MS, deadline - Date.now())),
+        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        ...(ctx?.runContext !== undefined ? { runawayKey: ctx.runContext.sessionId } : {}),
+      });
+      if (outcome.status !== "ok") return { ok: false, why: describeRegexOutcome(outcome) };
+      return { ok: true, match: outcome.result.matches[0]?.match };
+    };
+    const undetermined = (which: "pattern" | "failurePattern", why: string): string =>
+      // A run the caller's own abort ended is the abort, as before.
+      ctx?.signal?.aborted === true
+        ? json({
+            matched: false,
+            id: bg.id,
+            reason: "aborted",
+            status: bg.status,
+            waitedMs: Date.now() - startedAt,
+          })
+        : json({
+            matched: null,
+            id: bg.id,
+            reason: "undetermined",
+            detail: `${which} could not be evaluated against the output: ${why}`,
+            status: bg.status,
+            exitCode: bg.exitCode,
+            waitedMs: Date.now() - startedAt,
+          });
+
+    try {
+      for (;;) {
+        const text = haystack();
+        if (input.failurePattern !== undefined) {
+          const failed = await firstMatch(input.failurePattern, text);
+          if (!failed.ok) return undetermined("failurePattern", failed.why);
+          if (failed.match !== undefined) {
+            return json({
+              matched: false,
+              matchedFailure: true,
+              id: bg.id,
+              match: failed.match,
+              status: bg.status,
+              exitCode: bg.exitCode,
+              waitedMs: Date.now() - startedAt,
+            });
+          }
+        }
+        const hit = await firstMatch(input.pattern, text);
+        if (!hit.ok) return undetermined("pattern", hit.why);
+        if (hit.match !== undefined) {
+          return json({
+            matched: true,
+            id: bg.id,
+            match: hit.match,
+            status: bg.status,
+            exitCode: bg.exitCode,
+            waitedMs: Date.now() - startedAt,
+          });
+        }
+        // A process that has exited will never produce the line; one last look
+        // has already happened above, so stop instead of burning the deadline.
+        if (bg.status !== "running") {
+          return json({
+            matched: false,
+            id: bg.id,
+            reason: "process finished without matching",
+            status: bg.status,
+            exitCode: bg.exitCode,
+            waitedMs: Date.now() - startedAt,
+          });
+        }
+        if (ctx?.signal?.aborted === true) {
+          return json({
+            matched: false,
+            id: bg.id,
+            reason: "aborted",
+            status: bg.status,
+            waitedMs: Date.now() - startedAt,
+          });
+        }
+        const left = deadline - Date.now();
+        if (left <= 0) {
+          return json({
+            matched: false,
+            id: bg.id,
+            reason: "deadline",
+            status: bg.status,
+            exitCode: bg.exitCode,
+            waitedMs: Date.now() - startedAt,
+          });
+        }
+        await sleep(Math.min(interval, left), ctx?.signal);
       }
-      const hit = success.regex.exec(text);
-      if (hit !== null) {
-        return json({
-          matched: true,
-          id: bg.id,
-          match: hit[0],
-          status: bg.status,
-          exitCode: bg.exitCode,
-          waitedMs: Date.now() - startedAt,
-        });
-      }
-      // A process that has exited will never produce the line; one last look
-      // has already happened above, so stop instead of burning the deadline.
-      if (bg.status !== "running") {
-        return json({
-          matched: false,
-          id: bg.id,
-          reason: "process finished without matching",
-          status: bg.status,
-          exitCode: bg.exitCode,
-          waitedMs: Date.now() - startedAt,
-        });
-      }
-      if (ctx?.signal?.aborted === true) {
-        return json({
-          matched: false,
-          id: bg.id,
-          reason: "aborted",
-          status: bg.status,
-          waitedMs: Date.now() - startedAt,
-        });
-      }
-      const left = deadline - Date.now();
-      if (left <= 0) {
-        return json({
-          matched: false,
-          id: bg.id,
-          reason: "deadline",
-          status: bg.status,
-          exitCode: bg.exitCode,
-          waitedMs: Date.now() - startedAt,
-        });
-      }
-      await sleep(Math.min(interval, left), ctx?.signal);
+    } finally {
+      session.close();
     }
   },
 });
@@ -956,7 +1042,7 @@ export const waitForOutput: RegisteredTool = buildTool({
 export const commandExists: RegisteredTool = buildTool({
   name: "CommandExists",
   description:
-    "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match.",
+    "Report whether a program is on PATH and where it resolves, without running it. Use it to check a prerequisite before building a plan around it, so a missing binary is a clear answer rather than a failed command. It searches the same PATH RunCommand would use, in order, and returns the first executable match; on Windows it tries PATHEXT's extensions (git finds git.exe) as the shell does.",
   inputSchema: z.object({
     name: z.string().min(1).max(255).describe("a bare program name such as 'git' — not a path"),
   }),
@@ -966,26 +1052,28 @@ export const commandExists: RegisteredTool = buildTool({
     if (input.name.includes("/") || input.name.includes("\\") || input.name.includes("\0")) {
       return `[CommandExists error] "${input.name}" is a path, not a program name — pass a bare name such as "git".`;
     }
-    const raw = process.env["PATH"] ?? FALLBACK_PATH;
-    const dirs = raw.split(path.delimiter).filter((d) => d !== "");
-    for (const dir of dirs) {
-      const candidate = path.join(dir, input.name);
-      try {
-        if (!statSync(candidate).isFile()) continue;
-        accessSync(candidate, fsConstants.X_OK);
-        return json({ name: input.name, found: true, path: candidate, searchedDirs: dirs.length });
-      } catch {
-        // Not here, or not executable — keep looking.
-      }
-    }
-    return json({ name: input.name, found: false, path: null, searchedDirs: dirs.length });
+    const platform = hostPlatform();
+    // The PATH RunCommand hands its child (buildSpawnEnv). FALLBACK_PATH is
+    // a POSIX list; a Windows host with no PATH has nothing to search.
+    const raw = process.env["PATH"] ?? (platform === "win32" ? "" : FALLBACK_PATH);
+    const found = searchPath(input.name, {
+      pathValue: raw,
+      platform,
+      pathext: process.env["PATHEXT"],
+    });
+    return json({
+      name: input.name,
+      found: found.path !== null,
+      path: found.path,
+      searchedDirs: found.searchedDirs,
+    });
   },
 });
 
 export const envInspect: RegisteredTool = buildTool({
   name: "EnvInspect",
   description:
-    "Report whether named environment variables are set, and how long their values are, revealing a value only when the caller names it. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
+    "Report whether named environment variables are set, and how long their values are. Use it to check that a credential or configuration variable is present before running something that needs it, without pulling the secret into context. A value is shown only for a variable named in `reveal` that the operator listed in tool_config.proc.env_reveal, and never for one whose name looks like a credential (a key, token, secret, password or credential URL), listed or not; any other name in `reveal` comes back with `withheld` and the reason. There is no way to list the environment: a name you do not ask for is a name you learn nothing about.",
   inputSchema: z.object({
     names: z
       .array(z.string().min(1).max(255))
@@ -996,22 +1084,34 @@ export const envInspect: RegisteredTool = buildTool({
       .array(z.string().min(1).max(255))
       .max(16)
       .optional()
-      .describe("variables whose actual value should be returned; must also appear in names"),
+      .describe(
+        "variables whose value should be returned; must also appear in names, and each must be listed in tool_config.proc.env_reveal and not look like a credential",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const named = new Set(input.names);
     const reveal = input.reveal ?? [];
     const notNamed = reveal.filter((r) => !named.has(r));
     if (notNamed.length > 0) {
       return `[EnvInspect error] reveal lists ${notNamed.join(", ")}, which names does not — add them to names to inspect them.`;
     }
-    const { views, invalid } = inspectEnv(process.env, input.names, reveal);
+    // The list comes from the operator (tool_config), never from the call.
+    const allowed = revealAllowFor(ctx?.toolConfig);
+    const { views, invalid } = inspectEnv(process.env, input.names, reveal, (name) =>
+      checkEnvReveal(name, { allowed, configKey: ENV_REVEAL_KEY }),
+    );
+    const withheld = views.filter((v) => v.withheld !== undefined);
     return json({
       variables: views,
       ...(invalid.length > 0 ? { notEnvironmentNames: invalid } : {}),
-      note: "values are withheld unless named in reveal",
+      note:
+        withheld.length === 0
+          ? "values are shown only for names in reveal that tool_config.proc.env_reveal lists"
+          : `values are shown only for names in reveal that ${ENV_REVEAL_KEY} lists, and never for a name that looks like a credential; ${withheld
+              .map((v) => `${v.name}: ${v.withheld}`)
+              .join(", ")}`,
     });
   },
 });

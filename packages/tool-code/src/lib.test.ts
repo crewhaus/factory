@@ -28,6 +28,7 @@ import {
   parsePackageLockDetailed,
   parsePnpmLock,
   parsePnpmLockDetailed,
+  parsePnpmWorkspacePackages,
   parsePyproject,
   parseRequirementsTxt,
   parseSemver,
@@ -36,6 +37,7 @@ import {
   satisfies,
   satisfiesInstallable,
   stripJsonc,
+  unsupportedWorkspaceGlob,
 } from "./lib/deps";
 import {
   countBySeverity,
@@ -509,6 +511,138 @@ describe("test output parsers", () => {
     expect(outcome.failures[0]?.message).not.toContain("import { expect");
   });
 
+  test("bun: a status line is parsed in linear time, whatever its spacing (C079)", () => {
+    // 0.7.0's status pattern retried a long run of spaces from every split
+    // point: this line took about eight seconds.
+    const started = performance.now();
+    const outcome = parseBunTest(`a.test.ts:\n(fail) x${" ".repeat(100_000)}y\n`);
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(outcome.failed).toBe(1);
+    expect(outcome.failures[0]?.name.length).toBe(100_002);
+  });
+
+  test("pytest: the summary line is read in linear time, and its counts unchanged (C079)", () => {
+    // 0.7.0's two lazy groups and trailing `\s+` retried a run of spaces
+    // from every position: quadratic in a line the caller supplies.
+    const run = " ".repeat(60_000);
+    const digits = "1".repeat(60_000);
+    const started = performance.now();
+    const hostile = parsePytest(
+      `short test summary info\npassed${run}x\n${digits}a passed${run}in 1s\n`,
+    );
+    expect(performance.now() - started).toBeLessThan(1_500);
+    expect(hostile.passed).toBe(0);
+    // The same scan still reads every summary pytest prints.
+    const summary = parsePytest(
+      [
+        "==== 1 failed, 2 passed, 3 skipped, 1 xfailed, 2 errors in 0.12s ====",
+        "5 passed, 1 xpassed in 65.12s (0:01:05)",
+        "1 passed   in   0.5s",
+        "FAILED t.py::x - failed 9 passed in 0.1s",
+      ].join("\n"),
+    );
+    expect(summary).toMatchObject({ passed: 9, failed: 3, skipped: 4 });
+  });
+
+  test("go: a message go prints on the line after file_test.go:N: is kept (regression review)", () => {
+    // t.Errorf("\n got %d, want %d") and testify print the location, then the
+    // text indented below it. 0.7.0's pattern let `:\s*` cross the newline and
+    // captured that line; the linear rewrite dropped it.
+    const event = (e: Record<string, unknown>) => JSON.stringify({ Package: "p", Test: "T", ...e });
+    const errorf = parseGoTestJson(
+      [
+        event({ Action: "run" }),
+        event({ Action: "output", Output: "    sum_test.go:14: \n" }),
+        event({ Action: "output", Output: "        got 5, want 6\n" }),
+        event({ Action: "output", Output: "--- FAIL: T (0.00s)\n" }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(errorf.failures[0]).toMatchObject({
+      file: "sum_test.go",
+      line: 14,
+      message: "got 5, want 6",
+    });
+    const testify = parseGoTestJson(
+      [
+        event({ Action: "run" }),
+        event({ Action: "output", Output: "    sum_test.go:21: \n" }),
+        event({
+          Action: "output",
+          Output: "        \tError Trace:\t/src/p/sum_test.go:21\n",
+        }),
+        event({ Action: "output", Output: "        \tError:      \tNot equal: \n" }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(testify.failures[0]).toMatchObject({
+      file: "sum_test.go",
+      line: 21,
+      message: "Error Trace:\t/src/p/sum_test.go:21",
+    });
+  });
+
+  test("go: a failed test's output is searched in linear time, blank lines or not (C079)", () => {
+    // The location search was one multiline pattern whose `^\s*` spanned
+    // newlines: 160k characters of blank output took over five seconds.
+    const event = (e: Record<string, unknown>) => JSON.stringify({ Package: "p", Test: "T", ...e });
+    const blank = [
+      event({ Action: "run" }),
+      event({ Action: "output", Output: "\n".repeat(120_000) }),
+      event({ Action: "fail" }),
+    ].join("\n");
+    const started = performance.now();
+    const outcome = parseGoTestJson(blank);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(outcome.failed).toBe(1);
+    // …and a location after leading space and blank lines is still found.
+    const located = parseGoTestJson(
+      [
+        event({ Action: "output", Output: "=== RUN   T\n\n\n" }),
+        event({ Action: "output", Output: "    sum_test.go:12: got 3, want 4\r\n" }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(located.failures[0]).toMatchObject({
+      file: "sum_test.go",
+      line: 12,
+      message: "got 3, want 4",
+    });
+    // A location line followed only by blank lines is still linear, and has no message.
+    const trailing = parseGoTestJson(
+      [
+        event({ Action: "output", Output: `    sum_test.go:9: \n${"\n".repeat(120_000)}` }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(trailing.failures[0]).toMatchObject({ file: "sum_test.go", line: 9 });
+    expect(trailing.failures[0]?.message).toBeUndefined();
+    // Runner detection samples both ends, and a run of blank lines there is linear too.
+    const detectStarted = performance.now();
+    expect(detectRunnerFromOutput("\n".repeat(40_000))).toBeUndefined();
+    expect(performance.now() - detectStarted).toBeLessThan(500);
+  });
+
+  test("bun: the timing suffix is cut, and any other bracket is part of the name", () => {
+    const outcome = parseBunTest(
+      [
+        "a.test.ts:",
+        "(pass) suite > adds [0.12ms]",
+        "(fail) suite > name [1.23ms]",
+        "(fail) weird [name]",
+        "(fail) spaced   [3.00 ms]",
+        "(fail) glued[4.00ms]",
+      ].join("\n"),
+    );
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failures.map((f) => f.name)).toEqual([
+      "suite > name",
+      "weird [name]",
+      "spaced",
+      "glued[4.00ms]",
+    ]);
+  });
+
   test("bun: a green run reports no failures at all", () => {
     const outcome = parseBunTest(" 12 pass\n 0 fail\nRan 12 tests across 3 files. [40.00ms]");
     expect(outcome.failed).toBe(0);
@@ -688,7 +822,21 @@ describe("test output parsers", () => {
 
 describe("caller-supplied patterns", () => {
   test("a repetition nested in a repetition is rejected", () => {
-    for (const pattern of ["^(a|a|aa)+$", "(a+)+", "(a*)*", "(\\w+)+$", "(ab{1,})+"]) {
+    for (const pattern of ["^(a|a|aa)+$", "(a+)+", "(a*)*", "(\\w+)+$"]) {
+      expect({ pattern, unsafe: hasNestedRepetition(pattern) }).toEqual({ pattern, unsafe: true });
+    }
+  });
+
+  test("a bounded outer count does not make a nested repetition safe (C079)", () => {
+    // 0.7.0 treated `{1,99}` as bounded and so safe: each of these cost about
+    // 650 ms per long identifier, run against every name in the tree.
+    for (const pattern of [
+      "^(a|a){1,99}$",
+      "^(\\w|[a-zA-Z]){1,64}Z$",
+      "^(\\w+){2,64}$",
+      "(a?){30}a{30}",
+      "(\\w{1,})*$",
+    ]) {
       expect({ pattern, unsafe: hasNestedRepetition(pattern) }).toEqual({ pattern, unsafe: true });
     }
   });
@@ -703,6 +851,10 @@ describe("caller-supplied patterns", () => {
       "[+*]+",
       "\\(a+\\)",
       "(a|b){0,3}",
+      // Each pass starts with the `a` its run of b's cannot match, so it ends
+      // in exactly one place: linear, and the shared screen admits it.
+      "(ab{1,})+",
+      "(\\d{1,3}\\.){3}\\d{1,3}",
     ]) {
       expect({ pattern, unsafe: hasNestedRepetition(pattern) }).toEqual({ pattern, unsafe: false });
     }
@@ -1043,6 +1195,70 @@ describe("dependency manifests", () => {
     expect(poetry.map((d) => [d.name, d.range])).toEqual([["httpx", "^0.27"]]);
   });
 
+  test("pyproject.toml: optional groups, comments, and a key read exactly", () => {
+    const deps = parsePyproject(
+      [
+        "[project]",
+        "dependencies = [",
+        '  "requests>=2",',
+        "]",
+        "[project.optional-dependencies]",
+        'dev = ["pytest>=8", "ruff"]',
+        "docs = [",
+        '  "mkdocs",  # the site',
+        "]",
+        "broken = [",
+        "[tool.poetry.dependencies]",
+        'httpx = "^0.27"   # pinned for now',
+        'rich = "^13"#glued is not a comment',
+      ].join("\n"),
+    );
+    // Sorted by name, as every manifest reader returns them.
+    expect(deps.map((d) => [d.name, d.range, d.scope])).toEqual([
+      ["httpx", "^0.27", "prod"],
+      ["mkdocs", "", "optional"],
+      ["pytest", ">=8", "optional"],
+      ["requests", ">=2", "prod"],
+      ["rich", '^13"#glued is not a comment', "prod"],
+      ["ruff", "", "optional"],
+    ]);
+    // A group key with a dot is matched as written: 0.7.0 built a pattern
+    // from it, so `my.group` read the array of `myxgroup` above it.
+    const dotted = parsePyproject(
+      '[project.optional-dependencies]\nmyxgroup = ["alpha"]\nmy.group = ["beta"]\n',
+    );
+    expect(dotted.map((d) => d.name)).toEqual(["alpha", "beta"]);
+  });
+
+  test("pyproject.toml is read in linear time, whatever the repository wrote", () => {
+    // 0.7.0 ran `^\s*` in multiline mode (it spans newlines), stripped
+    // comments with `\s+#.*$`, and re-scanned the body once per array key:
+    // each quadratic in a file up to the read cap, about two seconds each at
+    // these sizes.
+    const cases: ReadonlyArray<[string, string, string[]]> = [
+      ["blank lines", `[project.optional-dependencies]\n${"\n".repeat(50_000)}x\n`, []],
+      [
+        "spaces before no comment",
+        `[tool.poetry.dependencies]\nhttpx = "1"${" ".repeat(60_000)}x\n`,
+        ["httpx"],
+      ],
+      ["unclosed arrays", `[project.optional-dependencies]\n${"k = [\n".repeat(15_000)}`, []],
+    ];
+    let timed = 0;
+    for (const [label, text, names] of cases) {
+      const started = performance.now();
+      const deps = parsePyproject(text);
+      const ms = performance.now() - started;
+      expect({ label, fast: ms < 1_000, names: deps.map((d) => d.name) }).toEqual({
+        label,
+        fast: true,
+        names,
+      });
+      timed += 1;
+    }
+    expect(timed).toBe(3);
+  });
+
   test("go.mod: require block and indirect markers", () => {
     const deps = parseGoMod(
       [
@@ -1086,6 +1302,88 @@ describe("dependency manifests", () => {
     expect(matchWorkspaceGlob("packages/a/b", "packages/**")).toBe(true);
     expect(matchWorkspaceGlob("apps/web", "packages/*")).toBe(false);
     expect(matchWorkspaceGlob("packages/x", "!packages/x")).toBe(false);
+  });
+
+  test("a workspace glob's ? is one character, and never a regex quantifier (C220)", () => {
+    // 0.7.0 left `?` unescaped, so `pkg-?` compiled to /^pkg-?$/: the one
+    // directory that is not a member matched, and every member did not.
+    expect(matchWorkspaceGlob("pkg", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("pkg-a", "pkg-?")).toBe(true);
+    expect(matchWorkspaceGlob("pkg-ab", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("pkg-", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("pkg-/x", "pkg-?")).toBe(false);
+    expect(matchWorkspaceGlob("packages/pkg-a", "packages/pkg-?")).toBe(true);
+    // `?` never matches a `/`.
+    expect(matchWorkspaceGlob("packages/a/b", "packages?a/b")).toBe(false);
+    // Every other character is itself.
+    expect(matchWorkspaceGlob("packages/aab", "packages/a+b")).toBe(false);
+    expect(matchWorkspaceGlob("packages/a+b", "packages/a+b")).toBe(true);
+    expect(matchWorkspaceGlob("packagesXa", "packages.a")).toBe(false);
+    expect(matchWorkspaceGlob("packages/(x)", "packages/(x)")).toBe(true);
+  });
+
+  test("workspace globs read `**`, `./` and a trailing slash the way package managers do", () => {
+    expect(matchWorkspaceGlob("packages/a", "./packages/*")).toBe(true);
+    expect(matchWorkspaceGlob("packages/a", "packages/*/")).toBe(true);
+    expect(matchWorkspaceGlob("packages/a/b/c", "packages/**/c")).toBe(true);
+    expect(matchWorkspaceGlob("packages/c", "packages/**/c")).toBe(true);
+    expect(matchWorkspaceGlob("apps/c", "packages/**/c")).toBe(false);
+    expect(matchWorkspaceGlob("packages/a/b", "**/b")).toBe(true);
+    // `**` inside a segment is a plain `*`: it does not cross a `/`.
+    expect(matchWorkspaceGlob("packages/a/b-x", "packages/**-x")).toBe(false);
+    expect(matchWorkspaceGlob("packages/b-x", "packages/**-x")).toBe(true);
+  });
+
+  test("a many-star glob is matched in bounded time, not by a backtracking regex", () => {
+    // 0.7.0 compiled this to /^packages\/[^/]*a[^/]*a…b$/, a polynomial
+    // backtracker: ~2s on a 100-character name here, minutes at 250. The glob
+    // is the repository's, so WorkspacePackages hung on it.
+    const dir = `packages/${"a".repeat(100)}`;
+    const started = performance.now();
+    expect(matchWorkspaceGlob(dir, "packages/*a*a*a*a*a*b")).toBe(false);
+    expect(matchWorkspaceGlob(`${dir}b`, "packages/*a*a*a*a*a*b")).toBe(true);
+    expect(matchWorkspaceGlob(`${dir}/a/a/a/a`, "**/**/**/**/**/x")).toBe(false);
+    expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  test("syntax the matcher does not evaluate is named, not read as literal text", () => {
+    expect(unsupportedWorkspaceGlob("packages/{a,b}")).toContain("brace");
+    expect(unsupportedWorkspaceGlob("!packages/[ab]")).toContain("character classes");
+    expect(unsupportedWorkspaceGlob("packages/*")).toBeUndefined();
+    expect(matchWorkspaceGlob("packages/a", "packages/{a,b}")).toBe(false);
+  });
+
+  test("pnpm-workspace.yaml: only the packages: list, quotes and comments dropped", () => {
+    const yaml = [
+      "# the workspace",
+      "packages:",
+      "  - 'packages/*'",
+      '  - "apps/**"',
+      "  - tools/cli # the cli",
+      "  - '!**/test/**'",
+      "- top-level/*",
+      "onlyBuiltDependencies:",
+      "  - esbuild",
+      "",
+    ].join("\r\n");
+    expect(parsePnpmWorkspacePackages(yaml)).toEqual([
+      "packages/*",
+      "apps/**",
+      "tools/cli",
+      "!**/test/**",
+      "top-level/*",
+    ]);
+  });
+
+  test("pnpm-workspace.yaml is read in linear time, whatever the repository wrote", () => {
+    // The 0.7.0 pattern grew with the square of a run of spaces before a
+    // stray quote, and of a run of blank lines: ~2s each at these sizes,
+    // and a 2 MB file (the read cap) was a hang.
+    const spaces = " ".repeat(40_000);
+    const hostile = `packages:\n  - a${spaces}"x\n${" \n".repeat(20_000)}`;
+    const started = performance.now();
+    expect(parsePnpmWorkspacePackages(hostile)).toEqual([`a${spaces}"x`]);
+    expect(performance.now() - started).toBeLessThan(500);
   });
 });
 

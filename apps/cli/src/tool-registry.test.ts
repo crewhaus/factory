@@ -561,6 +561,8 @@ describe("every copy of the private-address classifier is the same classifier", 
     "tool-navigate",
     "tool-notify",
     "tool-obs",
+    // 0.7.1 C144: WaitForPort classifies the host it may probe.
+    "tool-proc",
     "tool-web",
   ];
 

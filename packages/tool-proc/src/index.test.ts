@@ -26,6 +26,8 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   PROC_TOOLS,
   __resetRegistryForTest,
+  _resetProcConfig,
+  _setDnsLookup,
   commandExists,
   envInspect,
   processList,
@@ -33,6 +35,7 @@ import {
   processStart,
   processStatus,
   processStop,
+  registerProcConfig,
   retry,
   runCommand,
   runPipeline,
@@ -40,6 +43,8 @@ import {
   waitForOutput,
   waitForPort,
 } from "./index";
+import { unspecifiedDial } from "./lib/addr";
+import { _setPlatform, searchPath } from "./lib/which";
 
 let originalCwd: string;
 let tmp: string;
@@ -374,12 +379,70 @@ describe("RunCommand", () => {
     // The grandchild sleeps 20s; returning in anything under that proves the
     // drain gave up rather than waiting for EOF.
     expect(elapsed).toBeLessThan(10_000);
+    // C078: what arrived before the drain gave up is kept, and the result
+    // says it may be incomplete — it used to come back as "" with ok:true.
+    expect(out.stdout).toContain("parent done");
+    expect(out.outputIncomplete).toBe(true);
+    expect(out.ok).toBe(true);
   });
+
+  test("a timed-out command still returns what it printed before the deadline", async () => {
+    // `sh -c`, not a fresh script file: macOS may scan a new executable for
+    // longer than this deadline before running a line of it.
+    const out = await call(runCommand, {
+      // No `exec`: the shell's own child is what used to hold the pipe open
+      // after the deadline's signal killed only the shell.
+      argv: ["sh", "-c", "echo 'error: port in use'; sleep 3"],
+      timeoutMs: 1_000,
+    });
+    expect(out.timedOut).toBe(true);
+    expect(out.stdout).toContain("error: port in use");
+  });
+
+  test("output past the cap is discarded as it arrives, not buffered first", async () => {
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    let peak = before;
+    const sampler = setInterval(() => {
+      peak = Math.max(peak, process.memoryUsage().rss);
+    }, 5);
+    let out: { stdoutTruncated: boolean; stdout: string };
+    try {
+      out = await call(runCommand, {
+        argv: ["head", "-c", "200000000", "/dev/zero"],
+        maxOutputChars: 100,
+      });
+    } finally {
+      clearInterval(sampler);
+    }
+    // 0.7.0 held the whole 200 MB (and more) as a string before capping.
+    expect(peak - before).toBeLessThan(100 * 1024 * 1024);
+    expect(out.stdoutTruncated).toBe(true);
+    // Exactly what was not returned: 200 MB minus the 50 + 50 kept.
+    expect(out.stdout).toContain("[199999900 bytes dropped]");
+  }, 20_000);
+
+  test("a grandchild still writing after the child exits is cut off, not buffered for ever", async () => {
+    const out = await call(runCommand, {
+      // The grandchild starts writing only after the drain grace is over.
+      argv: ["sh", "-c", "(sleep 0.9; head -c 50000000 /dev/zero) &\necho started"],
+      maxOutputChars: 100,
+    });
+    expect(out.outputIncomplete).toBe(true);
+    expect(out.stdout).toContain("started");
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    await Bun.sleep(1_500);
+    Bun.gc(true);
+    // The stream was cancelled at the drain grace: the 50 MB the
+    // grandchild writes afterwards never reaches this process.
+    expect(process.memoryUsage().rss - before).toBeLessThan(40 * 1024 * 1024);
+  }, 20_000);
 
   test("output over the cap is truncated at both ends rather than dropped or unbounded", async () => {
     const out = await call(runCommand, { argv: ["seq", "1", "5000"], maxOutputChars: 200 });
     expect(out.stdoutTruncated).toBe(true);
-    expect(out.stdout).toContain("chars dropped");
+    expect(out.stdout).toContain("bytes dropped");
     expect(out.stdout.startsWith("1\n2\n")).toBe(true);
     expect(out.stdout.trimEnd().endsWith("5000")).toBe(true);
   });
@@ -780,6 +843,41 @@ describe("WaitForOutput", () => {
     expect(out.match).toBe("FATAL");
   });
 
+  test("a brace-quantified nested pattern is refused at once, not run to the deadline (C079)", async () => {
+    const started = await call(processStart, {
+      argv: ["sh", "-c", "echo deadbeefcafe0123456789abcdef0123456789ab; sleep 5"],
+    });
+    // 0.7.0's scanner took `{1,}` for a literal and ran this: ~6.7 s of a
+    // blocked event loop and a false reason "deadline".
+    const out = await call(waitForOutput, {
+      id: started.id,
+      pattern: "(\\w{1,})*$",
+      timeoutMs: 3_000,
+    });
+    expect(String(out)).toContain("[WaitForOutput error]");
+    expect(String(out)).toContain("exponentially");
+  });
+
+  test("a match the worker could not finish is undetermined, never 'deadline' or no-match (C079)", async () => {
+    const started = await call(processStart, {
+      argv: ["sh", "-c", `printf '${"a".repeat(300)}'; sleep 5`],
+    });
+    await Bun.sleep(200);
+    // Screened as safe (star height 1) but cubic: ~1 s on 300 characters,
+    // past this call's budget. Bounded: the abandoned worker stops within
+    // about a second.
+    const out = await call(waitForOutput, {
+      id: started.id,
+      pattern: "\\w*\\w*\\w*!",
+      timeoutMs: 250,
+    });
+    expect({ matched: out.matched, reason: out.reason }).toEqual({
+      matched: null,
+      reason: "undetermined",
+    });
+    expect(String(out.detail)).toContain("pattern could not be evaluated");
+  }, 20_000);
+
   test("the deadline is honoured when the pattern never appears", async () => {
     const started = await call(processStart, { argv: ["sleep", "30"] });
     const at = Date.now();
@@ -891,9 +989,237 @@ describe("WaitForPort", () => {
     const out = await call(waitForPort, { port: 80, host: "not a host", timeoutMs: 50 });
     expect(out).toContain("is not a hostname");
   });
+
+  /**
+   * C144: WaitForPort is read-only, so plan and auto mode run it unasked. It
+   * probes loopback; any other host needs the operator's
+   * tool_config.proc.wait_for_port_hosts, and is refused before a DNS query
+   * or a socket.
+   */
+  describe("what it may probe (C144)", () => {
+    let lookups: string[] = [];
+    let answers: Record<string, string[]> = {};
+    let server: ReturnType<typeof createServer>;
+    let port = 0;
+    beforeEach(async () => {
+      lookups = [];
+      answers = {};
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        return answers[host] ?? [];
+      });
+      server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      port = (server.address() as AddressInfo).port;
+    });
+    afterEach(async () => {
+      _setDnsLookup(undefined);
+      _resetProcConfig();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    test("the metadata address, a LAN address and an unlisted name are refused unprobed", async () => {
+      for (const host of [
+        "169.254.169.254",
+        "10.0.0.5",
+        "0xa9.0xfe.0xa9.0xfe",
+        "x.attacker.test",
+      ]) {
+        const out = await call(waitForPort, { host, port: 80, timeoutMs: 100 });
+        expect({ host, refused: String(out).includes("is not a loopback address") }).toEqual({
+          host,
+          refused: true,
+        });
+        // A refusal is a sentence: no probe ran, so no `attempts`.
+        expect(String(out)).not.toContain('"attempts"');
+      }
+      // Not even a DNS query for the unlisted name.
+      expect(lookups).toEqual([]);
+    });
+
+    test("loopback in any spelling still works, with no configuration", async () => {
+      for (const host of ["127.0.0.1", "0x7f.1", "2130706433", "127.1", "localhost"]) {
+        const out = await call(waitForPort, { host, port, timeoutMs: 3_000 });
+        expect({ host, satisfied: out.satisfied }).toEqual({ host, satisfied: true });
+      }
+      expect(lookups).toEqual([]);
+    });
+
+    test("a listed name is resolved once and its address dialled for every probe", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["db.internal"] });
+      answers["db.internal"] = ["127.0.0.1"];
+      const out = await call(waitForPort, { host: "db.internal", port, timeoutMs: 3_000 });
+      expect(out.satisfied).toBe(true);
+      // A closed wait polls several times; the name is still looked up once.
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      server = createServer();
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+      lookups = [];
+      const closed = await call(waitForPort, {
+        host: "db.internal",
+        port,
+        state: "open",
+        timeoutMs: 300,
+        intervalMs: 50,
+      });
+      expect(closed.attempts).toBeGreaterThan(1);
+      expect(lookups).toEqual(["db.internal"]);
+    });
+
+    test("a listed name that does not resolve yet is waited for, then pinned", async () => {
+      // A compose service's name exists only once its container does: the
+      // wait must keep looking it up, not give up on the first empty answer
+      // (regression review). Once it answers, that address is dialled on.
+      registerProcConfig({ wait_for_port_hosts: ["db"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 3 ? ["127.0.0.1"] : [];
+      });
+      const out = await call(waitForPort, {
+        host: "db",
+        port,
+        timeoutMs: 5_000,
+        intervalMs: 20,
+      });
+      expect({ satisfied: out.satisfied, attempts: out.attempts, note: out.note }).toEqual({
+        satisfied: true,
+        attempts: 3,
+        note: undefined,
+      });
+      expect(lookups).toEqual(["db", "db", "db"]);
+    });
+
+    test("a listed name that never resolves is closed: a closed wait is met, an open one is not", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["gone.invalid"] });
+      const closed = await call(waitForPort, {
+        host: "gone.invalid",
+        port,
+        state: "closed",
+        timeoutMs: 2_000,
+      });
+      expect({ satisfied: closed.satisfied, state: closed.state }).toEqual({
+        satisfied: true,
+        state: "closed",
+      });
+      expect(String(closed.note)).toContain("did not resolve");
+      const open = await call(waitForPort, {
+        host: "gone.invalid",
+        port,
+        timeoutMs: 200,
+        intervalMs: 50,
+      });
+      expect({ satisfied: open.satisfied, reason: open.reason }).toEqual({
+        satisfied: false,
+        reason: "deadline",
+      });
+      expect(open.attempts).toBeGreaterThan(1);
+      expect(String(open.note)).toContain("did not resolve");
+    });
+
+    test("a listed name that later resolves to link-local is refused mid-wait", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["flaky.example"] });
+      let asked = 0;
+      _setDnsLookup(async (host) => {
+        lookups.push(host);
+        asked += 1;
+        return asked >= 2 ? ["169.254.169.254"] : [];
+      });
+      const out = await call(waitForPort, {
+        host: "flaky.example",
+        port: 80,
+        timeoutMs: 2_000,
+        intervalMs: 20,
+      });
+      expect(String(out)).toContain("link-local");
+    });
+
+    test("0.0.0.0 and :: — what a dev server prints — are probed as loopback", async () => {
+      const out = await call(waitForPort, { host: "0.0.0.0", port, timeoutMs: 3_000 });
+      expect(out.satisfied).toBe(true);
+      expect(unspecifiedDial("0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("::")).toBe("::1");
+      expect(unspecifiedDial("0:0:0:0:0:0:0:0")).toBe("::1");
+      expect(unspecifiedDial("::ffff:0.0.0.0")).toBe("127.0.0.1");
+      expect(unspecifiedDial("10.0.0.1")).toBeNull();
+      expect(lookups).toEqual([]);
+    });
+
+    test("a listed name that resolves to link-local is refused; a listed literal is probed", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["meta.example", "10.255.255.1"] });
+      answers["meta.example"] = ["169.254.169.254"];
+      const meta = await call(waitForPort, { host: "meta.example", port: 80, timeoutMs: 100 });
+      expect(String(meta)).toContain("link-local");
+      const listed = await call(waitForPort, { host: "10.255.255.1", port: 80, timeoutMs: 50 });
+      expect(listed.attempts).toBeGreaterThanOrEqual(1);
+    });
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ wait_for_port_hosts: ["10.255.255.1"] });
+      const out = await waitForPort.execute(
+        { host: "10.255.255.1", port: 80, timeoutMs: 50 },
+        { toolConfig: { wait_for_port_hosts: [] } },
+      );
+      expect(String(out)).toContain("is not a loopback address");
+    });
+
+    test("the registrar refuses a malformed host list, naming the key", () => {
+      expect(() => registerProcConfig({ wait_for_port_hosts: "db" })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+      expect(() => registerProcConfig({ wait_for_port_hosts: ["has space"] })).toThrow(
+        "tool_config.proc.wait_for_port_hosts",
+      );
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
+
+/**
+ * Regression review: RunCommand's child is spawned detached (setsid), so it
+ * has no controlling terminal — sudo, ssh and gpg prompts fail instead of
+ * waiting. That is the chosen behaviour (a model-run command must not read or
+ * inject into the operator's terminal), so it is pinned here under a real
+ * pty: the same shell run directly under `script` opens /dev/tty, and run
+ * through RunCommand inside that same pty it cannot.
+ */
+describe("RunCommand runs without a terminal", () => {
+  const script = ["/usr/bin/script", "/bin/script"].find((p) => existsSync(p));
+  const probe = "if (exec 3</dev/tty) 2>/dev/null; then echo TTY-OK; else echo TTY-NONE; fi";
+  const underPty = (argv: string[]): string => {
+    const quoted = argv.map((a) => `'${a.replaceAll("'", "'\\''")}'`).join(" ");
+    const cmd =
+      process.platform === "darwin"
+        ? [script as string, "-q", "/dev/null", ...argv]
+        : [script as string, "-qec", quoted, "/dev/null"];
+    const r = Bun.spawnSync(cmd, { cwd: tmp, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    return r.stdout.toString().replaceAll("\r", "");
+  };
+
+  test.skipIf(process.platform === "win32" || script === undefined)(
+    "a child of RunCommand cannot open the terminal its harness runs in",
+    () => {
+      // The pty is live: a shell started in it opens /dev/tty.
+      expect(underPty(["/bin/sh", "-c", probe])).toContain("TTY-OK");
+      const child = join(tmp, "run-in-pty.ts");
+      writeFileSync(
+        child,
+        [
+          `import { runCommand } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+          `const out = await runCommand.execute({ argv: ["/bin/sh", "-c", ${JSON.stringify(probe)}], timeoutMs: 10000 });`,
+          'console.log("RESULT", String(out));',
+        ].join("\n"),
+      );
+      const out = underPty([process.execPath, child]);
+      const line = out.split("\n").find((l) => l.includes("RESULT {")) ?? "";
+      const result = JSON.parse(line.slice(line.indexOf("{"))) as { ok: boolean; stdout: string };
+      expect({ ok: result.ok, stdout: result.stdout }).toEqual({ ok: true, stdout: "TTY-NONE\n" });
+    },
+    30_000,
+  );
+});
 
 describe("WaitForFile", () => {
   test("returns once the file appears", async () => {
@@ -1054,6 +1380,56 @@ describe("CommandExists", () => {
     expect(await call(commandExists, { name: "../sh" })).toContain("is a path");
   });
 
+  describe("on Windows (C125)", () => {
+    const saved = { path: process.env["PATH"], pathext: process.env["PATHEXT"] };
+    afterEach(() => {
+      _setPlatform(undefined);
+      for (const [key, value] of [
+        ["PATH", saved.path],
+        ["PATHEXT", saved.pathext],
+      ] as const) {
+        if (value === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = value;
+      }
+    });
+
+    test("a bare name finds the program through PATHEXT, as RunCommand's spawn would", async () => {
+      const dir = join(tmp, "bin");
+      mkdirSync(dir);
+      // No execute bit: Windows has none, and the POSIX check must not apply.
+      writeFileSync(join(dir, "tool.exe"), "");
+      process.env["PATH"] = dir;
+      process.env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD";
+      _setPlatform("win32");
+      const out = await call(commandExists, { name: "tool" });
+      expect({ found: out.found, path: out.path }).toEqual({
+        found: true,
+        path: join(dir, "tool.exe"),
+      });
+      // Control: the same directory on POSIX has no program called "tool".
+      _setPlatform("linux");
+      expect((await call(commandExists, { name: "tool" })).found).toBe(false);
+    });
+
+    test("PATHEXT order, PATH order, a spelled-out extension and an extensionless file", () => {
+      const a = join(tmp, "a");
+      const b = join(tmp, "b");
+      mkdirSync(a);
+      mkdirSync(b);
+      writeFileSync(join(a, "git"), "");
+      writeFileSync(join(b, "git.exe"), "");
+      writeFileSync(join(b, "git.com"), "");
+      writeFileSync(join(a, "npm.cmd"), "");
+      const win = { pathValue: `"${a}";${b}`, platform: "win32" as const, pathext: ".COM;.EXE" };
+      // An extensionless `git` in an earlier directory is not a program there.
+      expect(searchPath("git", win)).toEqual({ path: join(b, "git.com"), searchedDirs: 2 });
+      expect(searchPath("git.exe", win).path).toBe(join(b, "git.exe"));
+      // .CMD is not in this PATHEXT, so npm is not found; with the default it is.
+      expect(searchPath("npm", win).path).toBeNull();
+      expect(searchPath("npm", { ...win, pathext: undefined }).path).toBe(join(a, "npm.cmd"));
+    });
+  });
+
   test("the answer is stable across calls", async () => {
     const a = await commandExists.execute({ name: "sh" });
     const b = await commandExists.execute({ name: "sh" });
@@ -1077,12 +1453,104 @@ describe("EnvInspect", () => {
     expect(JSON.stringify(out)).not.toContain("sk-0123456789");
   });
 
-  test("reveals only what the caller names", async () => {
-    const out = await call(envInspect, {
-      names: ["TOOL_PROC_TOKEN"],
-      reveal: ["TOOL_PROC_TOKEN"],
+  // C052: before 0.7.1 the CALL chose what to reveal, so a model could read
+  // any key into its own context from a read-only tool plan mode runs unasked.
+  describe("a value is shown only where the operator allowed it", () => {
+    const KEY = ["sk-ant-api03-", "0123456789abcdef", "ABCDEFGH"].join("");
+    beforeEach(() => {
+      process.env["TOOL_PROC_API_KEY"] = KEY;
+      process.env["TOOL_PROC_MODE"] = "staging";
+      process.env["TOOL_PROC_PGPASSWORD"] = "hunter2";
+      process.env["TOOL_PROC_DATABASE_URL"] = "postgres://u:p@h/db";
+      process.env["TOOL_PROC_GITHUB_PAT"] = "ghp-lookalike-value";
     });
-    expect(out.variables[0].value).toBe("sk-0123456789");
+    afterEach(() => {
+      _resetProcConfig();
+      for (const n of [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_MODE",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ]) {
+        Reflect.deleteProperty(process.env, n);
+      }
+    });
+
+    test("with no tool_config, a reveal shows nothing and says why", async () => {
+      const out = await call(envInspect, {
+        names: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+        reveal: ["TOOL_PROC_API_KEY", "TOOL_PROC_MODE"],
+      });
+      expect(JSON.stringify(out)).not.toContain(KEY);
+      expect(JSON.stringify(out)).not.toContain("staging");
+      expect(out.variables).toEqual([
+        {
+          name: "TOOL_PROC_API_KEY",
+          present: true,
+          chars: KEY.length,
+          withheld: "credential-shaped",
+        },
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, withheld: "not-allowed" },
+      ]);
+      expect(out.note).toContain("tool_config.proc.env_reveal");
+    });
+
+    test("a listed, ordinary name is shown", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const out = await call(envInspect, { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] });
+      expect(out.variables).toEqual([
+        { name: "TOOL_PROC_MODE", present: true, chars: 7, value: "staging" },
+      ]);
+    });
+
+    test("a credential-shaped name is never shown, and cannot be listed", async () => {
+      // Names the old suffix-only heuristics missed are caught too.
+      const secretNames = [
+        "TOOL_PROC_API_KEY",
+        "TOOL_PROC_PGPASSWORD",
+        "TOOL_PROC_DATABASE_URL",
+        "TOOL_PROC_GITHUB_PAT",
+      ];
+      for (const name of secretNames) {
+        expect(() => registerProcConfig({ env_reveal: [name] })).toThrow("looks like a credential");
+      }
+      const out = await call(envInspect, { names: secretNames, reveal: secretNames });
+      for (const secret of [KEY, "hunter2", "postgres://u:p@h/db", "ghp-lookalike-value"]) {
+        expect(JSON.stringify(out)).not.toContain(secret);
+      }
+      expect(out.variables.map((v: { withheld?: string }) => v.withheld)).toEqual([
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+        "credential-shaped",
+      ]);
+    });
+
+    test("a model pool candidate's own block replaces the boot list for its calls", async () => {
+      registerProcConfig({ env_reveal: ["TOOL_PROC_MODE"] });
+      const input = { names: ["TOOL_PROC_MODE"], reveal: ["TOOL_PROC_MODE"] };
+      const narrowed = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: [] } } as never)),
+      );
+      expect(narrowed.variables[0].withheld).toBe("not-allowed");
+      const broken = JSON.parse(
+        String(await envInspect.execute(input, { toolConfig: { env_reveal: "x" } } as never)),
+      );
+      expect(broken.variables[0].withheld).toBe("not-allowed");
+    });
+
+    test("the registrar refuses a block it cannot read, naming the key", () => {
+      expect(() => registerProcConfig({ env_reveal: "NODE_ENV" })).toThrow(
+        "tool_config.proc.env_reveal",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["not a name"] })).toThrow(
+        "not an environment",
+      );
+      expect(() => registerProcConfig({ env_reveal: ["A"], envReveal: ["B"] })).toThrow("both");
+      expect(() => registerProcConfig({})).not.toThrow();
+      expect(() => registerProcConfig({ allowed_origins: ["https://a.example"] })).not.toThrow();
+    });
   });
 
   test("revealing something that was not inspected is refused", async () => {

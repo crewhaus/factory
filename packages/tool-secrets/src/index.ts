@@ -49,6 +49,8 @@ import { classifyWrite, helperName } from "./lib/backends";
 import {
   type Edit,
   type EnvDoc,
+  encodeBare,
+  exportedAssignment,
   parseEnvDoc,
   planUnset,
   planUpsert,
@@ -304,11 +306,25 @@ export const secretLookup: RegisteredTool = buildTool({
         });
         continue;
       }
-      const report = await lookupOne(parsed.value, {
-        toolName: "SecretLookup",
-        timeoutMs,
-        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
-      });
+      let report: LookupReport;
+      try {
+        report = await lookupOne(parsed.value, {
+          toolName: "SecretLookup",
+          timeoutMs,
+          ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        });
+      } catch (err) {
+        // One reference that breaks must not discard the answers for the
+        // others. Only the error's class is reported: a message can carry
+        // whatever the failing step was holding, and here that is a secret.
+        report = {
+          ref: formatRef(parsed.value),
+          backend: parsed.value.kind,
+          status: "error",
+          resolved: false,
+          reason: `looking this reference up failed unexpectedly (${err instanceof Error ? err.name : typeof err}); the other references were still checked.`,
+        };
+      }
       const rotated = lastRotation(journal.entries, formatRef(parsed.value));
       reports.push({
         ...report,
@@ -903,6 +919,18 @@ export const secretRotate: RegisteredTool = buildTool({
           // fact worth recording before a credential is replaced with it.
           detail: `read from ${resolution.source}${resolution.note !== undefined ? ` — ${resolution.note}` : ""}`,
         });
+      }
+      // An envfile can hold only a value it can write losslessly for every
+      // reader (see encodeBare). Refused HERE, before keep-previous touches
+      // the file: a refusal at write-new would leave KEY_PREVIOUS written
+      // beside an unchanged KEY (C137).
+      if (ref.kind === "envfile") {
+        const current = readDocForEdit("SecretRotate", ref.path);
+        const exported = current.ok && exportedAssignment(current.value.doc, ref.key);
+        const encodable = encodeBare(ref.key, newValue, { exported });
+        if (!encodable.ok) {
+          return failed("new-value", `${encodable.message} Nothing was written.`);
+        }
       }
       const afterFingerprint = fingerprint(newValue);
       if (beforeFingerprint === afterFingerprint) {

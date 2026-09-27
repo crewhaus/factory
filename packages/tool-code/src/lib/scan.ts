@@ -31,6 +31,7 @@
  *
  * Everything here is pure: same text in, same bytes out.
  */
+import { screenUserRegex } from "@crewhaus/tool-safety/regex";
 
 /** Character classification produced by `maskSource`. */
 export const KIND_CODE = 0;
@@ -804,84 +805,23 @@ export function scanTodos(
 // caller-supplied patterns
 
 /**
- * True when `pattern` contains a repetition nested inside a repetition, the
- * shape that makes a JavaScript regular expression backtrack exponentially.
+ * True when `pattern` repeats a group whose passes can end in more than one
+ * place or split their text more than one way — a nested quantifier or an
+ * overlapping repeated alternation, the shapes that make a JavaScript regular
+ * expression backtrack exponentially.
  *
- * `AstQuery` compiles a pattern the caller wrote and runs it against every
- * declaration name in a tree, and a JavaScript regex cannot be interrupted
- * once it is running: `^(a|a|aa)+$` against a twenty-six-character identifier
- * measured at six hundred milliseconds HERE, so a few thousand names is a
- * harness that never comes back. There is no timeout to reach for, so the
- * pattern is refused before it is compiled.
- *
- * The test is the classic star-height one, done with a scanner rather than a
- * pattern of its own: a group with an unbounded quantifier (`*`, `+`, `{n,}`)
- * on it whose body itself contains an unbounded quantifier or an alternation.
- * That rejects `(a+)+`, `(a*)*` and `(a|a)+`, and leaves the patterns a caller
- * actually writes over declaration names — `^get[A-Z]\w*`, `^(get|set)Foo$`,
- * `Service$` — alone, because in those the quantifier and the group are not
- * nested in each other.
+ * This is @crewhaus/tool-safety's shared screen (C079). 0.7.0 kept a scanner
+ * here that treated a bounded outer count as safe, so `^(a|a){1,99}$`,
+ * `^(\w|[a-zA-Z]){1,64}Z$` and `^(\w+){2,64}$` passed it and cost about
+ * 650 ms per long identifier. The shared screen models `{n,m}` and `?`,
+ * accepts a small bounded repetition only while the ways through it stay
+ * few, and is fuzzed. `AstQuery` also runs the match in the regex worker
+ * under a deadline, so this is the second layer, not the first.
  */
 export function hasNestedRepetition(pattern: string): boolean {
-  const opens: number[] = [];
-  let inClass = false;
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
-    if (c === "\\") {
-      i += 1;
-      continue;
-    }
-    if (inClass) {
-      if (c === "]") inClass = false;
-      continue;
-    }
-    if (c === "[") {
-      inClass = true;
-      continue;
-    }
-    if (c === "(") {
-      opens.push(i);
-      continue;
-    }
-    if (c !== ")") continue;
-    const start = opens.pop();
-    if (start === undefined) continue;
-    if (!unboundedQuantifierAt(pattern, i + 1)) continue;
-    if (repeatsOrBranches(pattern.slice(start + 1, i))) return true;
-  }
-  return false;
-}
-
-/** `*`, `+` or an open-ended `{n,}` at this offset. */
-function unboundedQuantifierAt(pattern: string, at: number): boolean {
-  const c = pattern[at];
-  if (c === "*" || c === "+") return true;
-  if (c !== "{") return false;
-  const close = pattern.indexOf("}", at);
-  if (close === -1) return false;
-  return /^\{\d*,\s*\}$/.test(pattern.slice(at, close + 1));
-}
-
-/** True when a group body has an unbounded quantifier or a top-level `|`. */
-function repeatsOrBranches(body: string): boolean {
-  let inClass = false;
-  for (let i = 0; i < body.length; i++) {
-    const c = body[i];
-    if (c === "\\") {
-      i += 1;
-      continue;
-    }
-    if (inClass) {
-      if (c === "]") inClass = false;
-      continue;
-    }
-    if (c === "[") {
-      inClass = true;
-      continue;
-    }
-    if (c === "|") return true;
-    if (c === "*" || c === "+") return true;
-    if (c === "{" && unboundedQuantifierAt(body, i)) return true;
-  }
-  return false;
+  const verdict = screenUserRegex(pattern);
+  return (
+    !verdict.ok &&
+    (verdict.code === "nested-quantifier" || verdict.code === "overlapping-alternation")
+  );
 }

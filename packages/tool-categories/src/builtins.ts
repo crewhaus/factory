@@ -218,6 +218,20 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     keys: ["vectorDelete"],
     binds: ["registerVectorTarget"],
   },
+  // 0.7.1 C052: which variables' VALUES EnvInspect may show
+  // (`tool_config.proc.env_reveal`); with no block it shows none.
+  // 0.7.1 C144: which non-loopback hosts WaitForPort may probe
+  // (`tool_config.proc.wait_for_port_hosts`); with none it probes loopback.
+  // Named by those two rows only: no other tool-proc tool reads the block,
+  // so a compiled README does not label RunCommand as configured by it, and
+  // `tool_config.runCommand` is not taken for a proc block.
+  registerProcConfig: {
+    package: "@crewhaus/tool-proc",
+    source: "tool_config",
+    label: "EnvInspect and WaitForPort",
+    keys: ["proc"],
+    initSymbol: "registerProcConfig",
+  },
   registerTokenConfig: {
     package: "@crewhaus/tool-token",
     source: "tool_config",
@@ -845,32 +859,67 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     name: "RunPipeline",
     io: "process",
   },
-  retry: { package: "@crewhaus/tool-proc", export: "retry", name: "Retry", io: "process" },
+  retry: {
+    package: "@crewhaus/tool-proc",
+    export: "retry",
+    name: "Retry",
+    io: "process",
+  },
   processStart: {
     package: "@crewhaus/tool-proc",
     export: "processStart",
     name: "ProcessStart",
     io: "process",
   },
-  processStatus: { package: "@crewhaus/tool-proc", export: "processStatus", name: "ProcessStatus" },
-  processOutput: { package: "@crewhaus/tool-proc", export: "processOutput", name: "ProcessOutput" },
+  processStatus: {
+    package: "@crewhaus/tool-proc",
+    export: "processStatus",
+    name: "ProcessStatus",
+  },
+  processOutput: {
+    package: "@crewhaus/tool-proc",
+    export: "processOutput",
+    name: "ProcessOutput",
+  },
   processStop: {
     package: "@crewhaus/tool-proc",
     export: "processStop",
     name: "ProcessStop",
     io: "process",
   },
-  processList: { package: "@crewhaus/tool-proc", export: "processList", name: "ProcessList" },
+  processList: {
+    package: "@crewhaus/tool-proc",
+    export: "processList",
+    name: "ProcessList",
+  },
   waitForPort: {
     package: "@crewhaus/tool-proc",
     export: "waitForPort",
     name: "WaitForPort",
     io: "network",
+    initSymbol: "registerProcConfig",
   },
-  waitForFile: { package: "@crewhaus/tool-proc", export: "waitForFile", name: "WaitForFile" },
-  waitForOutput: { package: "@crewhaus/tool-proc", export: "waitForOutput", name: "WaitForOutput" },
-  commandExists: { package: "@crewhaus/tool-proc", export: "commandExists", name: "CommandExists" },
-  envInspect: { package: "@crewhaus/tool-proc", export: "envInspect", name: "EnvInspect" },
+  waitForFile: {
+    package: "@crewhaus/tool-proc",
+    export: "waitForFile",
+    name: "WaitForFile",
+  },
+  waitForOutput: {
+    package: "@crewhaus/tool-proc",
+    export: "waitForOutput",
+    name: "WaitForOutput",
+  },
+  commandExists: {
+    package: "@crewhaus/tool-proc",
+    export: "commandExists",
+    name: "CommandExists",
+  },
+  envInspect: {
+    package: "@crewhaus/tool-proc",
+    export: "envInspect",
+    name: "EnvInspect",
+    initSymbol: "registerProcConfig",
+  },
   base64Encode: { package: "@crewhaus/tool-encode", export: "base64Encode", name: "Base64Encode" },
   base64Decode: { package: "@crewhaus/tool-encode", export: "base64Decode", name: "Base64Decode" },
   httpRequest: {

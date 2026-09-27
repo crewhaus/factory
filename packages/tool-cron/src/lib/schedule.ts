@@ -21,7 +21,7 @@
  * either one to a five-field parser produces a confident wrong answer rather
  * than an error — which is exactly the failure this package exists to avoid.
  */
-import { cronDescribe, cronNext } from "@crewhaus/tool-datetime";
+import { cronDescribe, cronNext, dateParse } from "@crewhaus/tool-datetime";
 
 export type CronReading = {
   readonly description?: string;
@@ -102,6 +102,68 @@ export async function readCronExpression(
       error: `reading the expression failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+}
+
+export type ReferenceInstant =
+  | { readonly ok: true; readonly epochMs: number; readonly notes: readonly string[] }
+  | { readonly ok: false; readonly error: string };
+
+/**
+ * Read the caller's reference instant the way `CronNext` reads `after`.
+ *
+ * A string with a `Z` or a `±hh:mm` offset names one instant everywhere. A
+ * string without one is read on the wall clock of `timeZone` — the same zone
+ * the schedules are walked in, UTC unless the caller names another — and
+ * NEVER on the host's own clock: `Date.parse` reads an offset-less date-time
+ * as host-local time, so the same call used to answer differently on every
+ * machine while the result claimed the zone the caller asked for.
+ *
+ * The grammar is tool-datetime's `DateParse`, reached through the tool for
+ * the same reason as `CronNext` above; a bare numeric date it finds
+ * ambiguous (03/04/2026) is refused with both readings, not guessed.
+ */
+export async function readReferenceInstant(
+  text: string,
+  timeZone: string,
+): Promise<ReferenceInstant> {
+  let raw: unknown;
+  try {
+    raw = await dateParse.execute({ text, assumeTimeZone: timeZone });
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false, error: "the datetime tool answered with something other than text" };
+  }
+  let parsed: {
+    ok?: unknown;
+    error?: unknown;
+    epochMs?: unknown;
+    notes?: unknown;
+    ambiguous?: { interpretations?: { dateOrder?: unknown; date?: unknown }[] };
+  };
+  try {
+    parsed = JSON.parse(raw) as typeof parsed;
+  } catch {
+    // A caller error comes back as a plain sentence; that sentence is the reason.
+    return { ok: false, error: raw };
+  }
+  if (
+    parsed.ok !== true ||
+    typeof parsed.epochMs !== "number" ||
+    !Number.isFinite(parsed.epochMs)
+  ) {
+    const readings = (parsed.ambiguous?.interpretations ?? [])
+      .map((reading) => `${String(reading.dateOrder)} => ${String(reading.date)}`)
+      .join(", ");
+    const error =
+      typeof parsed.error === "string" ? parsed.error : "it is not a date this tool can read";
+    return { ok: false, error: readings === "" ? error : `${error}: ${readings}` };
+  }
+  const notes = Array.isArray(parsed.notes)
+    ? parsed.notes.filter((note): note is string => typeof note === "string")
+    : [];
+  return { ok: true, epochMs: parsed.epochMs, notes };
 }
 
 /**

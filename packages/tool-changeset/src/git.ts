@@ -16,23 +16,32 @@
  *     signal, and stdout is read under a cap while the pipe keeps draining —
  *     a git whose output nobody reads blocks forever, deadline or no.
  *
- * This is a deliberate second copy of tool-git's runner rather than an
- * import: `@crewhaus/tool-git` publishes its tools, not its spawn helper, and
- * a dependency on a package for one unexported function would be worse than
- * seventy lines that do one thing. What is NOT copied twice is the diff
- * parser — that one comes from `@crewhaus/tool-text`, because two parsers
- * mean two line numberings and one of them is wrong.
+ * The spawn itself is tool-git's runner (`@crewhaus/tool-git/run`), not a
+ * copy of it. This package used to keep a second copy, and the copy is where
+ * a hardening lands last: 0.7.0's lacked even what tool-git had, so a
+ * repository's own config (an fsmonitor hook, a textconv, a clean filter) or
+ * an embedded bare repository made DiffLint — a read — run a program the
+ * repository named (C007). The shared runner switches all of that off for a
+ * read and spawns git without the harness's credentials. What is also not
+ * copied twice is the diff parser — that one comes from `@crewhaus/tool-text`,
+ * because two parsers mean two line numberings and one of them is wrong.
  */
 import { statSync } from "node:fs";
 import * as path from "node:path";
+import {
+  bareRefusal,
+  inheritedIndexEnv,
+  locateRepository,
+  neutralisedNote,
+  probeRepositoryFilters,
+  runGit,
+} from "@crewhaus/tool-git/run";
 import { ToolPermissionError, resolveSafe } from "./paths";
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 120_000;
 /** Largest patch this package will read, from a spawn or from the caller. */
 export const MAX_DIFF_CHARS = 8_000_000;
-/** Grace period for draining a pipe whose writer was killed on the deadline. */
-const DRAIN_GRACE_MS = 500;
 
 export type Refusal = { readonly ok: false; readonly message: string };
 export type Resolved<T> = { readonly ok: true; readonly value: T } | Refusal;
@@ -106,142 +115,6 @@ export function checkPathspecs(
   return undefined;
 }
 
-export type GitRun = {
-  readonly code: number;
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly timedOut: boolean;
-  readonly truncated: boolean;
-};
-
-/**
- * Read a pipe into a string that can never exceed `cap` characters.
- *
- * The obvious `new Response(stream).text()` buffers everything before
- * anything can be capped, so a diff of a vendored tree would be in memory
- * whole before a single character was dropped. This keeps the first `cap`
- * characters and goes on draining: the writer never blocks on a full pipe,
- * the exit code stays truthful, and memory is bounded by the cap.
- */
-async function readCapped(
-  stream: ReadableStream<Uint8Array> | null | undefined,
-  cap: number,
-): Promise<{ text: string; truncated: boolean }> {
-  if (stream === null || stream === undefined) return { text: "", truncated: false };
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  let truncated = false;
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done === true) break;
-      if (truncated) continue;
-      text += decoder.decode(chunk.value, { stream: true });
-      if (text.length > cap) {
-        text = text.slice(0, cap);
-        truncated = true;
-      }
-    }
-    if (!truncated) text += decoder.decode();
-  } finally {
-    reader.releaseLock();
-  }
-  return { text, truncated };
-}
-
-/**
- * Await a pipe's text, giving up after the grace period instead of hanging.
- * A killed git can leave a grandchild holding the write end open, in which
- * case the read never ends. A given-up read is reported as truncated rather
- * than passed off as "git printed nothing".
- */
-async function drain(
-  pending: Promise<{ text: string; truncated: boolean }>,
-): Promise<{ text: string; truncated: boolean }> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const fallback = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), DRAIN_GRACE_MS);
-  });
-  try {
-    const settled = await Promise.race([pending.catch(() => null), fallback]);
-    return settled === null ? { text: "", truncated: true } : settled;
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-/**
- * Flags applied before the subcommand. A pager or ANSI colour would be
- * unparseable and would depend on the operator's config; `core.quotepath=false`
- * keeps a non-ASCII filename from coming back octal-escaped.
- */
-const GLOBAL_ARGS: ReadonlyArray<string> = [
-  "--no-pager",
-  "-c",
-  "core.quotepath=false",
-  "-c",
-  "color.ui=false",
-];
-
-/** Run git once, bounded by a deadline and the caller's abort signal. */
-export async function runGit(
-  args: ReadonlyArray<string>,
-  opts: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxOutputChars?: number },
-): Promise<GitRun> {
-  const cap = opts.maxOutputChars ?? MAX_DIFF_CHARS;
-  let proc: ReturnType<typeof Bun.spawn>;
-  try {
-    proc = Bun.spawn(["git", ...GLOBAL_ARGS, ...args], {
-      cwd: opts.cwd,
-      env: {
-        ...process.env,
-        // LC_ALL=C pins git's own diagnostics to one language, so the message
-        // this module matches on does not change with the operator's locale.
-        LC_ALL: "C",
-        GIT_TERMINAL_PROMPT: "0",
-        // A read must never contend for the index lock with a sibling run.
-        GIT_OPTIONAL_LOCKS: "0",
-      },
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
-      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      code: 127,
-      stdout: "",
-      stderr: `could not start git: ${message}. Is git installed and on PATH?`,
-      timedOut: false,
-      truncated: false,
-    };
-  }
-
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    try {
-      proc.kill("SIGKILL");
-    } catch {
-      // Already exited between the timer firing and the kill.
-    }
-  }, opts.timeoutMs);
-
-  try {
-    // Both pipes are read concurrently with the wait on exit: a git that
-    // fills one pipe while nobody reads it blocks forever.
-    const stdoutRead = readCapped(proc.stdout as ReadableStream<Uint8Array>, cap);
-    const stderrRead = readCapped(proc.stderr as ReadableStream<Uint8Array>, 8_000);
-    const code = await proc.exited;
-    const [out, err] = await Promise.all([drain(stdoutRead), drain(stderrRead)]);
-    return { code, stdout: out.text, stderr: err.text, timedOut, truncated: out.truncated };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 export type DiffRequest = {
   readonly cwd?: string;
   readonly ref?: string;
@@ -255,6 +128,11 @@ export type CollectedDiff = {
   readonly diff: string;
   readonly truncated: boolean;
   readonly command: string;
+  /**
+   * Set when the repository's own config names filter programs, which this
+   * read did not run: a filtered file's diff is of its unfiltered bytes.
+   */
+  readonly repoConfigNote?: string;
 };
 
 /**
@@ -262,9 +140,10 @@ export type CollectedDiff = {
  *
  * `-U0` because this tool reads added lines and nothing else: context lines
  * are bytes nobody here looks at, and on a large change set they are most of
- * the patch. `--no-ext-diff` because a repository-configured external diff
- * driver can print anything at all, which would make the result depend on
- * local config.
+ * the patch. `--no-ext-diff` (and, from the shared runner, `--no-textconv`
+ * and the repository's own filter drivers switched off) because a
+ * repository-configured driver is a program the repository names, and a
+ * read runs none.
  *
  * Every failure comes back as a sentence, never a throw: a caller mistake —
  * a ref that does not exist, a directory that is not a repository — is normal
@@ -318,9 +197,40 @@ export async function collectDiff(
     ...(paths.length > 0 ? ["--", ...paths] : []),
   ];
   const timeoutMs = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  // git works on the repository it discovers from `cwd`, which can enclose
+  // the workspace or be named by a planted .git file: tool-git's check
+  // refuses any repository that is not the workspace's (C071).
+  const located = await locateRepository(toolName, request.cwd ?? ".", cwd, {
+    timeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (!located.ok) {
+    // DiffLint's own wording for "not a repository" says what to do instead.
+    if (/it is not a git repository/.test(located.message)) {
+      return refuse(
+        `${toolName} refused "${request.cwd ?? "."}": it is not a git repository. Pass \`diff\` text instead, or run from inside a checkout.`,
+      );
+    }
+    return refuse(located.message);
+  }
+  // The repository's own filter drivers are switched off for this read; a
+  // driver git cannot be told to skip refuses the call instead.
+  const filters = await probeRepositoryFilters(toolName, cwd, {
+    timeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (!filters.ok) return refuse(filters.message);
+  // Run from a pre-commit or prepare-commit-msg hook, the index being
+  // committed is the one git named in GIT_INDEX_FILE: keep it when it is this
+  // repository's, so a staged lint sees what is about to be committed.
+  const indexEnv = inheritedIndexEnv(located.value);
   const run = await runGit(args, {
     cwd,
     timeoutMs,
+    readOnly: true,
+    maxOutputChars: MAX_DIFF_CHARS,
+    ...(Object.keys(indexEnv).length > 0 ? { env: indexEnv } : {}),
+    ...(filters.value.configArgs.length > 0 ? { configArgs: filters.value.configArgs } : {}),
     ...(signal !== undefined ? { signal } : {}),
   });
 
@@ -332,9 +242,24 @@ export async function collectDiff(
   if (run.code === 127) return refuse(`${toolName} could not run git. ${run.stderr.trim()}`);
   if (run.code !== 0) {
     const detail = (run.stderr.trim() === "" ? run.stdout : run.stderr).trim();
-    // The two failures a caller can actually act on are worth naming, because
+    // The failures a caller can actually act on are worth naming, because
     // "exit 128" sends them looking for the wrong problem.
+    if (/cannot use bare repository/i.test(detail)) {
+      return refuse(bareRefusal(toolName, request.cwd ?? "."));
+    }
     if (/not a git repository/i.test(detail)) {
+      // `git diff` in a repository directory that safe.bareRepository refused
+      // falls back to --no-index mode and says only "Not a git repository";
+      // ask git which of the two it was, so the refusal names the real reason.
+      const probe = await runGit(["rev-parse", "--git-dir"], {
+        cwd,
+        timeoutMs,
+        readOnly: true,
+        ...(signal !== undefined ? { signal } : {}),
+      });
+      if (/cannot use bare repository/i.test(probe.stderr)) {
+        return refuse(bareRefusal(toolName, request.cwd ?? "."));
+      }
       return refuse(
         `${toolName} refused "${request.cwd ?? "."}": it is not a git repository. Pass \`diff\` text instead, or run from inside a checkout.`,
       );
@@ -349,12 +274,14 @@ export async function collectDiff(
     );
   }
 
+  const note = neutralisedNote(filters.value.neutralised);
   return {
     ok: true,
     value: {
       diff: run.stdout,
       truncated: run.truncated,
       command: `git ${args.join(" ")}`,
+      ...(note !== undefined ? { repoConfigNote: note } : {}),
     },
   };
 }
