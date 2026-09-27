@@ -143,6 +143,27 @@ function withoutMethodPrefix(argGlob: string): string | undefined {
   return rest !== undefined && argGlobCanMatchUrl(rest) ? rest : undefined;
 }
 
+/**
+ * `glob` re-cased to match `name`, for the shapes a case-only rewrite can be
+ * derived for: an exact name, `prefix*`, `*suffix` and `*middle*` whose
+ * literal part appears in `name` ignoring case. Undefined otherwise.
+ */
+function recasedGlob(glob: string, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  if (!GLOB_META.test(glob)) return glob.toLowerCase() === lower ? name : undefined;
+  const inner = /^(\*?)([^*?\\]+)(\*?)$/.exec(glob);
+  if (inner === null) return undefined;
+  const [, lead, literal, trail] = inner as unknown as [string, string, string, string];
+  const want = literal.toLowerCase();
+  let at: number;
+  if (lead === "" && trail === "*") at = lower.startsWith(want) ? 0 : -1;
+  else if (lead === "*" && trail === "")
+    at = lower.endsWith(want) ? lower.length - want.length : -1;
+  else if (lead === "*" && trail === "*") at = lower.indexOf(want);
+  else return undefined;
+  return at === -1 ? undefined : `${lead}${name.slice(at, at + literal.length)}${trail}`;
+}
+
 /** Every rule in `input.rules` that cannot do what it says, with the fix. */
 export function permissionRuleProblems(
   input: PermissionRuleProblemsInput,
@@ -169,8 +190,55 @@ export function permissionRuleProblems(
 
     const matched = input.granted.filter((t) => matchesToolName(compiled, t.name));
     if (matched.length === 0) {
-      // Written with a spec key? Rules are matched against the registered
-      // name, which starts with a capital.
+      // Written with spec keys? The glob is tried against every tool's KEY,
+      // not only with its first letter capitalised: `codegraph*` reaches the
+      // keys codegraphSearch… whose names are CodeGraphSearch…, and `*script`
+      // reaches javascript, whose name is JavaScript.
+      const pool = [...input.granted, ...input.known];
+      const byName = new Map<string, RuleToolDescriptor>();
+      for (const t of pool) {
+        if (
+          t.key !== undefined &&
+          t.key !== t.name &&
+          matchesToolName(compiled, t.key) &&
+          !matchesToolName(compiled, t.name)
+        ) {
+          byName.set(t.name, t);
+        }
+      }
+      if (byName.size > 0) {
+        const names = [...byName.keys()].sort();
+        // A rewrite is offered only when one re-cased glob reaches exactly
+        // these tools by name, no more and no fewer.
+        const candidate = recasedGlob(toolGlob, names[0] as string);
+        let fixed: string | undefined;
+        if (candidate !== undefined) {
+          const next = withTool(rule.pattern, candidate);
+          const nextCompiled = compilePattern(next);
+          const reached = new Set(
+            pool.filter((t) => matchesToolName(nextCompiled, t.name)).map((t) => t.name),
+          );
+          if (reached.size === names.length && names.every((n) => reached.has(n))) fixed = next;
+        }
+        const shown = names.length > 6 ? [...names.slice(0, 5), `${names.length - 5} more`] : names;
+        const list =
+          shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
+        const advice =
+          fixed !== undefined
+            ? `Write "${fixed}".`
+            : `Name ${names.length === 1 ? "it" : "them"} by name: ${list}.`;
+        const only = names.length === 1 ? byName.get(names[0] as string) : undefined;
+        report(
+          "tool-key-not-name",
+          only !== undefined
+            ? `rule "${rule.pattern}" ${GLOB_META.test(toolGlob) ? `matches ${only.key}` : `names ${toolGlob}`}, the key a spec lists the tool under, but a rule is matched against the tool's name, ${only.name}, so this rule never fires. ${advice}`
+            : `rule "${rule.pattern}" matches the keys a spec lists ${list} under, but a rule is matched against each tool's name, so this rule never fires. ${advice}`,
+          fixed,
+        );
+        continue;
+      }
+      // Written with a spec key the descriptors do not carry? Rules are
+      // matched against the registered name, which starts with a capital.
       const capitalised = toolGlob.charAt(0).toUpperCase() + toolGlob.slice(1);
       if (capitalised !== toolGlob) {
         const fixed = withTool(rule.pattern, capitalised);

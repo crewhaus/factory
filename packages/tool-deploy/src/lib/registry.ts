@@ -102,7 +102,33 @@ export type ResolvedName = {
   readonly registryName: string;
   /** True when the mapping changed the name, so the result can say so. */
   readonly mapped: boolean;
+  /**
+   * Present (read access only) when `listSpecs` hides this name. A writer
+   * never gets one: {@link resolveName} refuses such a name for a write.
+   */
+  readonly hiddenFromListing?: true;
 };
+
+/**
+ * Whether `@crewhaus/spec-registry`'s `listSpecs` enumerates a spec stored
+ * under `registryName`: it skips every directory whose name starts with `_`
+ * or `.`, and `_tenants` is the tenant-overlay directory itself. Mirrored
+ * because the package keeps the rule private, and asserted against the real
+ * adapter in `lib.test.ts` like the filenames above, so an upstream change
+ * fails a test rather than silently hiding a pin.
+ */
+export function isListedSpecName(registryName: string): boolean {
+  return !registryName.startsWith("_") && !registryName.startsWith(".");
+}
+
+/** Why a hidden spec name matters, said once for the refusal and the report. */
+export const HIDDEN_FROM_LISTING =
+  '@crewhaus/spec-registry\'s listSpecs skips every name that starts with "_" or "." ' +
+  "(\"_tenants\" is the registry's tenant-overlay directory), so this spec's pins are missing from " +
+  "DeployInspect's registry-wide listing and from every other listSpecs walk, fleet migrations included";
+
+/** Whether a name is resolved for a call that may write (pin, roll back) or only reads. */
+export type NameAccess = "write" | "read";
 
 /**
  * Put a caller's spec name through `@crewhaus/spec-changelog`'s own mapping —
@@ -114,8 +140,13 @@ export type ResolvedName = {
  * so every such spec lands in ONE shared directory: a pin for one silently
  * repoints another. That is a collision the caller cannot see from their own
  * input, so it is refused rather than mapped.
+ *
+ * The second is a name `listSpecs` hides (a leading `_`, `_tenants`
+ * included; a leading `.` cannot survive the mapping). A WRITE under it is
+ * refused (security-11#9); a READ is allowed and marked, so what an earlier
+ * build pinned there can still be inspected.
  */
-export function resolveName(given: string): Loaded<ResolvedName> {
+export function resolveName(given: string, access: NameAccess = "write"): Loaded<ResolvedName> {
   if (given.includes("\u0000")) {
     return fail("bad-input", `spec name "${render(given)}" contains a NUL byte`);
   }
@@ -129,7 +160,26 @@ export function resolveName(given: string): Loaded<ResolvedName> {
       `spec name "${render(given)}" has nothing the registry can use, so @crewhaus/spec-changelog's registrySpecName maps it to the shared fallback "spec" — where it would share a directory, a manifest and every environment pin with every other unmappable name. Give the spec a name containing letters, digits, "_", "." or "-".`,
     );
   }
-  return { ok: true, value: { given, registryName, mapped: registryName !== given } };
+  const hidden = !isListedSpecName(registryName);
+  if (hidden && access === "write") {
+    // A pin written here would exist on disk and be absent from every
+    // enumeration, and "_tenants" would mix a spec's manifest into the
+    // overlay directory. Reads stay allowed, so a pin 0.7.0 wrote under
+    // such a name can still be inspected by name.
+    return fail(
+      "bad-input",
+      `spec name "${render(given)}" is stored as "${render(registryName)}", and ${HIDDEN_FROM_LISTING}. Give the spec a name that starts with a letter, a digit or "-".`,
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      given,
+      registryName,
+      mapped: registryName !== given,
+      ...(hidden ? { hiddenFromListing: true as const } : {}),
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------

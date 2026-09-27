@@ -324,6 +324,7 @@
       "version": "0.7.0",
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/barge-in-controller": {
@@ -854,13 +855,11 @@
       "dependencies": {
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
-      },
-      "devDependencies": {
-        "@crewhaus/eval-dataset": "workspace:*",
       },
     },
     "packages/eval-report": {
@@ -869,6 +868,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/eval-runner": {
@@ -2437,6 +2437,7 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/tool-registry-manifest": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2480,6 +2481,7 @@
         "@crewhaus/eval-dataset": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2641,6 +2643,7 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3098,6 +3101,7 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-code": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {

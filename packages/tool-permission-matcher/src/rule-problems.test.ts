@@ -58,6 +58,75 @@ describe("rules that name no tool", () => {
     expect(problems(["write(src/**)"])[0]?.suggestion).toBe("Write(src/**)");
   });
 
+  // The first 0.7.1 cut found a key-form tool half only by upper-casing its
+  // first letter, which is not how every builtin's name differs from its key:
+  // `codegraph*` and `*script` passed lint and --strict silently and never
+  // fired, because the names are CodeGraphSearch… and JavaScript.
+  test("a key-form GLOB is caught however the name differs from the key", () => {
+    const irregular = [
+      { name: "CodeGraphSearch", key: "codegraphSearch", ...safe },
+      { name: "CodeGraphCallers", key: "codegraphCallers", ...safe },
+      { name: "JavaScript", key: "javascript", destructive: true },
+    ];
+    const run = (type: string, pattern: string) =>
+      permissionRuleProblems({
+        rules: [{ type, pattern }],
+        granted: irregular,
+        known: [...irregular, tool("GraphqlQuery", [{ kind: "url" }])],
+        mcpServers: [],
+      });
+    const cases: Array<[string, string | undefined, string[]]> = [
+      ["codegraph*", "CodeGraph*", ["CodeGraphCallers", "CodeGraphSearch"]],
+      ["*script", "*Script", ["JavaScript"]],
+      ["codegraphSearch", "CodeGraphSearch", ["CodeGraphSearch"]],
+      ["codegraphS?arch", undefined, ["CodeGraphSearch"]],
+      ["*graph*", "*Graph*", ["CodeGraphCallers", "CodeGraphSearch", "GraphqlQuery"]],
+    ];
+    for (const [pattern, suggestion, names] of cases) {
+      const found = run("alwaysDeny", pattern);
+      expect({
+        pattern,
+        codes: found.map((p) => p.code),
+        suggestion: found[0]?.suggestion,
+        named: names.every((n) => found[0]?.message.includes(n)),
+      }).toEqual({ pattern, codes: ["tool-key-not-name"], suggestion, named: true });
+      // Every rewrite offered is one the engine matches, to exactly those tools.
+      if (suggestion !== undefined) {
+        const compiled = compilePattern(suggestion);
+        expect(
+          irregular
+            .filter((t) => matchesToolName(compiled, t.name))
+            .map((t) => t.name)
+            .sort(),
+        ).toEqual(names.filter((n) => irregular.some((t) => t.name === n)));
+      }
+    }
+    // A glob that already reaches a tool by NAME is not a key-form rule,
+    // even when it reaches that tool's key as well (`*Path` is RemovePath's
+    // name and the end of its key removePath; the tool is just not granted).
+    expect(run("alwaysDeny", "Code*")).toEqual([]);
+    expect(
+      permissionRuleProblems({
+        rules: [{ type: "alwaysDeny", pattern: "*Path" }],
+        granted: irregular,
+        known: [...irregular, removePath],
+        mcpServers: [],
+      }),
+    ).toEqual([]);
+    // No rewrite that would reach a tool the key-form glob did not: here a
+    // re-cased `*Graph*` would also allow Graphite, listed as `plotter`.
+    const widened = permissionRuleProblems({
+      rules: [{ type: "alwaysAllow", pattern: "*graph*" }],
+      granted: irregular,
+      known: [...irregular, { name: "Graphite", key: "plotter", destructive: true }],
+      mcpServers: [],
+    });
+    expect(widened.map((p) => [p.code, p.suggestion])).toEqual([["tool-key-not-name", undefined]]);
+    expect(widened[0]?.message).toContain(
+      "Name them by name: CodeGraphCallers and CodeGraphSearch.",
+    );
+  });
+
   test("a near miss of a tool name, and nothing for a name it has never heard of", () => {
     expect(problems(["Tre"])[0]).toMatchObject({ code: "unknown-tool", suggestion: "Tree" });
     // `Task`, `Consult` and a sub-agent's own tools are added at run time.

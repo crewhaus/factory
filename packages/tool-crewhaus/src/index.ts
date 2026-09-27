@@ -38,7 +38,12 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
-import { type VerifyResult, verify as verifyAuditChain } from "@crewhaus/audit-log";
+import {
+  type ChainFiles,
+  type VerifyResult,
+  listChainFiles,
+  verify as verifyAuditChain,
+} from "@crewhaus/audit-log";
 import { type CompileWarning, compile, expandSpecToolCategories } from "@crewhaus/compiler";
 import {
   type PreflightItem,
@@ -440,7 +445,7 @@ export const specCompileCheck: RegisteredTool = buildTool({
 export const specSummarize: RegisteredTool = buildTool({
   name: "SpecSummarize",
   description:
-    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path, and a stdio server's argv has its credential-shaped entries redacted, so a credential pasted into a spec is not echoed into the report.",
+    "Summarize a spec as structured JSON: shape, models, the tools granted at each site, MCP servers, permission rules and which optional blocks are declared. Use to see what a harness IS without reading its YAML — the projection is shape-agnostic, so a workflow, a crew and a channel all come back in the same form. MCP `env` and `headers` are reported by key only, an `sse` URL is reduced to origin and path, and a stdio server's argv has its credentials redacted (a credential flag's value, a header value, a URL's userinfo and token parameters), so a credential pasted into a spec is not echoed into the report.",
   inputSchema: specSourceSchema,
   readOnly: true,
   concurrencySafe: true,
@@ -456,7 +461,7 @@ export const specSummarize: RegisteredTool = buildTool({
 export const specDiff: RegisteredTool = buildTool({
   name: "SpecDiff",
   description:
-    "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
+    "Compare two specs semantically — a tool granted, a server added, a permission rule dropped, a model swapped — and flag which changes WIDEN what the harness can do. Use to review a spec edit before it ships: reordered keys, comments and reformatting are invisible here because both sides are parsed first. An existing MCP server counts too: a different command, argv, transport or endpoint, an added env or header key, a changed env, header or redacted-argv value (reported without the value) and a removed destructive or requireJustification trust flag all widen. It compares structure only, so it cannot tell you that a rewritten instruction changed the agent's behaviour.",
   inputSchema: z.object({
     before: specSourceSchema.describe("the spec as it was"),
     after: specSourceSchema.describe("the spec as it is now"),
@@ -603,34 +608,43 @@ export const permissionAudit: RegisteredTool = buildTool({
   execute: async (input) => {
     const text = loadSpecText("PermissionAudit", input);
     if (!text.ok) return text.message;
-    const view = specView(text.value);
-    if (!view.ok) return view.message;
+    const parsed = parseOrExplain(text.value);
+    if (!parsed.ok) return parsed.message;
+    // `all-<category>` selectors are expanded the way the compiler expands
+    // them, as ToolInventory does: audited unexpanded, `tools: [all-http]`
+    // was one pseudo-tool named "all-http", and a live `alwaysDeny
+    // HttpRequest` was listed as a rule that matches nothing (C032).
+    let expanded: Spec = parsed.value;
+    let categoryError: string | undefined;
+    try {
+      expanded = expandSpecToolCategories(parsed.value);
+    } catch (err) {
+      categoryError = (err as Error).message;
+    }
+    const view = buildSpecView(expanded, collectSpecModels(expanded));
 
     // The one destructive signal a spec carries on its own: an MCP server's
     // narrowing `tool_flags`.
     const destructive = new Set(input.destructiveTools ?? []);
     const flaggedDefaults: string[] = [];
-    const parsed = parseOrExplain(text.value);
-    if (parsed.ok) {
-      const servers = asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {};
-      for (const [server, raw] of Object.entries(servers)) {
-        const flags = asRecord(asRecord(raw)?.["tool_flags"]);
-        if (flags === undefined) continue;
-        if (asRecord(flags["defaults"])?.["destructive"] === true) flaggedDefaults.push(server);
-        for (const [tool, entry] of Object.entries(asRecord(flags["per_tool"]) ?? {})) {
-          if (asRecord(entry)?.["destructive"] === true) destructive.add(`mcp__${server}__${tool}`);
-        }
+    const servers = asRecord(asRecord(parsed.value)?.["mcp_servers"]) ?? {};
+    for (const [server, raw] of Object.entries(servers)) {
+      const flags = asRecord(asRecord(raw)?.["tool_flags"]);
+      if (flags === undefined) continue;
+      if (asRecord(flags["defaults"])?.["destructive"] === true) flaggedDefaults.push(server);
+      for (const [tool, entry] of Object.entries(asRecord(flags["per_tool"]) ?? {})) {
+        if (asRecord(entry)?.["destructive"] === true) destructive.add(`mcp__${server}__${tool}`);
       }
     }
 
-    const judge = parsed.ok
-      ? asRecord(asRecord(asRecord(parsed.value)?.["security"])?.["justification"])?.["judge"]
-      : undefined;
+    const judge = asRecord(asRecord(asRecord(parsed.value)?.["security"])?.["justification"])?.[
+      "judge"
+    ];
     const result = auditPermissions({
-      tools: view.value.tools,
-      mode: view.value.permissions.mode,
-      askMode: view.value.permissions.askMode,
-      rules: view.value.permissions.rules,
+      tools: view.tools,
+      mode: view.permissions.mode,
+      askMode: view.permissions.askMode,
+      rules: view.permissions.rules,
       destructiveTools: destructive,
       // permission-integration#9 / flag-truth-3#4 — a builtin's real flags,
       // from the manifest generated off the tools themselves, instead of
@@ -640,10 +654,11 @@ export const permissionAudit: RegisteredTool = buildTool({
       // The builtins, and the tools the runtime registers without a spec
       // listing them — `alwaysAllow Skill` names a real tool.
       knownTools: [...Object.values(TOOL_FLAGS), ...RUNTIME_TOOL_NAMES.map((name) => ({ name }))],
-      mcpServers: view.value.mcpServers.map((s) => s.name),
+      mcpServers: view.mcpServers.map((s) => s.name),
       ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });
     return json({
+      ...(categoryError !== undefined ? { categoryError } : {}),
       ...result,
       ...(flaggedDefaults.length > 0
         ? {
@@ -757,7 +772,7 @@ export const preflightRun: RegisteredTool = buildTool({
 export const harnessInventory: RegisteredTool = buildTool({
   name: "HarnessInventory",
   description:
-    "Enumerate the harnesses under a directory — name, shape, model, spec path, whether a bundle exists and whether it is older than the spec. Use to get the fleet table a supervisor starts from. A harness is any directory carrying a crewhaus.yaml, matching what `crewhaus fleet` discovers; the walk is depth-bounded, skips state and vendor directories, and never follows a directory symlink. A spec that does not parse is still listed, marked invalid, with its first issue.",
+    "Enumerate the harnesses under a directory — name, shape, model, spec path, whether a bundle exists and whether it is older than the spec (`unreadable`, with the reason, when that cannot be determined). Use to get the fleet table a supervisor starts from. A harness is any directory carrying a crewhaus.yaml, matching what `crewhaus fleet` discovers; the walk is depth-bounded, skips state and vendor directories, and never follows a directory symlink. A spec that does not parse is still listed, marked invalid, with its first issue.",
   inputSchema: z.object({
     root: z.string().optional().describe("where to look; defaults to the working directory"),
     maxDepth: z.number().int().min(0).max(12).optional().describe("walk depth cap (default 6)"),
@@ -796,6 +811,8 @@ export const harnessInventory: RegisteredTool = buildTool({
         specValid: identity.valid,
         ...(identity.firstIssue !== undefined ? { firstIssue: identity.firstIssue } : {}),
         bundle: freshness.state,
+        // `unreadable` is "could not determine", never "missing": say why.
+        ...(freshness.reason !== undefined ? { bundleDetail: freshness.reason } : {}),
       };
     });
 
@@ -807,6 +824,7 @@ export const harnessInventory: RegisteredTool = buildTool({
         invalidSpecs: harnesses.filter((h) => !h.specValid).length,
         staleBundles: harnesses.filter((h) => h.bundle === "stale").length,
         missingBundles: harnesses.filter((h) => h.bundle === "missing-bundle").length,
+        unreadableBundles: harnesses.filter((h) => h.bundle === "unreadable").length,
       },
       harnesses,
       ...(found.unreadable.length > 0 ? { unreadable: found.unreadable } : {}),
@@ -817,7 +835,7 @@ export const harnessInventory: RegisteredTool = buildTool({
 export const bundleFreshness: RegisteredTool = buildTool({
   name: "BundleFreshness",
   description:
-    'Compare each harness\'s compiled bundle against its spec and report which bundles are stale or missing, with the command that fixes them. Use to find the harnesses running yesterday\'s spec before you trust what they do. The comparison is the mtime heuristic preflight uses — mtimes lie across git checkouts, file copies and clock skew, so a `stale` verdict means "recompile to be sure", not "proven different".',
+    'Compare each harness\'s compiled bundle against its spec and report which bundles are stale or missing, with the command that fixes them. Use to find the harnesses running yesterday\'s spec before you trust what they do. The comparison is the mtime heuristic preflight uses — mtimes lie across git checkouts, file copies and clock skew, so a `stale` verdict means "recompile to be sure", not "proven different". A bundle or spec that exists but cannot be examined is `unreadable`, with the reason, never reported as missing.',
   inputSchema: z.object({
     dirs: z
       .array(z.string())
@@ -827,7 +845,12 @@ export const bundleFreshness: RegisteredTool = buildTool({
       .string()
       .optional()
       .describe("where to discover harnesses (default: working directory)"),
-    staleOnly: z.boolean().optional().describe("return only the bundles that need a recompile"),
+    staleOnly: z
+      .boolean()
+      .optional()
+      .describe(
+        "return only the bundles that need attention: stale or missing (recompile) and unreadable (the answer is unknown)",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -855,12 +878,20 @@ export const bundleFreshness: RegisteredTool = buildTool({
       rows.push({
         dir: dir.value.rel === "" ? "." : dir.value.rel,
         state: freshness.state,
+        // A recompile is the fix for a stale or absent bundle only. An
+        // unreadable one is UNKNOWN, and compiling over it fixes nothing.
         ...(freshness.state === "stale" || freshness.state === "missing-bundle"
           ? { remediation: "crewhaus compile crewhaus.yaml" }
           : {}),
+        ...(freshness.reason !== undefined ? { detail: freshness.reason } : {}),
       });
     }
-    const needsWork = rows.filter((r) => r["state"] === "stale" || r["state"] === "missing-bundle");
+    // Everything the caller must act on: a recompile, or a look at why the
+    // answer could not be determined.
+    const needsWork = rows.filter(
+      (r) =>
+        r["state"] === "stale" || r["state"] === "missing-bundle" || r["state"] === "unreadable",
+    );
     return json({
       checked: rows.length,
       counts: {
@@ -868,36 +899,13 @@ export const bundleFreshness: RegisteredTool = buildTool({
         stale: rows.filter((r) => r["state"] === "stale").length,
         missingBundle: rows.filter((r) => r["state"] === "missing-bundle").length,
         missingSpec: rows.filter((r) => r["state"] === "missing-spec").length,
+        unreadable: rows.filter((r) => r["state"] === "unreadable").length,
       },
       method: "mtime heuristic (approximate — mtimes lie across checkouts and copies)",
       bundles: input.staleOnly === true ? needsWork : rows,
     });
   },
 });
-
-/**
- * Total bytes of the `*.jsonl` files directly under an audit directory, or
- * `undefined` when the directory cannot be listed. Not recursive, because
- * `verify` is not: it reads exactly this set.
- */
-function chainBytes(dirReal: string): number | undefined {
-  let total = 0;
-  let names: string[];
-  try {
-    names = readdirSync(dirReal);
-  } catch {
-    return undefined;
-  }
-  for (const name of names) {
-    if (!name.endsWith(".jsonl")) continue;
-    try {
-      total += statSync(path.join(dirReal, name)).size;
-    } catch {
-      // Raced deletion — `verify` will skip it too.
-    }
-  }
-  return total;
-}
 
 export const auditVerify: RegisteredTool = buildTool({
   name: "AuditVerify",
@@ -924,23 +932,40 @@ export const auditVerify: RegisteredTool = buildTool({
     const dir = resolveDir("AuditVerify", rel);
     if (!dir.ok) return dir.message;
     const maxBytes = input.maxBytes ?? DEFAULT_MAX_AUDIT_BYTES;
-    const size = chainBytes(dir.value.real);
-    if (size === undefined) {
+    // The same list `verify` walks, each entry checked (without opening it)
+    // to be a regular file: a chain file linked out of the directory, or a
+    // FIFO, is tamper evidence and is reported as the break — never read,
+    // never counted as zero bytes (security-5#2, flag-truth-3#6).
+    let chain: ChainFiles;
+    try {
+      chain = listChainFiles(dir.value.real);
+    } catch {
       return `audit log at "${renderPath(rel)}" could not be listed`;
     }
+    const dirShown = dir.value.rel === "" ? "." : dir.value.rel;
+    if (!chain.ok) {
+      return json({
+        ok: false,
+        dir: dirShown,
+        recordsChecked: 0,
+        break: { file: chain.file, line: 0, reason: chain.reason },
+      });
+    }
+    const size = chain.bytes + chain.tailBytes;
     if (size > maxBytes) {
-      return `audit log at "${renderPath(rel)}" is ${size} bytes across its *.jsonl files, over the ${maxBytes} limit — raise maxBytes to walk it anyway`;
+      return `audit log at "${renderPath(rel)}" is ${size} bytes across its *.jsonl files and anchor, over the ${maxBytes} limit — raise maxBytes to walk it anyway`;
     }
     let result: VerifyResult;
     try {
       result = await verifyAuditChain(dir.value.real);
-    } catch (err) {
-      return `audit log at "${renderPath(rel)}" could not be verified: ${(err as Error).message}`;
+    } catch {
+      // Not the error text: a node error carries the absolute path.
+      return `audit log at "${renderPath(rel)}" could not be verified (an entry could not be read)`;
     }
     if (result.ok) {
       return json({
         ok: true,
-        dir: dir.value.rel === "" ? "." : dir.value.rel,
+        dir: dirShown,
         recordsChecked: result.recordsChecked,
         anchorChecked: result.anchorChecked,
         externalAnchorChecked: result.externalAnchorChecked,
@@ -959,7 +984,7 @@ export const auditVerify: RegisteredTool = buildTool({
       : result.file;
     return json({
       ok: false,
-      dir: dir.value.rel === "" ? "." : dir.value.rel,
+      dir: dirShown,
       recordsChecked: result.recordsChecked,
       break: { file: broken, line: result.line, reason: result.reason },
     });
@@ -1022,7 +1047,7 @@ function loadEvalDoc(
 export const evalBaselineCompare: RegisteredTool = buildTool({
   name: "EvalBaselineCompare",
   description:
-    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
+    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A comparison that never happened fails: runs that share no sample ids, or that name different datasets (unless allowDatasetMismatch), fail the gate, and minSharedFraction can require the candidate to cover more of the baseline. Another version or split of the same registry dataset (golden@v3 against golden@v4 or golden@v3#dev) is the same dataset: it is noted, not failed. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
   inputSchema: z.object({
     baseline: evalDocSchema.optional().describe("the baseline run's results document"),
     baselinePath: z.string().optional().describe("path to the baseline results.json instead"),
@@ -1052,6 +1077,20 @@ export const evalBaselineCompare: RegisteredTool = buildTool({
       .max(1)
       .optional()
       .describe("verdict-preserving score moves smaller than this are not reported (default 0.1)"),
+    allowDatasetMismatch: z
+      .boolean()
+      .optional()
+      .describe(
+        "gate two runs that name different datasets anyway (default false: their scores are not comparable, so the gate fails). Another version or split of one registry dataset is not a different dataset",
+      ),
+    minSharedFraction: z
+      .number()
+      .min(0)
+      .max(1)
+      .optional()
+      .describe(
+        "the share of the baseline's samples the candidate must also have run, e.g. 1 for all of them (default: any overlap; none at all always fails)",
+      ),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -1075,6 +1114,12 @@ export const evalBaselineCompare: RegisteredTool = buildTool({
       ...(input.maxPassRateDrop !== undefined ? { maxPassRateDrop: input.maxPassRateDrop } : {}),
       ...(input.maxRegressions !== undefined ? { maxRegressions: input.maxRegressions } : {}),
       ...(input.scoreEpsilon !== undefined ? { scoreEpsilon: input.scoreEpsilon } : {}),
+      ...(input.allowDatasetMismatch !== undefined
+        ? { allowDatasetMismatch: input.allowDatasetMismatch }
+        : {}),
+      ...(input.minSharedFraction !== undefined
+        ? { minSharedFraction: input.minSharedFraction }
+        : {}),
     };
     return json({
       ...compareEvalRuns(baseline.value, candidate.value, thresholds),

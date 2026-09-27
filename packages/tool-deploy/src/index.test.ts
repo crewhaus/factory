@@ -29,6 +29,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { createFileBackedRegistry } from "@crewhaus/spec-registry";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import type { z } from "zod";
 import { DEPLOY_TOOLS, deployInspect, deployRollback, specPin } from "./index";
@@ -262,6 +263,57 @@ test("SpecPin refuses a spec name that would land in the shared fallback directo
   expect(r["status"]).toBe("refused");
   expect(String(r["reason"])).toContain('fallback "spec"');
   expect(existsSync(path.join(tmp, ROOT_REL, "spec"))).toBe(false);
+});
+
+test("SpecPin refuses a name the registry's listing hides, and writes nothing (security-11#9)", async () => {
+  writeFileSync(path.join(tmp, "spec.yaml"), "name: x\n");
+  for (const name of ["_tenants", "_hidden"]) {
+    const r = await call(specPin, { name, specFile: "spec.yaml", env: "prod" });
+    expect({ name, status: r["status"], code: r["code"] }).toEqual({
+      name,
+      status: "refused",
+      code: "bad-input",
+    });
+    expect(String(r["reason"])).toContain("listSpecs");
+    // On 0.7.0 "_tenants" got manifest.json, v1.yaml and CHANGELOG.md beside
+    // the tenant overlays, and "_hidden" a pin no enumeration showed.
+    expect(existsSync(path.join(tmp, ROOT_REL, name, MANIFEST_FILENAME))).toBe(false);
+  }
+  expect(existsSync(specDir("_hidden"))).toBe(false);
+});
+
+test("a spec an earlier build stored under a hidden name is named by DeployInspect, and readable by name", async () => {
+  // Seeded through the real adapter, as 0.7.0's SpecPin or compile's
+  // auto-registration of a spec named "_legacy" would have left it.
+  const registry = createFileBackedRegistry({ rootDir: path.join(tmp, ROOT_REL) });
+  await registry.put("_legacy", "v1", "name: _legacy\n");
+  await registry.pin("_legacy", "prod", "v1");
+  await registry.put("demo", "v1", "name: demo\n");
+  await registry.pinForTenant("acme", "demo", "prod", "v1");
+
+  const all = await call(deployInspect, {});
+  const shown = (at(all, "specs", "shown") as Json[]).map((s) => s["registryName"]);
+  expect(shown).toEqual(["demo"]);
+  // Not silently absent: named, with why. The overlay directory is not a spec.
+  expect(at(all, "hiddenByRegistry", "names")).toEqual(["_legacy"]);
+  expect(String(at(all, "hiddenByRegistry", "reason"))).toContain("listSpecs");
+
+  const one = await call(deployInspect, { name: "_legacy" });
+  const spec = (at(one, "specs", "shown") as Json[])[0];
+  expect(spec?.["present"]).toBe(true);
+  expect(spec?.["pins"]).toEqual([expect.objectContaining({ env: "prod", version: "v1" })]);
+  expect(String(spec?.["hiddenFromListing"])).toContain("listSpecs");
+
+  // Rolling it back is a write, so it is refused like a pin.
+  const rollback = await call(deployRollback, {
+    name: "_legacy",
+    env: "prod",
+    toVersion: "v1",
+    dryRun: false,
+  });
+  expect(rollback["status"]).toBe("refused");
+  expect(String(rollback["reason"])).toContain("listSpecs");
+  expect(pinsOnDisk("_legacy")).toEqual({ prod: "v1" });
 });
 
 test("SpecPin keeps a missing spec file apart from an unreadable one", async () => {

@@ -26,6 +26,7 @@ import {
   startDeadline,
 } from "./lib/net";
 import {
+  type RangeDialect,
   highestSatisfying,
   highestVersion,
   isSemverShaped,
@@ -118,11 +119,16 @@ describe("package names", () => {
 
 describe("range dialects", () => {
   test("a bare Cargo requirement is a caret, and reading it as npm gets it wrong", () => {
-    const cargo = toNpmRange("crates", "1");
-    expect(cargo).toEqual({ ok: true, range: "^1" });
-    // The whole reason this translation exists: `serde = "1"` allows 1.9.0.
+    const cargo = toNpmRange("crates", "1.2.3");
+    expect(cargo).toEqual({ ok: true, range: "^1.2.3" });
+    // The whole reason this translation exists: `serde = "1.2.3"` allows
+    // 1.9.0, and npm reads a bare 1.2.3 as exactly that version.
+    expect(versionSatisfies("1.9.0", "^1.2.3")).toBe(true);
+    expect(versionSatisfies("1.9.0", "1.2.3")).toBe(false);
+    // `serde = "1"` allows 1.9.0 either way: npm reads a missing segment as a
+    // wildcard, and the caret keeps it.
+    expect(toNpmRange("crates", "1")).toEqual({ ok: true, range: "^1" });
     expect(versionSatisfies("1.9.0", "^1")).toBe(true);
-    expect(versionSatisfies("1.9.0", "1")).toBe(false);
   });
 
   test("Cargo commas become whitespace, wildcards are left alone", () => {
@@ -133,9 +139,48 @@ describe("range dialects", () => {
 
   test("PEP 440 compatible releases expand to the bound they mean", () => {
     expect(toNpmRange("pypi", "~=1.4.2")).toEqual({ ok: true, range: ">=1.4.2 <1.5.0" });
-    expect(toNpmRange("pypi", "~=1.4")).toEqual({ ok: true, range: ">=1.4 <2.0.0" });
+    expect(toNpmRange("pypi", "~=1.4")).toEqual({ ok: true, range: ">=1.4.0 <2.0.0" });
     expect(versionSatisfies("1.4.9", ">=1.4.2 <1.5.0")).toBe(true);
     expect(versionSatisfies("1.5.0", ">=1.4.2 <1.5.0")).toBe(false);
+  });
+
+  // npm reads a missing segment as a wildcard (`>1.4` is `>=1.5.0`, `<=1.4`
+  // is `<1.5.0`); PEP 440 and Poetry read it as zero. The translation pads,
+  // so what each dialect declared is what gets evaluated.
+  test("a PEP 440 or Poetry version with fewer than three segments means what its dialect says", () => {
+    const cases: Array<[RangeDialect, string, string, boolean]> = [
+      ["pep440", "==1.4", "1.4.1", false],
+      ["pep440", "==1.4", "1.4.0", true],
+      ["pep440", ">1.4", "1.4.1", true],
+      ["pep440", "<=1.4", "1.4.5", false],
+      ["pep440", "<1.4", "1.3.9", true],
+      ["poetry", ">1.2", "1.2.1", true],
+      ["poetry", "<=1.2", "1.2.5", false],
+      ["poetry", "1.2", "1.2.5", false],
+    ];
+    for (const [dialect, spec, version, want] of cases) {
+      const translated = toNpmRangeIn(dialect, spec);
+      const got = translated.ok ? versionSatisfies(version, translated.range) : undefined;
+      expect({ dialect, spec, version, got }).toEqual({ dialect, spec, version, got: want });
+    }
+  });
+
+  test("a Cargo requirement with fewer than three segments now means what Cargo says", () => {
+    // Cargo's `=1.2` is any 1.2.x, `~1` is <2.0.0, `^0` is <1.0.0, `<=1.2` is
+    // <1.3.0 — npm's reading of a missing segment, which the evaluator used to
+    // get wrong (it read each as a three-segment version).
+    const cases: Array<[string, string, boolean]> = [
+      ["=1.2", "1.2.5", true],
+      ["~1", "1.9.0", true],
+      ["^0", "0.5.0", true],
+      ["<=1.2", "1.2.5", true],
+      [">1.2", "1.2.5", false],
+    ];
+    for (const [spec, version, want] of cases) {
+      const translated = toNpmRange("crates", spec);
+      const got = translated.ok ? versionSatisfies(version, translated.range) : undefined;
+      expect({ spec, version, got }).toEqual({ spec, version, got: want });
+    }
   });
 
   test("PEP 440 operators without an equivalent are refused with the reason", () => {
@@ -150,7 +195,7 @@ describe("range dialects", () => {
 
   test("PEP 440 wildcards and comma lists translate", () => {
     expect(toNpmRange("pypi", "==1.4.*")).toEqual({ ok: true, range: "1.4.x" });
-    expect(toNpmRange("pypi", ">=2.0,<3")).toEqual({ ok: true, range: ">=2.0 <3" });
+    expect(toNpmRange("pypi", ">=2.0,<3")).toEqual({ ok: true, range: ">=2.0.0 <3.0.0" });
   });
 
   test("a location is not a range, in any dialect", () => {
@@ -184,6 +229,13 @@ describe("range dialects", () => {
     expect(highestSatisfying(versions, "^3")).toBeUndefined();
   });
 
+  test("a range naming a prerelease admits prereleases of that tuple only, as npm does (security-7#7)", () => {
+    // On 0.7.0 any `\d-x` in the range admitted every prerelease in range.
+    expect(highestSatisfying(["1.5.0", "1.9.0-rc.1"], "^1.2.3-beta.2")).toBe("1.5.0");
+    expect(highestSatisfying(["1.2.3-beta.4", "1.2.2"], "^1.2.3-beta.2")).toBe("1.2.3-beta.4");
+    expect(highestSatisfying(["1.5.0", "1.9.0-rc.1"], "^1.2.3-beta.2", true)).toBe("1.9.0-rc.1");
+  });
+
   test("newest-first is version order, not string order", () => {
     // `.sort()` would put 1.10.0 before 1.9.0 ascending, so a "newest first"
     // list built on it shows the OLDER release at the top of every package
@@ -210,9 +262,9 @@ describe("range dialects", () => {
     expect(asPep440.ok).toBe(false);
     expect(asPep440.ok === false && asPep440.reason).toContain("Poetry");
     const asPoetry = toNpmRangeIn("poetry", "^2.31");
-    expect(asPoetry).toEqual({ ok: true, range: ">=2.31 <3.0.0" });
-    expect(versionSatisfies("2.32.3", ">=2.31 <3.0.0")).toBe(true);
-    expect(versionSatisfies("3.0.0", ">=2.31 <3.0.0")).toBe(false);
+    expect(asPoetry).toEqual({ ok: true, range: ">=2.31.0 <3.0.0" });
+    expect(versionSatisfies("2.32.3", ">=2.31.0 <3.0.0")).toBe(true);
+    expect(versionSatisfies("3.0.0", ">=2.31.0 <3.0.0")).toBe(false);
   });
 
   test("Poetry's caret widens to the first non-zero segment the author wrote", () => {
@@ -222,12 +274,12 @@ describe("range dialects", () => {
     // pin the patch.
     const cases: Array<[string, string]> = [
       ["^1.2.3", ">=1.2.3 <2.0.0"],
-      ["^1.2", ">=1.2 <2.0.0"],
-      ["^1", ">=1 <2.0.0"],
+      ["^1.2", ">=1.2.0 <2.0.0"],
+      ["^1", ">=1.0.0 <2.0.0"],
       ["^0.2.3", ">=0.2.3 <0.3.0"],
       ["^0.0.3", ">=0.0.3 <0.0.4"],
-      ["^0.0", ">=0.0 <0.1.0"],
-      ["^0", ">=0 <1.0.0"],
+      ["^0.0", ">=0.0.0 <0.1.0"],
+      ["^0", ">=0.0.0 <1.0.0"],
     ];
     for (const [spec, range] of cases) {
       expect({ spec, got: toNpmRangeIn("poetry", spec) }).toEqual({
@@ -239,29 +291,31 @@ describe("range dialects", () => {
     // the release `^0.2.3` must not reach.
     expect(versionSatisfies("0.2.9", ">=0.2.3 <0.3.0")).toBe(true);
     expect(versionSatisfies("0.3.0", ">=0.2.3 <0.3.0")).toBe(false);
-    expect(versionSatisfies("0.9.0", ">=0 <1.0.0")).toBe(true);
+    expect(versionSatisfies("0.9.0", ">=0.0.0 <1.0.0")).toBe(true);
   });
 
   test("Poetry's tilde depends on how many segments were written", () => {
     expect(toNpmRangeIn("poetry", "~1.2.3")).toEqual({ ok: true, range: ">=1.2.3 <1.3.0" });
-    expect(toNpmRangeIn("poetry", "~1.2")).toEqual({ ok: true, range: ">=1.2 <1.3.0" });
-    expect(toNpmRangeIn("poetry", "~1")).toEqual({ ok: true, range: ">=1 <2.0.0" });
-    // `~1` allows minor-level change and `~1.2` does not — the distinction the
-    // shared `~` comparator cannot make, because it sees 1.0.0 either way.
-    expect(versionSatisfies("1.5.0", ">=1 <2.0.0")).toBe(true);
-    expect(versionSatisfies("1.5.0", ">=1.2 <1.3.0")).toBe(false);
-    expect(versionSatisfies("1.5.0", "~1")).toBe(false);
+    expect(toNpmRangeIn("poetry", "~1.2")).toEqual({ ok: true, range: ">=1.2.0 <1.3.0" });
+    expect(toNpmRangeIn("poetry", "~1")).toEqual({ ok: true, range: ">=1.0.0 <2.0.0" });
+    // `~1` allows minor-level change and `~1.2` does not.
+    expect(versionSatisfies("1.5.0", ">=1.0.0 <2.0.0")).toBe(true);
+    expect(versionSatisfies("1.5.0", ">=1.2.0 <1.3.0")).toBe(false);
   });
 
   test("a bare Poetry version is an exact pin, not a floor", () => {
-    expect(toNpmRangeIn("poetry", "2.31")).toEqual({ ok: true, range: "=2.31" });
-    expect(versionSatisfies("2.32.3", "=2.31")).toBe(false);
+    expect(toNpmRangeIn("poetry", "2.31")).toEqual({ ok: true, range: "=2.31.0" });
+    expect(versionSatisfies("2.32.3", "=2.31.0")).toBe(false);
+    // Padded because npm reads `=2.31` as any 2.31.x: an exact Poetry pin
+    // must not admit 2.31.5.
+    expect(versionSatisfies("2.31.5", "=2.31.0")).toBe(false);
+    expect(versionSatisfies("2.31.5", "=2.31")).toBe(true);
     expect(toNpmRangeIn("poetry", "*")).toEqual({ ok: true, range: "*" });
     expect(toNpmRangeIn("poetry", "1.2.*")).toEqual({ ok: true, range: "1.2.x" });
-    expect(toNpmRangeIn("poetry", ">=1.0,<2.0")).toEqual({ ok: true, range: ">=1.0 <2.0" });
+    expect(toNpmRangeIn("poetry", ">=1.0,<2.0")).toEqual({ ok: true, range: ">=1.0.0 <2.0.0" });
     expect(toNpmRangeIn("poetry", "^1.0 || ^2.0")).toEqual({
       ok: true,
-      range: ">=1.0 <2.0.0||>=2.0 <3.0.0",
+      range: ">=1.0.0 <2.0.0||>=2.0.0 <3.0.0",
     });
   });
 

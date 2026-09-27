@@ -44,14 +44,18 @@ import {
  *   4. CONTAINMENT. Every caller-supplied path goes through the same resolver
  *      the other filesystem packages use, and an absolute `outDir` recorded by
  *      whichever machine ran the eval is re-contained before it is opened.
+ *      So is every file NAMED UNDER one: `index.jsonl`, `baselines.json` and
+ *      `results.json` are read only when their own physical location is in
+ *      the workspace, and a FIFO or device there is refused unopened.
  *
- * Only `EvalBaselinePin` writes anything, and only to `baselines.json`.
+ * Only `EvalBaselinePin` writes anything, and only to `baselines.json` — as a
+ * regular file, never through a symbolic link at that name.
  */
 import {
   type BaselineLineage,
   DEFAULT_EVALS_DIR,
   type RunIndexEntry,
-  resolveBaseline,
+  lookupBaseline,
 } from "@crewhaus/eval-report";
 import type { EvalRoutingMode } from "@crewhaus/eval-runner";
 import { buildTool } from "@crewhaus/tool-builder";
@@ -631,7 +635,9 @@ export const evalBaselinePin: RegisteredTool = buildTool({
       // named. Reading it is also how `show` knows what is pinned.
       return refusal(pins);
     }
-    const lookup = resolveBaseline(lineage, index.value.dir.real);
+    // The map this call already read, with its leaf contained — not the
+    // file re-opened by a path eval-report would join.
+    const lookup = lookupBaseline(pins.value.file, lineage);
     const row =
       input.runId === undefined
         ? undefined
@@ -650,12 +656,16 @@ export const evalBaselinePin: RegisteredTool = buildTool({
       baselines: pins.value.file,
       ...(row !== undefined ? { row } : {}),
       evalsDir: index.value.dir,
+      pinsLinked: pins.value.linked,
     });
     if (!plan.ok) return refusal(plan);
 
     const dryRun = input.dryRun === true;
     const committed = plan.value.changes && !dryRun && input.action !== "show";
-    if (committed) commitPin(plan.value, pins.value.file, index.value.dir.real);
+    if (committed) {
+      const wrote = commitPin("EvalBaselinePin", plan.value, index.value.dir, dirRel);
+      if (!wrote.ok) return refusal(wrote);
+    }
 
     const lineageRuns = index.value.entries.filter((e) => keyOf(e) === plan.value.key);
     // What this lineage is pinned to once the call returns — the state the

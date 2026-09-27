@@ -22,13 +22,13 @@ tools:
 |---|---|
 | `SpecValidate` | Every YAML, schema and cross-field issue in a spec, with the path that owns it |
 | `SpecCompileCheck` | Lower and compile in memory — the offline "will this build" check, no bundle written |
-| `SpecSummarize` | Shape, models, tools, MCP servers, permissions and declared blocks as structured JSON — `env`/`headers` by key, `sse` URLs cut to origin and path, stdio argv redacted |
+| `SpecSummarize` | Shape, models, tools, MCP servers, permissions and declared blocks as structured JSON — `env`/`headers` by key, `sse` URLs cut to origin and path, stdio argv redacted (credential flags, header values, URL userinfo and token parameters) |
 | `SpecDiff` | What changed between two specs, semantically, and which changes widen capability |
 | `ToolInventory` | The tools a spec grants, builtin vs MCP, with `all-<category>` selectors expanded |
 | `PermissionAudit` | Which rule covers each granted tool, and which outward tools no rule names |
 | `PreflightRun` | The full preflight against an explicitly supplied env: blocking items, warnings, remediation |
-| `HarnessInventory` | The harnesses under a root — name, shape, model, spec path, bundle state |
-| `BundleFreshness` | Which compiled bundles are older than their spec, or missing |
+| `HarnessInventory` | The harnesses under a root — name, shape, model, spec path, bundle state (`unreadable` with the reason when it cannot be determined) |
+| `BundleFreshness` | Which compiled bundles are older than their spec, missing, or `unreadable` (unknown, with the reason — never reported as missing) |
 | `AuditVerify` | Re-walk the audit log's hash chain and report the first break |
 | `EvalBaselineCompare` | The release gate: pass-rate delta, per-sample regressions, threshold verdict |
 | `SessionSummarize` | Event counts, tool tallies and errors from a harness's session logs |
@@ -59,6 +59,11 @@ package's gate never saw — so `PreflightRun` reads that file itself, through
 `resolveSafe` and under the size cap, and hands the text over as `specYaml`.
 A harness directory whose `crewhaus.yaml` is a symlink out of the workspace is
 refused, rather than read and reflected back through the report's findings.
+`AuditVerify` likewise checks every `*.jsonl` and `_chain-tail.json` in the
+audit directory with `lstat` before anything is opened: the log writer never
+creates a symbolic link, FIFO or device, so one there is reported as the break
+(tamper evidence), not followed or counted as zero bytes. `@crewhaus/audit-log`'s
+own `verify` makes the same check, so `crewhaus audit verify` agrees.
 
 Refusals are bounded too: the path a caller supplied is truncated and stripped
 of control characters before it is echoed, and no refusal splices in a node
@@ -95,15 +100,19 @@ apply at run time. Where it *can* be exact it is: a pattern the runtime
 matcher would refuse to compile is listed under `malformedRules` and scored
 the way the engine scores it — a broken `alwaysDeny` or `alwaysAsk` fails
 closed and gates every call, a broken `alwaysAllow` is dropped — and under
-`mode: plan` the report says outright that no rule is consulted at all,
-because the engine decides on the tool's own `readOnly` flag and returns
-before the scan. `ToolInventory` can prove an MCP tool names an undeclared
-server, but a builtin key is only checked against a `knownTools` list you
-supply, because the builtin registry lives in the compiled bundle rather than
-in the spec. `BundleFreshness` uses preflight's mtime heuristic and says so —
+`mode: plan` the decisions follow plan mode: allow rules are ignored, a deny or
+ask rule denies, and anything else is allowed only if the tool is read-only.
+Builtins are reported with their own flags from the builtin manifest, rules
+are matched against the name the engine sees (`JavaScript`, not a guess from
+the key `javascript`), and an `all-<category>` selector is audited as the
+tools it expands to. `ToolInventory` can prove an MCP tool names an undeclared
+server, and checks builtin keys against this release's builtins unless you pass
+`knownTools` for a different runtime. `BundleFreshness` uses preflight's mtime heuristic and says so —
 `stale` means "recompile to be sure", not "proven different". `AuditVerify`
 returns `anchorChecked`, because a chain that verifies without an anchor has
-not ruled out a dropped tail. `EvalBaselineCompare` reads a results document
+not ruled out a dropped tail. `EvalBaselineCompare` fails a comparison that never happened — two runs that share
+no sample id, or that name different datasets (unless `allowDatasetMismatch`) —
+rather than passing a candidate measured on something else; and it reads a results document
 without believing it: a declared `passRate` outside 0..1 is discarded in
 favour of the samples, one the samples contradict is reported as a note, and a
 repeated `sampleId` is named, because samples are matched by id and a repeat

@@ -72,6 +72,7 @@ import {
   filterApprovals,
   foldApprovals,
   isApprovalId,
+  isOffsetlessDateTime,
   orderApprovals,
   parseInstant,
   toRow,
@@ -147,6 +148,12 @@ function containedChild(toolName: string, dirWsRel: string, child: string): Load
 function parseInstantArg(label: string, text: string | undefined): Loaded<number | undefined> {
   if (text === undefined) return { ok: true, value: undefined };
   const ms = parseInstant(text);
+  if (ms === null && isOffsetlessDateTime(text)) {
+    return {
+      ok: false,
+      message: `"${label}" (${JSON.stringify(text)}) has a time but no UTC offset — write it as e.g. 2026-09-19T14:00:00Z or with ±HH:MM. This tool never reads a time in the host's zone, which would select a different window on another machine`,
+    };
+  }
   if (ms === null) {
     return {
       ok: false,
@@ -157,6 +164,10 @@ function parseInstantArg(label: string, text: string | undefined): Loaded<number
 }
 
 const statusEnum = z.enum(["pending", "granted", "granted-always", "denied", "consumed"]);
+
+/** How every instant input is written, said once so the three fields agree. */
+const INSTANT_FORMAT =
+  "an ISO-8601 instant with Z or ±HH:MM (a time without an offset is refused; a bare date means 00:00:00Z at the START of that day)";
 
 const listingFields = {
   status: z
@@ -170,11 +181,11 @@ const listingFields = {
   since: z
     .string()
     .optional()
-    .describe("keep only parks created at or after this ISO-8601 instant"),
+    .describe(`keep only parks created at or after this instant: ${INSTANT_FORMAT}`),
   until: z
     .string()
     .optional()
-    .describe("keep only parks created at or before this ISO-8601 instant"),
+    .describe(`keep only parks created at or before this instant: ${INSTANT_FORMAT}`),
   order: z
     .enum(["operator", "oldest", "newest"])
     .optional()
@@ -192,7 +203,7 @@ const listingFields = {
     .string()
     .optional()
     .describe(
-      "an ISO-8601 instant to measure parked time against; omitted, rows carry no age, because this tool never reads the host clock",
+      `the instant to measure parked time against: ${INSTANT_FORMAT}. Omitted, rows carry no age, because this tool never reads the host clock`,
     ),
 };
 
@@ -461,7 +472,7 @@ export const approvalStatus: RegisteredTool = buildTool({
       unknowns.add(
         "approvals",
         `parsed createdAt on ${filtered.undatedIds.length} record(s)`,
-        `these records carry an unparseable createdAt and could not be placed in the requested time window, so they were KEPT rather than dropped: ${filtered.undatedIds.slice(0, 10).join(", ")}`,
+        `these records carry a createdAt that is not an ISO-8601 instant with an offset (a time without one is not placed in the host's zone) and could not be placed in the requested time window, so they were KEPT rather than dropped: ${filtered.undatedIds.slice(0, 10).join(", ")}`,
       );
     }
     const ordered = orderApprovals(filtered.kept, listing.value.order);
@@ -732,7 +743,7 @@ export const approvalsInbox: RegisteredTool = buildTool({
       unknowns.add(
         "approvals",
         `parsed createdAt on ${undatedIds.length} record(s)`,
-        `these records carry an unparseable createdAt and could not be placed in the requested time window, so they were KEPT rather than dropped: ${undatedIds.slice(0, 10).join(", ")}`,
+        `these records carry a createdAt that is not an ISO-8601 instant with an offset (a time without one is not placed in the host's zone) and could not be placed in the requested time window, so they were KEPT rather than dropped: ${undatedIds.slice(0, 10).join(", ")}`,
       );
     }
 

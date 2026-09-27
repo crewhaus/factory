@@ -62,26 +62,28 @@
  * writer's own uid cannot rewrite it.
  *
  * Files are created with mode 0o600 (owner-only) so the audit trail
- * cannot be read by other users on the host. Append uses
- * `appendFileSync` which is atomic per line on POSIX when the line
- * fits in `PIPE_BUF`, mirroring `event-log`'s contract.
+ * cannot be read by other users on the host. A record is appended with one
+ * `O_APPEND` write, which is atomic per line on POSIX when the line fits in
+ * `PIPE_BUF`, mirroring `event-log`'s contract.
+ *
+ * Every file in the directory is a REGULAR file the writer made (0.7.1). The
+ * writer never creates a link, a FIFO or a device, so one found where a chain
+ * file or `_chain-tail.json` belongs is tamper evidence: the writer refuses to
+ * append or write through it, and {@link verify} reports it as a break without
+ * opening it. Following it read (and quoted in a break reason) a file outside
+ * the directory, and a FIFO blocked the walk for ever (security-5#2,
+ * flag-truth-3#6).
  *
  * Layer R17. Pairs with `tenancy` (R17) and `gateway-server` (R16).
  */
 
 import { createHash } from "node:crypto";
-import {
-  appendFileSync,
-  createReadStream,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  writeFileSync,
-} from "node:fs";
+import { closeSync, createReadStream, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { CrewhausError, RuntimeError } from "@crewhaus/errors";
+import { type FileKind, openForReadFd, probeKind } from "@crewhaus/tool-safety/fs";
+import { LeafError, appendLeaf, overwriteLeaf, readLeaf } from "./leaf";
 
 export const GENESIS_HASH = "GENESIS";
 
@@ -322,21 +324,155 @@ function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** The on-host anchor's file name. */
+export const CHAIN_TAIL_FILENAME = "_chain-tail.json";
+
 function indexPath(rootDir: string): string {
-  return join(rootDir, "_chain-tail.json");
+  return join(rootDir, CHAIN_TAIL_FILENAME);
 }
 
 type ChainTail = { readonly day: string; readonly hash: string; readonly seq: number };
 
-function readChainTail(rootDir: string): ChainTail | undefined {
-  const p = indexPath(rootDir);
-  if (!existsSync(p)) return undefined;
-  return JSON.parse(readFileSync(p, "utf8")) as ChainTail;
+/** The anchor is ~100 bytes; one this large is not an anchor. */
+const MAX_CHAIN_TAIL_BYTES = 64 * 1024;
+
+function notRegularReason(name: string, kind: FileKind): string {
+  return `"${name}" is ${kind === "symlink" ? "a symbolic link" : `a ${kind}`}, not a regular file — the audit log writer never creates one, so it is treated as tampering and not opened`;
 }
 
-function writeChainTail(rootDir: string, day: string, hash: string, seq: number): void {
-  const p = indexPath(rootDir);
-  writeFileSync(p, JSON.stringify({ day, hash, seq }), { mode: 0o600 });
+/**
+ * Why a leaf operation on `name` was refused, for a message: never the
+ * directory's path, and never where a link leads.
+ */
+function leafReason(name: string, err: unknown): string {
+  if (!(err instanceof LeafError)) throw err;
+  const refusal = err.refusal;
+  if (refusal.code === "not-regular") return notRegularReason(name, refusal.kind);
+  if (refusal.code === "too-large") {
+    return `"${name}" is over ${refusal.bytes} bytes, which no anchor is`;
+  }
+  // `EACCES: permission denied, open '/abs/…'` → `EACCES: permission denied`.
+  const message = refusal.error instanceof Error ? refusal.error.message : String(refusal.error);
+  return `"${name}": ${message.split(",")[0]}`;
+}
+
+/**
+ * The anchor, or `undefined` when there is none. A link or special file at
+ * its name, or one too large to be an anchor, throws without being read.
+ */
+function readChainTail(rootDir: string): ChainTail | undefined {
+  let text: string | undefined;
+  try {
+    text = readLeaf(rootDir, CHAIN_TAIL_FILENAME, MAX_CHAIN_TAIL_BYTES);
+  } catch (err) {
+    throw new AuditLogError(leafReason(CHAIN_TAIL_FILENAME, err));
+  }
+  return text === undefined ? undefined : (JSON.parse(text) as ChainTail);
+}
+
+/**
+ * Rewrite the anchor IN PLACE (see `./leaf`): a link or special file at the
+ * name is refused, and an append-only directory, where an entry can never be
+ * replaced by a rename, keeps working as it did on 0.7.0.
+ */
+function writeChainTail(rootDir: string, tail: ChainTail): void {
+  try {
+    overwriteLeaf(rootDir, CHAIN_TAIL_FILENAME, JSON.stringify(tail), 0o600);
+  } catch (err) {
+    throw new AuditLogError(
+      `could not write ${CHAIN_TAIL_FILENAME}: ${leafReason(CHAIN_TAIL_FILENAME, err)}`,
+    );
+  }
+}
+
+function sameTail(a: ChainTail | undefined, b: ChainTail | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return a.day === b.day && a.hash === b.hash && a.seq === b.seq;
+}
+
+/** The chain files {@link verify} walks, each checked to be a regular file. */
+export type ChainFiles =
+  | {
+      readonly ok: true;
+      /** `*.jsonl` names, sorted — the walk order. */
+      readonly files: readonly string[];
+      /** Their total size. */
+      readonly bytes: number;
+      /** Size of `_chain-tail.json` (0 when absent). */
+      readonly tailBytes: number;
+    }
+  | {
+      readonly ok: false;
+      /** The name of the entry that is not a regular file. */
+      readonly file: string;
+      readonly reason: string;
+    };
+
+/**
+ * List the chain files under `rootDir` and check, WITHOUT opening any of them,
+ * that each `*.jsonl` and `_chain-tail.json` is a regular file (`lstat`: a
+ * symbolic link, FIFO, device or directory is refused). {@link verify} walks
+ * exactly this list, and a caller that bounds the walk by size (AuditVerify)
+ * sums the same sizes, so the pre-check and the walk vet the same set.
+ * Throws when the directory itself cannot be listed.
+ */
+export function listChainFiles(rootDir: string): ChainFiles {
+  const files = readdirSync(rootDir)
+    .filter((f) => f.endsWith(".jsonl"))
+    .sort();
+  let bytes = 0;
+  const present: string[] = [];
+  for (const name of files) {
+    const probe = probeKind(join(rootDir, name), { given: name });
+    if (!probe.ok) {
+      if (probe.code === "not-found") continue; // removed since the listing
+      return { ok: false, file: name, reason: `"${name}" could not be examined` };
+    }
+    if (probe.kind !== "file") {
+      return { ok: false, file: name, reason: notRegularReason(name, probe.kind) };
+    }
+    bytes += probe.stats.size;
+    present.push(name);
+  }
+  let tailBytes = 0;
+  const tail = probeKind(indexPath(rootDir), { given: CHAIN_TAIL_FILENAME });
+  if (tail.ok) {
+    if (tail.kind !== "file") {
+      return {
+        ok: false,
+        file: CHAIN_TAIL_FILENAME,
+        reason: notRegularReason(CHAIN_TAIL_FILENAME, tail.kind),
+      };
+    }
+    tailBytes = tail.stats.size;
+  }
+  return { ok: true, files: present, bytes, tailBytes };
+}
+
+/**
+ * Open `name` in `rootDir` for streaming, refusing a link or special file at
+ * it (`O_NOFOLLOW`, checked on the open descriptor). The stream owns the fd.
+ */
+function openChainFile(
+  rootDir: string,
+  name: string,
+): { ok: true; stream: ReturnType<typeof createReadStream> } | { ok: false; reason: string } {
+  const opened = openForReadFd(rootDir, name, { followLeafSymlink: false });
+  if (!opened.ok) {
+    return {
+      ok: false,
+      reason:
+        opened.code === "is-symlink" || opened.code === "not-regular-file"
+          ? notRegularReason(name, opened.kind ?? "symlink")
+          : opened.reason,
+    };
+  }
+  try {
+    return { ok: true, stream: createReadStream("", { fd: opened.fd, encoding: "utf8" }) };
+  } catch (err) {
+    closeSync(opened.fd);
+    throw err;
+  }
 }
 
 export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog> {
@@ -349,9 +485,18 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
   const anchorStore = opts.anchorStore;
   const logId = opts.logId ?? opts.rootDir;
 
+  // A record this log appended whose anchor write then failed: `basedOn` is
+  // the anchor as it was read for that append, `wrote` the record's own
+  // tail. While the anchor on disk still says `basedOn`, the chain's real tip
+  // is `wrote` — reading the stale anchor instead would give the next record
+  // the same seq and prevHash, forking the chain for good.
+  let lagging: { readonly basedOn: ChainTail | undefined; readonly wrote: ChainTail } | undefined;
+
   return {
     async append(input: AppendInput): Promise<AuditRecord> {
-      const tail = readChainTail(opts.rootDir);
+      const anchored = readChainTail(opts.rootDir);
+      const tail =
+        lagging !== undefined && sameTail(anchored, lagging.basedOn) ? lagging.wrote : anchored;
       const prevHash = tail?.hash ?? GENESIS_HASH;
       // First record gets seq 0; thereafter strictly increment the tail's
       // seq. A pre-`seq` anchor (`seq` absent) is treated as -1 so the next
@@ -371,9 +516,24 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
       // record to one day's file while committing the tail under the next
       // day — leaving the JSONL filename and the anchor's `day` inconsistent.
       const today = day();
-      const file = join(opts.rootDir, `${today}.jsonl`);
-      appendFileSync(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-      writeChainTail(opts.rootDir, today, hash, seq);
+      // One O_APPEND write to a regular file at exactly this name: a link or
+      // special file there is refused, never appended through.
+      const dayFile = `${today}.jsonl`;
+      try {
+        appendLeaf(opts.rootDir, dayFile, `${JSON.stringify(record)}\n`, 0o600);
+      } catch (err) {
+        throw new AuditLogError(`could not append to ${dayFile}: ${leafReason(dayFile, err)}`);
+      }
+      const wrote: ChainTail = { day: today, hash, seq };
+      try {
+        writeChainTail(opts.rootDir, wrote);
+        lagging = undefined;
+      } catch (err) {
+        lagging = { basedOn: anchored, wrote };
+        throw new AuditLogError(
+          `the record was appended to ${dayFile} (seq ${seq}), but the anchor was not updated — ${(err as Error).message}. The next append continues the chain from this record.`,
+        );
+      }
       // Best-effort: mirror the new tail to the off-host anchor. A failure
       // here (network/WORM hiccup) must NOT fail the durable local append —
       // the chain remains internally verifiable, and a lagging external
@@ -396,8 +556,11 @@ export async function openAuditLog(opts: OpenAuditLogOptions): Promise<AuditLog>
 
 async function* readDay(rootDir: string, day: string): AsyncIterable<AuditRecord> {
   const file = join(rootDir, `${day}.jsonl`);
-  if (!existsSync(file)) return;
-  const stream = createReadStream(file, { encoding: "utf8" });
+  const present = probeKind(file);
+  if (!present.ok && present.code === "not-found") return;
+  const opened = openChainFile(rootDir, `${day}.jsonl`);
+  if (!opened.ok) throw new AuditLogError(opened.reason);
+  const stream = opened.stream;
   const rl = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
   let lineNumber = 0;
   try {
@@ -518,9 +681,19 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
       externalAnchorChecked: empty?.externalAnchorChecked ?? false,
     };
   }
-  const files = readdirSync(rootDir)
-    .filter((f) => f.endsWith(".jsonl"))
-    .sort();
+  // Every entry is checked to be a regular file before any is opened: a link
+  // planted at a chain file's name is tamper evidence, not a file to follow.
+  const chain = listChainFiles(rootDir);
+  if (!chain.ok) {
+    return {
+      ok: false,
+      recordsChecked: 0,
+      file: join(rootDir, chain.file),
+      line: 0,
+      reason: chain.reason,
+    };
+  }
+  const files = chain.files;
   let prevHash = GENESIS_HASH;
   let expectedSeq = 0;
   let recordsChecked = 0;
@@ -529,7 +702,11 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
   let hashAtAnchoredSeq: string | undefined;
   for (const f of files) {
     const file = join(rootDir, f);
-    const stream = createReadStream(file, { encoding: "utf8" });
+    const opened = openChainFile(rootDir, f);
+    if (!opened.ok) {
+      return { ok: false, recordsChecked, file, line: 0, reason: opened.reason };
+    }
+    const stream = opened.stream;
     const rl = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
     let lineNumber = 0;
     try {

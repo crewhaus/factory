@@ -8,6 +8,7 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -319,6 +320,16 @@ describe("SpecDiff", () => {
     expect(result.changes.map((c) => c.kind)).toEqual(["tool-added"]);
   });
 
+  test("swapping an existing MCP server's command widens (0.7.1)", async () => {
+    const withServer = `${CLI_SPEC}\nmcp_servers:\n  thredz:\n    transport: stdio\n    command: bunx\n    args: ["thredz-mcp@0.3.0"]`;
+    const result = await callJson<{ widens: boolean; changes: Array<{ kind: string }> }>(specDiff, {
+      before: { spec: withServer },
+      after: { spec: withServer.replace("command: bunx", "command: npx") },
+    });
+    expect(result.widens).toBe(true);
+    expect(result.changes.map((c) => c.kind)).toEqual(["mcp-server"]);
+  });
+
   test("an unchanged pair reports no changes", async () => {
     const result = await callJson<{ changed: boolean }>(specDiff, {
       before: { spec: CLI_SPEC },
@@ -420,6 +431,62 @@ describe("ToolInventory", () => {
 });
 
 describe("PermissionAudit", () => {
+  // C032 / C146 residue: the builtins whose registered name is not the
+  // key with its first letter upper-cased, and `all-<category>` selectors.
+  test("rules name JavaScript and CodeGraph* as the engine does", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "tools: [javascript, codegraphCallers, codegraphSearch]",
+      "permissions:",
+      "  mode: default",
+      "  rules:",
+      "    - { type: alwaysDeny, pattern: JavaScript }",
+      "    - { type: alwaysAllow, pattern: CodeGraphCallers }",
+      "    - { type: alwaysAllow, pattern: CodeGraphSearch }",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string; rule?: { pattern: string } }>;
+      unusedRules: unknown[];
+      ruleProblems: unknown[];
+    }>(permissionAudit, { spec });
+    expect(result.unusedRules).toEqual([]);
+    expect(result.ruleProblems).toEqual([]);
+    expect(result.tools.map((t) => [t.tool, t.decision, t.rule?.pattern ?? null])).toEqual([
+      ["codegraphCallers", "allow", "CodeGraphCallers"],
+      ["codegraphSearch", "allow", "CodeGraphSearch"],
+      ["javascript", "deny", "JavaScript"],
+    ]);
+  });
+
+  test("an all-<category> selector is audited as the tools it expands to", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "tools: [all-http]",
+      "permissions:",
+      "  mode: auto",
+      "  rules:",
+      "    - { type: alwaysDeny, pattern: HttpRequest }",
+    ].join("\n");
+    const result = await callJson<{
+      tools: Array<{ tool: string; decision: string }>;
+      unusedRules: unknown[];
+      categoryError?: string;
+    }>(permissionAudit, { spec });
+    expect(result.categoryError).toBeUndefined();
+    expect(result.tools.some((t) => t.tool === "all-http")).toBe(false);
+    expect(result.tools.length).toBeGreaterThan(1);
+    expect(result.tools.find((t) => t.tool === "httpRequest")?.decision).toBe("deny");
+    expect(result.unusedRules).toEqual([]);
+  });
+
   test("an outward tool with no rule is a finding", async () => {
     const spec = CLI_SPEC.replace("[read, write, bash]", "[read, webFetch]");
     const result = await callJson<{ findings: Array<{ tool: string }>; fallback: string }>(
@@ -605,6 +672,47 @@ describe("HarnessInventory", () => {
   });
 });
 
+describe("a bundle that cannot be examined (flag-truth-3#10)", () => {
+  const canRevoke = process.platform !== "win32" && process.getuid?.() !== 0;
+
+  test.skipIf(!canRevoke)(
+    "is unreadable with the reason in BundleFreshness and HarnessInventory, never missing",
+    async () => {
+      write("h/crewhaus.yaml", CLI_SPEC);
+      write("h/dist/index.js", "// compiled");
+      const dist = path.join(tmp, "h", "dist");
+      chmodSync(dist, 0o000);
+      try {
+        const fresh = await callJson<{
+          counts: { missingBundle: number; unreadable: number };
+          bundles: Array<{ dir: string; state: string; detail?: string; remediation?: string }>;
+        }>(bundleFreshness, { dirs: ["h"] });
+        // On 0.7.0: state "missing-bundle" with "crewhaus compile" as the fix.
+        expect(fresh.bundles[0]?.state).toBe("unreadable");
+        expect(fresh.bundles[0]?.detail).toMatch(/^(EACCES|EPERM) listing dist\/$/);
+        expect(fresh.bundles[0]?.remediation).toBeUndefined();
+        expect(fresh.counts).toMatchObject({ missingBundle: 0, unreadable: 1 });
+        // The caller must act on it, so staleOnly keeps it.
+        const needsWork = await callJson<{ bundles: Array<{ dir: string }> }>(bundleFreshness, {
+          dirs: ["h"],
+          staleOnly: true,
+        });
+        expect(needsWork.bundles.map((b) => b.dir)).toEqual(["h"]);
+
+        const inventory = await callJson<{
+          counts: { missingBundles: number; unreadableBundles: number };
+          harnesses: Array<{ bundle: string; bundleDetail?: string }>;
+        }>(harnessInventory, {});
+        expect(inventory.harnesses[0]?.bundle).toBe("unreadable");
+        expect(inventory.harnesses[0]?.bundleDetail).toMatch(/^(EACCES|EPERM) listing dist\/$/);
+        expect(inventory.counts).toMatchObject({ missingBundles: 0, unreadableBundles: 1 });
+      } finally {
+        chmodSync(dist, 0o755);
+      }
+    },
+  );
+});
+
 describe("BundleFreshness", () => {
   function seed(dir: string, specMtime: number, bundleMtime?: number): void {
     const spec = write(`${dir}/crewhaus.yaml`, CLI_SPEC);
@@ -696,6 +804,66 @@ describe("AuditVerify", () => {
   test("a missing audit directory is a readable refusal", async () => {
     expect(await call(auditVerify, {})).toContain("does not exist");
   });
+
+  // 0.7.1 (security-5#2, flag-truth-3#6): only the directory was contained,
+  // and every *.jsonl in it was stat'ed and read through links.
+  test("a chain file linked out of the workspace is the break, and is never read", async () => {
+    await seedAudit();
+    const secretDir = outsideDir();
+    const token = ["gh", "p_", "AUDITLEAK".repeat(4)].join("");
+    writeFileSync(path.join(secretDir, "secret.txt"), `${token} rest\n`);
+    symlinkSync(
+      path.join(secretDir, "secret.txt"),
+      path.join(tmp, ".crewhaus", "audit", "0001.jsonl"),
+    );
+    const raw = await call(auditVerify, {});
+    expect(raw).not.toContain(token);
+    expect(raw).not.toContain(secretDir);
+    const result = JSON.parse(raw) as { ok: boolean; break: { file: string; reason: string } };
+    expect(result.ok).toBe(false);
+    expect(result.break.file).toBe("0001.jsonl");
+    expect(result.break.reason).toMatch(/not a regular file/);
+  });
+
+  test("a _chain-tail.json linked out is the break, and its hash is not quoted", async () => {
+    await seedAudit();
+    const secretDir = outsideDir();
+    const anchor = path.join(tmp, ".crewhaus", "audit", "_chain-tail.json");
+    rmSync(anchor);
+    writeFileSync(
+      path.join(secretDir, "tail.json"),
+      JSON.stringify({ day: "d", hash: "LEAKED_HASH_SENTINEL", seq: 0 }),
+    );
+    symlinkSync(path.join(secretDir, "tail.json"), anchor);
+    const raw = await call(auditVerify, {});
+    expect(raw).not.toContain("LEAKED_HASH_SENTINEL");
+    expect(JSON.parse(raw).ok).toBe(false);
+  });
+
+  // In a child process: before the fix a FIFO blocked the walk for ever, even
+  // with maxBytes 1 (it stat's as 0 bytes), and a blocked test hangs the suite.
+  test.skipIf(process.platform === "win32")(
+    "a FIFO chain file is refused promptly, before the walk",
+    async () => {
+      await seedAudit();
+      const fifo = path.join(tmp, ".crewhaus", "audit", "0001.jsonl");
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      const script = `
+        process.chdir(${JSON.stringify(tmp)});
+        const { auditVerify } = await import(${JSON.stringify(path.join(import.meta.dir, "index.ts"))});
+        console.log(await auditVerify.execute({ maxBytes: 1_000_000 }));
+      `;
+      const child = Bun.spawn([process.execPath, "-e", script], { stdout: "pipe", stderr: "pipe" });
+      const killer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+      const text = await new Response(child.stdout).text();
+      clearTimeout(killer);
+      expect(await child.exited).toBe(0);
+      const result = JSON.parse(text) as { ok: boolean; break: { reason: string } };
+      expect(result.ok).toBe(false);
+      expect(result.break.reason).toMatch(/is a fifo, not a regular file/);
+    },
+    20_000,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -758,6 +926,21 @@ describe("EvalBaselineCompare", () => {
         candidate: evalDoc([["a", true, 1]]),
       }),
     ).toContain("baseline");
+  });
+
+  test("a one-sample smoke run on another dataset does not pass a 50-sample gate (0.7.1)", async () => {
+    const baseline = evalDoc(
+      Array.from({ length: 50 }, (_, i): [string, boolean, number] => [`s${i}`, i % 10 !== 0, 1]),
+    );
+    const candidate = { ...evalDoc([["other-0", true, 1]]), config: { datasetName: "smoke" } };
+    const result = await callJson<{
+      verdict: string;
+      reasons: string[];
+      samples: { shared: number };
+    }>(evalBaselineCompare, { baseline, candidate });
+    expect(result.samples.shared).toBe(0);
+    expect(result.verdict).toBe("fail");
+    expect(result.reasons.length).toBe(2);
   });
 
   test("passing both a document and a path for one side is refused", async () => {
@@ -1059,6 +1242,108 @@ describe("secret hygiene", () => {
     const raw = await call(specSummarize, { spec: SPEC_WITH_ARGV_SECRET });
     expect(raw).not.toContain("sk-live-abcdef0123456789abcdef");
     expect(raw).not.toContain("ghp_ABCDEFGH0123456789abcdefghijklmnop");
+  });
+
+  test("a credential in a stdio URL or header argv reaches neither SpecSummarize nor SpecDiff", async () => {
+    // Built from parts: no secret-shaped literal in the source.
+    const pw = ["Hunter", "2", "Secret"].join("");
+    const tok = ["plain", "secret", "tok"].join("");
+    const hdr = ["abcdef", "0123", "456789"].join("");
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const spec = [
+      ...base,
+      "mcp_servers:",
+      "  pg:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      '      - "-y"',
+      '      - "@modelcontextprotocol/server-postgres"',
+      `      - "postgresql://admin:${pw}@db.internal:5432/prod"`,
+      "  remote:",
+      "    transport: stdio",
+      "    command: npx",
+      "    args:",
+      '      - "mcp-remote"',
+      `      - "https://mcp.example.com/sse?token=${tok}"`,
+      '      - "--header"',
+      `      - "Authorization: Bearer ${hdr}"`,
+    ].join("\n");
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, {
+      before: { spec: base.join("\n") },
+      after: { spec },
+    });
+    for (const [label, raw] of [
+      ["SpecSummarize", summary],
+      ["SpecDiff", diff],
+    ] as const) {
+      expect({
+        label,
+        pw: raw.includes(pw),
+        tok: raw.includes(tok),
+        hdr: raw.includes(hdr),
+      }).toEqual({ label, pw: false, tok: false, hdr: false });
+    }
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; redactedArgs?: number }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.redactedArgs])).toEqual([
+      ["pg", 1],
+      ["remote", 2],
+    ]);
+    // What the server IS still shows.
+    expect(summary).toContain("db.internal:5432/prod");
+    expect(diff).toContain("https://mcp.example.com/sse?token=(redacted)");
+  });
+
+  test("a header in mcp-proxy's two-entry form, or after supergateway's --oauth2Bearer, reaches neither tool", async () => {
+    // On the first 0.7.1 cut both tools printed these argv verbatim: only a
+    // one-entry `Name: value` header and a separator-then-word credential
+    // flag were recognised. Built from parts: no secret-shaped literal.
+    const secret = ["S3CRET", "value", "42"].join("");
+    const base = [
+      "name: leaky",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: x",
+    ];
+    const spec = [
+      ...base,
+      "mcp_servers:",
+      "  proxy:",
+      "    transport: stdio",
+      "    command: uvx",
+      `    args: [mcp-proxy, --headers, X-Api-Key, "${secret}", "https://example.io/sse"]`,
+      "  gw:",
+      "    transport: stdio",
+      "    command: npx",
+      `    args: [-y, supergateway, --sse, "https://example.io/sse", --oauth2Bearer, "${secret}"]`,
+    ].join("\n");
+    const summary = await call(specSummarize, { spec });
+    const diff = await call(specDiff, { before: { spec: base.join("\n") }, after: { spec } });
+    expect({ summary: summary.includes(secret), diff: diff.includes(secret) }).toEqual({
+      summary: false,
+      diff: false,
+    });
+    const parsed = JSON.parse(summary) as {
+      mcpServers: Array<{ name: string; args?: string[]; redactedArgs?: number }>;
+    };
+    expect(parsed.mcpServers.map((s) => [s.name, s.args, s.redactedArgs])).toEqual([
+      [
+        "gw",
+        ["-y", "supergateway", "--sse", "https://example.io/sse", "--oauth2Bearer", "(redacted)"],
+        1,
+      ],
+      ["proxy", ["mcp-proxy", "--headers", "X-Api-Key", "(redacted)", "https://example.io/sse"], 1],
+    ]);
   });
 
   test("an sse endpoint keeps neither its query string nor its userinfo", async () => {

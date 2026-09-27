@@ -229,6 +229,14 @@ an inbox and include the wrong side of a `since` boundary. The ISO shape is gate
 before `Date.parse`, because `Date.parse`'s acceptance of non-ISO input is
 implementation-defined.
 
+A time must carry its offset: `2026-09-19T14:00:00Z` or `…+02:00`. A time without
+one is refused as `since`, `until` or `now`, with a message saying so, because
+`Date.parse` would read it in the host's zone and select a different window on
+another machine. A bare date means 00:00:00Z at the start of that day, so
+`until: 2026-09-19` ends before that day begins. A ledger record whose timestamp
+has no offset is treated like any other unplaceable one: kept, listed as undated,
+and given no age.
+
 The one place a clock could enter is how long something has been parked, and it
 is an explicit `now` input. Omit it and rows carry no age at all.
 

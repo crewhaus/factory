@@ -182,8 +182,15 @@ the indirect prompt-injection channel.
 
 Every such string is carried inside a named `authored` object, never
 interpolated into a sentence of the tool's own, under a top-level `dataNotice`
-saying so. Control bytes, C1 codes, bidi overrides and zero-width characters
-are replaced, the field is length-capped, and **every substitution is reported**
+saying so. Control bytes, C1 codes and line/paragraph separators are replaced,
+and so is every character Unicode classes as a format character (bidi marks,
+zero-width characters, the soft hyphen, the tag characters U+E0000–E007F that
+can spell a hidden sentence), every default-ignorable code point (variation
+selectors, fillers), private-use characters and unpaired surrogates — Unicode's
+own classes, not a hand-kept list of ranges. One text/emoji presentation
+selector directly after an emoji survives, so "❤️" keeps its presentation. The
+field is length-capped by code point, so the cut never splits a character, and
+**every substitution is reported**
 in `authoredSanitized` — on a template row and on a peer's `record` alike, a
 silently altered field is its own kind of lie. A library error that quotes the
 peer's own text (the discovery library interpolates the endpoint into its

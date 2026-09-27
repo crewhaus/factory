@@ -11,6 +11,7 @@
     { "path": "../tool-builder" },
     { "path": "../tool-permission-matcher" },
     { "path": "../tool-registry-manifest" },
+    { "path": "../tool-safety" },
     { "path": "../target-cli" },
     { "path": "../tool-executor" }
   ],

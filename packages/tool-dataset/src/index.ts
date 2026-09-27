@@ -685,7 +685,11 @@ export const datasetInspect: RegisteredTool = buildTool({
       for (const name of listed) {
         const versions = await listVersions(registry, name);
         if (!versions.ok) {
-          datasets.push({ name, status: "unreadable", reason: versions.message });
+          datasets.push({
+            name,
+            status: versions.code === "refused" ? "refused" : "unreadable",
+            reason: versions.message,
+          });
           continue;
         }
         datasets.push({

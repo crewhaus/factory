@@ -24,6 +24,9 @@
       "path": "../eval-dataset"
     },
     {
+      "path": "../tool-safety"
+    },
+    {
       "path": "../tool-executor"
     }
   ],

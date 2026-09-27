@@ -31,7 +31,7 @@ durability`), a `level` (`info | warn | blocking`), a `message`, and optional
 | `channels` | the channel daemon's boot-gate secret env refs, offline (pure env presence — the exact set the compiled daemon exits 2 on) | an env-ref secret is unset, or a credential value would fail compilation |
 | `mcp` | dry-run of boot-time secret-ref resolution via `@crewhaus/mcp-host`, plus lint for `$FOO`/`${FOO}` literals (the MCP transports never expand `$…` values) and credentials pasted inline | an env-ref is unset (the predicted `ConfigError` is the byte-identical one the boot would throw) |
 | `ports` | bindability of `gateway.port`, a numeric `PORT` env, and any caller-requested ports | a port is already in use |
-| `bundle` | `crewhaus.yaml` vs newest `dist/` mtime — labelled approximate; the `FreshnessComparator` seam accepts an exact spec-hash comparator once bundle manifests record one | never (warn only) |
+| `bundle` | `crewhaus.yaml` vs newest `dist/` mtime — labelled approximate. A spec or `dist/` entry that exists but cannot be examined is `bundle.unreadable` with the errno (unknown, not missing). The `FreshnessComparator` seam accepts an exact spec-hash comparator once bundle manifests record one | never (warn only) |
 | `durability` | channel daemon without `CREWHAUS_DEDUP_STORE`; live provider credentials with no `budget:` block | never (warn only) |
 
 ## Env injection

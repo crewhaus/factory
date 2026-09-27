@@ -2022,4 +2022,5 @@ export {
   parseYarnLock,
   parseYarnLockDetailed,
   satisfies,
+  satisfiesInstallable,
 } from "./lib/deps";

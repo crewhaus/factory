@@ -13,6 +13,8 @@ import { describe, expect, test } from "bun:test";
 import { parseIstanbulSummary, parseLcov, totalOf, worstFirst } from "./lib/coverage";
 import {
   LOCKFILE_NAMES,
+  type SemVer,
+  compareSemver,
   matchWorkspaceGlob,
   parseBunLock,
   parseBunLockDetailed,
@@ -32,6 +34,7 @@ import {
   parseYarnLock,
   parseYarnLockDetailed,
   satisfies,
+  satisfiesInstallable,
   stripJsonc,
 } from "./lib/deps";
 import {
@@ -1393,6 +1396,111 @@ describe("semver, the subset", () => {
     expect(satisfies("1.0.0", "^1.0.0 || ^2.0.0")).toBe(true);
     expect(satisfies("2.5.0", "^1.0.0 || ^2.0.0")).toBe(true);
     expect(satisfies("3.0.0", "^1.0.0 || ^2.0.0")).toBe(false);
+  });
+
+  // npm semver 7.7.4 is the oracle for every row: a missing segment is a
+  // wildcard, and each operator widens or narrows it the way node-semver's
+  // replaceXRange/replaceTilde/replaceCaret do. The first 0.7.1 cut read
+  // `1.2` as exactly 1.2.0 and answered each of these wrongly but definitely.
+  test("a partial version reads as npm reads it, under every operator", () => {
+    const rows: Array<[string, string, boolean]> = [
+      ["1.2.4", "1.2", true],
+      ["1.3.0", "1.2", false],
+      ["1.9.0", "1", true],
+      ["1.2.4", "=1.2", true],
+      ["1.2.4", "<=1.2", true],
+      ["1.3.0", "<=1.2", false],
+      ["1.2.4", ">1.2", false],
+      ["1.3.0", ">1.2", true],
+      ["1.9.0", ">1", false],
+      ["2.0.0", ">1", true],
+      ["1.1.9", "<1.2", true],
+      ["1.2.0", "<1.2", false],
+      ["1.9.0", "~1", true],
+      ["2.0.0", "~1", false],
+      ["0.5.0", "^0", true],
+      ["1.0.0", "^0", false],
+      ["0.0.9", "^0.0", true],
+      ["0.1.0", "^0.0", false],
+      ["1.2.7", "~>1.2", true],
+      ["1.2.0", ">= 1.2", true],
+      ["1.9.0", "<=1.x", true],
+      ["2.0.0", ">1.x", true],
+      ["1.0.0", ">*", false],
+      ["1.2.3", "1.2.3+build.5", true],
+    ];
+    const got = rows.map(([version, range]) => [version, range, satisfies(version, range)]);
+    expect(got).toEqual(rows);
+    // Prereleases of the next tuple stay out of a wildcard's ceiling, and
+    // includePrerelease lowers a wildcard's floor to its `-0`, as npm does.
+    expect(satisfiesInstallable("1.3.0-rc.1", "<=1.2", { includePrerelease: true })).toBe(false);
+    expect(satisfiesInstallable("1.2.0-beta.1", "1.2", { includePrerelease: true })).toBe(true);
+    expect(satisfiesInstallable("1.2.0-beta.1", "1.2")).toBe(false);
+    // What npm would not read at all stays "cannot tell".
+    for (const range of ["1.2-beta", "1.2.3foo", "1.2.3 - 2.0.0"]) {
+      expect({ range, got: satisfies("1.2.3", range) }).toEqual({ range, got: undefined });
+    }
+  });
+
+  test("satisfiesInstallable applies npm's prerelease rule on top of satisfies", () => {
+    // In range, and on the tuple the range names: eligible.
+    expect(satisfiesInstallable("1.2.3-beta.4", "^1.2.3-beta.2")).toBe(true);
+    // In range, but a prerelease of a later tuple: an install never picks it.
+    expect(satisfies("1.9.0-rc.1", "^1.2.3-beta.2")).toBe(true);
+    expect(satisfiesInstallable("1.9.0-rc.1", "^1.2.3-beta.2")).toBe(false);
+    expect(satisfiesInstallable("1.9.0-rc.1", "^1.2.3-beta.2", { includePrerelease: true })).toBe(
+      true,
+    );
+    // The named prerelease must be in the SAME alternative.
+    expect(satisfiesInstallable("2.5.0-rc.1", "1.2.3-beta.1 || ^2.0.0")).toBe(false);
+    expect(satisfiesInstallable("2.0.0-rc.2", "<2.0.0-rc.3 >=1.0.0")).toBe(true);
+    // Each of major, minor and patch must match the named prerelease's.
+    expect(satisfiesInstallable("1.2.4-rc.1", ">=1.2.3-rc.1 <1.3.0")).toBe(false);
+    expect(satisfiesInstallable("1.3.3-rc.1", ">=1.2.3-rc.1 <1.4.0")).toBe(false);
+    expect(satisfiesInstallable("2.2.3-rc.1", ">=1.2.3-rc.1 <3.0.0")).toBe(false);
+    // Releases are exactly `satisfies`; an unevaluable range stays unknown.
+    expect(satisfiesInstallable("1.5.0", "^1.2.3-beta.2")).toBe(true);
+    expect(satisfiesInstallable("3.0.0", "^1.2.3-beta.2")).toBe(false);
+    expect(satisfiesInstallable("1.0.0-rc.1", "workspace:*")).toBeUndefined();
+    expect(satisfiesInstallable("banana", "^1.0.0")).toBeUndefined();
+  });
+
+  test("prereleases order identifier by identifier, numbers numerically, as SemVer and npm do", () => {
+    // SemVer 2.0.0 §11's own example chain, shuffled; on 0.7.0 the tags were
+    // compared as whole strings, so beta.11 sorted below beta.2.
+    const chain = [
+      "1.0.0-alpha",
+      "1.0.0-alpha.1",
+      "1.0.0-alpha.beta",
+      "1.0.0-beta",
+      "1.0.0-beta.2",
+      "1.0.0-beta.11",
+      "1.0.0-rc.1",
+      "1.0.0",
+    ];
+    const shuffled = [
+      chain[5],
+      chain[7],
+      chain[2],
+      chain[0],
+      chain[6],
+      chain[4],
+      chain[1],
+      chain[3],
+    ];
+    const sorted = [...(shuffled as string[])].sort((a, b) =>
+      compareSemver(parseSemver(a) as SemVer, parseSemver(b) as SemVer),
+    );
+    expect(sorted).toEqual(chain);
+    const cmp = (a: string, b: string): number =>
+      Math.sign(compareSemver(parseSemver(a) as SemVer, parseSemver(b) as SemVer));
+    expect([cmp("1.0.0-rc.10", "1.0.0-rc.9"), cmp("1.0.0-2", "1.0.0-10")]).toEqual([1, -1]);
+    // A numeric identifier sorts below an alphanumeric one; equal numbers are equal.
+    expect([cmp("1.0.0-1", "1.0.0-a"), cmp("1.0.0-rc.01", "1.0.0-rc.1")]).toEqual([-1, 0]);
+    // Range evaluation rests on the same comparison.
+    expect(satisfies("1.0.0-beta.9", ">=1.0.0-beta.10")).toBe(false);
+    expect(satisfies("1.0.0-rc.10", "<=1.0.0-rc.5")).toBe(false);
+    expect(satisfiesInstallable("1.2.3-beta.11", "^1.2.3-beta.2")).toBe(true);
   });
 
   test("a range it cannot evaluate says so instead of guessing", () => {

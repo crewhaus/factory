@@ -266,6 +266,42 @@ describe("ApprovalStatus", () => {
     writeApprovals(tmp, [approval({ id: approvalId(1) })]);
     expect(await call(approvalStatus, { since: "yesterday" })).toContain("ISO-8601");
   });
+
+  test("a since, until or now with a time but no offset is refused, naming the offset (security-2#5)", async () => {
+    writeApprovals(tmp, [approval({ id: approvalId(1) })]);
+    for (const [label, text] of [
+      ["since", "2026-09-19T14:00:00"],
+      ["until", "2026-09-19 14:00"],
+      ["now", "2026-09-19T14:00"],
+    ] as const) {
+      const out = await call(approvalStatus, { [label]: text });
+      expect({
+        label,
+        refused: out.includes(`"${label}"`) && out.includes("has a time but no UTC offset"),
+      }).toEqual({
+        label,
+        refused: true,
+      });
+    }
+  });
+
+  test("a record whose createdAt has no offset is kept as undated and given no age", async () => {
+    writeApprovals(tmp, [
+      approval({ id: approvalId(1), createdAt: "2026-09-18T10:30:00" }),
+      approval({ id: approvalId(2), createdAt: "2026-09-18T10:30:00.000Z" }),
+    ]);
+    const out = await callJson<{
+      approvals: Array<{ id: string; ageSeconds?: number }>;
+      unknown: Array<{ field: string; reason: string }>;
+    }>(approvalStatus, { since: "2026-09-18T00:00:00Z", now: "2026-09-18T12:00:00Z" });
+    const byId = new Map(out.approvals.map((row) => [row.id, row]));
+    // Kept, not dropped, and not placed in the host's zone.
+    expect(byId.get(approvalId(1))?.ageSeconds).toBeUndefined();
+    expect(byId.get(approvalId(2))?.ageSeconds).toBe(5400);
+    const undated = out.unknown.find((u) => u.field === "approvals");
+    expect(undated?.reason).toContain(approvalId(1));
+    expect(undated?.reason).not.toContain(approvalId(2));
+  });
 });
 
 // ---------------------------------------------------------------------------
