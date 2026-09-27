@@ -17,6 +17,15 @@ import { type SpawnBoundedResult, spawnBounded } from "@crewhaus/tool-safety/str
  *     grace period for a child that ignores the first signal. The child
  *     leads its own process group and the deadline (or an abort) signals the
  *     whole group, so a `cmd &` it started cannot outlive the timeout.
+ *   - the child runs in a SESSION of its own (spawnBounded's detached spawn,
+ *     setsid), so it has no controlling terminal. That is deliberate, and a
+ *     change from 0.7.0: a model-run command cannot read the operator's
+ *     keystrokes from /dev/tty (the answers typed into the harness's own
+ *     approval prompt), cannot push input into that terminal (TIOCSTI), and
+ *     a `sudo`/`ssh`/`gpg` prompt fails at once instead of waiting on a
+ *     terminal the model cannot see. Bun has no "own process group but keep
+ *     the terminal" spawn, and the group is what makes the deadline real.
+ *     The background family (ProcessStart) keeps 0.7.0's spawn.
  *   - both streams are capped AS THEY ARE READ (C078). The foreground run is
  *     @crewhaus/tool-safety's `spawnBounded`: memory is bounded by the cap,
  *     not by what the child prints, and the reader keeps draining past the

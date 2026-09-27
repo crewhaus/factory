@@ -1177,6 +1177,50 @@ describe("WaitForPort", () => {
 
 // ---------------------------------------------------------------------------
 
+/**
+ * Regression review: RunCommand's child is spawned detached (setsid), so it
+ * has no controlling terminal — sudo, ssh and gpg prompts fail instead of
+ * waiting. That is the chosen behaviour (a model-run command must not read or
+ * inject into the operator's terminal), so it is pinned here under a real
+ * pty: the same shell run directly under `script` opens /dev/tty, and run
+ * through RunCommand inside that same pty it cannot.
+ */
+describe("RunCommand runs without a terminal", () => {
+  const script = ["/usr/bin/script", "/bin/script"].find((p) => existsSync(p));
+  const probe = "if (exec 3</dev/tty) 2>/dev/null; then echo TTY-OK; else echo TTY-NONE; fi";
+  const underPty = (argv: string[]): string => {
+    const quoted = argv.map((a) => `'${a.replaceAll("'", "'\\''")}'`).join(" ");
+    const cmd =
+      process.platform === "darwin"
+        ? [script as string, "-q", "/dev/null", ...argv]
+        : [script as string, "-qec", quoted, "/dev/null"];
+    const r = Bun.spawnSync(cmd, { cwd: tmp, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    return r.stdout.toString().replaceAll("\r", "");
+  };
+
+  test.skipIf(process.platform === "win32" || script === undefined)(
+    "a child of RunCommand cannot open the terminal its harness runs in",
+    () => {
+      // The pty is live: a shell started in it opens /dev/tty.
+      expect(underPty(["/bin/sh", "-c", probe])).toContain("TTY-OK");
+      const child = join(tmp, "run-in-pty.ts");
+      writeFileSync(
+        child,
+        [
+          `import { runCommand } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+          `const out = await runCommand.execute({ argv: ["/bin/sh", "-c", ${JSON.stringify(probe)}], timeoutMs: 10000 });`,
+          'console.log("RESULT", String(out));',
+        ].join("\n"),
+      );
+      const out = underPty([process.execPath, child]);
+      const line = out.split("\n").find((l) => l.includes("RESULT {")) ?? "";
+      const result = JSON.parse(line.slice(line.indexOf("{"))) as { ok: boolean; stdout: string };
+      expect({ ok: result.ok, stdout: result.stdout }).toEqual({ ok: true, stdout: "TTY-NONE\n" });
+    },
+    30_000,
+  );
+});
+
 describe("WaitForFile", () => {
   test("returns once the file appears", async () => {
     const target = join(tmp, "artifact.bin");

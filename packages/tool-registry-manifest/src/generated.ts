@@ -6457,7 +6457,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "retry",
     name: "Retry",
     description:
-      "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported.",
+      "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported. Each attempt runs with no terminal, so one that prompts fails instead of waiting.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -6565,7 +6565,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "runCommand",
     name: "RunCommand",
     description:
-      "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, and always has a timeout.",
+      "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, always has a timeout, and runs in a session of its own with no terminal: a program that prompts (sudo, ssh, gpg) fails instead of waiting for input.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -6581,7 +6581,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "runPipeline",
     name: "RunPipeline",
     description:
-      "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout.",
+      "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout, and runs with no terminal, so a step that prompts fails instead of waiting.",
     readOnly: false,
     destructive: true,
     scope: "external",
