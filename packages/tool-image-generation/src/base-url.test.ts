@@ -95,6 +95,27 @@ describe("resolveOpenAIBaseUrl", () => {
     }
   });
 
+  // Attacker review: `/\/+$/` rescanned a run of slashes from every start,
+  // quadratic in its length (about 80 s for 400k slashes, at boot). A
+  // bounded proof: 100k slashes took seconds with the regex and take
+  // milliseconds with the loop.
+  test("trailing slashes are stripped in linear time", () => {
+    expect(resolveOpenAIBaseUrl({ openaiBaseUrl: "https://api.openai.com/v1///" }, {})).toBe(
+      "https://api.openai.com/v1",
+    );
+    const slashes = "/".repeat(100_000);
+    const started = performance.now();
+    const result = resolveOpenAIBaseUrl(
+      { openaiBaseUrl: `https://api.openai.com/${slashes}v1` },
+      {},
+    );
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(result.endsWith(`${slashes}v1`)).toBe(true);
+    expect(() =>
+      resolveOpenAIBaseUrl({ openaiBaseUrl: `https://proxy.example/${slashes}v1` }, {}),
+    ).toThrow("set OPENAI_BASE_URL=https://proxy.example/");
+  });
+
   test("userinfo in the URL is refused", () => {
     expect(() =>
       resolveOpenAIBaseUrl({ openaiBaseUrl: "https://u:p@api.openai.com/v1" }, {}),

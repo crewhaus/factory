@@ -160,6 +160,17 @@ function processEnv(): Readonly<Record<string, string | undefined>> {
 const OPENAI_ORIGIN = "https://api.openai.com";
 const OPENAI_DEFAULT_BASE_URL = `${OPENAI_ORIGIN}/v1`;
 
+/**
+ * `text` without its trailing slashes. A loop, not `/\/+$/`, which rescans
+ * a run of slashes from every start and is quadratic in its length; a base
+ * URL comes from a spec, which may come from a template or a pull request.
+ */
+function withoutTrailingSlashes(text: string): string {
+  let end = text.length;
+  while (end > 0 && text[end - 1] === "/") end--;
+  return text.slice(0, end);
+}
+
 function isLoopbackHost(host: string): boolean {
   const h = host.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
   return h === "localhost" || h === "::1" || /^127(\.\d{1,3}){3}$/.test(h);
@@ -215,7 +226,7 @@ export function resolveOpenAIBaseUrl(
       approved = false;
     }
   }
-  const approve = `set OPENAI_BASE_URL=${url.origin}${url.pathname.replace(/\/+$/, "")} in the environment the harness starts in`;
+  const approve = `set OPENAI_BASE_URL=${url.origin}${withoutTrailingSlashes(url.pathname)} in the environment the harness starts in`;
   if (url.protocol === "http:") {
     if (!isLoopbackHost(url.hostname) || !approved) {
       throw new ImageGenerationError(
@@ -231,7 +242,7 @@ export function resolveOpenAIBaseUrl(
       `tool_config.imageGenerate.openaiBaseUrl would send OPENAI_API_KEY to ${url.origin}. A spec cannot choose where the key goes; to approve this endpoint, ${approve}.`,
     );
   }
-  return raw.replace(/\/+$/, "");
+  return withoutTrailingSlashes(raw);
 }
 
 /**
