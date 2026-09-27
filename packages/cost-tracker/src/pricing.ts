@@ -80,9 +80,10 @@ export type PricingTable = {
  * specific row always wins, so the fallbacks only ever catch ids no
  * more-specific row covers.
  *
- * Anthropic pricing note (2026-07): current Anthropic prices come from the
- * `claude-api` skill — Opus 4.5+ is $5/$25, Sonnet is $3/$15, Haiku is $1/$5,
- * Fable/Mythos is $10/$50. Every current family is spelled out rather than left
+ * Anthropic pricing note (2026-09): current Anthropic prices come from the
+ * `claude-api` skill — Opus 4.5–5 is $5/$25, Opus 5.5 is $4/$20, Sonnet 5 is
+ * $2/$10, Sonnet 4.x is $3/$15, Haiku is $1/$5, Fable/Mythos is $10/$50. Every
+ * current family is spelled out rather than left
  * to a fallback so each rate is greppable, and because the bedrock table's
  * fallbacks were added late: an id no row covered there matched NOTHING and
  * billed $0 rather than merely mispricing.
@@ -104,9 +105,15 @@ export type PricingTable = {
  * same commit.
  */
 export const DEFAULT_PRICING: PricingTable = {
-  version: "2026-07-31",
+  version: "2026-09-23",
   providers: {
     anthropic: {
+      // Opus 5.5 is CHEAPER than Opus 5, so it needs its own row: without it,
+      // `claude-opus-5-5` matched the `claude-opus-5` row on longest-prefix and
+      // billed 25% high. Its cache reads are $0.20 (0.05x input, not the 0.1x
+      // default), so that rate is explicit; the $5 cache write is the default
+      // 1.25x.
+      "claude-opus-5-5": { inputPer1M: 4.0, outputPer1M: 20.0, cachedReadPer1M: 0.2 },
       // Current generation (2026-07). Opus 4.5+ dropped to $5/$25.
       "claude-opus-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
       "claude-opus-4-8": { inputPer1M: 5.0, outputPer1M: 25.0 },
@@ -119,7 +126,9 @@ export const DEFAULT_PRICING: PricingTable = {
       // what it now catches is the genuinely-legacy 4.0/4.1 lineage.
       "claude-opus-4-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
       "claude-opus-4": { inputPer1M: 15.0, outputPer1M: 75.0 },
-      "claude-sonnet-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
+      // Sonnet 5 is $2/$10, below Sonnet 4.x. It sat at the 4.x $3/$15 and
+      // metered 50% high.
+      "claude-sonnet-5": { inputPer1M: 2.0, outputPer1M: 10.0 },
       "claude-sonnet-4-6": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-sonnet-4-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
       "claude-sonnet-4": { inputPer1M: 3.0, outputPer1M: 15.0 },
@@ -219,11 +228,13 @@ export const DEFAULT_PRICING: PricingTable = {
     bedrock: {
       // Current-generation Anthropic-on-Bedrock at first-party rates, so a
       // current model no longer inherits the legacy $15/$75 base.
+      // Opus 5.5 and Sonnet 5 mirror the first-party rows above.
+      "anthropic.claude-opus-5-5": { inputPer1M: 4.0, outputPer1M: 20.0, cachedReadPer1M: 0.2 },
       "anthropic.claude-opus-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
       "anthropic.claude-opus-4-8": { inputPer1M: 5.0, outputPer1M: 25.0 },
       // Same 4.5-falls-to-legacy-base trap as the first-party table.
       "anthropic.claude-opus-4-5": { inputPer1M: 5.0, outputPer1M: 25.0 },
-      "anthropic.claude-sonnet-5": { inputPer1M: 3.0, outputPer1M: 15.0 },
+      "anthropic.claude-sonnet-5": { inputPer1M: 2.0, outputPer1M: 10.0 },
       "anthropic.claude-haiku-4-5": { inputPer1M: 1.0, outputPer1M: 5.0 },
       "anthropic.claude-fable-5": { inputPer1M: 10.0, outputPer1M: 50.0 },
       "anthropic.claude-opus-4": { inputPer1M: 15.0, outputPer1M: 75.0 },

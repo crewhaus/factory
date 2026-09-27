@@ -114,6 +114,43 @@ describe("cost-tracker — T1 pricing table", () => {
     ).toBe(15.0);
   });
 
+  test("claude-opus-5-5 and claude-sonnet-5 price at their own rates on anthropic and bedrock", () => {
+    // Regression: `claude-opus-5-5` had no row and matched `claude-opus-5` on
+    // longest-prefix ($5/$25 — 25% high), and `claude-sonnet-5` sat at the
+    // Sonnet 4.x $3/$15 (50% high). Real rates: Opus 5.5 $4/$20 with $0.20
+    // cache reads (0.05x, not the 0.1x default); Sonnet 5 $2/$10.
+    for (const [provider, prefix] of [
+      ["anthropic", ""],
+      ["bedrock", "anthropic."],
+      ["bedrock", "us.anthropic."],
+    ] as const) {
+      const opus55 = resolvePricing(DEFAULT_PRICING, provider, `${prefix}claude-opus-5-5`);
+      expect(opus55?.inputPer1M).toBe(4.0);
+      expect(opus55?.outputPer1M).toBe(20.0);
+      expect(opus55?.cachedReadPer1M).toBe(0.2);
+      const sonnet5 = resolvePricing(DEFAULT_PRICING, provider, `${prefix}claude-sonnet-5`);
+      expect(sonnet5?.inputPer1M).toBe(2.0);
+      expect(sonnet5?.outputPer1M).toBe(10.0);
+      // The new row must not shadow Opus 5, dated or not.
+      for (const id of ["claude-opus-5", "claude-opus-5-20260401"]) {
+        expect(resolvePricing(DEFAULT_PRICING, provider, `${prefix}${id}`)?.inputPer1M).toBe(5.0);
+      }
+    }
+    // A dated Opus 5.5 id still reaches its own row.
+    expect(
+      resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-5-5-20260901")?.inputPer1M,
+    ).toBe(4.0);
+  });
+
+  test("claude-opus-5-5 bills its $0.20 cache reads and the default 1.25x cache writes", () => {
+    const row = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-5-5");
+    if (row === undefined) throw new Error("claude-opus-5-5 must resolve");
+    // 1000×4 + 100×20 + 10_000×0.2 + 2000×(4×1.25) = 4000 + 2000 + 2000 + 10_000
+    expect(computeCostMicros(row, 1000, 100, 10_000, 2000)).toBe(18_000);
+    // Savings: 10_000×(4−0.2) read discount − 2000×(5−4) write premium.
+    expect(computeCacheSavingsMicros(row, 10_000, 2000)).toBe(36_000);
+  });
+
   test("resolvePricing strips Bedrock cross-region inference-profile prefixes", () => {
     // us.anthropic.* profiles route to the same model as anthropic.* —
     // pricing rows are keyed on the bare id.
@@ -440,8 +477,10 @@ describe("cost-tracker — T3 trace bus integration", () => {
       [
         // opus-4-8 @ $5/$25: 1000×5 + 500×25 = 17_500
         { model: "claude-opus-4-8", input: 1000, output: 500, micros: 17_500 },
-        // sonnet-5 @ $3/$15: 1000×3 + 500×15 = 10_500
-        { model: "claude-sonnet-5", input: 1000, output: 500, micros: 10_500 },
+        // opus-5-5 @ $4/$20: 1000×4 + 500×20 = 14_000
+        { model: "claude-opus-5-5", input: 1000, output: 500, micros: 14_000 },
+        // sonnet-5 @ $2/$10: 1000×2 + 500×10 = 7_000
+        { model: "claude-sonnet-5", input: 1000, output: 500, micros: 7_000 },
         // haiku-4-5 @ $1/$5: 1000×1 + 500×5 = 3_500
         { model: "claude-haiku-4-5", input: 1000, output: 500, micros: 3_500 },
         // fable-5 @ $10/$50: 1000×10 + 500×50 = 35_000
@@ -470,9 +509,9 @@ describe("cost-tracker — T3 trace bus integration", () => {
   });
 
   test("F2 — bare-family fallbacks catch a hypothetical next-major id at the current rate", () => {
-    // No claude-opus-5-x row exists; the `claude-opus` fallback ($5/$25)
+    // No claude-opus-6 row exists; the `claude-opus` fallback ($5/$25)
     // resolves it instead of missing.
-    const row = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-5-0");
+    const row = resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-6-0");
     expect(row?.inputPer1M).toBe(5.0);
     expect(row?.outputPer1M).toBe(25.0);
     // Longest-prefix still wins for today's ids: opus-4-8 keeps its own row.

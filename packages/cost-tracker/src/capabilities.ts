@@ -76,7 +76,7 @@ export type CapabilityTable = {
  * adapter-gemini/adapter-bedrock family.ts).
  */
 export const DEFAULT_CAPABILITIES: CapabilityTable = {
-  version: "2026-07-14",
+  version: "2026-09-23",
   providers: {
     anthropic: {
       // Every current claude-* family: explicit caching, tools, vision,
@@ -84,6 +84,29 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
       // major-base covers claude-opus-4-8; `claude-sonnet-5`/`claude-fable-5`
       // and the bare-family fallbacks cover the current models that don't
       // share a prefix with the 4.x bases — kept in lockstep with pricing.ts.
+      //
+      // Opus 5.5, Opus 5 and Sonnet 5 are 1M context / 128K output — the
+      // default and the maximum, not a beta tier. Without their own rows the
+      // two Opus ids fell through to the bare `claude-opus` fallback
+      // (200K/32K), clamping `max_tokens` to a quarter of what they can emit.
+      "claude-opus-5-5": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+        contextWindow: 1000000,
+        maxOutputTokens: 128000,
+      },
+      "claude-opus-5": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: true,
+        contextWindow: 1000000,
+        maxOutputTokens: 128000,
+      },
       "claude-opus-4": {
         caching: "explicit",
         tool_use: true,
@@ -99,8 +122,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: true,
-        contextWindow: 200000,
-        maxOutputTokens: 64000,
+        contextWindow: 1000000,
+        maxOutputTokens: 128000,
       },
       "claude-sonnet-4": {
         caching: "explicit",
@@ -305,15 +328,25 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
     bedrock: {
       // Transcribes adapter-bedrock featuresForFamily(): anthropic on Bedrock
       // keeps explicit caching + thinking; llama/mistral are tools-only;
-      // nova adds vision.
+      // nova adds vision. Opus 5.5 / Opus 5 / Sonnet 5 carry the same 1M/128K
+      // limits as first-party (1M context is available on Bedrock).
+      "anthropic.claude-opus-5-5": {
+        caching: "explicit",
+        tool_use: true,
+        vision: true,
+        thinking: true,
+        web_search: false,
+        contextWindow: 1000000,
+        maxOutputTokens: 128000,
+      },
       "anthropic.claude-opus-5": {
         caching: "explicit",
         tool_use: true,
         vision: true,
         thinking: true,
         web_search: false,
-        contextWindow: 200000,
-        maxOutputTokens: 32000,
+        contextWindow: 1000000,
+        maxOutputTokens: 128000,
       },
       "anthropic.claude-opus-4-8": {
         caching: "explicit",
@@ -330,8 +363,8 @@ export const DEFAULT_CAPABILITIES: CapabilityTable = {
         vision: true,
         thinking: true,
         web_search: false,
-        contextWindow: 200000,
-        maxOutputTokens: 64000,
+        contextWindow: 1000000,
+        maxOutputTokens: 128000,
       },
       "anthropic.claude-opus-4": {
         caching: "explicit",
