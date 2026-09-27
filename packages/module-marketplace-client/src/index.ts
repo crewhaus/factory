@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import type { PluginRegistry } from "@crewhaus/plugin-registry";
 import {
@@ -10,7 +10,7 @@ import {
   entrypointImportProblem,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
-import { openForRead } from "@crewhaus/tool-safety/fs";
+import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import pkg from "../package.json" with { type: "json" };
 
 /**
@@ -148,7 +148,12 @@ export type MarketplaceClientOptions = {
   readonly pluginRegistry: PluginRegistry;
   /** Local directory under which installed plugins live. Mirrors the §41 trustedRoots. */
   readonly pluginsDir: string;
-  /** Test seam: override the file write. Defaults to a 0600-mode writeFileSync. */
+  /**
+   * Test seam: override the file write. The default writes inside
+   * `pluginsDir` only, never through a link: a new manifest is created 0600,
+   * a temp file is renamed into place, and a link planted at `plugin.json`
+   * or at the plugin's directory is refused, naming the path.
+   */
   readonly writeFileImpl?: (path: string, contents: string) => void;
   /**
    * Test seam: read a plugin's `index.js`. Resolves `undefined` when there is
@@ -187,10 +192,27 @@ async function defaultReadEntrypoint(path: string): Promise<Uint8Array | undefin
   throw new Error(read.reason);
 }
 
-function defaultWriteFile(path: string, contents: string): void {
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(path, contents, { encoding: "utf8", mode: 0o600 });
+/**
+ * The default manifest writer: `path` inside `pluginsDir`, through
+ * tool-safety's writeFileSafe. The plugin's directory is created inside
+ * `pluginsDir` without following a link out of it; the bytes go to a temp
+ * file created beside the manifest and renamed into place, so a link planted
+ * at `plugin.json` is never written through (a leaf link is refused, naming
+ * the path). A new manifest is 0600; one it replaces keeps its mode.
+ */
+function writeManifestContained(pluginsDir: string, path: string, contents: string): void {
+  // pluginsDir is the operator's own directory; what is inside it is not.
+  mkdirSync(pluginsDir, { recursive: true });
+  const written = writeFileSafe(pluginsDir, relative(pluginsDir, path), contents, {
+    overwrite: true,
+    createParents: true,
+    mode: 0o600,
+  });
+  if (!written.ok) {
+    throw new ModuleMarketplaceError(
+      `module-marketplace-client: cannot write ${path}: ${written.reason} — not installed`,
+    );
+  }
 }
 
 export interface MarketplaceClient {
@@ -240,7 +262,9 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
   if (typeof opts.pluginsDir !== "string" || opts.pluginsDir.length === 0) {
     throw new ModuleMarketplaceError("module-marketplace-client: pluginsDir is required");
   }
-  const writeFile = opts.writeFileImpl ?? defaultWriteFile;
+  const writeFile =
+    opts.writeFileImpl ??
+    ((path: string, contents: string) => writeManifestContained(opts.pluginsDir, path, contents));
   const readEntrypoint = opts.readEntrypointImpl ?? defaultReadEntrypoint;
   const hostVersion = opts.hostVersion ?? HOST_VERSION;
 
