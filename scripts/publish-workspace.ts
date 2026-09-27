@@ -52,7 +52,9 @@
  * After a failed run, fix the cause and re-run WITHOUT --filter: versions already
  * on the registry are skipped and everything the failure held back goes out.
  * `--filter <leaf>` would publish the leaf alone and exit 0 with its dependents
- * still missing. The summary of a failed run says this.
+ * still missing. The summary of a failed run says this. A --filter run looks up
+ * every dependency outside the run on the registry, down its whole closure (for
+ * the CLI, nearly every package); those lookups run a few at a time.
  *
  * Brand-new package names can 404 on the registry for a few minutes after a
  * successful publish — poll before assuming failure or re-running.
@@ -793,6 +795,31 @@ export function unmetDependencies(
 }
 
 /**
+ * Every `<name>@<version>` unmetDependencies() may ask the registry about for
+ * these packages: each dependency outside the run and its whole closure, at the
+ * dependent's version, once each. Empty for a full run (every dependency is in
+ * it). Asked up front, a few at a time, it costs a `--filter crewhaus` run
+ * seconds instead of one sequential lookup per package in the closure.
+ */
+export function outsideClosure(
+  pkgs: readonly Pick<PkgInfo, "deps" | "version">[],
+  inRun: ReadonlySet<string>,
+  depsOf: (name: string) => readonly string[],
+): { readonly name: string; readonly version: string }[] {
+  const out: { name: string; version: string }[] = [];
+  const seen = new Set<string>();
+  const visit = (name: string, version: string): void => {
+    const key = `${name}@${version}`;
+    if (inRun.has(name) || seen.has(key)) return;
+    seen.add(key);
+    out.push({ name, version });
+    for (const next of depsOf(name)) visit(next, version);
+  };
+  for (const p of pkgs) for (const d of p.deps) visit(d, p.version);
+  return out;
+}
+
+/**
  * What to do after a failed run. A full re-run is what finishes a release: it
  * skips every version already on the registry and publishes what the failure
  * held back. `--filter <name>` publishes that one package and nothing that
@@ -894,6 +921,17 @@ async function main(): Promise<void> {
     },
     depsOf: (name) => byName.get(name)?.deps ?? [],
   };
+  // Registry lookups the dependency gate will make (under --filter, a whole
+  // closure), asked a few at a time now rather than one by one in the loop.
+  if (!NO_REGISTRY) {
+    const ahead = outsideClosure(filtered, gate.inRun, gate.depsOf);
+    const states = await mapPool(ahead, NPM_POOL, async ({ name, version }) =>
+      versionState(await npmAsync(["view", `${name}@${version}`, "version"])),
+    );
+    ahead.forEach(({ name, version }, i) => {
+      registryMemo.set(`${name}@${version}`, states[i] as RegistryState);
+    });
+  }
   // What npm would pack for each package, asked before anything is published.
   console.log(`Asking npm what it would pack for ${filtered.length} package(s)...`);
   const packLists = await mapPool(filtered, NPM_POOL, (p) => npmPackList(p.dir, p.name));

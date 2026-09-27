@@ -30,6 +30,7 @@ import {
   mapPool,
   npmErrorCode,
   npmPackList,
+  outsideClosure,
   ownershipVerdict,
   packedContentsProblems,
   parsePackJson,
@@ -239,6 +240,38 @@ test("unmetDependencies walks a dependency outside the run down to its own depen
   expect(unmetDependencies({ version: V, deps: ["@crewhaus/b"] }, failed)).toEqual([
     "@crewhaus/c (failed or was refused in this run; needed through @crewhaus/b)",
   ]);
+});
+
+test("outsideClosure lists every registry lookup the gate may make: the closure outside the run, once each", () => {
+  const graph: Record<string, string[]> = {
+    "@crewhaus/b": ["@crewhaus/a", "@crewhaus/c"],
+    "@crewhaus/c": ["@crewhaus/a", "@crewhaus/in-run"],
+    "@crewhaus/a": [],
+    "@crewhaus/in-run": ["@crewhaus/never-walked"],
+  };
+  const depsOf = (name: string) => graph[name] ?? [];
+  const cli = { version: V, deps: ["@crewhaus/b", "@crewhaus/in-run"] };
+  const ahead = outsideClosure([cli], new Set(["crewhaus", "@crewhaus/in-run"]), depsOf);
+  expect(ahead).toEqual([
+    { name: "@crewhaus/b", version: V },
+    { name: "@crewhaus/a", version: V },
+    { name: "@crewhaus/c", version: V },
+  ]);
+  // Every lookup unmetDependencies makes is one of these, so none is left to
+  // make one at a time in the loop.
+  const asked: string[] = [];
+  unmetDependencies(cli, {
+    unavailable: new Set(),
+    inRun: new Set(["crewhaus", "@crewhaus/in-run"]),
+    registry: (name, version) => {
+      asked.push(`${name}@${version}`);
+      return { kind: "published" };
+    },
+    depsOf,
+  });
+  expect(asked.sort()).toEqual(ahead.map((d) => `${d.name}@${d.version}`).sort());
+  // A full run has every dependency in it, so it asks the registry nothing extra.
+  expect(outsideClosure([cli], new Set(Object.keys(graph)), depsOf)).toEqual([]);
 });
 
 test("mapPool keeps input order and never runs more than its limit at once", async () => {
@@ -602,11 +635,20 @@ withNpm(
     expect(r.stderr).toContain(
       `crewhaus@${V} not published: it depends on @crewhaus/zz-a@${V} (not on the registry; needed through @crewhaus/zz-b)`,
     );
-    expect(r.calls.filter((a) => a[0] === "view" && a[2] === "version").map((a) => a[1])).toEqual([
-      `@crewhaus/zz-b@${V}`,
-      `@crewhaus/zz-a@${V}`,
-      `crewhaus@${V}`,
-    ]);
+    // The closure is asked about up front, a few at a time (so in no fixed order),
+    // each member once; then the package itself, in the loop.
+    const versionCalls = r.calls
+      .filter((a) => a[0] === "view" && a[2] === "version")
+      .map((a) => a[1]);
+    expect(versionCalls.slice(0, 2).sort()).toEqual([`@crewhaus/zz-a@${V}`, `@crewhaus/zz-b@${V}`]);
+    expect(versionCalls.slice(2)).toEqual([`crewhaus@${V}`]);
+    // Up front means before the loop: before npm is even asked what it would pack.
+    const firstPack = r.calls.findIndex((a) => a[0] === "pack");
+    const closureAsked = r.calls.flatMap((a, i) =>
+      a[0] === "view" && a[1] !== `crewhaus@${V}` && a[2] === "version" ? [i] : [],
+    );
+    expect(closureAsked).toHaveLength(2);
+    expect(closureAsked.every((i) => i < firstPack)).toBe(true);
     expect(r.stdout).toContain("Published: 0  Skipped: 0  Failed: 1");
   },
   RUN_BUDGET,
