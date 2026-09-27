@@ -47,7 +47,16 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { lookup as dnsLookup, resolveTxt } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
-import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
+import {
+  REDACTED,
+  type SecretValue,
+  createSecretRedactor,
+  isEnvName,
+  looksLikePastedSecret,
+  resolveCredentialEnv,
+  secretForms,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
 import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import { joinTxtChunks, normalizeDomain } from "./lib/dns-records";
 
@@ -1130,7 +1139,11 @@ export function rejectInlineCredentials(headers: Record<string, string>): string
 }
 
 export type AppliedAuth =
-  | { readonly ok: true; readonly secretHeaders: ReadonlySet<string>; readonly secrets: string[] }
+  | {
+      readonly ok: true;
+      readonly secretHeaders: ReadonlySet<string>;
+      readonly secrets: SecretValue[];
+    }
   | { readonly ok: false; readonly message: string };
 
 /**
@@ -1160,9 +1173,16 @@ export function applyAuth(
         message: 'auth type "basic" needs a username; the password comes from envVar',
       };
     }
-    const encoded = Buffer.from(`${auth.username}:${secret}`, "utf8").toString("base64");
+    const publicPrefix = `${auth.username}:`;
+    const encoded = Buffer.from(`${publicPrefix}${secret}`, "utf8").toString("base64");
     headers["Authorization"] = `Basic ${encoded}`;
-    return { ok: true, secretHeaders: new Set(["authorization"]), secrets: [secret, encoded] };
+    // The pair's `user:` is the account name, not a secret: a reply that
+    // ends with it is left alone, while every spelling of the pair is not.
+    return {
+      ok: true,
+      secretHeaders: new Set(["authorization"]),
+      secrets: [secret, { publicPrefix, secret }],
+    };
   }
   if (auth.headerName === undefined) {
     return { ok: false, message: 'auth type "header" needs a headerName' };
@@ -1189,26 +1209,47 @@ export function applyAuth(
  *
  * Secrets shorter than six characters are left alone: replacing every "x" in
  * a result would mangle it without protecting anything real.
+ *
+ * This is tool-safety's redactor: every spelling of a secret, and the part
+ * of one a cut left at a string's end. A cut this package makes itself is
+ * trimmed where it is made ({@link readCapped}, {@link excerptOf}), because a
+ * cut inside a JSON result is not at the end of the text this runs on (net
+ * attacker review: a byte cap through an echoed header returned all but one
+ * character of the credential).
+ *
+ * `identifiers` (an SMTP username) are replaced only whole, as 0.7.0 did:
+ * they are not secrets, so the start of one at a string's end is not cut.
  */
-export function redactorFor(secrets: readonly (string | undefined)[]): (text: string) => string {
-  const forms = new Set<string>();
-  for (const secret of secrets) {
-    if (secret === undefined || secret.length < 6) continue;
-    forms.add(secret);
-    forms.add(encodeURIComponent(secret));
-    try {
-      forms.add(Buffer.from(secret, "utf8").toString("base64"));
-    } catch {
-      // not encodable — the literal form is still covered
-    }
-  }
-  const ordered = [...forms].filter((f) => f.length >= 6).sort((a, b) => b.length - a.length);
-  if (ordered.length === 0) return (text) => text;
+export function redactorFor(
+  secrets: readonly (SecretValue | undefined)[],
+  identifiers: readonly (string | undefined)[] = [],
+): (text: string) => string {
+  const redactSecrets = createSecretRedactor(secrets);
+  const idForms = [
+    ...new Set(
+      identifiers.flatMap((v) =>
+        v === undefined || v.trim().length < 6 ? [] : secretForms(v).filter((f) => f.length >= 6),
+      ),
+    ),
+  ].sort((a, b) => b.length - a.length);
   return (text: string): string => {
-    let out = text;
-    for (const form of ordered) out = out.split(form).join("<redacted>");
+    let out = redactSecrets(text);
+    for (const form of idForms) if (out.includes(form)) out = out.split(form).join(REDACTED);
     return out;
   };
+}
+
+/** The most of a reply an error message quotes. */
+export const EXCERPT_CHARS = 500;
+
+/**
+ * The first {@link EXCERPT_CHARS} of a reply, for an error message. When
+ * that cuts the reply, whatever part of an echoed credential the cut leaves
+ * at the end is trimmed, since the redactor matches whole spellings.
+ */
+export function excerptOf(text: string, secrets: readonly (SecretValue | undefined)[]): string {
+  if (text.length <= EXCERPT_CHARS) return text;
+  return trimSecretTail(text.slice(0, EXCERPT_CHARS), secrets);
 }
 
 /** Response headers as a sorted plain object, credentials removed. */
@@ -1422,12 +1463,21 @@ export async function readCapped(
   res: Response,
   maxBytes: number,
   signal?: AbortSignal,
+  secrets: readonly (SecretValue | undefined)[] = [],
 ): Promise<CappedBody> {
   const read = await readResponseBounded(res, {
     maxBytes,
     ...(signal !== undefined ? { signal } : {}),
   });
-  if (read.ok) return { text: read.text, bytes: read.bytes.byteLength, truncated: read.truncated };
+  if (read.ok) {
+    return {
+      // A cut can fall inside a credential the endpoint echoed; what it
+      // leaves is a prefix no whole spelling matches, so it goes here.
+      text: read.truncated ? trimSecretTail(read.text, secrets) : read.text,
+      bytes: read.bytes.byteLength,
+      truncated: read.truncated,
+    };
+  }
   switch (read.code) {
     case "aborted": {
       const err = new Error("the read was aborted before the reply ended");

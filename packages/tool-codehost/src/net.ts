@@ -38,10 +38,15 @@
  * A token a model can put in a tool argument is a token in the transcript,
  * the trace and the eval report.
  */
-import { Buffer } from "node:buffer";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { CrewhausError } from "@crewhaus/errors";
-import { isEnvName, looksLikePastedSecret, resolveCredentialEnv } from "@crewhaus/tool-safety/env";
+import {
+  createSecretRedactor,
+  isEnvName,
+  looksLikePastedSecret,
+  resolveCredentialEnv,
+  trimSecretTail,
+} from "@crewhaus/tool-safety/env";
 import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 /** Refusal by the allow-list, the SSRF gate, a redirect rule or a credential rule. */
@@ -896,26 +901,20 @@ export function originOfBase(baseUrl: string): string {
  * each put the token in a transcript, and that is not a mistake worth leaving
  * one layer deep.
  *
+ * It is tool-safety's redactor, so it also catches the JSON-escaped and
+ * base64url spellings, and the start of the token that a cut left at a
+ * string's end.
+ *
  * Secrets shorter than six characters are left alone: replacing every "x" in
  * a result would mangle it without protecting anything real, and no usable
  * host token is that short.
  */
 export function redactorFor(secret: string | undefined): (text: string) => string {
-  if (secret === undefined || secret.length < 6) return (text) => text;
-  const encodedForms = new Set<string>([secret, encodeURIComponent(secret)]);
-  try {
-    encodedForms.add(Buffer.from(secret, "utf8").toString("base64"));
-  } catch {
-    // not encodable — the literal form is still covered
-  }
-  return (text: string): string => {
-    let out = text;
-    for (const form of [...encodedForms].sort((a, b) => b.length - a.length)) {
-      if (form.length < 6) continue;
-      out = out.split(form).join("<redacted>");
-    }
-    return out;
-  };
+  // tool-safety's redactor: every spelling of the token, and the part of
+  // one a cut left at a string's end. A cut this package makes itself is
+  // trimmed where it is made (readCapped), as tool-http's is (net attacker
+  // review).
+  return createSecretRedactor([secret]);
 }
 
 /** The auth header for a host, ready to merge into a request. */
@@ -1146,12 +1145,21 @@ export async function readCapped(
   res: Response,
   maxBytes: number,
   signal?: AbortSignal,
+  secrets: readonly (string | undefined)[] = [],
 ): Promise<CappedBody> {
   const read = await readResponseBounded(res, {
     maxBytes,
     ...(signal !== undefined ? { signal } : {}),
   });
-  if (read.ok) return { text: read.text, bytes: read.bytes.byteLength, truncated: read.truncated };
+  if (read.ok) {
+    return {
+      // A cut can fall inside a token the server echoed; what it leaves is a
+      // prefix no whole spelling matches, so it is trimmed here.
+      text: read.truncated ? trimSecretTail(read.text, secrets) : read.text,
+      bytes: read.bytes.byteLength,
+      truncated: read.truncated,
+    };
+  }
   switch (read.code) {
     case "aborted":
     case "stalled": {

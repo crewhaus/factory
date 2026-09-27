@@ -1270,7 +1270,7 @@ async function callRemote(call: RemoteCall): Promise<RemoteResult> {
       cfg: call.cfg,
       credentialHeaders: secretHeaders,
     });
-    const body = await readCapped(opened.res, call.maxBytes, deadline.signal);
+    const body = await readCapped(opened.res, call.maxBytes, deadline.signal, [token.token]);
     return {
       ok: true,
       status: opened.res.status,

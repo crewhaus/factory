@@ -46,6 +46,7 @@ import { readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type { SecretValue } from "@crewhaus/tool-safety/env";
 import { z } from "zod";
 import type { Block, Platform } from "./lib/blocks";
 import {
@@ -90,6 +91,7 @@ import {
   byString,
   describeFailure,
   destinationRefusal,
+  excerptOf,
   isDotSegment,
   json,
   ledgerLookup,
@@ -240,11 +242,13 @@ type Prepared = {
   readonly cfg: NotifyConfig;
   readonly deadline: Deadline;
   readonly redact: (text: string) => string;
+  /** The call's credential values: a cut of a reply is trimmed of any part of one. */
+  readonly secrets: readonly SecretValue[];
 };
 
 /** Everything that echoes out of this package passes through the redactor. */
 function withRedaction(
-  secrets: readonly (string | undefined)[],
+  secrets: readonly SecretValue[],
   timeoutMs: number | undefined,
   ctx: ToolExecuteContext | undefined,
 ): Prepared {
@@ -252,6 +256,7 @@ function withRedaction(
     cfg: resolveNotifyConfig(ctx?.toolConfig),
     deadline: startDeadline(timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal),
     redact: redactorFor(secrets),
+    secrets,
   };
 }
 
@@ -260,7 +265,7 @@ type PreparedRequest =
       readonly ok: true;
       readonly headers: Record<string, string>;
       readonly secretHeaders: ReadonlySet<string>;
-      readonly secrets: string[];
+      readonly secrets: SecretValue[];
     }
   | { readonly ok: false; readonly message: string };
 
@@ -299,6 +304,8 @@ type SendOutcome = {
   readonly status: number;
   readonly ok: boolean;
   readonly body: string;
+  /** The start of `body` an error message quotes, trimmed of any part of a credential. */
+  readonly excerpt: string;
   readonly truncated: boolean;
   readonly parsed: unknown;
   /**
@@ -346,12 +353,13 @@ async function send(
   const status = opened.res.status;
   let capped: Awaited<ReturnType<typeof readCapped>>;
   try {
-    capped = await readCapped(opened.res, maxBytes, prepared.deadline.signal);
+    capped = await readCapped(opened.res, maxBytes, prepared.deadline.signal, prepared.secrets);
   } catch (err) {
     return {
       status,
       ok: status >= 200 && status < 300,
       body: "",
+      excerpt: "",
       truncated: false,
       parsed: undefined,
       replyUnreadable: describeFailure(err, prepared.deadline),
@@ -367,6 +375,7 @@ async function send(
     status: opened.res.status,
     ok: opened.res.status >= 200 && opened.res.status < 300,
     body: capped.text,
+    excerpt: excerptOf(capped.text, prepared.secrets),
     truncated: capped.truncated,
     parsed,
   };
@@ -381,7 +390,7 @@ function platformFailure(platform: Platform, outcome: SendOutcome): string | nul
   if (!outcome.ok) {
     return outcome.replyUnreadable !== undefined
       ? `the service answered ${outcome.status}, and its reply could not be read: ${outcome.replyUnreadable}`
-      : `the service answered ${outcome.status}: ${outcome.body.slice(0, 500)}`;
+      : `the service answered ${outcome.status}: ${outcome.excerpt}`;
   }
   if (platform === "slack" && typeof outcome.parsed === "object" && outcome.parsed !== null) {
     const record = outcome.parsed as Record<string, unknown>;
@@ -518,7 +527,7 @@ type ChatRoute =
       readonly ok: true;
       readonly url: URL;
       readonly headers: Record<string, string>;
-      readonly secrets: string[];
+      readonly secrets: SecretValue[];
       readonly secretHeaders: ReadonlySet<string>;
       readonly mode: "webhook" | "api";
     }
@@ -1449,7 +1458,9 @@ export const emailSend: RegisteredTool = buildTool({
     const cached = ledgerAnswer("EmailSend", args.idempotencyKey, fingerprint);
     if (cached !== undefined) return cached;
 
-    const redact = redactorFor([username, password]);
+    // The username is an identifier, redacted whole as 0.7.0 did; only the
+    // password is a secret whose cut start is caught.
+    const redact = redactorFor([password], [username]);
     const deadline = startDeadline(args.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal);
     try {
       assertSmtpHostAllowed(args.host, cfg);
@@ -1921,7 +1932,7 @@ export const webhookPost: RegisteredTool = buildTool({
       return notSentBecause("give exactly one of url or urlEnv");
     }
     const allowedEnvs = resolveNotifyConfig(ctx?.toolConfig).allowedSecretEnvs;
-    const urlSecrets: string[] = [];
+    const urlSecrets: SecretValue[] = [];
     let url: URL;
     if (args.urlEnv !== undefined) {
       const resolved = webhookUrlFrom(args.urlEnv, allowedEnvs);
@@ -2017,7 +2028,7 @@ export const webhookPost: RegisteredTool = buildTool({
         if (!retryable) {
           return prepared.redact(
             notSentBecause(
-              `${safeUrlLabel(url)} answered ${(outcome as SendOutcome).status}, which is not a retryable status: ${(outcome as SendOutcome).replyUnreadable ?? (outcome as SendOutcome).body.slice(0, 500)}`,
+              `${safeUrlLabel(url)} answered ${(outcome as SendOutcome).status}, which is not a retryable status: ${(outcome as SendOutcome).replyUnreadable ?? (outcome as SendOutcome).excerpt}`,
             ),
           );
         }
@@ -2053,7 +2064,7 @@ type ProviderCall =
       readonly method: string;
       readonly headers: Record<string, string>;
       readonly body: string;
-      readonly secrets: string[];
+      readonly secrets: SecretValue[];
       readonly secretHeaders: ReadonlySet<string>;
     }
   | { readonly ok: false; readonly message: string };
@@ -2156,6 +2167,7 @@ async function runProviderSend(
     cfg,
     deadline: startDeadline(args.timeoutMs ?? DEFAULT_TIMEOUT_MS, ctx?.signal),
     redact: redactorFor(call.secrets),
+    secrets: call.secrets,
   };
   try {
     const outcome = await send(
@@ -2170,7 +2182,7 @@ async function runProviderSend(
     if (!outcome.ok) {
       return prepared.redact(
         notSentBecause(
-          `${safeUrlLabel(call.url)} answered ${outcome.status}: ${outcome.replyUnreadable ?? outcome.body.slice(0, 500)}`,
+          `${safeUrlLabel(call.url)} answered ${outcome.status}: ${outcome.replyUnreadable ?? outcome.excerpt}`,
         ),
       );
     }
@@ -2382,6 +2394,7 @@ export const deliveryCheck: RegisteredTool = buildTool({
         opened.res,
         args.maxBytes ?? DEFAULT_MAX_BYTES,
         deadline.signal,
+        applied.secrets,
       );
       let parsedBody: unknown;
       try {
