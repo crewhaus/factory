@@ -419,15 +419,40 @@ describe("EVM ids: rules read <chainId>/<address>, and case cannot dodge a deny"
     }
     const lower = rules(["alwaysDeny", `ContractInspect(1/${USDT.toLowerCase()})`]);
     expect(await gate("ContractInspect", inspect(USDT), lower, "auto")).toBe("deny");
-    // Another address is not caught, and a bare address (no chain) matches nothing.
+    // Another address is not caught.
     const other = `${USDT.slice(0, -1)}8`;
     expect(await gate("ContractInspect", inspect(other), checksummed, "auto")).toBe("allow");
+  });
+
+  test("a deny written the 0.7.0 way — a bare address, or * — still denies in every mode", async () => {
+    // The value is `<chainId>/<address>` and `*` does not cross the `/`, so
+    // these rules had become silent no-ops; they match the address alone.
+    for (const pattern of [`ContractInspect(${USDT})`, "ContractInspect(*)"]) {
+      const deny = rules(["alwaysDeny", pattern]);
+      for (const mode of ["default", "auto", "plan"] as const) {
+        expect({
+          pattern,
+          mode,
+          d: await gate("ContractInspect", inspect(USDT), deny, mode),
+        }).toEqual({ pattern, mode, d: "deny" });
+      }
+    }
+    // An allow must name the chain: a bare `*` grants nothing, so default
+    // mode asks (fails closed) rather than granting every chain.
     expect(
       await gate(
         "ContractInspect",
         inspect(USDT),
-        rules(["alwaysDeny", `ContractInspect(${USDT})`]),
-        "auto",
+        rules(["alwaysAllow", "ContractInspect(*)"]),
+        "default",
+      ),
+    ).toBe("ask");
+    expect(
+      await gate(
+        "ContractInspect",
+        inspect(USDT),
+        rules(["alwaysAllow", "ContractInspect(1/*)"]),
+        "default",
       ),
     ).toBe("allow");
   });

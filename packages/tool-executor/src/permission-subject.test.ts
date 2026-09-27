@@ -205,6 +205,94 @@ describe("url, command and id values", () => {
       argv: [],
     });
     expect(words?.map((v) => v.caseInsensitive === true)).toEqual([false, false]);
+    // A `0X` prefix is the same hex to a node (geth decodes it), so it is
+    // folded too.
+    const upper = operativeValuesFor(tool, {
+      chainId: "1",
+      to: `0X${hex.slice(2)}`,
+      label: `0X${hex.slice(2)}`,
+      argv: [],
+    });
+    expect(upper?.map((v) => v.caseInsensitive === true)).toEqual([true, true]);
+  });
+
+  test("a within value keeps its parts as deny-only spellings, and an allow must name both", () => {
+    // 0.7.0 matched a rule against every string in the call, so a deny
+    // written `EvmCall(0x…)` or `EvmCall(*)` fired. The qualified value made
+    // both no-ops, silently.
+    const tool = buildTool({
+      name: "Call",
+      description: "d",
+      inputSchema: z.object({ chainId: z.string(), to: z.string() }),
+      operativeArgs: [{ field: "to", kind: "id", within: "chainId" }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    const values = operativeValuesFor(tool, { chainId: "mainnet", to: "0xab" });
+    expect(values).toEqual([
+      {
+        kind: "id",
+        canonical: ["mainnet/0xab"],
+        spellings: ["0xab", "mainnet"],
+        caseInsensitive: true,
+      },
+    ]);
+    const match = (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(
+        compilePattern(pattern),
+        "Call",
+        {},
+        {
+          polarity,
+          operativeValues: values ?? [],
+        },
+      );
+    for (const pattern of ["Call(*)", "Call(0xab)", "Call(0xAB)", "Call(mainnet)"]) {
+      expect({ pattern, deny: match(pattern, "restrict"), allow: match(pattern, "allow") }).toEqual(
+        { pattern, deny: true, allow: false },
+      );
+    }
+    expect(match("Call(mainnet/0xab)", "allow")).toBe(true);
+    expect(match("Call(other/0xab)", "restrict")).toBe(false);
+    // A path within a directory keeps its one resolved spelling.
+    const stage = buildTool({
+      name: "Stage",
+      description: "d",
+      inputSchema: z.object({ cwd: z.string(), paths: z.array(z.string()) }),
+      operativeArgs: [{ field: "paths", kind: "path", within: "cwd" }],
+      execute: async () => "ok",
+    });
+    expect(
+      operativeValuesFor(stage, { cwd: "pkg", paths: ["a.ts"] })?.flatMap((v) => v.spellings ?? []),
+    ).toEqual(["pkg/a.ts"]);
+  });
+
+  test("a left-out field whose default is * stands for every value", () => {
+    const tool = buildTool({
+      name: "Logs",
+      description: "d",
+      inputSchema: z.object({ chainId: z.string(), address: z.string().optional() }),
+      operativeArgs: [{ field: "address", kind: "id", within: "chainId", default: "*" }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(tool, { chainId: "1" })).toEqual([
+      { kind: "id", canonical: ["1/*"], spellings: ["*", "1"], standsForAny: ["1/", ""] },
+    ]);
+    // A value the call gives is only itself.
+    expect(operativeValuesFor(tool, { chainId: "1", address: "0xab" })?.[0]?.standsForAny).toBe(
+      undefined,
+    );
+    // Any other default is a value, not "every value".
+    const dot = buildTool({
+      name: "Dot",
+      description: "d",
+      inputSchema: z.object({ key: z.string().optional() }),
+      operativeArgs: [{ field: "key", kind: "id", default: "main" }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(dot, {})).toEqual([{ kind: "id", canonical: ["main"] }]);
   });
 
   test("a path within a directory field is resolved from that directory", () => {

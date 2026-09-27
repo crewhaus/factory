@@ -127,6 +127,49 @@ describe("the linear-time glob accepts exactly the old regex's language", () => 
   });
 });
 
+describe("matchesSegmentAfter: a glob against a prefix and ANY one segment", () => {
+  test("agrees with trying every short segment against the 0.7.0 compiler", () => {
+    // For a glob this short, when some segment after the prefix matches, a
+    // segment of at most five characters from {a, b, c} does: each literal
+    // or `?` needs at most one character, and every `*` can match none.
+    // So trying all of them is a complete oracle.
+    const rand = prng(0x5e9);
+    const globAlphabet = ["a", "b", "/", "*", "**", "?", "\\*"];
+    const prefixes = ["", "a", "a/", "b/", "a/b/", "/"];
+    const segments = [""];
+    for (let len = 1; len <= 5; len++) {
+      for (const base of segments.filter((x) => x.length === len - 1)) {
+        for (const c of ["a", "b", "c", "*"]) segments.push(base + c);
+      }
+    }
+    let compared = 0;
+    let matched = 0;
+    for (let g = 0; g < 600; g++) {
+      let glob = "";
+      const glen = 1 + Math.floor(rand() * 5);
+      for (let i = 0; i < glen; i++) {
+        glob += globAlphabet[Math.floor(rand() * globAlphabet.length)];
+      }
+      const oracle = oracleGlobToRegex(glob);
+      const argRe = compilePattern(`T(${glob})`)._argRe;
+      if (argRe === null) throw new Error("expected an arg glob");
+      for (const prefix of prefixes) {
+        const want = segments.some((seg) => oracle.test(prefix + seg));
+        if (argRe.matchesSegmentAfter(prefix) !== want) {
+          throw new Error(
+            `glob ${JSON.stringify(glob)} after ${JSON.stringify(prefix)}: oracle=${want} new=${!want}`,
+          );
+        }
+        compared++;
+        if (want) matched++;
+      }
+    }
+    expect(compared).toBe(600 * 6);
+    expect(matched).toBeGreaterThan(300);
+    expect(compared - matched).toBeGreaterThan(300);
+  });
+});
+
 describe("security-8#2 — a glob cannot stall the event loop", () => {
   // The audit's reproductions. Under the old regex the first took 12 s at
   // 18 KB (cubic), and the second did not finish inside 110 s at 20 KB.
@@ -446,6 +489,65 @@ describe("declared operative values", () => {
     expect(matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [other] })).toBe(
       false,
     );
+  });
+
+  test("a value that stands for any value fires a deny naming one of them; an allow must name it", () => {
+    // EvmGetLogs with no `address` reads every contract's logs, and is
+    // matched as `1/*`. A deny about one contract on chain 1 read nothing in
+    // `1/*`, so leaving the address out dodged it.
+    const every: OperativeValue = {
+      kind: "id",
+      canonical: ["1/*"],
+      spellings: ["*", "1"],
+      standsForAny: ["1/", ""],
+    };
+    const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+    const fires = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "EvmGetLogs",
+        {},
+        {
+          ...restrict,
+          operativeValues: [every],
+        },
+      );
+    const grants = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "EvmGetLogs",
+        {},
+        {
+          ...allow,
+          operativeValues: [every],
+        },
+      );
+    const denies = [
+      `EvmGetLogs(1/${USDT})`,
+      `EvmGetLogs(*/${USDT})`,
+      `EvmGetLogs(**${USDT})`,
+      `EvmGetLogs(${USDT})`,
+      "EvmGetLogs(1/0x*)",
+    ];
+    expect(denies.filter(fires)).toEqual(denies);
+    // Another chain, or a pattern no single address can match, does not fire.
+    expect([`EvmGetLogs(137/${USDT})`, "EvmGetLogs(1/a/b)"].filter(fires)).toEqual([]);
+    // An allow still reads only the canonical value.
+    expect([`EvmGetLogs(1/${USDT})`, `EvmGetLogs(${USDT})`].filter(grants)).toEqual([]);
+    expect(["EvmGetLogs(1/*)", "EvmGetLogs(**)"].filter(grants)).toHaveLength(2);
+    // Without the mark the value is only its text.
+    const plain: OperativeValue = { kind: "id", canonical: ["1/*"] };
+    expect(
+      matchesPattern(
+        compilePattern(`EvmGetLogs(1/${USDT})`),
+        "EvmGetLogs",
+        {},
+        {
+          ...restrict,
+          operativeValues: [plain],
+        },
+      ),
+    ).toBe(false);
   });
 
   test("non-path values are not filtered by absoluteness", () => {

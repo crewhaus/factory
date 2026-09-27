@@ -254,12 +254,19 @@ A tool that cannot say no is not finished. These say no, with the reason:
 
 ## Permission rules
 
-A rule's argument for these tools is `<chainId>/<address>`, the chain first:
+A rule's argument for these tools is `<chainId>/<address>`, the chain first
+and written as your spec's `chains[].id` names it:
 `EvmMulticall(8453/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)` is one contract
-on Base, and `ContractInspect(**0x8335…)` that address on any chain. `*` does
-not cross the `/`, so a bare `ContractInspect(*)` or `ContractInspect(0x8335…)`
-matches nothing — write `**` for "any". A deny or ask ignores the letter case
-of the hex: an EIP-55 address and its lower-case spelling are one account.
+on a chain declared `id: "8453"`, `EvmMulticall(base-mainnet/0x8335…)` the same
+contract on one declared `id: base-mainnet`, and `ContractInspect(**0x8335…)`
+that address on any chain.
+
+An allow must be written that way: `*` does not cross the `/`, so
+`alwaysAllow ContractInspect(*)` or `ContractInspect(0x8335…)` grants nothing
+(write `**` for "any"). A deny or ask also fires on the address alone and on
+the chain alone, so `alwaysDeny ContractInspect(0x8335…)` denies that contract
+on every chain. A deny or ask ignores the letter case of the hex: an EIP-55
+address and its lower-case spelling are one account.
 
 ## Numbers
 

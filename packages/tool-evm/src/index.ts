@@ -9,12 +9,22 @@
  * doubt" stance: zero-cost cache hit + defense in depth.
  *
  * Permission rules scope these tools by chain AND contract, account or
- * transaction: a rule's argument is `<chainId>/<address-or-hash>`, so
- * `EvmCall(1/0xdAC17F…)` is USDT on mainnet, `EvmCall(**0xdAC17F…)` is that
- * address on any chain, and `EvmGetLogs(1/*)` every log query on mainnet.
- * A bare `EvmCall(0xdAC17F…)` or `EvmGetLogs(*)` matches nothing — `*` does
- * not cross the `/`; write `**` for "any". A deny or ask ignores the letter
- * case of the hex (EIP-55 case is only a checksum).
+ * transaction: a rule's argument is `<chainId>/<address-or-hash>`, where the
+ * chain is written as the spec's `chains[].id` names it — `1/0x…` for
+ * `id: "1"`, `ethereum-mainnet/0x…` for `id: ethereum-mainnet`. So
+ * `EvmCall(1/0xdAC17F…)` is USDT on the chain with id "1",
+ * `EvmCall(**0xdAC17F…)` that address on any chain, and `EvmGetLogs(1/*)`
+ * every log query on it; `**` alone means any call at all.
+ *
+ * An allow must be written that way: `*` does not cross the `/`, so an
+ * allow of `EvmCall(0xdAC17F…)` or `EvmCall(*)` grants nothing. A deny or
+ * ask also fires on the address alone and on the chain alone, so
+ * `alwaysDeny EvmCall(0xdAC17F…)`, `EvmCall(*)` and `EvmCall(1)` still do
+ * what they said on 0.7.0. A deny or ask ignores the letter case of the hex
+ * (EIP-55 case is only a checksum), and an EvmGetLogs call without an
+ * `address` reads every contract's logs, so a deny or ask naming any one
+ * contract on that chain fires on it. Addresses and hashes must be `0x`
+ * and hex digits, the form a rule is written in.
  *
  * Read-only is not offline: every call sends its arguments (EvmCall's
  * calldata among them) to the chain's RPC endpoint. So every tool is
@@ -112,9 +122,22 @@ function requireAdapter(chainId: string, toolName: string): ChainAdapter {
   return a;
 }
 
+/**
+ * An address or a hash the way a rule reads it and the node receives it:
+ * `0x` and the hex digits, nothing else. A node such as geth also accepts a
+ * `0X` prefix, which slipped past a deny written `0x…`; refusing it here
+ * means the value a rule sees is the value the node gets.
+ */
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+const HASH = /^0x[0-9a-fA-F]{64}$/;
+const addressArg = (what: string) =>
+  z.string().regex(ADDRESS, "an address is 0x followed by 40 hex digits").describe(what);
+const hashArg = (what: string) =>
+  z.string().regex(HASH, "a hash is 0x followed by 64 hex digits").describe(what);
+
 const callSchema = z.object({
   chainId: z.string().min(1).describe("Id of the chain from spec.chains[]"),
-  to: z.string().min(1).describe("Target contract address (0x-prefixed)"),
+  to: addressArg("Target contract address (0x-prefixed)"),
   data: z.string().min(1).describe("ABI-encoded calldata (0x-prefixed)"),
   blockTag: z
     .string()
@@ -143,7 +166,7 @@ export const evmCall: RegisteredTool = buildTool({
 
 const getLogsSchema = z.object({
   chainId: z.string().min(1),
-  address: z.string().min(1).optional().describe("Contract address to filter logs by"),
+  address: addressArg("Contract address to filter logs by").optional(),
   fromBlock: z.string().min(1).describe("Starting block (hex or 'earliest')"),
   toBlock: z.string().min(1).describe("Ending block (hex or 'latest')"),
   topics: z
@@ -156,7 +179,9 @@ export const evmGetLogs: RegisteredTool = buildTool({
   name: "EvmGetLogs",
   // A call without `address` reads EVERY contract's logs, the broadest query
   // there is, so it must carry a value a rule can see: it is matched as
-  // `<chainId>/*`, which `EvmGetLogs(1/*)` and `EvmGetLogs(**)` cover.
+  // `<chainId>/*`, which `EvmGetLogs(1/*)` and `EvmGetLogs(**)` allow, and
+  // the `*` default stands for every address, so a deny or ask naming any
+  // one contract on that chain fires on it too.
   operativeArgs: [{ field: "address", kind: "id", within: "chainId", default: "*" }],
   description:
     "Fetch event logs matching the given filter. Returns an array of decoded log entries. The agent should normally request a bounded block range (≤ 5000 blocks) to avoid timeouts.",
@@ -177,7 +202,7 @@ export const evmGetLogs: RegisteredTool = buildTool({
 
 const getTxSchema = z.object({
   chainId: z.string().min(1),
-  txHash: z.string().min(1).describe("Transaction hash (0x-prefixed, 32 bytes)"),
+  txHash: hashArg("Transaction hash (0x-prefixed, 32 bytes)"),
 });
 
 export const evmGetTransaction: RegisteredTool = buildTool({
@@ -210,7 +235,7 @@ export const evmGetTransactionReceipt: RegisteredTool = buildTool({
 
 const getBalanceSchema = z.object({
   chainId: z.string().min(1),
-  address: z.string().min(1),
+  address: addressArg("Account address (0x-prefixed)"),
   blockTag: z.string().min(1).optional(),
 });
 

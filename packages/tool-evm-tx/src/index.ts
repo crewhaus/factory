@@ -137,6 +137,17 @@ function requireEngine(toolName: string): WalletEngine {
   return e;
 }
 
+/**
+ * The contract a transaction goes to, the way a rule reads it and the node
+ * receives it: `0x` and 40 hex digits. A node such as geth also accepts a
+ * `0X` prefix, which slipped past a rule written `0x…`.
+ */
+const toAddress = (what: string) =>
+  z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/, "an address is 0x followed by 40 hex digits")
+    .describe(what);
+
 const sendTxSchema = z.object({
   walletId: z.string().min(1).describe("Id of the wallet from spec.wallets[]"),
   contractId: z
@@ -146,7 +157,7 @@ const sendTxSchema = z.object({
     .describe(
       "Id of the target contract from spec.contracts[]. Required when transaction_policy.allowedContracts is non-empty.",
     ),
-  to: z.string().min(1).describe("Target contract address (0x-prefixed)"),
+  to: toAddress("Target contract address (0x-prefixed)"),
   data: z.string().min(1).describe("ABI-encoded calldata (0x-prefixed)"),
   value: z
     .string()
@@ -204,7 +215,7 @@ export const evmSendTransaction: RegisteredTool = buildTool({
 
 const simulateSchema = z.object({
   walletId: z.string().min(1),
-  to: z.string().min(1),
+  to: toAddress("Target contract address (0x-prefixed)"),
   data: z.string().min(1),
   value: z.string().min(1).optional(),
 });
