@@ -9,6 +9,7 @@ import type {
   McpToolFlagsConfig,
 } from "@crewhaus/mcp-host";
 import { nextBackoffMs } from "@crewhaus/mcp-host";
+import { toolDefinitionHits, withExtraHits } from "@crewhaus/prompt-injection-detector";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
 import {
@@ -132,10 +133,26 @@ export type RegisterMcpServerOptions = {
 
 /**
  * The longest description a remote tool carries into the model's context. A
- * longer one is cut here and marked as cut, so a server cannot fill the
- * context window through its tool list.
+ * longer one is cut here and marked as cut. What one SERVER can put in front
+ * of the model is bounded separately, by {@link MAX_MCP_SERVER_DEFINITION_CHARS}
+ * and {@link MAX_MCP_SERVER_TOOLS}: per-tool caps alone let a server fill the
+ * window with many tools.
  */
 export const MAX_MCP_DESCRIPTION_CHARS = 4096;
+
+/**
+ * The most definition text — names, descriptions and input schemas as JSON,
+ * as the model is shown them — one server's tools may put in front of the
+ * model. Every request carries them, so without a budget a server listing
+ * many tools just under the per-tool caps could fill the context window and
+ * fail every request. Tools past the budget are left out, in listing order,
+ * and reported through `onSkip`. Real servers use a small part of it (a
+ * browser-automation or code-hosting server lists about 20–30 KiB).
+ */
+export const MAX_MCP_SERVER_DEFINITION_CHARS = 256 * 1024;
+
+/** The most tools one server may register; later ones are left out and reported. */
+export const MAX_MCP_SERVER_TOOLS = 256;
 
 /**
  * The largest input schema, measured as JSON, a remote tool may carry. A
@@ -242,15 +259,15 @@ export async function screenMcpToolDefinition(
   }
   const name = String(remote.name);
   const description = sanitizeDescription(remote.description) ?? "";
-  const screen = async (text: string) => classifyBoundary(text, { origin: "mcp" });
+  const screen = screenDefinitionText;
   const whole = await screen([name, description, ...parts.structural, ...parts.prose].join("\n"));
-  if (whole.action !== "redact") return { kind: "shown", definition: remote };
+  if (!whole.flagged) return { kind: "shown", definition: remote };
 
   const structural = await screen([name, ...parts.structural].join("\n"));
-  if (structural.action === "redact") {
+  if (structural.flagged) {
     return {
       kind: "refused",
-      reason: `${label} was left out: its name or input schema reads as a prompt injection (${rulesOf(structural)}), so none of it is shown to the model.`,
+      reason: `${label} was left out: its name or input schema reads as a prompt injection (${structural.rules}), so none of it is shown to the model.`,
     };
   }
   const descFlag = description === "" ? undefined : await screen(description).then(flaggedRules);
@@ -273,16 +290,16 @@ export async function screenMcpToolDefinition(
   });
   let definition = shownAs();
   let recheck = await screen(definitionText(definition));
-  if (recheck.action === "redact" && !(withholdDesc && withholdProse)) {
+  if (recheck.flagged && !(withholdDesc && withholdProse)) {
     withholdDesc = description !== "";
     withholdProse = parts.prose.length > 0;
     definition = shownAs();
     recheck = await screen(definitionText(definition));
   }
-  if (recheck.action === "redact") {
+  if (recheck.flagged) {
     return {
       kind: "refused",
-      reason: `${label} was left out: its definition reads as a prompt injection (${rulesOf(recheck)}) even with its descriptions withheld, so none of it is shown to the model.`,
+      reason: `${label} was left out: its definition reads as a prompt injection (${recheck.rules}) even with its descriptions withheld, so none of it is shown to the model.`,
     };
   }
   const what = [
@@ -295,7 +312,7 @@ export async function screenMcpToolDefinition(
   return {
     kind: "shown",
     definition,
-    withheld: `${label}: ${what} ${withholdProse ? "read" : "reads"} as a prompt injection (${rules || rulesOf(whole)}), so crewhaus withheld ${withholdProse ? "them" : "it"} from the model. The tool is registered without ${withholdProse ? "them" : "it"}.`,
+    withheld: `${label}: ${what} ${withholdProse ? "read" : "reads"} as a prompt injection (${rules || whole.rules}), so crewhaus withheld ${withholdProse ? "them" : "it"} from the model. The tool is registered without ${withholdProse ? "them" : "it"}.`,
   };
 }
 
@@ -312,16 +329,30 @@ export async function mcpToolDefinitionProblem(
   return screened.kind === "refused" ? screened.reason : undefined;
 }
 
-type BoundaryVerdict = Awaited<ReturnType<typeof classifyBoundary>>;
+/** Whether a piece of a definition reads as an injection, and the rules that fired. */
+type DefinitionVerdict = { readonly flagged: boolean; readonly rules: string };
 
-/** The rules that fired, for a reason line: at most six, never the text. */
-function rulesOf(verdict: BoundaryVerdict): string {
-  return [...new Set(verdict.verdict.hits.map((h) => h.rule))].slice(0, 6).join(", ");
+/**
+ * Screen a piece of a tool definition: the boundary classifier at origin
+ * `"mcp"` (the rules for tool output, plus Layer 3 when the process has
+ * installed it), with the tool-definition rules folded in
+ * (`TOOL_DEFINITION_RULES`: <IMPORTANT> blocks, "do not mention this to the
+ * user", "pass the contents of ~/.ssh/id_rsa as …", instructions about other
+ * tools, "your new task is …"). A definition is flagged when either reads it
+ * as malicious. `rules` names at most six rules, never the text.
+ */
+async function screenDefinitionText(text: string): Promise<DefinitionVerdict> {
+  const boundary = await classifyBoundary(text, { origin: "mcp" });
+  const verdict = withExtraHits(boundary.verdict, toolDefinitionHits(text));
+  return {
+    flagged: boundary.action === "redact" || verdict.classification === "malicious",
+    rules: [...new Set(verdict.hits.map((h) => h.rule))].slice(0, 6).join(", "),
+  };
 }
 
-/** The rules behind a malicious verdict, or undefined when it is not one. */
-function flaggedRules(verdict: BoundaryVerdict): string | undefined {
-  return verdict.action === "redact" ? rulesOf(verdict) : undefined;
+/** The rules behind a flagged verdict, or undefined when it is not one. */
+function flaggedRules(verdict: DefinitionVerdict): string | undefined {
+  return verdict.flagged ? verdict.rules : undefined;
 }
 
 /** Everything the model is shown of `definition`, as one text. */
@@ -351,6 +382,7 @@ async function registerOne(
   catalog: ToolCatalog,
   remote: McpToolDefinition,
   opts: RegisterMcpServerOptions,
+  budget: ServerBudget,
 ): Promise<void> {
   const serverProblem = mcpServerNameProblem(serverName);
   if (serverProblem !== undefined) throw new McpError(serverProblem);
@@ -369,20 +401,86 @@ async function registerOne(
     );
     return;
   }
+  // A server that already spent its tool count is not screened any further.
+  const full = budgetProblem(serverName, remote.name, budget);
+  if (full !== undefined) {
+    reportSkip(serverName, remote, full, opts);
+    return;
+  }
   const screened = await screenMcpToolDefinition(serverName, remote);
   if (screened.kind === "refused") {
     reportSkip(serverName, remote, screened.reason, opts);
     return;
   }
-  if (screened.withheld !== undefined) reportWithheld(fullName, remote, screened.withheld, opts);
   const tool = buildMcpRegisteredTool(
     host,
     serverName,
     screened.definition,
     resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
   );
+  const overBudget = budgetProblem(serverName, remote.name, budget, tool);
+  if (overBudget !== undefined) {
+    reportSkip(serverName, remote, overBudget, opts);
+    return;
+  }
+  if (screened.withheld !== undefined) reportWithheld(fullName, remote, screened.withheld, opts);
   catalog.register(tool);
+  spend(budget, tool);
   opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
+}
+
+/** What one server's registered tools already put in front of the model. */
+type ServerBudget = { chars: number; tools: number };
+
+/** The characters of `tool`'s definition the model is shown: name, description, schema. */
+function advertisedChars(tool: RegisteredTool): number {
+  let schema = 0;
+  try {
+    schema = JSON.stringify(tool.jsonSchema ?? null)?.length ?? 0;
+  } catch {
+    schema = MAX_MCP_SCHEMA_CHARS;
+  }
+  return tool.name.length + tool.description.length + schema;
+}
+
+/**
+ * The budget already spent by `serverName`'s tools on `catalog` (a retry, or
+ * a reconcile that keeps the tools it did not change). Tools are found by
+ * their `mcp__<server>__` prefix.
+ */
+function spentBudget(catalog: ToolCatalog, serverName: string): ServerBudget {
+  const prefix = namespacedToolName(serverName, "");
+  const budget: ServerBudget = { chars: 0, tools: 0 };
+  for (const tool of catalog.list()) if (tool.name.startsWith(prefix)) spend(budget, tool);
+  return budget;
+}
+
+function spend(budget: ServerBudget, tool: RegisteredTool): void {
+  budget.chars += advertisedChars(tool);
+  budget.tools += 1;
+}
+
+/**
+ * Why registering one more tool would take `serverName` past its budget, or
+ * undefined: its tool count, and — given the `tool` as the model would be
+ * shown it — its definition characters.
+ */
+function budgetProblem(
+  serverName: string,
+  remoteName: string,
+  budget: ServerBudget,
+  tool?: RegisteredTool,
+): string | undefined {
+  const label = `mcp server "${serverName}" tool ${shownName(remoteName)} was left out`;
+  if (budget.tools >= MAX_MCP_SERVER_TOOLS) {
+    return `${label}: the server already registered ${budget.tools} tools, the most one server may register (${MAX_MCP_SERVER_TOOLS}). Configure the server to offer fewer tools.`;
+  }
+  if (tool === undefined) return undefined;
+  const size = advertisedChars(tool);
+  if (budget.chars + size > MAX_MCP_SERVER_DEFINITION_CHARS) {
+    return `${label}: its definition is ${size} characters, and the server's tools already put ${budget.chars} in front of the model on every request; one server may put at most ${MAX_MCP_SERVER_DEFINITION_CHARS}. Configure the server to offer fewer tools.`;
+  }
+  return undefined;
 }
 
 /** Report a remote tool registered with part of its definition withheld. */
@@ -730,8 +828,9 @@ export async function registerMcpServer(
   const client = host.getClient(serverName);
   await client.connect();
   const remoteTools = firstOfEachName(serverName, await client.listTools(), opts);
+  const budget = spentBudget(catalog, serverName);
   for (const remote of remoteTools) {
-    await registerOne(host, serverName, catalog, remote, opts);
+    await registerOne(host, serverName, catalog, remote, opts, budget);
   }
 }
 
@@ -882,10 +981,11 @@ export async function reconcileMcpServer(
     const fullName = namespacedToolName(serverName, remoteName);
     if (catalog.has(fullName)) catalog.unregister(fullName);
   }
+  const budget = spentBudget(catalog, serverName);
   for (const remoteName of [...drift.added, ...drift.schemaChanged]) {
     const remote = byName.get(remoteName);
     if (remote === undefined) continue;
-    await registerOne(host, serverName, catalog, remote, opts);
+    await registerOne(host, serverName, catalog, remote, opts, budget);
   }
   return { drift, snapshot };
 }
@@ -1327,6 +1427,9 @@ export async function registerMcpToolAliases(
   const remoteTools = firstOfEachName(serverName, listed, opts, (t) => wanted.has(t.name));
   const registered: string[] = [];
   const refused: string[] = [];
+  // Aliases carry bare names, so their budget is this call's: the aliases a
+  // backend flip selects are a handful of one server's tools.
+  const budget: ServerBudget = { chars: 0, tools: 0 };
   for (const remote of remoteTools) {
     if (!wanted.has(remote.name)) continue;
     if (catalog.has(remote.name)) {
@@ -1334,14 +1437,17 @@ export async function registerMcpToolAliases(
         `mcp server "${serverName}" tool "${remote.name}" cannot be aliased onto its bare name — a tool named "${remote.name}" is already registered on the catalog (the local twin must not be registered when the ${serverName} backend owns the vocabulary)`,
       );
     }
+    const full = budgetProblem(serverName, remote.name, budget);
+    if (full !== undefined) {
+      refused.push(remote.name);
+      reportSkip(serverName, remote, full, opts, remote.name);
+      continue;
+    }
     const screened = await screenMcpToolDefinition(serverName, remote);
     if (screened.kind === "refused") {
       refused.push(remote.name);
       reportSkip(serverName, remote, screened.reason, opts, remote.name);
       continue;
-    }
-    if (screened.withheld !== undefined) {
-      reportWithheld(remote.name, remote, screened.withheld, opts);
     }
     const tool = buildMcpRegisteredTool(
       host,
@@ -1350,7 +1456,17 @@ export async function registerMcpToolAliases(
       resolveMcpToolFlags(opts, serverName, remote, configuredFlags(host, serverName)),
       { registeredName: remote.name },
     );
+    const overBudget = budgetProblem(serverName, remote.name, budget, tool);
+    if (overBudget !== undefined) {
+      refused.push(remote.name);
+      reportSkip(serverName, remote, overBudget, opts, remote.name);
+      continue;
+    }
+    if (screened.withheld !== undefined) {
+      reportWithheld(remote.name, remote, screened.withheld, opts);
+    }
     catalog.register(tool);
+    spend(budget, tool);
     registered.push(remote.name);
     opts.onRegister?.({ fullName: tool.name, remoteName: remote.name });
   }

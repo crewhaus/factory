@@ -15,6 +15,7 @@
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/mcp-host": "workspace:*",
+    "@crewhaus/prompt-injection-detector": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
