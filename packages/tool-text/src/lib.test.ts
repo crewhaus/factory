@@ -912,6 +912,18 @@ describe("markdown", () => {
 });
 
 describe("template", () => {
+  test("a placeholder reads the data's own fields, never Object.prototype's", () => {
+    const data = { user: { name: "ada" }, items: [1] };
+    for (const path of ["constructor", "user.toString", "user.__proto__", "items.constructor"]) {
+      expect({ path, value: lookupPath(data, path) }).toEqual({ path, value: undefined });
+    }
+    expect(() => renderTemplateString("hi {{constructor}}", data, true)).toThrow(
+      /"constructor", which the data does not provide/,
+    );
+    const own = JSON.parse('{"constructor":"C","__proto__":"P"}');
+    expect(renderTemplateString("{{constructor}} {{__proto__}}", own, true).text).toBe("C P");
+  });
+
   test("lookupPath walks objects and arrays", () => {
     const data = { user: { name: "ada" }, items: [{ id: 7 }] };
     expect(lookupPath(data, "user.name")).toBe("ada");

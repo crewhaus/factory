@@ -4,7 +4,12 @@ export class TemplateError extends Error {
   override readonly name = "TemplateError";
 }
 
-/** Walk a dotted path (`user.name`, `items.0.id`) through plain data. */
+/**
+ * Walk a dotted path (`user.name`, `items.0.id`) through plain data. Only
+ * the data's own fields are read: `{{constructor}}` on data with no such
+ * field is missing, where 0.7.0 rendered Object's constructor as
+ * "function Object() { [native code] }" and strict mode let it through.
+ */
 export function lookupPath(data: unknown, path: string): unknown {
   if (path === ".") return data;
   let cur: unknown = data;
@@ -16,7 +21,7 @@ export function lookupPath(data: unknown, path: string): unknown {
       cur = cur[i];
       continue;
     }
-    if (typeof cur !== "object") return undefined;
+    if (typeof cur !== "object" || !Object.hasOwn(cur, part)) return undefined;
     cur = (cur as Record<string, unknown>)[part];
   }
   return cur;
