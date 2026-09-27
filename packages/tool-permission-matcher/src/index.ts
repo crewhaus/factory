@@ -417,10 +417,13 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * A deny or ask rule is not dodged by another spelling of a URL, a
  * recipient, an id or a command either: it also compares them folded, as
  * the destination treats them (`restrictFolds`) — a URL without userinfo,
- * root dot, fragment, port or percent-escapes, over http and https; an
- * address in lower case without a `+tag`; an id or a program name in lower
- * case. An allow rule reads only `canonical`, and never grants a URL that
- * carries userinfo or an escaped `..`.
+ * root dot, fragment or percent-escapes, with an IPv4-mapped IPv6 host as
+ * its IPv4 address, and, for a rule that names a host, on any port and over
+ * http and https (a rule that names a port or leaves the host a wildcard
+ * keeps to the scheme and port it names); an address in lower case without
+ * a `+tag`; an id or a program name in lower case. An allow rule reads only
+ * `canonical`, and never grants a URL that carries userinfo or an escaped
+ * `..`.
  */
 export type OperativeValue = {
   readonly kind: OperativeValueKind;
@@ -592,28 +595,115 @@ function hrefSpellings(url: URL): string[] {
 }
 
 /**
- * The spellings of one URL a deny or ask rule compares, lower-cased: as
- * written, then as the request that is really made (see {@link requestUrl}),
- * on any port, and over either of http and https — `https://evil.example/**`
- * names a host, and the same host on another port or scheme is still it.
+ * One folded spelling of a URL a deny or ask rule compares, lower-cased, and
+ * whether it moved the request to another port or the other of http and
+ * https. Those two are other doors of the same host, and only a rule that
+ * names the host reads them (see {@link urlGlobScope}).
  */
-function restrictUrlSpellings(raw: string): string[] {
-  const out = [raw];
-  const url = requestUrl(raw);
-  if (url !== undefined) {
-    out.push(...hrefSpellings(url));
-    if (url.port !== "") {
-      url.port = "";
-      out.push(...hrefSpellings(url));
+type UrlFold = {
+  readonly text: string;
+  readonly portDropped: boolean;
+  readonly schemeSwapped: boolean;
+};
+
+/** An IPv6 literal that reaches an IPv4 host, as WHATWG writes it: mapped, or NAT64. */
+const IPV4_IN_IPV6 = /^\[(?:::ffff:|64:ff9b::)([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/;
+
+/**
+ * The same request with its host written the other ways that name that
+ * host: an IPv4-mapped (`[::ffff:93.184.215.14]`, which WHATWG writes
+ * `[::ffff:5db8:d70e]`) or NAT64 (`[64:ff9b::…]`) literal is the dotted IPv4
+ * address it reaches. (WHATWG already folds the decimal, hex and octal IPv4
+ * forms.)
+ */
+function sameHostUrls(url: URL): URL[] {
+  const m = IPV4_IN_IPV6.exec(url.hostname);
+  if (m === null) return [url];
+  const hi = Number.parseInt(m[1] as string, 16);
+  const lo = Number.parseInt(m[2] as string, 16);
+  const v4 = new URL(url.href);
+  v4.hostname = `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  return [url, v4];
+}
+
+/**
+ * The spellings of one URL a deny or ask rule compares: as written, then as
+ * the request that is really made (see {@link requestUrl}) under each way of
+ * writing its host ({@link sameHostUrls}); and, marked, the same request on
+ * no explicit port and over the other of http and https.
+ */
+function restrictUrlSpellings(raw: string): UrlFold[] {
+  const out: UrlFold[] = [];
+  const add = (texts: ReadonlyArray<string>, portDropped: boolean, schemeSwapped: boolean) => {
+    for (const t of texts) {
+      out.push({ text: t.normalize("NFC").toLowerCase(), portDropped, schemeSwapped });
     }
+  };
+  add([raw], false, false);
+  const request = requestUrl(raw);
+  if (request === undefined) return out;
+  for (const url of sameHostUrls(request)) {
+    add(hrefSpellings(url), false, false);
     const other =
       url.protocol === "https:" ? "http:" : url.protocol === "http:" ? "https:" : undefined;
     if (other !== undefined) {
-      url.protocol = other;
-      out.push(...hrefSpellings(url));
+      const swapped = new URL(url.href);
+      swapped.protocol = other;
+      add(hrefSpellings(swapped), false, true);
+    }
+    if (url.port !== "") {
+      const portless = new URL(url.href);
+      portless.port = "";
+      add(hrefSpellings(portless), true, false);
+      if (other !== undefined) {
+        portless.protocol = other;
+        add(hrefSpellings(portless), true, true);
+      }
     }
   }
-  return out.map((s) => s.normalize("NFC").toLowerCase());
+  return out;
+}
+
+/**
+ * Which folded URL spellings a deny or ask rule reads, from its argument
+ * glob. A rule that names a HOST (`https://evil.example/**`,
+ * `http://*.corp.example/**`) is about that host, and the host on another
+ * port, or over the other of http and https, is still it — unless the rule
+ * names a port, which then stays the one it names. A rule whose host is a
+ * wildcard (`http://**`, `https://*:8443/**`) is about the scheme or port it
+ * names, and reads only that: `alwaysDeny WebFetch(http://**)` refuses
+ * plain HTTP and nothing else.
+ */
+type UrlGlobScope = { readonly anyPort: boolean; readonly eitherScheme: boolean };
+
+const urlScopes = new WeakMap<CompiledPattern, UrlGlobScope>();
+
+function urlGlobScope(compiled: CompiledPattern): UrlGlobScope {
+  const cached = urlScopes.get(compiled);
+  if (cached !== undefined) return cached;
+  const glob = (compiled.argGlob ?? "").normalize("NFC").toLowerCase();
+  const m = /^([a-z][a-z0-9+.-]*):\/\/([^/]*)/.exec(glob);
+  let scope: UrlGlobScope = { anyPort: false, eitherScheme: false };
+  if (m !== null) {
+    const scheme = m[1] as string;
+    const authority = m[2] as string;
+    // The host, without userinfo or a port. (A port-less spelling can never
+    // meet a glob that writes a port, so a rule that names one keeps to it.)
+    let host = authority.slice(authority.lastIndexOf("@") + 1);
+    if (host.startsWith("[")) {
+      const close = host.indexOf("]");
+      if (close !== -1) host = host.slice(0, close + 1);
+    } else if (host.includes(":")) {
+      host = host.slice(0, host.lastIndexOf(":"));
+    }
+    const namesHost = /[^*?]/.test(host);
+    scope = {
+      anyPort: namesHost,
+      eitherScheme: namesHost && (scheme === "http" || scheme === "https"),
+    };
+  }
+  urlScopes.set(compiled, scope);
+  return scope;
 }
 
 /**
@@ -673,7 +763,8 @@ function restrictRecipientSpellings(raw: string): string[] {
  * kind, with how the rule's glob is folded to meet them; `undefined` for a
  * kind that is compared only as written.
  *
- * - `url`: see {@link restrictUrlSpellings}.
+ * - `url`: see {@link restrictUrlSpellings} and {@link urlGlobScope} — its
+ *   folds depend on the rule, so they are read in `valueMatches`.
  * - `recipient`: see {@link restrictRecipientSpellings}.
  * - `id`: letter case ignored — an owner or repository on a code host, a
  *   hex address on a chain, are the same whatever the case.
@@ -682,6 +773,7 @@ function restrictRecipientSpellings(raw: string): string[] {
  */
 /** Each value's folds, worked out once however many rules read them. */
 const restrictFoldCache = new WeakMap<OperativeValue, string[] | undefined>();
+const urlFoldCache = new WeakMap<OperativeValue, UrlFold[]>();
 
 function restrictFoldsOf(value: OperativeValue): string[] | undefined {
   if (restrictFoldCache.has(value)) return restrictFoldCache.get(value);
@@ -690,13 +782,20 @@ function restrictFoldsOf(value: OperativeValue): string[] | undefined {
   return folds;
 }
 
+function urlFoldsOf(value: OperativeValue): UrlFold[] {
+  let folds = urlFoldCache.get(value);
+  if (folds === undefined) {
+    folds = [...value.canonical, ...(value.spellings ?? [])].flatMap(restrictUrlSpellings);
+    urlFoldCache.set(value, folds);
+  }
+  return folds;
+}
+
 function restrictFolds(
   kind: OperativeValueKind,
   candidates: ReadonlyArray<string>,
 ): string[] | undefined {
   switch (kind) {
-    case "url":
-      return candidates.flatMap(restrictUrlSpellings);
     case "recipient":
       return candidates.flatMap(restrictRecipientSpellings);
     case "id":
@@ -740,6 +839,16 @@ function valueMatches(
   }
   // Nor is a deny or ask on a URL, a recipient, an id or a command dodged by
   // another spelling of the same destination.
+  if (value.kind === "url") {
+    const scope = urlGlobScope(compiled);
+    const folded = foldedArgMatcher(compiled, "lower");
+    return urlFoldsOf(value).some(
+      (f) =>
+        (!f.portDropped || scope.anyPort) &&
+        (!f.schemeSwapped || scope.eitherScheme) &&
+        folded.test(f.text),
+    );
+  }
   const folds = restrictFoldsOf(value);
   if (folds === undefined) return false;
   const folded = foldedArgMatcher(compiled, "lower");

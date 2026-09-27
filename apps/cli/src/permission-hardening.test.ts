@@ -355,6 +355,33 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
     ).toBe("ask");
   }, 30_000);
 
+  // The folding above must not widen a rule that names a scheme or a port
+  // rather than a host: on the real tools and loop, in auto mode (WebFetch is
+  // read-only and runs unasked) and behind a bare allow.
+  test("a URL rule that names a scheme or a port keeps to it", async () => {
+    const https = "https://api.github.com/repos/crewhaus/factory";
+    for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+      const noPlainHttp = rules([type, "WebFetch(http://**)"]);
+      expect({
+        type,
+        decision: await gate("WebFetch", { url: https }, noPlainHttp, "auto"),
+      }).toEqual({ type, decision: "allow" });
+      expect(await gate("WebFetch", { url: "http://api.github.com/x" }, noPlainHttp, "auto")).toBe(
+        type === "alwaysDeny" ? "deny" : "ask",
+      );
+    }
+    const noDb = rules(
+      ["alwaysDeny", "HttpRequest(http://localhost:5432/**)"],
+      ["alwaysAllow", "HttpRequest"],
+    );
+    expect(
+      await gate("HttpRequest", { method: "GET", url: "http://localhost:3000/health" }, noDb),
+    ).toBe("allow");
+    expect(await gate("HttpRequest", { method: "GET", url: "http://localhost:5432/q" }, noDb)).toBe(
+      "deny",
+    );
+  }, 30_000);
+
   test("Grep(src/**) is not satisfied by a regex that names src/", async () => {
     expect(
       await gate(

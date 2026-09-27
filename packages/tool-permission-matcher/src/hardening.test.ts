@@ -488,6 +488,64 @@ describe("a restrict rule reads every spelling of a destination", () => {
     expect(fires(rule, url("https://good.example/evil.example/"))).toBe(false);
   });
 
+  // A rule that names a scheme or a port, and not a host, is about that
+  // scheme or port: folding http into https (or every port into none) made
+  // `alwaysDeny WebFetch(http://**)` — "no plain HTTP" — deny every https
+  // fetch, and `http://localhost:5432/**` deny localhost:3000.
+  test("a rule that leaves the host a wildcard keeps to the scheme and port it names", () => {
+    const plain = "T(http://**)";
+    expect(fires(plain, url("http://a.example/x"))).toBe(true);
+    expect(fires(plain, url("http://a.example:8080/x"))).toBe(true);
+    expect(fires(plain, url("https://a.example/x"))).toBe(false);
+    expect(fires(plain, url("https://a.example:8080/x"))).toBe(false);
+    const altPort = "T(https://*:8443/**)";
+    expect(fires(altPort, url("https://a.example:8443/x"))).toBe(true);
+    expect(fires(altPort, url("https://a.example/x"))).toBe(false);
+    expect(fires(altPort, url("http://a.example:8443/x"))).toBe(false);
+  });
+
+  test("a rule that names a port keeps to it, over either scheme", () => {
+    const db = "T(http://localhost:5432/**)";
+    expect(fires(db, url("http://localhost:5432/q"))).toBe(true);
+    expect(fires(db, url("https://localhost:5432/q"))).toBe(true);
+    expect(fires(db, url("http://localhost:3000/health"))).toBe(false);
+    expect(fires(db, url("http://localhost/health"))).toBe(false);
+  });
+
+  test("a rule that names a host and no port covers the host on every port (0.7.1)", () => {
+    const hits = [
+      "http://localhost/x",
+      "http://localhost:3000/x",
+      "https://localhost:8443/x",
+      "http://x@localhost:3000/x",
+    ].filter((s) => fires("T(http://localhost/**)", url(s)));
+    expect(hits).toHaveLength(4);
+    expect(fires("T(http://*.corp.example/**)", url("https://db.corp.example:8443/x"))).toBe(true);
+  });
+
+  // An IPv4-mapped IPv6 literal reaches the IPv4 host (a socket bound only to
+  // 127.0.0.1 answers http://[::ffff:127.0.0.1]:<port>/), and WHATWG writes
+  // it in hex, so a deny on the dotted address never saw it.
+  test("a deny on an IPv4 address fires on its IPv4-mapped and NAT64 IPv6 literals", () => {
+    const rule = "T(https://93.184.215.14/**)";
+    const spellings = [
+      "https://93.184.215.14/x",
+      "https://1572394766/x",
+      "https://[::ffff:93.184.215.14]/x",
+      "https://[::ffff:5db8:d70e]/x",
+      "https://[0:0:0:0:0:ffff:5db8:d70e]/x",
+      "https://[64:ff9b::5db8:d70e]/x",
+      "http://[::ffff:93.184.215.14]:8080/x",
+    ];
+    expect(spellings.filter((s) => fires(rule, url(s)))).toEqual(spellings);
+    // Controls: IPv6 literals that do not reach that IPv4 host.
+    for (const other of ["https://[::1]/x", "https://[2001:db8::5db8:d70e]/x"]) {
+      expect({ other, fired: fires(rule, url(other)) }).toEqual({ other, fired: false });
+    }
+    // An allow is not widened: the mapped literal is not granted by the dotted rule.
+    expect(fires(rule, url("https://[::ffff:5db8:d70e]/x"), allow)).toBe(false);
+  });
+
   test("a path deny fires on an escaped letter, a doubled slash, a dot segment and case", () => {
     const rule = "T(https://api.example/admin/**)";
     const spellings = [
