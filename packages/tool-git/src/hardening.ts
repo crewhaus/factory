@@ -52,6 +52,16 @@
  *     not clear it (git applies the reset before the repository's value);
  *     the flag does. A reader who wants those revisions skipped passes them
  *     as `ref` ranges instead.
+ *   - Every read: `core.hooksPath=/dev/null`. A read can still WRITE the
+ *     index: `git diff` that finds a tracked file whose stat data changed
+ *     but whose bytes did not refreshes the index and writes it back, with
+ *     or without GIT_OPTIONAL_LOCKS=0, and writing the index runs the
+ *     repository's `post-index-change` hook — from `.git/hooks`, which a
+ *     copied checkout carries, or from wherever its `core.hooksPath` points.
+ *     GitDiff, GitConflicts and DiffLint ran it. No read runs any hook now;
+ *     the index refresh itself is harmless, and it quietly skips its write
+ *     when another run holds the index lock, so two reads never fail on
+ *     each other.
  *   - Every read: `mailmap.file=` (empty). blame maps each author through
  *     the mailmap, and `mailmap.file` names a file anywhere on the disk, so
  *     a line of it shaped `Name <email>` would come back as an author name.
@@ -82,8 +92,20 @@ export const HARDENED_CONFIG_ARGS: readonly string[] = Object.freeze([
   "diff.submodule=short",
 ]);
 
+/**
+ * The value that switches every hook off. git documents `core.hooksPath` set
+ * to /dev/null as the way to disable all hooks for one command: it looks for
+ * `<hooksPath>/<name>`, and nothing can exist under a device file.
+ */
+export const NO_HOOKS_PATH = "/dev/null";
+
 /** `-c` pairs applied to every read-only invocation, after the global ones. */
-export const READ_CONFIG_ARGS: readonly string[] = Object.freeze(["-c", "mailmap.file="]);
+export const READ_CONFIG_ARGS: readonly string[] = Object.freeze([
+  "-c",
+  "mailmap.file=",
+  "-c",
+  `core.hooksPath=${NO_HOOKS_PATH}`,
+]);
 
 /** Subcommands whose read-only runs get `--no-ext-diff --no-textconv`. */
 const DIFF_PRODUCING: ReadonlySet<string> = new Set(["diff", "show", "log", "blame"]);

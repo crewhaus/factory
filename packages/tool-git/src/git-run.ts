@@ -23,9 +23,10 @@
  *    (GIT_DIR, GIT_WORK_TREE …) dropped.
  * 3. A read runs no program the repository names (C007). See `./hardening`:
  *    every invocation switches off the fsmonitor hook, signature display and
- *    implicit bare repositories; a read also switches off external diff
- *    drivers, textconv, submodule recursion and the repository's own filter
- *    drivers, and gets the environment without the harness's credentials.
+ *    implicit bare repositories; a read also switches off every hook,
+ *    external diff drivers, textconv, submodule recursion and the
+ *    repository's own filter drivers, and gets the environment without the
+ *    harness's credentials.
  *
  * This module is also `@crewhaus/tool-git/run`, so tool-changeset's DiffLint
  * spawns git through the same hardened runner instead of a copy of it.
@@ -259,8 +260,9 @@ export type RunOptions = {
   readonly signal?: AbortSignal;
   readonly stdin?: string;
   /**
-   * A read: adds GIT_OPTIONAL_LOCKS=0 so it never contends for the index
-   * lock, inserts the read switches of `hardenReadArgs`, and spawns git
+   * A read: adds GIT_OPTIONAL_LOCKS=0 so status takes no index lock, adds
+   * READ_CONFIG_ARGS (no hook runs, even when `git diff` writes a refreshed
+   * index), inserts the read switches of `hardenReadArgs`, and spawns git
    * without the harness's credentials (a read needs none: nothing here talks
    * to a remote or signs).
    */

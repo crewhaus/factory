@@ -133,6 +133,60 @@ describe("DiffLint runs no program the repository's config names", () => {
   }, 30_000);
 });
 
+/**
+ * `git diff` refreshes a stale stat and writes the index back, and writing the
+ * index runs `post-index-change` from `.git/hooks` (no config needed) or from
+ * `core.hooksPath` (C007). b.txt gets a fresh mtime before every call, so each
+ * one has a refresh to do.
+ */
+describe("DiffLint runs no hook the repository carries (C007)", () => {
+  let bumps = 0;
+  const staleStat = (): void => {
+    bumps += 1;
+    const at = new Date(Date.UTC(2001, 0, 1, 0, bumps));
+    utimesSync(join(repo, "b.txt"), at, at);
+  };
+  const plant = (dir: string): void => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "post-index-change");
+    writeFileSync(
+      file,
+      `#!/bin/sh\necho "hook:post-index-change $*" >> ${JSON.stringify(marker)}\n`,
+    );
+    chmodSync(file, 0o755);
+  };
+  const hookLines = (): string[] => ran().filter((line) => line.startsWith("hook:"));
+
+  for (const where of ["git-dir", "hooks-path"] as const) {
+    test(`from ${where === "git-dir" ? ".git/hooks" : "core.hooksPath"}`, async () => {
+      if (where === "git-dir") plant(join(repo, ".git", "hooks"));
+      else {
+        plant(join(workspace, "shared-hooks"));
+        git(["config", "core.hooksPath", join(workspace, "shared-hooks")], repo);
+      }
+      rmSync(marker, { force: true });
+      staleStat();
+      git(["diff"], repo);
+      expect({ where, live: hookLines() }).toEqual({ where, live: ["hook:post-index-change 0 0"] });
+
+      let checked = 0;
+      for (const input of [{ cwd: "repo" }, { cwd: "repo", staged: true }]) {
+        rmSync(marker, { force: true });
+        staleStat();
+        const out = JSON.parse(String(await diffLint.execute(input))) as Record<string, unknown>;
+        const label = `${where} ${JSON.stringify(input)}`;
+        expect({ label, hooks: hookLines() }).toEqual({ label, hooks: [] });
+        expect({ label, source: String(out["source"]).startsWith("git diff") }).toEqual({
+          label,
+          source: true,
+        });
+        checked += 1;
+      }
+      expect(checked).toBe(2);
+    }, 30_000);
+  }
+});
+
 describe("DiffLint runs no program a submodule's config names", () => {
   test("diff.submodule=diff over a submodule with its own diff.external", async () => {
     // The superproject's config asks for inline submodule diffs; git renders

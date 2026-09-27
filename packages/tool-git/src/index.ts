@@ -86,9 +86,13 @@ const pathsField = z
 
 /**
  * Safety flags for a tool that only interrogates the repository. Reading still
- * spawns a process, so `scope`/`ioCapability` say so; `concurrencySafe` is
- * honest because these runs also set GIT_OPTIONAL_LOCKS=0 and so never contend
- * for the index lock with a sibling.
+ * spawns a process, so `scope`/`ioCapability` say so. `concurrencySafe` holds
+ * because a read never FAILS on a sibling's lock: these runs set
+ * GIT_OPTIONAL_LOCKS=0, so status takes no lock, and the one read that can
+ * write the index — `git diff` refreshing stat data it found stale — skips
+ * that write when the lock is held. Concurrency-safe tools run only beside
+ * each other, never beside a write. No read runs a hook on that write
+ * (`./hardening`, core.hooksPath).
  */
 const READ_FLAGS = {
   readOnly: true,

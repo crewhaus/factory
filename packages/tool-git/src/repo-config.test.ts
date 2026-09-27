@@ -248,6 +248,88 @@ describe("repository config cannot make a read run a program", () => {
   }, 20_000);
 });
 
+/**
+ * A read can WRITE the index: `git diff` that finds a tracked file whose stat
+ * data changed but whose bytes did not refreshes the index and writes it
+ * back, GIT_OPTIONAL_LOCKS=0 or not, and writing the index runs the
+ * repository's `post-index-change` hook. `.git/hooks` arrives with a copied
+ * checkout and needs no config at all; `core.hooksPath` can point anywhere.
+ * Before each call b.txt gets a fresh, distinct mtime, so every call finds a
+ * stale stat to refresh (the first refresh would otherwise fix it for good).
+ */
+describe("a repository's hooks never run from a read (C007)", () => {
+  const HOOKS = ["post-index-change", "reference-transaction", "post-checkout", "pre-auto-gc"];
+  let bumps = 0;
+  const staleStat = (): void => {
+    bumps += 1;
+    const at = new Date(Date.UTC(2001, 0, 1, 0, bumps));
+    utimesSync(join(repo, "b.txt"), at, at);
+  };
+  const plantHooks = (dir: string): void => {
+    mkdirSync(dir, { recursive: true });
+    for (const name of HOOKS) {
+      const file = join(dir, name);
+      writeFileSync(file, `#!/bin/sh\necho "hook:${name} $*" >> ${JSON.stringify(marker)}\n`);
+      chmodSync(file, 0o755);
+    }
+  };
+  const hookLines = (): string[] => ran().filter((line) => line.startsWith("hook:"));
+
+  const withHooksAt = async (where: "git-dir" | "hooks-path"): Promise<number> => {
+    if (where === "git-dir") plantHooks(join(repo, ".git", "hooks"));
+    else {
+      plantHooks(join(workspace, "shared-hooks"));
+      git(["config", "core.hooksPath", join(workspace, "shared-hooks")], repo);
+    }
+    // Live: plain git diff runs the hook on its index write.
+    rmSync(marker, { force: true });
+    staleStat();
+    git(["diff"], repo);
+    expect({ where, live: hookLines() }).toEqual({ where, live: ["hook:post-index-change 0 0"] });
+
+    let checked = 0;
+    for (const [tool, input] of READS_FOR_HOOKS) {
+      rmSync(marker, { force: true });
+      staleStat();
+      const text = await call(tool, input);
+      const label = `${where} ${tool.name} ${JSON.stringify(input)}`;
+      expect({ label, hooks: hookLines() }).toEqual({ label, hooks: [] });
+      expect({ label, json: text.startsWith("{") }).toEqual({ label, json: true });
+      checked += 1;
+    }
+    return checked;
+  };
+
+  test("from .git/hooks, with no config naming them", async () => {
+    expect(await withHooksAt("git-dir")).toBe(READS_FOR_HOOKS.length);
+  }, 60_000);
+
+  test("from a core.hooksPath the repository's config names", async () => {
+    expect(await withHooksAt("hooks-path")).toBe(READS_FOR_HOOKS.length);
+  }, 60_000);
+});
+
+/** Every read-only tool; the diff family is the one whose run writes the index. */
+const READS_FOR_HOOKS: ReadonlyArray<[RegisteredTool, Record<string, unknown>]> = [
+  [gitDiff, { mode: "stat" }],
+  [gitDiff, { mode: "patch" }],
+  [gitDiff, { mode: "numstat" }],
+  [gitDiff, { mode: "nameOnly" }],
+  [gitConflicts, {}],
+  [gitStatus, {}],
+  [gitBlame, { path: "b.txt" }],
+  [gitShow, { ref: "HEAD" }],
+  [gitLog, {}],
+  [gitFileHistory, { path: "a.txt" }],
+  [gitStashList, {}],
+  [gitBranchList, {}],
+  [gitTagList, {}],
+  [gitRemoteList, {}],
+  [gitMergeBase, { a: "main", b: "signed" }],
+  [gitRevParse, { refs: ["HEAD"] }],
+  [gitWorktreeList, {}],
+];
+
 describe("an embedded repository directory is not a place a read runs git", () => {
   test("a committed gitdir-shaped directory, cloned, is refused and runs nothing", async () => {
     // The clone-only vector: an outer repository commits a directory laid out
