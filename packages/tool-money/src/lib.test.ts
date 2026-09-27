@@ -509,6 +509,62 @@ describe("cost basis", () => {
       ),
     ).toThrow(/names no lots/);
   });
+
+  test("HIFO re-ranks a lot a disposal took part of", () => {
+    // B costs 333.5 a unit and A 333.33, so B goes first. Taking one unit of
+    // B costs 334 (333.5 rounded), which leaves B at 333 a unit — now BELOW A,
+    // so the next disposal must take A.
+    const result = computeCostBasis(
+      [
+        { id: "A", acquiredAt: "2024-01-01T00:00:00Z", quantity: 3, costMinor: 1000 },
+        { id: "B", acquiredAt: "2024-01-02T00:00:00Z", quantity: 2, costMinor: 667 },
+      ],
+      [1, 2].map((n) => ({
+        id: `d${n}`,
+        disposedAt: `2025-06-0${n}T00:00:00Z`,
+        quantity: 1,
+        proceedsMinor: 0,
+      })),
+      "hifo",
+    );
+    expect(result.disposals.map((d) => d.consumed.map((c) => [c.lotId, c.costMinor]))).toEqual([
+      [["B", 334]],
+      [["A", 333]],
+    ]);
+  });
+
+  test("HIFO costs about what FIFO does at thousands of lots, not a sort per disposal", () => {
+    // Every open lot was re-sorted, with bigint products, for every
+    // disposal: 3000 lots and disposals took seconds where FIFO took
+    // milliseconds, and the schema allows ten thousand of each.
+    const n = 3000;
+    const many = Array.from({ length: n }, (_, i) => ({
+      id: `l${i}`,
+      acquiredAt: new Date(Date.UTC(2020, 0, 1) + i * 3_600_000).toISOString(),
+      quantity: [0.5, 1.25, 2, 0.001][i % 4] as number,
+      costMinor: 1000 + ((i * 7919) % 100_000),
+    }));
+    const sells = Array.from({ length: n }, (_, i) => ({
+      id: `d${i}`,
+      disposedAt: new Date(Date.UTC(2025, 0, 1) + i * 60_000).toISOString(),
+      quantity: 0.25,
+      proceedsMinor: 5000,
+    }));
+    const fastest = (method: "fifo" | "hifo"): number => {
+      let best = Number.POSITIVE_INFINITY;
+      for (let run = 0; run < 3; run++) {
+        const start = performance.now();
+        expect(computeCostBasis(many, sells, method).disposals).toHaveLength(n);
+        best = Math.min(best, performance.now() - start);
+      }
+      return best;
+    };
+    const fifo = fastest("fifo");
+    const hifo = fastest("hifo");
+    expect({ fifo, hifo, withinBudget: hifo <= 5 * fifo + 250 }).toMatchObject({
+      withinBudget: true,
+    });
+  }, 60_000);
 });
 
 describe("spend limits", () => {
