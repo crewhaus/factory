@@ -21,7 +21,11 @@
 import { statSync } from "node:fs";
 import * as path from "node:path";
 import { withoutCredentials } from "@crewhaus/tool-safety/env";
-import { CHECKER_CACHE_PLACEHOLDER, isCheckerCachePath } from "./lib/checker-cache";
+import {
+  CHECKER_CACHE_PLACEHOLDER,
+  displayMypyCacheArg,
+  isCheckerCachePath,
+} from "./lib/checker-cache";
 import { ToolPermissionError, resolveSafe } from "./paths";
 
 /** Default wall-clock budget for one toolchain invocation. */
@@ -463,9 +467,7 @@ export function displayCommand(argv: readonly string[], root: string): string {
       // and a hash of this checkout's path: shown as a placeholder instead.
       isCheckerCachePath(arg)
         ? CHECKER_CACHE_PLACEHOLDER
-        : arg.startsWith(prefix)
-          ? relPosix(root, arg)
-          : arg,
+        : (displayMypyCacheArg(arg) ?? (arg.startsWith(prefix) ? relPosix(root, arg) : arg)),
     )
     .join(" ");
 }

@@ -15,7 +15,7 @@
  * because there is nowhere else for them to come from.
  */
 import * as path from "node:path";
-import { typecheckBuildInfoFile } from "./lib/checker-cache";
+import { mypyCacheDir, typecheckBuildInfoFile } from "./lib/checker-cache";
 import { parsePackageJson } from "./lib/deps";
 import { type SkippedFile, fileExists, readTextFile } from "./walk";
 
@@ -260,8 +260,10 @@ export function detectBuild(
  * is sent to a per-user temp file keyed by the project (./lib/checker-cache,
  * C150) with `--incremental --tsBuildInfoFile`, which the command line lets
  * override the tsconfig — on TypeScript 4.0 and later; 3.x rejects the pair
- * and writes no build info under `--noEmit`. mypy gets `--cache-dir=/dev/null` (its documented
- * way to write no cache) and ruff `--no-cache`, for the same reason.
+ * and writes no build info under `--noEmit`. mypy gets `--cache-dir=` a
+ * per-user temp directory keyed by the project, so it stays incremental
+ * without writing `.mypy_cache` into the project (or wherever its config's
+ * `cache_dir` points); ruff gets `--no-cache`, for the same reason.
  */
 export function detectTypecheck(
   dir: string,
@@ -291,12 +293,7 @@ export function detectTypecheck(
   const mypy = localBinary(dir, root, "mypy");
   if (mypy !== undefined && fileExists(path.join(dir, "pyproject.toml"))) {
     return {
-      argv: [
-        mypy,
-        "--no-color-output",
-        "--no-error-summary",
-        `--cache-dir=${process.platform === "win32" ? "nul" : "/dev/null"}`,
-      ],
+      argv: [mypy, "--no-color-output", "--no-error-summary", `--cache-dir=${mypyCacheDir(dir)}`],
       tool: "mypy",
       reason: "mypy installed",
     };

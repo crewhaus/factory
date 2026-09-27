@@ -57,6 +57,7 @@ import {
   typecheck,
   workspacePackages,
 } from "./index";
+import { displayCommand } from "./run";
 
 let workspace: string;
 let outside: string;
@@ -1298,7 +1299,20 @@ describe("toolchain detection", () => {
     installBinary("mypy", "exit 0");
     installBinary("ruff", "exit 0");
     const mypy = (detectTypecheck(workspace, workspace) as { argv: string[] }).argv;
-    expect(mypy).toContain("--cache-dir=/dev/null");
+    // A cache kept BETWEEN runs (regression review: /dev/null made every run
+    // cold), in the per-user temp directory, keyed by the project.
+    const cacheArg = mypy.find((a) => a.startsWith("--cache-dir=")) as string;
+    const cacheDir = cacheArg.slice("--cache-dir=".length);
+    expect(cacheDir).not.toBe("/dev/null");
+    expect(cacheDir.startsWith(realpathSync(tmpdir())) || cacheDir.startsWith(tmpdir())).toBe(true);
+    expect(cacheDir.startsWith(workspace)).toBe(false);
+    // The same project gets the same directory on the next run; another gets its own.
+    expect((detectTypecheck(workspace, workspace) as { argv: string[] }).argv).toContain(cacheArg);
+    write("other/pyproject.toml", "[tool.mypy]\n");
+    const other = (detectTypecheck(join(workspace, "other"), workspace) as { argv: string[] }).argv;
+    expect(other).not.toContain(cacheArg);
+    expect(displayCommand(mypy, workspace)).toContain("--cache-dir=<tmp>/crewhaus-mypy-cache");
+    expect(displayCommand(mypy, workspace)).not.toContain(cacheDir);
     expect((detectLint(workspace, workspace) as { argv: string[] }).argv).toContain("--no-cache");
     expect((detectFormat(workspace, workspace, false) as { argv: string[] }).argv).toContain(
       "--no-cache",
