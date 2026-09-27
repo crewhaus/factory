@@ -79,7 +79,7 @@
  *      Nothing here writes a substitute log.
  */
 
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { createDeploymentController } from "@crewhaus/deployment-controller";
 import { autoRegisterSpecVersion, nextVersion } from "@crewhaus/spec-changelog";
@@ -106,6 +106,7 @@ import {
   probeTenantOverlay,
   probeVersion,
   readManifest,
+  reservedRegistryRoot,
   resolveName,
 } from "./lib/registry";
 import {
@@ -122,6 +123,7 @@ import {
   renderStrings,
   sample,
 } from "./lib/result";
+import { workspaceRoot } from "./paths";
 
 // ---------------------------------------------------------------------------
 // shared plumbing
@@ -136,7 +138,9 @@ const DEFAULT_SPEC_LIMIT = 200;
 const registryDirField = z
   .string()
   .optional()
-  .describe(`the file-backed spec registry root (default: ${DEFAULT_REGISTRY_RELDIR})`);
+  .describe(
+    `the file-backed spec registry root (default: ${DEFAULT_REGISTRY_RELDIR}); SpecPin and DeployRollback refuse a root inside a directory another registry reserves (its "_tenants" or any other "_" name)`,
+  );
 
 const tenantField = z
   .string()
@@ -179,6 +183,13 @@ function open(
   // registry on first use. Existence is reported by the caller, not required.
   const root = contain(tool, rootRel);
   if (!root.ok) return root;
+  const reserved = reservedRegistryRoot(root.value, realpathSync(workspaceRoot()));
+  if (reserved !== undefined) {
+    return fail(
+      "refused",
+      `registry root "${render(rootRel)}" is not written to: ${reserved}. Point registryDir at a registry's own root, such as "${DEFAULT_REGISTRY_RELDIR}".`,
+    );
+  }
   const specPaths = containSpecPaths(tool, root.value, name.value.registryName, knownVersions);
   if (specPaths !== undefined) return specPaths;
   if (tenant !== undefined) {
@@ -385,7 +396,7 @@ export const specPin: RegisteredTool = buildTool({
     { field: "env", kind: "id", within: "name" },
   ],
   description:
-    "Register a spec file's current content as a version in the local spec registry and pin that version to an environment (or to a tenant's overlay of one). Registration is @crewhaus/spec-changelog's autoRegisterSpecVersion: content-hashed, so re-registering unchanged content is a no-op that reports the version already holding it, and each new version appends a distilled entry to the per-spec CHANGELOG.md beside the manifest. Pinning is @crewhaus/spec-registry's own. It REFUSES to move a pin that already exists unless repin:true (the registry has no unpin and no pin history, so the previous binding would survive nowhere else) — but a tenant's FIRST overlay is not such a move: with no overlay file the version aliasForTenant returned is the global pin showing through its fallback, nothing of the tenant's is replaced, and the global pin is not touched, so it is written rather than refused. It refuses a spec name that maps onto the shared \"spec\" fallback directory or onto one the registry's listing hides (a leading \"_\", the tenant-overlay directory \"_tenants\" included), refuses when the manifest cannot be read or is a symlink (an unreadable manifest is never treated as 'no versions'), and refuses when any path the registry would open — the spec directory, its manifest, its changelog, a version file, a tenant overlay — resolves outside the workspace. NO AUDIT RECORD IS WRITTEN: @crewhaus/audit-log is not a dependency of this package, and the result says so next to the pin that did change. dryRun changes nothing and previews the same pin decision the real call makes.",
+    "Register a spec file's current content as a version in the local spec registry and pin that version to an environment (or to a tenant's overlay of one). Registration is @crewhaus/spec-changelog's autoRegisterSpecVersion: content-hashed, so re-registering unchanged content is a no-op that reports the version already holding it, and each new version appends a distilled entry to the per-spec CHANGELOG.md beside the manifest. Pinning is @crewhaus/spec-registry's own. It REFUSES to move a pin that already exists unless repin:true (the registry has no unpin and no pin history, so the previous binding would survive nowhere else) — but a tenant's FIRST overlay is not such a move: with no overlay file the version aliasForTenant returned is the global pin showing through its fallback, nothing of the tenant's is replaced, and the global pin is not touched, so it is written rather than refused. It refuses a spec name that maps onto the shared \"spec\" fallback directory or onto one the registry's listing hides (a leading \"_\", the tenant-overlay directory \"_tenants\" included), refuses a registryDir inside such a directory of another registry, refuses when the manifest cannot be read or is a symlink (an unreadable manifest is never treated as 'no versions'), and refuses when any path the registry would open — the spec directory, its manifest, its changelog, a version file, a tenant overlay — resolves outside the workspace. NO AUDIT RECORD IS WRITTEN: @crewhaus/audit-log is not a dependency of this package, and the result says so next to the pin that did change. dryRun changes nothing and previews the same pin decision the real call makes.",
   inputSchema: z.object({
     name: z
       .string()

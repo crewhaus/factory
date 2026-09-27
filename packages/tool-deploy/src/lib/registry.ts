@@ -36,7 +36,7 @@
  *      on the link's target. That is the one case where absence and a door
  *      are spelled the same, so it is probed with `lstat` instead.
  */
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { contentHash, registrySpecName } from "@crewhaus/spec-changelog";
 import type { Manifest, RegistryAdapter } from "@crewhaus/spec-registry";
 import { SpecRegistryError } from "@crewhaus/spec-registry";
@@ -208,6 +208,47 @@ export function containSpecPaths(
     ...versions.map((v) => `${registryName}/${versionFilename(v)}`),
   ];
   return containUnder(toolName, root, rels);
+}
+
+/**
+ * Why a registry ROOT may not be written under, or undefined when it may.
+ *
+ * {@link resolveName} refuses a spec NAME a registry hides (`_hidden`,
+ * `_tenants`), but the root is the caller's choice too: `registryDir:
+ * ".crewhaus/specs/_tenants"` with the name `acme` put `manifest.json`,
+ * `v1.yaml` and `CHANGELOG.md` into tenant acme's overlay directory, where
+ * `aliasForTenant` reads `manifest.json` as the overlay of a spec named
+ * "manifest", and DeployInspect listed none of it. So a root is refused
+ * when its REAL path (links followed, so a link to `_tenants` is caught)
+ * goes through
+ *
+ * a `_`-prefixed directory directly inside a registry — the default root,
+ * or any directory holding `_tenants` — which that registry reserves:
+ * `_tenants` (in any letter case) holds its overlays, and its listing skips
+ * every other `_` name, as it skips a `_`-prefixed spec name.
+ *
+ * A `_`-prefixed directory anywhere else (`_infra/specs`) is an ordinary
+ * directory and is not refused.
+ */
+export function reservedRegistryRoot(root: SafePath, workspaceReal: string): string | undefined {
+  const rel = relative(workspaceReal, root.real);
+  if (rel === "" || rel.startsWith("..")) return undefined;
+  const parts = rel.split(sep);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i] as string;
+    if (!part.startsWith("_")) continue;
+    const parentRel = parts.slice(0, i).join("/");
+    // Anything but a definite "no `_tenants` here" counts as a registry.
+    const parentIsRegistry =
+      parentRel === DEFAULT_REGISTRY_RELDIR ||
+      probeName(join(workspaceReal, ...parts.slice(0, i), TENANTS_DIRNAME)).kind !== "absent";
+    if (!parentIsRegistry) continue;
+    const where = render(parentRel === "" ? "." : parentRel);
+    return part.toLowerCase() === TENANTS_DIRNAME
+      ? `it is inside "${render(parentRel === "" ? part : `${parentRel}/${part}`)}", the tenant-overlay directory of the registry at "${where}", where a spec's manifest.json would be read as a tenant's overlay`
+      : `"${render(part)}" is a directory the registry at "${where}" skips (${HIDDEN_FROM_LISTING})`;
+  }
+  return undefined;
 }
 
 /** The tenant overlay directory and file a tenant-scoped call reads or writes. */

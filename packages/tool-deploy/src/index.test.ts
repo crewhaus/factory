@@ -23,6 +23,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -280,6 +281,69 @@ test("SpecPin refuses a name the registry's listing hides, and writes nothing (s
     expect(existsSync(path.join(tmp, ROOT_REL, name, MANIFEST_FILENAME))).toBe(false);
   }
   expect(existsSync(specDir("_hidden"))).toBe(false);
+});
+
+// The ops review: the NAME was refused, but the ROOT is the caller's choice
+// too. `registryDir: ".crewhaus/specs/_tenants"` with name `acme` wrote
+// manifest.json, v1.yaml and CHANGELOG.md into tenant acme's overlay
+// directory and reported "pinned"; DeployInspect listed none of it.
+test("SpecPin and DeployRollback refuse a registry root inside another registry's reserved directory", async () => {
+  await seed("name: demo\n");
+  // The default root reserves its `_` names before any tenant exists.
+  const hidden = await call(specPin, {
+    name: "acme",
+    specFile: "spec.yaml",
+    env: "prod",
+    registryDir: `${ROOT_REL}/_hidden`,
+  });
+  expect([hidden["status"], String(hidden["reason"]).includes("skips")]).toEqual(["refused", true]);
+  await call(specPin, {
+    name: "demo",
+    specFile: "spec.yaml",
+    env: "prod",
+    tenant: "acme",
+    repin: true,
+  });
+  const overlayDir = path.join(tmp, ROOT_REL, "_tenants", "acme");
+  const before = readdirSync(overlayDir).sort();
+  // A link to the overlay directory is the same place.
+  symlinkSync(path.join(tmp, ROOT_REL, "_tenants"), path.join(tmp, "overlays"));
+  const roots = [
+    `${ROOT_REL}/_tenants`,
+    `${ROOT_REL}/_TENANTS`,
+    `${ROOT_REL}/_tenants/acme`,
+    "overlays",
+    // Any directory holding `_tenants` is a registry, not only the default.
+    "other/_x",
+  ];
+  mkdirSync(path.join(tmp, "other", "_tenants"), { recursive: true });
+  let refused = 0;
+  for (const registryDir of roots) {
+    for (const [tool, input] of [
+      [specPin, { name: "acme", specFile: "spec.yaml", env: "prod", registryDir }],
+      [deployRollback, { name: "acme", env: "prod", toVersion: "v1", registryDir, dryRun: false }],
+    ] as const) {
+      const r = await call(tool, input);
+      expect({ tool: tool.name, registryDir, status: r["status"] }).toEqual({
+        tool: tool.name,
+        registryDir,
+        status: "refused",
+      });
+      expect(String(r["reason"])).toContain("is not written to");
+      refused += 1;
+    }
+  }
+  expect(refused).toBe(roots.length * 2);
+  expect(readdirSync(overlayDir).sort()).toEqual(before);
+  expect(existsSync(path.join(tmp, ROOT_REL, "_hidden"))).toBe(false);
+  // A `_`-prefixed directory that is not inside a registry is ordinary.
+  const own = await call(specPin, {
+    name: "demo",
+    specFile: "spec.yaml",
+    env: "prod",
+    registryDir: "_infra/specs",
+  });
+  expect(own["status"]).toBe("pinned");
 });
 
 test("a spec an earlier build stored under a hidden name is named by DeployInspect, and readable by name", async () => {
