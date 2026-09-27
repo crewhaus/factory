@@ -875,19 +875,39 @@ export function driftIsEmpty(drift: McpToolDrift): boolean {
  * (that is not drift), while any real member add/remove/retype IS. Mirrors
  * `mcp-doctor`'s `canonicalJson`.
  */
-function canonicalJson(value: unknown): string {
+function canonicalJson(value: unknown, depth = 0): string {
+  // A server's schema can nest past the call stack; the snapshot must not
+  // take the server's other tools down with it (see snapshotTools).
+  if (depth > CANONICAL_JSON_MAX_DEPTH) throw new RangeError("schema nests too deep to hash");
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item, depth + 1)).join(",")}]`;
+  }
   const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
     a < b ? -1 : a > b ? 1 : 0,
   );
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v, depth + 1)}`).join(",")}}`;
 }
+
+/**
+ * Past this depth a schema is not hashed. Well past the depth a schema may
+ * have to register ({@link MAX_MCP_SCHEMA_DEPTH}), and well inside the call
+ * stack.
+ */
+const CANONICAL_JSON_MAX_DEPTH = 256;
 
 /** Stable 16-hex-char sha256 of a tool's JSON-schema. Mirrors `mcp-doctor`. */
 export function hashToolSchema(schema: unknown): string {
   return createHash("sha256").update(canonicalJson(schema)).digest("hex").slice(0, 16);
 }
+
+/**
+ * The snapshot hash of a tool whose schema (or annotations) cannot be hashed:
+ * nested past {@link CANONICAL_JSON_MAX_DEPTH}, or not JSON. Such a tool is
+ * refused when it is registered, so all that matters is that the snapshot
+ * records it and that a later hashable schema reads as a change.
+ */
+const UNHASHABLE_SCHEMA = "unhashable";
 
 /**
  * Build a drift snapshot (remote name → schema hash) from a live tool list.
@@ -900,14 +920,19 @@ export function snapshotTools(tools: ReadonlyArray<McpToolDefinition>): McpToolS
   for (const t of tools) {
     // A name listed twice keeps its first definition, as registration does.
     if (map.has(t.name)) continue;
-    map.set(
-      t.name,
-      hashToolSchema(
+    let hash: string;
+    try {
+      hash = hashToolSchema(
         t.annotations === undefined
           ? t.inputSchema
           : { inputSchema: t.inputSchema, annotations: t.annotations },
-      ),
-    );
+      );
+    } catch {
+      // One tool that cannot be hashed must not stop the listing: it is
+      // recorded, and registration refuses it with a reason (C100).
+      hash = UNHASHABLE_SCHEMA;
+    }
+    map.set(t.name, hash);
   }
   return map;
 }

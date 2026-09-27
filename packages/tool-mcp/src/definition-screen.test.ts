@@ -29,8 +29,10 @@ import {
   reconcileMcpServer,
   registerMcpServer,
   registerMcpToolAliases,
+  registerOptionalMcpServer,
   screenMcpToolDefinition,
   snapshotTools,
+  watchMcpServer,
 } from "./index.js";
 
 /** Classifies malicious at origin "mcp" (ignore-previous + tell-me-system-prompt). */
@@ -869,4 +871,65 @@ describe("one server's tool list has a budget (C102)", () => {
     expect(result.refused.length).toBeGreaterThan(0);
     expect(advertised(catalog)).toBeLessThanOrEqual(MAX_MCP_SERVER_DEFINITION_CHARS);
   }, 20_000);
+});
+
+describe("one tool the snapshot cannot hash does not take its server down (C100)", () => {
+  // What an SDK's JSON.parse hands over for a hostile listing: nesting far
+  // past the call stack's reach for a recursive walk.
+  const nested = (depth: number) =>
+    JSON.parse(
+      `{"type":"object","properties":{"x":${'{"a":'.repeat(depth)}1${"}".repeat(depth)}}}`,
+    ) as Record<string, unknown>;
+  const arrays = (depth: number) => JSON.parse(`${"[".repeat(depth)}${"]".repeat(depth)}`);
+  const listing = (deep: unknown): McpToolDefinition[] => [
+    { name: "ok_one", description: "fine", inputSchema: { type: "object" } },
+    { name: "deep", description: "deep", inputSchema: deep },
+    { name: "ok_two", description: "fine", inputSchema: { type: "object" } },
+  ];
+
+  for (const [label, deep] of [
+    ["an object nested 12000 deep", nested(12_000)],
+    ["arrays nested 12000 deep, under the size cap", arrays(12_000)],
+  ] as const) {
+    test(`watchMcpServer registers the others around ${label}`, async () => {
+      const { host } = makeHost("gh", listing(deep));
+      const catalog = new ToolCatalog();
+      const errors: unknown[] = [];
+      const skipped: string[] = [];
+      await watchMcpServer(host, "gh", catalog, {
+        onError: (e) => errors.push(e),
+        onSkip: ({ remoteName }) => skipped.push(remoteName),
+      });
+      expect(errors).toEqual([]);
+      expect(catalog.list().map((t) => t.name)).toEqual(["mcp__gh__ok_one", "mcp__gh__ok_two"]);
+      expect(skipped).toEqual(["deep"]);
+    });
+
+    test(`registerOptionalMcpServer connects and registers the others around ${label}`, async () => {
+      const { host } = makeHost("gh", listing(deep));
+      const catalog = new ToolCatalog();
+      const logs: string[] = [];
+      const handle = registerOptionalMcpServer(host, "gh", catalog, {
+        retry: false,
+        log: (l) => logs.push(l.trim()),
+        onSkip: () => {},
+      });
+      expect(await handle.firstAttempt).toBe(true);
+      expect(handle.connected()).toBe(true);
+      expect(catalog.list().map((t) => t.name)).toEqual(["mcp__gh__ok_one", "mcp__gh__ok_two"]);
+      expect(logs).toEqual(['[mcp] optional server "gh" connected — 2 tool(s) registered']);
+      handle.stop();
+    });
+  }
+
+  test("the unhashable tool is recorded, and a later clean schema re-registers it", async () => {
+    const { host, setTools } = makeHost("gh", listing(arrays(12_000)));
+    const catalog = new ToolCatalog();
+    const first = await reconcileMcpServer(host, "gh", catalog, undefined, { onSkip: () => {} });
+    expect([...first.snapshot.keys()]).toEqual(["ok_one", "deep", "ok_two"]);
+    setTools(listing({ type: "object" }));
+    const next = await reconcileMcpServer(host, "gh", catalog, first.snapshot);
+    expect(next.drift.schemaChanged).toEqual(["deep"]);
+    expect(catalog.has("mcp__gh__deep")).toBe(true);
+  });
 });
