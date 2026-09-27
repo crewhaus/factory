@@ -13,8 +13,10 @@
  * ## What this does not read
  *
  * MakerNotes (vendor-private, undocumented, and different per camera),
- * IFD1 thumbnails, XMP, IPTC, and EXIF carried in a TIFF or HEIC rather
- * than a JPEG. Each would be a separate parser; none is approximated.
+ * IFD1 thumbnails, and EXIF carried in a TIFF or HEIC rather than a JPEG.
+ * Each would be a separate parser; none is approximated. XMP and Photoshop
+ * resource blocks are searched for a location (see `otherMetadataOf`), not
+ * parsed, and any other APPn segment is reported as not read.
  */
 import { ByteReader, MediaFormatError, asciiAt, startsWith } from "./bytes";
 
@@ -760,6 +762,8 @@ export type JpegMetadataReport = {
   readonly unaccountedBytes: number;
   /** EXIF signatures in those bytes beyond the ones parsed. */
   readonly exifSignaturesNotParsed: number;
+  /** Every APPn segment other than EXIF, in the main image and the appended ones walked. */
+  readonly otherMetadata: ReadonlyArray<OtherMetadata>;
 };
 
 /** How many appended images one call walks. */
@@ -799,6 +803,184 @@ function exifBlocksOf(
 }
 
 /**
+ * A metadata segment other than EXIF, and whether it names a location.
+ * `location` is true when it does, false when it was read (or its format
+ * has no place for one) and it does not, and null when this reader does
+ * not parse it, so it may.
+ */
+export type OtherMetadata = {
+  /** `"APP1 XMP"`, `"APP13 Photoshop"`, or the marker and its identifier. */
+  readonly segment: string;
+  readonly where: ExifLocation["where"];
+  readonly offset: number;
+  readonly location: boolean | null;
+};
+
+const XMP_ID = "http://ns.adobe.com/xap/1.0/\0";
+const XMP_EXTENSION_ID = "http://ns.adobe.com/xmp/extension/\0";
+/** Extended XMP: the identifier, a 32-byte GUID, the full length and this chunk's offset. */
+const XMP_EXTENSION_HEADER = XMP_EXTENSION_ID.length + 32 + 4 + 4;
+
+/**
+ * Does an XMP packet name a location? The GPS properties are
+ * `exif:GPSLatitude` and `exif:GPSLongitude`, written as attributes or
+ * elements under whatever prefix the packet binds (IPTC's LocationCreated
+ * nests the same two; DJI writes `drone-dji:GpsLatitude`), so the property
+ * names are searched for, ignoring case. A packet that has either is taken
+ * to carry a location: for a file about to be published, a false "yes" costs
+ * a strip, and a false "no" publishes where it was taken.
+ */
+function xmpNamesLocation(bytes: Uint8Array): boolean {
+  let text = "";
+  // Latin-1 keeps one character per byte, and the property names are ASCII.
+  for (let i = 0; i < bytes.length; i += 8192) {
+    text += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  }
+  const lower = text.toLowerCase();
+  return lower.includes("gpslatitude") || lower.includes("gpslongitude");
+}
+
+/**
+ * Walk a Photoshop Image Resource Block (APP13 `Photoshop 3.0`) and say
+ * whether it names a location: the EXIF (0x0422, 0x0423) and XMP (0x0424)
+ * resources Photoshop can keep there are read like their APP1 twins; the
+ * IPTC-IIM record (0x0404) has place names but no coordinates. A block that
+ * does not walk is not read.
+ */
+function photoshopNamesLocation(payload: Uint8Array): boolean | null {
+  const header = "Photoshop 3.0\0";
+  let at = header.length;
+  let unread = false;
+  while (at + 12 <= payload.length) {
+    if (!asciiAt(payload, at, "8BIM")) return null;
+    const id = ((payload[at + 4] as number) << 8) | (payload[at + 5] as number);
+    const nameLength = payload[at + 6] as number;
+    // The Pascal-string name, its length byte included, is padded to even.
+    const nameEnd = at + 6 + ((nameLength + 2) & ~1);
+    if (nameEnd + 4 > payload.length) return null;
+    const size =
+      (((payload[nameEnd] as number) << 24) >>> 0) +
+      ((payload[nameEnd + 1] as number) << 16) +
+      ((payload[nameEnd + 2] as number) << 8) +
+      (payload[nameEnd + 3] as number);
+    const dataStart = nameEnd + 4;
+    if (dataStart + size > payload.length) return null;
+    const data = payload.subarray(dataStart, dataStart + size);
+    if (id === 0x0424 && xmpNamesLocation(data)) return true;
+    if (id === 0x0422 || id === 0x0423) {
+      const framed = new Uint8Array(6 + data.length);
+      framed.set([0x45, 0x78, 0x69, 0x66, 0, 0]);
+      framed.set(data, 6);
+      try {
+        if (parseExif(framed).hasGps) return true;
+      } catch {
+        unread = true;
+      }
+    }
+    at = dataStart + size + (size & 1);
+  }
+  return unread ? null : false;
+}
+
+/** The first bytes of an identifier, for naming a segment this does not read. */
+function identifierOf(payload: Uint8Array): string {
+  let id = "";
+  for (let i = 0; i < Math.min(payload.length, 24); i++) {
+    const b = payload[i] as number;
+    if (b === 0) break;
+    if (b < 0x20 || b > 0x7e) return id;
+    id += String.fromCharCode(b);
+  }
+  return id;
+}
+
+/**
+ * The APPn segments of one walk other than EXIF, each with whether it names
+ * a location. XMP split across Extended XMP chunks is put back together
+ * (per GUID, by offset) before it is searched, so a property cut in two by a
+ * chunk boundary is still seen.
+ */
+function otherMetadataOf(
+  walk: JpegWalk,
+  base: number,
+  where: (sawScan: boolean) => ExifLocation["where"],
+): OtherMetadata[] {
+  const out: OtherMetadata[] = [];
+  const extended = new Map<
+    string,
+    { where: ExifLocation["where"]; offset: number; chunks: Array<[number, Uint8Array]> }
+  >();
+  let sawScan = false;
+  for (const part of walk.parts) {
+    if (part.type === "scan") {
+      sawScan = true;
+      continue;
+    }
+    const s = part.segment;
+    if (s.marker < 0xe0 || s.marker > 0xef) continue;
+    const p = s.payload;
+    const at = { where: where(sawScan), offset: base + s.offset };
+    if (s.marker === 0xe1 && asciiAt(p, 0, "Exif")) continue; // parsed as EXIF
+    if (s.marker === 0xe1 && asciiAt(p, 0, XMP_ID)) {
+      out.push({ segment: "APP1 XMP", ...at, location: xmpNamesLocation(p) });
+      continue;
+    }
+    if (s.marker === 0xe1 && asciiAt(p, 0, XMP_EXTENSION_ID)) {
+      if (p.length < XMP_EXTENSION_HEADER) {
+        out.push({ segment: "APP1 extended XMP", ...at, location: null });
+        continue;
+      }
+      const guid = String.fromCharCode(
+        ...p.subarray(XMP_EXTENSION_ID.length, XMP_EXTENSION_ID.length + 32),
+      );
+      const o = XMP_EXTENSION_ID.length + 36;
+      const chunkOffset =
+        (((p[o] as number) << 24) >>> 0) +
+        ((p[o + 1] as number) << 16) +
+        ((p[o + 2] as number) << 8) +
+        (p[o + 3] as number);
+      const entry = extended.get(guid) ?? { ...at, chunks: [] };
+      entry.chunks.push([chunkOffset, p.subarray(XMP_EXTENSION_HEADER)]);
+      extended.set(guid, entry);
+      continue;
+    }
+    let location: boolean | null = null;
+    let segment = `${s.name} ${identifierOf(p)}`.trim();
+    if (s.marker === 0xe0 && asciiAt(p, 0, "JFIF\0")) location = false;
+    // JFXX carries a thumbnail; one coded as a JPEG (0x10) could carry EXIF.
+    else if (s.marker === 0xe0 && asciiAt(p, 0, "JFXX\0")) location = p[5] === 0x10 ? null : false;
+    else if (s.marker === 0xe2 && asciiAt(p, 0, "ICC_PROFILE\0")) location = false;
+    // MPF indexes the appended images, which are walked for themselves.
+    else if (s.marker === 0xe2 && asciiAt(p, 0, "MPF\0")) location = false;
+    else if (s.marker === 0xec && asciiAt(p, 0, "Ducky")) location = false;
+    else if (s.marker === 0xee && asciiAt(p, 0, "Adobe")) location = false;
+    else if (s.marker === 0xed && asciiAt(p, 0, "Photoshop 3.0\0")) {
+      segment = "APP13 Photoshop";
+      location = photoshopNamesLocation(p);
+    }
+    out.push({ segment, ...at, location });
+  }
+  for (const entry of extended.values()) {
+    entry.chunks.sort((a, b) => a[0] - b[0]);
+    let total = 0;
+    for (const [, chunk] of entry.chunks) total += chunk.length;
+    const joined = new Uint8Array(total);
+    let at = 0;
+    for (const [, chunk] of entry.chunks) {
+      joined.set(chunk, at);
+      at += chunk.length;
+    }
+    out.push({
+      segment: "APP1 extended XMP",
+      where: entry.where,
+      offset: entry.offset,
+      location: xmpNamesLocation(joined),
+    });
+  }
+  return out;
+}
+
+/**
  * Every place in a JPEG that can carry metadata: EXIF before and between
  * scans, other APPn/COM segments, and the JPEGs appended after EOI (walked
  * once each, not their own trailers again). Bytes no walk accounts for —
@@ -809,9 +991,10 @@ function exifBlocksOf(
  */
 export function inspectJpegMetadata(bytes: Uint8Array): JpegMetadataReport {
   const walk = walkJpeg(bytes);
-  const exifBlocks = exifBlocksOf(walk, 0, (sawScan) =>
-    sawScan ? "between scans" : "before the first scan",
-  );
+  const mainWhere = (sawScan: boolean): ExifLocation["where"] =>
+    sawScan ? "between scans" : "before the first scan";
+  const exifBlocks = exifBlocksOf(walk, 0, mainWhere);
+  const otherMetadata = otherMetadataOf(walk, 0, mainWhere);
   const interScan: string[] = [];
   const before: string[] = [];
   let sawScan = false;
@@ -853,6 +1036,7 @@ export function inspectJpegMetadata(bytes: Uint8Array): JpegMetadataReport {
         const inner = walkJpeg(bytes.subarray(i));
         embeddedImages++;
         exifBlocks.push(...exifBlocksOf(inner, i, () => "in an appended image"));
+        otherMetadata.push(...otherMetadataOf(inner, i, () => "in an appended image"));
         const end = i + (inner.eoiEnd ?? inner.stopped?.offset ?? bytes.length - i);
         covered.push([i, end]);
         coveredTo = end;
@@ -914,5 +1098,6 @@ export function inspectJpegMetadata(bytes: Uint8Array): JpegMetadataReport {
     ...(walk.stopped === null ? {} : { breaksOffAt: walk.stopped }),
     unaccountedBytes: unaccounted,
     exifSignaturesNotParsed: signatures - parsedLoose,
+    otherMetadata,
   };
 }

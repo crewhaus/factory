@@ -408,7 +408,7 @@ export const pngRead: RegisteredTool = buildTool({
 export const exifRead: RegisteredTool = buildTool({
   name: "ExifRead",
   description:
-    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read (a file past 64 MiB up to that point), so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too; when it cannot tell, hasGps is null with the reason.",
+    "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read (a file past 64 MiB up to that point), so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too, and so does GPS written in XMP; when it cannot tell, hasGps is null with the reason.",
   inputSchema: z.object({ path: pathField.describe("a JPEG inside the workspace") }),
   readOnly: true,
   concurrencySafe: true,
@@ -433,6 +433,12 @@ export const exifRead: RegisteredTool = buildTool({
       );
       const withGps = report.exifBlocks.filter((b) => b.exif?.hasGps === true);
       const unreadableBlocks = report.exifBlocks.filter((b) => b.exif === null);
+      // XMP and Photoshop resources are read for a location; a segment this
+      // reader does not parse (a C2PA manifest in APP11, a vendor APPn) may
+      // hold one, so it leaves "no GPS" undetermined, as an unparsed EXIF
+      // block does.
+      const locatedElsewhere = report.otherMetadata.filter((m) => m.location === true);
+      const notRead = report.otherMetadata.filter((m) => m.location === null);
       // GPS found anywhere is a definite yes. No GPS is a definite no only
       // when every byte was read, every EXIF block parsed, and every byte
       // after the image accounted for by an appended image that was walked.
@@ -458,8 +464,17 @@ export const exifRead: RegisteredTool = buildTool({
       }
       if (unreadableBlocks.length > 0)
         unknowns.push("an EXIF block in the file could not be parsed");
-      const undetermined = withGps.length === 0 && unknowns.length > 0;
-      const hasGps = withGps.length > 0 ? true : undetermined ? null : false;
+      if (notRead.length > 0) {
+        const named = notRead
+          .slice(0, 8)
+          .map((m) => `${m.segment} at offset ${m.offset}`)
+          .join(", ");
+        const more = notRead.length > 8 ? ` and ${notRead.length - 8} more` : "";
+        unknowns.push(`metadata this reader does not parse may carry a location: ${named}${more}`);
+      }
+      const found = withGps.length > 0 || locatedElsewhere.length > 0;
+      const undetermined = !found && unknowns.length > 0;
+      const hasGps = found ? true : undetermined ? null : false;
       const where = {
         ...(partial ? { bytesRead: bytes.length, fileBytes: size } : {}),
         trailingBytes: report.trailingBytes,
@@ -478,6 +493,15 @@ export const exifRead: RegisteredTool = buildTool({
                 hasGps: b.exif?.hasGps ?? null,
                 ...(b.exif?.gps === undefined ? {} : { gps: b.exif.gps }),
                 ...(b.unreadable === undefined ? {} : { unreadable: b.unreadable }),
+              })),
+            }
+          : {}),
+        ...(locatedElsewhere.length > 0
+          ? {
+              gpsInOtherMetadata: locatedElsewhere.map((m) => ({
+                segment: m.segment,
+                where: m.where,
+                offset: m.offset,
               })),
             }
           : {}),

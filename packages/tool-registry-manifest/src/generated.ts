@@ -2554,7 +2554,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "exifRead",
     name: "ExifRead",
     description:
-      "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read (a file past 64 MiB up to that point), so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too; when it cannot tell, hasGps is null with the reason.",
+      "Read a JPEG's EXIF metadata: capture time, camera, lens, exposure, orientation, and GPS coordinates when the file carries them. Use before publishing or sharing a photograph, because `hasGps: true` means the file is carrying the location it was taken at. The whole file is read (a file past 64 MiB up to that point), so EXIF between scans or in an image appended after the main one (a preview, a gain map) counts too, and so does GPS written in XMP; when it cannot tell, hasGps is null with the reason.",
     readOnly: true,
     destructive: false,
     scope: "internal",

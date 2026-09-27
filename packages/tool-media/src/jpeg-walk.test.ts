@@ -193,6 +193,141 @@ describe("ExifRead and ExifStrip over the whole file", () => {
     expect(out.gpsUndetermined).toMatch(/could not be parsed/);
   });
 
+  describe("metadata other than EXIF is read for a location, or leaves the answer open", () => {
+    const text = (t: string) => new TextEncoder().encode(t);
+    /** A small JPEG with `segments` after its SOI (and its own APP0 JFIF after them). */
+    const withSegments = (...segments: Uint8Array[]) =>
+      concatBytes([
+        new Uint8Array([0xff, 0xd8]),
+        ...segments,
+        sampleJpeg({ width: 8, height: 8 }).subarray(2),
+      ]);
+    const XMP_ID = "http://ns.adobe.com/xap/1.0/\0";
+    const xmp = (body: string) =>
+      jpegSegment(
+        0xe1,
+        text(
+          `${XMP_ID}<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description ${body}/></rdf:RDF></x:xmpmeta>`,
+        ),
+      );
+    const extendedXmp = (guid: string, offset: number, full: number, chunk: string) => {
+      const header = text(`http://ns.adobe.com/xmp/extension/\0${guid}`);
+      const u32 = (n: number) =>
+        new Uint8Array([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]);
+      return jpegSegment(0xe1, concatBytes([header, u32(full), u32(offset), text(chunk)]));
+    };
+    /** A Photoshop IRB with one resource. */
+    const photoshop = (id: number, data: Uint8Array) =>
+      jpegSegment(
+        0xed,
+        concatBytes([
+          text("Photoshop 3.0\0"),
+          text("8BIM"),
+          new Uint8Array([id >> 8, id & 255, 0, 0]),
+          new Uint8Array([0, 0, data.length >> 8, data.length & 255]),
+          data,
+          new Uint8Array(data.length & 1),
+        ]),
+      );
+
+    test("GPS written only in XMP is a definite yes (0.7.1's first cut: hasGps false)", async () => {
+      writeFileSync(
+        path.join(tmp, "xmp.jpg"),
+        withSegments(xmp('exif:GPSLatitude="37,46.5N" exif:GPSLongitude="122,25.1W"')),
+      );
+      const out = await run(exifRead, { path: "xmp.jpg" });
+      expect(out.hasExif).toBe(false);
+      expect(out.hasGps).toBe(true);
+      expect(out.gpsInOtherMetadata).toEqual([
+        { segment: "APP1 XMP", where: "before the first scan", offset: 2 },
+      ]);
+      expect(out.privacyWarning).toBeDefined();
+    });
+
+    test("XMP without GPS, ICC and JFIF are read, so no GPS stays a definite no", async () => {
+      writeFileSync(
+        path.join(tmp, "plain.jpg"),
+        withSegments(xmp('xmp:CreatorTool="Camera 1.0" photoshop:City="Springfield"')),
+      );
+      writeFileSync(
+        path.join(tmp, "icc.jpg"),
+        sampleJpeg({ width: 8, height: 8, iccProfile: true }),
+      );
+      for (const name of ["plain.jpg", "icc.jpg"]) {
+        const out = await run(exifRead, { path: name });
+        expect({ name, hasGps: out.hasGps, why: out.gpsUndetermined }).toEqual({
+          name,
+          hasGps: false,
+          why: undefined,
+        });
+      }
+    });
+
+    test("Extended XMP is put back together before it is searched", async () => {
+      const guid = "0123456789ABCDEF0123456789ABCDEF";
+      const whole = '<rdf:Description exif:GPSLatitude="51,30N"/>';
+      const cut = whole.indexOf("Latitude");
+      writeFileSync(
+        path.join(tmp, "ext.jpg"),
+        // Out of order, and the property name cut across the two chunks.
+        withSegments(
+          xmp('xmpNote:HasExtendedXMP="0123456789ABCDEF0123456789ABCDEF"'),
+          extendedXmp(guid, cut, whole.length, whole.slice(cut)),
+          extendedXmp(guid, 0, whole.length, whole.slice(0, cut)),
+        ),
+      );
+      const out = await run(exifRead, { path: "ext.jpg" });
+      expect(out.hasGps).toBe(true);
+      expect(out.gpsInOtherMetadata[0].segment).toBe("APP1 extended XMP");
+    });
+
+    test("a Photoshop block is read: its XMP and EXIF resources count, IPTC alone does not", async () => {
+      const gps = exifApp1Payload(AWAY).subarray(6); // the TIFF stream, without "Exif\0\0"
+      writeFileSync(
+        path.join(tmp, "irb-xmp.jpg"),
+        withSegments(photoshop(0x0424, text('<x exif:GPSLongitude="0,7.2W"/>'))),
+      );
+      writeFileSync(path.join(tmp, "irb-exif.jpg"), withSegments(photoshop(0x0422, gps)));
+      writeFileSync(
+        path.join(tmp, "irb-iptc.jpg"),
+        withSegments(
+          photoshop(0x0404, new Uint8Array([0x1c, 2, 90, 0, 4, 0x4c, 0x69, 0x6d, 0x61])),
+        ),
+      );
+      const got: Record<string, unknown> = {};
+      for (const name of ["irb-xmp.jpg", "irb-exif.jpg", "irb-iptc.jpg"]) {
+        got[name] = (await run(exifRead, { path: name })).hasGps;
+      }
+      expect(got).toEqual({ "irb-xmp.jpg": true, "irb-exif.jpg": true, "irb-iptc.jpg": false });
+    });
+
+    test("a segment this reader does not parse leaves hasGps null, and names it", async () => {
+      // A C2PA manifest (JUMBF in APP11) can carry the EXIF location as an
+      // assertion; a vendor APP5 could hold anything.
+      writeFileSync(
+        path.join(tmp, "c2pa.jpg"),
+        withSegments(
+          jpegSegment(
+            0xeb,
+            concatBytes([text("JP"), new Uint8Array([0, 0, 0, 0, 0, 1]), text("jumb")]),
+          ),
+          jpegSegment(0xe5, text("VENDOR\0payload")),
+        ),
+      );
+      const out = await run(exifRead, { path: "c2pa.jpg" });
+      expect(out.hasGps).toBeNull();
+      expect(out.gpsUndetermined).toMatch(
+        /metadata this reader does not parse may carry a location: APP11 JP at offset 2, APP5 VENDOR at offset \d+/,
+      );
+      // GPS found anywhere still wins over a segment not read.
+      writeFileSync(
+        path.join(tmp, "both.jpg"),
+        withSegments(jpegSegment(0xe5, text("VENDOR\0")), jpegSegment(0xe1, exifApp1Payload(HOME))),
+      );
+      expect((await run(exifRead, { path: "both.jpg" })).hasGps).toBe(true);
+    });
+  });
+
   test("GPS in bytes no walk accounts for is found; without it, hasGps is undetermined", async () => {
     // 0.7.1's first cut answered a definite hasGps: false for each of these,
     // though every file carries the GPS block byte for byte.

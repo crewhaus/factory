@@ -148,8 +148,9 @@ too. No EAN-8, and no 2- or 5-digit add-ons. Bars only — the
 human-readable digits underneath would need a font.
 
 **EXIF.** IFD0, the Exif sub-IFD and the GPS sub-IFD of an `APP1` segment,
-both byte orders. Not MakerNotes, IFD1 thumbnails, XMP, IPTC, or EXIF in a
-TIFF or HEIC.
+both byte orders. Not MakerNotes, IFD1 thumbnails, or EXIF in a TIFF or HEIC.
+XMP (Extended XMP reassembled) and a Photoshop `APP13` block are searched for
+a location, not parsed field by field.
 
 **Subtitles.** SRT and WebVTT, through a BOM and either line ending, with
 cue ids and cue settings preserved. Not WebVTT chapter or metadata tracks.
@@ -172,5 +173,9 @@ found outside the main image's own. When it cannot tell and found no GPS
 elsewhere, `hasGps` is `null` with the reason in `gpsUndetermined`, never
 `false`: an EXIF block that does not parse, more appended images than it
 walks, bytes after the image that no walk accounts for (padding aside), a
-file that breaks off after its first scan, or a file past 64 MiB, which is
-read that far and answered from what was read.
+file that breaks off after its first scan, a file past 64 MiB, which is
+read that far and answered from what was read, or a metadata segment it does
+not read (a C2PA manifest in `APP11`, a vendor `APPn`), which it names. GPS
+written only in XMP, or in the EXIF or XMP a Photoshop `APP13` block keeps,
+is a definite `true`, listed in `gpsInOtherMetadata`; JFIF, ICC, MPF, Adobe
+and Ducky segments and an IPTC record have no place for coordinates.
