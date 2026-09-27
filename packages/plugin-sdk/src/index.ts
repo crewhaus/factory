@@ -247,6 +247,12 @@ export type PluginManifest = {
 // Validation
 // ---------------------------------------------------------------------------
 
+/**
+ * The largest `plugin.json` crewhaus reads: the loader refuses a larger one,
+ * and install refuses to write one. A manifest is metadata; this is generous.
+ */
+export const MAX_PLUGIN_MANIFEST_BYTES = 1024 * 1024;
+
 const NAME_PATTERN = /^[a-z][a-z0-9-]{1,62}[a-z0-9]$/;
 /** A tool name every model provider accepts. */
 export const PLUGIN_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;

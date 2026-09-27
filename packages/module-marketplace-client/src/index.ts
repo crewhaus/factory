@@ -1,13 +1,19 @@
 import { mkdirSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
-import type { PluginRegistry } from "@crewhaus/plugin-registry";
 import {
+  type PluginRegistry,
+  type TrustAnchorSource,
+  createPluginRegistry,
+} from "@crewhaus/plugin-registry";
+import {
+  MAX_PLUGIN_MANIFEST_BYTES,
   type PluginManifest,
   canonicalJson,
   crewhausEngineProblem,
   entrypointDigest,
   entrypointImportProblem,
+  manifestExpiryProblem,
   validatePluginManifest,
 } from "@crewhaus/plugin-sdk";
 import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
@@ -126,8 +132,10 @@ export type InstallResult = {
   /**
    * Whether a spec that names the plugin can load it as installed: its
    * `index.js` sits next to the manifest (matching `entrypointDigest` when
-   * the manifest sets one), and its `engines.crewhaus` range includes this
-   * crewhaus. When false, `warnings` says what is missing.
+   * the manifest sets one), its `engines.crewhaus` range includes this
+   * crewhaus, its signed `notAfter` has not passed, and — when
+   * `bootTrustAnchors` is given — a key a boot trusts verifies its
+   * signature. When false, `warnings` says what is missing.
    */
   readonly runnable: boolean;
   /** What the operator has to know or do before a spec can load the plugin. */
@@ -155,6 +163,15 @@ export type MarketplaceClientOptions = {
    * or at the plugin's directory is refused, naming the path.
    */
   readonly writeFileImpl?: (path: string, contents: string) => void;
+  /**
+   * The publisher keys a boot verifies signed plugins against
+   * (`~/.crewhaus/plugin-trust`, `CREWHAUS_PLUGIN_TRUST_ANCHORS`). Give it
+   * when install verifies against more keys than a boot reads (the CLI's
+   * `--trust-anchor`): a signed manifest that none of these verifies still
+   * installs, but is reported not runnable, since every boot would refuse
+   * it. Omitted, `pluginRegistry`'s keys are taken to be the boot's.
+   */
+  readonly bootTrustAnchors?: ReadonlyArray<TrustAnchorSource>;
   /**
    * Test seam: read a plugin's `index.js`. Resolves `undefined` when there is
    * no such file, and throws when it cannot be read as a regular file. The
@@ -326,6 +343,28 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
     return true;
   }
 
+  /**
+   * Why a boot would refuse `manifest`'s signature although install accepted
+   * it, or undefined: only when `bootTrustAnchors` is given and the manifest
+   * is signed, and no key a boot reads verifies it.
+   */
+  async function bootTrustProblem(manifest: PluginManifest): Promise<string | undefined> {
+    const anchors = opts.bootTrustAnchors;
+    if (anchors === undefined || manifest.signature === undefined) return undefined;
+    if (anchors.length > 0) {
+      try {
+        await createPluginRegistry({
+          registryPath: join(opts.pluginsDir, ".boot-trust-check"),
+          trustAnchors: anchors,
+        }).verifyManifest?.(manifest);
+        return undefined;
+      } catch {
+        // Not verified by any key a boot reads: reported below.
+      }
+    }
+    return `${manifest.name}@${manifest.version}: no key a boot trusts verifies its signature (it was verified against a key given only to this install), so every boot will refuse it. Put the publisher's .pem in ~/.crewhaus/plugin-trust, or list it in CREWHAUS_PLUGIN_TRUST_ANCHORS.`;
+  }
+
   return {
     async search(filter): Promise<ReadonlyArray<PluginMetadata>> {
       const all = await opts.registry.listPlugins();
@@ -365,13 +404,21 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
           `module-marketplace-client: registry "${opts.registry.id}" served ${manifest.name}@${manifest.version} when ${version} was asked for — not installed`,
         );
       }
+      // What is written is what the loader reads; a boot refuses a larger one.
+      const text = `${JSON.stringify(manifest, null, 2)}\n`;
+      const bytes = Buffer.byteLength(text, "utf8");
+      if (bytes > MAX_PLUGIN_MANIFEST_BYTES) {
+        throw new ModuleMarketplaceError(
+          `module-marketplace-client: ${manifest.name}@${manifest.version}'s manifest is ${bytes} bytes as written, and a boot reads at most ${MAX_PLUGIN_MANIFEST_BYTES} — not installed`,
+        );
+      }
       // Refuse a manifest the registry will not register BEFORE it is
       // written, so it never replaces a working manifest on disk.
       await opts.pluginRegistry.verifyManifest?.(manifest);
       const subdir = installOpts?.subdir ?? manifest.name;
       const filename = installOpts?.manifestFilename ?? "plugin.json";
       const manifestPath = join(opts.pluginsDir, subdir, filename);
-      writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      writeFile(manifestPath, text);
       await opts.pluginRegistry.register({
         manifest,
         sourcePath: manifestPath,
@@ -397,10 +444,19 @@ export function createMarketplaceClient(opts: MarketplaceClientOptions): Marketp
       if (engine !== undefined) {
         warnings.push(`${engine}, so a spec that names it will be refused at boot.`);
       }
+      const expired = manifestExpiryProblem(manifest, Date.now());
+      if (expired !== undefined) {
+        warnings.push(
+          `${expired}, so a spec that names it will be refused at boot. Ask the publisher for a release signed with a later notAfter.`,
+        );
+      }
+      const untrusted = await bootTrustProblem(manifest);
+      if (untrusted !== undefined) warnings.push(untrusted);
       return {
         manifest,
         manifestPath,
-        runnable: hasCode && engine === undefined,
+        runnable:
+          hasCode && engine === undefined && expired === undefined && untrusted === undefined,
         warnings,
       };
     },

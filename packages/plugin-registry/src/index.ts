@@ -92,6 +92,11 @@ export type PluginRegistryOptions = {
    * signatures. A signature that is present is still checked against the
    * anchors: one that does not verify is a tamper signal, not a missing
    * signature, and the loader would refuse it at boot anyway.
+   *
+   * With NO `trustAnchors`, nothing is verified: `register()` and
+   * `verifyManifest()` accept any manifest, signed or not, and a signature
+   * it carries is not checked. A caller that installs that way must say the
+   * install is unverified.
    */
   readonly allowUnsigned?: boolean;
   /**

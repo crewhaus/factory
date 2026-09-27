@@ -26,8 +26,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createPluginRegistry } from "@crewhaus/plugin-registry";
+import { type TrustAnchorSource, createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
+  MAX_PLUGIN_MANIFEST_BYTES,
   type PluginManifest,
   entrypointDigest,
   manifestPayloadForSigning,
@@ -60,7 +61,11 @@ function source(manifest: PluginManifest): ModuleRegistrySource {
 
 function client(
   manifest: PluginManifest,
-  extra: { registry?: ReturnType<typeof createPluginRegistry>; hostVersion?: string } = {},
+  extra: {
+    registry?: ReturnType<typeof createPluginRegistry>;
+    hostVersion?: string;
+    bootTrustAnchors?: ReadonlyArray<TrustAnchorSource>;
+  } = {},
 ) {
   const registry =
     extra.registry ??
@@ -72,6 +77,7 @@ function client(
       pluginRegistry: registry,
       pluginsDir: join(dir, "plugins"),
       ...(extra.hostVersion !== undefined ? { hostVersion: extra.hostVersion } : {}),
+      ...(extra.bootTrustAnchors !== undefined ? { bootTrustAnchors: extra.bootTrustAnchors } : {}),
     }),
   };
 }
@@ -279,6 +285,99 @@ describe("install says when signed code cannot run as signed (C108)", () => {
     const unsigned = { name: "dev", version: "1.0.0", entrypointDigest: entrypointDigest(multi) };
     const b = await client(unsigned).client.install("dev");
     expect({ runnable: b.runnable, warnings: b.warnings }).toEqual({
+      runnable: true,
+      warnings: [],
+    });
+  });
+});
+
+describe("install reports what every boot would refuse (review of C017)", () => {
+  // Each of these installed as runnable: true with no warning on the first
+  // 0.7.1 cut, and every boot then refused the plugin.
+  const keyA = generateKeyPairSync("ed25519");
+  const keyB = generateKeyPairSync("ed25519");
+  const pemOf = (k: typeof keyA) => k.publicKey.export({ type: "spki", format: "pem" }).toString();
+  const anchor = (name: string, k: typeof keyA): TrustAnchorSource => ({
+    kind: "pem",
+    name,
+    publicKeyPem: pemOf(k),
+  });
+  const signWith = (m: PluginManifest, k: typeof keyA): PluginManifest => ({
+    ...m,
+    signature: {
+      algorithm: "ed25519",
+      publicKeyB64: "unused",
+      sigB64: sign(null, Buffer.from(manifestPayloadForSigning(m), "utf8"), k.privateKey).toString(
+        "base64",
+      ),
+    },
+  });
+  const trusting = (...anchors: TrustAnchorSource[]) =>
+    createPluginRegistry({ registryPath: join(dir, "registry.json"), trustAnchors: anchors });
+  const signedGreeter = (extra: Partial<PluginManifest> = {}) =>
+    signWith(
+      { name: "greeter", version: "1.0.0", entrypointDigest: entrypointDigest(CODE), ...extra },
+      keyA,
+    );
+
+  test("a signed notAfter that has passed is not runnable, and says so", async () => {
+    placeCode("greeter");
+    const m = signedGreeter({ notAfter: "2020-01-01T00:00:00Z" });
+    const result = await client(m, { registry: trusting(anchor("a", keyA)) }).client.install(
+      "greeter",
+    );
+    expect(result.runnable).toBe(false);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toMatch(
+      /^plugin "greeter" 1\.0\.0 expired: its manifest is good until 2020-01-01T00:00:00Z, and it is now .*, so a spec that names it will be refused at boot\. Ask the publisher for a release signed with a later notAfter\.$/,
+    );
+    // A notAfter still ahead is fine.
+    const later = signedGreeter({ notAfter: "2999-01-01T00:00:00Z" });
+    const ok = await client(later, { registry: trusting(anchor("a", keyA)) }).client.install(
+      "greeter",
+    );
+    expect({ runnable: ok.runnable, warnings: ok.warnings }).toEqual({
+      runnable: true,
+      warnings: [],
+    });
+  });
+
+  test("a manifest over the loader's cap as written is refused, and nothing is written", async () => {
+    // Under the cap as compact JSON, over it as the indented JSON install
+    // writes: what counts is what the boot will read.
+    const fs = Array.from({ length: 100_000 }, () => "a");
+    const m = { name: "greeter", version: "1.0.0", permissions: { fs } } as PluginManifest;
+    expect(JSON.stringify(m).length).toBeLessThan(MAX_PLUGIN_MANIFEST_BYTES);
+    const { client: c, registry } = client(m);
+    await expect(c.install("greeter")).rejects.toThrow(ModuleMarketplaceError);
+    await expect(c.install("greeter")).rejects.toThrow(
+      new RegExp(
+        `^module-marketplace-client: greeter@1\\.0\\.0's manifest is \\d+ bytes as written, and a boot reads at most ${MAX_PLUGIN_MANIFEST_BYTES} — not installed$`,
+      ),
+    );
+    expect(existsSync(join(dir, "plugins", "greeter", "plugin.json"))).toBe(false);
+    expect(await registry.get("greeter")).toBeUndefined();
+  });
+
+  test("a signature only a key given to install verifies is not runnable; one a boot trusts is", async () => {
+    placeCode("greeter");
+    const m = signedGreeter();
+    // Install trusts A (as `--trust-anchor a.pem` does); the boot reads only B, or nothing.
+    for (const boot of [[anchor("b", keyB)], []]) {
+      const result = await client(m, {
+        registry: trusting(anchor("a", keyA)),
+        bootTrustAnchors: boot,
+      }).client.install("greeter");
+      expect(result.runnable).toBe(false);
+      expect(result.warnings).toEqual([
+        "greeter@1.0.0: no key a boot trusts verifies its signature (it was verified against a key given only to this install), so every boot will refuse it. Put the publisher's .pem in ~/.crewhaus/plugin-trust, or list it in CREWHAUS_PLUGIN_TRUST_ANCHORS.",
+      ]);
+    }
+    const trusted = await client(m, {
+      registry: trusting(anchor("a", keyA)),
+      bootTrustAnchors: [anchor("b", keyB), anchor("a", keyA)],
+    }).client.install("greeter");
+    expect({ runnable: trusted.runnable, warnings: trusted.warnings }).toEqual({
       runnable: true,
       warnings: [],
     });

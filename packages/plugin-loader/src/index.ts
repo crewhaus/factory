@@ -16,6 +16,7 @@ import { basename, delimiter, dirname, join, resolve as resolvePath, sep } from 
 import { CrewhausError } from "@crewhaus/errors";
 import { type PluginRegistry, createPluginRegistry } from "@crewhaus/plugin-registry";
 import {
+  MAX_PLUGIN_MANIFEST_BYTES,
   PLUGIN_TOOL_NAME_PATTERN,
   type PluginChannelAdapter,
   type PluginContributions,
@@ -55,8 +56,8 @@ import pkg from "../package.json" with { type: "json" };
  */
 export const PLUGIN_HOST_VERSION: string = typeof pkg.version === "string" ? pkg.version : "0.0.0";
 
-/** The largest `plugin.json` the loader reads. A manifest is metadata; this is generous. */
-export const MAX_PLUGIN_MANIFEST_BYTES = 1024 * 1024;
+/** The largest `plugin.json` the loader reads (plugin-sdk's, so install holds to it too). */
+export { MAX_PLUGIN_MANIFEST_BYTES };
 /** The largest `index.js` the loader reads for its digest check (the marketplace's cap too). */
 export const MAX_PLUGIN_ENTRYPOINT_BYTES = 64 * 1024 * 1024;
 
