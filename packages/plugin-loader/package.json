@@ -25,7 +25,8 @@
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/model-plan": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
-    "@crewhaus/runtime-core": "workspace:*"
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/tool-executor": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

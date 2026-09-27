@@ -15,6 +15,7 @@ import { createPluginRegistry } from "@crewhaus/plugin-registry";
 import type { PluginPermissions, RegisteredTool } from "@crewhaus/plugin-sdk";
 import { runChatLoop } from "@crewhaus/runtime-core";
 import { buildTool } from "@crewhaus/tool-builder";
+import { executeTool } from "@crewhaus/tool-executor";
 import { z } from "zod";
 import { activatePlugins, createPluginLoader, pluginBridgeView } from "./index";
 
@@ -404,5 +405,44 @@ describe("a plugin tool's concurrencyClassifier cannot run a host tool (C106)", 
   test("a plugin tool without a classifier gets none", async () => {
     const activated = await activate({ tools: [] }, [probe]);
     expect(activated.tools[0]?.concurrencyClassifier).toBeUndefined();
+  });
+});
+
+describe("a plugin tool's execute and classifier keep their receiver (regression of C106)", () => {
+  // On 0.7.0 the runtime called tool.execute(input, ctx) as a method of the
+  // registered tool, so an object-literal plugin tool could read its own
+  // this.name and this.inputSchema. The first bridge wrapper called it with
+  // no receiver, and such a tool failed with "undefined is not an object".
+  const selfReading = {
+    name: "acme_echo",
+    description: "echoes its input, trimmed",
+    inputSchema: z.object({ text: z.string().trim() }),
+    async execute(this: { name: string; inputSchema: z.ZodTypeAny }, input: unknown) {
+      const parsed = this.inputSchema.parse(input) as { text: string };
+      return `${this.name}: ${parsed.text}`;
+    },
+    concurrencyClassifier(this: { name: string; readOnly: boolean }) {
+      return this.name === "acme_echo" && this.readOnly === false;
+    },
+  };
+
+  test("through the runtime's executor, with and without a bridge", async () => {
+    const activated = await activate({ tools: [] }, [selfReading]);
+    const tool = activated.tools[0];
+    if (tool === undefined) throw new Error("acme_echo was not activated");
+    for (const bridge of [fullBridge(), undefined]) {
+      const result = await executeTool(
+        tool,
+        { text: "  hi  " },
+        { toolUseId: "tu_1", ...(bridge !== undefined ? { bridge } : {}) },
+      );
+      expect(result).toEqual({ toolUseId: "tu_1", content: "acme_echo: hi", isError: false });
+    }
+  });
+
+  test("the classifier is called as a method of the registered tool too", async () => {
+    const activated = await activate({ tools: [] }, [selfReading]);
+    const tool = activated.tools[0];
+    expect(tool?.concurrencyClassifier?.({}, [])).toBe(true);
   });
 });

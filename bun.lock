@@ -1456,6 +1456,7 @@
         "@crewhaus/model-plan": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "@crewhaus/tool-executor": "workspace:*",
       },
     },
     "packages/plugin-registry": {

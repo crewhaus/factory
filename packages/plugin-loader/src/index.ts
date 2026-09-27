@@ -1016,23 +1016,35 @@ function pluginClassifierCatalog(
  * `tool`, whose `execute` sees {@link pluginBridgeView} in place of the
  * runtime's bridge, and whose `concurrencyClassifier`, if it has one, sees
  * {@link pluginClassifierCatalog} in place of the runtime's catalog.
+ *
+ * Both stay methods and pass their receiver on: the runtime calls
+ * `tool.execute(input, ctx)` on the registered tool, and on 0.7.0 a plugin
+ * tool written as an object literal could read its own `this.name` or
+ * `this.inputSchema` there. An arrow wrapper would call it with no `this`.
  */
 function withPluginBridge(tool: RegisteredTool, allowedTools: ReadonlySet<string>): RegisteredTool {
   const run = tool.execute;
   const classify = tool.concurrencyClassifier;
   return {
     ...tool,
-    execute: (input, ctx) =>
-      run(
+    execute(this: RegisteredTool, input, ctx) {
+      return run.call(
+        this,
         input,
         ctx?.bridge === undefined
           ? ctx
           : { ...ctx, bridge: pluginBridgeView(ctx.bridge, allowedTools, ctx) },
-      ),
+      );
+    },
     ...(classify !== undefined
       ? {
-          concurrencyClassifier: (input: unknown, catalog: ReadonlyArray<RegisteredTool>) =>
-            classify(input, pluginClassifierCatalog(catalog, allowedTools)),
+          concurrencyClassifier(
+            this: RegisteredTool,
+            input: unknown,
+            catalog: ReadonlyArray<RegisteredTool>,
+          ) {
+            return classify.call(this, input, pluginClassifierCatalog(catalog, allowedTools));
+          },
         }
       : {}),
   };
