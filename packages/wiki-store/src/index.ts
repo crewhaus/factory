@@ -106,34 +106,54 @@ const SPEC_NAME_REGEX = /^[a-zA-Z0-9_\-.]+$/;
  *  that could traverse (`..`, `/`, uppercase, spaces). */
 const SLUG_REGEX = /^[a-z0-9][a-z0-9-]{0,127}$/;
 
-/** What a missing or unreadable timestamp reads as. */
-const EPOCH = "1970-01-01T00:00:00.000Z";
+/**
+ * What an article's `createdAt` / `updatedAt` reads as when the file holds
+ * no timestamp the store can read. It is printed as it stands
+ * (`updated: unknown`), sorts after every real timestamp in `list()`, and
+ * `Date.parse` gives `NaN` for it, so nothing downstream takes it for a date.
+ */
+export const UNKNOWN_TIMESTAMP = "unknown";
 
 /** A calendar date: ECMAScript reads a date-only form as UTC midnight. */
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 /**
- * A date-time as `Date#toISOString` writes it, or by hand, with or without
- * an offset (group 1). Linear: no quantifier is nested or overlapping.
+ * A date-time as `Date#toISOString` writes it, or as RFC 3339 and ISO 8601
+ * allow it by hand: a `T`, `t` or space between date (group 1) and time
+ * (group 2), a `.` or `,` before the fraction, and an offset that is `Z`,
+ * `±hh:mm`, `±hhmm` or `±hh` (groups 3–6), or none. Linear: no quantifier is
+ * nested or overlapping.
  */
-const ISO_DATE_TIME =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(Z|[+-]\d{2}:\d{2})?$/;
+const DATE_TIME =
+  /^(\d{4}-\d{2}-\d{2})[Tt ](\d{2}:\d{2}(?::\d{2}(?:[.,]\d{1,9})?)?)(?:([Zz])|([+-])(\d{2})(?::?(\d{2}))?)?$/;
 
 /**
- * `value` when it is a real ISO-8601 timestamp, else {@link EPOCH}. A
- * timestamp is printed in list rows and sorted on, and a file on disk (which
- * any agent with a write tool can edit) could put any text there. A
- * date-time without an offset is read as UTC — a `Z` is appended — never as
- * the host's local time, which is what `Date.parse` would do with it.
+ * `value` as an ISO-8601 timestamp, or {@link UNKNOWN_TIMESTAMP}. A timestamp
+ * is printed in list rows and sorted on, and a file on disk (which any agent
+ * with a write tool can edit) could put any text there, so only a timestamp
+ * is kept, written the one way `Date.parse` reads the same everywhere: `T`,
+ * `.`, and `Z` or `±hh:mm`. A date-time without an offset is read as UTC — a
+ * `Z` is appended — never as the host's local time, which is what
+ * `Date.parse` would do with it. The result is its own normal form.
  */
 function isoTimestampOr(value: unknown): string {
-  if (typeof value !== "string") return EPOCH;
+  if (typeof value !== "string") return UNKNOWN_TIMESTAMP;
   let iso: string | undefined;
   if (ISO_DATE.test(value)) iso = value;
   else {
-    const m = ISO_DATE_TIME.exec(value);
-    if (m !== null) iso = m[1] === undefined ? `${value}Z` : value;
+    const m = value.match(DATE_TIME);
+    if (m !== null) {
+      const [, date, time, z, sign, hh, mm] = m;
+      const zone = z !== undefined || sign === undefined ? "Z" : `${sign}${hh}:${mm ?? "00"}`;
+      iso = `${date}T${(time ?? "").replace(",", ".")}${zone}`;
+    }
   }
-  return iso !== undefined && !Number.isNaN(Date.parse(iso)) ? iso : EPOCH;
+  return iso !== undefined && !Number.isNaN(Date.parse(iso)) ? iso : UNKNOWN_TIMESTAMP;
+}
+
+/** A timestamp's instant for sorting, or `undefined` when it is not known. */
+function instantOf(timestamp: string): number | undefined {
+  const ms = Date.parse(timestamp);
+  return Number.isNaN(ms) ? undefined : ms;
 }
 
 const WIKILINK_REGEX = /\[\[([^\]]+)\]\]/g;
@@ -215,7 +235,9 @@ export type WikiFrontmatter = {
   readonly supersedes?: number;
   readonly createdBy?: WikiCreatedBy;
   readonly status: WikiArticleStatus;
+  /** ISO-8601, or {@link UNKNOWN_TIMESTAMP} when the file holds none. */
   readonly createdAt: string;
+  /** ISO-8601, or {@link UNKNOWN_TIMESTAMP} when the file holds none. */
   readonly updatedAt: string;
 };
 
@@ -229,6 +251,7 @@ export type WikiRef = {
   readonly confidence: number;
   readonly verified: boolean;
   readonly version: number;
+  /** ISO-8601, or {@link UNKNOWN_TIMESTAMP} when the article holds none. */
   readonly updatedAt: string;
   /** Out-links extracted from `[[wikilinks]]` in the body (normalized slugs). */
   readonly links: readonly string[];
@@ -1070,10 +1093,17 @@ export function createWikiStore(opts: WikiStoreOptions): WikiStore {
         refs = refs.filter((r) => wanted.every((t) => r.tags.includes(t)));
       }
       const dir = listOpts.staleFirst === true ? 1 : -1;
-      refs.sort(
-        (a, b) =>
-          dir * (Date.parse(a.updatedAt) - Date.parse(b.updatedAt)) || a.slug.localeCompare(b.slug),
-      );
+      // An article whose timestamp is unknown sorts last in either order:
+      // it is neither the stalest nor the freshest, it is undated.
+      refs.sort((a, b) => {
+        const at = instantOf(a.updatedAt);
+        const bt = instantOf(b.updatedAt);
+        if (at === undefined || bt === undefined) {
+          if (at !== bt) return at === undefined ? 1 : -1;
+          return a.slug.localeCompare(b.slug);
+        }
+        return dir * (at - bt) || a.slug.localeCompare(b.slug);
+      });
       return refs;
     },
 
