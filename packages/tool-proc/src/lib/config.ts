@@ -92,8 +92,10 @@ export function parseProcConfig(config: unknown): readonly string[] {
 }
 
 /**
- * The boot registrar: `tool_config.proc` (or `tool_config.envInspect`,
- * `tool_config.waitForPort`). Both keys are parsed before either is stored,
+ * The boot registrar: `tool_config.proc`. A block under the own key of a
+ * tool that reads it — `tool_config.envInspect` or `tool_config.waitForPort`
+ * — reaches it too, when that tool is listed (the builtin table's boot rule;
+ * no other tool-proc tool names this registrar). Both keys are parsed before either is stored,
  * so a block with one bad key changes nothing.
  */
 export function registerProcConfig(config: unknown): void {

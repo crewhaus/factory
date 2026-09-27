@@ -213,6 +213,9 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
   // (`tool_config.proc.env_reveal`); with no block it shows none.
   // 0.7.1 C144: which non-loopback hosts WaitForPort may probe
   // (`tool_config.proc.wait_for_port_hosts`); with none it probes loopback.
+  // Named by those two rows only: no other tool-proc tool reads the block,
+  // so a compiled README does not label RunCommand as configured by it, and
+  // `tool_config.runCommand` is not taken for a proc block.
   registerProcConfig: {
     package: "@crewhaus/tool-proc",
     source: "tool_config",
@@ -817,53 +820,45 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "runCommand",
     name: "RunCommand",
     io: "process",
-    initSymbol: "registerProcConfig",
   },
   runPipeline: {
     package: "@crewhaus/tool-proc",
     export: "runPipeline",
     name: "RunPipeline",
     io: "process",
-    initSymbol: "registerProcConfig",
   },
   retry: {
     package: "@crewhaus/tool-proc",
     export: "retry",
     name: "Retry",
     io: "process",
-    initSymbol: "registerProcConfig",
   },
   processStart: {
     package: "@crewhaus/tool-proc",
     export: "processStart",
     name: "ProcessStart",
     io: "process",
-    initSymbol: "registerProcConfig",
   },
   processStatus: {
     package: "@crewhaus/tool-proc",
     export: "processStatus",
     name: "ProcessStatus",
-    initSymbol: "registerProcConfig",
   },
   processOutput: {
     package: "@crewhaus/tool-proc",
     export: "processOutput",
     name: "ProcessOutput",
-    initSymbol: "registerProcConfig",
   },
   processStop: {
     package: "@crewhaus/tool-proc",
     export: "processStop",
     name: "ProcessStop",
     io: "process",
-    initSymbol: "registerProcConfig",
   },
   processList: {
     package: "@crewhaus/tool-proc",
     export: "processList",
     name: "ProcessList",
-    initSymbol: "registerProcConfig",
   },
   waitForPort: {
     package: "@crewhaus/tool-proc",
@@ -876,19 +871,16 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-proc",
     export: "waitForFile",
     name: "WaitForFile",
-    initSymbol: "registerProcConfig",
   },
   waitForOutput: {
     package: "@crewhaus/tool-proc",
     export: "waitForOutput",
     name: "WaitForOutput",
-    initSymbol: "registerProcConfig",
   },
   commandExists: {
     package: "@crewhaus/tool-proc",
     export: "commandExists",
     name: "CommandExists",
-    initSymbol: "registerProcConfig",
   },
   envInspect: {
     package: "@crewhaus/tool-proc",
