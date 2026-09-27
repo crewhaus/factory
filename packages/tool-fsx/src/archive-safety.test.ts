@@ -587,6 +587,11 @@ describe("a FIFO, device or socket member is never extracted (0.7.1 review)", ()
       expect(result.refused).toEqual([
         "pkg/data.csv (fifo): only files, directories and links are extracted",
       ]);
+      // The reason is the member's kind, not an escape: nothing here leads
+      // outside the destination, and the detail must not say it does.
+      expect(result.detail).toBe(
+        "one or more members are FIFOs, devices or sockets, which are never extracted; nothing was extracted",
+      );
     }
     expect(existsSync(path.join(ws, "out"))).toBe(false);
   });
