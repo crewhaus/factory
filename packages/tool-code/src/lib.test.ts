@@ -541,6 +541,44 @@ describe("test output parsers", () => {
     expect(summary).toMatchObject({ passed: 9, failed: 3, skipped: 4 });
   });
 
+  test("go: a message go prints on the line after file_test.go:N: is kept (regression review)", () => {
+    // t.Errorf("\n got %d, want %d") and testify print the location, then the
+    // text indented below it. 0.7.0's pattern let `:\s*` cross the newline and
+    // captured that line; the linear rewrite dropped it.
+    const event = (e: Record<string, unknown>) => JSON.stringify({ Package: "p", Test: "T", ...e });
+    const errorf = parseGoTestJson(
+      [
+        event({ Action: "run" }),
+        event({ Action: "output", Output: "    sum_test.go:14: \n" }),
+        event({ Action: "output", Output: "        got 5, want 6\n" }),
+        event({ Action: "output", Output: "--- FAIL: T (0.00s)\n" }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(errorf.failures[0]).toMatchObject({
+      file: "sum_test.go",
+      line: 14,
+      message: "got 5, want 6",
+    });
+    const testify = parseGoTestJson(
+      [
+        event({ Action: "run" }),
+        event({ Action: "output", Output: "    sum_test.go:21: \n" }),
+        event({
+          Action: "output",
+          Output: "        \tError Trace:\t/src/p/sum_test.go:21\n",
+        }),
+        event({ Action: "output", Output: "        \tError:      \tNot equal: \n" }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(testify.failures[0]).toMatchObject({
+      file: "sum_test.go",
+      line: 21,
+      message: "Error Trace:\t/src/p/sum_test.go:21",
+    });
+  });
+
   test("go: a failed test's output is searched in linear time, blank lines or not (C079)", () => {
     // The location search was one multiline pattern whose `^\s*` spanned
     // newlines: 160k characters of blank output took over five seconds.
@@ -567,6 +605,15 @@ describe("test output parsers", () => {
       line: 12,
       message: "got 3, want 4",
     });
+    // A location line followed only by blank lines is still linear, and has no message.
+    const trailing = parseGoTestJson(
+      [
+        event({ Action: "output", Output: `    sum_test.go:9: \n${"\n".repeat(120_000)}` }),
+        event({ Action: "fail" }),
+      ].join("\n"),
+    );
+    expect(trailing.failures[0]).toMatchObject({ file: "sum_test.go", line: 9 });
+    expect(trailing.failures[0]?.message).toBeUndefined();
     // Runner detection samples both ends, and a run of blank lines there is linear too.
     const detectStarted = performance.now();
     expect(detectRunnerFromOutput("\n".repeat(40_000))).toBeUndefined();

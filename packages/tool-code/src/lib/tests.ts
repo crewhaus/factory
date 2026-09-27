@@ -509,15 +509,25 @@ export function pytestSummaryCounts(line: string): Array<[string, number]> | und
  * undefined. Line by line, each trimmed and matched anchored: 0.7.0 ran one
  * multiline pattern whose `^\s*` spanned newlines, so a failed test that
  * printed many blank lines took quadratic time (C079).
+ *
+ * That pattern's trailing `:\s*(.*)` crossed newlines too, and the message
+ * go prints on the NEXT line depends on it: `t.Errorf("\n got %d")` and
+ * testify both print `file_test.go:14: ` and then the text, indented, below
+ * it. So when the location line carries nothing, the message is the first
+ * non-blank line after it — found in the same single forward pass.
  */
 function goFailureLocation(
   blob: string,
 ): { file: string; line: number; message: string } | undefined {
-  for (const raw of blob.split("\n")) {
-    const m = /^([\w./-]+\.go):(\d+):\s*(.*)/.exec(raw.trimStart());
-    if (m !== null) {
-      return { file: m[1] as string, line: Number(m[2]), message: (m[3] as string).trim() };
+  const lines = blob.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^([\w./-]+\.go):(\d+):\s*(.*)/.exec((lines[i] as string).trimStart());
+    if (m === null) continue;
+    let message = (m[3] as string).trim();
+    for (let j = i + 1; message === "" && j < lines.length; j++) {
+      message = (lines[j] as string).trim();
     }
+    return { file: m[1] as string, line: Number(m[2]), message };
   }
   return undefined;
 }
