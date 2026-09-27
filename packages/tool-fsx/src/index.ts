@@ -1066,6 +1066,12 @@ const copyMoveSchema = {
  * a virtualenv's interpreter: the copy reaches nothing the source did not). Files are created with `O_EXCL|O_NOFOLLOW`, and a
  * replaced file goes through a temp and a rename. FIFOs, sockets and
  * devices are refused, since opening one to copy it can block for ever.
+ *
+ * Every copied file gets the source's permission bits, replaced or new, as
+ * 0.7.0's `copyFileSync` gave them: a 0600 secret copied over a 0644 file
+ * stays 0600, and a script keeps its execute bits. Keeping the replaced
+ * file's bits (the helper's default, as `cp` does) made the secret readable
+ * by all (0.7.1 review). Set-id and sticky bits are not copied.
  */
 function copyContained(
   source: SafePath,
@@ -1076,6 +1082,7 @@ function copyContained(
   return copyTreeSafe(root, relArg(source), root, relArg(destination), {
     symlinks: "copy-no-new-reach",
     specials: "refuse",
+    fileModes: "source",
     maxEntries: options.maxEntries,
     overwrite: options.overwrite,
     createParents: true,

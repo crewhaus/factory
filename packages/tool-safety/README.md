@@ -205,9 +205,11 @@ This creates a new file and returns its open descriptor. Anything already at the
 
 This is the one walk. It never follows a symlink. Every entry is `lstat`ed and reported with its `kind` (`file`, `directory`, `symlink`, `fifo`, `socket` …). A link carries its target text and whether it physically leads inside the root. A directory swapped for a link while it was listed is reported in `unreadable`, and so is one that could not be read. A truncated walk says why (`max-entries`, `max-depth` or `max-visited`). The order is depth-first and sorted by raw name, so it is the same on every machine.
 
-### Copying: `copyTreeSafe(srcRoot, src, dstRoot, dst, { symlinks, maxEntries, maxBytes?, overwrite?, specials?, createParents?, dryRun? })`
+### Copying: `copyTreeSafe(srcRoot, src, dstRoot, dst, { symlinks, maxEntries, maxBytes?, overwrite?, fileModes?, specials?, createParents?, dryRun? })`
 
 The whole copy is planned before a byte is written. Every source entry is `lstat`ed, never followed. Every destination path is checked, not just the destination root: an existing link anywhere on it is refused (security-11#0, flag-truth-6#0). With `symlinks: "copy-contained"`, each link is resolved from its NEW location, the way the kernel will, taking into account the directories and links the copy is about to create. A link that would lead outside the destination root is refused (security-11#2). `"copy-no-new-reach"` also keeps a link that leads outside from its new location when it leads to exactly where its source leads (an absolute link to an interpreter in a virtualenv, say), so the copy reaches nothing the source did not; it applies only when source and destination share one root, and those links are listed in `outsideLinks`. `"skip"` leaves links out and lists them; `"refuse"` fails the copy. Budgets and conflicts fail the copy before anything is written.
+
+A copied file's permission bits follow `fileModes`. With `"keep-replaced"` (the default, as `cp` does), a replaced file keeps its own bits and a new one gets the source's less the umask. With `"source"` (as `fs.copyFileSync` does), every copied file gets the source's bits exactly, so a 0600 secret copied over a 0644 file stays 0600. CopyPath uses `"source"`, which is what 0.7.0 did. Set-id and sticky bits are never copied.
 
 During the write, each entry is checked against the directory that was planned. If a directory is swapped for a link mid-copy, the copy stops, removes the entry it had just made through the swap, and reports how many entries were already copied.
 
