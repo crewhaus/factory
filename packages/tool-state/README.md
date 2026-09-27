@@ -10,8 +10,9 @@ it was killed, and what the other agent found out an hour ago. These twenty
 tools are that memory, and a model spends no tokens deciding any of it.
 
 The package exports each tool and the frozen `STATE_TOOLS` list a catalog
-registers. There is **no `all-state` category yet** — `@crewhaus/tool-categories`
-does not know this package, so a spec names the tools it wants:
+registers. `all-state` turns on the twenty tools below, and the `all-memory`
+and `all-data-stores` roll-ups include it. `VectorDelete` is not in it (see
+below). A spec can also name just the tools it wants:
 
 ```yaml
 tools:
@@ -166,6 +167,10 @@ test enforces that over the list's membership; a vector store may be a qdrant,
 pinecone or weaviate collection over HTTP, so this one is labelled
 `scope: "external"` with `ioCapability: "network"`, takes a justification, and
 is kept out of a list whose meaning it would quietly dilute.
+
+The categories follow the same line: `VectorDelete` is in `all-vector` and
+`all-network`, not in `all-state`, `all-memory` or `all-data-stores`. Grant it
+with one of those, or by name: `tools: [vectorDelete]`.
 
 **It needs a store.** Name it in the spec, and a compiled bundle, `crewhaus run`
 and `crewhaus eval` build it at boot:

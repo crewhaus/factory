@@ -1299,7 +1299,10 @@ export async function wireMemory(
   // the fact/wiki lines they sit beside.
   if (fragment.memory?.sessionRecall === true) {
     const indexDir = join(crewhausDirOf(deps), SESSIONS_INDEX_DIRNAME);
-    const sessionRecall = createSessionSummaryRecall({ indexDir });
+    const sessionRecall = createSessionSummaryRecall({
+      indexDir,
+      ...(deps.log !== undefined ? { log: deps.log } : {}),
+    });
     const base = options.memory;
     const baseRecall = base?.recall;
     options = {

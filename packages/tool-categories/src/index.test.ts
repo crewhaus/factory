@@ -100,6 +100,32 @@ describe("toolsInCategory", () => {
   });
 });
 
+// 0.7.1 (C149): `all-state` (and the `all-memory` / `all-data-stores`
+// roll-ups over it) granted VectorDelete, a network tool that deletes from a
+// remote vector store, while `all-network` did not.
+describe("the state leaf stays inside the workspace", () => {
+  test("no state tool reaches the network or starts a process", () => {
+    const state = toolsInCategory("state");
+    const crossing = state.filter((k) => BUILTIN_TOOLS[k]?.io !== undefined);
+    expect(crossing).toEqual([]);
+    // tool-state's STATE_TOOLS: twenty tools, all inside the workspace.
+    expect(state.length).toBe(20);
+  });
+
+  test("VectorDelete is reached through all-vector only, not the local roll-ups or all-network", () => {
+    expect(toolsInCategory("vector")).toEqual(["vectorDelete"]);
+    // all-network would newly grant a destructive tool to every 0.7.0 spec
+    // that wrote it; the roll-up's note names all-vector instead.
+    expect(toolsInCategory("network")).not.toContain("vectorDelete");
+    for (const local of ["state", "memory", "data-stores"]) {
+      expect(`${local}:${toolsInCategory(local).includes("vectorDelete")}`).toBe(`${local}:false`);
+    }
+    expect(expandToolSelectors(["all-memory"]).tools).not.toContain("vectorDelete");
+    expect(expandToolSelectors(["all-data-stores"]).tools).not.toContain("vectorDelete");
+    expect([...categoriesForTool("vectorDelete")].sort()).toEqual(["vector"]);
+  });
+});
+
 describe("expandToolSelectors — plain lists stay untouched", () => {
   test("a list with no category syntax passes through", () => {
     const out = expandToolSelectors(["read", "glob"]);
@@ -415,6 +441,23 @@ describe("lookup helpers", () => {
 // says what it holds; this guard keeps the roll-up, the two exemption lists
 // and the builtin table's io column (itself checked against every tool by
 // apps/cli/src/tool-registry.test.ts) in agreement, both ways.
+/**
+ * Written out, not derived: deriving it with the predicate the test checks
+ * would compare the table with itself. A new shape-specific network tool is
+ * added here on purpose.
+ */
+const SHAPE_SPECIFIC_NETWORK_BUILTINS = [
+  "evmBlockNumber",
+  "evmCall",
+  "evmGetBalance",
+  "evmGetLogs",
+  "evmGetTransaction",
+  "evmGetTransactionReceipt",
+  "evmSendTransaction",
+  "evmSimulate",
+  "sendMessage",
+];
+
 describe("the network roll-up and the io column agree", () => {
   const inRollup = new Set(toolsInCategory("network"));
   const leafOf = (key: string): string | undefined =>
@@ -437,7 +480,11 @@ describe("the network roll-up and the io column agree", () => {
     // The guard's hit count: the lists really carry the tools left out.
     const outside = categorized.filter((k) => !inRollup.has(k));
     expect(outside.length).toBeGreaterThan(40);
-    expect(networkBuiltins.length - categorized.length).toBe(2);
+    // The shape-specific network builtins, named: the channel send, and the
+    // EVM tools the graph, workflow and crew shapes carry.
+    expect(networkBuiltins.filter((k) => !categorized.includes(k)).sort()).toEqual([
+      ...SHAPE_SPECIFIC_NETWORK_BUILTINS,
+    ]);
   });
 
   test("every listed leaf still reaches the network and is still outside the roll-up", () => {

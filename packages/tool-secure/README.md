@@ -180,6 +180,23 @@ variable — and reads it itself. The key never appears in an argument, a
 result, an error message or a transcript. An unset variable is refused by
 name, loudly.
 
+**Only a variable the operator listed can be a key.** Name them in the spec:
+
+```yaml
+tool_config:
+  secure:
+    key_env_vars: [AUDIT_SIGNING_KEY, EXPORT_PSEUDONYM_KEY]
+```
+
+A call may pick among the listed names and never add one. Before 0.7.1 any
+variable could key these tools, and they are read-only, so plan and auto mode
+ran them unasked: a signature over a known payload under `DB_PASSWORD` or
+`SLACK_SIGNING_SECRET` is an offline oracle for the secret and a forgery for
+whatever trusts it. An unlisted name is refused with the same message whether
+or not it is set, so the refusal does not reveal which variables exist. The
+block can also sit under a keyed tool's own key (`tool_config.signPayload`),
+and a model-pool candidate's block replaces it for that candidate's calls.
+
 Pseudonym tokens come in two flavours, and the difference is reported in
 every result that uses them. **Keyed** tokens are `HMAC-SHA256(key,
 "<type>:<canonical>")` truncated: stable across documents, and unlinkable

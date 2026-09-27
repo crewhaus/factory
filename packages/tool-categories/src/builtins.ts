@@ -211,6 +211,25 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     binds: ["setPeerPolicy"],
     checks: NO_PRIVATE_HOSTS("peer origins"),
   },
+  registerObjectStoreConfig: {
+    package: "@crewhaus/tool-objectstore",
+    source: "tool_config",
+    label: "ObjectPresign's credential profiles",
+    keys: ["objectstore"],
+  },
+  // Named only by the five rows that read a key (SignPayload, VerifyPayload,
+  // Pseudonymize, PiiRedact, RedactForExport). A block under another secure
+  // tool's key configures nothing and is reported unused, as on 0.7.0; when
+  // every row named it, `tool_config.piiScan` and `tool_config.secretScan`
+  // blocks that differed stopped compile, and `crewhaus tools show secretScan`
+  // said tool_config.secure configures it.
+  registerSecureConfig: {
+    package: "@crewhaus/tool-secure",
+    source: "tool_config",
+    label:
+      "the keyed secure tools (SignPayload, VerifyPayload, Pseudonymize, PiiRedact, RedactForExport)",
+    keys: ["secure"],
+  },
   registerVectorDeleteConfig: {
     package: "@crewhaus/tool-state",
     source: "tool_config",
@@ -1468,16 +1487,38 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     name: "DocumentText",
   },
   documentDiff: { package: "@crewhaus/tool-docs", export: "documentDiff", name: "DocumentDiff" },
-  piiScan: { package: "@crewhaus/tool-secure", export: "piiScan", name: "PiiScan" },
-  piiRedact: { package: "@crewhaus/tool-secure", export: "piiRedact", name: "PiiRedact" },
-  pseudonymize: { package: "@crewhaus/tool-secure", export: "pseudonymize", name: "Pseudonymize" },
+  piiScan: {
+    package: "@crewhaus/tool-secure",
+    export: "piiScan",
+    name: "PiiScan",
+  },
+  piiRedact: {
+    package: "@crewhaus/tool-secure",
+    export: "piiRedact",
+    name: "PiiRedact",
+    initSymbol: "registerSecureConfig",
+  },
+  pseudonymize: {
+    package: "@crewhaus/tool-secure",
+    export: "pseudonymize",
+    name: "Pseudonymize",
+    initSymbol: "registerSecureConfig",
+  },
   depseudonymize: {
     package: "@crewhaus/tool-secure",
     export: "depseudonymize",
     name: "Depseudonymize",
   },
-  secretScan: { package: "@crewhaus/tool-secure", export: "secretScan", name: "SecretScan" },
-  entropyScore: { package: "@crewhaus/tool-secure", export: "entropyScore", name: "EntropyScore" },
+  secretScan: {
+    package: "@crewhaus/tool-secure",
+    export: "secretScan",
+    name: "SecretScan",
+  },
+  entropyScore: {
+    package: "@crewhaus/tool-secure",
+    export: "entropyScore",
+    name: "EntropyScore",
+  },
   promptInjectionScan: {
     package: "@crewhaus/tool-secure",
     export: "promptInjectionScan",
@@ -1513,16 +1554,23 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "hashChainVerify",
     name: "HashChainVerify",
   },
-  signPayload: { package: "@crewhaus/tool-secure", export: "signPayload", name: "SignPayload" },
+  signPayload: {
+    package: "@crewhaus/tool-secure",
+    export: "signPayload",
+    name: "SignPayload",
+    initSymbol: "registerSecureConfig",
+  },
   verifyPayload: {
     package: "@crewhaus/tool-secure",
     export: "verifyPayload",
     name: "VerifyPayload",
+    initSymbol: "registerSecureConfig",
   },
   redactForExport: {
     package: "@crewhaus/tool-secure",
     export: "redactForExport",
     name: "RedactForExport",
+    initSymbol: "registerSecureConfig",
   },
   evaluate: { package: "@crewhaus/tool-math", export: "evaluate", name: "Evaluate" },
   statistics: { package: "@crewhaus/tool-math", export: "statistics", name: "Statistics" },
@@ -2224,6 +2272,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-objectstore",
     export: "objectPresign",
     name: "ObjectPresign",
+    initSymbol: "registerObjectStoreConfig",
   },
   systemInfo: {
     package: "@crewhaus/tool-host",
@@ -2326,6 +2375,7 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     export: "openExternal",
     name: "OpenExternal",
     io: "process",
+    justify: true,
   },
   printDocument: {
     package: "@crewhaus/tool-desktop",

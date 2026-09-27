@@ -25,6 +25,12 @@
     },
     {
       "path": "../tool-catalog"
+    },
+    {
+      "path": "../tool-executor"
+    },
+    {
+      "path": "../tool-safety"
     }
   ],
   "include": ["src/**/*"]

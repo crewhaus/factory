@@ -353,8 +353,21 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
       "stateExport",
       "stateImport",
       "dedupeMark",
-      "vectorDelete",
     ],
+  },
+
+  // VectorDelete lives in its own leaf, not in `state`: every state tool
+  // stays inside the workspace (tool-state's STATE_TOOLS promise, which a
+  // test holds), while VectorDelete deletes from a vector store that may be
+  // a qdrant, pinecone or weaviate service over HTTP. No roll-up includes
+  // this leaf: `network` would newly grant a destructive tool to every spec
+  // that wrote all-network on 0.7.0 (NETWORK_LEAVES_OUTSIDE_ROLLUP names it),
+  // and `memory` and `data-stores` are local. On 0.7.0 VectorDelete had no
+  // bound store, so no category grant of it ever worked.
+  vector: {
+    title:
+      "Delete entries from a vector store (reaches the network, destructive, asks for a justification)",
+    tools: ["vectorDelete"],
   },
 
   crewhaus: {
@@ -964,7 +977,7 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     // ciWorkflowAudit (reads local workflow files, in supplychain).
     title:
       "Web, HTTP, package and container registries, supply chain and chain reads and calls — not every tool that reaches the network",
-    note: "also reach the network, outside this roll-up: all-codehost, all-notify, all-obs and all-kyc, and imageGenerate, waitForPort, preflightRun, vectorDelete, packageManifestVerify and federationDiscover. Exclude them by name: -all-network does not.",
+    note: "also reach the network, outside this roll-up: all-codehost, all-notify, all-obs, all-kyc and all-vector, and imageGenerate, waitForPort, preflightRun, packageManifestVerify and federationDiscover. Exclude them by name: -all-network does not.",
     includes: [
       "web",
       "http",
@@ -999,6 +1012,8 @@ export const NETWORK_LEAVES_OUTSIDE_ROLLUP: Readonly<Record<string, string>> = O
     "messaging (chat, email, SMS, push, webhooks); a patch release does not grant messaging to all-network specs",
   obs: "metrics, logs, alerts and status pages of the operator's own services",
   kyc: "business-registry and VAT lookups",
+  vector:
+    "VectorDelete deletes from a vector store over HTTP; it was in `state` on 0.7.0 (and inert there), and adding it here would grant a destructive network tool to every spec that wrote all-network",
 });
 
 /**
@@ -1011,7 +1026,6 @@ export const NETWORK_TOOLS_OUTSIDE_ROLLUP: Readonly<Record<string, string>> = Ob
   waitForPort: "the one networked tool in proc (it polls a TCP host and port)",
   preflightRun:
     "the one networked tool in crewhaus (its preflight checks reach the services a harness uses)",
-  vectorDelete: "the one networked tool in state (it deletes from the registered vector store)",
   packageManifestVerify:
     "the one networked tool in distribution (it fetches every URL a published manifest points at)",
   federationDiscover:

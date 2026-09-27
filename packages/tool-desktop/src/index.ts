@@ -47,7 +47,10 @@
  * drives all of them, and the un-injected platform is deliberately a platform
  * no backend serves — see `./host.ts`.
  */
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -60,7 +63,7 @@ import {
   planClipboardWrite,
 } from "./lib/clipboard";
 import { osascriptProgramText } from "./lib/escape";
-import { fs } from "./lib/fsseam";
+import { fs, StateFileError } from "./lib/fsseam";
 import { type NotifyUrgency, classifyNotify, planNotify } from "./lib/notify";
 import {
   OPENABLE_SCHEMES,
@@ -75,12 +78,13 @@ import {
   type AssertionScope,
   type AssertionState,
   DEFAULT_HOLD_MINUTES,
+  LEGACY_STATE_RELATIVE_PATH,
   MAX_HOLD_MINUTES,
   SAFE_REASON,
-  STATE_RELATIVE_PATH,
   boundedSeconds,
   classifyLiveness,
   isAssertionState,
+  isHolderCommand,
   planHold,
   planProcessProbe,
   planRelease,
@@ -100,6 +104,7 @@ import {
   MAX_COPIES,
   classifyPrint,
   parseQueues,
+  parseWindowsQueues,
   planPrint,
   planPrinterProbe,
   refusePrintOptions,
@@ -481,7 +486,7 @@ export const desktopNotify: RegisteredTool = buildTool({
 export const openExternal: RegisteredTool = buildTool({
   name: "OpenExternal",
   operativeArgs: [{ field: "target", kind: "url" }],
-  description: `Hand a URL or a local path to the operating system to open with whatever is registered for it. The scheme set is an ALLOW-LIST and it is short: ${OPENABLE_SCHEMES.join(", ")}. Everything else is refused by name — file: (it would bypass this tool's path containment), smb: and nfs: (they mount a remote share and can leak an authentication handshake to the host named in the URL), javascript:, data:, and the Windows ms-* shell handlers. The allowSchemes input can only NARROW that set, never widen it. What is checked is what is opened: an http(s) URL is handed to the desktop in its normalised form rather than as you typed it, a URL containing a backslash is refused (parsers disagree about whether that is a path separator, so the host checked here would not be the host opened there), a URL carrying credentials before the "@" is refused (they would sit in a process listing and in this transcript, and "google.com@evil.example" reads as the host it is not), and a mailto: may carry only the headers RFC 6068 calls safe — attach= is refused by name, because a mail client that honours it reads a local file into the message. A target with no scheme is treated as a filesystem path, resolved inside the workspace root with symlinks followed, and refused if it lands outside; an EXECUTABLE file is refused even inside the workspace, because "open this" and "run this" are the same gesture to a desktop. The result says "handedOff", not "opened": every opener returns as soon as the handler has been asked and none of them report what it then did.`,
+  description: `Hand a URL or a local path to the operating system to open with whatever is registered for it. The scheme set is an ALLOW-LIST and it is short: ${OPENABLE_SCHEMES.join(", ")}. Everything else is refused by name — file: (it would bypass this tool's path containment), smb: and nfs: (they mount a remote share and can leak an authentication handshake to the host named in the URL), javascript:, data:, and the Windows ms-* shell handlers. The allowSchemes input can only NARROW that set, never widen it. What is checked is what is opened: an http(s) URL is handed to the desktop in its normalised form rather than as you typed it, a URL containing a backslash is refused (parsers disagree about whether that is a path separator, so the host checked here would not be the host opened there), a URL carrying credentials before the "@" is refused (they would sit in a process listing and in this transcript, and "google.com@evil.example" reads as the host it is not), and a mailto: may carry only the headers RFC 6068 calls safe — attach= is refused by name, because a mail client that honours it reads a local file into the message. A target with no scheme is treated as a filesystem path, resolved inside the workspace root with symlinks followed, and refused if it lands outside; an EXECUTABLE file is refused even inside the workspace, because "open this" and "run this" are the same gesture to a desktop, and so is a file whose type the desktop runs, installs or follows without an execute bit — scripts, installers and configuration profiles (.jnlp, .mobileconfig, .msix, .py), and shortcut or location files that point somewhere else (.lnk, .url, .webloc, .fileloc, .library-ms). The result says "handedOff", not "opened": every opener returns as soon as the handler has been asked and none of them report what it then did. What it opens acts in the operator's own desktop session and outlives this call — a browser tab carries the operator's cookies, an app keeps running — so every call is gated like a change and carries a justification.`,
   inputSchema: z.object({
     target: z
       .string()
@@ -501,6 +506,21 @@ export const openExternal: RegisteredTool = buildTool({
     timeoutMs: timeoutSchema,
   }),
   readOnly: false,
+  // The effect outlives the call and the process — the package's own test for
+  // "destructive" (see PowerAssertion): an app is launched, a tab opens with
+  // the operator's cookies. As destructive:false it ran with no rule at all
+  // in auto mode, so a workspace .fileloc could launch any app unasked
+  // (flag-truth-5#6). A destructive tool that goes where the model points
+  // also carries a justification (apps/cli/src/flag-rules.test.ts, rule 1):
+  // opening `https://host/?q=<secret>` in the operator's browser is an
+  // outbound request like HttpRequest's. The justification gate runs AFTER
+  // the permission decision, so an `alwaysAllow` OpenExternal rule no longer
+  // skips it: every call is scored by `security.justification.judge`, or,
+  // when a spec sets none, by the rule-based judge (with its one-time
+  // stderr warning), which denies a justification that shares no salient
+  // word with the instructions.
+  destructive: true,
+  requireJustification: true,
   concurrencySafe: false,
   scope: "external",
   ioCapability: "process",
@@ -683,12 +703,14 @@ export const printDocument: RegisteredTool = buildTool({
       probe.refused === true || probe.missing || probe.timedOut
         ? unreadableQueues(
             probe.missing
-              ? "lpstat is not installed on this host, so the queue could not be read"
+              ? `${platform === "win32" ? "PowerShell" : "lpstat"} is not installed on this host, so the queue could not be read`
               : probe.timedOut
                 ? "the queue probe did not finish within its timeout and was killed, so whether this host has printers is unknown — it is NOT that it has none"
                 : probe.stderr,
           )
-        : parseQueues(probe.stdout, probe.stderr);
+        : platform === "win32"
+          ? parseWindowsQueues(probe.stdout, probe.stderr)
+          : parseQueues(probe.stdout, probe.stderr);
 
     const queueJson = {
       printers: queues.printers,
@@ -917,8 +939,37 @@ export const userPresence: RegisteredTool = buildTool({
 // PowerAssertion
 // ---------------------------------------------------------------------------
 
+/**
+ * Where the held assertion is remembered: a file only this user can write,
+ * OUTSIDE the workspace, keyed by the workspace.
+ *
+ * 0.7.0 kept it at `.crewhaus/power-assertion.json` in the workspace, where
+ * the agent the tool serves can write, and `release` SIGTERMs the pid the
+ * record names (security-10#1). The directory is `$XDG_RUNTIME_DIR/crewhaus`
+ * when the session has one (Linux: per-user, 0700, cleared at logout), else
+ * `crewhaus-<uid>` under the OS temp directory (per-user on macOS and
+ * Windows), created 0700 and refused if another user owns it. The file name
+ * carries a hash of the workspace root, so two workspaces never share one.
+ */
+export function powerStateFile(): string {
+  const runtime = process.env["XDG_RUNTIME_DIR"];
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  const dir =
+    runtime !== undefined && runtime !== "" && isAbsolute(runtime)
+      ? join(runtime, "crewhaus")
+      : join(tmpdir(), uid === undefined ? "crewhaus" : `crewhaus-${uid}`);
+  let root = workspaceRoot();
+  try {
+    root = realpathSync(root);
+  } catch {
+    // keep the lexical root
+  }
+  const key = createHash("sha256").update(root).digest("hex").slice(0, 16);
+  return join(dir, `power-assertion-${key}.json`);
+}
+
 function statePath(): string {
-  return join(workspaceRoot(), STATE_RELATIVE_PATH);
+  return powerStateFile();
 }
 
 /**
@@ -935,7 +986,13 @@ type StateRead =
   | { readonly kind: "unreadable"; readonly reason: string };
 
 function readState(): StateRead {
-  const text = fs().readText(statePath());
+  let text: string | undefined;
+  try {
+    text = fs().readText(statePath());
+  } catch (err) {
+    if (!(err instanceof StateFileError)) throw err;
+    return { kind: "unreadable", reason: err.message };
+  }
   if (text === undefined) return { kind: "none" };
   let parsed: unknown;
   try {
@@ -1016,7 +1073,7 @@ export const powerAssertion: RegisteredTool = buildTool({
         ...head,
         outcome: "unreadableState",
         reason: `${stateRead.reason} — so this package cannot say whether an inhibitor it started is still running. Nothing was signalled and nothing was started; any holder recorded there still ends at its own deadline. Delete the file to start again.`,
-        statePath: STATE_RELATIVE_PATH,
+        statePath: statePath(),
       });
     }
     const state = stateRead.kind === "state" ? stateRead.state : undefined;
@@ -1024,11 +1081,33 @@ export const powerAssertion: RegisteredTool = buildTool({
     const liveness = async (
       recorded: AssertionState,
     ): Promise<{ verdict: ReturnType<typeof classifyLiveness>; argv: readonly string[] }> => {
+      // A record made on another platform cannot name a holder of ours here:
+      // it is somebody else's pid, whatever that process is running.
+      if (recorded.platform !== platform) return { verdict: "reused", argv: [] };
       const probeRequest = planProcessProbe(platform, recorded.pid);
       if (probeRequest === undefined) return { verdict: "unknown", argv: [] };
       const probe = await run(probeRequest, timeoutMs, context?.signal);
-      return { verdict: classifyLiveness(recorded.marker, probe), argv: probeRequest.argv };
+      // The live command line is checked against what THIS package starts on
+      // this platform, never against the record's own `marker` field: the
+      // record supplies the pid, so it must not also choose what that pid is
+      // checked against (security-10#1).
+      return {
+        verdict: classifyLiveness((line) => isHolderCommand(platform, line), probe),
+        argv: probeRequest.argv,
+      };
     };
+
+    // 0.7.0's record in the workspace is never read (the agent could have
+    // written it), only mentioned, so an operator who upgraded mid-hold knows
+    // why release finds nothing and that the holder ends on its own.
+    const legacyNote = (): Record<string, unknown> =>
+      fs().stat(join(workspaceRoot(), LEGACY_STATE_RELATIVE_PATH))?.exists === true
+        ? {
+            legacyStateFile: LEGACY_STATE_RELATIVE_PATH,
+            legacyNote:
+              "a record from an earlier version is in the workspace. It is not read, because the agent can write files there; nothing it names is signalled, and any holder it recorded ends at its own deadline. Delete the file.",
+          }
+        : {};
 
     const stateJson = (recorded: AssertionState): Record<string, unknown> => ({
       pid: recorded.pid,
@@ -1042,7 +1121,12 @@ export const powerAssertion: RegisteredTool = buildTool({
 
     if (input.action === "status") {
       if (state === undefined) {
-        return json({ ...head, outcome: "none", reason: "this package is holding no assertion" });
+        return json({
+          ...head,
+          outcome: "none",
+          reason: "this package is holding no assertion",
+          ...legacyNote(),
+        });
       }
       const { verdict, argv } = await liveness(state);
       const expired = now() >= state.expiresAt;
@@ -1076,7 +1160,12 @@ export const powerAssertion: RegisteredTool = buildTool({
 
     if (input.action === "release") {
       if (state === undefined) {
-        return json({ ...head, outcome: "none", reason: "this package is holding no assertion" });
+        return json({
+          ...head,
+          outcome: "none",
+          reason: "this package is holding no assertion",
+          ...legacyNote(),
+        });
       }
       const { verdict, argv } = await liveness(state);
       if (verdict === "unknown") {
@@ -1092,23 +1181,30 @@ export const powerAssertion: RegisteredTool = buildTool({
           probe: argv.join(" "),
         });
       }
+      // A dry run changes nothing, the record included.
+      const dry = input.dryRun === true;
       if (verdict === "gone") {
-        fs().remove(statePath());
+        if (!dry) fs().remove(statePath());
         return json({
           ...head,
           outcome: "expired",
           ...stateJson(state),
-          reason: "the holder had already ended; the recorded assertion was cleared",
+          reason: dry
+            ? "the holder has already ended; a real release would clear the recorded assertion"
+            : "the holder had already ended; the recorded assertion was cleared",
         });
       }
       if (verdict === "reused") {
-        fs().remove(statePath());
+        if (!dry) fs().remove(statePath());
         return json({
           ...head,
           outcome: "stale",
           ...stateJson(state),
-          reason:
-            "a process with the recorded pid exists but is not this package's holder, so the pid was reused — NOTHING was signalled and the recorded assertion was cleared",
+          reason: `${
+            state.platform !== platform
+              ? `the record was made on ${state.platform}, not ${platform}, so its pid is not a holder of this package's`
+              : "a process with the recorded pid exists but is not this package's holder, so the pid was reused"
+          } — NOTHING was signalled and the recorded assertion ${dry ? "would be" : "was"} cleared`,
         });
       }
       const killRequest = planRelease(platform, state.pid);
@@ -1216,7 +1312,23 @@ export const powerAssertion: RegisteredTool = buildTool({
       expiresAt,
       reason: input.reason ?? null,
     };
-    fs().writeTextAtomic(statePath(), JSON.stringify(recorded));
+    try {
+      fs().writeTextAtomic(statePath(), JSON.stringify(recorded));
+    } catch (err) {
+      if (!(err instanceof StateFileError)) throw err;
+      // The holder is running and bounded; only the record is missing.
+      return json({
+        ...head,
+        outcome: "heldUnrecorded",
+        backend: plan.backend,
+        scope,
+        pid: detached.pid,
+        seconds: bounded.seconds,
+        startedAt: new Date(startedAt).toISOString(),
+        expiresAt: new Date(expiresAt).toISOString(),
+        reason: `${err.message} — the inhibitor is held and still ends at its own deadline, but release cannot end it sooner`,
+      });
+    }
     return json({
       ...head,
       outcome: "held",

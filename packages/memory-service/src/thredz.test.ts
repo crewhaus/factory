@@ -7,7 +7,7 @@
  * integration test that spawns the actual published server.ts read-only).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -383,6 +383,74 @@ describe("goal mirror — spec scope only, local write authoritative", () => {
     if (wired === null) throw new Error("continuity not wired");
     await wired.store.writeGoal({ title: "per-conversation goal" });
     expect(calls).toEqual([]);
+  });
+
+  test("a link planted at the id map is neither followed on write nor read (C070)", async () => {
+    // The map lives under .crewhaus/, which any agent with a write tool can
+    // reach. writeFileSync followed a link there, so one mirrored goal_write
+    // truncated and overwrote the file the link named.
+    const outside = join(tmp, "outside-rc");
+    writeFileSync(outside, "ORIGINAL OPERATOR FILE\n");
+    const { client } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-9"}', isError: false }),
+      goal_update: () => ({ content: '{"_id":"tz-goal-9"}', isError: false }),
+    });
+    const { deps: d, logs } = deps({ thredz: { client } });
+    const wired = wireContinuity(
+      { specName: "mirror-planted", continuity: {}, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    mkdirSync(wired.store.dir(), { recursive: true });
+    symlinkSync(outside, join(wired.store.dir(), THREDZ_GOAL_MAP_FILE));
+
+    const goal = await wired.store.writeGoal({ title: "ship it" });
+    expect(readFileSync(outside, "utf-8")).toBe("ORIGINAL OPERATOR FILE\n");
+    // The local goal is authoritative and still lands.
+    expect((await wired.store.listGoals()).map((g) => g.id)).toContain(goal.id);
+    const log = logs.join("");
+    expect(log).toContain(`goal mirror map ${THREDZ_GOAL_MAP_FILE} not written`);
+    expect(log).toContain(`goal mirror map ${THREDZ_GOAL_MAP_FILE} not read`);
+    // The outside file's content is never read as the map either.
+    writeFileSync(outside, JSON.stringify({ [goal.id]: "attacker-chosen-id" }));
+    await wired.store.updateGoal(goal.id, { current: 1 });
+    expect(logs.join("")).toContain("has no mirrored Thredz id");
+    // Each refusal is logged once, not on every mirror call.
+    const reads = logs.join("").split(`${THREDZ_GOAL_MAP_FILE} not read`).length - 1;
+    expect(reads).toBe(1);
+  });
+
+  test("a link at the id map to a file inside the store is not read as the map either", async () => {
+    const { client, calls } = fakeClient({
+      goal_write: () => ({ content: "no id here", isError: false }),
+      goal_update: () => ({ content: "{}", isError: false }),
+    });
+    const { deps: d } = deps({ thredz: { client } });
+    const wired = wireContinuity(
+      { specName: "mirror-inlink", continuity: {}, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    const goal = await wired.store.writeGoal({ title: "ship it" });
+    const decoy = join(wired.store.dir(), "decoy.json");
+    writeFileSync(decoy, JSON.stringify({ [goal.id]: "attacker-chosen-id" }));
+    symlinkSync(decoy, join(wired.store.dir(), THREDZ_GOAL_MAP_FILE));
+    await wired.store.updateGoal(goal.id, { current: 1 });
+    expect(calls.filter((c) => c.name === "goal_update")).toEqual([]);
+  });
+
+  test("the id map is created owner-only", async () => {
+    const { client } = fakeClient({
+      goal_write: () => ({ content: '{"_id":"tz-goal-10"}', isError: false }),
+    });
+    const { deps: d } = deps({ thredz: { client } });
+    const wired = wireContinuity(
+      { specName: "mirror-mode", continuity: {}, thredz: { goals: true } },
+      d,
+    );
+    if (wired === null) throw new Error("continuity not wired");
+    await wired.store.writeGoal({ title: "private" });
+    expect(statSync(join(wired.store.dir(), THREDZ_GOAL_MAP_FILE)).mode & 0o777).toBe(0o600);
   });
 
   test("goals: false turns the mirror off", async () => {

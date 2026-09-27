@@ -53,6 +53,69 @@ describe("resolveOpenAIBaseUrl", () => {
     ).toBe("http://127.0.0.1:18081/v1");
   });
 
+  test("a query or fragment in the base URL is refused, and not echoed", () => {
+    const token = ["sk", "proxy", "token", "9f2c"].join("-");
+    for (const openaiBaseUrl of [
+      `https://api.openai.com/v1?api_key=${token}`,
+      `https://api.openai.com/v1#${token}`,
+    ]) {
+      let message = "";
+      try {
+        resolveOpenAIBaseUrl({ openaiBaseUrl }, {});
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain("has a query or fragment");
+      expect(message).not.toContain(token);
+    }
+  });
+
+  // Attacker review (C008 residual): the parse-failure message quoted the
+  // whole value, so a base URL that did not parse (a bad port) echoed a
+  // credential in its query; a model-pool block reaches this per call.
+  test("a base URL that does not parse is refused without quoting any of it", () => {
+    const token = ["sk", "proj", "SECRET", "123"].join("-");
+    for (const openaiBaseUrl of [
+      `https://proxy.example.com:99999/v1?api_key=${token}`,
+      `https://user:${token}@exa mple.com/v1`,
+      `${token}`,
+      `https://[${token}]/v1`,
+    ]) {
+      let message = "";
+      try {
+        resolveOpenAIBaseUrl({ openaiBaseUrl }, {});
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(`${openaiBaseUrl}: ${message.includes("is not an absolute URL")}`).toBe(
+        `${openaiBaseUrl}: true`,
+      );
+      expect(message).not.toContain(token);
+      expect(message).not.toContain("SECRET");
+    }
+  });
+
+  // Attacker review: `/\/+$/` rescanned a run of slashes from every start,
+  // quadratic in its length (about 80 s for 400k slashes, at boot). A
+  // bounded proof: 100k slashes took seconds with the regex and take
+  // milliseconds with the loop.
+  test("trailing slashes are stripped in linear time", () => {
+    expect(resolveOpenAIBaseUrl({ openaiBaseUrl: "https://api.openai.com/v1///" }, {})).toBe(
+      "https://api.openai.com/v1",
+    );
+    const slashes = "/".repeat(100_000);
+    const started = performance.now();
+    const result = resolveOpenAIBaseUrl(
+      { openaiBaseUrl: `https://api.openai.com/${slashes}v1` },
+      {},
+    );
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(result.endsWith(`${slashes}v1`)).toBe(true);
+    expect(() =>
+      resolveOpenAIBaseUrl({ openaiBaseUrl: `https://proxy.example/${slashes}v1` }, {}),
+    ).toThrow("set OPENAI_BASE_URL=https://proxy.example/");
+  });
+
   test("userinfo in the URL is refused", () => {
     expect(() =>
       resolveOpenAIBaseUrl({ openaiBaseUrl: "https://u:p@api.openai.com/v1" }, {}),
@@ -99,6 +162,16 @@ describe("the key never leaves for an unapproved host", () => {
       } as never),
     ).rejects.toThrow("would send OPENAI_API_KEY to https://attacker.example");
     expect(sent).toEqual([]);
+  });
+
+  test("a per-call block that sets fetch is refused, not called as a function", async () => {
+    process.env["OPENAI_API_KEY"] = KEY;
+    Reflect.deleteProperty(process.env, "OPENAI_BASE_URL");
+    await expect(
+      imageGenerate.execute({ prompt: "a cat" }, {
+        toolConfig: { provider: "openai", fetch: "http://attacker.example/" },
+      } as never),
+    ).rejects.toThrow("tool_config.imageGenerate.fetch is not a setting a spec can write");
   });
 
   test("a spec that sets fetch is refused, not called", () => {

@@ -14,7 +14,12 @@
  *   1. `opts.subAgents.get(name)` — inline spec map (codegen-supplied).
  *   2. `<opts.subAgentDir or cwd/.crewhaus/sub-agents>/<name>.md` — frontmatter
  *      file on disk. Format mirrors SKILL.md: leading `---` YAML block, body
- *      becomes `instructions`.
+ *      becomes `instructions`. Any agent with a write tool can put a file
+ *      there, so a definition from disk can only NARROW: its permissions
+ *      meet the parent's, its pool candidates carry no tool_config, it runs
+ *      only on models the spec already names (a model id can carry an
+ *      endpoint), and the file is read without following a link or opening
+ *      a FIFO planted in its place.
  *   3. Built-in `general-purpose` fallback.
  *
  * Concurrency: a Task dispatch runs in parallel with its siblings ONLY
@@ -38,7 +43,6 @@
  * occurs when callers wire `Task` into a `runChatLoop` invocation that
  * doesn't pass `spawnSubAgent`.
  */
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type RuntimeBridge,
@@ -56,7 +60,12 @@ import {
 } from "@crewhaus/sub-agent-permission-inheritance";
 import { buildTool } from "@crewhaus/tool-builder";
 import { type RegisteredTool, toolListEntryNames } from "@crewhaus/tool-catalog";
-import { registeredToolName } from "@crewhaus/tool-categories";
+import {
+  builtinKeyForName,
+  expandToolSelectors,
+  registeredToolName,
+} from "@crewhaus/tool-categories";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -322,11 +331,31 @@ export function parseSubAgentFile(content: string, fallbackName?: string): SubAg
   return def;
 }
 
+/** A definition is a page of prose; anything past this is not one. */
+const SUB_AGENT_FILE_MAX_BYTES = 256 * 1024;
+
+/**
+ * The file is read contained to the directory, never through a symlink at
+ * the leaf, with a FIFO refused before it is opened and the size capped.
+ * The directory is one any agent with a write tool can populate: `<name>.md`
+ * linked to a file outside it used to be read and handed to a child as its
+ * instructions, and a FIFO there blocked the event loop for every session.
+ */
 function loadSubAgentFromDisk(name: string, dir: string): SubAgentDefinition | null {
-  const filePath = join(dir, `${name}.md`);
-  if (!existsSync(filePath)) return null;
-  const content = readFileSync(filePath, "utf-8");
-  return parseSubAgentFile(content, name);
+  const read = openForReadSync(dir, `${name}.md`, {
+    maxBytes: SUB_AGENT_FILE_MAX_BYTES,
+    followLeafSymlink: false,
+  });
+  if (!read.ok) {
+    if (read.code === "not-found") return null;
+    throw new SubAgentResolutionError(`sub-agent "${name}" in ${dir} was not read: ${read.reason}`);
+  }
+  if (read.truncated) {
+    throw new SubAgentResolutionError(
+      `sub-agent "${name}" in ${dir} is larger than ${SUB_AGENT_FILE_MAX_BYTES} bytes, so it was not read`,
+    );
+  }
+  return parseSubAgentFile(read.text, name);
 }
 
 /**
@@ -422,10 +451,27 @@ function buildChildCatalog(
   );
 }
 
-/** The definition with its `tools` mapped to registered names (`read` → `Read`). */
-function withRegisteredToolNames(def: SubAgentDefinition): SubAgentDefinition {
+/**
+ * The definition with its `tools` mapped to registered names (`read` → `Read`).
+ *
+ * A definition from disk never passed through the compiler, so its list is
+ * also expanded here the way the compiler expands a spec's: a category
+ * (`all-git`) or an exclusion (`-gitPush`) becomes the tool keys it names,
+ * and a builtin key is matched without regard to case (`gitstatus`), as
+ * `builtinKeyForName` does. Before this, either spelling gave the child no
+ * tools at all, silently. A bad category throws the compiler's own
+ * `ToolCategoryError`, which the Task call reports.
+ */
+function withRegisteredToolNames(def: SubAgentDefinition, fromDisk: boolean): SubAgentDefinition {
   if (def.tools === undefined) return def;
-  const tools = def.tools.map((n) => registeredToolName(n) ?? n);
+  const listed = fromDisk ? expandToolSelectors(def.tools).tools : def.tools;
+  const tools = listed.map(
+    (n) =>
+      registeredToolName(n) ??
+      (fromDisk ? registeredToolName(builtinKeyForName(n) ?? n) : undefined) ??
+      n,
+  );
+  if (tools.length !== def.tools.length) return { ...def, tools };
   // Already canonical (every spec-declared definition is, since lowering maps
   // it): hand back the same object.
   return tools.every((n, i) => n === def.tools?.[i]) ? def : { ...def, tools };
@@ -503,6 +549,204 @@ function narrowDiskModelPool(def: SubAgentDefinition): {
 /** Definitions whose refused model_pool keys have already been reported. */
 const reportedRefusedPoolKeys = new Set<string>();
 
+type DiskModelPool = NonNullable<SubAgentDefinition["modelPool"]>;
+
+/**
+ * The model strings a pool's `strategy` block names (`guide.model`,
+ * `shadow.candidate`, `shadow.gradeWith`, `committee.judge`). A pool from
+ * disk is passed through unvalidated below `candidates`, so a slot may hold
+ * anything: it is returned as found, and the caller refuses a non-string.
+ */
+function strategyModelSlots(strategy: unknown): ReadonlyArray<unknown> {
+  if (typeof strategy !== "object" || strategy === null) return [strategy];
+  const s = strategy as Record<string, unknown>;
+  const field = (block: unknown, key: string): unknown =>
+    typeof block === "object" && block !== null
+      ? (block as Record<string, unknown>)[key]
+      : undefined;
+  return [
+    field(s["guide"], "model"),
+    field(s["shadow"], "candidate"),
+    field(s["shadow"], "gradeWith"),
+    field(s["committee"], "judge"),
+  ].filter((v) => v !== undefined);
+}
+
+/**
+ * security — a disk definition's pool keeps only models the spec names, in
+ * every slot the runtime can call: each candidate's `model` (a candidate on
+ * another model is removed) and its `fallbacks` (the runtime builds a
+ * failover chain from them, and a file-chosen breaker threshold of 1 turns
+ * one transient error into every call going to the fallback), and the
+ * pool-level `classifier` and `strategy` blocks, which name models of their
+ * own. Returns the same object when nothing was narrowed, and undefined when
+ * no candidate is left.
+ */
+function narrowPoolModels(
+  pool: DiskModelPool,
+  ok: (model: string) => boolean,
+): DiskModelPool | undefined {
+  let changed = false;
+  const candidates: PoolCandidate[] = [];
+  for (const candidate of pool.candidates) {
+    if (!ok(candidate.model)) {
+      changed = true;
+      continue;
+    }
+    const fallbacks: unknown = candidate.fallbacks;
+    if (fallbacks === undefined) {
+      candidates.push(candidate);
+      continue;
+    }
+    const kept = Array.isArray(fallbacks)
+      ? fallbacks.filter((m): m is string => typeof m === "string" && ok(m))
+      : [];
+    if (Array.isArray(fallbacks) && kept.length === fallbacks.length) {
+      candidates.push(candidate);
+      continue;
+    }
+    changed = true;
+    const { fallbacks: _dropped, ...rest } = candidate;
+    candidates.push(kept.length > 0 ? { ...rest, fallbacks: kept } : rest);
+  }
+  if (candidates.length === 0) return undefined;
+  const { classifier, strategy, ...base } = pool;
+  const classifierModel: unknown = classifier?.model;
+  const keepClassifier =
+    classifier === undefined || (typeof classifierModel === "string" && ok(classifierModel));
+  const keepStrategy =
+    strategy === undefined ||
+    strategyModelSlots(strategy).every((m) => typeof m === "string" && ok(m));
+  if (!changed && keepClassifier && keepStrategy) return pool;
+  return {
+    ...base,
+    candidates,
+    ...(keepClassifier && classifier !== undefined ? { classifier } : {}),
+    ...(keepStrategy && strategy !== undefined ? { strategy } : {}),
+  };
+}
+
+/**
+ * Every model the operator's spec names for this Task tool: every model the
+ * parent run was configured with (its primary, fallbacks, tiers, pool
+ * candidates and their fallbacks, compaction and budget-degrade models — the
+ * runtime puts them on the bridge as `specModels`), the arm serving the
+ * parent right now, and every model an inline (spec) definition can run on.
+ * Exact strings: `vertex/claude-x` and `claude-x` reach different endpoints,
+ * and so do two `local/…@url` strings.
+ */
+function declaredModels(
+  bridge: RuntimeBridge,
+  subAgents: ReadonlyMap<string, SubAgentDefinition> | undefined,
+): ReadonlySet<string> {
+  const out = new Set<string>([bridge.model, ...(bridge.specModels ?? [])]);
+  if (bridge.routing?.served.model !== undefined) out.add(bridge.routing.served.model);
+  for (const def of subAgents?.values() ?? []) {
+    if (def.model !== undefined) out.add(def.model);
+    for (const m of def.modelFallbacks ?? []) out.add(m);
+    if (def.modelTiers !== undefined) {
+      out.add(def.modelTiers.fast);
+      out.add(def.modelTiers.default);
+    }
+    for (const c of def.modelPool?.candidates ?? []) {
+      out.add(c.model);
+      for (const m of c.fallbacks ?? []) out.add(m);
+    }
+    for (const o of def.allowedProfiles ?? []) {
+      out.add(o.model);
+      for (const m of o.modelFallbacks ?? []) out.add(m);
+    }
+  }
+  return out;
+}
+
+/**
+ * security — a definition on disk may run only on models the spec already
+ * names ({@link declaredModels}). A model id can carry an endpoint
+ * (`local/<model>@<url>`), so a file the agent wrote could otherwise send the
+ * child's whole conversation — its prompt and every tool result it reads —
+ * to a host of its choosing, or pick a model the operator never agreed to pay
+ * for; 0.6.0 §7.7 already refuses the second for the Task `profile` argument.
+ * Anything else is dropped, and the child runs on the parent's model.
+ * Returns the fields it dropped, to report — never the model strings, which
+ * can carry a URL.
+ */
+function narrowDiskModels(
+  def: SubAgentDefinition,
+  declared: ReadonlySet<string>,
+): { readonly def: SubAgentDefinition; readonly refused: ReadonlyArray<string> } {
+  const refused: string[] = [];
+  const ok = (model: string): boolean => declared.has(model);
+  let next: SubAgentDefinition = def;
+  const drop = (field: keyof SubAgentDefinition, label: string): void => {
+    const { [field]: _dropped, ...rest } = next;
+    next = rest as SubAgentDefinition;
+    refused.push(label);
+  };
+  if (def.model !== undefined && !ok(def.model)) {
+    drop("model", "model");
+    if (next.modelProfile !== undefined) {
+      const { modelProfile: _p, ...rest } = next;
+      next = rest as SubAgentDefinition;
+    }
+  }
+  if (def.modelFallbacks !== undefined && !def.modelFallbacks.every(ok)) {
+    const kept = def.modelFallbacks.filter(ok);
+    if (kept.length > 0) {
+      next = { ...next, modelFallbacks: kept };
+      refused.push("model_fallbacks");
+    } else drop("modelFallbacks", "model_fallbacks");
+  }
+  if (def.modelTiers !== undefined && !(ok(def.modelTiers.fast) && ok(def.modelTiers.default))) {
+    drop("modelTiers", "model_tiers");
+  }
+  if (def.modelPool !== undefined) {
+    const narrowed = narrowPoolModels(def.modelPool, ok);
+    if (narrowed === undefined) drop("modelPool", "model_pool");
+    else if (narrowed !== def.modelPool) {
+      next = { ...next, modelPool: narrowed };
+      refused.push("model_pool");
+    }
+  }
+  if (
+    def.allowedProfiles !== undefined &&
+    !def.allowedProfiles.every((o) => ok(o.model) && (o.modelFallbacks ?? []).every(ok))
+  ) {
+    const options = def.allowedProfiles
+      .filter((o) => ok(o.model))
+      .map((o) =>
+        o.modelFallbacks === undefined || o.modelFallbacks.every(ok)
+          ? o
+          : { ...o, modelFallbacks: o.modelFallbacks.filter(ok) },
+      );
+    if (options.length > 0) {
+      next = { ...next, allowedProfiles: options };
+      refused.push("allowed_profiles");
+    } else drop("allowedProfiles", "allowed_profiles");
+  }
+  return { def: next, refused };
+}
+
+/** Definitions whose refused models have already been reported. */
+const reportedRefusedModels = new Set<string>();
+
+/** Definitions from disk whose tool list matched nothing, already reported. */
+const reportedToolless = new Set<string>();
+
+/**
+ * A file's tool entries for a notice: each quoted with its control
+ * characters escaped (the file is the agent's to write, and the notice goes
+ * to the operator's terminal), shortened, and at most a handful of them.
+ */
+function describeEntries(entries: ReadonlyArray<string>): string {
+  const shown = entries
+    .slice(0, 8)
+    .map((e) => JSON.stringify(e.length > 64 ? `${e.slice(0, 64)}…` : e));
+  return entries.length > shown.length
+    ? `${shown.join(", ")} and ${entries.length - shown.length} more`
+    : shown.join(", ");
+}
+
 export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool {
   const knownNames = opts.subAgents !== undefined ? [...opts.subAgents.keys()] : [];
   // 0.6.0 §7.7 — advertise the `profile` argument only when some definition
@@ -550,7 +794,8 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       if (!parsed.success) return false;
       let def: SubAgentDefinition;
       try {
-        def = resolveSubAgentDefinition(parsed.data.subagent_type, opts);
+        const resolved = resolveSubAgent(parsed.data.subagent_type, opts);
+        def = withRegisteredToolNames(resolved.def, resolved.fromDisk);
       } catch {
         return false;
       }
@@ -569,16 +814,32 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       const spawnSubAgent = bridge.spawnSubAgent;
       let def: SubAgentDefinition;
       let fromDisk: boolean;
+      // The tool list as the definition wrote it, for a notice.
+      let listedTools: ReadonlyArray<string>;
       try {
         ({ def, fromDisk } = resolveSubAgent(input.subagent_type, opts));
+        listedTools = def.tools ?? [];
         // One spelling for everything below: the child catalog AND a
         // `scoped` rule filter both match registered names (`Bash`), and a
         // permission glob is case-sensitive. A spec key left raw here would
         // give the child the tool while scoping away the parent's rules for
         // it — so map before either reads the list.
-        def = withRegisteredToolNames(def);
+        def = withRegisteredToolNames(def, fromDisk);
       } catch (err) {
         return `[Task error] ${(err as Error).message}`;
+      }
+
+      // A definition from disk runs only on models the spec names — before
+      // the `profile` check below reads its allowed_profiles.
+      if (fromDisk) {
+        const narrowedModels = narrowDiskModels(def, declaredModels(bridge, opts.subAgents));
+        def = narrowedModels.def;
+        if (narrowedModels.refused.length > 0 && !reportedRefusedModels.has(def.name)) {
+          reportedRefusedModels.add(def.name);
+          process.stderr.write(
+            `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, so it may run only on models the spec names — its ${narrowedModels.refused.join(", ")} named others, which were dropped; where none was left, it runs on the parent's model. To run it on another model, declare the sub-agent under sub_agents in crewhaus.yaml.\n`,
+          );
+        }
       }
 
       // 0.6.0 §7.7 / §10.1 — the model-filled `profile` argument is checked
@@ -595,6 +856,17 @@ export function createTaskTool(opts: CreateTaskToolOptions = {}): RegisteredTool
       }
 
       const childTools = buildChildCatalog(bridge.tools, def);
+      if (
+        fromDisk &&
+        childTools.length === 0 &&
+        listedTools.length > 0 &&
+        !reportedToolless.has(def.name)
+      ) {
+        reportedToolless.add(def.name);
+        process.stderr.write(
+          `[task] sub-agent "${def.name}" comes from .crewhaus/sub-agents, and none of its tools (${describeEntries(listedTools)}) is a tool the parent has, so it runs with no tools. List registered names (Read) or spec keys (read); a category (all-git) gives the child only the tools of it the parent has.\n`,
+        );
+      }
       const parentPerms = { mode: bridge.permissionMode, rules: bridge.permissionRules };
       let childPerms: ChildPermissions;
       if (fromDisk) {

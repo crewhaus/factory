@@ -196,6 +196,53 @@ export type ExpandResult = {
 };
 
 /**
+ * Tools a later release moved out of a category, each with the leaf that
+ * held it before. Keyed by tool; the value is the old leaf.
+ *
+ * `[all-state, -vectorDelete]` compiled on 0.7.0, when VectorDelete sat in
+ * the `state` leaf that `memory` and `data-stores` include. 0.7.1 moved it
+ * to its own `vector` leaf (under `network`), so the same list would now
+ * exclude a tool that nothing includes, which is refused as a typo. The
+ * author asked for VectorDelete to be left out and it is, so that exclusion
+ * is accepted as a no-op instead: a spec that compiled on 0.7.0 still does.
+ */
+const MOVED_OUT_OF_LEAF: ReadonlyMap<string, string> = new Map([["vectorDelete", "state"]]);
+
+/** Whether `category` (following `includes`) reaches the leaf `leaf`. */
+function reachesLeaf(category: string, leaf: string, seen = new Set<string>()): boolean {
+  if (category === leaf) return true;
+  if (seen.has(category)) return false;
+  seen.add(category);
+  const def = Object.hasOwn(CATEGORIES, category) ? CATEGORIES[category] : undefined;
+  return (def?.includes ?? []).some((child) => reachesLeaf(child, leaf, seen));
+}
+
+/**
+ * `parsed` without the exclusions {@link MOVED_OUT_OF_LEAF} forgives: a
+ * `-<tool>` of a moved tool that no selector includes any more, in a list
+ * that includes a category which reached the tool's old leaf. Anything
+ * else is left for the inert-exclusion check, unchanged.
+ */
+function withoutMovedExclusions(parsed: ReadonlyArray<Selector>): Selector[] {
+  const includes = parsed.filter((sel) => !sel.exclude);
+  const isIncluded = (key: string): boolean =>
+    includes.some((sel) => {
+      if (sel.kind === "tool") return sel.key === key;
+      try {
+        return toolsInCategory(sel.name).includes(key);
+      } catch {
+        return false; // an unknown category is reported by the caller
+      }
+    });
+  return parsed.filter((sel) => {
+    if (sel.kind !== "tool" || !sel.exclude) return true;
+    const oldLeaf = MOVED_OUT_OF_LEAF.get(sel.key);
+    if (oldLeaf === undefined || isIncluded(sel.key)) return true;
+    return !includes.some((inc) => inc.kind === "category" && reachesLeaf(inc.name, oldLeaf));
+  });
+}
+
+/**
  * Expand a `tools:` list into concrete tool keys.
  *
  * Throws `ToolCategoryError` on an unknown category, and on an exclusion
@@ -222,7 +269,7 @@ export function expandToolSelectors(
     return { tools: selectors, expanded: false };
   }
 
-  const parsed = selectors.map(parseSelector);
+  const parsed = withoutMovedExclusions(selectors.map(parseSelector));
   const included = new Set<string>();
   const excluded = new Set<string>();
   // Every exclusion as written, with the keys it removes, so an inert one is

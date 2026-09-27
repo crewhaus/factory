@@ -18,9 +18,9 @@
  * fact/wiki lines they sit beside.
  */
 
-import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { readdir } from "node:fs/promises";
 import type { SessionSummary } from "@crewhaus/session-store";
+import { openForRead } from "@crewhaus/tool-safety/fs";
 
 /** The recall seam the composition root folds into the auto-recall bundle. */
 export type SessionSummaryRecall = {
@@ -32,7 +32,12 @@ export type SessionSummaryRecall = {
 export type CreateSessionSummaryRecallOptions = {
   /** The sessions-index directory (`<crewhausDir>/sessions-index`). */
   readonly indexDir: string;
+  /** Where a skipped record is reported, once per reason. */
+  readonly log?: (line: string) => void;
 };
+
+/** A summary is a few hundred bytes; a record past this is not one. */
+const SESSION_SUMMARY_MAX_BYTES = 1024 * 1024;
 
 /** Cap on the fused summary body inside the recall bundle — recall is a
  *  pointer surface ("go re-read session X"), not a transcript dump. */
@@ -122,26 +127,49 @@ export function createSessionSummaryRecall(
   opts: CreateSessionSummaryRecallOptions,
 ): SessionSummaryRecall {
   const { indexDir } = opts;
+  const reported = new Set<string>();
+  const skip = (why: string): void => {
+    if (reported.has(why)) return;
+    reported.add(why);
+    opts.log?.(`[memory] sessionRecall skipped a sessions-index record: ${why}\n`);
+  };
 
+  /**
+   * Every readable summary in the index. The index sits in `.crewhaus/`,
+   * which any agent with a write tool can reach, and this runs before every
+   * turn: a record is read only when it is a regular file inside the index,
+   * never through a link at its name, never from a FIFO (which used to hang
+   * auto-recall, and so every turn, for ever) and never past
+   * {@link SESSION_SUMMARY_MAX_BYTES}. Anything else is skipped, and each
+   * reason is logged once.
+   */
   async function loadSummaries(): Promise<SessionSummary[]> {
     let files: string[];
     try {
-      files = await readdir(indexDir);
+      files = (await readdir(indexDir, { withFileTypes: true }))
+        .filter((e) => e.name.endsWith(".json"))
+        .map((e) => e.name);
     } catch {
       return []; // index dir absent — nothing indexed yet.
     }
     const out: SessionSummary[] = [];
     for (const file of files) {
-      if (!file.endsWith(".json")) continue;
-      let raw: string;
-      try {
-        raw = await readFile(join(indexDir, file), "utf-8");
-      } catch {
+      const read = await openForRead(indexDir, file, {
+        maxBytes: SESSION_SUMMARY_MAX_BYTES,
+        followLeafSymlink: false,
+      });
+      if (!read.ok) {
+        // A record removed since the listing is no news.
+        if (read.code !== "not-found") skip(read.reason);
         continue; // a single unreadable record must not abort recall.
+      }
+      if (read.truncated) {
+        skip(`${file} is larger than ${SESSION_SUMMARY_MAX_BYTES} bytes, so it was not read`);
+        continue;
       }
       let parsed: unknown;
       try {
-        parsed = JSON.parse(raw);
+        parsed = JSON.parse(read.text);
       } catch {
         continue;
       }

@@ -461,6 +461,16 @@ export type RuntimeBridge = ParentRunHandle & {
    * bridges) don't wire it; tools MUST check for undefined.
    */
   readonly runState?: Store<Record<string, unknown>>;
+  /**
+   * 0.7.1 — every model string this run was configured with: the declared
+   * primary, its `model_fallbacks`, both `model_tiers`, each `model_pool`
+   * candidate and its fallbacks, the compaction model and a budget-degrade
+   * target. The Task tool lets a `.crewhaus/sub-agents` definition (a file the
+   * agent could have written) run only on these or on an inline sub-agent's
+   * models. Not part of {@link ParentRunHandle}: a child's own loop builds its
+   * own. Optional — a bridge built elsewhere falls back to `model` alone.
+   */
+  readonly specModels?: ReadonlyArray<string>;
 };
 
 /**

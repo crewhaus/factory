@@ -2,7 +2,8 @@
  * Batch E item 8 (G77) — session-summary recall (the third recall ranker).
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionSummary } from "@crewhaus/session-store";
@@ -138,5 +139,66 @@ describe("createSessionSummaryRecall", () => {
     const recall = createSessionSummaryRecall({ indexDir });
     const lines = await recall.recall("csv", 5);
     expect(lines[0]).toContain("[session:nodate · ?]");
+  });
+});
+
+// Attacker review (a C070 sibling): the sessions-index sits in .crewhaus/,
+// which any agent with a write tool can reach, and it is read before every
+// turn. readFile followed a link planted at a record's name and opened a
+// FIFO, so one `mkfifo <index>/b.json` hung auto-recall, and every turn.
+describe.skipIf(process.platform === "win32")("records that are not regular files", () => {
+  const good = summary({ sessionId: "sess-good", outcome: "shipped the fox export" });
+
+  test("a FIFO record is skipped, recall still answers, and the reason is logged once", async () => {
+    const indexDir = seedIndex([good]);
+    execFileSync("mkfifo", [join(indexDir, "b.json")]);
+    const logged: string[] = [];
+    const recall = createSessionSummaryRecall({ indexDir, log: (l) => logged.push(l) });
+    expect((await recall.recall("fox export", 5)).join("\n")).toContain("sess-good");
+    expect((await recall.recall("fox export", 5)).join("\n")).toContain("sess-good");
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain("b.json");
+  });
+
+  test("a record linked to a file outside the index is not read through", async () => {
+    const indexDir = seedIndex([good]);
+    const outside = join(root, "outside.json");
+    writeFileSync(
+      outside,
+      JSON.stringify(summary({ sessionId: "sess-planted", outcome: "fox export secrets" })),
+    );
+    symlinkSync(outside, join(indexDir, "planted.json"));
+    const logged: string[] = [];
+    const recall = createSessionSummaryRecall({ indexDir, log: (l) => logged.push(l) });
+    const lines = (await recall.recall("fox export", 5)).join("\n");
+    expect(lines).toContain("sess-good");
+    expect(lines).not.toContain("sess-planted");
+    expect(logged).toHaveLength(1);
+  });
+
+  test("a link at a record's name is not followed even inside the index", async () => {
+    const indexDir = seedIndex([good]);
+    symlinkSync(join(indexDir, "sess-good.json"), join(indexDir, "alias.json"));
+    const logged: string[] = [];
+    const recall = createSessionSummaryRecall({ indexDir, log: (l) => logged.push(l) });
+    const lines = await recall.recall("fox export", 5);
+    expect(lines).toHaveLength(1);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toContain("alias.json");
+  });
+
+  test("a record past the size cap is skipped, not buffered", async () => {
+    const indexDir = seedIndex([good]);
+    writeFileSync(
+      join(indexDir, "huge.json"),
+      JSON.stringify(
+        summary({ sessionId: "sess-huge", outcome: `fox export ${"x".repeat(1_100_000)}` }),
+      ),
+    );
+    const logged: string[] = [];
+    const recall = createSessionSummaryRecall({ indexDir, log: (l) => logged.push(l) });
+    const lines = (await recall.recall("fox export", 5)).join("\n");
+    expect(lines).not.toContain("sess-huge");
+    expect(logged.join("")).toContain("huge.json is larger than");
   });
 });

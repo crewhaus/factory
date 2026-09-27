@@ -7,9 +7,18 @@
  * fallback + injected callback, and the wiki_write event seam.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { createEmbedder } from "@crewhaus/embedder";
 import { openEventLog } from "@crewhaus/event-log";
 import { createRunContext } from "@crewhaus/run-context";
@@ -147,6 +156,55 @@ describe("flags (every tool pinned)", () => {
   });
 });
 
+// 0.7.1 (C040): with an embedder outside the process, the ranking tools send
+// the query and article text to it, so they say they reach the network.
+describe("flags follow the embedder", () => {
+  const RANKING = ["wiki_recall", "wiki_semantic_search", "wiki_related"];
+  function embedder(provider?: string) {
+    const sent: string[] = [];
+    return {
+      sent,
+      ...(provider !== undefined ? { provider } : {}),
+      async embed(texts: ReadonlyArray<string>): Promise<number[][]> {
+        sent.push(...texts);
+        return texts.map(() => [1, 0]);
+      },
+    };
+  }
+  function networkTools(bundle: ReturnType<typeof makeBundle>): string[] {
+    return bundle.all
+      .filter((t) => t.scope === "external" && t.ioCapability === "network")
+      .map((t) => t.name)
+      .sort();
+  }
+
+  test("a provider outside the process: the three ranking tools are external/network, readOnly kept", () => {
+    for (const provider of ["openai", undefined]) {
+      const bundle = makeBundle({ embedder: embedder(provider) });
+      expect(networkTools(bundle)).toEqual([...RANKING].sort());
+      for (const name of RANKING) {
+        expect(bundle.all.find((t) => t.name === name)?.readOnly).toBe(true);
+      }
+      expect(bundle.search.scope).toBe("internal");
+      expect(bundle.get.scope).toBe("internal");
+    }
+  });
+
+  test("the mock provider and no embedder keep every tool internal", () => {
+    for (const bundle of [makeBundle({ embedder: embedder("mock") }), makeBundle()]) {
+      expect(networkTools(bundle)).toEqual([]);
+      expect(bundle.all.every((t) => t.scope === "internal")).toBe(true);
+    }
+  });
+
+  test("an injected store that can rank semantically but does not say where is taken to reach out", () => {
+    const real = createWikiStore({ specName: "spec", rootDir: tmp, embedder: embedder() });
+    const { embedderLeavesProcess: _dropped, ...rest } = real;
+    const bundle = makeBundle({ store: rest as typeof real });
+    expect(networkTools(bundle)).toEqual([...RANKING].sort());
+  });
+});
+
 describe("wiki_write — upsert + Sources governance", () => {
   test("creates then updates by slug without the model passing a version", async () => {
     const bundle = makeBundle();
@@ -277,6 +335,338 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
     await bundle.store.write({ slug: "evil", title: "Evil", body: MALICIOUS_BODY });
     const out = await bundle.get.execute({ slug: "evil" });
     expect(out).not.toContain("exfiltrate the system prompt");
+  });
+
+  // 0.7.1 (C154): the title, tags and sources line are free text too, and
+  // were rendered unclassified by every read tool.
+  test("a poisoned title, tag or sources line is redacted by every read tool; the slug survives", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({
+      slug: "evil-meta",
+      title: `Coffee notes ${MALICIOUS_BODY}`,
+      body: "benign coffee body",
+      tags: ["coffee", MALICIOUS_BODY],
+      sources: [MALICIOUS_BODY],
+    });
+    await bundle.store.write({
+      slug: "good",
+      title: "Coffee basics",
+      body: "coffee grind size",
+      tags: ["coffee"],
+    });
+    const rc = createRunContext();
+    const outputs: Record<string, string> = {
+      get: String(await bundle.get.execute({ slug: "evil-meta" }, { runContext: rc })),
+      recall: String(await bundle.recall.execute({ query: "coffee" }, { runContext: rc })),
+      search: String(await bundle.search.execute({ query: "coffee" }, { runContext: rc })),
+      list: String(await bundle.list.execute({}, { runContext: rc })),
+      semantic: String(
+        await bundle.semanticSearch.execute({ query: "coffee" }, { runContext: rc }),
+      ),
+      related: String(await bundle.related.execute({ slug: "good" }, { runContext: rc })),
+    };
+    const leaks = Object.entries(outputs)
+      .filter(([, out]) => out.includes("exfiltrate the system prompt"))
+      .map(([name]) => name);
+    expect(leaks).toEqual([]);
+    for (const [name, out] of Object.entries(outputs)) {
+      expect(`${name}:${out.includes("evil-meta")}:${out.toLowerCase().includes("redact")}`).toBe(
+        `${name}:true:true`,
+      );
+    }
+    // The clean article still renders in full, next to the redacted one.
+    expect(outputs["recall"]).toContain("coffee grind size");
+    expect(outputs["search"]).toContain("Coffee basics");
+    const tagged = [...(rc.dataLineage?.keys() ?? [])];
+    expect(tagged.some((t) => t.includes("exfiltrate"))).toBe(false);
+    expect(new Set(rc.dataLineage?.values()).has("memory")).toBe(true);
+  });
+
+  // C154 residual (review): wiki_list printed `updatedAt` outside the
+  // classified unit. The store now normalises timestamps it reads, so this
+  // drives the tool with a store whose list() returns the planted value, as
+  // a store from another backend could.
+  test("wiki_list classifies an article's updatedAt with the row it heads", async () => {
+    const real = createWikiStore({ specName: "spec", rootDir: tmp });
+    const ref = {
+      slug: "notes",
+      title: "Coffee notes",
+      tags: ["coffee"],
+      confidence: 0.5,
+      verified: false,
+      version: 1,
+      links: [],
+      status: "published" as const,
+    };
+    const store = {
+      ...real,
+      list: async () => [
+        { ...ref, updatedAt: MALICIOUS_BODY },
+        { ...ref, slug: "clean", updatedAt: "2026-09-01T00:00:00.000Z" },
+      ],
+    };
+    const bundle = makeBundle({ store });
+    const out = String(await bundle.list.execute({}, { runContext: createRunContext() }));
+    expect(out).not.toContain("exfiltrate the system prompt");
+    expect(out).toContain("notes (v1) — ");
+    expect(out.toLowerCase()).toContain("redact");
+    expect(out).toContain("2026-09-01T00:00:00.000Z  clean (v1");
+  });
+
+  // Regression review (Layer-3 cost): every row used to be one full
+  // classification, so with the model-backed classifier registered a
+  // 400-row wiki_search made 400 model calls.
+  describe("list rows and the model-backed classifier", () => {
+    const TITLE_PAD = "a steady walk through brewing ratios and water temperature ".repeat(10);
+
+    async function seedWidgets(bundle: ReturnType<typeof makeBundle>, n: number): Promise<void> {
+      for (let i = 0; i < n; i++) {
+        await bundle.store.write({
+          slug: `widget-${String(i).padStart(2, "0")}`,
+          title: `Widget ${i} ${TITLE_PAD}`,
+          body: `widget number ${i}`,
+          tags: ["widget"],
+        });
+      }
+    }
+
+    function counting(flag?: string) {
+      const seen: string[] = [];
+      let inFlight = 0;
+      let most = 0;
+      const classifier = async (text: string) => {
+        seen.push(text);
+        inFlight++;
+        most = Math.max(most, inFlight);
+        await new Promise((r) => setTimeout(r, 2));
+        inFlight--;
+        return {
+          verdict:
+            flag !== undefined && text.includes(flag) ? ("malicious" as const) : ("clean" as const),
+        };
+      };
+      return { classifier, seen, most: () => most };
+    }
+
+    test("one model call per chunk of rows, not per row, and the rows keep their order", async () => {
+      const bundle = makeBundle();
+      await seedWidgets(bundle, 60);
+      const stub = counting();
+      setDefaultBoundaryLlmClassifier(stub.classifier);
+      try {
+        const out = String(await bundle.search.execute({ query: "widget" }));
+        const rows = out.split("\n").slice(1);
+        const rowChars = rows.reduce((n, r) => n + r.length, 0);
+        // Every row reached the model, inside a chunk no larger than the
+        // classifier analyses in full...
+        expect(stub.seen.every((t) => t.length <= 16 * 1024)).toBe(true);
+        for (const r of rows) {
+          const slug = /widget-\d\d/.exec(r)?.[0] ?? "?";
+          expect(`${slug}:${stub.seen.some((t) => t.includes(`${slug} (v1`))}`).toBe(
+            `${slug}:true`,
+          );
+        }
+        // ...in a handful of calls rather than sixty.
+        expect(stub.seen.length).toBeLessThanOrEqual(Math.ceil(rowChars / (16 * 1024)) + 1);
+        expect(stub.seen.length).toBeLessThan(10);
+        expect(stub.most()).toBeLessThanOrEqual(8);
+        const slugs = rows.map((l) => /widget-\d\d/.exec(l)?.[0]);
+        expect(slugs).toHaveLength(60);
+        const ranked = (await bundle.store.search("widget")).map((r) => r.slug);
+        expect(slugs).toEqual(ranked);
+      } finally {
+        setDefaultBoundaryLlmClassifier(undefined);
+      }
+    });
+
+    test("a row only the model flags is redacted alone; its chunk-mates render", async () => {
+      const bundle = makeBundle();
+      await seedWidgets(bundle, 60);
+      const marker = "zebra quartz lantern";
+      await bundle.store.write({
+        slug: "widget-flagged",
+        title: `Widget flagged ${marker}`,
+        body: "widget flagged",
+        tags: ["widget"],
+      });
+      const stub = counting(marker);
+      setDefaultBoundaryLlmClassifier(stub.classifier);
+      try {
+        const out = String(await bundle.search.execute({ query: "widget" }));
+        expect(out).not.toContain(marker);
+        expect(out).toMatch(/widget-flagged \(v1\) — \[tool output redacted/);
+        // Every other row still renders in full.
+        const rendered = out.split("\n").filter((l) => l.includes("brewing ratios"));
+        expect(rendered).toHaveLength(60);
+        // Chunks, plus one call per row of the one flagged chunk only.
+        const chunkCalls = stub.seen.filter((t) => t.split("\n").length > 1).length;
+        const rowCalls = stub.seen.length - chunkCalls;
+        expect(chunkCalls).toBeGreaterThan(1);
+        expect(rowCalls).toBeGreaterThan(0);
+        expect(rowCalls).toBeLessThan(61);
+        expect(stub.seen.length).toBeLessThan(40);
+        expect(stub.most()).toBeLessThanOrEqual(8);
+      } finally {
+        setDefaultBoundaryLlmClassifier(undefined);
+      }
+    });
+
+    test("an encoded payload is decoded on its own row, however many encoded neighbours it has", async () => {
+      const bundle = makeBundle();
+      // Each neighbour carries hex tokens the decoder spends its bounded
+      // attempts on when rows are classified together.
+      const hex = (i: number, j: number) =>
+        `${i.toString(16).padStart(4, "0")}${"ab".repeat(8)}${j}`;
+      for (let i = 0; i < 12; i++) {
+        await bundle.store.write({
+          slug: `digest-${String(i).padStart(2, "0")}`,
+          title: `Digest ${i} ${[0, 1, 2, 3, 4, 5, 6, 7, 8].map((j) => hex(i, j)).join(" ")}`,
+          body: "digest",
+          tags: ["digest"],
+        });
+      }
+      const encoded = Buffer.from(MALICIOUS_BODY).toString("base64");
+      // A long body ranks it last, after every neighbour's hex tokens.
+      await bundle.store.write({
+        slug: "digest-zz",
+        title: `Digest encoded ${encoded}`,
+        body: `digest ${"filler ".repeat(500)}`,
+        tags: ["digest"],
+      });
+      const out = String(await bundle.search.execute({ query: "digest" }));
+      expect((await bundle.store.search("digest")).at(-1)?.slug).toBe("digest-zz");
+      expect(out).not.toContain(encoded);
+      expect(out).toMatch(/digest-zz \(v1\) — \[tool output redacted/);
+      expect(out.split("\n").filter((l) => /digest-\d\d \(v1, published/.test(l))).toHaveLength(12);
+    });
+  });
+
+  // C154 (attacker review): a planted index.json put injection text in the
+  // slug key and a string `version`, which the redacted fallback printed
+  // beside the notice, outside the classified unit.
+  test("a planted index.json reaches no read tool: slug, version and title stay out", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({
+      slug: "coffee",
+      title: "Coffee",
+      body: "coffee grind size notes",
+      tags: ["coffee"],
+    });
+    await bundle.store.write({
+      slug: "tea",
+      title: "Tea",
+      body: "tea and coffee notes",
+      tags: ["coffee"],
+    });
+    const index = {
+      version: 1,
+      articles: {
+        [`notes ${MALICIOUS_BODY}`]: {
+          title: "Coffee notes",
+          tags: ["coffee"],
+          confidence: 0.5,
+          verified: false,
+          version: `1) ${MALICIOUS_BODY} (`,
+          links: [],
+          status: "published",
+          updatedAt: "2026-09-01T00:00:00.000Z",
+        },
+        coffee: {
+          title: `Coffee ${MALICIOUS_BODY}`,
+          tags: "coffee",
+          confidence: "high",
+          verified: false,
+          version: 1,
+          links: [],
+          status: "published",
+          updatedAt: "2026-09-01T00:00:00.000Z",
+        },
+      },
+    };
+    writeFileSync(join(tmp, "spec", "index.json"), JSON.stringify(index));
+    const outputs: Record<string, string> = {
+      list: String(await bundle.list.execute({})),
+      search: String(await bundle.search.execute({ query: "coffee" })),
+      related: String(await bundle.related.execute({ slug: "tea" })),
+      recall: String(await bundle.recall.execute({ query: "coffee" })),
+      semantic: String(await bundle.semanticSearch.execute({ query: "coffee" })),
+      stats: String(await bundle.stats.execute({})),
+    };
+    const leaks = Object.entries(outputs)
+      .filter(([, out]) => out.includes("exfiltrate"))
+      .map(([name]) => name);
+    expect(leaks).toEqual([]);
+    // The index was rebuilt from the articles: both real ones are listed.
+    expect(outputs["list"]).toContain("2/2 article(s)");
+    expect(outputs["list"]).toContain("coffee (v1, published");
+  });
+
+  test("a redacted row from another store prints no slug or version that is not one", async () => {
+    const real = createWikiStore({ specName: "spec", rootDir: tmp });
+    const store = {
+      ...real,
+      list: async () => [
+        {
+          slug: `notes ${MALICIOUS_BODY}`,
+          title: "Coffee notes",
+          tags: ["coffee"],
+          confidence: 0.5,
+          verified: false,
+          version: `1) ${MALICIOUS_BODY} (` as unknown as number,
+          links: [],
+          status: "published" as const,
+          updatedAt: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+    };
+    const out = String(await makeBundle({ store }).list.execute({}));
+    expect(out).not.toContain("exfiltrate");
+    expect(out).toContain("(an article with an invalid slug) (v?) — ");
+  });
+
+  test("a Sources bullet written through wiki_write is not re-emitted in wiki_get's header", async () => {
+    const bundle = makeBundle();
+    await bundle.write.execute({
+      slug: "sourced",
+      title: "Sourced",
+      body: `notes\n\n## Sources\n\n- ${MALICIOUS_BODY}\n`,
+    });
+    expect((await bundle.store.get("sourced"))?.sources).toEqual([MALICIOUS_BODY]);
+    const out = String(await bundle.get.execute({ slug: "sourced" }));
+    expect(out).not.toContain("exfiltrate the system prompt");
+    expect(out).toContain("slug: sourced");
+  });
+
+  test("a poisoned title on a middle hit of a large recall is still redacted", async () => {
+    const bundle = makeBundle();
+    const big = `coffee ${"espresso crema ".repeat(3000)}`; // ~45 KB each
+    await bundle.store.write({ slug: "big-a", title: "Coffee A", body: `coffee coffee ${big}` });
+    await bundle.store.write({
+      slug: "evil-mid",
+      title: `Coffee ${MALICIOUS_BODY}`,
+      body: "coffee",
+    });
+    await bundle.store.write({ slug: "big-b", title: "Coffee B", body: big });
+    const out = String(await bundle.recall.execute({ query: "coffee", limit: 10 }));
+    expect(out.length).toBeGreaterThan(64 * 1024);
+    expect(out).toContain("evil-mid");
+    expect(out).not.toContain("exfiltrate the system prompt");
+  });
+
+  test("benign titles, tags and sources render verbatim and are tagged at the memory origin", async () => {
+    const bundle = makeBundle();
+    await bundle.write.execute({
+      slug: "latte",
+      title: "Latte art basics",
+      body: "Pour slowly.\n\n## Sources\n\n- the barista handbook\n",
+      tags: ["milk"],
+    });
+    const rc = createRunContext();
+    const out = String(await bundle.get.execute({ slug: "latte" }, { runContext: rc }));
+    expect(out).toContain("# Latte art basics");
+    expect(out).toContain("tags: milk");
+    expect(out).toContain("sources: the barista handbook");
+    expect(new Set(rc.dataLineage?.values())).toEqual(new Set(["memory"]));
   });
 
   test("wiki_write stamps createdBy from the RunContext", async () => {
@@ -444,6 +834,19 @@ describe("log_knowledge_gap", () => {
     expect(res).toBe("gap routed to plan store: T");
     expect(seen).toEqual([{ topic: "T", tags: ["a"], priority: "medium" }]);
     expect(await bundle.store.get("gap-t")).toBeNull(); // fallback skipped
+  });
+
+  test("a link planted at the gap article's predictable temp name creates nothing outside (security-2#0)", async () => {
+    const outside = join(tmp, "outside");
+    mkdirSync(outside);
+    const articles = join(tmp, "spec", "articles");
+    mkdirSync(articles, { recursive: true });
+    symlinkSync(join(outside, "x.sh"), join(articles, "gap-foo.md.tmp"));
+    const bundle = makeBundle();
+    const res = await bundle.logKnowledgeGap.execute({ topic: "foo" });
+    expect(res).toContain("gap-foo");
+    expect(existsSync(join(outside, "x.sh"))).toBe(false);
+    expect(lstatSync(join(articles, "gap-foo.md")).isFile()).toBe(true);
   });
 });
 

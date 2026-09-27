@@ -128,3 +128,32 @@ jobs:
 
       - name: Test the process layer + the manager server
         run: bun --filter '@crewhaus/harness-supervisor' --filter '@crewhaus/hangar-server' test
+
+  # reliability#7 — the tool packages that shell out to OS programs, on
+  # Windows. `ci` runs them on ubuntu only, while tool-desktop ships
+  # PowerShell backends its own comments marked DOCUMENTED, NOT RECORDED;
+  # that is how 0.7.0 shipped a printer probe that cut "Microsoft Print to
+  # PDF" to "Microsoft". tool-desktop's windows-recording.test.ts runs the
+  # read-only probes here and logs their raw output (a runner is a service
+  # session, so the log records shapes, not a desktop's answers).
+  #
+  # NON-GATING, as windows-supervision was until its first green run:
+  # tool-proc's suite still holds POSIX argv without platform gates, and
+  # release.yml reuses this workflow, so a red job here must not block a
+  # tag. Make it gating (drop continue-on-error) once it is green.
+  windows-tools:
+    name: OS-backed tool packages (Windows, non-gating)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          # The same pin as `ci` and windows-supervision; see `ci` for why.
+          bun-version: "1.3.11"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test the OS-backed tool packages
+        run: bun --filter '@crewhaus/tool-desktop' --filter '@crewhaus/tool-proc' --filter '@crewhaus/tool-cron' --filter '@crewhaus/tool-host' --filter '@crewhaus/tool-hostfs' --filter '@crewhaus/tool-pkgmgr' test

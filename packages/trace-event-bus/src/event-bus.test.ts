@@ -305,7 +305,16 @@ describe("TraceEventBus — Batch C approval events round-trip the ring", () => 
 describe("AUXILIARY_MODEL_ROLES / isAuxiliaryModelRole", () => {
   test("names exactly the side-call roles; the answer's own rungs and children are not auxiliary", () => {
     expect([...AUXILIARY_MODEL_ROLES].sort()).toEqual(
-      ["classifier", "committee", "compaction", "consult", "guide", "judge", "shadow"].sort(),
+      [
+        "classifier",
+        "committee",
+        "compaction",
+        "consult",
+        "grounding",
+        "guide",
+        "judge",
+        "shadow",
+      ].sort(),
     );
     expect(Object.isFrozen(AUXILIARY_MODEL_ROLES)).toBe(true);
     const notAux: ModelRole[] = ["primary", "draft", "escalation", "subagent"];

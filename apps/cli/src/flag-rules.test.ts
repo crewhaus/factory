@@ -80,6 +80,7 @@ describe("requireJustification (permission-integration#11)", () => {
     "IssueUpdate",
     "KnowledgeSync",
     "ManifestDependencySet",
+    "OpenExternal",
     "PackageInstall",
     "PrComment",
     "PrCreate",
@@ -216,8 +217,6 @@ describe("what auto mode runs without asking (permission-integration#13)", () =>
     ImageGenerate: "sends a prompt to the configured image provider",
     Lint: "runs the project's linter without --fix; changes nothing",
     MediaProbe: "runs ffprobe on a workspace file",
-    OpenExternal:
-      "hands a URL to the OS; its egress is blocked on tool-sourced text, and allowSchemes limits what it opens",
     ProcessOutput: "reads output from a process this session started",
     TodoWrite: "writes this session's own task list",
     Typecheck: "runs the project's type checker with --noEmit; changes nothing",

@@ -43,8 +43,9 @@ describe("every configurable package's documented block reaches its registrar", 
       swept += 1;
     }
     // fetch, webFetch, codeExecution, imageGenerate, http, codehost, notify,
-    // obs, defi, chainread, federationDiscover, vectorDelete, proc, token, chaincall.
-    expect(swept).toBe(15);
+    // obs, defi, chainread, federationDiscover, objectstore, secure,
+    // vectorDelete, proc, token, chaincall.
+    expect(swept).toBe(17);
   });
 
   test("tool_config.http configures the http tools, and the README says so", () => {

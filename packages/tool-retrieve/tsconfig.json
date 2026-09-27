@@ -9,6 +9,7 @@
     { "path": "../errors" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" },
+    { "path": "../tool-safety" },
     { "path": "../vector-store" }
   ],
   "include": ["src/**/*"]
