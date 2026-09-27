@@ -265,6 +265,45 @@ permissions:
     expect(result.ok).toBe(true);
   });
 
+  // C146: a deny spelled another way than the tool's name never fires, and
+  // lint said "clean". A glob that still reaches a declared MCP server's
+  // tools is not dead, and is not called dead.
+  test("a deny spelled another way than the name is reported; an MCP-reaching glob is not called dead", () => {
+    const variants = `${validCli}tools: [codegraphSearch, removePath, javascript, read, grep]
+permissions:
+  mode: auto
+  rules:
+    - { type: alwaysDeny, pattern: "Codegraph*" }
+    - { type: alwaysDeny, pattern: "remove_path" }
+    - { type: alwaysDeny, pattern: "JAVASCRIPT" }
+`;
+    const found = runLint(variants, noTools).findings.filter((f) =>
+      f.rule.startsWith("permission-rule:"),
+    );
+    expect(found.map((f) => [f.rule, f.path])).toEqual([
+      ["permission-rule:unknown-tool", "permissions.rules[alwaysDeny Codegraph*]"],
+      ["permission-rule:unknown-tool", "permissions.rules[alwaysDeny remove_path]"],
+      ["permission-rule:unknown-tool", "permissions.rules[alwaysDeny JAVASCRIPT]"],
+    ]);
+    expect(found.map((f) => f.message.match(/Write "([^"]+)"/)?.[1])).toEqual([
+      "CodeGraph*",
+      "RemovePath",
+      "JavaScript",
+    ]);
+    const mcp = `${validCli}tools: [read, grep]
+mcp_servers:
+  fs:
+    transport: stdio
+    command: npx
+permissions:
+  rules:
+    - { type: alwaysDeny, pattern: "*write*" }
+`;
+    expect(
+      runLint(mcp, noTools).findings.filter((f) => f.rule.startsWith("permission-rule:")),
+    ).toEqual([]);
+  });
+
   test("the live tool's declaration is what is checked", () => {
     const declaresNothing = { name: "ClipboardWrite" } as RegisteredTool;
     const result = runLint(spec, (name) =>

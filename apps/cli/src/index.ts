@@ -2169,12 +2169,15 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   //
   // 0.7.1 — mcp-server-name is informational for the same reason as
   // model-sunset: the key ran on 0.7.0, and a spec that compiled under
-  // --strict before the upgrade must still compile after it.
+  // --strict before the upgrade must still compile after it. So is
+  // permission-rule-note: a glob such as `*write*` that still fires on a
+  // declared MCP server's tools is not dead, it merely misses a builtin.
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
     "channel-plugins-at-start",
     "cli-autodistill-toolchain",
     "mcp-server-name",
+    "permission-rule-note",
     "model-plan-candidate-only",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",
@@ -2719,8 +2722,14 @@ async function permissionRuleWarnings(
   const toolMap = await loadToolMap();
   const byRegisteredName: Record<string, RegisteredTool> = {};
   for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  // A `builtin-not-reached` note is about a rule that still fires (on a
+  // declared MCP server's tools), so --strict does not escalate it.
   return permissionRuleProblemsOf(ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
-    (p) => ({ code: "permission-rule", path: "permissions.rules", message: p.message }),
+    (p) => ({
+      code: p.code === "builtin-not-reached" ? "permission-rule-note" : "permission-rule",
+      path: "permissions.rules",
+      message: p.message,
+    }),
   );
 }
 
