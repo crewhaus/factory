@@ -59,7 +59,18 @@ const checkSchema = z.object({
   message: z.string().optional(),
 });
 
-const minorUnits = z.number().int();
+/**
+ * An amount in minor units: an integer a double holds exactly. Past 2^53 − 1
+ * a JSON number has already been rounded before the tool sees it, so it is
+ * refused rather than computed with.
+ */
+const UNSAFE_AMOUNT =
+  "is past ±(2^53 − 1) minor units, the largest amount computed exactly — express it in a larger unit";
+const minorUnits = z
+  .number()
+  .int()
+  .min(Number.MIN_SAFE_INTEGER, UNSAFE_AMOUNT)
+  .max(Number.MAX_SAFE_INTEGER, UNSAFE_AMOUNT);
 
 /**
  * An instant, as epoch milliseconds or ISO-8601 WITH an offset.
@@ -85,6 +96,15 @@ function parseInstant(value: string | number, field: string): number {
 }
 
 const instantField = z.union([z.string(), z.number()]);
+
+/**
+ * The `now` a caller may pass. It replaces the real clock, which moves every
+ * time window with it — the spend windows, the quiet hours, a webhook's
+ * replay tolerance — so it is for tests and replays of a recorded event, not
+ * for a live decision.
+ */
+const CLOCK_OVERRIDE =
+  "tests and replays only; omit it for a live decision — it replaces the real clock, and every time window moves with it";
 
 // ---------------------------------------------------------------------------
 
@@ -168,7 +188,7 @@ export const refundAmountCompute: RegisteredTool = buildTool({
       .array(
         z.object({
           id: z.string().min(1),
-          quantity: z.number().int().positive(),
+          quantity: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
           unitPriceMinor: minorUnits,
           taxMinor: minorUnits.optional(),
           discountMinor: minorUnits.optional(),
@@ -177,7 +197,12 @@ export const refundAmountCompute: RegisteredTool = buildTool({
       .min(1)
       .max(LIMITS.lines),
     returned: z
-      .array(z.object({ lineId: z.string().min(1), quantity: z.number().int().positive() }))
+      .array(
+        z.object({
+          lineId: z.string().min(1),
+          quantity: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        }),
+      )
       .min(1)
       .max(LIMITS.lines),
     orderDiscountMinor: minorUnits.optional(),
@@ -294,7 +319,7 @@ export const costBasisCompute: RegisteredTool = buildTool({
 export const spendLimitCheck: RegisteredTool = buildTool({
   name: "SpendLimitCheck",
   description:
-    "Decide whether a proposed payment fits inside the operator's velocity, counterparty and quiet-hours limits, given what has already been spent. Use it as the gate an unattended harness actually consults before moving money: a limit a model is asked to respect is a suggestion, while one computed from the record of prior spend is a limit. It reports every limit the payment breaks rather than the first, and the headroom that would pass.",
+    "Check a proposed payment against velocity, counterparty and quiet-hours limits, given the payments already made, and report every limit it breaks rather than the first, plus the headroom that would pass. Use it to apply the same limits the same way every time: the window arithmetic is exact and repeatable. It computes over the history, the limits and the clock passed in, and enforces nothing by itself — when the caller writes those inputs the verdict is advisory, so a limit that must hold belongs where the caller cannot edit it: in the policy of the tool that moves the money, such as transaction_policy for EvmSendTransaction.",
   inputSchema: z.object({
     proposed: z.object({ amountMinor: minorUnits, counterparty: z.string().optional() }),
     history: z
@@ -318,15 +343,24 @@ export const spendLimitCheck: RegisteredTool = buildTool({
       knownCounterpartiesOnly: z.boolean().optional(),
       knownCounterparties: z.array(z.string()).max(10_000).optional(),
     }),
-    now: instantField.optional().describe("overrides the real clock, for tests and replays"),
+    now: instantField.optional().describe(CLOCK_OVERRIDE),
   }),
   readOnly: true,
   concurrencySafe: true,
   execute: async (input) => {
     const nowMs = input.now === undefined ? Date.now() : parseInstant(input.now, "now");
-    return json(
-      checkSpendLimit(input.proposed, input.history as ReadonlyArray<Spend>, input.limits, nowMs),
-    );
+    return json({
+      ...checkSpendLimit(
+        input.proposed,
+        input.history as ReadonlyArray<Spend>,
+        input.limits,
+        nowMs,
+      ),
+      // Said in the payload, where whoever acts on the verdict reads it.
+      clock: input.now === undefined ? "runtime" : "caller-supplied",
+      basis:
+        "the history and limits passed in this call; this verdict is only as binding as the record they came from",
+    });
   },
 });
 
@@ -355,7 +389,7 @@ export const refundAbuseCheck: RegisteredTool = buildTool({
         refundCount: z.number().int().nonnegative().optional(),
       })
       .optional(),
-    now: instantField.optional(),
+    now: instantField.optional().describe(CLOCK_OVERRIDE),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -381,7 +415,7 @@ export const webhookSignatureVerify: RegisteredTool = buildTool({
       .describe("NAME of the environment variable holding the signing secret, never the secret"),
     toleranceSeconds: z.number().int().positive().max(86_400).optional().describe("default 300"),
     scheme: z.string().optional().describe("default v1"),
-    now: instantField.optional(),
+    now: instantField.optional().describe(CLOCK_OVERRIDE),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -444,7 +478,7 @@ export const statementParse: RegisteredTool = buildTool({
       .positive()
       .max(20_000)
       .optional()
-      .describe("cap the returned list; default 500"),
+      .describe("cap the returned transaction and rejected lists; default 500"),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -454,8 +488,14 @@ export const statementParse: RegisteredTool = buildTool({
     if (size > LIMITS.statementBytes) {
       throw new Error(`${at.rel} is ${size} bytes, over the ${LIMITS.statementBytes}-byte limit`);
     }
-    const result = parseStatement(readFileSync(at.real, "utf-8"), input);
     const limit = input.limit ?? 500;
+    // Only what is returned is held: the counts and the totals still cover
+    // every row, but a file of a million unreadable blocks is not a million
+    // objects in memory on the way to showing five hundred of them.
+    const result = parseStatement(readFileSync(at.real, "utf-8"), {
+      ...input,
+      keep: { transactions: limit, rejected: limit },
+    });
     return json({
       file: at.rel,
       format: result.format,
@@ -464,8 +504,14 @@ export const statementParse: RegisteredTool = buildTool({
       totalMinor: result.totalMinor,
       debitMinor: result.debitMinor,
       creditMinor: result.creditMinor,
+      // Set, with the reason, when a total is past what a number holds exactly.
+      ...(result.totalsUnavailable === null ? {} : { totalsUnavailable: result.totalsUnavailable }),
+      // Capped like the transactions: a file of nothing but unreadable rows
+      // would otherwise come back as one reason per row, whatever its size.
       rejected: result.rejected,
-      transactions: result.transactions.slice(0, limit),
+      rejectedCount: result.rejectedCount,
+      rejectedTruncated: result.rejectedCount > limit,
+      transactions: result.transactions,
       truncated: result.count > limit,
     });
   },

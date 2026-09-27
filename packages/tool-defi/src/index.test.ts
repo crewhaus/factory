@@ -37,6 +37,7 @@ import {
 } from "./fixtures";
 import {
   DEFI_TOOLS,
+  PORTFOLIO_PROVIDER_REQUESTS,
   REFUSED_PROTOCOLS,
   SUPPORTED_PROTOCOLS,
   _resetDefiConfig,
@@ -598,6 +599,61 @@ describe("OraclePriceRead", () => {
     expect(provenance["priceId"]).toBe(ETH_USD_PRICE_ID);
   });
 
+  test("a Pyth confidence at or above 2^63 is a wide band, not a negative one (C204)", async () => {
+    // conf is a uint64. 0.7.0 read it as an int64, so these came back
+    // negative, the ratio was negative, and beyondConfidenceBound was false.
+    for (const [confidence, expected] of [
+      [1n << 63n, "92233720368.54775808"],
+      [(1n << 64n) - 1n, "184467440737.09551615"],
+    ] as const) {
+      const chain = newChain();
+      await pythFeed(chain, ADDR.pyth, ETH_USD_PRICE_ID, {
+        price: 342_155_000_000n,
+        confidence,
+        exponent: -8,
+        publishTime: BigInt(NOW - 5),
+      });
+      install({ chain });
+      configured();
+      const out = await call(oraclePriceRead, {
+        chainId: "1",
+        kind: "pyth",
+        address: ADDR.pyth,
+        priceId: ETH_USD_PRICE_ID,
+        maxConfidenceBps: 50,
+      });
+      expect(out["confidence"]).toBe(expected);
+      const signals = out["signals"] as Record<string, unknown>;
+      expect(signals["confidenceToPriceBps"] as number).toBeGreaterThan(50);
+      expect(signals["beyondConfidenceBound"]).toBe(true);
+      // A canonical encoding: nothing to say about padding.
+      expect((out["notes"] as string[]).join(" ")).not.toContain("not padded");
+    }
+  });
+
+  test("a Pyth answer whose words are not the ABI's padding is read, and says so", async () => {
+    const chain = newChain();
+    const word = (n: bigint): string => n.toString(16).padStart(64, "0");
+    // conf with a bit set above its 64: no Pyth contract answers like that.
+    route(chain, ADDR.pyth, SELECTOR_TEXT.getPriceUnsafe + ETH_USD_PRICE_ID.replace(/^0x/, ""), {
+      data: `0x${word(342_155_000_000n)}${word((1n << 64n) | 3_421_550_000n)}${word(
+        (1n << 256n) - 8n,
+      )}${word(BigInt(NOW - 5))}`,
+    });
+    install({ chain });
+    configured();
+    const out = await call(oraclePriceRead, {
+      chainId: "1",
+      kind: "pyth",
+      address: ADDR.pyth,
+      priceId: ETH_USD_PRICE_ID,
+    });
+    expect(out["confidence"]).toBe("34.2155");
+    const notes = (out["notes"] as string[]).join(" ");
+    expect(notes).toContain("the answer's conf (uint64) word is not padded");
+    expect(notes).not.toContain("expo");
+  });
+
   test("a Pyth read without a price id is refused before anything is dialled", async () => {
     const { recorded } = install({ chain: newChain() });
     configured();
@@ -949,6 +1005,38 @@ describe("PortfolioValuation", () => {
     expect((out["total"] as Record<string, unknown>)["value"]).toBe("4224.14");
     const priced = out["priced"] as Array<Record<string, unknown>>;
     expect(priced[0]?.["amount"]).toBe("1.234567890123456789");
+  });
+
+  test("a Pyth band of 2^63 or wider puts the holding in unpriced, not in the total (C204)", async () => {
+    const chain = newChain();
+    await pythFeed(chain, ADDR.pyth, ETH_USD_PRICE_ID, {
+      price: 100_000_000n,
+      confidence: 1n << 63n,
+      exponent: -8,
+      publishTime: BigInt(NOW - 5),
+    });
+    install({ chain });
+    configured();
+    const out = await call(portfolioValuation, {
+      quoteCurrency: "USD",
+      chainId: "1",
+      holdings: [
+        {
+          asset: "X",
+          amount: "1000",
+          oracle: {
+            kind: "pyth",
+            address: ADDR.pyth,
+            priceId: ETH_USD_PRICE_ID,
+            maxConfidenceBps: 100,
+          },
+        },
+      ],
+    });
+    expect((out["priced"] as unknown[]).length).toBe(0);
+    const unpriced = out["unpriced"] as Array<Record<string, unknown>>;
+    expect(String(unpriced[0]?.["reason"])).toContain("confidence band");
+    expect((out["total"] as Record<string, unknown>)["value"]).toBe("0.00");
   });
 
   test("an oracle-priced holding with an incomplete round lands in the unpriced bucket, not in the total", async () => {
@@ -1498,3 +1586,173 @@ describe("adversarial regressions", () => {
 function configuredForAdversarial(): void {
   registerDefiConfig({ rpc: { "1": ENDPOINT }, multicall3: { "1": ADDR.multicall3 } });
 }
+
+describe("timeoutMs is one deadline for the whole call, and a call's requests are bounded (C166)", () => {
+  /**
+   * A provider that never answers: each request waits until its signal
+   * aborts. Counting dials is the assertion; nothing here races a clock
+   * against real I/O — the only timer is the call's own deadline.
+   */
+  function silentProvider(): { dials: () => number } {
+    let dials = 0;
+    _setFetch(
+      (req) =>
+        new Promise<Response>((_, reject) => {
+          dials++;
+          req.signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    _setClock(() => NOW);
+    return { dials: () => dials };
+  }
+
+  test("a quote that would cross pairs asks once, then stops at the deadline", async () => {
+    const { dials } = silentProvider();
+    // BTC/JPY: coinbase direct, its inverse, then two legs each through USD
+    // and EUR — six requests, each with the whole budget, on 0.7.0.
+    await expect(call(priceQuote, { base: "BTC", quote: "JPY", timeoutMs: 50 })).rejects.toThrow(
+      /deadline elapsed/,
+    );
+    expect(dials()).toBe(1);
+  });
+
+  test("a valuation stops asking at the deadline, and says which holdings it left", async () => {
+    const { dials } = silentProvider();
+    const out = await call(portfolioValuation, {
+      quoteCurrency: "JPY",
+      holdings: ["AAA", "BBB", "CCC"].map((base) => ({
+        asset: base,
+        amount: "1",
+        quotePair: { base },
+      })),
+      timeoutMs: 50,
+    });
+    expect(dials()).toBe(1);
+    const unpriced = out["unpriced"] as Array<Record<string, unknown>>;
+    expect(unpriced.map((row) => row["asset"])).toEqual(["AAA", "BBB", "CCC"]);
+    expect(String(unpriced[0]?.["reason"])).toContain("deadline elapsed");
+    for (const row of unpriced.slice(1)) {
+      expect(String(row["reason"])).toBe(
+        `${row["asset"]}: not priced — the call's timeoutMs of 50ms elapsed first`,
+      );
+    }
+    expect((out["notes"] as string[]).join(" ")).toContain(
+      "2 holding(s) were not priced because the call ran out of time",
+    );
+  });
+
+  test("a valuation's provider requests are capped, and the rows past the cap say so", async () => {
+    const { recorded } = install({ http: {} });
+    const holdings = Array.from({ length: 256 }, (_, i) => {
+      const base = `T${String(i).padStart(3, "0")}`;
+      return { asset: base, amount: "1", quotePair: { base } };
+    });
+    const out = await call(portfolioValuation, { quoteCurrency: "USD", holdings });
+    // Every pair 404s at once: direct, inverse, then both legs through EUR —
+    // 1,024 requests to the provider on 0.7.0.
+    expect(recorded.length).toBe(PORTFOLIO_PROVIDER_REQUESTS);
+    const unpriced = out["unpriced"] as Array<Record<string, unknown>>;
+    expect(unpriced.length).toBe(256);
+    expect(String(unpriced.at(-1)?.["reason"])).toContain(
+      `this call has already sent the ${PORTFOLIO_PROVIDER_REQUESTS} price-provider requests it may send`,
+    );
+  });
+
+  test("unlisted assets cannot spend the budget before a listed one is asked", async () => {
+    // 128 tokens no provider lists, then BTC and ETH, valued in EUR: each
+    // unlisted one costs four requests, 512 in all — the whole budget. 0.7.1's
+    // first cut had no reserve (and 256 for the call), so 64 were enough to
+    // spend it on the dust and say coinbase "publishes neither BTC-EUR nor
+    // its inverse" — which nobody had asked.
+    install({
+      http: {
+        [coinbaseUrl("BTC", "EUR")]: coinbaseSpot("BTC", "EUR", "50000.00"),
+        [coinbaseUrl("ETH", "EUR")]: coinbaseSpot("ETH", "EUR", "3000.00"),
+      },
+    });
+    const dust = Array.from({ length: 128 }, (_, i) => ({
+      asset: `DUST${i}`,
+      amount: "1",
+      quotePair: { base: `DUST${i}` },
+    }));
+    const out = await call(portfolioValuation, {
+      quoteCurrency: "EUR",
+      holdings: [
+        ...dust,
+        { asset: "BTC", amount: "0.5", quotePair: { base: "BTC" } },
+        { asset: "ETH", amount: "2", quotePair: { base: "ETH" } },
+      ],
+    });
+    const priced = (out["priced"] as Array<Record<string, unknown>>).map((r) => r["asset"]);
+    expect(priced).toEqual(["BTC", "ETH"]);
+    expect((out["unpriced"] as unknown[]).length).toBe(128);
+  });
+
+  test("a route the budget did not ask is named as not asked, and a note counts them", async () => {
+    // XYZ is listed against USD only. After 255 unlisted holdings it has one
+    // request left: its direct pair (404), and nothing for the rest.
+    install({ http: { [coinbaseUrl("XYZ", "USD")]: coinbaseSpot("XYZ", "USD", "2") } });
+    const holdings = [
+      ...Array.from({ length: 255 }, (_, i) => ({
+        asset: `T${i}`,
+        amount: "1",
+        quotePair: { base: `T${i}` },
+      })),
+      { asset: "XYZ", amount: "1", quotePair: { base: "XYZ" } },
+    ];
+    const out = await call(portfolioValuation, { quoteCurrency: "EUR", holdings });
+    const xyz = (out["unpriced"] as Array<Record<string, unknown>>).find(
+      (r) => r["asset"] === "XYZ",
+    );
+    const reason = String(xyz?.["reason"]);
+    expect(reason).toContain(
+      "its inverse EUR-XYZ was not asked: this call has already sent the 512",
+    );
+    expect(reason).toContain("coinbase was not asked for XYZ-USD");
+    expect(reason).not.toContain("publishes neither XYZ-EUR");
+    expect((out["notes"] as string[]).join(" ")).toMatch(
+      /^.*\d+ unpriced holding\(s\) had a price route that was not asked, because this call's 512 price-provider requests were spent or held for later holdings/,
+    );
+  });
+
+  test("the same pair across many holdings is asked for once", async () => {
+    const { recorded } = install({
+      http: { [coinbaseUrl("BTC", "USD")]: coinbaseSpot("BTC", "USD", "60000.00") },
+    });
+    const out = await call(portfolioValuation, {
+      quoteCurrency: "USD",
+      holdings: Array.from({ length: 20 }, (_, i) => ({
+        asset: `lot${i}`,
+        amount: "0.5",
+        quotePair: { base: "BTC" },
+      })),
+    });
+    expect(recorded.length).toBe(1);
+    expect((out["priced"] as unknown[]).length).toBe(20);
+    expect((out["total"] as Record<string, unknown>)["value"]).toBe("600000.00");
+  });
+
+  test("a leg two crosses share is fetched once", async () => {
+    const { recorded } = install({
+      http: {
+        [coinbaseUrl("AAA", "USD")]: coinbaseSpot("AAA", "USD", "2"),
+        [coinbaseUrl("BBB", "USD")]: coinbaseSpot("BBB", "USD", "3"),
+        [frankfurterUrl("USD", "JPY")]: { date: "2026-09-23", rates: { JPY: 150 } },
+      },
+    });
+    const out = await call(portfolioValuation, {
+      quoteCurrency: "JPY",
+      holdings: [
+        { asset: "AAA", amount: "1", quotePair: { base: "AAA", via: "USD" } },
+        { asset: "BBB", amount: "1", quotePair: { base: "BBB", via: "USD" } },
+      ],
+    });
+    expect((out["priced"] as unknown[]).length).toBe(2);
+    const usdJpy = recorded.filter((r) => r.url === frankfurterUrl("USD", "JPY"));
+    expect(usdJpy.length).toBe(1);
+  });
+});

@@ -467,7 +467,7 @@ describe("the chain seam", () => {
   test("an adapter-backed reader says which chain has no adapter", async () => {
     const reader = chainReaderFromAdapters(() => undefined);
     await expect(reader({ chainId: 8453, method: "eth_call", params: [] })).rejects.toThrow(
-      "no chain adapter is registered for chain 8453",
+      'no chain is declared with id "8453", so chain 8453 cannot be read',
     );
   });
 

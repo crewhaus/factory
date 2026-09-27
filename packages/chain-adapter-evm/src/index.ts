@@ -16,10 +16,27 @@ import {
   type ChainAdapter,
   type ChainAdapterConfig,
   ChainAdapterError,
+  type RpcReadOptions,
   assertReadOnlyMethod,
   classifyChainPayload,
   orderRpcUrls,
 } from "@crewhaus/chain-adapter-base";
+import { readResponseBounded, withRawBody } from "@crewhaus/tool-safety/streams";
+
+/**
+ * A read's deadline when the caller names none: across every URL it tries,
+ * so a fallback list cannot multiply it. Under `fallback` each URL has a
+ * share of it before the next is asked too (see {@link fallbackDispatch});
+ * under `quorum` the voters that answered in time decide.
+ */
+export const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+
+/**
+ * The most bytes of a JSON-RPC response this reads, decoded. A large
+ * eth_getLogs or Multicall3 answer runs to megabytes; nothing a node should
+ * send runs to more, and a body is held in memory whole.
+ */
+export const MAX_RPC_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 type JsonRpcRequest = {
   readonly jsonrpc: "2.0";
@@ -55,17 +72,41 @@ export function createEvmAdapter(
     async rpcRead(
       method: string,
       params: ReadonlyArray<unknown>,
-      opts?: { readonly bypassCache?: boolean },
+      opts?: RpcReadOptions,
     ): Promise<unknown> {
       assertReadOnlyMethod(config.chainId, method);
       const urls = orderRpcUrls(config.rpcUrls, config.rpcPolicy);
-
-      if (config.rpcPolicy === "quorum") {
-        return quorumDispatch(config.chainId, urls, method, params, fetchImpl, nextId++, opts);
+      const timeoutMs = opts?.timeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new ChainAdapterError(
+          config.chainId,
+          method,
+          `timeoutMs ${timeoutMs} is not a duration`,
+        );
       }
+      const deadline = AbortSignal.timeout(timeoutMs);
+      const call: Dispatch = {
+        chainId: config.chainId,
+        method,
+        params,
+        fetchImpl,
+        id: nextId++,
+        signal: opts?.signal === undefined ? deadline : AbortSignal.any([opts.signal, deadline]),
+        timeoutMs,
+        deadlineAt: Date.now() + timeoutMs,
+        callerCancelled: () => opts?.signal?.aborted === true,
+        cancelled: () =>
+          opts?.signal?.aborted === true
+            ? "the read was cancelled"
+            : deadline.aborted
+              ? `no answer within ${timeoutMs} ms`
+              : undefined,
+        ...(opts?.bypassCache !== undefined ? { bypassCache: opts.bypassCache } : {}),
+      };
+      if (config.rpcPolicy === "quorum") return quorumDispatch(urls, call);
       // "single" was reduced to one URL by orderRpcUrls; "fallback"
       // iterates the full list and stops on the first success.
-      return fallbackDispatch(config.chainId, urls, method, params, fetchImpl, nextId++, opts);
+      return fallbackDispatch(urls, call);
     },
   };
 }
@@ -126,79 +167,211 @@ function endpointLabel(url: string): string {
   }
 }
 
-async function fallbackDispatch(
-  chainId: string,
-  urls: readonly string[],
-  method: string,
-  params: ReadonlyArray<unknown>,
-  fetchImpl: typeof fetch,
-  id: number,
-  opts?: { readonly bypassCache?: boolean },
-): Promise<unknown> {
-  let lastError: unknown;
-  for (const url of urls) {
-    try {
-      return await dispatchOne(chainId, url, method, params, fetchImpl, id, opts);
-    } catch (err) {
-      lastError = err;
+/** One read, as every URL it is sent to sees it. */
+type Dispatch = {
+  readonly chainId: string;
+  readonly method: string;
+  readonly params: ReadonlyArray<unknown>;
+  readonly fetchImpl: typeof fetch;
+  readonly id: number;
+  /** The caller's signal and the read's deadline, together. */
+  readonly signal: AbortSignal;
+  /** The read's whole budget, and when (epoch ms) it runs out. */
+  readonly timeoutMs: number;
+  readonly deadlineAt: number;
+  /** True once the CALLER cancelled — as opposed to the deadline passing. */
+  readonly callerCancelled: () => boolean;
+  /** Why the read was stopped, once it was; undefined while it may go on. */
+  readonly cancelled: () => string | undefined;
+  readonly bypassCache?: boolean;
+};
+
+/** One URL's attempt: the read's signal, plus its own, so a settled read closes the rest. */
+function attemptOn(call: Dispatch): { readonly call: Dispatch; readonly stop: () => void } {
+  const own = new AbortController();
+  return {
+    call: { ...call, signal: AbortSignal.any([call.signal, own.signal]) },
+    stop: () => own.abort(),
+  };
+}
+
+/**
+ * `fallback`: the URLs in order, each with a share of the read's deadline.
+ *
+ * The next URL is asked when the one before it fails — or has not answered
+ * within its share (what is left of the deadline, split among the URLs not
+ * yet asked). A slow URL is not dropped when that happens: it keeps its
+ * chance, the first answer from either wins, and the rest are closed. So a
+ * primary that stalls cannot spend the whole deadline and leave a healthy
+ * secondary unasked, and a primary that is merely slow still answers.
+ * The read's own deadline and the caller's cancel end every attempt.
+ */
+function fallbackDispatch(urls: readonly string[], call: Dispatch): Promise<unknown> {
+  const { chainId, method } = call;
+  return new Promise<unknown>((resolve, reject) => {
+    const stops: Array<() => void> = [];
+    let next = 0;
+    let pending = 0;
+    let done = false;
+    let lastError: unknown;
+    let hedge: ReturnType<typeof setTimeout> | undefined;
+    /** Settle once, closing every attempt still out — all but `winner`, whose answer this is. */
+    const finish = (settle: () => void, winner?: () => void): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(hedge);
+      call.signal.removeEventListener("abort", onStop);
+      for (const stop of stops) if (stop !== winner) stop();
+      settle();
+    };
+    const onStop = (): void =>
+      finish(() =>
+        reject(new ChainAdapterError(chainId, method, call.cancelled() ?? "the read was stopped")),
+      );
+    const launch = (): void => {
+      clearTimeout(hedge);
+      if (done || next >= urls.length) return;
+      const url = urls[next++] as string;
+      const attempt = attemptOn(call);
+      stops.push(attempt.stop);
+      pending++;
+      dispatchOne(url, attempt.call).then(
+        (value) => finish(() => resolve(value), attempt.stop),
+        (err: unknown) => {
+          pending--;
+          lastError = err;
+          if (done) return;
+          if (call.cancelled() !== undefined) {
+            onStop();
+            return;
+          }
+          if (next < urls.length) launch();
+          else if (pending === 0) {
+            finish(() =>
+              reject(
+                new ChainAdapterError(
+                  chainId,
+                  method,
+                  `all ${urls.length} RPC URL(s) failed`,
+                  lastError,
+                ),
+              ),
+            );
+          }
+        },
+      );
+      if (next < urls.length) {
+        // This URL's share: what is left, split among it and those after it.
+        const share = Math.max(0, call.deadlineAt - Date.now()) / (urls.length - next + 1);
+        hedge = setTimeout(launch, share);
+      }
+    };
+    if (call.signal.aborted) {
+      onStop();
+      return;
     }
-  }
-  throw new ChainAdapterError(chainId, method, `all ${urls.length} RPC URL(s) failed`, lastError);
+    call.signal.addEventListener("abort", onStop, { once: true });
+    launch();
+  });
 }
 
-async function quorumDispatch(
-  chainId: string,
-  urls: readonly string[],
-  method: string,
-  params: ReadonlyArray<unknown>,
-  fetchImpl: typeof fetch,
-  id: number,
-  opts?: { readonly bypassCache?: boolean },
-): Promise<unknown> {
-  const results = await Promise.allSettled(
-    urls.map((u) => dispatchOne(chainId, u, method, params, fetchImpl, id, opts)),
-  );
-  const fulfilled = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
-  if (fulfilled.length === 0) {
-    throw new ChainAdapterError(chainId, method, "quorum failed: every RPC URL rejected");
-  }
-  // Quorum: require a strict majority agree on the result. Compare
-  // by JSON serialization so structural equality is bit-exact.
-  const counts = new Map<string, { value: unknown; n: number }>();
-  for (const v of fulfilled) {
-    const k = JSON.stringify(v);
-    const cur = counts.get(k);
-    if (cur === undefined) counts.set(k, { value: v, n: 1 });
-    else cur.n += 1;
-  }
+/**
+ * `quorum`: every URL at once, and the answer is the value a strict majority
+ * of them returned — as soon as it has one, so a slow voter does not hold an
+ * agreed answer back, and is closed. A voter that fails, or has not answered
+ * when the deadline passes, counts as not agreeing; the read fails when no
+ * value can reach the threshold any more. The caller's cancel ends it
+ * outright.
+ */
+function quorumDispatch(urls: readonly string[], call: Dispatch): Promise<unknown> {
+  const { chainId, method } = call;
   const threshold = Math.floor(urls.length / 2) + 1;
-  for (const { value, n } of counts.values()) {
-    if (n >= threshold) return value;
-  }
-  throw new ChainAdapterError(
-    chainId,
-    method,
-    `quorum failed: no value reached threshold ${threshold}/${urls.length}`,
-  );
+  return new Promise<unknown>((resolve, reject) => {
+    const stops: Array<() => void> = [];
+    // Compared by JSON serialization, so structural equality is bit-exact.
+    const counts = new Map<string, { readonly value: unknown; n: number }>();
+    let answered = 0;
+    let settled = 0;
+    let done = false;
+    /** Settle once, closing every voter still out — all but `winner`, whose answer this is. */
+    const finish = (settle: () => void, winner?: () => void): void => {
+      if (done) return;
+      done = true;
+      call.signal.removeEventListener("abort", onStop);
+      for (const stop of stops) if (stop !== winner) stop();
+      settle();
+    };
+    const fail = (why: string): void =>
+      finish(() => reject(new ChainAdapterError(chainId, method, why)));
+    const noQuorum = (): string =>
+      answered === 0
+        ? "quorum failed: every RPC URL rejected"
+        : `quorum failed: no value reached threshold ${threshold}/${urls.length}`;
+    const onStop = (): void => {
+      if (call.callerCancelled()) {
+        fail("the read was cancelled");
+        return;
+      }
+      fail(
+        answered === 0
+          ? `no answer within ${call.timeoutMs} ms`
+          : `${noQuorum()} — ${answered} of ${urls.length} answered within ${call.timeoutMs} ms`,
+      );
+    };
+    /** Settle once no value can reach the threshold with the voters still out. */
+    const decideIfLost = (): void => {
+      const best = Math.max(0, ...[...counts.values()].map((c) => c.n));
+      if (best + (urls.length - settled) < threshold) fail(noQuorum());
+    };
+    if (call.signal.aborted) {
+      onStop();
+      return;
+    }
+    call.signal.addEventListener("abort", onStop, { once: true });
+    for (const url of urls) {
+      const attempt = attemptOn(call);
+      stops.push(attempt.stop);
+      dispatchOne(url, attempt.call).then(
+        (value) => {
+          if (done) return;
+          settled++;
+          answered++;
+          const key = JSON.stringify(value);
+          const tally = counts.get(key) ?? { value, n: 0 };
+          tally.n += 1;
+          counts.set(key, tally);
+          if (tally.n >= threshold) {
+            finish(() => resolve(tally.value), attempt.stop);
+            return;
+          }
+          decideIfLost();
+        },
+        () => {
+          if (done) return;
+          settled++;
+          decideIfLost();
+        },
+      );
+    }
+  });
 }
 
-async function dispatchOne(
-  chainId: string,
-  url: string,
-  method: string,
-  params: ReadonlyArray<unknown>,
-  fetchImpl: typeof fetch,
-  id: number,
-  opts?: { readonly bypassCache?: boolean },
-): Promise<unknown> {
+async function dispatchOne(url: string, call: Dispatch): Promise<unknown> {
+  const { chainId, method, params, id } = call;
   const body: JsonRpcRequest = { jsonrpc: "2.0", id, method, params };
   let res: Response;
   try {
-    res = await fetchImpl(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    // The body stays encoded until the bounded reader decodes it, so a
+    // compressed answer cannot inflate past the cap before it is counted.
+    res = await call.fetchImpl(
+      url,
+      withRawBody({
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: call.signal,
+      }) as RequestInit,
+    );
   } catch (err) {
     // No `cause`: a dialler's error can quote the URL it failed on, and a
     // provider keeps its key in the URL's path.
@@ -206,16 +379,41 @@ async function dispatchOne(
     throw new ChainAdapterError(chainId, method, `network error: ${message}`);
   }
   if (!res.ok) {
+    try {
+      await res.body?.cancel();
+    } catch {
+      // already closed
+    }
     throw new ChainAdapterError(chainId, method, `HTTP ${res.status} from ${endpointLabel(url)}`);
   }
-  const text = await res.text();
+  const read = await readResponseBounded(res, {
+    maxBytes: MAX_RPC_RESPONSE_BYTES,
+    signal: call.signal,
+  });
+  if (!read.ok) {
+    throw new ChainAdapterError(
+      chainId,
+      method,
+      `the response from ${endpointLabel(url)} could not be read: ${read.code === "aborted" ? (call.cancelled() ?? "the read was stopped") : read.reason}`,
+    );
+  }
+  if (read.truncated) {
+    // Parsing a prefix is not an option — half a JSON-RPC answer is either
+    // an error or, worse, a shorter plausible one.
+    throw new ChainAdapterError(
+      chainId,
+      method,
+      `the response from ${endpointLabel(url)} is larger than ${MAX_RPC_RESPONSE_BYTES} bytes — refusing to read it`,
+    );
+  }
+  const text = read.text;
 
   // Pillar 3: classify the raw response BEFORE parsing. The classifier
   // operates on text — JSON-RPC error messages, decoded log strings,
   // and any other vector through which an attacker could plant a
   // malicious payload all hit the classifier first.
   const boundary = await classifyChainPayload(text, {
-    ...(opts?.bypassCache !== undefined ? { bypassCache: opts.bypassCache } : {}),
+    ...(call.bypassCache !== undefined ? { bypassCache: call.bypassCache } : {}),
   });
   if (boundary.action === "redact") {
     // The verbatim node response is suspected of carrying an injection

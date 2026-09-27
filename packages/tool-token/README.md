@@ -116,6 +116,16 @@ own `getEthBalance` to stay in that snapshot. `batch: false` reads them
 one at a time for chains with no Multicall3 deployment, and says in the answer
 that the result is not a snapshot.
 
+**Which Multicall3 is the operator's choice.** A batch is one `eth_call`, and
+every answer in it — decimals, balances, the block number — is whatever that
+contract returns, so a contract that fakes `aggregate3` can make a decimals
+mismatch read as verified. Batches go to the canonical deployment
+(`0xcA11bde05977b3631167028862bE2a173976CA11`) unless `tool_config.token.multicall3`
+names another for the chain; a call's `multicall3Address` is accepted only when
+it is that same address, and anything else is refused before any read. Every
+batched answer says who served it: `aggregator: { address, source }`, with
+`source` either `canonical` or `config`.
+
 A sub-call inside that batch is a contract call like any other, and one that
 does not answer is **not a zero**. A `getEthBalance` that came back empty —
 an aggregator without the helper, a sub-call out of gas — is reported as
@@ -149,9 +159,14 @@ chains:                              # the chain reader
 tool_config:
   token:
     metadata_origins: [https://ipfs.io]   # the only origins a tokenURI is read from
+    multicall3:                           # only where the canonical deployment is absent
+      "324": "0xF9cda624FBC7e059355ce98a31693d299FACd963"
 ```
 
 Without a `chains` block, a chain read refuses and names the block to write.
+These tools name a chain by its EIP-155 id, so declare it under that id in
+decimal (`id: "1"`, `id: "8453"`); a chain declared as `mainnet` is refused
+with the ids the spec does declare.
 Without `metadata_origins`, metadata is not fetched, and the answer says why.
 The metadata fetch goes through `@crewhaus/tool-http`'s gate: https only, the
 SSRF refusal, no redirects, a byte cap. The caller's own `allowedHosts` and
@@ -190,5 +205,6 @@ A tool that cannot say no is not finished. These say no, with the reason:
 - an `ipfs://` URI that resolves outside the gateway it was given
 - an `https://` metadata host nobody allow-listed, and any `http://` URI
 - a metadata document over the byte cap — refused rather than parsed as a prefix
+- a `multicall3Address` other than the canonical deployment or the one the operator configured
 - a Multicall3 address that answers with something other than results
 - a block tag that is not one, and a token id that is not a `uint256`

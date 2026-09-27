@@ -400,3 +400,35 @@ describe("F3b — every builtin's declaration is what a rule reads (permission-i
     ).toBe("ask");
   });
 });
+
+describe("EVM ids: rules read <chainId>/<address>, and case cannot dodge a deny", () => {
+  // ContractInspect, like every chain tool, scopes by `<chainId>/<address>`.
+  const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+  const inspect = (address: string) => ({ chainId: "1", address });
+
+  test("a deny written from a block explorer fires on the address in any letter case", async () => {
+    const checksummed = rules(["alwaysDeny", `ContractInspect(*/${USDT})`]);
+    for (const mode of ["default", "auto", "plan"] as const) {
+      for (const address of [USDT, USDT.toLowerCase()]) {
+        expect({
+          mode,
+          address,
+          d: await gate("ContractInspect", inspect(address), checksummed, mode),
+        }).toEqual({ mode, address, d: "deny" });
+      }
+    }
+    const lower = rules(["alwaysDeny", `ContractInspect(1/${USDT.toLowerCase()})`]);
+    expect(await gate("ContractInspect", inspect(USDT), lower, "auto")).toBe("deny");
+    // Another address is not caught, and a bare address (no chain) matches nothing.
+    const other = `${USDT.slice(0, -1)}8`;
+    expect(await gate("ContractInspect", inspect(other), checksummed, "auto")).toBe("allow");
+    expect(
+      await gate(
+        "ContractInspect",
+        inspect(USDT),
+        rules(["alwaysDeny", `ContractInspect(${USDT})`]),
+        "auto",
+      ),
+    ).toBe("allow");
+  });
+});

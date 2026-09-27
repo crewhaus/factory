@@ -362,10 +362,73 @@ describe("VatIdValidate", () => {
     expect(calls[0]?.accept).toBe("application/vnd.hmrc.1.0+json");
   });
 
-  test("HMRC's 404 is the one 404 that really means not registered", async () => {
-    serve({});
+  const hmrcLookup = `${ORIGINS.hmrc}/organisations/vat/check-vat-number/lookup/123456782`;
+
+  test("HMRC's NOT_FOUND code is the one 404 that really means not registered (C128)", async () => {
+    serve({
+      [hmrcLookup]: {
+        status: 404,
+        body: '{"code":"NOT_FOUND","message":"targetVrn does not match a registered company"}',
+      },
+    });
     const result = await call(vatIdValidate, { vatId: "GB123456782", now: NOW });
     expect(result).toMatchObject({ outcome: "notFound", register: "hmrc", code: "NOT_FOUND" });
+  });
+
+  test("any other HMRC 404 is could-not-check, never not-registered (C128)", async () => {
+    // What HMRC answers a version-1.0 request since it removed that version.
+    serve({ [hmrcLookup]: { status: 404, body: '{"code":"MATCHING_RESOURCE_NOT_FOUND"}' } });
+    const removed = await call(vatIdValidate, { vatId: "GB123456782", now: NOW });
+    expect(removed).toMatchObject({
+      outcome: "unavailable",
+      code: "MATCHING_RESOURCE_NOT_FOUND",
+      retryable: false,
+    });
+    expect(String(removed["basis"])).toContain("removed version 1.0");
+    for (const body of ["", "<html>not found</html>", '{"message":"no route"}']) {
+      calls = [];
+      serve({ [hmrcLookup]: { status: 404, body } });
+      const result = await call(vatIdValidate, { vatId: "GB123456782", now: NOW });
+      expect(result).toMatchObject({ outcome: "unavailable", code: "HTTP 404" });
+      expect(String(result["basis"])).toContain("with no error code");
+    }
+  });
+
+  test("an answer about a different number is not an answer about this one (C128)", async () => {
+    serve({ [hmrcLookup]: { target: { name: "SOMEONE ELSE", vatNumber: "111111111" } } });
+    const result = await call(vatIdValidate, { vatId: "GB123456782", now: NOW });
+    expect(result["outcome"]).toBe("unavailable");
+    expect(String(result["basis"])).toContain("answered about 111111111");
+    expect(result["registration"]).toBeUndefined();
+  });
+
+  test("a requester that is not a well-formed VRN is refused before it reaches the path (C128)", async () => {
+    // 0.7.0 interpolated it raw: "\\" became "/" and %2e%2e a dot-segment,
+    // so the request went to another HMRC path — or asked about another number.
+    for (const requesterVatId of [
+      "GB%2e%2e\\%2e%2e\\%2e%2e\\x",
+      "GB%2e%2e\\111111111",
+      "GB987654321?x=1",
+      "GBnot a vrn#frag",
+      "GB12",
+    ]) {
+      serveNothing();
+      const line = await raw(vatIdValidate, { vatId: "GB123456782", requesterVatId, now: NOW });
+      expect(line).toStartWith(`VatIdValidate will not use requesterVatId "${requesterVatId}"`);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  test("a well-formed requester sends exactly two numbers, and nothing else (C128)", async () => {
+    const twoParty = `${hmrcLookup}/987654321`;
+    serve({ [twoParty]: { target: { name: "ACME LTD", vatNumber: "123456782" } } });
+    const result = await call(vatIdValidate, {
+      vatId: "GB123456782",
+      requesterVatId: "GB 987 654 321",
+      now: NOW,
+    });
+    expect(result["outcome"]).toBe("found");
+    expect(calls.map((c) => c.url)).toEqual([twoParty]);
   });
 
   test("HMRC maintenance is unavailable", async () => {

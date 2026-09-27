@@ -2,11 +2,26 @@
  * Section 47 — `tool-evm`.
  *
  * Built-in read-only EVM tools. Each tool wraps a single JSON-RPC method
- * exposed by `chain-adapter-evm` and presents it to the model as a
- * typed, side-effect-free tool. Every tool is `readOnly: true` and
+ * exposed by `chain-adapter-evm` and presents it to the model as a typed
+ * tool that changes nothing on chain. Every tool is `readOnly: true` and
  * `classifyOutput: true` — the adapter already classified the raw
  * payload, but the second pass is the §41 "double-classify when in
  * doubt" stance: zero-cost cache hit + defense in depth.
+ *
+ * Permission rules scope these tools by chain AND contract, account or
+ * transaction: a rule's argument is `<chainId>/<address-or-hash>`, so
+ * `EvmCall(1/0xdAC17F…)` is USDT on mainnet, `EvmCall(**0xdAC17F…)` is that
+ * address on any chain, and `EvmGetLogs(1/*)` every log query on mainnet.
+ * A bare `EvmCall(0xdAC17F…)` or `EvmGetLogs(*)` matches nothing — `*` does
+ * not cross the `/`; write `**` for "any". A deny or ask ignores the letter
+ * case of the hex (EIP-55 case is only a checksum).
+ *
+ * Read-only is not offline: every call sends its arguments (EvmCall's
+ * calldata among them) to the chain's RPC endpoint. So every tool is
+ * `scope: "external"` with `ioCapability: "network"`, which is what puts
+ * the call in front of the egress classifier and the strict scope audit,
+ * and passes the call's signal to the adapter, so a cancelled call does not
+ * leave its read running.
  *
  * Catalog layer: R4 (built-in tool implementations). Slice 0 surface.
  * Destructive (signing) tools land in slice 1 as `@crewhaus/tool-evm-tx`.
@@ -22,10 +37,11 @@ import {
   CHAINS_BLOCK_EXAMPLE,
   type ChainAdapter,
   type ChainAdapterConfig,
+  type RpcReadOptions,
 } from "@crewhaus/chain-adapter-base";
 import { createEvmAdapters } from "@crewhaus/chain-adapter-evm";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 
 /**
@@ -62,6 +78,22 @@ export function bindEvmChains(config: {
 }
 
 /**
+ * What every tool here declares: it changes nothing, and it crosses the
+ * network to reach the chain's RPC endpoint.
+ */
+const RPC_READ = {
+  readOnly: true,
+  concurrencySafe: true,
+  scope: "external",
+  ioCapability: "network",
+} as const;
+
+/** The call's cancellation, handed to the adapter. */
+function readOptions(ctx: ToolExecuteContext | undefined): RpcReadOptions {
+  return ctx?.signal === undefined ? {} : { signal: ctx.signal };
+}
+
+/**
  * Resolve an adapter for `chainId` or throw a descriptive error
  * pointing the user at the spec's `chains[]` block.
  */
@@ -93,17 +125,18 @@ const callSchema = z.object({
 
 export const evmCall: RegisteredTool = buildTool({
   name: "EvmCall",
+  operativeArgs: [{ field: "to", kind: "id", within: "chainId" }],
   description:
     "Execute a read-only EVM `eth_call` against a contract. Returns the ABI-encoded result as a hex string. Use for view/pure functions like `balanceOf`, `allowance`, `getOwner`. For writes, see tool-evm-tx (slice 1).",
   inputSchema: callSchema,
-  readOnly: true,
-  concurrencySafe: true,
-  execute: async (input) => {
+  ...RPC_READ,
+  execute: async (input, ctx) => {
     const a = requireAdapter(input.chainId, "EvmCall");
-    const result = await a.rpcRead("eth_call", [
-      { to: input.to, data: input.data },
-      input.blockTag ?? "latest",
-    ]);
+    const result = await a.rpcRead(
+      "eth_call",
+      [{ to: input.to, data: input.data }, input.blockTag ?? "latest"],
+      readOptions(ctx),
+    );
     return typeof result === "string" ? result : JSON.stringify(result);
   },
 });
@@ -121,12 +154,15 @@ const getLogsSchema = z.object({
 
 export const evmGetLogs: RegisteredTool = buildTool({
   name: "EvmGetLogs",
+  // A call without `address` reads EVERY contract's logs, the broadest query
+  // there is, so it must carry a value a rule can see: it is matched as
+  // `<chainId>/*`, which `EvmGetLogs(1/*)` and `EvmGetLogs(**)` cover.
+  operativeArgs: [{ field: "address", kind: "id", within: "chainId", default: "*" }],
   description:
     "Fetch event logs matching the given filter. Returns an array of decoded log entries. The agent should normally request a bounded block range (≤ 5000 blocks) to avoid timeouts.",
   inputSchema: getLogsSchema,
-  readOnly: true,
-  concurrencySafe: true,
-  execute: async (input) => {
+  ...RPC_READ,
+  execute: async (input, ctx) => {
     const a = requireAdapter(input.chainId, "EvmGetLogs");
     const filter: Record<string, unknown> = {
       fromBlock: input.fromBlock,
@@ -134,7 +170,7 @@ export const evmGetLogs: RegisteredTool = buildTool({
     };
     if (input.address !== undefined) filter["address"] = input.address;
     if (input.topics !== undefined) filter["topics"] = input.topics;
-    const result = await a.rpcRead("eth_getLogs", [filter]);
+    const result = await a.rpcRead("eth_getLogs", [filter], readOptions(ctx));
     return JSON.stringify(result);
   },
 });
@@ -146,28 +182,28 @@ const getTxSchema = z.object({
 
 export const evmGetTransaction: RegisteredTool = buildTool({
   name: "EvmGetTransaction",
+  operativeArgs: [{ field: "txHash", kind: "id", within: "chainId" }],
   description:
     "Look up an EVM transaction by hash. Returns the transaction envelope (from, to, value, input, gas, status). Combine with EvmGetTransactionReceipt for confirmation count.",
   inputSchema: getTxSchema,
-  readOnly: true,
-  concurrencySafe: true,
-  execute: async (input) => {
+  ...RPC_READ,
+  execute: async (input, ctx) => {
     const a = requireAdapter(input.chainId, "EvmGetTransaction");
-    const result = await a.rpcRead("eth_getTransactionByHash", [input.txHash]);
+    const result = await a.rpcRead("eth_getTransactionByHash", [input.txHash], readOptions(ctx));
     return JSON.stringify(result);
   },
 });
 
 export const evmGetTransactionReceipt: RegisteredTool = buildTool({
   name: "EvmGetTransactionReceipt",
+  operativeArgs: [{ field: "txHash", kind: "id", within: "chainId" }],
   description:
     "Fetch the receipt for a transaction hash. Includes status (0x1 success / 0x0 revert), gasUsed, logs, and blockNumber. Use blockNumber + EvmBlockNumber to compute confirmation count for finality checks.",
   inputSchema: getTxSchema,
-  readOnly: true,
-  concurrencySafe: true,
-  execute: async (input) => {
+  ...RPC_READ,
+  execute: async (input, ctx) => {
     const a = requireAdapter(input.chainId, "EvmGetTransactionReceipt");
-    const result = await a.rpcRead("eth_getTransactionReceipt", [input.txHash]);
+    const result = await a.rpcRead("eth_getTransactionReceipt", [input.txHash], readOptions(ctx));
     return JSON.stringify(result);
   },
 });
@@ -180,14 +216,18 @@ const getBalanceSchema = z.object({
 
 export const evmGetBalance: RegisteredTool = buildTool({
   name: "EvmGetBalance",
+  operativeArgs: [{ field: "address", kind: "id", within: "chainId" }],
   description:
     "Read the native-token balance of an address (in wei, hex-encoded). For ERC-20 balances use EvmCall against the token contract's `balanceOf(address)` method.",
   inputSchema: getBalanceSchema,
-  readOnly: true,
-  concurrencySafe: true,
-  execute: async (input) => {
+  ...RPC_READ,
+  execute: async (input, ctx) => {
     const a = requireAdapter(input.chainId, "EvmGetBalance");
-    const result = await a.rpcRead("eth_getBalance", [input.address, input.blockTag ?? "latest"]);
+    const result = await a.rpcRead(
+      "eth_getBalance",
+      [input.address, input.blockTag ?? "latest"],
+      readOptions(ctx),
+    );
     return typeof result === "string" ? result : JSON.stringify(result);
   },
 });
@@ -198,14 +238,14 @@ const blockNumberSchema = z.object({
 
 export const evmBlockNumber: RegisteredTool = buildTool({
   name: "EvmBlockNumber",
+  operativeArgs: [{ field: "chainId", kind: "id" }],
   description:
     "Return the latest block number on the chain (hex-encoded). Use for finality and confirmation-count calculations.",
   inputSchema: blockNumberSchema,
-  readOnly: true,
-  concurrencySafe: true,
-  execute: async (input) => {
+  ...RPC_READ,
+  execute: async (input, ctx) => {
     const a = requireAdapter(input.chainId, "EvmBlockNumber");
-    const result = await a.rpcRead("eth_blockNumber", []);
+    const result = await a.rpcRead("eth_blockNumber", [], readOptions(ctx));
     return typeof result === "string" ? result : JSON.stringify(result);
   },
 });

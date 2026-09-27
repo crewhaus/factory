@@ -211,11 +211,21 @@ const simulateSchema = z.object({
 
 export const evmSimulate: RegisteredTool = buildTool({
   name: "EvmSimulate",
+  // The contract the simulated transaction calls. An `id`, not a
+  // `recipient`: nothing is sent to it — the calldata goes to the RPC
+  // endpoint the spec configured.
+  operativeArgs: [{ field: "to", kind: "id" }],
   description:
     "Simulate an EVM transaction without broadcasting. Useful as a pre-flight check before requesting approval. Returns success, gasUsed, returnData, and (if failed) revertReason. No state mutation.",
   inputSchema: simulateSchema,
   readOnly: true,
   concurrencySafe: true,
+  // Pillar 3 sink-side: nothing is signed or broadcast, but eth_call and
+  // eth_estimateGas carry the model-chosen to/data/value to the chain's RPC
+  // endpoint, so the payload crosses the network like any other egress.
+  scope: "external",
+  // FR-002 — declare the io-capability fact (JSON-RPC over the network).
+  ioCapability: "network",
   execute: async (input) => {
     const wallet = requireWallet(input.walletId, "EvmSimulate");
     const engine = requireEngine("EvmSimulate");

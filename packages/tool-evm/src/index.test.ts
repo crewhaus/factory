@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
-import { EVM_TOOL_MAP, setEvmAdapterResolver } from "./index";
+import { auditToolScopes } from "@crewhaus/tool-builder";
+import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { preparePermissionSubject } from "@crewhaus/tool-executor";
+import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
+import { EVM_TOOL_MAP, bindEvmChains, setEvmAdapterResolver } from "./index";
 
 type Call = { method: string; params: ReadonlyArray<unknown> };
 
@@ -31,6 +35,87 @@ describe("tool-evm: all tools surfaced with readOnly: true", () => {
       expect(tool.readOnly).toBe(true);
       expect(tool.destructive).toBe(false);
       expect(tool.classifyOutput).toBe(true);
+    }
+  });
+
+  test("every tool declares the RPC boundary it crosses (C041)", () => {
+    // Read-only is not offline: each call's arguments, EvmCall's calldata
+    // among them, go to the chain's RPC endpoint. Undeclared, the egress
+    // classifier and the strict scope audit never saw them.
+    const tools = Object.values(EVM_TOOL_MAP);
+    expect(tools).toHaveLength(6);
+    for (const tool of tools) {
+      expect({ name: tool.name, scope: tool.scope, io: tool.ioCapability }).toEqual({
+        name: tool.name,
+        scope: "external",
+        io: "network",
+      });
+    }
+    expect(auditToolScopes(tools)).toEqual([]);
+  });
+});
+
+describe("tool-evm: a call's cancellation reaches the adapter (C041)", () => {
+  const inputs: Record<string, Record<string, unknown>> = {
+    evmCall: { chainId: "1", to: "0xc", data: "0x" },
+    evmGetLogs: { chainId: "1", fromBlock: "0x0", toBlock: "latest" },
+    evmGetTransaction: { chainId: "1", txHash: "0xh" },
+    evmGetTransactionReceipt: { chainId: "1", txHash: "0xh" },
+    evmGetBalance: { chainId: "1", address: "0xa" },
+    evmBlockNumber: { chainId: "1" },
+  };
+
+  test("every tool hands its ctx.signal to rpcRead", async () => {
+    const seen: unknown[] = [];
+    setEvmAdapterResolver(() => ({
+      ...fakeAdapter(() => "0x1"),
+      async rpcRead(_method, _params, opts) {
+        seen.push(opts);
+        return "0x1";
+      },
+    }));
+    const { signal } = new AbortController();
+    for (const [key, tool] of Object.entries(EVM_TOOL_MAP)) {
+      await tool.execute(inputs[key] as never, { signal });
+    }
+    expect(seen).toHaveLength(6);
+    for (const opts of seen) expect(opts).toEqual({ signal });
+  });
+
+  test("a cancelled EvmGetLogs against a node that never answers ends", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () => new Promise<Response>(() => {}),
+    });
+    try {
+      bindEvmChains({
+        chains: [
+          {
+            chainId: "1",
+            rpcUrls: [`http://127.0.0.1:${server.port}/`],
+            rpcPolicy: "single",
+            finality: { kind: "finalized" },
+            reorgTolerant: true,
+          },
+        ],
+      });
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(), 50);
+      // A two-second sentinel, far past the 50 ms cancel: it wins only when
+      // nothing ends the read (0.7.0 had no signal to end it with).
+      const outcome = await Promise.race([
+        EVM_TOOL_MAP.evmGetLogs
+          .execute(inputs["evmGetLogs"] as never, { signal: cancel.signal })
+          .then(
+            () => "resolved",
+            (err: unknown) => err,
+          ),
+        Bun.sleep(2_000).then(() => "still pending"),
+      ]);
+      expect(String(outcome)).toContain("the read was cancelled");
+    } finally {
+      server.stop(true);
     }
   });
 });
@@ -213,5 +298,55 @@ describe("requireAdapter — unbound resolver branch", () => {
     await expect(EVM_TOOL_MAP.evmBlockNumber.execute({ chainId: "base-mainnet" })).rejects.toThrow(
       /EvmBlockNumber: no chain is configured\. Declare one in the spec — chains: \[/,
     );
+  });
+});
+
+describe("tool-evm: what a permission rule sees (review of 544b042d)", () => {
+  const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+  /** Would a deny or ask with `pattern` fire on this call, as the runtime prepares it? */
+  function restricts(tool: RegisteredTool, pattern: string, input: unknown): boolean {
+    const subject = preparePermissionSubject(tool, input);
+    if (!subject.ok) throw new Error(subject.reason);
+    return matchesPattern(compilePattern(pattern), tool.name, subject.input, {
+      polarity: "restrict",
+      ...(subject.operativeValues !== undefined
+        ? { operativeValues: subject.operativeValues }
+        : {}),
+    });
+  }
+
+  test("EvmGetLogs without an address carries <chainId>/*, so a chain-wide deny fires", () => {
+    const all = { chainId: "1", fromBlock: "0x1", toBlock: "0x2" };
+    // 544b042d left it with no value at all, which no argument-scoped rule of
+    // either polarity can match — the broadest query ran past every one.
+    for (const pattern of ["EvmGetLogs(1/*)", "EvmGetLogs(**)", "EvmGetLogs(*/*)"]) {
+      expect({ pattern, fires: restricts(EVM_TOOL_MAP.evmGetLogs, pattern, all) }).toEqual({
+        pattern,
+        fires: true,
+      });
+    }
+    expect(restricts(EVM_TOOL_MAP.evmGetLogs, "EvmGetLogs(8453/*)", all)).toBe(false);
+    // A rule about one contract is about that contract.
+    expect(restricts(EVM_TOOL_MAP.evmGetLogs, `EvmGetLogs(1/${USDT})`, all)).toBe(false);
+    expect(
+      restricts(EVM_TOOL_MAP.evmGetLogs, `EvmGetLogs(1/${USDT})`, { ...all, address: USDT }),
+    ).toBe(true);
+  });
+
+  test("the hex in a rule and in a call may differ in case", () => {
+    const call = (to: string) => ({ chainId: "1", to, data: "0x18160ddd" });
+    expect(restricts(EVM_TOOL_MAP.evmCall, `EvmCall(1/${USDT})`, call(USDT.toLowerCase()))).toBe(
+      true,
+    );
+    expect(restricts(EVM_TOOL_MAP.evmCall, `EvmCall(**${USDT.toLowerCase()})`, call(USDT))).toBe(
+      true,
+    );
+    const hash = `0x${"Ab".repeat(32)}`;
+    expect(
+      restricts(EVM_TOOL_MAP.evmGetTransaction, `EvmGetTransaction(1/${hash.toLowerCase()})`, {
+        chainId: "1",
+        txHash: hash,
+      }),
+    ).toBe(true);
   });
 });

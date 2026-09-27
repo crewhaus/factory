@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import type { ChainAdapter } from "@crewhaus/chain-adapter-base";
 import { _setRpc, bindChainCallChains } from "./index";
-import { resolveRpc } from "./lib/rpc";
+import { chainRpcFromAdapter, resolveRpc } from "./lib/rpc";
 
 let server: ReturnType<typeof Bun.serve>;
 let origin = "";
@@ -35,4 +36,25 @@ test("bound from the spec's chains block, each declared chain gets its transport
   expect(() => resolveRpc("1", "GasMarketRead")).toThrow(
     'no chain is configured for chainId "1" — declare it in spec.chains[]',
   );
+});
+
+test("the adapter seam passes the call's signal down, so a cancel reaches the request (C041)", async () => {
+  const seen: unknown[] = [];
+  const adapter: ChainAdapter = {
+    chainId: "1",
+    config: {
+      chainId: "1",
+      rpcUrls: [origin],
+      rpcPolicy: "single",
+      finality: { kind: "finalized" },
+      reorgTolerant: true,
+    },
+    rpcRead: async (_method, _params, opts) => {
+      seen.push(opts);
+      return "0x1";
+    },
+  };
+  const { signal } = new AbortController();
+  await chainRpcFromAdapter(adapter)("eth_blockNumber", [], { signal });
+  expect(seen).toEqual([{ signal }]);
 });

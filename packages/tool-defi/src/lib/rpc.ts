@@ -24,6 +24,7 @@
  */
 import { assertReadOnlyMethod } from "@crewhaus/chain-adapter-base";
 import { CrewhausError } from "@crewhaus/errors";
+import { parseMulticallMap } from "@crewhaus/tool-onchain";
 
 /** A refusal this package chose: a missing endpoint, a bad shape, a write attempt. */
 export class DefiError extends CrewhausError {
@@ -90,12 +91,18 @@ export function buildDefiConfig(input: DefiConfigInput): DefiConfig {
     if (typeof url !== "string") throw new DefiError(`rpc["${chainId}"] must be a URL string`);
     endpoints.set(String(chainId), assertEndpoint(url, chainId));
   }
-  const multicall = new Map<string, string>();
-  for (const [chainId, address] of Object.entries(input.multicall3 ?? {})) {
-    if (typeof address !== "string") {
-      throw new DefiError(`multicall3["${chainId}"] must be an address string`);
-    }
-    multicall.set(String(chainId), address.trim().toLowerCase());
+  // Checked like any address a coder writes: shape, and the EIP-55 checksum
+  // when it carries one. The deployment answers every read in a batch.
+  let multicall: Map<string, string>;
+  try {
+    multicall = new Map(
+      [...parseMulticallMap(input.multicall3, "multicall3")].map(([id, a]) => [
+        id,
+        a.toLowerCase(),
+      ]),
+    );
+  } catch (err) {
+    throw new DefiError((err as Error).message);
   }
   const feeds = new Map<string, FeedPin>();
   for (const [name, row] of Object.entries(input.feeds ?? {})) {
@@ -160,6 +167,13 @@ export function _resetDefiConfig(): void {
  * is looking at the spec, rather than three tool calls into a run.
  */
 function assertEndpoint(raw: string, chainId: string): string {
+  if (/^\$[A-Z_][A-Z0-9_]*$/.test(raw.trim())) {
+    // A bundle and `crewhaus run` read a `$VAR` value from the environment
+    // before this sees it; one arriving here was handed over unresolved.
+    throw new DefiError(
+      `rpc["${chainId}"] is ${raw.trim()}, an environment reference nothing resolved — a compiled bundle and crewhaus run read it from the environment at start; a direct registerDefiConfig caller passes the URL itself`,
+    );
+  }
   let url: URL;
   try {
     url = new URL(raw.trim());
@@ -301,7 +315,19 @@ export const DEFI_RPC_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 export type TransportFailure = {
-  readonly kind: "transport" | "status" | "rateLimited" | "malformed" | "rpcError" | "refused";
+  /**
+   * `budget`: not sent, because the call's price-provider requests are spent
+   * or held for the holdings after this one — nothing was asked, so nothing
+   * is known about what the provider publishes.
+   */
+  readonly kind:
+    | "transport"
+    | "status"
+    | "rateLimited"
+    | "malformed"
+    | "rpcError"
+    | "refused"
+    | "budget";
   readonly message: string;
   readonly status?: number;
   /** The JSON-RPC error code, when the node answered with one. */
@@ -313,11 +339,59 @@ export type RpcOutcome<T> =
   | ({ readonly ok: false } & TransportFailure);
 
 export type RpcOptions = {
+  /**
+   * The WHOLE call's signal: a tool opens one deadline per call
+   * ({@link startDeadline}) and hands its signal down, so every request the
+   * call makes shares one budget of time. Once it has aborted, nothing more
+   * is dialled.
+   */
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
   /** Only for the refusal message when a method is off the allow-list. */
   readonly chainId?: string;
+  /** The call's price-provider budget and answers, for {@link getJson}. */
+  readonly providers?: ProviderLedger;
 };
+
+/**
+ * What one tool call may ask the public price providers, and what it already
+ * has.
+ *
+ * `PortfolioValuation` prices up to 256 holdings, and one quote can take up to
+ * fifteen requests (direct, inverted, then crossed through two intermediates).
+ * Unbounded, one call could send thousands of requests to somebody else's
+ * public endpoint — and the same leg (USD/JPY, for every holding crossed
+ * through USD) was fetched again for every holding. The ledger caps the
+ * requests and answers a URL already fetched in this call from its answer.
+ */
+export type ProviderLedger = {
+  readonly limit: number;
+  made: number;
+  /**
+   * Requests held back for work still to come — one per holding a valuation
+   * has not reached — so assets that no provider lists cannot spend the
+   * budget before a later holding has been asked at all.
+   */
+  reserve: number;
+  /** How many requests were refused for budget, so a caller can say so. */
+  refused: number;
+  readonly answers: Map<string, Promise<RpcOutcome<unknown>>>;
+};
+
+export function newProviderLedger(limit: number): ProviderLedger {
+  return { limit, made: 0, reserve: 0, refused: 0, answers: new Map() };
+}
+
+/** Why nothing was dialled: the call's signal had already fired. */
+function notAsked(signal: AbortSignal, label: string, what: string): TransportFailure {
+  const cancelled = !(signal.reason instanceof DeadlineElapsed);
+  return {
+    kind: "transport",
+    message: `the deadline elapsed before ${label} was asked ${what}: ${
+      cancelled ? "the call was cancelled" : `the call's ${signal.reason.ms}ms were spent`
+    }`,
+  };
+}
 
 /**
  * Issue one JSON-RPC call.
@@ -344,6 +418,9 @@ export async function rpcCall<T = unknown>(
   }
 
   const label = endpointLabel(endpoint);
+  if (options.signal?.aborted === true) {
+    return { ok: false, ...notAsked(options.signal, label, method) };
+  }
   const deadline = startDeadline(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.signal);
   try {
     const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
@@ -480,6 +557,36 @@ export async function getJson(
   options: RpcOptions & { readonly accept?: string } = {},
 ): Promise<RpcOutcome<unknown>> {
   const label = endpointLabel(url);
+  if (options.signal?.aborted === true) {
+    return { ok: false, ...notAsked(options.signal, label, "for a price") };
+  }
+  const ledger = options.providers;
+  if (ledger === undefined) return dialJson(url, label, options);
+  const key = `${options.accept ?? "application/json"} ${url}`;
+  const known = ledger.answers.get(key);
+  if (known !== undefined) return known;
+  if (ledger.made >= ledger.limit - ledger.reserve) {
+    ledger.refused++;
+    return {
+      ok: false,
+      kind: "budget",
+      message:
+        ledger.made >= ledger.limit
+          ? `this call has already sent the ${ledger.limit} price-provider requests it may send, so ${label} was not asked — price fewer distinct assets per call`
+          : `${label} was not asked: the rest of this call's ${ledger.limit} price-provider requests is held for the ${ledger.reserve} holding(s) after this one — price fewer distinct assets per call`,
+    };
+  }
+  ledger.made++;
+  const answer = dialJson(url, label, options);
+  ledger.answers.set(key, answer);
+  return answer;
+}
+
+async function dialJson(
+  url: string,
+  label: string,
+  options: RpcOptions & { readonly accept?: string },
+): Promise<RpcOutcome<unknown>> {
   const deadline = startDeadline(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, options.signal);
   try {
     let res: Response;
@@ -671,7 +778,15 @@ async function readCapped(res: Response, maxBytes: number): Promise<string | nul
   return new TextDecoder("utf-8", { fatal: false }).decode(merged);
 }
 
-export type Deadline = { readonly signal: AbortSignal; cancel(): void };
+export type Deadline = { readonly signal: AbortSignal; readonly ms: number; cancel(): void };
+
+/** The abort reason of a deadline that ran out, as opposed to a cancellation. */
+export class DeadlineElapsed extends Error {
+  override readonly name = "DeadlineElapsed";
+  constructor(readonly ms: number) {
+    super(`deadline of ${ms}ms elapsed`);
+  }
+}
 
 /**
  * A deadline that also honours the runtime's own cancellation. Every call
@@ -680,7 +795,7 @@ export type Deadline = { readonly signal: AbortSignal; cancel(): void };
  */
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
+  const timer = setTimeout(() => controller.abort(new DeadlineElapsed(ms)), ms);
   const onOuter = (): void => controller.abort(outer?.reason);
   if (outer !== undefined) {
     if (outer.aborted) controller.abort(outer.reason);
@@ -688,6 +803,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   }
   return {
     signal: controller.signal,
+    ms,
     cancel: () => {
       clearTimeout(timer);
       outer?.removeEventListener("abort", onOuter);

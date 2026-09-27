@@ -44,7 +44,13 @@ import {
   revertWith,
   reverts,
 } from "./fixtures";
-import { TOKEN_TOOLS, erc20Balance, erc721TokenInfo, tokenResolve } from "./index";
+import {
+  TOKEN_TOOLS,
+  erc20Balance,
+  erc721TokenInfo,
+  registerTokenConfig,
+  tokenResolve,
+} from "./index";
 import { READ_METHODS, _setChainReader } from "./lib/chain";
 import { SELECTOR } from "./lib/erc";
 import { _setMetadataFetch } from "./lib/uri";
@@ -148,6 +154,7 @@ function mainnet(extra: Record<string, ContractHandler> = {}) {
 afterEach(() => {
   _setChainReader(undefined);
   _setMetadataFetch(undefined);
+  registerTokenConfig({});
 });
 
 // ---------------------------------------------------------------------------
@@ -315,6 +322,168 @@ describe("package-wide contract", () => {
 
 // ---------------------------------------------------------------------------
 
+describe("the aggregator is the operator's choice, not a call's (C127)", () => {
+  // An aggregator answers every read in a batch; any contract can implement
+  // aggregate3 and answer with rows it made up.
+  const ALT = "0x9999999999999999999999999999999999999999";
+  const ZKSYNC = "0xF9cda624FBC7e059355ce98a31693d299FACd963";
+
+  async function callWith(tool: RegisteredTool, input: unknown, toolConfig?: unknown) {
+    const parsed = tool.inputSchema.safeParse(input);
+    if (!parsed.success) throw new Error(parsed.error.message);
+    const out = await tool.execute(
+      parsed.data,
+      (toolConfig === undefined ? {} : { toolConfig }) as never,
+    );
+    return JSON.parse(out as string) as Json;
+  }
+
+  /** A chain whose Multicall3 sits at `at`, holding an honest USDC. */
+  function chainWithAggregatorAt(at: string) {
+    return chainStub({
+      blockNumber: 19_000_000n,
+      multicall3Address: at,
+      nativeBalances: { [low(ALICE)]: 1n },
+      contracts: {
+        [low(USDC)]: erc20({
+          decimals: 6n,
+          symbol: "USDC",
+          name: "USD Coin",
+          totalSupply: 10n ** 15n,
+          balances: { [low(ALICE)]: 5n },
+        }),
+      },
+    });
+  }
+
+  const callsTo = (stub: ReturnType<typeof chainStub>, address: string) =>
+    stub.reads.filter(
+      (r) =>
+        r.method === "eth_call" &&
+        String((r.params[0] as { to: string }).to).toLowerCase() === low(address),
+    );
+
+  test("an aggregator a call names and the operator did not is refused before any read", async () => {
+    const stub = chainWithAggregatorAt(ALT);
+    _setChainReader(stub.reader);
+    const refusal =
+      /multicall3Address "0x9{40}" is not the Multicall3 chain 1 reads through \(0xcA11bde05977b3631167028862bE2a173976CA11\).*tool_config\.token\.multicall3/;
+    await expect(
+      callWith(tokenResolve, {
+        chainId: 1,
+        query: "USDC",
+        lists: [UNISWAP_LIST],
+        multicall3Address: ALT,
+      }),
+    ).rejects.toThrow(refusal);
+    await expect(
+      callWith(erc20Balance, {
+        chainId: 1,
+        token: USDC,
+        accounts: [ALICE],
+        multicall3Address: ALT,
+      }),
+    ).rejects.toThrow(refusal);
+    await expect(
+      callWith(erc20Balance, {
+        chainId: 1,
+        token: "native",
+        accounts: [ALICE],
+        multicall3Address: ALT,
+      }),
+    ).rejects.toThrow(refusal);
+    await expect(
+      callWith(erc721TokenInfo, {
+        chainId: 1,
+        contract: USDC,
+        tokenId: "1",
+        multicall3Address: ALT,
+      }),
+    ).rejects.toThrow(refusal);
+    expect(callsTo(stub, ALT)).toEqual([]);
+    expect(stub.reads).toEqual([]);
+  });
+
+  test("the operator's per-chain deployment is used, and the answer says who served it", async () => {
+    const stub = chainWithAggregatorAt(ZKSYNC);
+    _setChainReader(stub.reader);
+    const config = { multicall3: { "1": low(ZKSYNC) } };
+    const resolved = await callWith(
+      tokenResolve,
+      { chainId: 1, query: "USDC", lists: [UNISWAP_LIST] },
+      config,
+    );
+    expect(resolved.resolved).toBe(true);
+    expect(resolved.verified).toBe(true);
+    expect(resolved.aggregator).toEqual({ address: ZKSYNC, source: "config" });
+    // A call may still name it, in any case, since it is the one that would be used.
+    const balance = await callWith(
+      erc20Balance,
+      {
+        chainId: 1,
+        token: USDC,
+        accounts: [ALICE],
+        multicall3Address: ZKSYNC.toUpperCase().replace("0X", "0x"),
+      },
+      config,
+    );
+    expect(balance.balances[0].raw).toBe("5");
+    expect(balance.aggregator).toEqual({ address: ZKSYNC, source: "config" });
+    expect(callsTo(stub, ZKSYNC).length).toBe(2);
+    // The same from the boot registration, which a candidate's own block replaces.
+    registerTokenConfig({ multicall3: { "1": ZKSYNC } });
+    const booted = await callWith(erc20Balance, { chainId: 1, token: USDC, accounts: [ALICE] });
+    expect(booted.aggregator.source).toBe("config");
+    await expect(
+      callWith(erc20Balance, { chainId: 1, token: USDC, accounts: [ALICE] }, {}),
+    ).rejects.toThrow(/did not answer with results/);
+  });
+
+  test("with nothing configured the canonical deployment serves, and says so", async () => {
+    const stub = mainnet();
+    _setChainReader(stub.reader);
+    const out = await callWith(erc20Balance, {
+      chainId: 1,
+      token: USDC,
+      accounts: [ALICE],
+      multicall3Address: "0xca11bde05977b3631167028862be2a173976ca11",
+    });
+    expect(out.aggregator).toEqual({
+      address: "0xcA11bde05977b3631167028862bE2a173976CA11",
+      source: "canonical",
+    });
+  });
+
+  test("batch:false never contacts an aggregator, whatever a call names", async () => {
+    const stub = mainnet();
+    _setChainReader(stub.reader);
+    const out = await callWith(erc20Balance, {
+      chainId: 1,
+      token: USDC,
+      accounts: [ALICE],
+      batch: false,
+      multicall3Address: ALT,
+    });
+    expect(out.aggregator).toBeNull();
+    expect(out.balances[0].raw).toBe("1500000");
+    expect(callsTo(stub, ALT)).toEqual([]);
+  });
+
+  test("a configured deployment must be an address whose checksum holds", () => {
+    expect(() =>
+      registerTokenConfig({ multicall3: { "324": "0xF9cda624FBC7e059355ce98a31693d299FACd96" } }),
+    ).toThrow(
+      'tool_config.token.multicall3["324"]: an address is 0x followed by 40 hex characters; this has 39',
+    );
+    expect(() =>
+      registerTokenConfig({ multicall3: { "324": "0xF9cda624FBC7e059355ce98a31693d299FACd964" } }),
+    ).toThrow(/\["324"\]: the EIP-55 checksum does not match/);
+    expect(() => registerTokenConfig({ multicall3: ["0x"] } as never)).toThrow(
+      /must map a chain id to its Multicall3 address/,
+    );
+  });
+});
+
 describe("Erc20Balance", () => {
   test("reads balances for several accounts at one block, in base units and decimal", async () => {
     const stub = mainnet();
@@ -413,8 +582,8 @@ describe("Erc20Balance", () => {
   });
 
   test("a native balance the batch could not answer is NOT a zero balance", async () => {
-    // `multicall3Address` is caller input, and an aggregator that is not the
-    // canonical Multicall3 need not carry `getEthBalance` at all. The answer
+    // An operator's own Multicall3 deployment need not carry `getEthBalance`
+    // at all, as the canonical one does. The answer
     // that came back was no answer; reporting it as 0 ETH is the one number a
     // gas check or a drained-wallet alarm would act on without looking.
     const stub = chainStub({ contracts: {}, withoutMulticallHelpers: true });

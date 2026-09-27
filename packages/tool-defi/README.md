@@ -131,7 +131,22 @@ a holding goes to `unpriced[]` — never to zero, never to absence — when:
 - its Pyth confidence band is past the bound you supplied;
 - its token's `decimals()` could not be read and none was given (defaulting to
   18 on a six-decimal token is a factor of a trillion);
-- a provider refused, rate-limited, or answered in the wrong currency.
+- a provider refused, rate-limited, or answered in the wrong currency;
+- the call ran out of time, or out of provider requests, before reaching it.
+
+`timeoutMs` is one deadline for the **whole call**, every request it makes
+included (20 s by default; 60 s for `PortfolioValuation`, which reads
+holding by holding; 120 s at most). Once it passes, nothing more is asked of
+anybody: the holdings not yet priced are listed with that reason, and a note
+says how many. A `PortfolioValuation` also sends at most four requests to the
+public price providers per holding priced from one (what an asset nobody lists
+costs in a fiat currency), between 16 and 512 for the call; a single
+`PriceQuote` sends at most 16. A pair or a leg already fetched is reused rather
+than asked for again, so twenty holdings of BTC cost one quote, and every
+holding not yet reached keeps one request in reserve, so a run of tokens no
+provider lists cannot leave a later holding unasked. A route the budget did not
+ask is named as "not asked" in its row — never as something the provider does
+not publish — and a note counts those rows.
 
 `weightBps` is a share of the **priced** total, which is stated in the payload
 too — the weights of an incomplete portfolio still sum to 10000, and that is

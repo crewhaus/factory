@@ -25,12 +25,14 @@ import {
   UINT256_MAX,
   addressFromWord,
   asSigned,
+  asUnsigned,
   callWithAddress,
   callWithAddresses,
   callWithBytes32,
   callWithUint256,
   decodeString,
   decodeWords,
+  isCanonicalInt,
   normalizeAddress,
   sanitizeContractText,
 } from "./lib/abi";
@@ -337,6 +339,28 @@ describe("ABI, against @crewhaus/tool-onchain's coder", () => {
     expect(() => asSigned(1n, 257)).toThrow(AbiError);
   });
 
+  test("a uint64 at or above 2^63 reads positive through asUnsigned (C204)", async () => {
+    const data = await encodeReturn(["uint64"], [(1n << 63n).toString()]);
+    const [word] = decodeWords(data, 1, "conf") as [bigint];
+    expect(asUnsigned(word, 64)).toBe(1n << 63n);
+    // What 0.7.0 read it as.
+    expect(asSigned(word, 64)).toBe(-(1n << 63n));
+    expect(asUnsigned((1n << 64n) - 1n, 64)).toBe((1n << 64n) - 1n);
+    expect(asUnsigned((1n << 64n) | 5n, 64)).toBe(5n);
+    expect(() => asUnsigned(1n, 0)).toThrow(AbiError);
+    expect(() => asUnsigned(1n, 257)).toThrow(AbiError);
+  });
+
+  test("isCanonicalInt says whether a word is what an encoder writes for the type", async () => {
+    const [neg] = decodeWords(await encodeReturn(["int32"], ["-8"]), 1, "e") as [bigint];
+    expect(isCanonicalInt(neg, 32, true)).toBe(true);
+    expect(isCanonicalInt(neg, 32, false)).toBe(false);
+    expect(isCanonicalInt((1n << 64n) - 1n, 64, false)).toBe(true);
+    expect(isCanonicalInt(1n << 64n, 64, false)).toBe(false);
+    // Low 64 bits negative, upper bits zero: not a sign extension.
+    expect(isCanonicalInt(1n << 63n, 64, true)).toBe(false);
+  });
+
   test("decodeString reads the same string AbiDecode does, offset and all", async () => {
     const data = await encodeReturn(["string"], ["ETH / USD"]);
     expect(decodeString(data, "description()")).toBe("ETH / USD");
@@ -386,6 +410,44 @@ describe("configuration", () => {
     expect(() => buildDefiConfig({ rpc: { "1": "https://user:pass@node.example" } })).toThrow(
       /userinfo/,
     );
+  });
+
+  test("an endpoint's refusal never repeats the value, which a $VAR may have supplied (C156)", () => {
+    // A bundle resolves `rpc: { "1": $ETH_RPC_URL }` before this sees it
+    // (tool-categories' applyToolConfig); what the environment held must not
+    // come back in a refusal.
+    for (const resolved of [
+      "eth.example/v2/KEY-FROM-ENV",
+      "ftp://eth.example/v2/KEY-FROM-ENV",
+      "https://user:KEY-FROM-ENV@eth.example/v2/x",
+    ]) {
+      expect(() => buildDefiConfig({ rpc: { "1": resolved } })).toThrow(DefiError);
+      try {
+        buildDefiConfig({ rpc: { "1": resolved } });
+      } catch (err) {
+        expect({ resolved, leaks: (err as Error).message.includes("KEY-FROM-ENV") }).toEqual({
+          resolved,
+          leaks: false,
+        });
+      }
+    }
+    // Handed over unresolved, the reference is named for what it is.
+    expect(() => buildDefiConfig({ rpc: { "1": "$ETH_RPC_URL" } })).toThrow(
+      'rpc["1"] is $ETH_RPC_URL, an environment reference nothing resolved',
+    );
+  });
+
+  test("a Multicall3 deployment is held to the address check at config time (C127)", () => {
+    // The aggregator answers every read in a batch; 0.7.0 lowercased whatever
+    // was written, so a mistyped mixed-case address became every answer.
+    expect(() =>
+      buildDefiConfig({ multicall3: { "324": "0xF9cda624FBC7e059355ce98a31693d299FACd964" } }),
+    ).toThrow(/multicall3\["324"\]: the EIP-55 checksum does not match/);
+    expect(() => buildDefiConfig({ multicall3: { "324": "0x1234" } })).toThrow(DefiError);
+    expect(
+      buildDefiConfig({ multicall3: { "324": "0xF9cda624FBC7e059355ce98a31693d299FACd963" } })
+        .multicall,
+    ).toEqual(new Map([["324", "0xf9cda624fbc7e059355ce98a31693d299facd963"]]));
   });
 
   test("a pyth feed without a price id is refused at config time", () => {
@@ -685,11 +747,10 @@ describe("the batch", () => {
  * to one.
  */
 describe("what a contract is allowed to say", () => {
-  test("an address word is the LOW 20 bytes, as tool-onchain's decoder reads it", async () => {
-    // The ABI says the top 12 bytes of an address word are zero and nothing on
-    // the receiving end enforces it. Formatting the whole word instead gives a
-    // 66-character string that is not an address, and every address check
-    // downstream then rejects a read that was perfectly good.
+  test("an address word is the LOW 20 bytes, and dirty padding is reported, not hidden", async () => {
+    // The ABI says the top 12 bytes of an address word are zero. Formatting
+    // the whole word instead gives a 66-character string that is not an
+    // address, and every address check downstream then rejects the read.
     const clean = BigInt(ADDR.usdc);
     const dirty = (BigInt(`0x${"ff".repeat(12)}`) << 160n) | clean;
 
@@ -698,12 +759,18 @@ describe("what a contract is allowed to say", () => {
     // Leading zero bytes in the address itself must still pad out to 40.
     expect(addressFromWord(0xabn).address).toBe(`0x${"0".repeat(38)}ab`);
 
-    // The oracle: tool-onchain's own decoder, on the same dirty word.
-    const encoded = `0x${dirty.toString(16).padStart(64, "0")}`;
+    // The oracle: tool-onchain's own decoder reads the clean word the same
+    // way. It REFUSES the dirty one (C209), as Solidity's decoder does; this
+    // package reads it and flags it instead, so one non-conforming contract
+    // costs a caveat on a row rather than the whole read.
+    const word = (value: bigint): string => `0x${value.toString(16).padStart(64, "0")}`;
     const out = JSON.parse(
-      (await abiDecode.execute({ data: encoded, types: ["address"] }, ctx)) as string,
+      (await abiDecode.execute({ data: word(clean), types: ["address"] }, ctx)) as string,
     ) as { values: string[] };
-    expect((out.values[0] as string).toLowerCase()).toBe(addressFromWord(dirty).address);
+    expect((out.values[0] as string).toLowerCase()).toBe(addressFromWord(clean).address);
+    await expect(abiDecode.execute({ data: word(dirty), types: ["address"] }, ctx)).rejects.toThrow(
+      /non-zero upper bytes/,
+    );
   });
 
   test("a contract-supplied label is capped and scrubbed, and says when it was", () => {

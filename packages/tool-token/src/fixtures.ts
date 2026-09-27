@@ -205,9 +205,8 @@ export function chainStub(opts: {
   /**
    * A Multicall3-shaped contract that implements `aggregate3` and nothing
    * else, so `getEthBalance` and `getBlockNumber` reach its fallback and
-   * answer with no data. Real: `multicall3Address` is a caller-supplied
-   * address, and an aggregator that is not the canonical deployment has no
-   * obligation to carry the helpers.
+   * answer with no data. Real: an operator's own deployment on a chain where
+   * the canonical one is absent has no obligation to carry the helpers.
    */
   readonly withoutMulticallHelpers?: boolean;
 }): ChainStub {

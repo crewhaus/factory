@@ -522,6 +522,21 @@ describe("EvmRpcHealth", () => {
     expect((second?.errors as string[]).join(" ")).toContain("0x hex quantity");
   });
 
+  test("an unparseable rpcUrl is reported without its path, in errors as in origin (C157)", async () => {
+    serve(makeChain({ blocks: 300, startTimestamp: START, blockTime: 12n }));
+    const result = await call(evmRpcHealth, {
+      rpcUrl: "https://rpc.example.com:443443/v2/SECRETPATHKEY",
+      compareWith: ["backup.example.com/v3/SECRETPATHKEY2"],
+    });
+    const endpoints = result.endpoints as Array<Record<string, unknown>>;
+    expect(endpoints.map((e) => [e["origin"], e["reachable"]])).toEqual([
+      ["(unparseable url)", false],
+      ["(unparseable url)", false],
+    ]);
+    expect((endpoints[0]?.["errors"] as string[]).join(" ")).toContain("not an absolute URL");
+    expect(JSON.stringify(result)).not.toContain("SECRETPATHKEY");
+  });
+
   test("a client too old for eth_chainId is asked net_version instead", async () => {
     // Pre-2018 clients, and a few L2 devnets, answer eth_chainId with "method
     // not found" and net_version with the same number in decimal. One extra

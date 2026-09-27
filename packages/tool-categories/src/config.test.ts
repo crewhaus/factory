@@ -461,6 +461,21 @@ describe("what a registrar would refuse, found at compile time", () => {
     ]);
   });
 
+  test("an entry that does not parse is named by position, never repeated (C157)", () => {
+    // A keyed provider URL written without its scheme: its key is its path.
+    const found = problems("registerChainreadConfig", {
+      allowed_origins: ["eth-mainnet.g.alchemy.com/v2/SECRET-PROVIDER-KEY"],
+    });
+    expect(found).toEqual([
+      {
+        path: "tool_config.k.allowed_origins[0]",
+        message:
+          "is not an origin — it must start with https:// (or http://). Write it as https://host[:port]; the value is not repeated here, because a provider keeps its key in the path.",
+      },
+    ]);
+    expect(JSON.stringify(found)).not.toContain("SECRET");
+  });
+
   test("a host with a port but no scheme is named as that, not as a strange scheme", () => {
     expect(
       problems("registerHttpConfig", { allowed_origins: ["localhost:8080"] })[0]?.message,

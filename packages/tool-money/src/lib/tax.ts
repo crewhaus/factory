@@ -12,6 +12,8 @@
  * differ, and a tool that picked one silently would be wrong half the time.
  */
 
+import { big, mathRound, toNumber } from "./exact";
+
 export const ROUNDING_MODES = ["half-up", "half-even", "down", "up"] as const;
 export type RoundingMode = (typeof ROUNDING_MODES)[number];
 
@@ -82,38 +84,54 @@ export type TaxResult = {
   readonly scope: RoundingScope;
 };
 
-/** Round a rational to an integer, by the caller's rule. */
-export function roundMinor(numerator: number, denominator: number, mode: RoundingMode): number {
-  if (denominator === 0) throw new Error("denominator must not be zero");
-  const negative = numerator < 0 !== denominator < 0;
-  const n = Math.abs(numerator);
-  const d = Math.abs(denominator);
-  const whole = Math.floor(n / d);
+/**
+ * Round a rational to an integer, by the caller's rule, exactly: the
+ * numerator is an amount times a rate in basis points, which passes 2^53 long
+ * before the amount or the answer does.
+ */
+export function roundMinorExact(
+  numerator: bigint,
+  denominator: bigint,
+  mode: RoundingMode,
+): bigint {
+  if (denominator === 0n) throw new Error("denominator must not be zero");
+  const negative = numerator < 0n !== denominator < 0n;
+  const n = numerator < 0n ? -numerator : numerator;
+  const d = denominator < 0n ? -denominator : denominator;
+  const whole = n / d;
   const remainder = n - whole * d;
-  let result: number;
+  let result: bigint;
   switch (mode) {
     case "down":
       result = whole;
       break;
     case "up":
-      result = remainder > 0 ? whole + 1 : whole;
+      result = remainder > 0n ? whole + 1n : whole;
       break;
     case "half-even": {
-      const twice = remainder * 2;
-      if (twice > d) result = whole + 1;
+      const twice = remainder * 2n;
+      if (twice > d) result = whole + 1n;
       else if (twice < d) result = whole;
       // Exactly half: go to the even neighbour. Over many lines this is what
       // keeps a total from drifting upward the way half-up does.
-      else result = whole % 2 === 0 ? whole : whole + 1;
+      else result = whole % 2n === 0n ? whole : whole + 1n;
       break;
     }
     default:
-      result = remainder * 2 >= d ? whole + 1 : whole;
+      result = remainder * 2n >= d ? whole + 1n : whole;
   }
   return negative ? -result : result;
 }
 
-const BPS_DENOMINATOR = 10_000;
+/** {@link roundMinorExact} over integer numbers, for callers holding numbers. */
+export function roundMinor(numerator: number, denominator: number, mode: RoundingMode): number {
+  return toNumber(
+    roundMinorExact(big(numerator, "numerator"), big(denominator, "denominator"), mode),
+    "the rounded amount",
+  );
+}
+
+const BPS_DENOMINATOR = 10_000n;
 
 export function calculateTax(
   lines: ReadonlyArray<TaxLine>,
@@ -133,64 +151,69 @@ export function calculateTax(
       }
     }
   }
-  if (!Number.isInteger(lines.reduce((s, l) => s + l.amountMinor, 0))) {
-    throw new Error("amounts must be integer minor units");
-  }
-
-  const tally = new Map<string, { bps: number; taxMinor: number; netMinor: number }>();
+  // Exact throughout: every amount and rate as a bigint, and a figure goes
+  // back to a number only when it fits. See ./exact.
+  const tally = new Map<string, { bps: number; taxMinor: bigint; netMinor: bigint }>();
   const results: TaxLineResult[] = [];
   // Exact totals kept as numerator over BPS_DENOMINATOR, so invoice-scope
   // rounding rounds the true sum rather than a sum of rounded pieces.
-  let exactTaxNumerator = 0;
+  let exactTaxNumerator = 0n;
+  let netTotal = 0n;
+  let summedTax = 0n;
 
   for (const line of lines) {
-    if (!Number.isInteger(line.amountMinor)) {
-      throw new Error(`line "${line.id}" has a non-integer amount; use minor units`);
-    }
+    const amount = big(line.amountMinor, `line "${line.id}" amountMinor`);
     const applied = line.exempt || options.reverseCharge ? [] : line.taxCodes;
     const rateList = applied.map((code) => byCodeIndex.get(code) as TaxRate);
 
     // Net is the base everything is charged on. When listed prices already
     // include tax it has to be recovered first: gross / (1 + total rate).
-    let netMinor: number;
+    let net: bigint;
     if (options.pricesIncludeTax && rateList.length > 0) {
       let multiplier = BPS_DENOMINATOR;
       for (const rate of rateList) {
+        const bps = big(rate.bps, `rate "${rate.code}" bps`);
         multiplier = rate.compound
-          ? Math.round((multiplier * (BPS_DENOMINATOR + rate.bps)) / BPS_DENOMINATOR)
-          : multiplier + rate.bps;
+          ? mathRound(multiplier * (BPS_DENOMINATOR + bps), BPS_DENOMINATOR)
+          : multiplier + bps;
       }
-      netMinor = roundMinor(line.amountMinor * BPS_DENOMINATOR, multiplier, mode);
+      net = roundMinorExact(amount * BPS_DENOMINATOR, multiplier, mode);
     } else {
-      netMinor = line.amountMinor;
+      net = amount;
     }
 
     const breakdown: Array<{ code: string; bps: number; taxMinor: number }> = [];
-    let lineTax = 0;
+    let lineTax = 0n;
     for (const rate of rateList) {
       // `compound` describes the base THIS rate is charged on — net plus the
       // taxes already applied — not an effect on the rates after it. Adding
       // to the base afterwards instead left the compound rate itself charged
       // on the bare net, which is the whole thing the flag exists to change.
-      const base = rate.compound ? netMinor + lineTax : netMinor;
-      const numerator = base * rate.bps;
-      const taxMinor = roundMinor(numerator, BPS_DENOMINATOR, mode);
+      const base = rate.compound ? net + lineTax : net;
+      const numerator = base * big(rate.bps, `rate "${rate.code}" bps`);
+      const taxMinor = roundMinorExact(numerator, BPS_DENOMINATOR, mode);
       exactTaxNumerator += numerator;
-      breakdown.push({ code: rate.code, bps: rate.bps, taxMinor });
+      breakdown.push({
+        code: rate.code,
+        bps: rate.bps,
+        taxMinor: toNumber(taxMinor, `line "${line.id}" ${rate.code} tax`),
+      });
       lineTax += taxMinor;
-      const seen = tally.get(rate.code) ?? { bps: rate.bps, taxMinor: 0, netMinor: 0 };
+      const seen = tally.get(rate.code) ?? { bps: rate.bps, taxMinor: 0n, netMinor: 0n };
       tally.set(rate.code, {
         bps: rate.bps,
         taxMinor: seen.taxMinor + taxMinor,
-        netMinor: seen.netMinor + netMinor,
+        netMinor: seen.netMinor + net,
       });
     }
 
+    netTotal += net;
+    summedTax += lineTax;
     results.push({
       id: line.id,
-      netMinor,
-      taxMinor: lineTax,
-      grossMinor: netMinor + lineTax,
+      netMinor: toNumber(net, `line "${line.id}" net`),
+      taxMinor: toNumber(lineTax, `line "${line.id}" tax`),
+      grossMinor: toNumber(net + lineTax, `line "${line.id}" gross`),
       breakdown,
       note: options.reverseCharge
         ? "reverse charge: the customer accounts for the tax"
@@ -200,18 +223,21 @@ export function calculateTax(
     });
   }
 
-  const netMinor = results.reduce((s, r) => s + r.netMinor, 0);
-  const summedTax = results.reduce((s, r) => s + r.taxMinor, 0);
-  const taxMinor =
-    scope === "invoice" ? roundMinor(exactTaxNumerator, BPS_DENOMINATOR, mode) : summedTax;
+  const taxTotal =
+    scope === "invoice" ? roundMinorExact(exactTaxNumerator, BPS_DENOMINATOR, mode) : summedTax;
 
   return {
     lines: results,
-    netMinor,
-    taxMinor,
-    grossMinor: netMinor + taxMinor,
+    netMinor: toNumber(netTotal, "the invoice's net"),
+    taxMinor: toNumber(taxTotal, "the invoice's tax"),
+    grossMinor: toNumber(netTotal + taxTotal, "the invoice's gross"),
     byCode: [...tally.entries()]
-      .map(([code, v]) => ({ code, ...v }))
+      .map(([code, v]) => ({
+        code,
+        bps: v.bps,
+        taxMinor: toNumber(v.taxMinor, `the ${code} tax`),
+        netMinor: toNumber(v.netMinor, `the net taxed at ${code}`),
+      }))
       .sort((a, b) => (a.code < b.code ? -1 : 1)),
     reverseCharge: options.reverseCharge === true,
     rounding: mode,

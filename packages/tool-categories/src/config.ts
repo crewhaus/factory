@@ -557,7 +557,13 @@ function originProblem(entry: unknown, httpsOnly: boolean): string | undefined {
   try {
     url = new URL(entry);
   } catch {
-    return `"${entry}" is not an origin. Write it as https://host[:port].`;
+    // Not repeated: what fails to parse here is most often a provider URL
+    // written without its scheme, and the provider's key is in its path.
+    return `is not an origin — ${
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(entry)
+        ? "check the host and the port"
+        : "it must start with https:// (or http://)"
+    }. Write it as https://host[:port]; the value is not repeated here, because a provider keeps its key in the path.`;
   }
   const ok = httpsOnly
     ? url.protocol === "https:"

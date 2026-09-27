@@ -164,6 +164,12 @@ export type JsonFetch =
       readonly message: string;
       /** Seconds the server asked us to wait, when it said. */
       readonly retryAfter?: string;
+      /**
+       * On `notFound`: the `code` field of the register's JSON error body,
+       * when it had one. A 404 says a route matched nothing, which is only
+       * about the subject when the register's code says so.
+       */
+      readonly code?: string;
     };
 
 export type GetJsonOptions = {
@@ -287,12 +293,13 @@ export async function getJson(rawUrl: string, options: GetJsonOptions = {}): Pro
     }
 
     if (res.status === 404 || res.status === 410) {
-      await discard(res);
+      const code = await errorCode(res);
       return {
         ok: false,
         kind: "notFound",
         status: res.status,
-        message: `${safeLabel(current)} answered ${res.status}`,
+        message: `${safeLabel(current)} answered ${res.status}${code === undefined ? "" : ` (${code})`}`,
+        ...(code === undefined ? {} : { code }),
       };
     }
     if (res.status === 401 || res.status === 403) {
@@ -360,6 +367,28 @@ export function safeLabel(url: URL | string): string {
     return `${parsed.origin}${parsed.pathname}`;
   } catch {
     return String(url);
+  }
+}
+
+/** An error body is small; anything past this is not one worth reading. */
+const ERROR_BODY_BYTES = 4096;
+
+/**
+ * The `code` of a JSON error body — `{"code":"NOT_FOUND","message":…}` —
+ * read under a small cap, or undefined when there is none to read.
+ */
+async function errorCode(res: Response): Promise<string | undefined> {
+  const body = await readCapped(res, ERROR_BODY_BYTES);
+  if (body.truncated) return undefined;
+  try {
+    const parsed = JSON.parse(body.text) as unknown;
+    const code =
+      typeof parsed === "object" && parsed !== null
+        ? (parsed as Record<string, unknown>)["code"]
+        : undefined;
+    return typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code) ? code : undefined;
+  } catch {
+    return undefined;
   }
 }
 

@@ -66,6 +66,27 @@ nothing on a chain. So:
   percentage, because a percentage invites a decimal and a decimal invites a
   float.
 
+- **Data that decodes to far more than itself.** Return data comes from
+  whoever deployed the contract, and nothing in the ABI format stops two
+  offsets pointing at the same bytes: a few kilobytes whose heads all share
+  one tail decode to millions of values. `AbiDecode` (and every package that
+  decodes through it) refuses data that decodes to more than four times its
+  own size — no encoder writes such data — and checks an array's length
+  against the bytes that follow it before building anything. It also counts
+  the values it produces, tuples and arrays included, and stops at what the
+  data could hold for those types if each word were read once. An empty
+  tuple `()` is refused as a type to decode: no Solidity type is one, and it
+  reads no bytes, so a type string full of them multiplied every word of
+  data on its own. Type strings are capped at 8,192 characters and 32 levels
+  of nesting.
+
+- **An address re-typed between two calls.** `AbiEncodeCall` and
+  `TypedDataHash` (message fields and `verifyingContract` alike) check every
+  address they encode the way `AddressCheck` does: 0x and 40 hex characters,
+  and a mixed-case address must pass its EIP-55 checksum. All-lowercase and
+  all-uppercase hex carry no checksum and are accepted, as ethers and viem
+  accept them.
+
 An address with no checksum is reported as valid **and** as unverifiable,
 rather than letting `valid: true` be read as "no typo". A position with no
 debt has no health factor rather than an infinite one — `Infinity` would read
@@ -105,7 +126,11 @@ same as all of them, so every entry point takes it as an argument.
 - **It does not sign or hold keys.**
 - **It does not know what a contract does.** `AbiDecode` decodes the types
   you name; naming the wrong ones produces confident nonsense, which is why
-  data that ends early is an error rather than a short answer.
+  data that ends early is an error rather than a short answer. So is a word
+  that is not the encoding of its type — a `uint8` holding 256, an `address`
+  or `bytes4` with non-zero padding, an `int8` that is not sign-extended —
+  which is how Solidity's own decoder treats it, and what reading a
+  `uint256` slot as a `uint8` looks like.
 - **It does not fetch an ABI.** Signatures come from the caller.
 - **It does not price anything.** `DefiMath` computes against a reference you
   supply; where that reference came from is your problem.

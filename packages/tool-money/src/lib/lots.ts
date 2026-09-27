@@ -11,7 +11,16 @@
  * as an integer remainder and the final consumption takes whatever is left,
  * so a fully consumed lot always accounts for exactly its cost with no
  * rounding drift.
+ *
+ * Quantities are counted as exact decimals, not as doubles. Each is read as
+ * the decimal it is written as (0.1 is one tenth, not the binary fraction
+ * nearest it), and every lot and disposal is scaled to the same number of
+ * decimal places as a bigint. So ten disposals of 0.1 leave nothing of a lot
+ * of 1, and five units left of a lot of ten billion stay five units — where a
+ * tolerance for binary noise would have to guess which remainders are real.
  */
+
+import { addExact, big, mathRound, sumExact, toNumber } from "./exact";
 
 export const LOT_METHODS = ["fifo", "lifo", "hifo", "specific"] as const;
 export type LotMethod = (typeof LOT_METHODS)[number];
@@ -66,6 +75,39 @@ export type CostBasisResult = {
 
 const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 
+/*
+ * A disposal may come up short of the lots by up to 1e-9 units and still be
+ * read as consuming them: a caller's own float sum (0.1 + 0.2 is
+ * 0.30000000000000004) is not a claim to hold more than was bought.
+ */
+
+/** A quantity as the decimal it is written as: `units / 10^scale`. */
+type DecimalQuantity = { readonly units: bigint; readonly scale: number };
+
+function decimalOf(value: number, what: string): DecimalQuantity {
+  // The shortest text that reads back as the same double is the decimal the
+  // caller wrote: 0.1, 1e-7, 10000000000.
+  const match = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/.exec(String(value));
+  if (match === null) throw new Error(`${what} (${value}) is not a positive decimal quantity`);
+  const fraction = match[2] ?? "";
+  let digits = `${match[1]}${fraction}`;
+  let scale = fraction.length - Number(match[3] ?? 0);
+  if (scale < 0) {
+    digits += "0".repeat(-scale);
+    scale = 0;
+  }
+  return { units: BigInt(digits), scale };
+}
+
+/** `units / 10^scale` back as a number: the double nearest the exact decimal. */
+function quantityNumber(units: bigint, scale: number): number {
+  if (scale === 0) return Number(units);
+  const negative = units < 0n;
+  const text = (negative ? -units : units).toString().padStart(scale + 1, "0");
+  const value = Number(`${text.slice(0, -scale)}.${text.slice(-scale)}`);
+  return negative ? -value : value;
+}
+
 function instant(value: string, what: string): number {
   if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value.trim())) {
     throw new Error(
@@ -89,13 +131,32 @@ export function computeCostBasis(
     if (lot.quantity <= 0) throw new Error(`lot "${lot.id}" has quantity ${lot.quantity}`);
     if (!Number.isInteger(lot.costMinor))
       throw new Error(`lot "${lot.id}" cost must be minor units`);
+    big(lot.costMinor, `lot "${lot.id}" costMinor`);
     instant(lot.acquiredAt, `lot "${lot.id}" acquiredAt`);
   }
+
+  for (const disposal of disposals) {
+    if (disposal.quantity <= 0) {
+      throw new Error(`disposal "${disposal.id}" has quantity ${disposal.quantity}`);
+    }
+  }
+  // Every quantity on one decimal scale, so each subtraction is exact.
+  const quantities = [
+    ...lots.map((l) => decimalOf(l.quantity, `lot "${l.id}" quantity`)),
+    ...disposals.map((d) => decimalOf(d.quantity, `disposal "${d.id}" quantity`)),
+  ];
+  const scale = quantities.reduce((most, q) => Math.max(most, q.scale), 0);
+  const scaled = (value: number, what: string): bigint => {
+    const q = decimalOf(value, what);
+    return q.units * 10n ** BigInt(scale - q.scale);
+  };
+  // SHORTFALL_TOLERANCE on this scale; nothing when the scale is coarser.
+  const shortfallAllowed = scale >= 9 ? 10n ** BigInt(scale - 9) : 0n;
 
   // Working copies: remaining cost is an integer so a lot cannot drift.
   const open = lots.map((lot) => ({
     ...lot,
-    remainingQuantity: lot.quantity,
+    remainingUnits: scaled(lot.quantity, `lot "${lot.id}" quantity`),
     remainingCostMinor: lot.costMinor,
     acquiredMs: instant(lot.acquiredAt, "acquiredAt"),
   }));
@@ -104,11 +165,8 @@ export function computeCostBasis(
 
   for (const disposal of disposals) {
     const disposedMs = instant(disposal.disposedAt, `disposal "${disposal.id}" disposedAt`);
-    if (disposal.quantity <= 0) {
-      throw new Error(`disposal "${disposal.id}" has quantity ${disposal.quantity}`);
-    }
 
-    let order = open.filter((l) => l.remainingQuantity > 0);
+    let order = open.filter((l) => l.remainingUnits > 0n);
     if (method === "specific") {
       const wanted = disposal.lotIds;
       if (!wanted || wanted.length === 0) {
@@ -129,58 +187,71 @@ export function computeCostBasis(
     } else if (method === "lifo") {
       order = [...order].sort((a, b) => b.acquiredMs - a.acquiredMs || (a.id < b.id ? -1 : 1));
     } else {
-      // Highest cost per unit first, which realizes the smallest gain.
-      order = [...order].sort(
-        (a, b) =>
-          b.remainingCostMinor / b.remainingQuantity - a.remainingCostMinor / a.remainingQuantity ||
-          (a.id < b.id ? -1 : 1),
-      );
+      // Highest cost per unit first, which realizes the smallest gain —
+      // compared by cross-multiplying, so two lots a float would call equal
+      // are still told apart.
+      order = [...order].sort((a, b) => {
+        const left = BigInt(b.remainingCostMinor) * a.remainingUnits;
+        const right = BigInt(a.remainingCostMinor) * b.remainingUnits;
+        return left > right ? 1 : left < right ? -1 : a.id < b.id ? -1 : 1;
+      });
     }
 
-    let toConsume = disposal.quantity;
-    const consumed: Consumption[] = [];
+    const disposalUnits = scaled(disposal.quantity, `disposal "${disposal.id}" quantity`);
+    let toConsume = disposalUnits;
+    const consumed: Array<Consumption & { readonly units: bigint }> = [];
     let costMinor = 0;
 
     for (const lot of order) {
-      if (toConsume <= 0) break;
-      const take = Math.min(toConsume, lot.remainingQuantity);
+      if (toConsume <= 0n) break;
       // Taking the whole remainder consumes the whole remaining cost. That
       // is what keeps a lot's costs summing to exactly what it cost, however
       // many partial disposals came before.
-      const takeCost =
-        take === lot.remainingQuantity
-          ? lot.remainingCostMinor
-          : Math.round((lot.remainingCostMinor * take) / lot.remainingQuantity);
-      lot.remainingQuantity -= take;
-      lot.remainingCostMinor -= takeCost;
+      const whole = toConsume >= lot.remainingUnits;
+      const take = whole ? lot.remainingUnits : toConsume;
+      const takeCost = whole
+        ? lot.remainingCostMinor
+        : toNumber(
+            mathRound(BigInt(lot.remainingCostMinor) * take, lot.remainingUnits),
+            `disposal "${disposal.id}" cost`,
+          );
+      lot.remainingUnits -= take;
+      lot.remainingCostMinor = addExact(
+        lot.remainingCostMinor,
+        -takeCost,
+        `lot "${lot.id}" remaining cost`,
+      );
       toConsume -= take;
-      costMinor += takeCost;
+      costMinor = addExact(costMinor, takeCost, `disposal "${disposal.id}" cost`);
       consumed.push({
         lotId: lot.id,
-        quantity: take,
+        quantity: quantityNumber(take, scale),
+        units: take,
         costMinor: takeCost,
         acquiredAt: lot.acquiredAt,
         longTerm: disposedMs - lot.acquiredMs > YEAR_MS,
       });
     }
 
-    if (toConsume > 1e-9) {
+    if (toConsume > shortfallAllowed) {
       throw new Error(
-        `disposal "${disposal.id}" needs ${disposal.quantity} but only ${disposal.quantity - toConsume} was open — a disposal cannot exceed the lots held`,
+        `disposal "${disposal.id}" needs ${disposal.quantity} but only ${quantityNumber(disposalUnits - toConsume, scale)} was open — a disposal cannot exceed the lots held`,
       );
     }
 
     // Proceeds follow the units, so the split between short and long term is
     // allocated by quantity rather than by cost.
-    const gainMinor = disposal.proceedsMinor - costMinor;
-    let longTermProceeds = 0;
-    let longTermCost = 0;
+    const what = `disposal "${disposal.id}"`;
+    const proceeds = big(disposal.proceedsMinor, `${what} proceedsMinor`);
+    const gainMinor = toNumber(proceeds - big(costMinor, what), `${what} gain`);
+    let longTermProceeds = 0n;
+    let longTermCost = 0n;
     for (const entry of consumed) {
       if (!entry.longTerm) continue;
-      longTermProceeds += Math.round((disposal.proceedsMinor * entry.quantity) / disposal.quantity);
-      longTermCost += entry.costMinor;
+      longTermProceeds += mathRound(proceeds * entry.units, disposalUnits);
+      longTermCost += big(entry.costMinor, what);
     }
-    const longTermGainMinor = longTermProceeds - longTermCost;
+    const longTermGainMinor = toNumber(longTermProceeds - longTermCost, `${what} long-term gain`);
 
     results.push({
       id: disposal.id,
@@ -189,23 +260,32 @@ export function computeCostBasis(
       costMinor,
       gainMinor,
       longTermGainMinor,
-      shortTermGainMinor: gainMinor - longTermGainMinor,
-      consumed,
+      shortTermGainMinor: addExact(gainMinor, -longTermGainMinor, `${what} short-term gain`),
+      consumed: consumed.map(({ units: _units, ...entry }) => entry),
     });
   }
 
-  const remaining = open.filter((l) => l.remainingQuantity > 0);
+  const remaining = open.filter((l) => l.remainingUnits > 0n);
   return {
     method,
     disposals: results,
-    realizedGainMinor: results.reduce((s, r) => s + r.gainMinor, 0),
+    realizedGainMinor: sumExact(
+      results.map((r) => r.gainMinor),
+      "the realized gain",
+    ),
     remainingLots: remaining.map((l) => ({
       id: l.id,
       acquiredAt: l.acquiredAt,
-      quantity: l.remainingQuantity,
+      quantity: quantityNumber(l.remainingUnits, scale),
       costMinor: l.remainingCostMinor,
     })),
-    remainingQuantity: remaining.reduce((s, l) => s + l.remainingQuantity, 0),
-    remainingCostMinor: remaining.reduce((s, l) => s + l.remainingCostMinor, 0),
+    remainingQuantity: quantityNumber(
+      remaining.reduce((sum, l) => sum + l.remainingUnits, 0n),
+      scale,
+    ),
+    remainingCostMinor: sumExact(
+      remaining.map((l) => l.remainingCostMinor),
+      "the remaining cost",
+    ),
   };
 }

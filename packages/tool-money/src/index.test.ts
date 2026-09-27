@@ -176,6 +176,42 @@ describe("TaxCalculate", () => {
   });
 });
 
+describe("amounts past 2^53 − 1 minor units are refused at the schema (C218)", () => {
+  test("every minor-unit field takes a safe integer and nothing larger", () => {
+    const tax = taxCalculate.inputSchema.safeParse({
+      lines: [{ id: "a", amountMinor: 2 ** 53, taxCodes: ["Z"] }],
+      rates: [{ code: "Z", bps: 0 }],
+    });
+    expect(tax.success).toBe(false);
+    expect(JSON.stringify(tax.error?.issues)).toContain("express it in a larger unit");
+    expect(
+      costBasisCompute.inputSchema.safeParse({
+        lots: [{ id: "l", acquiredAt: "2026-01-01T00:00:00Z", quantity: 1, costMinor: 1e18 }],
+        disposals: [],
+        method: "fifo",
+      }).success,
+    ).toBe(false);
+    expect(
+      taxCalculate.inputSchema.safeParse({
+        lines: [{ id: "a", amountMinor: Number.MAX_SAFE_INTEGER, taxCodes: ["Z"] }],
+        rates: [{ code: "Z", bps: 0 }],
+      }).success,
+    ).toBe(true);
+  });
+
+  test("a total past it is an error naming the figure, not JSON one unit off", async () => {
+    await expect(
+      raw(taxCalculate, {
+        lines: [
+          { id: "a", amountMinor: Number.MAX_SAFE_INTEGER, taxCodes: ["Z"] },
+          { id: "b", amountMinor: 2, taxCodes: ["Z"] },
+        ],
+        rates: [{ code: "Z", bps: 0 }],
+      }),
+    ).rejects.toThrow(/cannot be reported exactly/);
+  });
+});
+
 describe("RefundAmountCompute", () => {
   test("a full return refunds what was charged", async () => {
     const result = await call<{ totalMinor: number; fullReturn: boolean }>(refundAmountCompute, {
@@ -207,6 +243,24 @@ describe("PurchaseOrderMatch", () => {
     );
     expect(result.ok).toBe(false);
     expect(result.pairs[0]?.status).toBe("over-receipt");
+  });
+
+  test("a fractional quantityAbsolute on whole quantities is a verdict, not a crash", async () => {
+    const input = (quantityAbsolute: number) => ({
+      invoiceLines: [{ id: "inv-1", poLineId: "po-1", quantity: 10, unitPriceMinor: 1250 }],
+      poLines: [{ id: "po-1", quantity: 11, unitPriceMinor: 1250 }],
+      tolerance: { quantityAbsolute, pricePercentBps: 100 },
+    });
+    const matched = await call<{ pairs: Array<{ status: string }> }>(
+      purchaseOrderMatch,
+      input(1.5),
+    );
+    expect(matched.pairs[0]?.status).toBe("matched");
+    const variance = await call<{ pairs: Array<{ status: string }> }>(
+      purchaseOrderMatch,
+      input(0.5),
+    );
+    expect(variance.pairs[0]?.status).toBe("quantity-variance");
   });
 });
 
@@ -247,6 +301,50 @@ describe("SpendLimitCheck", () => {
     });
     expect(result.allowed).toBe(false);
     expect(result.headroomMinor).toBe(20_000);
+  });
+
+  test("it claims to compute a verdict, not to be a gate its caller cannot pass (C145)", () => {
+    // The history, the limits and the clock are all inputs, so a model that
+    // supplies them can pass any payment. 0.7.0 called this "the gate an
+    // unattended harness actually consults" and said its result "is a limit".
+    const text = spendLimitCheck.description;
+    expect({
+      consults: text.includes("actually consults"),
+      isALimit: text.includes("is a limit"),
+    }).toEqual({
+      consults: false,
+      isALimit: false,
+    });
+    expect(text).toContain("enforces nothing by itself");
+    expect(text).toContain("passed in");
+  });
+
+  test("the result says which clock the verdict used", async () => {
+    const input = {
+      proposed: { amountMinor: 1 },
+      history: [],
+      limits: { perDayMinor: 100 },
+    };
+    const live = await call<{ clock: string; basis: string }>(spendLimitCheck, input);
+    expect(live.clock).toBe("runtime");
+    expect(live.basis).toContain("passed in this call");
+    const replay = await call<{ clock: string }>(spendLimitCheck, {
+      ...input,
+      now: "2026-01-01T11:00:00Z",
+    });
+    expect(replay.clock).toBe("caller-supplied");
+  });
+
+  test("every tool's `now` says it is for tests and replays, not live decisions", () => {
+    for (const tool of [spendLimitCheck, refundAbuseCheck, webhookSignatureVerify]) {
+      const shape = (
+        tool.inputSchema as unknown as { shape: Record<string, { description?: string }> }
+      ).shape;
+      expect({ tool: tool.name, now: shape["now"]?.description }).toEqual({
+        tool: tool.name,
+        now: expect.stringContaining("omit it for a live decision"),
+      });
+    }
   });
 });
 
@@ -320,6 +418,44 @@ describe("StatementParse", () => {
       dateOrder: "dmy",
     });
     expect(result.transactions[0]?.date).toBe("2026-04-03");
+  });
+
+  test("the rejected list is capped like the transactions, and says how many there were (C092)", async () => {
+    writeFileSync(join(workspace, "s.ofx"), `<OFX>${"<STMTTRN>junk</STMTTRN>".repeat(1_000)}`);
+    const result = await call<{
+      rejected: unknown[];
+      rejectedCount: number;
+      rejectedTruncated: boolean;
+    }>(statementParse, { file: "s.ofx", limit: 10 });
+    expect(result.rejected.length).toBe(10);
+    expect(result.rejectedCount).toBe(1_000);
+    expect(result.rejectedTruncated).toBe(true);
+  });
+
+  test("an amount or a total past 2^53 − 1 comes back refused by name, never rounded (C218)", async () => {
+    writeFileSync(
+      join(workspace, "big.ofx"),
+      "<OFX>\n<STMTTRN><DTPOSTED>20240101<TRNAMT>90071992547409.93<FITID>A</STMTTRN>\n",
+    );
+    const one = await call<{ count: number; rejectedCount: number; rejected: unknown[] }>(
+      statementParse,
+      { file: "big.ofx" },
+    );
+    expect(one.count).toBe(0);
+    expect(one.rejectedCount).toBe(1);
+    expect(JSON.stringify(one.rejected)).toContain("is more than 2^53 − 1");
+    writeFileSync(
+      join(workspace, "sum.csv"),
+      "date,amount\n2024-01-01,90071992547409.91\n2024-01-02,0.01\n2024-01-03,0.01\n",
+    );
+    const sum = await call<{
+      totalMinor: number | null;
+      creditMinor: number | null;
+      totalsUnavailable?: string;
+    }>(statementParse, { file: "sum.csv" });
+    expect(sum.totalMinor).toBeNull();
+    expect(sum.creditMinor).toBeNull();
+    expect(sum.totalsUnavailable).toContain("total comes to 9007199254740993 minor units");
   });
 
   test("a path outside the workspace is refused", async () => {

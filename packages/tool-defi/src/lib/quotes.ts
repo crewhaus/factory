@@ -201,7 +201,11 @@ async function frankfurterLeg(
   );
   assertKnownOrigin(url);
   const outcome = await getJson(url.toString(), options);
-  if (!outcome.ok) return { ok: false, reason: `frankfurter: ${outcome.message}` };
+  if (!outcome.ok) {
+    return outcome.kind === "budget"
+      ? { ok: false, reason: `frankfurter was not asked for ${base}/${quote}: ${outcome.message}` }
+      : { ok: false, reason: `frankfurter: ${outcome.message}` };
+  }
 
   const body = outcome.value as { date?: unknown; rates?: Record<string, unknown> };
   if (typeof body !== "object" || body === null) {
@@ -275,6 +279,10 @@ async function coinbaseLeg(
     return { ok: false, reason: "a pair of one asset with itself is not a quote" };
   }
   const direct = await coinbaseSpot(base, quote, options);
+  if (!direct.ok && direct.notAsked === true) {
+    // Nothing was asked, so nothing is known about what coinbase publishes.
+    return { ok: false, reason: `coinbase was not asked for ${base}-${quote}: ${direct.reason}` };
+  }
   if (direct.ok) {
     return {
       ok: true,
@@ -298,7 +306,10 @@ async function coinbaseLeg(
   if (!inverse.ok) {
     return {
       ok: false,
-      reason: `coinbase publishes neither ${base}-${quote} (${direct.reason}) nor its inverse`,
+      reason:
+        inverse.notAsked === true
+          ? `coinbase does not publish ${base}-${quote} (${direct.reason}), and its inverse ${quote}-${base} was not asked: ${inverse.reason}`
+          : `coinbase publishes neither ${base}-${quote} (${direct.reason}) nor its inverse`,
     };
   }
   if (!isPositive(inverse.price)) {
@@ -328,7 +339,8 @@ async function coinbaseLeg(
 
 type SpotOutcome =
   | { readonly ok: true; readonly price: Fixed; readonly literal: PriceLiteralKind }
-  | { readonly ok: false; readonly reason: string };
+  /** `notAsked`: the request was not sent (the call's provider budget), so no answer exists. */
+  | { readonly ok: false; readonly reason: string; readonly notAsked?: true };
 
 async function coinbaseSpot(
   base: string,
@@ -338,7 +350,11 @@ async function coinbaseSpot(
   const url = new URL(`/v2/prices/${base}-${quote}/spot`, PROVIDER_ORIGINS.coinbase);
   assertKnownOrigin(url);
   const outcome = await getJson(url.toString(), options);
-  if (!outcome.ok) return { ok: false, reason: outcome.message };
+  if (!outcome.ok) {
+    return outcome.kind === "budget"
+      ? { ok: false, reason: outcome.message, notAsked: true }
+      : { ok: false, reason: outcome.message };
+  }
   const body = outcome.value as { data?: { amount?: unknown; currency?: unknown } };
   const data = body?.data;
   if (typeof data !== "object" || data === null) {

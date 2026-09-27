@@ -591,6 +591,48 @@ describe("LedgerReconcile", () => {
     ).rejects.toThrow(/day-first or month-first/);
   });
 
+  test("a statement row the parser could not read is named beside the reconciliation", async () => {
+    // Its amount is past 2^53 − 1 minor units, so tool-money refuses it
+    // rather than rounding it; it must not silently drop out of both sides.
+    writeFileSync(
+      join(workspace, "big.csv"),
+      "Date,Amount\n2026-01-05,1.00\n2026-01-06,90071992547409.93\nnot-a-date,2.00\n",
+    );
+    const result = await call(ledgerReconcile, {
+      left: { kind: "statement", file: "big.csv" },
+      right: { kind: "lines", lines: [statementRow("R1", "2026-01-05", 100)] },
+      currency: "USD",
+    });
+    expect((result["summary"] as { matchedCount: number }).matchedCount).toBe(1);
+    const unreadable = result["unreadableStatementRows"] as {
+      left: { count: number; rows: Array<{ row: number; reason: string }> };
+      right?: unknown;
+    };
+    expect(unreadable.left.count).toBe(2);
+    expect(unreadable.left.rows.map((r) => r.row)).toEqual([3, 4]);
+    expect(unreadable.left.rows[0]?.reason).toContain("is more than 2^53 − 1");
+    expect(unreadable.right).toBeUndefined();
+    // A clean statement adds no such field.
+    writeFileSync(join(workspace, "ok.csv"), "Date,Amount\n2026-01-05,1.00\n");
+    const clean = await call(ledgerReconcile, {
+      left: { kind: "statement", file: "ok.csv" },
+      right: { kind: "lines", lines: [] },
+      currency: "USD",
+    });
+    expect(clean["unreadableStatementRows"]).toBeUndefined();
+  });
+
+  test("a statement over the side limit is refused by its true row count", async () => {
+    const rows = Array.from({ length: 20_003 }, () => "2026-01-05,1.00").join("\n");
+    writeFileSync(join(workspace, "long.csv"), `Date,Amount\n${rows}\n`);
+    await expect(
+      raw(ledgerReconcile, {
+        left: { kind: "statement", file: "long.csv" },
+        right: { kind: "lines", lines: [] },
+      }),
+    ).rejects.toThrow("the left side has 20003 rows, over the 20000 limit");
+  });
+
   test("a statement path outside the workspace is refused", async () => {
     await expect(
       raw(ledgerReconcile, {

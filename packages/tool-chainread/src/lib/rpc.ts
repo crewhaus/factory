@@ -224,7 +224,9 @@ async function request(endpoint: VettedEndpoint, spec: RequestSpec): Promise<Rpc
       return {
         ok: false,
         kind: "transport",
-        message: `could not reach ${origin}: ${error?.message ?? String(err)}`,
+        // The dialler's message is somebody else's string, and one that
+        // quotes the URL it could not reach quotes the key in its path.
+        message: `could not reach ${origin}: ${withoutPath(error?.message ?? String(err), endpoint.url)}`,
       };
     }
 
@@ -383,6 +385,26 @@ function capMessage(text: string): string {
 function snippet(text: string): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat;
+}
+
+/**
+ * Take an endpoint's path and query out of a message this package did not
+ * write — a dialler's error, which may quote the URL it could not reach, the
+ * pinned-IP spelling of it included. The origin is kept (every message here
+ * names it anyway); the path and the query, where a provider keeps its key,
+ * become `<redacted>`.
+ */
+export function withoutPath(message: string, url: URL): string {
+  let out = message.split(url.href).join(url.origin);
+  const pieces: Array<[string, string]> = [
+    [`${url.pathname}${url.search}`, "/<redacted>"],
+    [url.pathname, "/<redacted>"],
+    [url.search, "?<redacted>"],
+  ];
+  for (const [piece, mask] of pieces) {
+    if (piece.length > 1) out = out.split(piece).join(mask);
+  }
+  return out;
 }
 
 /** Turn a failed outcome into the refusal a tool throws, with the reason kept. */

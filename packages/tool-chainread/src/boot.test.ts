@@ -1,7 +1,19 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { getRpcEndpointPolicy, registerChainreadConfig, setRpcEndpointPolicy } from "./index";
+import {
+  _setDnsLookup,
+  _setFetch,
+  evmGetBlock,
+  evmRpcHealth,
+  getRpcEndpointPolicy,
+  registerChainreadConfig,
+  setRpcEndpointPolicy,
+} from "./index";
 
-afterEach(() => setRpcEndpointPolicy({}));
+afterEach(() => {
+  setRpcEndpointPolicy({});
+  _setFetch(undefined);
+  _setDnsLookup(undefined);
+});
 
 describe("registerChainreadConfig — tool_config.chainread at boot", () => {
   test("allowed_origins becomes the only RPC origins, canonicalised", () => {
@@ -33,5 +45,58 @@ describe("registerChainreadConfig — tool_config.chainread at boot", () => {
     expect(() => registerChainreadConfig({ allowed_origins: ["ftp://a.example"] })).toThrow(
       "which is not http(s)",
     );
+  });
+
+  test("an entry that does not parse is named by position, never repeated (C157)", () => {
+    // A keyed provider URL written without its scheme: the key is its path.
+    let message = "";
+    try {
+      registerChainreadConfig({
+        allowed_origins: [
+          "https://mainnet.base.org",
+          "eth-mainnet.g.alchemy.com/v2/SECRET-PROVIDER-KEY",
+        ],
+      });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toBe(
+      "tool_config.chainread.allowed_origins[1] is not an origin — it must start with https:// (or http://). Write it as https://host[:port]; the value is not repeated here, because a provider keeps its key in the path.",
+    );
+    expect(message).not.toContain("SECRET");
+    expect(() =>
+      registerChainreadConfig({ allowed_origins: ["https://exa mple.com/v2/SECRET"] }),
+    ).toThrow(/allowed_origins\[0\] is not an origin — check the host and the port\./);
+  });
+
+  test("through the tools, an origin the block does not list is never dialled (C029)", async () => {
+    // 0.7.0 had the seam and no caller: every public origin a model named was
+    // dialled by these read-only tools, which plan and auto mode run unasked.
+    const dialled: string[] = [];
+    _setDnsLookup(async () => ({ address: "93.184.216.34", family: 4 }));
+    _setFetch(async (req) => {
+      dialled.push(req.url);
+      return Response.json({ jsonrpc: "2.0", id: 1, result: "0x1" });
+    });
+    registerChainreadConfig({ allowed_origins: ["https://mainnet.base.org"] });
+    const refusal =
+      'refusing "https://x.attacker.example" — the operator\'s rpc allow-list is https://mainnet.base.org';
+    const health = JSON.parse(
+      (await evmRpcHealth.execute(
+        { rpcUrl: "https://x.attacker.example/p" } as never,
+        {} as never,
+      )) as string,
+    );
+    expect(health.endpoints[0].errors).toEqual([refusal]);
+    await expect(
+      evmGetBlock.execute(
+        { rpcUrl: "https://x.attacker.example/p", block: "latest" } as never,
+        {} as never,
+      ),
+    ).rejects.toThrow(refusal);
+    expect(dialled).toEqual([]);
+    await evmRpcHealth.execute({ rpcUrl: "https://mainnet.base.org" } as never, {} as never);
+    expect(dialled.length).toBeGreaterThan(0);
+    expect(dialled.every((u) => u.startsWith("https://mainnet.base.org"))).toBe(true);
   });
 });

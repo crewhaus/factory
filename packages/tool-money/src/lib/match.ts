@@ -8,6 +8,8 @@
  * get it wrong on an invoice nobody re-reads.
  */
 
+import { addExact, quantityDifference, roundFractionalMinor, sumExact } from "./exact";
+
 export type MatchLine = {
   readonly id: string;
   /** Explicit link to a PO line, when the document carries one. */
@@ -49,7 +51,11 @@ export type MatchPair = {
   readonly poQuantity: number;
   readonly receivedQuantity: number | null;
   readonly quantityDelta: number;
-  /** What the variance costs, positive when the invoice asks for more. */
+  /**
+   * What the variance costs, positive when the invoice asks for more. With a
+   * fractional quantity (kilograms, hours) the figure is rounded to whole
+   * minor units, half away from zero.
+   */
   readonly exposureMinor: number;
   readonly reasons: ReadonlyArray<string>;
 };
@@ -74,16 +80,42 @@ function normalizeDescription(text: string): string {
     .trim();
 }
 
+/**
+ * `delta <= bound`, exactly, for a whole-number delta and ANY bound — a
+ * quantity tolerance may be fractional (half a unit), and a whole number is
+ * at most 1.5 exactly when it is at most 1.
+ */
+function atMost(delta: bigint, bound: number): boolean {
+  if (Number.isNaN(bound)) return false;
+  if (bound === Number.POSITIVE_INFINITY) return true;
+  return delta <= BigInt(Math.floor(bound));
+}
+
 function withinTolerance(
   actual: number,
   expected: number,
   percentBps: number | undefined,
   absolute: number | undefined,
 ): boolean {
-  const delta = Math.abs(actual - expected);
-  if (delta === 0) return true;
+  if (actual === expected) return true;
   // Either bound may pass. A percentage alone is useless on a cheap line and
   // an absolute alone is useless on an expensive one.
+  if (Number.isSafeInteger(actual) && Number.isSafeInteger(expected)) {
+    // Prices are integers, and their products with a rate pass 2^53 on
+    // ordinary amounts: compared exactly. Integer quantities come this way
+    // too, and their absolute tolerance may be fractional.
+    const abs = (v: bigint): bigint => (v < 0n ? -v : v);
+    const delta = abs(BigInt(actual) - BigInt(expected));
+    const base = abs(BigInt(expected));
+    const byPercent =
+      percentBps !== undefined &&
+      (Number.isInteger(percentBps)
+        ? base * BigInt(percentBps) >= delta * 10_000n
+        : Math.abs(expected) * percentBps >= Math.abs(actual - expected) * 10_000);
+    const byAbsolute = absolute !== undefined && atMost(delta, absolute);
+    return byPercent || byAbsolute;
+  }
+  const delta = Math.abs(actual - expected);
   const byPercent = percentBps !== undefined && Math.abs(expected) * percentBps >= delta * 10_000;
   const byAbsolute = absolute !== undefined && delta <= absolute;
   return byPercent || byAbsolute;
@@ -184,9 +216,14 @@ export function matchInvoiceToPurchaseOrder(
     }
 
     const billable = Math.min(invoice.quantity, receivedQuantity ?? invoice.quantity);
-    const exposureMinor =
+    // A fractional quantity times an integer price is a fraction of a minor
+    // unit; the figure is rounded to whole units (half away from zero) and
+    // refused past 2^53 rather than reported with float noise in it.
+    const exposureMinor = roundFractionalMinor(
       invoice.quantity * invoice.unitPriceMinor -
-      billable * Math.min(invoice.unitPriceMinor, po.unitPriceMinor);
+        billable * Math.min(invoice.unitPriceMinor, po.unitPriceMinor),
+      `invoice line "${invoice.id}" exposure`,
+    );
 
     pairs.push({
       invoiceLineId: invoice.id,
@@ -195,11 +232,15 @@ export function matchInvoiceToPurchaseOrder(
       status,
       invoiceUnitPriceMinor: invoice.unitPriceMinor,
       poUnitPriceMinor: po.unitPriceMinor,
-      priceDeltaMinor: invoice.unitPriceMinor - po.unitPriceMinor,
+      priceDeltaMinor: addExact(
+        invoice.unitPriceMinor,
+        -po.unitPriceMinor,
+        `invoice line "${invoice.id}" price delta`,
+      ),
       invoiceQuantity: invoice.quantity,
       poQuantity: po.quantity,
       receivedQuantity,
-      quantityDelta: invoice.quantity - po.quantity,
+      quantityDelta: quantityDifference(invoice.quantity, po.quantity),
       exposureMinor: status === "matched" ? 0 : exposureMinor,
       reasons,
     });
@@ -212,7 +253,10 @@ export function matchInvoiceToPurchaseOrder(
     unmatchedPoLines: [...remainingPo.keys()],
     ok: exceptions === 0 && unmatchedInvoiceLines.length === 0,
     exceptions,
-    totalExposureMinor: pairs.reduce((s, p) => s + p.exposureMinor, 0),
+    totalExposureMinor: sumExact(
+      pairs.map((p) => p.exposureMinor),
+      "the total exposure",
+    ),
     threeWay: receiptLines.length > 0,
   };
 }

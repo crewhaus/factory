@@ -401,11 +401,14 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * - `outsideWorkspace` — the path lands outside the workspace, or where it
  *   lands could not be worked out. It never satisfies an allow rule and
  *   always satisfies a deny or ask rule.
- * - `caseInsensitive` — the path lands on a filesystem that does not tell
- *   names apart by letter case (macOS and Windows by default), or the runtime
- *   could not find out. A deny or ask rule then compares it ignoring case, so
+ * - `caseInsensitive` — the value names the same thing in any letter case: a
+ *   path on a filesystem that does not tell names apart by case (macOS and
+ *   Windows by default, or the runtime could not find out), or a `0x` hex id
+ *   such as an address or a hash, whose EIP-55 mixed case is only a
+ *   checksum. A deny or ask rule then compares it ignoring case, so
  *   `alwaysDeny Write(.crewhaus/settings.json)` also fires on
- *   `.crewhaus/Settings.json`, which is the same file there.
+ *   `.crewhaus/Settings.json`, and `alwaysDeny EvmCall(1/0xdAC17F…)` on the
+ *   same address written in lower case.
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
@@ -547,12 +550,13 @@ function valueMatches(
   }
   // A deny or ask on a path is not dodged by spelling the name another way
   // the filesystem treats as the same: another Unicode normal form always,
-  // and another letter case where the filesystem ignores case.
-  if (polarity === "restrict" && value.kind === "path") {
+  // and another letter case where the filesystem ignores case. Nor is one on
+  // a value that names the same thing in any case (a hex address).
+  if (polarity === "restrict" && (value.kind === "path" || value.caseInsensitive === true)) {
     const ignoreCase = value.caseInsensitive === true;
     const folded = foldedArgMatcher(compiled, ignoreCase);
     for (const candidate of candidates) {
-      if (isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
+      if (value.kind === "path" && isAbsoluteSpelling(candidate) !== absoluteGlob) continue;
       if (folded.test(foldPath(candidate, ignoreCase))) return true;
     }
   }

@@ -385,6 +385,7 @@
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/chain-adapter-base": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/channel-adapter-base": {
@@ -2414,7 +2415,12 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-onchain": "workspace:*",
         "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-evm": "workspace:*",
+        "@crewhaus/tool-evm-tx": "workspace:*",
       },
     },
     "packages/tool-crewhaus": {
@@ -2651,6 +2657,10 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/tool-executor": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
       },
     },
     "packages/tool-evm-tx": {
