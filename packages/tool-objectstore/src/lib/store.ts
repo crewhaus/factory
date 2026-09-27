@@ -156,7 +156,7 @@ export function parseEndpoint(raw: string): Endpoint {
   }
   if (url.username !== "" || url.password !== "") {
     throw new PresignError(
-      "endpoint carries a username or password — SigV4 credentials go in accessKeyId/secretAccessKey, and a credential in the URL would be signed into the result",
+      "endpoint carries a username or password — a credential in the URL would be signed into the result. Credentials never go in the endpoint or in any argument: the operator names the environment variables that hold them in a tool_config.objectstore.credentials profile, and the call passes that profile's name as `credentials`",
     );
   }
   if (url.search !== "" || url.hash !== "") {

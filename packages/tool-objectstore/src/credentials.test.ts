@@ -79,6 +79,34 @@ describe("a credential is never a tool argument", () => {
     expect(JSON.stringify(out)).not.toContain(SECRET);
   });
 
+  // C055 residual (attacker review): the endpoint-userinfo refusal still
+  // said "SigV4 credentials go in accessKeyId/secretAccessKey", steering the
+  // model to write the secret into a tool_use input the schema then refuses
+  // — after it is already in the transcript.
+  test("no refusal tells the model to pass a credential as an argument", async () => {
+    const asArgument = /\b(?:accessKeyId|secretAccessKey|sessionToken)\b/;
+    const refusals: string[] = [await attempt(BASE)];
+    registerObjectStoreConfig({ credentials: { main: PROFILE } });
+    for (const input of [
+      { ...BASE, endpoint: "https://user:pass@s3.us-east-1.amazonaws.com", credentials: "main" },
+      { ...BASE, endpoint: "https://s3.us-east-1.amazonaws.com/prefix", credentials: "main" },
+      { ...BASE, endpoint: "http://s3.example.com", credentials: "main" },
+      { ...BASE, region: "US-East-1", credentials: "main" },
+      { ...BASE, credentials: "nope" },
+    ]) {
+      refusals.push(await attempt(input));
+    }
+    registerObjectStoreConfig({
+      credentials: { main: { ...PROFILE, secret_access_key_env: "OBJ_CRED_UNSET" } },
+    });
+    refusals.push(await attempt({ ...BASE, credentials: "main" }));
+    expect(refusals.filter((r) => r.startsWith("error:"))).toHaveLength(7);
+    expect(refusals.filter((r) => asArgument.test(r))).toEqual([]);
+    // The userinfo refusal says where credentials do go.
+    expect(refusals[1]).toContain("username or password");
+    expect(refusals[1]).toContain(CREDENTIALS_CONFIG_KEY);
+  });
+
   test("no profile configured: refused, naming where an operator adds one", async () => {
     const out = await attempt(BASE);
     expect(out).toContain("error:");
