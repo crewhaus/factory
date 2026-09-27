@@ -38,12 +38,13 @@ import { z } from "zod";
  * The model may ask for its own `timeout` (up to 10 minutes) — unless the
  * operator sets `max_timeout_ms`, which caps every call: the model's
  * timeout, the default, and an injected sandbox's own default alike
- * (security-6#15). A model pool candidate's block may lower the cap, never
- * raise it, and — as every candidate block does since 0.6.0 — it applies
- * per tool: under `python` it caps Python calls, under `codeExecution` all
- * three, and compile warns when a candidate caps one of them while the
- * others are listed. (At boot a block under any of those keys configures
- * all three, because there is one registration.)
+ * (security-6#15). Written under both spellings (`max_timeout_ms` and
+ * `maxTimeoutMs`), the smaller holds. A model pool candidate's block may
+ * lower the cap, never raise it, and — as every candidate block does since
+ * 0.6.0 — it applies per tool: under `python` it caps Python calls, under
+ * `codeExecution` all three, and compile warns when a candidate caps one of
+ * them while the others are listed. (At boot a block under any of those
+ * keys configures all three, because there is one registration.)
  *
  * `CREWHAUS_SANDBOX=noop` turns code execution OFF: the permission floor
  * denies these tools, and if a call reaches them anyway (bypass mode, or a
@@ -69,7 +70,8 @@ export type CodeExecutionConfig = {
    * The longest timeout any call may run with, in ms. The model's `timeout`,
    * the default, a serving candidate's default and an injected sandbox's
    * default are all clamped to it. Unset: the model may ask for up to
-   * 600 000 (the input schema's limit).
+   * 600 000 (the input schema's limit). Registered under both spellings,
+   * the smaller.
    */
   readonly maxTimeoutMs?: number;
   /** Optional warm pool size per language. Reserved for v1; v0 ignores. */
@@ -122,16 +124,18 @@ let activeSandbox: Sandbox | undefined;
 const MODEL_TIMEOUT_LIMIT_MS = 600_000;
 
 export function registerCodeExecutionConfig(input: CodeExecutionConfigInput): void {
-  const maxTimeoutMs = input.maxTimeoutMs ?? input.max_timeout_ms;
-  if (
-    maxTimeoutMs !== undefined &&
-    (typeof maxTimeoutMs !== "number" || !Number.isFinite(maxTimeoutMs) || maxTimeoutMs <= 0)
-  ) {
-    // A cap that cannot be read must not become "no cap".
-    throw new ConfigError(
-      `code execution max_timeout_ms must be a number of milliseconds > 0, got ${JSON.stringify(maxTimeoutMs)}`,
-    );
+  const spellings = [input.maxTimeoutMs, input.max_timeout_ms].filter((v) => v !== undefined);
+  for (const cap of spellings) {
+    if (typeof cap !== "number" || !Number.isFinite(cap) || cap <= 0) {
+      // A cap that cannot be read must not become "no cap".
+      throw new ConfigError(
+        `code execution max_timeout_ms must be a number of milliseconds > 0, got ${JSON.stringify(cap)}`,
+      );
+    }
   }
+  // Written under both spellings, the smaller holds: a cap only narrows,
+  // and the larger one must not silently undo the other (C169).
+  const maxTimeoutMs = spellings.length === 0 ? undefined : Math.min(...(spellings as number[]));
   activeConfig = {
     sandbox: input.sandbox,
     backend: input.backend,
@@ -292,16 +296,29 @@ export function resolveCallTimeoutMs(override: unknown): number | undefined {
  * cap (see {@link resolveEffectiveTimeout}).
  */
 export function resolveCallMaxTimeoutMs(override: unknown): number | undefined {
-  return readPositiveMs(override, "maxTimeoutMs", "max_timeout_ms");
+  return readPositiveMs(override, "maxTimeoutMs", "max_timeout_ms", "smaller");
 }
 
-function readPositiveMs(override: unknown, camel: string, snake: string): number | undefined {
+/**
+ * A positive number of ms under either spelling of a key. For a default the
+ * camelCase spelling wins, as it did in 0.7.0; for a cap (`"smaller"`) the
+ * smaller of the two holds, since a cap only narrows.
+ */
+function readPositiveMs(
+  override: unknown,
+  camel: string,
+  snake: string,
+  both: "camel" | "smaller" = "camel",
+): number | undefined {
   if (typeof override !== "object" || override === null || Array.isArray(override)) {
     return undefined;
   }
   const o = override as Record<string, unknown>;
-  const raw = o[camel] ?? o[snake];
-  return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : undefined;
+  const valid = (raw: unknown): number | undefined =>
+    typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : undefined;
+  if (both === "camel") return valid(o[camel] ?? o[snake]);
+  const values = [valid(o[camel]), valid(o[snake])].filter((v): v is number => v !== undefined);
+  return values.length === 0 ? undefined : Math.min(...values);
 }
 
 /**

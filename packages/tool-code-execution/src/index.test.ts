@@ -377,7 +377,38 @@ describe("max_timeout_ms caps every call", () => {
       expect(() =>
         registerCodeExecutionConfig({ max_timeout_ms: bad as unknown as number }),
       ).toThrow(/max_timeout_ms must be a number of milliseconds > 0/);
+      // Under either spelling, whatever the other one says.
+      expect(() =>
+        registerCodeExecutionConfig({
+          maxTimeoutMs: 1_000,
+          max_timeout_ms: bad as unknown as number,
+        }),
+      ).toThrow(/max_timeout_ms must be a number of milliseconds > 0/);
     }
+  });
+
+  // C169: `max_timeout_ms: 1000` next to `maxTimeoutMs: 600000` ran calls for
+  // 600 s — the camelCase spelling won, and the operator's cap was gone.
+  test("a cap written under both spellings holds at the smaller, in either order", async () => {
+    for (const [camel, snake] of [
+      [600_000, 1_000],
+      [1_000, 600_000],
+    ] as const) {
+      const stub = new StubSandbox({});
+      registerCodeExecutionConfig({ sandbox: stub, maxTimeoutMs: camel, max_timeout_ms: snake });
+      await python.execute({ code: "x", timeout: 600_000 });
+      expect(stub.calls[0]?.timeoutMs).toBe(1_000);
+    }
+  });
+
+  test("a candidate's cap written under both spellings holds at the smaller", async () => {
+    const stub = new StubSandbox({});
+    registerCodeExecutionConfig({ sandbox: stub, max_timeout_ms: 60_000 });
+    await python.execute(
+      { code: "x", timeout: 600_000 },
+      { toolConfig: { maxTimeoutMs: 30_000, max_timeout_ms: 2_000 } },
+    );
+    expect(stub.calls[0]?.timeoutMs).toBe(2_000);
   });
 
   test("the model is told the timeout can be capped", () => {
