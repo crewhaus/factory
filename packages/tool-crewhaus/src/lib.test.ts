@@ -922,6 +922,108 @@ describe("eval gate", () => {
         datasetBaseName,
       ),
     ).toEqual(["golden", "golden", "golden", "evals/smoke.jsonl", "a@b@c", "x#dev"]);
+    // The regression-suite union `crewhaus eval` records is set aside first.
+    expect(
+      [
+        "smoke+regressions@v1",
+        "golden@v3+regressions@v1",
+        "golden@v3#dev+regressions@v2",
+        "a+regressions@v1@x",
+      ].map(datasetBaseName),
+    ).toEqual(["smoke", "golden", "golden", "a+regressions@v1@x"]);
+  });
+
+  // The ops review: `crewhaus eval` records `<primary>+regressions@<v>` when
+  // the pinned regression suite (on by default after `crewhaus optimize`)
+  // added samples, and every pair below FAILED as "different datasets"
+  // although 0.7.0 passed it — including the version bump d01ef02a allowed.
+  test("a regression-suite union of the same dataset is noted, not failed", () => {
+    const rows: Array<[string, boolean, number]> = [
+      ["a", true, 1],
+      ["b", true, 1],
+    ];
+    const at = (datasetName: string) => {
+      const read = readEvalRun(evalDoc(rows, { config: { datasetName } }), datasetName);
+      if (!read.ok) throw new Error("fixture did not read");
+      return read.run;
+    };
+    const pairs: Array<[string, string]> = [
+      ["smoke", "smoke+regressions@v1"],
+      ["golden@v3", "golden@v3+regressions@v1"],
+      ["golden@v3+regressions@v1", "golden@v4+regressions@v1"],
+      ["golden@v3#dev+regressions@v1", "golden@v3#dev+regressions@v2"],
+    ];
+    for (const [from, to] of pairs) {
+      const result = compareEvalRuns(at(from), at(to));
+      expect({ from, to, verdict: result.verdict, reasons: result.reasons }).toEqual({
+        from,
+        to,
+        verdict: "pass",
+        reasons: [],
+      });
+      expect(result.notes.filter((n) => n.includes("regression-suite union"))).toHaveLength(1);
+    }
+    // Another dataset with a suite unioned in is still another dataset.
+    expect(compareEvalRuns(at("smoke"), at("other+regressions@v1")).reasons).toEqual([
+      "the runs name different datasets (smoke vs other+regressions@v1) — their scores are not comparable; pass allowDatasetMismatch to gate them anyway",
+    ]);
+  });
+
+  // The ops review: a sample with no `sampleId` got the id `<sample i>`, so
+  // two runs that share no real id matched by POSITION — 50 baseline samples
+  // against 1 unrelated candidate sample came back `shared: 1`, pass.
+  test("a sample with no sampleId is never matched by position", () => {
+    const anonymousDoc = (passes: boolean[], idKey?: string) => ({
+      samples: passes.map((passed, i) => ({
+        ...(idKey !== undefined ? { [idKey]: `${idKey}-${i}` } : {}),
+        grades: { overall: { passed, score: passed ? 1 : 0 } },
+      })),
+    });
+    const read = (doc: unknown) => {
+      const r = readEvalRun(doc, "x");
+      if (!r.ok) throw new Error("fixture did not read");
+      return r.run;
+    };
+    for (const idKey of [undefined, "id"]) {
+      const result = compareEvalRuns(
+        read(
+          anonymousDoc(
+            Array.from({ length: 50 }, () => true),
+            idKey,
+          ),
+        ),
+        read(anonymousDoc([true], idKey)),
+      );
+      expect({
+        idKey,
+        verdict: result.verdict,
+        shared: result.samples.shared,
+        reasons: result.reasons,
+      }).toEqual({
+        idKey,
+        verdict: "fail",
+        shared: 0,
+        reasons: [
+          "the two runs share no sample ids — samples without a sampleId (50 in the baseline and 1 in the candidate) are never matched by position, so nothing was compared sample by sample and the candidate cannot be shown to hold the line",
+        ],
+      });
+    }
+    // Beside real ids, an anonymous sample is left out of the matching and
+    // named in a note; the named samples still decide.
+    const mixed = evalDoc([
+      ["a", true, 1],
+      ["b", true, 1],
+    ]);
+    (mixed["samples"] as unknown[]).push({ grades: { overall: { passed: false, score: 0 } } });
+    const baseRun = read(evalDoc([["a", true, 1]]));
+    const result = compareEvalRuns(baseRun, read(mixed), { maxPassRateDrop: 1 });
+    expect([result.verdict, result.samples]).toEqual([
+      "pass",
+      { shared: 1, baselineOnly: [], candidateOnly: ["b"] },
+    ]);
+    expect(result.notes).toContain(
+      "samples without a sampleId (1 in the candidate) are never matched by position: they were not compared one by one, but they count in the pass rates",
+    );
   });
 
   test("runs that share no sample ids FAIL the gate, even with a perfect candidate", () => {
