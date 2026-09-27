@@ -96,6 +96,29 @@ describe("an MCP tool flagged destructive is asked about in auto mode (C173)", (
     ]);
   });
 
+  test("an operator's alwaysAllow brings back 0.7.0's auto mode for a server's tools", async () => {
+    // What the changelog tells an operator whose annotated server (most of
+    // Playwright MCP's browser actions, for one) now asks in auto mode.
+    const catalog = await registered();
+    const rules = {
+      ...emptyRuleSet,
+      builtin: [...BUILTIN_DEFAULT_RULES],
+      yaml: [{ type: "alwaysAllow" as const, pattern: "mcp__gh__*", source: "yaml" as const }],
+    };
+    const decisions = ["mcp__gh__delete_repo", "mcp__gh__drop_branch", "mcp__gh__list_repos"].map(
+      (name) => {
+        const t = catalog.get(name);
+        if (t === undefined) throw new Error(`${name} not registered`);
+        return evaluateWithReason(
+          { toolName: t.name, input: {}, readOnly: t.readOnly, destructive: t.destructive },
+          "auto",
+          rules,
+        ).decision;
+      },
+    );
+    expect(decisions).toEqual(["allow", "allow", "allow"]);
+  });
+
   test("end to end: in a headless auto-mode turn the flagged tools do not run; the plain one does", async () => {
     const called: string[] = [];
     const catalog = await registered(called);
