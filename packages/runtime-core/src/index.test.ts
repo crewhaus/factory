@@ -1411,8 +1411,11 @@ describe("runChatLoop — a one-line tool result reaches the model capped (flag-
       const preview = typeof content === "string" ? content : "";
       const marker = preview.lastIndexOf("\n[truncated, full output at ");
       expect(marker).toBeGreaterThan(0);
-      // Before the fix the whole megabyte went through, plus the marker.
-      expect(Buffer.byteLength(preview.slice(0, marker), "utf8")).toBeLessThanOrEqual(10_240);
+      // Before the fix the whole megabyte went through, plus the marker. (The
+      // line before the marker names the part that continues it.)
+      const partLine = preview.lastIndexOf("\n[part 1 of ", marker);
+      expect(partLine).toBeGreaterThan(0);
+      expect(Buffer.byteLength(preview.slice(0, partLine), "utf8")).toBeLessThanOrEqual(10_240);
       const fullPath = preview.match(/full output at (.+?)\]$/)?.[1] ?? "";
       expect(readFileSync(fullPath, "utf8")).toBe(oneLine);
     } finally {

@@ -18,6 +18,7 @@ import {
   DEFAULT_PREVIEW_LINES,
   DEFAULT_THRESHOLD_BYTES,
   MAX_NAME_ATTEMPTS,
+  MAX_PARTS,
   assertUnderRoot,
   previewHead,
   resolveStoragePath,
@@ -126,7 +127,10 @@ function headOf(preview: unknown): string {
   if (typeof preview !== "string") throw new Error("expected a string preview");
   const at = preview.lastIndexOf("\n[truncated, full output at ");
   if (at === -1) throw new Error("no truncation marker");
-  return preview.slice(0, at);
+  const body = preview.slice(0, at);
+  // The line naming part 2, when the rest was saved in parts.
+  const part = body.lastIndexOf("\n[part 1 of ");
+  return part === -1 ? body : body.slice(0, part);
 }
 
 // flag-truth-6#4 / security-12#8 — the preview kept the first 100 LINES, so a
@@ -202,6 +206,135 @@ describe("storeAndPreview — the preview is capped by bytes, not only lines", (
   });
 });
 
+// 0.7.1 review — capping a one-line result's preview by bytes put the rest
+// out of the model's reach: `Read` has no offset, and a Read of the saved
+// file is cut to the same preview. The rest is now also saved in parts that
+// one Read returns whole, each naming the next.
+describe("storeAndPreview — the rest of the output in parts", () => {
+  /** Follow the chain from the preview, as a model with only Read would. */
+  async function followParts(preview: string): Promise<{ pieces: string[]; paths: string[] }> {
+    const pieces = [headOf(preview)];
+    const paths: string[] = [];
+    let next = /\n\[part 1 of \d+; Read (.+) for part 2\]\n/.exec(preview)?.[1];
+    while (next !== undefined) {
+      paths.push(next);
+      const text = readFileSync(next, "utf8");
+      // A Read of a part comes back whole: it is not over the threshold.
+      const again = await storeAndPreview(makeResult(text), {
+        runId: "run_read",
+        toolUseId: `tu_read_${paths.length}`,
+        rootDir: newTempRoot(),
+      });
+      expect(again.persisted).toBe(false);
+      const cut = text.lastIndexOf("\n[part ");
+      pieces.push(text.slice(0, cut));
+      next = /; Read (.+) for part \d+; full output at /.exec(text.slice(cut))?.[1];
+    }
+    return { pieces, paths };
+  }
+
+  test("an 18 KB one-line JSON result: every item is reachable with Read alone", async () => {
+    const rootDir = newTempRoot();
+    const items = Array.from({ length: 300 }, (_, i) => ({
+      id: i,
+      name: `item-${i}`,
+      tags: ["a"],
+    }));
+    const content = JSON.stringify(items);
+    expect(content.includes("\n")).toBe(false);
+    expect(Buffer.byteLength(content)).toBeGreaterThan(DEFAULT_THRESHOLD_BYTES);
+    const out = await storeAndPreview(makeResult(content), {
+      runId: "run_parts",
+      toolUseId: "tu_1",
+      rootDir,
+    });
+    const { pieces, paths } = await followParts(String(out.previewContent));
+    expect(pieces.join("")).toBe(content);
+    expect(paths).toEqual(out.partPaths ?? []);
+    expect(paths.length).toBeGreaterThanOrEqual(1);
+    expect(readFileSync(paths[paths.length - 1] as string, "utf8")).toContain(
+      "the end of the output; full output at",
+    );
+    // The full file is unchanged by the parts.
+    expect(readFileSync(out.fullPath as string, "utf8")).toBe(content);
+  });
+
+  test("multi-line output is cut at newlines, and a multi-byte character is never split", async () => {
+    const rootDir = newTempRoot();
+    const content = Array.from({ length: 3000 }, (_, i) => `row ${i} — ${"é".repeat(i % 7)}`).join(
+      "\n",
+    );
+    const out = await storeAndPreview(makeResult(content), {
+      runId: "run_lines",
+      toolUseId: "tu_1",
+      rootDir,
+    });
+    const { pieces } = await followParts(String(out.previewContent));
+    expect(pieces.join("")).toBe(content);
+    for (const piece of pieces.slice(1, -1)) expect(piece.endsWith("\n")).toBe(true);
+    for (const piece of pieces) expect(piece).not.toContain("\ufffd");
+  });
+
+  test("past MAX_PARTS the last part says the rest is only in the full output", async () => {
+    const rootDir = newTempRoot();
+    const content = "z".repeat(DEFAULT_THRESHOLD_BYTES * (MAX_PARTS + 4));
+    const out = await storeAndPreview(makeResult(content), {
+      runId: "run_cap",
+      toolUseId: "tu_1",
+      rootDir,
+    });
+    expect(String(out.previewContent)).toContain(`[part 1 of ${MAX_PARTS}; Read `);
+    expect(out.partPaths).toHaveLength(MAX_PARTS - 1);
+    const last = readFileSync(out.partPaths?.[MAX_PARTS - 2] as string, "utf8");
+    expect(last).toMatch(
+      new RegExp(
+        `\\[part ${MAX_PARTS} of ${MAX_PARTS}, the last part saved; the remaining \\d+ bytes are only in the full output at `,
+      ),
+    );
+    const { pieces } = await followParts(String(out.previewContent));
+    const shown = pieces.join("");
+    expect(content.startsWith(shown)).toBe(true);
+    const remaining = Number(/the remaining (\d+) bytes/.exec(last)?.[1]);
+    expect(shown.length + remaining).toBe(content.length);
+  }, 20_000);
+
+  test("a retried call reuses its parts; a part taken by other content is reported", async () => {
+    const rootDir = newTempRoot();
+    const content = "q".repeat(DEFAULT_THRESHOLD_BYTES * 3);
+    const opts = { runId: "run_retry", toolUseId: "tu_1", rootDir };
+    const first = await storeAndPreview(makeResult(content), opts);
+    const again = await storeAndPreview(makeResult(content), opts);
+    expect(again.reused).toBe(true);
+    expect(again.partPaths).toEqual(first.partPaths ?? []);
+    expect(again.previewContent).toBe(first.previewContent);
+
+    const planted = { runId: "run_planted", toolUseId: "tu_1", rootDir };
+    mkdirSync(join(rootDir, "run_planted"), { recursive: true });
+    writeFileSync(join(rootDir, "run_planted", "tu_1.part-2.txt"), "someone else's");
+    const out = await storeAndPreview(makeResult(content), planted);
+    expect(out.persisted).toBe(true);
+    expect(out.partPaths).toBeUndefined();
+    expect(String(out.previewContent)).toContain(
+      "[the rest could not also be saved in parts to Read one at a time: ",
+    );
+    expect(readFileSync(join(rootDir, "run_planted", "tu_1.part-2.txt"), "utf8")).toBe(
+      "someone else's",
+    );
+  });
+
+  test("a threshold too small for a useful part writes none, as before", async () => {
+    const rootDir = newTempRoot();
+    const out = await storeAndPreview(makeResult("y".repeat(5_000)), {
+      runId: "run_small",
+      toolUseId: "tu_1",
+      rootDir,
+      thresholdBytes: 100,
+    });
+    expect(out.partPaths).toBeUndefined();
+    expect(String(out.previewContent)).not.toContain("[part 1 of");
+  });
+});
+
 describe("storeAndPreview — over threshold", () => {
   test("large content is persisted; preview shows first N lines + marker", async () => {
     const rootDir = newTempRoot();
@@ -220,13 +353,17 @@ describe("storeAndPreview — over threshold", () => {
     if (out.fullPath === null) throw new Error("unreachable");
     expect(statSync(out.fullPath).size).toBe(Buffer.byteLength(padded, "utf8"));
 
-    // Preview = first DEFAULT_PREVIEW_LINES lines + truncation marker.
+    // Preview = first DEFAULT_PREVIEW_LINES lines, the line naming part 2,
+    // then the truncation marker.
     if (typeof out.previewContent !== "string") throw new Error("expected string preview");
     const previewLines = out.previewContent.split("\n");
-    // last line should be the marker, the line before that may be partial.
+    // last line should be the marker, the line before it names the next part.
     expect(previewLines[previewLines.length - 1]).toContain("[truncated, full output at ");
     expect(previewLines[previewLines.length - 1]).toContain(out.fullPath);
-    expect(previewLines.length).toBe(DEFAULT_PREVIEW_LINES + 1);
+    expect(previewLines[previewLines.length - 2]).toMatch(
+      /^\[part 1 of \d+; Read .+ for part 2\]$/,
+    );
+    expect(previewLines.length).toBe(DEFAULT_PREVIEW_LINES + 2);
     // First preview line should be the very first line of input.
     expect(previewLines[0]).toBe("line 1");
   });
