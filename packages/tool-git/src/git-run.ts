@@ -916,6 +916,22 @@ export function conflictedPatchPaths(stderr: string): string[] {
 }
 
 /**
+ * The paths a real `git apply --3way` WROTE with conflicts: git prints
+ * `U <path>` for each only after writing the merged result (conflict markers
+ * in the file, unmerged stages in the index), and exits 1. The "with
+ * conflicts." line comes earlier, from the check phase, so on its own it
+ * does not prove anything was written.
+ */
+export function unmergedApplyPaths(stderr: string): string[] {
+  const out: string[] = [];
+  for (const raw of stderr.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith("U ") && line.length > 2) out.push(line.slice(2));
+  }
+  return out;
+}
+
+/**
  * The run with the progress lines `-v` adds taken out of stderr, so a
  * failure still reads as git's own error first. What git prints without
  * `-v` — a three-way merge's "with conflicts" line and its `U path` list —

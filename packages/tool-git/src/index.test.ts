@@ -1474,8 +1474,57 @@ describe("GitApplyPatch", () => {
     expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
     expect(out.conflicts).toEqual(["README.md"]);
     expect(readFileSync(join(repo, "README.md"), "utf8")).toBe("hello\nworld\nsomething else\n");
-    const real = await call(gitApplyPatch, { patch: diff.patch, threeWay: true });
-    expect(real.applied).toBe(false);
+  });
+
+  test("a real threeWay apply that leaves conflicts says it applied, and names them", async () => {
+    // git writes the merge — conflict markers in the file, unmerged stages in
+    // the index — and exits 1. `applied: false` would say nothing changed.
+    writeFileSync(join(repo, "README.md"), "hello\nworld\npatched\n");
+    const diff = await call(gitDiff, { mode: "patch" });
+    git(["checkout", "--", "README.md"], repo);
+    writeFileSync(join(repo, "README.md"), "hello\nworld\nsomething else\n");
+    commitAll(repo, "diverge", D3);
+    const real = await call(gitApplyPatch, { patch: diff.patch, threeWay: true, index: true });
+    const content = readFileSync(join(repo, "README.md"), "utf8");
+    const unmergedStages = git(["ls-files", "-u", "--", "README.md"], repo)
+      .stdout.trim()
+      .split("\n");
+    expect({
+      applied: real.applied,
+      conflicted: real.conflicted,
+      conflicts: real.conflicts,
+      markers: content.includes("<<<<<<<") && content.includes(">>>>>>>"),
+      unmergedStages: unmergedStages.length,
+    }).toEqual({
+      applied: true,
+      conflicted: true,
+      conflicts: ["README.md"],
+      markers: true,
+      unmergedStages: 3,
+    });
+    expect(String(real.reason)).toContain("WITH CONFLICTS");
+  });
+
+  test("a threeWay apply that fails outright still says nothing was applied", async () => {
+    // A patch whose preimage blob this repository lacks cannot fall back to a
+    // merge: git writes nothing, prints no `U` line, and the answer is false.
+    const patch = [
+      "diff --git a/README.md b/README.md",
+      "index 0123456..89abcde 100644",
+      "--- a/README.md",
+      "+++ b/README.md",
+      "@@ -1 +1 @@",
+      "-not what the file says",
+      "+changed",
+      "",
+    ].join("\n");
+    const before = readFileSync(join(repo, "README.md"), "utf8");
+    const out = await call(gitApplyPatch, { patch, threeWay: true });
+    expect({ applied: out.applied, conflicted: out.conflicted }).toEqual({
+      applied: false,
+      conflicted: undefined,
+    });
+    expect(readFileSync(join(repo, "README.md"), "utf8")).toBe(before);
   });
 
   test("a conflicted file past the size cap is reported, not read into memory", async () => {

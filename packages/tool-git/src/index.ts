@@ -40,6 +40,7 @@ import {
   resolveInsideRoot,
   skippedPatchPaths,
   truncationNote,
+  unmergedApplyPaths,
   withoutApplyProgress,
 } from "./git-run";
 import {
@@ -1186,6 +1187,19 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     ];
     const run = await repo.run(args, { stdin: patchText });
     if (run.code !== 0) {
+      // A three-way apply that merged WITH CONFLICTS exits 1 after writing:
+      // the files hold conflict markers and the index holds them unmerged.
+      // "applied: false" would say nothing changed.
+      const unmerged = checkedOnly ? [] : unmergedApplyPaths(run.stderr);
+      if (unmerged.length > 0) {
+        return json({
+          applied: true,
+          checkedOnly,
+          conflicted: true,
+          conflicts: unmerged,
+          reason: `GitApplyPatch: the patch was applied as a three-way merge WITH CONFLICTS in ${unmerged.length} file(s). Conflict markers were written into them and the index holds them unmerged; resolve them as after a merge (GitConflicts lists them), then stage the result.`,
+        });
+      }
       return json({
         applied: false,
         checkedOnly,
