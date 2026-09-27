@@ -538,6 +538,106 @@ describe("EIP-712, against the specification's own example", () => {
   });
 });
 
+describe("EIP-712 types are checked once, before anything is hashed", () => {
+  const domain = { name: "T", chainId: 1 };
+
+  test("a struct referenced but never instantiated still has its field types checked", () => {
+    // Q only appears inside an empty array, so no Q is ever hashed; its type
+    // string went into the encoded type unexamined, and the digest came back.
+    const types = {
+      M: [{ name: "ps", type: "P[]" }],
+      P: [{ name: "qs", type: "Q[]" }],
+      Q: [{ name: "z", type: "[1][1]x" }],
+    };
+    expect(() => typedDataDigest(domain, types, "M", { ps: [{ qs: [] }] })).toThrow(
+      /^Q\.z: "\[1\]\[1\]x" is neither a struct defined in types nor an ABI type/,
+    );
+  });
+
+  test("a long type string is refused by its length, not scanned in the square of it", () => {
+    // `(\[\d*\])+$` backtracked quadratically on this, once per struct
+    // instance: about 120 KB of request blocked the event loop for 30 s.
+    const long = `${"[1]".repeat(3_000)}x`;
+    const types = {
+      M: [{ name: "ps", type: "P[]" }],
+      P: [{ name: "qs", type: "Q[]" }],
+      Q: [{ name: "z", type: long }],
+    };
+    const message = { ps: Array.from({ length: 6 }, () => ({ qs: [] })) };
+    expect(() => typedDataDigest(domain, types, "M", message)).toThrow(
+      /^Q\.z: "\[1\]\[1\].*… \(9001 characters\)" is neither a struct .* longer than the 8192 this reads/,
+    );
+  });
+
+  test("a struct array may nest no deeper than an ABI type", () => {
+    const types = {
+      M: [{ name: "p", type: `P${"[]".repeat(33)}` }],
+      P: [{ name: "a", type: "uint8" }],
+    };
+    expect(() => typedDataDigest(domain, types, "M", { p: [] })).toThrow(
+      /^M\.p: "P\[\]\[\].*" nests arrays more than 32 levels deep/,
+    );
+    const ok = {
+      M: [{ name: "p", type: `P${"[]".repeat(32)}` }],
+      P: [{ name: "a", type: "uint8" }],
+    };
+    expect(typedDataDigest(domain, ok, "M", { p: [] }).digest).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  test("a struct's type hash is computed once per digest, not once per instance", () => {
+    // Every P re-encoded every struct P refers to, so a message of many small
+    // instances cost its count times the size of the types. Counting the
+    // reads of Q's field list shows the work does not grow with the count.
+    let reads = 0;
+    const qFields = new Proxy([{ name: "a", type: "uint256" }], {
+      get(target, key, receiver) {
+        if (key === "length") reads++;
+        return Reflect.get(target, key, receiver);
+      },
+    });
+    const types = {
+      M: [{ name: "ps", type: "P[]" }],
+      P: [
+        { name: "x", type: "uint8" },
+        { name: "qs", type: "Q[]" },
+      ],
+      Q: qFields,
+    };
+    const readsFor = (count: number): number => {
+      reads = 0;
+      const message = { ps: Array.from({ length: count }, () => ({ x: 1, qs: [] })) };
+      expect(typedDataDigest(domain, types, "M", message).digest).toMatch(/^0x[0-9a-f]{64}$/);
+      return reads;
+    };
+    const one = readsFor(1);
+    expect(one).toBeGreaterThan(0);
+    expect(readsFor(50)).toBe(one);
+  });
+
+  test("array suffixes are read the same way the digest always read them", () => {
+    // EIP-712's own example, with a fixed and a nested array added: the
+    // encoded type is unchanged by the linear reader.
+    const types = {
+      Mail: [
+        { name: "to", type: "Person[2]" },
+        { name: "ids", type: "uint256[][1]" },
+      ],
+      Person: [{ name: "name", type: "string" }],
+    };
+    expect(encodeType("Mail", types)).toBe(
+      "Mail(Person[2] to,uint256[][1] ids)Person(string name)",
+    );
+    const digest = typedDataDigest(domain, types, "Mail", {
+      to: [{ name: "a" }, { name: "b" }],
+      ids: [[1, 2]],
+    });
+    expect(digest.encodedType).toBe("Mail(Person[2] to,uint256[][1] ids)Person(string name)");
+    expect(() =>
+      typedDataDigest(domain, types, "Mail", { to: [{ name: "a" }], ids: [[1]] }),
+    ).toThrow("Mail.to: expected 2 items, got 1");
+  });
+});
+
 describe("EIP-712 reads only what the message and the types define (C210)", () => {
   const domain = { name: "X", version: "1", chainId: 1 };
   const INHERITED = ["toString", "constructor", "valueOf", "hasOwnProperty", "__proto__"];
