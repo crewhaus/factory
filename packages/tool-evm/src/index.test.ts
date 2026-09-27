@@ -326,11 +326,119 @@ describe("tool-evm: what a permission rule sees (review of 544b042d)", () => {
       });
     }
     expect(restricts(EVM_TOOL_MAP.evmGetLogs, "EvmGetLogs(8453/*)", all)).toBe(false);
-    // A rule about one contract is about that contract.
-    expect(restricts(EVM_TOOL_MAP.evmGetLogs, `EvmGetLogs(1/${USDT})`, all)).toBe(false);
     expect(
       restricts(EVM_TOOL_MAP.evmGetLogs, `EvmGetLogs(1/${USDT})`, { ...all, address: USDT }),
     ).toBe(true);
+  });
+
+  test("EvmGetLogs without an address reads every contract, so a deny on one contract fires", () => {
+    // The query returns USDT's logs among everyone else's: a deny scoped to
+    // USDT on this chain must not be dodged by leaving `address` out.
+    const all = { chainId: "1", fromBlock: "0x1", toBlock: "0x2" };
+    const fires = (pattern: string) => restricts(EVM_TOOL_MAP.evmGetLogs, pattern, all);
+    expect(fires(`EvmGetLogs(1/${USDT})`)).toBe(true);
+    expect(fires(`EvmGetLogs(**${USDT})`)).toBe(true);
+    expect(fires(`EvmGetLogs(${USDT})`)).toBe(true);
+    // Not another chain's rule, and not an allow for one contract.
+    expect(fires(`EvmGetLogs(8453/${USDT})`)).toBe(false);
+    const subject = preparePermissionSubject(EVM_TOOL_MAP.evmGetLogs, all);
+    if (!subject.ok) throw new Error(subject.reason);
+    const allows = (pattern: string) =>
+      matchesPattern(compilePattern(pattern), "EvmGetLogs", subject.input, {
+        polarity: "allow",
+        ...(subject.operativeValues !== undefined
+          ? { operativeValues: subject.operativeValues }
+          : {}),
+      });
+    expect(allows(`EvmGetLogs(1/${USDT})`)).toBe(false);
+    expect(allows("EvmGetLogs(1/*)")).toBe(true);
+  });
+
+  test("a deny or ask written the 0.7.0 way still fires; an allow must name the chain", () => {
+    // 0.7.0 matched a rule against every string in the call. Since 0.7.1 the
+    // value is `<chainId>/<address>`, and `*` does not cross the `/`, so
+    // these denies had silently become no-ops.
+    for (const chainId of ["1", "ethereum-mainnet"]) {
+      const call = { chainId, to: USDT, data: "0x18160ddd" };
+      for (const pattern of [
+        "EvmCall(*)",
+        `EvmCall(${USDT})`,
+        `EvmCall(${USDT.toLowerCase()})`,
+        `EvmCall(${chainId})`,
+        `EvmCall(${chainId}/${USDT})`,
+      ]) {
+        expect({ chainId, pattern, fires: restricts(EVM_TOOL_MAP.evmCall, pattern, call) }).toEqual(
+          { chainId, pattern, fires: true },
+        );
+      }
+      expect(restricts(EVM_TOOL_MAP.evmCall, `EvmCall(${USDT.slice(0, -1)}8)`, call)).toBe(false);
+    }
+    const balance = { chainId: "1", address: USDT };
+    expect(restricts(EVM_TOOL_MAP.evmGetBalance, "EvmGetBalance(*)", balance)).toBe(true);
+    const hash = `0x${"ab".repeat(32)}`;
+    expect(
+      restricts(EVM_TOOL_MAP.evmGetTransactionReceipt, "EvmGetTransactionReceipt(*)", {
+        chainId: "1",
+        txHash: hash,
+      }),
+    ).toBe(true);
+    // The allow side keeps requiring the qualified form: naming an address
+    // without its chain grants it on no chain, rather than on every chain.
+    const subject = preparePermissionSubject(EVM_TOOL_MAP.evmCall, {
+      chainId: "1",
+      to: USDT,
+      data: "0x",
+    });
+    if (!subject.ok) throw new Error(subject.reason);
+    const allows = (pattern: string) =>
+      matchesPattern(compilePattern(pattern), "EvmCall", subject.input, {
+        polarity: "allow",
+        ...(subject.operativeValues !== undefined
+          ? { operativeValues: subject.operativeValues }
+          : {}),
+      });
+    expect([allows("EvmCall(*)"), allows(`EvmCall(${USDT})`), allows("EvmCall(1)")]).toEqual([
+      false,
+      false,
+      false,
+    ]);
+    expect([allows(`EvmCall(1/${USDT})`), allows("EvmCall(1/*)"), allows("EvmCall(**)")]).toEqual([
+      true,
+      true,
+      true,
+    ]);
+  });
+
+  test("an address or hash is 0x and hex digits, so a 0X spelling cannot dodge a deny", () => {
+    // geth decodes `0X…` to the same address; a rule written `0x…` did not
+    // fire on it. The schema now refuses what a rule cannot be written for.
+    const upper = `0X${USDT.slice(2).toUpperCase()}`;
+    const hash = `0X${"AB".repeat(32)}`;
+    const cases: Array<[RegisteredTool, Record<string, unknown>]> = [
+      [EVM_TOOL_MAP.evmCall, { chainId: "1", to: upper, data: "0x" }],
+      [EVM_TOOL_MAP.evmGetLogs, { chainId: "1", address: upper, fromBlock: "0x1", toBlock: "0x2" }],
+      [EVM_TOOL_MAP.evmGetBalance, { chainId: "1", address: upper }],
+      [EVM_TOOL_MAP.evmGetTransaction, { chainId: "1", txHash: hash }],
+      [EVM_TOOL_MAP.evmGetTransactionReceipt, { chainId: "1", txHash: hash }],
+    ];
+    for (const [tool, input] of cases) {
+      const subject = preparePermissionSubject(tool, input);
+      expect({ tool: tool.name, ok: subject.ok }).toEqual({ tool: tool.name, ok: false });
+      if (!subject.ok) expect(subject.reason).toMatch(/is 0x followed by (40|64) hex digits/);
+    }
+    // Nor anything that is not an address: a name, a short or long hex.
+    for (const to of ["usdt.eth", "0xabc", `${USDT}00`]) {
+      expect(
+        preparePermissionSubject(EVM_TOOL_MAP.evmCall, { chainId: "1", to, data: "0x" }).ok,
+      ).toBe(false);
+    }
+    // The checksummed and the lower-case spelling both pass, and a deny
+    // written in either case fires on both.
+    for (const to of [USDT, USDT.toLowerCase()]) {
+      expect(
+        restricts(EVM_TOOL_MAP.evmCall, `EvmCall(1/${USDT})`, { chainId: "1", to, data: "0x" }),
+      ).toBe(true);
+    }
   });
 
   test("the hex in a rule and in a call may differ in case", () => {

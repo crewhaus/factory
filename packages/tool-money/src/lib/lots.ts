@@ -20,7 +20,7 @@
  * tolerance for binary noise would have to guess which remainders are real.
  */
 
-import { addExact, big, mathRound, sumExact, toNumber } from "./exact";
+import { addExact, big, decimalOf, mathRound, sumExact, toNumber } from "./exact";
 
 export const LOT_METHODS = ["fifo", "lifo", "hifo", "specific"] as const;
 export type LotMethod = (typeof LOT_METHODS)[number];
@@ -80,24 +80,6 @@ const YEAR_MS = 365 * 24 * 60 * 60 * 1000;
  * read as consuming them: a caller's own float sum (0.1 + 0.2 is
  * 0.30000000000000004) is not a claim to hold more than was bought.
  */
-
-/** A quantity as the decimal it is written as: `units / 10^scale`. */
-type DecimalQuantity = { readonly units: bigint; readonly scale: number };
-
-function decimalOf(value: number, what: string): DecimalQuantity {
-  // The shortest text that reads back as the same double is the decimal the
-  // caller wrote: 0.1, 1e-7, 10000000000.
-  const match = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/.exec(String(value));
-  if (match === null) throw new Error(`${what} (${value}) is not a positive decimal quantity`);
-  const fraction = match[2] ?? "";
-  let digits = `${match[1]}${fraction}`;
-  let scale = fraction.length - Number(match[3] ?? 0);
-  if (scale < 0) {
-    digits += "0".repeat(-scale);
-    scale = 0;
-  }
-  return { units: BigInt(digits), scale };
-}
 
 /** `units / 10^scale` back as a number: the double nearest the exact decimal. */
 function quantityNumber(units: bigint, scale: number): number {
@@ -163,10 +145,41 @@ export function computeCostBasis(
 
   const results: DisposalResult[] = [];
 
+  // Which open lot a disposal takes first, for the ordered methods. A
+  // negative answer means `a` goes before `b`; ids are unique, so no two lots
+  // tie.
+  type OpenLot = (typeof open)[number];
+  const byId = (a: OpenLot, b: OpenLot): number => (a.id < b.id ? -1 : 1);
+  const takenBefore: ((a: OpenLot, b: OpenLot) => number) | undefined =
+    method === "fifo"
+      ? (a, b) => a.acquiredMs - b.acquiredMs || byId(a, b)
+      : method === "lifo"
+        ? (a, b) => b.acquiredMs - a.acquiredMs || byId(a, b)
+        : method === "hifo"
+          ? (a, b) => {
+              // Highest cost per unit first, which realizes the smallest
+              // gain — compared by cross-multiplying, so two lots a float
+              // would call equal are still told apart.
+              const left = BigInt(b.remainingCostMinor) * a.remainingUnits;
+              const right = BigInt(a.remainingCostMinor) * b.remainingUnits;
+              return left > right ? 1 : left < right ? -1 : byId(a, b);
+            }
+          : undefined;
+  // The open lots in that order, sorted ONCE and kept sorted, with the next
+  // lot to take at the END. A disposal takes lots off the end; the only lot
+  // whose place can change is the one it took part of (its cost per unit
+  // moves by the rounding of that part), and that one is put back where it
+  // now belongs. Re-sorting every open lot for every disposal made HIFO
+  // quadratic in the lots at the schema's limit.
+  const queue = takenBefore === undefined ? [] : [...open].sort((a, b) => takenBefore(b, a));
+  const fromTheEnd = function* (): Generator<OpenLot> {
+    for (let i = queue.length - 1; i >= 0; i--) yield queue[i] as OpenLot;
+  };
+
   for (const disposal of disposals) {
     const disposedMs = instant(disposal.disposedAt, `disposal "${disposal.id}" disposedAt`);
 
-    let order = open.filter((l) => l.remainingUnits > 0n);
+    let order: Iterable<OpenLot>;
     if (method === "specific") {
       const wanted = disposal.lotIds;
       if (!wanted || wanted.length === 0) {
@@ -174,7 +187,7 @@ export function computeCostBasis(
           `disposal "${disposal.id}" uses the specific-identification method but names no lots`,
         );
       }
-      const index = new Map(order.map((l) => [l.id, l]));
+      const index = new Map(open.filter((l) => l.remainingUnits > 0n).map((l) => [l.id, l]));
       order = wanted.map((id) => {
         const lot = index.get(id);
         if (!lot) {
@@ -182,19 +195,8 @@ export function computeCostBasis(
         }
         return lot;
       });
-    } else if (method === "fifo") {
-      order = [...order].sort((a, b) => a.acquiredMs - b.acquiredMs || (a.id < b.id ? -1 : 1));
-    } else if (method === "lifo") {
-      order = [...order].sort((a, b) => b.acquiredMs - a.acquiredMs || (a.id < b.id ? -1 : 1));
     } else {
-      // Highest cost per unit first, which realizes the smallest gain —
-      // compared by cross-multiplying, so two lots a float would call equal
-      // are still told apart.
-      order = [...order].sort((a, b) => {
-        const left = BigInt(b.remainingCostMinor) * a.remainingUnits;
-        const right = BigInt(a.remainingCostMinor) * b.remainingUnits;
-        return left > right ? 1 : left < right ? -1 : a.id < b.id ? -1 : 1;
-      });
+      order = fromTheEnd();
     }
 
     const disposalUnits = scaled(disposal.quantity, `disposal "${disposal.id}" quantity`);
@@ -231,6 +233,24 @@ export function computeCostBasis(
         acquiredAt: lot.acquiredAt,
         longTerm: disposedMs - lot.acquiredMs > YEAR_MS,
       });
+    }
+    if (takenBefore !== undefined) {
+      while (queue.length > 0 && (queue[queue.length - 1] as OpenLot).remainingUnits === 0n) {
+        queue.pop();
+      }
+      const partial = queue[queue.length - 1];
+      if (partial !== undefined && consumed.some((c) => c.lotId === partial.id)) {
+        queue.pop();
+        // Binary search for its place: every lot before it is taken after it.
+        let lo = 0;
+        let hi = queue.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >>> 1;
+          if (takenBefore(queue[mid] as OpenLot, partial) > 0) lo = mid + 1;
+          else hi = mid;
+        }
+        queue.splice(lo, 0, partial);
+      }
     }
 
     if (toConsume > shortfallAllowed) {

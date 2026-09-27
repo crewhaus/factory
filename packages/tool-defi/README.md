@@ -142,11 +142,13 @@ says how many. A `PortfolioValuation` also sends at most four requests to the
 public price providers per holding priced from one (what an asset nobody lists
 costs in a fiat currency), between 16 and 512 for the call; a single
 `PriceQuote` sends at most 16. A pair or a leg already fetched is reused rather
-than asked for again, so twenty holdings of BTC cost one quote, and every
-holding not yet reached keeps one request in reserve, so a run of tokens no
-provider lists cannot leave a later holding unasked. A route the budget did not
-ask is named as "not asked" in its row — never as something the provider does
-not publish — and a note counts those rows.
+than asked for again, so twenty holdings of BTC cost one quote. The requests
+go out in rounds, one per holding still unpriced, and a round runs only when
+every such holding can have one, so which holdings get priced never depends on
+where they sit in the list: tokens no provider lists, ahead of a holding, take
+no more of the budget than it gets. A route the budget did not ask is named as "not asked" in its
+row — never as something the provider does not publish — and a note counts
+those rows.
 
 `weightBps` is a share of the **priced** total, which is stated in the payload
 too — the weights of an incomplete portfolio still sum to 10000, and that is

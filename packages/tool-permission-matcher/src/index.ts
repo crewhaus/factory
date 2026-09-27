@@ -168,6 +168,12 @@ type GlobState =
  */
 export type GlobMatcher = {
   readonly test: (value: string, work?: { steps: number }) => boolean;
+  /**
+   * Whether the glob matches `prefix` followed by SOME run of characters
+   * without a `/` (possibly none): for a value that stands for every value
+   * in its last segment (see `OperativeValue.standsForAny`).
+   */
+  readonly matchesSegmentAfter: (prefix: string) => boolean;
 };
 
 function compileGlob(glob: string): GlobMatcher {
@@ -182,6 +188,8 @@ function compileGlob(glob: string): GlobMatcher {
         if (work !== undefined) work.steps += value.length;
         return value === literal;
       },
+      matchesSegmentAfter: (prefix: string) =>
+        literal.startsWith(prefix) && !literal.slice(prefix.length).includes("/"),
     };
   }
 
@@ -276,6 +284,47 @@ function compileGlob(glob: string): GlobMatcher {
         [current, following] = [following, current];
       }
       return done(current.includes(0));
+    },
+    matchesSegmentAfter(prefix: string): boolean {
+      // Run the prefix like `test` does, then ask whether the accepting
+      // state can be reached reading only characters that are not `/`.
+      let current = [start];
+      for (let i = 0; i < prefix.length; i++) {
+        const c = prefix.charCodeAt(i);
+        const following: number[] = [];
+        const seen = new Uint8Array(count);
+        const stack = [...current];
+        while (stack.length > 0) {
+          const s = stack.pop() as number;
+          if (seen[s] === 1) continue;
+          seen[s] = 1;
+          const st = states[s] as GlobState;
+          if (st.t === "split") stack.push(st.b, st.a);
+          else if (
+            (st.t === "lit" && st.c === c) ||
+            (st.t === "notSlash" && c !== SLASH) ||
+            st.t === "anyChar"
+          ) {
+            following.push(st.out);
+          }
+        }
+        if (following.length === 0) return false;
+        current = following;
+      }
+      const seen = new Uint8Array(count);
+      const stack = [...current];
+      while (stack.length > 0) {
+        const s = stack.pop() as number;
+        if (seen[s] === 1) continue;
+        seen[s] = 1;
+        const st = states[s] as GlobState;
+        if (st.t === "accept") return true;
+        if (st.t === "split") stack.push(st.b, st.a);
+        else if ((st.t === "lit" && st.c !== SLASH) || st.t === "notSlash" || st.t === "anyChar") {
+          stack.push(st.out);
+        }
+      }
+      return false;
     },
   };
 }
@@ -409,6 +458,15 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   `alwaysDeny Write(.crewhaus/settings.json)` also fires on
  *   `.crewhaus/Settings.json`, and `alwaysDeny EvmCall(1/0xdAC17F…)` on the
  *   same address written in lower case.
+ * - `standsForAny` — the value stands for EVERY value after each of these
+ *   prefixes: a field left out whose declared default is `*` (an EvmGetLogs
+ *   call with no `address` reads every contract's logs, and is matched as
+ *   `<chainId>/*`). A deny or ask rule fires when its glob matches one of
+ *   the prefixes followed by any one segment, so `alwaysDeny
+ *   EvmGetLogs(1/0xdAC17F…)` catches the query that reads that contract
+ *   among all the others, and `EvmGetLogs(137/…)` does not. An allow rule
+ *   still matches only `canonical` — naming one contract does not grant a
+ *   read of all of them.
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
@@ -434,6 +492,7 @@ export type OperativeValue = {
   readonly spellings?: ReadonlyArray<string>;
   readonly outsideWorkspace?: boolean;
   readonly caseInsensitive?: boolean;
+  readonly standsForAny?: ReadonlyArray<string>;
 };
 
 export type MatchOptions = {
@@ -832,6 +891,13 @@ function valueMatches(
     if (argRe.test(candidate)) return true;
   }
   if (polarity !== "restrict") return false;
+  // A field the call left out whose default is `*` stands for every value, so
+  // a deny or ask naming any one value there fires on it.
+  if (value.standsForAny !== undefined) {
+    for (const prefix of value.standsForAny) {
+      if (argRe.matchesSegmentAfter(prefix)) return true;
+    }
+  }
   // A deny or ask on a path is not dodged by spelling the name another way
   // the filesystem treats as the same: another Unicode normal form always,
   // and another letter case where the filesystem ignores case.

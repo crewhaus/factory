@@ -37,9 +37,19 @@
  *      covers it (the call asks). A command inside an array of objects
  *      (`steps.argv`) runs in its element's own directory field when it has
  *      one, else the top-level one.
+ *      Unless it is a path or a command, the value alone and the qualifier
+ *      alone are kept as other spellings, so a deny or ask rule written
+ *      without the qualifier — `alwaysDeny EvmCall(0xdAC17F…)`,
+ *      `EvmCall(*)`, the way 0.7.0 matched every string in the call — still
+ *      fires. An allow must name the qualified value, so it cannot be
+ *      widened by leaving the qualifier out.
+ *    - a field left out whose declared default is `*` stands for every
+ *      value (`standsForAny`): a deny or ask naming any one value there
+ *      fires on it.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
- *      hash) is marked `caseInsensitive`: its letter case is at most an
- *      EIP-55 checksum, so a deny or ask rule must not be dodged by it.
+ *      hash — `0x` or `0X`, both of which a node accepts) is marked
+ *      `caseInsensitive`: its letter case is at most an EIP-55 checksum, so
+ *      a deny or ask rule must not be dodged by it.
  *    A tool that declares `[]` has no field that decides where it acts, and
  *    is matched on its string values like a tool that declares nothing.
  *
@@ -133,7 +143,10 @@ export function operativeValuesOf(
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
   for (const arg of operativeArgs) {
-    for (const { value: raw, words, runsIn } of readField(parsedInput, arg)) {
+    for (const { value: raw, words, runsIn, unqualified, anyAfter } of readField(
+      parsedInput,
+      arg,
+    )) {
       switch (arg.kind) {
         case "path":
           values.push(...canonicalizePath(raw));
@@ -153,32 +166,41 @@ export function operativeValuesOf(
             kind: "command",
             canonical: [raw],
             ...(words !== undefined ? { spellings: words } : {}),
+            ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
           });
           break;
-        default:
+        default: {
+          const spellings = [...(words ?? []), ...(unqualified ?? [])];
           values.push({
             kind: arg.kind,
             canonical: [raw],
-            ...(words !== undefined ? { spellings: words } : {}),
+            ...(spellings.length > 0 ? { spellings } : {}),
             ...(HEX_ID.test(raw) ? { caseInsensitive: true } : {}),
+            ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
           });
+        }
       }
     }
   }
   return values;
 }
 
-/** A value that ends in a `0x` hex id, after any `<qualifier>/`. */
-const HEX_ID = /(?:^|\/)0x[0-9a-fA-F]+$/;
+/** A value that ends in a `0x` (or `0X`) hex id, after any `<qualifier>/`. */
+const HEX_ID = /(?:^|\/)0[xX][0-9a-fA-F]+$/;
 
 /**
- * One value of a declared field; `words` is the argv it was joined from, and
- * `runsIn` the directory a `command` declared `within` one runs in.
+ * One value of a declared field. `words` is the argv it was joined from;
+ * `runsIn` the directory a `command` declared `within` one runs in;
+ * `unqualified` the value and its qualifier apart, for any other `within`
+ * field; `anyAfter` the prefixes after which a `*` default stands for any
+ * value.
  */
 type FieldReading = {
   readonly value: string;
   readonly words?: ReadonlyArray<string>;
   readonly runsIn?: string;
+  readonly unqualified?: ReadonlyArray<string>;
+  readonly anyAfter?: ReadonlyArray<string>;
 };
 
 /** Do these canonical values name the workspace root itself, and nothing else? */
@@ -237,18 +259,34 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     walk((value as Record<string, unknown>)[key], i + 1, depth + 1, value);
   };
   walk(input, 0, 0, input);
+  // A default of `*` is "every value": EvmGetLogs without an `address`
+  // reads every contract's logs.
+  const every = out.length === 0 && arg.default === ANY_VALUE;
   if (out.length === 0 && arg.default !== undefined) {
     out.push({ value: arg.default, ...runsInOf(input) });
   }
+  const anyValue = (rs: FieldReading[]): FieldReading[] =>
+    every ? rs.map((r) => ({ ...r, anyAfter: [""] })) : rs;
   // A command's `within` is where it runs, carried as `runsIn` above.
-  if (arg.kind === "command") return out;
+  if (arg.kind === "command") return anyValue(out);
   const qualifier = topQualifier;
-  if (qualifier === undefined) return out;
-  return out.map((r) =>
+  if (qualifier === undefined) return anyValue(out);
+  return out.map((r) => {
     // A path relative to a directory field; an absolute one ignores it.
-    arg.kind === "path" && isAbsolutePath(r.value) ? r : { ...r, value: `${qualifier}/${r.value}` },
-  );
+    if (arg.kind === "path") {
+      return isAbsolutePath(r.value) ? r : { ...r, value: `${qualifier}/${r.value}` };
+    }
+    return {
+      ...r,
+      value: `${qualifier}/${r.value}`,
+      unqualified: [r.value, qualifier],
+      ...(every ? { anyAfter: [`${qualifier}/`, ""] } : {}),
+    };
+  });
 }
+
+/** The declared default that stands for every value of its field. */
+const ANY_VALUE = "*";
 
 function isAbsolutePath(value: string): boolean {
   return value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(value);

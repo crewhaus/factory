@@ -11,7 +11,14 @@
  * was actually shown, compared against the one the dapp asked for.
  */
 import { keccak256, toHex } from "@crewhaus/tool-encode";
-import { type AbiType, type AbiValue, bytesArg, encodeTuple, parseType } from "./abi";
+import {
+  type AbiType,
+  type AbiValue,
+  MAX_TYPE_DEPTH,
+  bytesArg,
+  encodeTuple,
+  parseType,
+} from "./abi";
 
 export type TypedField = { readonly name: string; readonly type: string };
 export type TypedTypes = Readonly<Record<string, ReadonlyArray<TypedField>>>;
@@ -29,6 +36,36 @@ const concat = (parts: ReadonlyArray<Uint8Array>): Uint8Array => {
   return out;
 };
 
+const OPEN_BRACKET = 0x5b;
+const CLOSE_BRACKET = 0x5d;
+const isDigit = (code: number): boolean => code >= 0x30 && code <= 0x39;
+
+/**
+ * The outermost array suffix of `type` — `Foo[2][]` is `Foo[2]` with a
+ * dynamic suffix — or `undefined` when it has none. Read from the end, one
+ * character at a time: the regex this replaces backtracked in the square of
+ * the type's length, and a type string is the caller's.
+ */
+function outerArraySuffix(type: string): { inner: string; length: string } | undefined {
+  if (type.charCodeAt(type.length - 1) !== CLOSE_BRACKET) return undefined;
+  let i = type.length - 2;
+  while (i >= 0 && isDigit(type.charCodeAt(i))) i--;
+  if (i < 0 || type.charCodeAt(i) !== OPEN_BRACKET) return undefined;
+  return { inner: type.slice(0, i), length: type.slice(i + 1, -1) };
+}
+
+/** `type` without its array suffixes, and how many it had, in one pass. */
+function withoutArraySuffixes(type: string): { base: string; depth: number } {
+  let base = type;
+  let depth = 0;
+  for (let suffix = outerArraySuffix(base); suffix !== undefined; ) {
+    base = suffix.inner;
+    depth++;
+    suffix = outerArraySuffix(base);
+  }
+  return { base, depth };
+}
+
 /** The struct types `primary` refers to, transitively. */
 function referencedTypes(
   primary: string,
@@ -40,7 +77,7 @@ function referencedTypes(
   if (!fields) return seen;
   seen.add(primary);
   for (const field of fields) {
-    const base = field.type.replace(/(\[\d*\])+$/, "");
+    const { base } = withoutArraySuffixes(field.type);
     if (structFields(types, base)) referencedTypes(base, types, seen);
   }
   return seen;
@@ -78,25 +115,79 @@ export function typeHash(primary: string, types: TypedTypes): Uint8Array {
   return hash(encoder.encode(encodeType(primary, types)));
 }
 
+/**
+ * One digest's hashing: the types, and each struct's type hash computed
+ * once. `hashStruct` needs the type hash of its struct for EVERY instance,
+ * and computing it re-encodes every struct that one refers to — so a
+ * message of many small instances cost its count times the size of the
+ * types.
+ */
+type Hashing = { readonly types: TypedTypes; readonly typeHashes: Map<string, Uint8Array> };
+
+function cachedTypeHash(ctx: Hashing, primary: string): Uint8Array {
+  let known = ctx.typeHashes.get(primary);
+  if (known === undefined) {
+    known = typeHash(primary, ctx.types);
+    ctx.typeHashes.set(primary, known);
+  }
+  return known;
+}
+
+/** A caller's text in a refusal, cut to a length a message can carry. */
+function clip(text: string): string {
+  return text.length <= 80 ? text : `${text.slice(0, 80)}… (${text.length} characters)`;
+}
+
+/**
+ * Every struct `primary` reaches, checked before anything is hashed: each
+ * field's type must be a struct `types` defines (with array suffixes, at
+ * most as many as an ABI type may nest) or an ABI type the coder parses.
+ * Checked on use alone, a struct referenced but never instantiated (in an
+ * empty array) went into the encoded type unexamined, and the digest came
+ * back "ok" over a type string no wallet would accept.
+ */
+function checkTypes(primary: string, types: TypedTypes): void {
+  if (!structFields(types, primary)) throw new Error(`the type "${clip(primary)}" is not defined`);
+  for (const name of referencedTypes(primary, types)) {
+    for (const field of structFields(types, name) ?? []) {
+      const what = `${clip(name)}.${clip(field.name)}`;
+      const { base, depth } = withoutArraySuffixes(field.type);
+      if (structFields(types, base)) {
+        if (depth > MAX_TYPE_DEPTH) {
+          throw new Error(
+            `${what}: "${clip(field.type)}" nests arrays more than ${MAX_TYPE_DEPTH} levels deep`,
+          );
+        }
+        continue;
+      }
+      try {
+        parseType(field.type);
+      } catch (err) {
+        throw new Error(
+          `${what}: "${clip(field.type)}" is neither a struct defined in types nor an ABI type (${(err as Error).message})`,
+        );
+      }
+    }
+  }
+}
+
 /** One field, as the 32 bytes it contributes to a struct's encoding. */
-function encodeField(type: string, value: unknown, types: TypedTypes, what: string): Uint8Array {
-  const arrayMatch = /^(.*)\[(\d*)\]$/.exec(type);
-  if (arrayMatch) {
+function encodeField(ctx: Hashing, type: string, value: unknown, what: string): Uint8Array {
+  const types = ctx.types;
+  const array = outerArraySuffix(type);
+  if (array) {
     if (!Array.isArray(value)) throw new Error(`${what}: expected an array`);
-    const inner = arrayMatch[1] as string;
-    const expected = arrayMatch[2];
-    if (
-      expected !== undefined &&
-      expected !== "" &&
-      value.length !== Number.parseInt(expected, 10)
-    ) {
+    const expected = array.length;
+    if (expected !== "" && value.length !== Number.parseInt(expected, 10)) {
       throw new Error(`${what}: expected ${expected} items, got ${value.length}`);
     }
     // An array contributes the hash of its members' encodings.
-    return hash(concat(value.map((item, i) => encodeField(inner, item, types, `${what}[${i}]`))));
+    return hash(
+      concat(value.map((item, i) => encodeField(ctx, array.inner, item, `${what}[${i}]`))),
+    );
   }
 
-  if (structFields(types, type)) return hashStruct(type, value, types);
+  if (structFields(types, type)) return structHash(ctx, type, value);
 
   if (type === "string") {
     // A number or a boolean reads as the text it prints as. An object does
@@ -134,13 +225,17 @@ function describeValue(value: unknown): string {
 }
 
 export function hashStruct(primary: string, data: unknown, types: TypedTypes): Uint8Array {
-  const fields = structFields(types, primary);
+  return structHash({ types, typeHashes: new Map() }, primary, data);
+}
+
+function structHash(ctx: Hashing, primary: string, data: unknown): Uint8Array {
+  const fields = structFields(ctx.types, primary);
   if (!fields) throw new Error(`the type "${primary}" is not defined`);
   if (data === null || typeof data !== "object" || Array.isArray(data)) {
     throw new Error(`"${primary}" expects an object for its fields, got ${describeValue(data)}`);
   }
   const record = data as Record<string, unknown>;
-  const parts = [typeHash(primary, types)];
+  const parts = [cachedTypeHash(ctx, primary)];
   for (const field of fields) {
     // An OWN field. `in` also sees what every object inherits, so a message
     // missing "toString" was hashed over the source text of
@@ -151,7 +246,7 @@ export function hashStruct(primary: string, data: unknown, types: TypedTypes): U
         `"${primary}" requires the field "${field.name}", which the message does not have`,
       );
     }
-    parts.push(encodeField(field.type, record[field.name], types, `${primary}.${field.name}`));
+    parts.push(encodeField(ctx, field.type, record[field.name], `${primary}.${field.name}`));
   }
   return hash(concat(parts));
 }
@@ -208,13 +303,15 @@ export function typedDataDigest(
     Object.entries(types).filter(([name]) => name !== "EIP712Domain"),
   );
   const separator = domainSeparator(domain);
-  const structHash = hashStruct(primaryType, message, withoutDomain);
-  const digest = hash(concat([new Uint8Array([0x19, 0x01]), separator, structHash]));
+  checkTypes(primaryType, withoutDomain);
+  const ctx: Hashing = { types: withoutDomain, typeHashes: new Map() };
+  const messageHash = structHash(ctx, primaryType, message);
+  const digest = hash(concat([new Uint8Array([0x19, 0x01]), separator, messageHash]));
   return {
     digest: `0x${toHex(digest)}`,
     domainSeparator: `0x${toHex(separator)}`,
-    messageHash: `0x${toHex(structHash)}`,
-    typeHash: `0x${toHex(typeHash(primaryType, withoutDomain))}`,
+    messageHash: `0x${toHex(messageHash)}`,
+    typeHash: `0x${toHex(cachedTypeHash(ctx, primaryType))}`,
     encodedType: encodeType(primaryType, withoutDomain),
     primaryType,
   };

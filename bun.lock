@@ -2921,6 +2921,7 @@
         "@crewhaus/tool-datetime": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
         "@crewhaus/tool-money": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3027,6 +3028,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/tool-schema": "workspace:*",
         "zod": "^3.23.8",
       },

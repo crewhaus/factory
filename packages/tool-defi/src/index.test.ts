@@ -49,6 +49,7 @@ import {
   priceQuote,
   registerDefiConfig,
 } from "./index";
+import { getJson, newProviderLedger } from "./lib/rpc";
 
 // biome-ignore lint/suspicious/noExplicitAny: the executor supplies this context; these tools read only its signal and toolConfig.
 const ctx = {} as any;
@@ -1693,30 +1694,134 @@ describe("timeoutMs is one deadline for the whole call, and a call's requests ar
   });
 
   test("a route the budget did not ask is named as not asked, and a note counts them", async () => {
-    // XYZ is listed against USD only. After 255 unlisted holdings it has one
-    // request left: its direct pair (404), and nothing for the rest.
+    // XYZ is listed against USD only. With 255 unlisted holdings beside it,
+    // the 512 requests give every holding two rounds — its direct pair and
+    // its inverse — and none is left for a third, so XYZ's route through USD
+    // is not asked, wherever XYZ sits.
     install({ http: { [coinbaseUrl("XYZ", "USD")]: coinbaseSpot("XYZ", "USD", "2") } });
-    const holdings = [
-      ...Array.from({ length: 255 }, (_, i) => ({
-        asset: `T${i}`,
-        amount: "1",
-        quotePair: { base: `T${i}` },
-      })),
-      { asset: "XYZ", amount: "1", quotePair: { base: "XYZ" } },
+    const unlisted = Array.from({ length: 255 }, (_, i) => ({
+      asset: `T${i}`,
+      amount: "1",
+      quotePair: { base: `T${i}` },
+    }));
+    const xyzHolding = { asset: "XYZ", amount: "1", quotePair: { base: "XYZ" } };
+    for (const holdings of [
+      [...unlisted, xyzHolding],
+      [xyzHolding, ...unlisted],
+    ]) {
+      const out = await call(portfolioValuation, { quoteCurrency: "EUR", holdings });
+      const xyz = (out["unpriced"] as Array<Record<string, unknown>>).find(
+        (r) => r["asset"] === "XYZ",
+      );
+      const reason = String(xyz?.["reason"]);
+      expect(reason).toContain("coinbase publishes neither XYZ-EUR");
+      // Refused either as the last of the 512 or as past its round's share.
+      expect(reason).toMatch(
+        /coinbase was not asked for XYZ-USD: .*this call('s| has already sent the) 512 price-provider requests/,
+      );
+      expect((out["notes"] as string[]).join(" ")).toMatch(
+        /256 unpriced holding\(s\) had a price route that was not asked: this call's 512 price-provider requests go out one per holding per round/,
+      );
+    }
+  });
+
+  test("a round's attempt makes one new request, and once refused reads nothing more, cached or not", async () => {
+    // Refusing the cache too keeps a route the walk prefers less from
+    // answering while one it prefers more was not asked.
+    const { recorded } = install({
+      http: {
+        [coinbaseUrl("AAA", "USD")]: coinbaseSpot("AAA", "USD", "1"),
+        [coinbaseUrl("BBB", "USD")]: coinbaseSpot("BBB", "USD", "2"),
+      },
+    });
+    const ledger = newProviderLedger(10);
+    const options = { providers: ledger };
+    expect((await getJson(coinbaseUrl("AAA", "USD"), options)).ok).toBe(true);
+    ledger.allowance = 1;
+    ledger.halted = false;
+    expect((await getJson(coinbaseUrl("AAA", "USD"), options)).ok).toBe(true); // cached: free
+    expect((await getJson(coinbaseUrl("BBB", "USD"), options)).ok).toBe(true); // the one new request
+    const refused = await getJson(coinbaseUrl("CCC", "USD"), options);
+    expect(refused).toMatchObject({ ok: false, kind: "budget" });
+    expect((await getJson(coinbaseUrl("AAA", "USD"), options)).ok).toBe(false); // halted
+    expect({ made: ledger.made, refused: ledger.refused, halted: ledger.halted }).toEqual({
+      made: 2,
+      refused: 2,
+      halted: true,
+    });
+    expect(recorded.length).toBe(2);
+  });
+
+  test("which holdings are priced does not depend on where unlisted ones sit", async () => {
+    // BTC is listed only against USD, so in EUR it takes four requests
+    // (direct, inverse, BTC-USD, USD-EUR); ETH is listed in EUR. A run of
+    // unlisted tokens ahead of BTC used to spend the budget BTC needed, so
+    // the answer changed with the order of the list.
+    const listed = {
+      [coinbaseUrl("BTC", "USD")]: coinbaseSpot("BTC", "USD", "60000.00"),
+      [coinbaseUrl("USD", "EUR")]: coinbaseSpot("USD", "EUR", "0.90"),
+      [coinbaseUrl("ETH", "EUR")]: coinbaseSpot("ETH", "EUR", "3000.00"),
+    };
+    const real = [
+      { asset: "BTC", amount: "0.5", quotePair: { base: "BTC" } },
+      { asset: "ETH", amount: "2", quotePair: { base: "ETH" } },
     ];
-    const out = await call(portfolioValuation, { quoteCurrency: "EUR", holdings });
-    const xyz = (out["unpriced"] as Array<Record<string, unknown>>).find(
-      (r) => r["asset"] === "XYZ",
-    );
-    const reason = String(xyz?.["reason"]);
-    expect(reason).toContain(
-      "its inverse EUR-XYZ was not asked: this call has already sent the 512",
-    );
-    expect(reason).toContain("coinbase was not asked for XYZ-USD");
-    expect(reason).not.toContain("publishes neither XYZ-EUR");
-    expect((out["notes"] as string[]).join(" ")).toMatch(
-      /^.*\d+ unpriced holding\(s\) had a price route that was not asked, because this call's 512 price-provider requests were spent or held for later holdings/,
-    );
+    const pricedFor = async (dustCount: number, dustFirst: boolean) => {
+      install({ http: listed });
+      const dust = Array.from({ length: dustCount }, (_, i) => ({
+        asset: `DUST${i}`,
+        amount: "1",
+        quotePair: { base: `DUST${i}` },
+      }));
+      const out = await call(portfolioValuation, {
+        quoteCurrency: "EUR",
+        holdings: dustFirst ? [...dust, ...real] : [...real, ...dust],
+      });
+      return {
+        priced: (out["priced"] as Array<Record<string, unknown>>).map((r) => r["asset"]),
+        notes: (out["notes"] as string[]).join(" "),
+      };
+    };
+    // Room for four rounds: BTC is priced wherever it sits.
+    for (const dustFirst of [true, false]) {
+      expect((await pricedFor(64, dustFirst)).priced).toEqual(["BTC", "ETH"]);
+    }
+    // Room for two rounds only: BTC's USD route is asked in neither order,
+    // and the note says why. The same holdings are priced either way.
+    const before = await pricedFor(200, true);
+    const after = await pricedFor(200, false);
+    expect(before.priced).toEqual(["ETH"]);
+    expect(after.priced).toEqual(["ETH"]);
+    expect(before.notes).toContain("had a price route that was not asked");
+  });
+
+  test("a round the budget cannot give to every holding is not given to the first few", async () => {
+    // ZZZ is priced by its third request (ZZZ-USD, with USD-EUR already
+    // answered for the cash holding). After two rounds for 202 holdings, 109
+    // of 512 requests are left for 201 holdings still unpriced: a third round
+    // that served the first 109 would price ZZZ only when it sat early.
+    const pricedWith = async (zzzFirst: boolean) => {
+      install({
+        http: {
+          [coinbaseUrl("USD", "EUR")]: coinbaseSpot("USD", "EUR", "0.90"),
+          [coinbaseUrl("ZZZ", "USD")]: coinbaseSpot("ZZZ", "USD", "5"),
+        },
+      });
+      const dust = Array.from({ length: 200 }, (_, i) => ({
+        asset: `DUST${i}`,
+        amount: "1",
+        quotePair: { base: `DUST${i}` },
+      }));
+      const zzz = { asset: "ZZZ", amount: "1", quotePair: { base: "ZZZ" } };
+      const cash = { asset: "USD", amount: "10", quotePair: { base: "USD" } };
+      const out = await call(portfolioValuation, {
+        quoteCurrency: "EUR",
+        holdings: zzzFirst ? [cash, zzz, ...dust] : [cash, ...dust, zzz],
+      });
+      return (out["priced"] as Array<Record<string, unknown>>).map((r) => r["asset"]);
+    };
+    expect(await pricedWith(true)).toEqual(["USD"]);
+    expect(await pricedWith(false)).toEqual(["USD"]);
   });
 
   test("the same pair across many holdings is asked for once", async () => {

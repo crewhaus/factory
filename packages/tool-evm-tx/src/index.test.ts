@@ -77,6 +77,28 @@ describe("EvmSendTransaction & EvmSimulate — tool flags", () => {
   });
 });
 
+describe("the address a transaction goes to", () => {
+  test("is 0x and 40 hex digits, so a 0X spelling cannot dodge a rule written 0x…", () => {
+    // geth decodes `0X…` to the same address, and a deny or allow written
+    // `0x…` did not read it as that address.
+    const usdc = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+    const base = { walletId: "treasury", data: "0x" };
+    for (const tool of [EVM_TX_TOOL_MAP.evmSendTransaction, EVM_TX_TOOL_MAP.evmSimulate]) {
+      for (const to of [`0X${usdc.slice(2)}`, "usdc.eth", "0xabc", `${usdc}00`]) {
+        const parsed = tool.inputSchema.safeParse({ ...base, to });
+        expect({ tool: tool.name, to, ok: parsed.success }).toEqual({
+          tool: tool.name,
+          to,
+          ok: false,
+        });
+      }
+      for (const to of [usdc, usdc.toLowerCase()]) {
+        expect(tool.inputSchema.safeParse({ ...base, to }).success).toBe(true);
+      }
+    }
+  });
+});
+
 describe("EvmSendTransaction — happy path through wallet-engine", () => {
   test("broadcasts and returns the receipt", async () => {
     const engine = createWalletEngine({

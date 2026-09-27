@@ -642,6 +642,48 @@ describe("LedgerReconcile", () => {
     ).rejects.toThrow(/escapes the workspace root/);
   });
 
+  test("a FIFO statement or template is refused without being opened (C092's harm, by a new path)", async () => {
+    // With no writer, opening a FIFO blocks for ever, and these reads were
+    // synchronous: the whole process stopped. A writer is kept waiting on
+    // each pipe so the test stays bounded even against that code — an open
+    // would complete, and the writer would exit.
+    const writers: Array<ReturnType<typeof Bun.spawn>> = [];
+    const pipe = (name: string) => {
+      const fifo = join(workspace, name);
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+      writers.push(
+        Bun.spawn(["sh", "-c", `printf x > '${fifo}'`], { stdout: "ignore", stderr: "ignore" }),
+      );
+    };
+    pipe("statement.csv");
+    pipe("t.md");
+    try {
+      await Bun.sleep(100);
+      await expect(
+        raw(ledgerReconcile, {
+          left: { kind: "statement", file: "statement.csv" },
+          right: { kind: "lines", lines: [] },
+        }),
+      ).rejects.toThrow('"statement.csv" is a fifo, not a regular file');
+      await expect(
+        raw(invoiceRender, invoiceInput({ templateFile: "t.md", outputs: ["markdown"] })),
+      ).rejects.toThrow('"t.md" is a fifo, not a regular file');
+      await Bun.sleep(200);
+      // Both still blocked in their opens: nothing opened either pipe.
+      expect(writers.map((w) => w.exitCode)).toEqual([null, null]);
+    } finally {
+      for (const w of writers) w.kill("SIGKILL");
+      await Promise.all(writers.map((w) => w.exited));
+    }
+  }, 10_000);
+
+  test("a template file past the inline template's limit is refused", async () => {
+    writeFileSync(join(workspace, "big.md"), "x".repeat(256 * 1024 + 1));
+    await expect(
+      raw(invoiceRender, invoiceInput({ templateFile: "big.md", outputs: ["markdown"] })),
+    ).rejects.toThrow(/"big\.md" is over the 262144-byte limit/);
+  });
+
   test("a side that names a kind but not its source is refused", async () => {
     await expect(
       raw(ledgerReconcile, { left: { kind: "lines" }, right: { kind: "lines", lines: [] } }),

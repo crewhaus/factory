@@ -211,12 +211,20 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * `default` is the value the tool uses when the field is omitted, for a tool
  * that fills the default in `execute` rather than in its schema. Without it,
  * a call that leaves the field out would carry no value for a deny rule to
- * catch, while the tool still acts on the default.
+ * catch, while the tool still acts on the default. A default of `*` means
+ * "every value" (EvmGetLogs without an `address` reads every contract's
+ * logs): an allow must match the `*` itself, and a deny or ask naming any
+ * one value there fires.
  *
  * `within` names a second, top-level field that qualifies this one. Its value
  * is written in front, with a `/` between: `{ field: "repo", kind:
  * "recipient", within: "owner" }` is matched as `crewhaus/factory`, so one rule
- * can say `IssueCreate(crewhaus/*)`. For a `path`, `within` names the
+ * can say `IssueCreate(crewhaus/*)`. An allow must match that qualified
+ * form; a deny or ask also fires on the value alone and on the qualifier
+ * alone, so `alwaysDeny IssueCreate(factory)` or `IssueCreate(*)`, written
+ * the way 0.7.0 matched every string in a call, is not silently dead.
+ *
+ * For a `path`, `within` names the
  * directory the path is relative to (`{ field: "paths", kind: "path", within:
  * "cwd" }`), and the joined path is what gets resolved; an absolute path is
  * left as it is. When the call leaves the qualifying field out, the value is

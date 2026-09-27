@@ -37,7 +37,15 @@ export class ChainCallError extends CrewhausError {
 export type ChainRpc = (
   method: string,
   params: ReadonlyArray<unknown>,
-  opts?: { readonly signal?: AbortSignal },
+  opts?: {
+    readonly signal?: AbortSignal;
+    /**
+     * What is left of the tool's own deadline, in ms. A transport with a
+     * deadline of its own (the chain adapter's defaults to 30 s) uses this
+     * instead, so a `timeoutMs` above that default is not silently cut to it.
+     */
+    readonly timeoutMs?: number;
+  },
 ) => Promise<unknown>;
 
 /** Boot-time binding: chain id in, transport out. */
@@ -62,7 +70,10 @@ export function setChainRpcResolver(fn: ChainRpcResolver | undefined): void {
  */
 export function chainRpcFromAdapter(adapter: ChainAdapter): ChainRpc {
   return (method, params, opts) =>
-    adapter.rpcRead(method, params, opts?.signal === undefined ? {} : { signal: opts.signal });
+    adapter.rpcRead(method, params, {
+      ...(opts?.signal === undefined ? {} : { signal: opts.signal }),
+      ...(opts?.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+    });
 }
 
 /**
@@ -140,7 +151,13 @@ export async function rpcRead(
   // Checked before dispatch, not after: a cancelled run should not be the
   // reason a node sees one more request.
   if (signal?.aborted === true) throw abortError(signal);
-  const call = rpc(method, params, signal === undefined ? {} : { signal });
+  const deadlineAt = signal === undefined ? undefined : DEADLINES.get(signal);
+  const call = rpc(method, params, {
+    ...(signal === undefined ? {} : { signal }),
+    // The rest of the tool's budget, so the transport's own deadline is not
+    // shorter than the one the caller asked for.
+    ...(deadlineAt === undefined ? {} : { timeoutMs: Math.max(1, deadlineAt - Date.now()) }),
+  });
   if (signal === undefined) return call;
 
   let onAbort: (() => void) | undefined;
@@ -203,11 +220,19 @@ export function rpcError(err: unknown): RpcErrorShape {
   return typeof message === "string" ? { message } : { message: String(err) };
 }
 
-/** True when the failure is the caller's or the runtime's cancellation. */
+/**
+ * True when the failure is a cancellation or a deadline — the caller's, the
+ * runtime's, or the transport's own (a chain adapter's timeout carries
+ * `timedOut`) — rather than anything the node said.
+ */
 export function isAbort(err: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted === true) return true;
   const record = asRecord(err);
-  return record?.["name"] === "AbortError" || record?.["name"] === "TimeoutError";
+  return (
+    record?.["name"] === "AbortError" ||
+    record?.["name"] === "TimeoutError" ||
+    record?.["timedOut"] === true
+  );
 }
 
 /**
@@ -259,8 +284,12 @@ export type Deadline = {
  * here opens one before its first byte and cancels it in a `finally`: a tool
  * that fans out over several round trips can hang in several places.
  */
+/** When each deadline's signal runs out (epoch ms), for `rpcRead` to pass down. */
+const DEADLINES = new WeakMap<AbortSignal, number>();
+
 export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   const ctrl = new AbortController();
+  DEADLINES.set(ctrl.signal, Date.now() + ms);
   const timer = setTimeout(() => ctrl.abort(new Error(`deadline of ${ms}ms elapsed`)), ms);
   const onOuter = (): void => ctrl.abort(outer?.reason);
   if (outer !== undefined) {

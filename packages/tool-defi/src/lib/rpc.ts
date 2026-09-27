@@ -317,8 +317,8 @@ export const DEFI_RPC_METHODS: ReadonlySet<string> = new Set([
 export type TransportFailure = {
   /**
    * `budget`: not sent, because the call's price-provider requests are spent
-   * or held for the holdings after this one — nothing was asked, so nothing
-   * is known about what the provider publishes.
+   * or this round's share of them is — nothing was asked, so nothing is
+   * known about what the provider publishes.
    */
   readonly kind:
     | "transport"
@@ -368,18 +368,26 @@ export type ProviderLedger = {
   readonly limit: number;
   made: number;
   /**
-   * Requests held back for work still to come — one per holding a valuation
-   * has not reached — so assets that no provider lists cannot spend the
-   * budget before a later holding has been asked at all.
+   * How many NEW requests the attempt in progress may still make, when a
+   * caller shares the budget out in rounds (PortfolioValuation: one per
+   * holding per round). Undefined: no per-attempt limit. An answer already
+   * fetched in the call is free — until the attempt is `halted`.
    */
-  reserve: number;
+  allowance?: number;
+  /**
+   * Set once the attempt in progress has been refused a request: every
+   * later request of that attempt is refused too, cached or not, so a route
+   * it prefers less cannot answer from the cache while a route it prefers
+   * more was not asked.
+   */
+  halted?: boolean;
   /** How many requests were refused for budget, so a caller can say so. */
   refused: number;
   readonly answers: Map<string, Promise<RpcOutcome<unknown>>>;
 };
 
 export function newProviderLedger(limit: number): ProviderLedger {
-  return { limit, made: 0, reserve: 0, refused: 0, answers: new Map() };
+  return { limit, made: 0, refused: 0, answers: new Map() };
 }
 
 /** Why nothing was dialled: the call's signal had already fired. */
@@ -563,18 +571,30 @@ export async function getJson(
   const ledger = options.providers;
   if (ledger === undefined) return dialJson(url, label, options);
   const key = `${options.accept ?? "application/json"} ${url}`;
-  const known = ledger.answers.get(key);
-  if (known !== undefined) return known;
-  if (ledger.made >= ledger.limit - ledger.reserve) {
+  const roundOver = (): RpcOutcome<unknown> => {
+    ledger.halted = true;
     ledger.refused++;
     return {
       ok: false,
       kind: "budget",
-      message:
-        ledger.made >= ledger.limit
-          ? `this call has already sent the ${ledger.limit} price-provider requests it may send, so ${label} was not asked — price fewer distinct assets per call`
-          : `${label} was not asked: the rest of this call's ${ledger.limit} price-provider requests is held for the ${ledger.reserve} holding(s) after this one — price fewer distinct assets per call`,
+      message: `${label} was not asked: this call's ${ledger.limit} price-provider requests go out one per holding per round, and too few were left for another round of every holding still unpriced — price fewer distinct assets per call`,
     };
+  };
+  if (ledger.halted === true) return roundOver();
+  const known = ledger.answers.get(key);
+  if (known !== undefined) return known;
+  if (ledger.made >= ledger.limit) {
+    ledger.halted = true;
+    ledger.refused++;
+    return {
+      ok: false,
+      kind: "budget",
+      message: `this call has already sent the ${ledger.limit} price-provider requests it may send, so ${label} was not asked — price fewer distinct assets per call`,
+    };
+  }
+  if (ledger.allowance !== undefined) {
+    if (ledger.allowance <= 0) return roundOver();
+    ledger.allowance--;
   }
   ledger.made++;
   const answer = dialJson(url, label, options);
