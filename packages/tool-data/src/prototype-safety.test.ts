@@ -18,7 +18,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { z } from "zod";
 import {
+  columnsToRecords,
   csvParse,
+  csvWrite,
   dataConvert,
   flattenObject,
   jsonMergePatch,
@@ -26,6 +28,7 @@ import {
   jsonQuery,
   recordsToColumns,
   tableAggregate,
+  tableJoin,
   tableQuery,
   unflattenObject,
   xmlParse,
@@ -244,6 +247,80 @@ describe("keys named like prototype members round-trip as data", () => {
     );
     expectPrototypeUntouched();
     expect(Object.hasOwn(agg.groups[0], "__proto__")).toBe(true);
+  });
+});
+
+describe("a top-level __proto__ key survives every record input", () => {
+  // zod rebuilds a z.record into a new object and skips "__proto__" while it
+  // does, so these tools lost the field before they ran, with no error. Each
+  // input here is what the model sends: JSON text parsed into an object whose
+  // own key is "__proto__", then the tool's own schema.
+  const rows = () => JSON.parse('[{"__proto__":"P","b":2},{"__proto__":"Q","b":3}]');
+
+  test("FlattenObject -> UnflattenObject, the documented round trip", async () => {
+    const flat = await call(flattenObject, { json: '{"__proto__":"P","a":{"b":1}}' });
+    expect(flat).toBe('{"__proto__":"P","a.b":1}');
+    const back = await call(unflattenObject, JSON.parse(`{"flat":${flat}}`));
+    expectPrototypeUntouched();
+    expect(back).toBe('{"__proto__":"P","a":{"b":1}}');
+  });
+
+  test("CsvParse -> CsvWrite writes the __proto__ column it read, in place", async () => {
+    const parsed = JSON.parse(await call(csvParse, { text: "__proto__,b\nP,2\n" }));
+    const written = await call(csvWrite, JSON.parse(JSON.stringify({ records: parsed.records })));
+    expectPrototypeUntouched();
+    expect(written).toBe("__proto__,b\nP,2");
+  });
+
+  test("TableQuery, TableAggregate and TableJoin see the field", async () => {
+    const selected = JSON.parse(
+      await call(tableQuery, { records: rows(), select: ["__proto__", "b"] }),
+    );
+    expect(selected.records).toEqual(
+      JSON.parse('[{"__proto__":"P","b":2},{"__proto__":"Q","b":3}]'),
+    );
+    expect(Object.hasOwn(selected.records[0], "__proto__")).toBe(true);
+    const grouped = JSON.parse(
+      await call(tableAggregate, {
+        records: rows(),
+        groupBy: ["__proto__"],
+        aggregations: [{ as: "n", fn: "count" }],
+      }),
+    );
+    expect(grouped.groups.map((g: Record<string, unknown>) => g["__proto__"])).toEqual(["P", "Q"]);
+    const joined = JSON.parse(
+      await call(tableJoin, {
+        left: rows(),
+        right: JSON.parse('[{"__proto__":"Q","c":9}]'),
+        leftKey: "__proto__",
+      }),
+    );
+    expectPrototypeUntouched();
+    expect(joined.rows).toHaveLength(1);
+    expect(joined.rows[0].c).toBe(9);
+  });
+
+  test("RecordsToColumns and ColumnsToRecords keep a __proto__ column", async () => {
+    const cols = JSON.parse(await call(recordsToColumns, { records: rows() }));
+    expect(Object.hasOwn(cols.columns, "__proto__")).toBe(true);
+    expect(cols.columns.__proto__).toEqual(["P", "Q"]);
+    const back = JSON.parse(await call(columnsToRecords, JSON.parse(JSON.stringify(cols))));
+    expectPrototypeUntouched();
+    expect(back.records).toEqual(rows());
+  });
+
+  test("the key is checked like any other: a wrong type is refused, with its path", () => {
+    const result = columnsToRecords.inputSchema.safeParse(
+      JSON.parse('{"columns":{"__proto__":5,"b":[1]}}'),
+    );
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues[0]?.path).toEqual(["columns", "__proto__"]);
+  });
+
+  test("the model is shown the same schema: each input is still a record", () => {
+    const shape = (tableQuery.inputSchema as unknown as z.AnyZodObject).shape;
+    expect(shape.records.element).toBeInstanceOf(z.ZodRecord);
+    expect(shape.records.element._def.typeName).toBe(z.ZodFirstPartyTypeKind.ZodRecord);
   });
 });
 

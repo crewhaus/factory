@@ -50,6 +50,7 @@ import {
 } from "./lib/json";
 import { parseJsonl, writeJsonl } from "./lib/jsonl";
 import { PathError, parsePath, queryPath } from "./lib/jsonpath";
+import { ownRecord } from "./lib/own-record";
 import {
   PatchError,
   type PatchOp,
@@ -672,7 +673,7 @@ export const csvWrite: RegisteredTool = buildTool({
     "Render records or rows as RFC 4180 CSV, quoting any field that contains the delimiter, a quote or a newline. Use to hand a spreadsheet, a ticketing import or a colleague a file that will not break on the first address field.",
   inputSchema: z.object({
     records: z
-      .array(z.union([z.record(z.unknown()), z.array(z.unknown())]))
+      .array(z.union([ownRecord(z.unknown()), z.array(z.unknown())]))
       .max(200_000)
       .describe("objects (a header is derived from their keys) or arrays (written as raw rows)"),
     columns: z
@@ -762,7 +763,7 @@ export const tableQuery: RegisteredTool = buildTool({
   description:
     "Filter, project, sort and page an array of records with a small declarative predicate over dotted field paths. Use to narrow a large result set to the rows and columns that matter before any of it reaches a model.",
   inputSchema: z.object({
-    records: z.array(z.record(z.unknown())).max(200_000),
+    records: z.array(ownRecord(z.unknown())).max(200_000),
     where: z
       .object({
         all: z.array(conditionSchema).optional().describe("every condition must hold"),
@@ -823,7 +824,7 @@ export const tableAggregate: RegisteredTool = buildTool({
   description:
     "Group records by one or more fields and reduce each group with count, sum, min, max, avg, first, last or distinct. Use to turn thousands of rows into the handful of numbers a decision actually rests on, without a model doing arithmetic.",
   inputSchema: z.object({
-    records: z.array(z.record(z.unknown())).max(200_000),
+    records: z.array(ownRecord(z.unknown())).max(200_000),
     groupBy: z
       .array(z.string())
       .max(8)
@@ -870,8 +871,8 @@ export const tableJoin: RegisteredTool = buildTool({
   description:
     "Join two record arrays on a key with inner, left, right or full semantics, reporting how many rows on each side found no match. Use to stitch two API results together without a model pairing them up by eye and quietly dropping the ones that did not line up.",
   inputSchema: z.object({
-    left: z.array(z.record(z.unknown())).max(100_000),
-    right: z.array(z.record(z.unknown())).max(100_000),
+    left: z.array(ownRecord(z.unknown())).max(100_000),
+    right: z.array(ownRecord(z.unknown())).max(100_000),
     leftKey: z.string().min(1).describe("dotted path to the join key on the left"),
     rightKey: z
       .string()
@@ -911,7 +912,7 @@ export const recordsToColumns: RegisteredTool = buildTool({
   description:
     "Turn an array of records into a column-oriented object, one array per field, with missing values filled as null. Use to feed a plotting or statistics step that wants columns, or to shrink a repetitive payload before it goes into context.",
   inputSchema: z.object({
-    records: z.array(z.record(z.unknown())).max(200_000),
+    records: z.array(ownRecord(z.unknown())).max(200_000),
     columns: z.array(z.string()).optional().describe("restrict and order the output columns"),
   }),
   readOnly: true,
@@ -934,7 +935,7 @@ export const columnsToRecords: RegisteredTool = buildTool({
   description:
     "Turn a column-oriented object back into an array of records, padding short columns with null and naming any that were short. Use to convert a columnar API response into the row shape every other table tool here expects.",
   inputSchema: z.object({
-    columns: z.record(z.array(z.unknown())).describe("field name to array of values"),
+    columns: ownRecord(z.array(z.unknown())).describe("field name to array of values"),
   }),
   readOnly: true,
   concurrencySafe: true,
@@ -990,7 +991,7 @@ export const unflattenObject: RegisteredTool = buildTool({
   description:
     "Rebuild a nested JSON value from an object of dotted-path keys, turning a contiguous run of numeric keys back into an array. Use to reverse FlattenObject, or to build a config object from flat environment-style settings.",
   inputSchema: z.object({
-    flat: z.record(z.unknown()).describe("dotted key to value"),
+    flat: ownRecord(z.unknown()).describe("dotted key to value"),
     separator: z.string().min(1).max(4).optional().describe("default ."),
     arraysFromNumericKeys: z
       .boolean()
