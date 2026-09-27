@@ -54,6 +54,7 @@ import {
   type GenerateContentParameters,
   type Part,
 } from "@google/genai";
+import { geminiCallIdFor } from "./call-ids.js";
 
 export function toGeminiParams(req: ProviderRequest): GenerateContentParameters {
   const config: GenerateContentConfig = {
@@ -255,10 +256,10 @@ function toGeminiContent(m: CanonicalMessage, toolNameById: ReadonlyMap<string, 
       parts.push({
         functionResponse: {
           // Gemini's contract: `name` must be the declared function
-          // name, not our synthetic correlator id — that travels in
-          // `id` instead.
+          // name, not our synthetic correlator id. The id is the one
+          // Gemini gave the call when it gave one, else the correlator.
           name: toolNameById.get(block.tool_use_id) ?? stripSyntheticToolUseId(block.tool_use_id),
-          id: block.tool_use_id,
+          id: geminiCallIdFor(block.tool_use_id) ?? block.tool_use_id,
           response: stringifyToolResultToObj(block.content),
         },
       });

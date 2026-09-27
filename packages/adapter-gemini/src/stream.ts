@@ -28,6 +28,7 @@
 
 import type { StreamEvent } from "@crewhaus/adapter-anthropic";
 import type { GenerateContentResponse } from "@google/genai";
+import { rememberGeminiCallId } from "./call-ids.js";
 
 type OpenBlock = { readonly kind: "text" | "thinking"; readonly index: number };
 
@@ -140,16 +141,15 @@ export async function* translateGeminiStream(
           openBlock = undefined;
         }
         const idx = nextBlockIndex++;
-        // Gemini usually sends no tool-call id. Use its id when it does;
-        // otherwise synthesise one from the function name, this stream's
-        // nonce and the index, so tool_result messages correlate and no
-        // two calls in a run share an id.
+        // The tool_use id is synthesised from the function name, this
+        // stream's nonce and the index, so tool_result messages correlate,
+        // no two calls in a run share an id, and an orphaned result can
+        // still be named. An id Gemini sends is kept beside it (call-ids.ts)
+        // and goes back on the functionResponse.
         const fnName = part.functionCall.name ?? "";
         const apiId = part.functionCall.id;
-        const id =
-          typeof apiId === "string" && apiId.length > 0
-            ? apiId
-            : `gemini_${fnName}_${idNonce}${idx}`;
+        const id = `gemini_${fnName}_${idNonce}${idx}`;
+        if (typeof apiId === "string" && apiId.length > 0) rememberGeminiCallId(id, apiId);
         yield {
           kind: "content_block_start",
           index: idx,

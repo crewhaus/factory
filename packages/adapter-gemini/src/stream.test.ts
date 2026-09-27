@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { StreamEvent } from "@crewhaus/adapter-anthropic";
 import { FinishReason, type GenerateContentResponse } from "@google/genai";
+import { geminiCallIdFor } from "./call-ids.js";
 import { translateGeminiStream } from "./stream.js";
 
 async function* synthChunks(
@@ -493,12 +494,16 @@ describe("translateGeminiStream — tool-call ids are unique within a run", () =
     for (const id of ids) expect(id).toMatch(/^gemini_my_tool_\d+$/);
   });
 
-  test("an id Gemini sends is used as is", async () => {
-    expect(await toolUseIds([{ functionCall: { id: "abc", name: "Bash", args: {} } }])).toEqual([
-      "abc",
-    ]);
+  // An API id carries no function name, so a tool_use id made of it could
+  // not be named once its tool_use left the window (functionResponse.name
+  // became "fc_…"). The id stays synthetic; Gemini's own id is kept beside it.
+  test("an id Gemini sends is kept beside the synthetic id, not in its place", async () => {
+    const [id] = await toolUseIds([{ functionCall: { id: "abc", name: "Bash", args: {} } }]);
+    expect(id).toMatch(/^gemini_Bash_\d+$/);
+    expect(geminiCallIdFor(id as string)).toBe("abc");
     // An empty one is not an id.
     const [synth] = await toolUseIds([{ functionCall: { id: "", name: "Bash", args: {} } }]);
     expect(synth).toMatch(/^gemini_Bash_\d+$/);
+    expect(geminiCallIdFor(synth as string)).toBeUndefined();
   });
 });

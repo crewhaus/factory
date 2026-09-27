@@ -146,6 +146,55 @@ describe("toGeminiParams", () => {
     expect(fr?.id).toBe(id);
   });
 
+  // f916f83f used Gemini's own call id as the tool_use id, so once that
+  // tool_use left the window (compaction) the result was sent as
+  // functionResponse.name "fc_9f2k1", which names no declared function.
+  test("an orphaned result of a call Gemini gave an id: named by its function, answered under that id", async () => {
+    const { translateGeminiStream } = await import("./stream.js");
+    const ids: string[] = [];
+    for await (const e of translateGeminiStream(
+      (async function* () {
+        yield {
+          candidates: [
+            {
+              content: {
+                role: "model",
+                parts: [
+                  { functionCall: { id: "fc_9f2k1", name: "Read", args: { path: "a" } } },
+                  { functionCall: { name: "my_tool", args: {} } },
+                ],
+              },
+            },
+          ],
+        } as never;
+      })(),
+    )) {
+      if (e.kind === "content_block_start" && e.block.type === "tool_use") ids.push(e.block.id);
+    }
+    const params = toGeminiParams({
+      ...baseReq,
+      messages: [
+        {
+          role: "user",
+          content: ids.map((id) => ({
+            type: "tool_result" as const,
+            tool_use_id: id,
+            content: "ok",
+          })),
+        },
+      ],
+    });
+    const frs = (
+      params.contents as Array<{
+        parts?: Array<{ functionResponse?: { id?: string; name?: string } }>;
+      }>
+    )[0]?.parts?.map((p) => p.functionResponse);
+    expect(frs?.map((fr) => [fr?.name, fr?.id])).toEqual([
+      ["Read", "fc_9f2k1"],
+      ["my_tool", ids[1]],
+    ]);
+  });
+
   test("orphaned non-synthetic tool_use_ids pass through as the name unchanged", () => {
     const params = toGeminiParams({
       ...baseReq,
