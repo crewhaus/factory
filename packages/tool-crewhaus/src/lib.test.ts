@@ -172,6 +172,96 @@ describe("spec diff", () => {
     expect(dropAllow.some((c) => c.kind === "permission-rule-removed" && c.widens)).toBe(false);
   });
 
+  // The engine takes the FIRST matching rule in declaration order, so the
+  // same rules in another order can decide differently: [deny X, allow X]
+  // denies X, [allow X, deny X] allows it. SpecDiff compared rules as a set
+  // and reported no change at all.
+  describe("rule order", () => {
+    const rulesSpec = (...rules: string[]) =>
+      [
+        "name: t",
+        "target: cli",
+        "agent:",
+        "  model: m",
+        "  instructions: go",
+        "tools: [runCommand]",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        ...rules.map((r) => {
+          const [type, pattern] = r.split(" ");
+          return `    - { type: ${type}, pattern: "${pattern}" }`;
+        }),
+      ].join("\n");
+    const diff = (before: string[], after: string[]) =>
+      diffSpecViews(view(rulesSpec(...before)), view(rulesSpec(...after)));
+
+    test("an allow moved ahead of a deny widens, and says which two rules swapped", () => {
+      expect(
+        diff(
+          ["alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+          ["alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+        ),
+      ).toEqual([
+        {
+          kind: "permission-rules-reordered",
+          path: "permissions.rules",
+          from: "alwaysDeny RunCommand, then alwaysAllow RunCommand",
+          to: "alwaysAllow RunCommand, then alwaysDeny RunCommand",
+          widens: true,
+        },
+      ]);
+      // An ask moved ahead of a deny turns the deny into a question.
+      expect(
+        diff(
+          ["alwaysDeny RunCommand(rm *)", "alwaysAsk RunCommand"],
+          ["alwaysAsk RunCommand", "alwaysDeny RunCommand(rm *)"],
+        ).map((c) => [c.kind, c.widens]),
+      ).toEqual([["permission-rules-reordered", true]]);
+    });
+
+    test("a guard moved ahead of an allow is reported and does not widen", () => {
+      expect(
+        diff(
+          ["alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+          ["alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+        ).map((c) => [c.kind, c.widens]),
+      ).toEqual([["permission-rules-reordered", false]]);
+    });
+
+    test("a widening swap is reported even beside a narrowing one", () => {
+      const changes = diff(
+        ["alwaysAllow Read", "alwaysDeny Read", "alwaysDeny RunCommand", "alwaysAllow RunCommand"],
+        ["alwaysDeny Read", "alwaysAllow Read", "alwaysAllow RunCommand", "alwaysDeny RunCommand"],
+      );
+      expect(changes.map((c) => [c.kind, c.widens, c.to])).toEqual([
+        ["permission-rules-reordered", true, "alwaysAllow RunCommand, then alwaysDeny RunCommand"],
+      ]);
+    });
+
+    test("rules of one type in another order decide the same, and are no change", () => {
+      expect(
+        diff(
+          ["alwaysDeny RunCommand(rm *)", "alwaysDeny RunCommand(curl *)"],
+          ["alwaysDeny RunCommand(curl *)", "alwaysDeny RunCommand(rm *)"],
+        ),
+      ).toEqual([]);
+    });
+
+    test("an ask ADDED ahead of a deny widens; one added after it does not", () => {
+      const ahead = diff(
+        ["alwaysDeny RunCommand"],
+        ["alwaysAsk RunCommand", "alwaysDeny RunCommand"],
+      );
+      expect(ahead.map((c) => [c.kind, c.widens])).toEqual([["permission-rule-added", true]]);
+      const behind = diff(
+        ["alwaysDeny RunCommand"],
+        ["alwaysDeny RunCommand", "alwaysAsk RunCommand"],
+      );
+      expect(behind.map((c) => [c.kind, c.widens])).toEqual([["permission-rule-added", false]]);
+    });
+  });
+
   test("default → auto widens, default → plan does not", () => {
     const auto = CLI_SPEC.replace("mode: default", "mode: auto");
     const plan = CLI_SPEC.replace("mode: default", "mode: plan");

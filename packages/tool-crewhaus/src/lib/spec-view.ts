@@ -676,6 +676,62 @@ function diffSets(
   };
 }
 
+/** Where each key first appears: the occurrence the first-match rule sees. */
+function firstPositions(keys: readonly string[]): Map<string, number> {
+  const out = new Map<string, number>();
+  keys.forEach((key, i) => {
+    if (!out.has(key)) out.set(key, i);
+  });
+  return out;
+}
+
+/** How much a rule type lets through when it is the first to match. */
+const RULE_LEAD: Readonly<Record<string, number>> = {
+  alwaysAllow: 0,
+  alwaysAsk: 1,
+  alwaysDeny: 2,
+};
+const ruleLead = (key: string): number => RULE_LEAD[key.slice(0, key.indexOf(" "))] ?? 2;
+
+/**
+ * Two rules on both sides whose ORDER swapped, when their types differ.
+ *
+ * The engine takes the first matching rule in declaration order, so
+ * `[alwaysDeny X, alwaysAllow X]` denies X and the same two rules reversed
+ * allow it. A swap widens when the rule that now comes first lets more
+ * through (an allow ahead of an ask or a deny, an ask ahead of a deny); it
+ * is conservative in that it does not check the two patterns can match the
+ * same call. A widening swap is reported in preference to a narrowing one.
+ * Linear in the number of rules.
+ */
+function ruleReorder(
+  before: readonly string[],
+  after: readonly string[],
+): { first: string; second: string; widens: boolean } | undefined {
+  const posBefore = firstPositions(before);
+  const posAfter = firstPositions(after);
+  const common = [...posBefore.keys()]
+    .filter((key) => posAfter.has(key))
+    .sort((a, b) => (posBefore.get(a) ?? 0) - (posBefore.get(b) ?? 0));
+  // For each lead (0..2), the seen rule of that type that now sits LATEST.
+  const latest: Array<{ key: string; at: number } | undefined> = [undefined, undefined, undefined];
+  let narrowing: { first: string; second: string; widens: boolean } | undefined;
+  for (const key of common) {
+    const at = posAfter.get(key) ?? 0;
+    const lead = ruleLead(key);
+    for (let other = 0; other < latest.length; other++) {
+      const seen = latest[other];
+      if (other === lead || seen === undefined || seen.at <= at) continue;
+      // `seen` came first before, and `key` comes first now.
+      if (lead < other) return { first: seen.key, second: key, widens: true };
+      narrowing ??= { first: seen.key, second: key, widens: false };
+    }
+    const current = latest[lead];
+    if (current === undefined || current.at < at) latest[lead] = { key, at };
+  }
+  return narrowing;
+}
+
 function sourceToModel(models: readonly ModelSlot[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const slot of models) {
@@ -799,16 +855,34 @@ export function diffSpecViews(before: SpecView, after: SpecView): SpecChange[] {
     });
   }
   const ruleKey = (r: PermissionRuleView): string => `${r.type} ${r.pattern}`;
-  const rules = diffSets(
-    before.permissions.rules.map(ruleKey),
-    after.permissions.rules.map(ruleKey),
-  );
+  const beforeRules = before.permissions.rules.map(ruleKey);
+  const afterRules = after.permissions.rules.map(ruleKey);
+  const rules = diffSets(beforeRules, afterRules);
+  const afterPos = firstPositions(afterRules);
+  // The first matching rule decides, so an ask placed ahead of a deny can
+  // turn that deny into a question for every call both match. One pass finds
+  // the last deny, so the check stays linear however many rules are added.
+  let lastDeny = -1;
+  afterRules.forEach((key, i) => {
+    if (key.startsWith("alwaysDeny ")) lastDeny = i;
+  });
   for (const key of rules.added) {
+    const aheadOfDeny = key.startsWith("alwaysAsk ") && (afterPos.get(key) ?? 0) < lastDeny;
     push({
       kind: "permission-rule-added",
       path: "permissions.rules",
       to: key,
-      widens: key.startsWith("alwaysAllow "),
+      widens: key.startsWith("alwaysAllow ") || aheadOfDeny,
+    });
+  }
+  const reorder = ruleReorder(beforeRules, afterRules);
+  if (reorder !== undefined) {
+    push({
+      kind: "permission-rules-reordered",
+      path: "permissions.rules",
+      from: `${reorder.first}, then ${reorder.second}`,
+      to: `${reorder.second}, then ${reorder.first}`,
+      widens: reorder.widens,
     });
   }
   for (const key of rules.removed) {
