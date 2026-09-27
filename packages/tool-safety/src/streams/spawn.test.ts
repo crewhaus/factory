@@ -579,3 +579,82 @@ describe.if(posix)("when the host goes away", () => {
     }
   }, 30_000);
 });
+
+/**
+ * A host started with a signal ignored — `nohup` for SIGHUP, a shell's
+ * background job for SIGINT — used to die of it once a command had run: the
+ * host-exit listener replaced SIG_IGN, and removing it left SIG_DFL. The
+ * host here is a Bun process exec'd by perl with the signal ignored.
+ */
+const hasPerl = posix && Bun.spawnSync(["perl", "-e", "exit 0"]).exitCode === 0;
+
+function startedIgnoring(perlName: string, argv: ReadonlyArray<string>) {
+  return Bun.spawnSync(["perl", "-e", `$SIG{${perlName}}="IGNORE"; exec @ARGV`, "--", ...argv], {
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 30_000,
+  });
+}
+
+/** The property is only meaningful where the runtime keeps a signal it was started ignoring. */
+function runtimeKeepsIgnored(perlName: string, sig: string): boolean {
+  if (!hasPerl) return false;
+  const r = startedIgnoring(perlName, [
+    process.execPath,
+    "-e",
+    `process.kill(process.pid, ${JSON.stringify(sig)}); setTimeout(() => console.log("alive"), 100);`,
+  ]);
+  return r.exitCode === 0 && new TextDecoder().decode(r.stdout).includes("alive");
+}
+
+for (const [sig, perlName] of [
+  ["SIGHUP", "HUP"],
+  ["SIGINT", "INT"],
+] as const) {
+  describe.if(runtimeKeepsIgnored(perlName, sig))(`a host started ignoring ${sig}`, () => {
+    const spawnModule = join(import.meta.dir, "spawn.ts");
+    const ignoredModule = join(import.meta.dir, "ignored-signals.ts");
+
+    test("is read as ignoring it, and only it", () => {
+      const script = join(scratch, `read-ignored-${sig}.ts`);
+      writeFileSync(
+        script,
+        [
+          `import { readIgnoredSignals } from ${JSON.stringify(ignoredModule)};`,
+          `console.log(JSON.stringify([...readIgnoredSignals(["SIGHUP", "SIGINT", "SIGTERM"])]));`,
+        ].join("\n"),
+      );
+      const ignoring = startedIgnoring(perlName, [process.execPath, script]);
+      expect(JSON.parse(new TextDecoder().decode(ignoring.stdout))).toEqual([sig]);
+      const plain = Bun.spawnSync([process.execPath, script], { stdout: "pipe" });
+      expect(JSON.parse(new TextDecoder().decode(plain.stdout))).toEqual([]);
+    }, 30_000);
+
+    test("keeps ignoring it while a command runs and after: the command finishes, the host lives", () => {
+      const started = join(scratch, `ignored-${sig}.started`);
+      const script = join(scratch, `ignored-${sig}-host.ts`);
+      writeFileSync(
+        script,
+        [
+          `import { existsSync } from "node:fs";`,
+          `import { spawnBounded } from ${JSON.stringify(spawnModule)};`,
+          "const [sig, started] = process.argv.slice(2);",
+          `const run = spawnBounded({ cmd: ["sh", "-c", 'echo > "$0"; sleep 1; echo work-finished', started], timeoutMs: 20_000, maxStdoutBytes: 1000, maxStderrBytes: 1000 });`,
+          // Mid-run: the signal arrives while the command runs (the terminal went away).
+          "const poll = setInterval(() => { if (existsSync(started)) { clearInterval(poll); process.kill(process.pid, sig); } }, 10);",
+          "const r = await run;",
+          // After: the listener is gone again, and the signal must still be ignored.
+          "process.kill(process.pid, sig);",
+          "await Bun.sleep(200);",
+          "console.log(`${r.stdout.trim()} exit=${r.exitCode} signalled=${existsSync(started)}`);",
+        ].join("\n"),
+      );
+      const h = startedIgnoring(perlName, [process.execPath, script, sig, started]);
+      expect({
+        exitCode: h.exitCode,
+        signal: h.signalCode ?? null,
+        out: new TextDecoder().decode(h.stdout).trim(),
+      }).toEqual({ exitCode: 0, signal: null, out: "work-finished exit=0 signalled=true" });
+    }, 30_000);
+  });
+}

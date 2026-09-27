@@ -32,6 +32,12 @@ export {
   setHostExitCleanup,
   spawnBounded,
 } from "./spawn";
+/**
+ * Listening for a caller's abort signal alongside spawnBounded without
+ * disarming it: on Bun, removing the last listener from an
+ * `AbortSignal.timeout()` cancels its timer for good.
+ */
+export { onAbort } from "../signal";
 export {
   type DecodedBody,
   type DecodedBodyOutcome,

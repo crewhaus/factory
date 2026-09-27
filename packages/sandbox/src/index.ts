@@ -4,6 +4,7 @@ import { CrewhausError } from "@crewhaus/errors";
 import {
   type SpawnBoundedResult,
   addHostExitHook,
+  onAbort,
   spawnBounded,
 } from "@crewhaus/tool-safety/streams";
 
@@ -29,31 +30,39 @@ import {
  *   --read-only
  *   --tmpfs /tmp:rw,size=64m,mode=1777,exec
  *   --name crewhaus-sbx-<random>, so the run can be stopped by name
- *   --ulimit cpu=<the timeout's worth of CPU time, plus a grace>, a limit
- *     the kernel enforces inside the container even if nothing on the host
- *     is left to (see below)
+ *   --label crewhaus.sandbox=1, so a leftover can be found:
+ *     `docker ps -a --filter label=crewhaus.sandbox`
  *   60 second default wall-clock timeout (a caller may pass its own)
  *   1 MiB of stdout and 1 MiB of stderr kept (head and tail), the rest
  *   counted and dropped as it arrives
  *
- * A timeout or an abort stops the CONTAINER, not just the CLI: the sandbox
- * runs `<cli> kill <name>`, kills the CLI's process group, stops waiting
- * for output after a short grace, and runs `<cli> rm -f <name>` for a
- * container created but never started. Signalling the CLI alone left the
- * container running — its PID 1 ignores the SIGTERM the CLI proxies — and
- * under Docker Desktop's wrapper the call waited for the program to end on
- * its own (security-6#0, security-12#5, flag-truth-3#0).
+ * A run is `<cli> create` and then `<cli> start -a -i`, not `<cli> run`, so
+ * the container exists by name before anything can race to stop it.
+ *
+ * A timeout or an abort stops the CONTAINER, not just the CLI. While the
+ * container is running: `<cli> kill <name>`, SIGKILL for the CLI's process
+ * group, a short grace for output, then `<cli> rm -f <name>`. While it is
+ * still being created: the sandbox waits for the create to answer (up to
+ * 5 s) and then removes what it made. Cutting a create off let the daemon
+ * commit a container after the last `rm -f` — left behind, and started by a
+ * client that outlived its SIGTERM (C012). Signalling the CLI alone left the
+ * container running, since its PID 1 ignores the SIGTERM the CLI proxies
+ * (security-6#0, security-12#5, flag-truth-3#0). When a stopped run's
+ * container cannot be confirmed gone, the result names it
+ * (`strayContainer`) and a detached process retries the removal.
  *
  * If the HOST goes away mid-run, the containers still running are stopped
- * too: on `process.exit`, and on a SIGINT, SIGTERM or SIGHUP the host does
- * not handle itself (a terminal Ctrl-C, a supervisor's stop), the sandbox
- * runs `<cli> kill` and `<cli> rm -f` for them synchronously before the host
- * is gone. The CLI leads its own process group, so a terminal Ctrl-C no
- * longer reaches it, and the timeout lived in the host. For a host killed
- * outright (SIGKILL, a crash), `--ulimit cpu` is the backstop: the kernel
- * kills a program that has used its timeout's worth of CPU, so an orphaned
- * busy loop does not burn a CPU forever. It assumes `--cpus` is enforced,
- * which the safety floor already does.
+ * too: on `process.exit`, and on a SIGINT, SIGTERM or SIGHUP the host
+ * neither handles nor ignores, the sandbox runs `<cli> kill` for them
+ * synchronously (at most 2 s for all of them) and starts `<cli> rm -f`
+ * without waiting for it. The CLI leads its own process group, so a
+ * terminal Ctrl-C no longer reaches it, and the timeout lived in the host.
+ * For a host killed outright (SIGKILL, a crash), every run with a timeout
+ * also has a watchdog: a detached `sh` that, 10 s after the run's timeout,
+ * runs `<cli> kill` and `<cli> rm -f` for its container. It is its own
+ * session, so it outlives the host, and it stops the whole container — a
+ * program that keeps forking is ended as surely as one busy loop. It is
+ * cancelled when the run ends. A run with no timeout has none.
  *
  * Image allowlist: any image string requested by `exec()` must appear
  * in the constructor's `allowedImages` set OR in
@@ -70,7 +79,7 @@ import {
  *
  * SECURITY: image strings and command strings are passed as separate
  * `Bun.spawn` argv elements, so shell metacharacters (`;`, `&&`, `$()`)
- * cannot escape the docker run invocation. Image and mount values are
+ * cannot escape the docker create invocation. Image and mount values are
  * additionally screened for line-feed and dash-prefix tampering before
  * the spawn so an attacker cannot smuggle CLI flags via input.
  *
@@ -160,8 +169,10 @@ export type SandboxExecResult = {
   readonly stderr: string;
   /**
    * The exit status; 128 + N when the process died of signal N (137 for a
-   * SIGKILL). -1 when there is none to report: the run was cancelled before
-   * it started, or its process could not be reaped after the kill.
+   * SIGKILL). 125 when the container could not be created (the CLI's
+   * message is in `stderr`). -1 when there is none to report: the run was
+   * cancelled before it started, or its process could not be reaped after
+   * the kill.
    */
   readonly exitCode: number;
   readonly timedOut: boolean;
@@ -183,6 +194,19 @@ export type SandboxExecResult = {
    * text is what had arrived by then, not necessarily all of it.
    */
   readonly outputComplete?: boolean;
+  /**
+   * Set only when the container of a stopped run could not be confirmed
+   * gone: the daemon was still creating it when the create had to be cut
+   * off, or `<cli> rm -f` failed or did not answer. Its name, and why. The
+   * sandbox retries the removal from a detached process; `<cli> rm -f
+   * <name>` removes it by hand. Absent reads as "nothing left behind".
+   */
+  readonly strayContainer?: SandboxStrayContainer;
+};
+
+export type SandboxStrayContainer = {
+  readonly name: string;
+  readonly reason: string;
 };
 
 export class SandboxError extends CrewhausError {
@@ -195,11 +219,13 @@ export class SandboxError extends CrewhausError {
 export interface Sandbox {
   readonly backend: SandboxBackend;
   /**
-   * The timeout an exec runs with when it passes none, in ms. The built-in
-   * backends always say; a caller that caps timeouts reads it to apply the
-   * cap to a call that sets no timeout of its own.
+   * What an exec runs with when it sets nothing itself: `timeoutMs`, in ms.
+   * The built-in backends always say; a caller that caps timeouts reads it
+   * to apply the cap to a call that sets no timeout of its own. Optional,
+   * and named so it cannot collide with a field an existing implementation
+   * already has (0.7.0's own classes kept a private `defaultTimeoutMs`).
    */
-  readonly defaultTimeoutMs?: number;
+  readonly execDefaults?: { readonly timeoutMs: number };
   exec(opts: SandboxExecOptions): Promise<SandboxExecResult>;
   /** Idempotent. */
   close(): Promise<void>;
@@ -215,7 +241,7 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MEMORY = "512m";
 const DEFAULT_CPUS = "1.0";
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
-/** SIGTERM to SIGKILL for the process group a run leads (the CLI, or the noop program). */
+/** SIGTERM to SIGKILL for the noop backend's process group (the program itself). */
 const KILL_GRACE_MS = 1_000;
 /**
  * Once the run's process is gone, how long a pipe held open by something it
@@ -225,17 +251,42 @@ const DRAIN_GRACE_MS = 750;
 /** Bound on each `<cli> kill` / `<cli> rm -f` the sandbox runs itself. */
 const CONTAINER_CONTROL_TIMEOUT_MS = 5_000;
 /**
- * Bound on each `<cli> kill` / `<cli> rm -f` run while the host is exiting.
- * These block the exit, so they are shorter; a daemon that has taken the
- * request finishes it after the CLI is gone.
+ * How long a run stopped (timeout or abort) while its container is still
+ * being created waits for `<cli> create` to answer. Only then is the
+ * create cut off — and the daemon may still commit it, so the result names
+ * the container. Until the answer, a `kill` or `rm -f` can find nothing and
+ * the container appear right after (C012).
  */
-const HOST_EXIT_CONTROL_TIMEOUT_MS = 3_000;
+const CREATE_STOP_GRACE_MS = 5_000;
+/** Bytes of `<cli> create`'s own output kept (its error, when it fails). */
+const CREATE_OUTPUT_BYTES = 16 * 1024;
+/** `docker run`'s status for a container it could not create; kept from 0.7.0. */
+const CREATE_FAILED_EXIT_CODE = 125;
 /**
- * CPU seconds past the run's own timeout (scaled by `cpus`) before the
- * kernel kills the program. Only an orphan reaches it: while the host lives
- * its timeout fires first, and `--cpus` holds CPU time to wall time × cpus.
+ * The exit path's whole budget for `<cli> kill`, for every live container
+ * together: it holds the host's exit. `<cli> rm -f` after it is started and
+ * not waited for.
  */
-const CPU_LIMIT_GRACE_S = 10;
+const HOST_EXIT_KILL_BUDGET_MS = 2_000;
+/**
+ * Seconds past a run's timeout before its watchdog stops the container: the
+ * host's own stop comes first while the host lives.
+ */
+const WATCHDOG_GRACE_S = 10;
+/** When a stopped run's container could not be confirmed gone: retry after these many seconds. */
+const STRAY_RETRY_DELAYS_S: ReadonlyArray<number> = [5, 30];
+/** The longest delay `setTimeout` honours; a longer one fires at once. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+/** `<cli> rm -f`'s answer for a container that is gone or going. */
+const GONE_RE = /no such container|already in progress/i;
+
+/**
+ * The label on every container the sandbox creates. List leftovers with
+ * `docker ps -a --filter label=crewhaus.sandbox`.
+ */
+export const SANDBOX_CONTAINER_LABEL = "crewhaus.sandbox";
+/** `$0` of the detached watchdog and retry processes, as `ps` shows it. */
+export const SANDBOX_REAPER_TAG = "crewhaus-sandbox-reaper";
 
 /**
  * Image strings must be `repository[:tag][@digest]`. We disallow leading
@@ -444,24 +495,57 @@ function signalExitCode(signal: string | null): number | undefined {
   return n === undefined ? undefined : 128 + n;
 }
 
-/**
- * The `--ulimit cpu` value, in whole seconds, for a run with this timeout
- * and CPU cap: its timeout's worth of CPU time at the cap, plus
- * {@link CPU_LIMIT_GRACE_S}. Undefined — no limit — for a run with no
- * timeout, or a `cpus` value that is not a positive number.
- */
-function cpuTimeLimitSeconds(timeoutMs: number, cpus: string): number | undefined {
-  if (!Number.isFinite(timeoutMs)) return undefined;
-  const n = Number(cpus);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.ceil((timeoutMs / 1000) * Math.max(1, n)) + CPU_LIMIT_GRACE_S;
+/** The first line of a CLI's message, for a reason shown to the caller. */
+function firstLine(text: string): string {
+  const line = text.split("\n", 1)[0] ?? "";
+  return line.trim().slice(0, 300);
 }
 
 /**
- * Containers of runs in flight — started, or being stopped — by name, with
- * the CLI that owns them. While any is registered, a host-exit hook stops
- * them if the host goes away: the run's own timeout and abort live in the
- * host and die with it.
+ * The `sh` script of a reaper: after each delay in turn, `<cli> kill` then
+ * `<cli> rm -f` for one container. Arguments: cli, name, delays (seconds).
+ */
+const REAPER_SCRIPT =
+  'cli=$1; name=$2; shift 2; for delay in "$@"; do sleep "$delay"; "$cli" kill "$name" >/dev/null 2>&1; "$cli" rm -f "$name" >/dev/null 2>&1; done';
+
+/**
+ * Starts a detached process that stops and removes one container after
+ * each of `delaysS`, and returns a function that cancels it. It is a
+ * session of its own with no pipes to the host, so it outlives the host —
+ * a SIGKILL, a crash, a supervisor that kills the host's group — and never
+ * holds a reader of the host's output open. It only ever touches the one
+ * container name, which is random. Best effort: where it cannot start
+ * (Windows, no `/bin/sh`), the run goes on without it.
+ */
+function startReaper(cli: string, name: string, delaysS: ReadonlyArray<number>): () => void {
+  if (delaysS.length === 0 || process.platform === "win32") return () => undefined;
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(
+      ["/bin/sh", "-c", REAPER_SCRIPT, SANDBOX_REAPER_TAG, cli, name, ...delaysS.map(String)],
+      { stdin: "ignore", stdout: "ignore", stderr: "ignore", detached: true },
+    );
+  } catch {
+    return () => undefined;
+  }
+  proc.unref();
+  return () => {
+    // Its group: `sh` and the `sleep` it waits on. While Bun has not seen
+    // it exit, the pid cannot have been reused.
+    if (proc.exitCode !== null || proc.signalCode !== null) return;
+    try {
+      process.kill(-proc.pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  };
+}
+
+/**
+ * Containers of runs in flight — being created, started, or stopped — by
+ * name, with the CLI that owns them. While any is registered, a host-exit
+ * hook stops them if the host goes away: the run's own timeout and abort
+ * live in the host and die with it.
  */
 const liveContainers = new Map<string, string>();
 let removeExitHook: (() => void) | undefined;
@@ -471,23 +555,37 @@ function stopLiveContainersNow(): void {
   const byCli = new Map<string, string[]>();
   for (const [name, cli] of liveContainers) byCli.set(cli, [...(byCli.get(cli) ?? []), name]);
   liveContainers.clear();
+  const until = performance.now() + HOST_EXIT_KILL_BUDGET_MS;
   for (const [cli, names] of byCli) {
-    // `kill` first (SIGKILL at once; podman's `rm -f` would wait 10 s on a
-    // PID 1 that ignores SIGTERM), then `rm -f` for one created but never
-    // started. Synchronous, because the host is exiting; detached, so a
-    // supervisor that SIGKILLs the host's group does not cut it short.
-    for (const verb of [["kill"], ["rm", "-f"]]) {
+    // `kill` stops a running container at once (podman's `rm -f` would wait
+    // 10 s on a PID 1 that ignores SIGTERM). Waited for, within one budget
+    // for all of them, since it holds the exit. Detached, so a supervisor
+    // that SIGKILLs the host's group does not cut it short.
+    const left = Math.floor(until - performance.now());
+    if (left > 0) {
       try {
-        Bun.spawnSync([cli, ...verb, ...names], {
+        Bun.spawnSync([cli, "kill", ...names], {
           stdin: "ignore",
           stdout: "ignore",
           stderr: "ignore",
-          timeout: HOST_EXIT_CONTROL_TIMEOUT_MS,
+          timeout: left,
           detached: true,
         });
       } catch {
-        // The host is going away; there is nothing else to try.
+        // The host is going away; the watchdog is still there.
       }
+    }
+    // `rm -f` removes one that was created but never started. Not waited
+    // for: it finishes after the host is gone.
+    try {
+      Bun.spawn([cli, "rm", "-f", ...names], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+        detached: true,
+      }).unref();
+    } catch {
+      // As above.
     }
   }
 }
@@ -513,25 +611,38 @@ type SuperviseOptions = {
   readonly signal?: AbortSignal;
   readonly onStdoutChunk?: (chunk: string) => void;
   readonly onStderrChunk?: (chunk: string) => void;
+  /** SIGTERM to SIGKILL for the group, once a timeout or abort starts the kill. */
+  readonly killGraceMs: number;
   /**
    * Stops what the process is only a client of (the container). Started
    * when a timeout or abort begins the kill; the result waits for it.
    */
   readonly stopRemote?: () => Promise<void>;
-  /** Runs once a killed run's process is gone (`rm -f` a late container). */
-  readonly afterKill?: () => Promise<void>;
+  /** When the run began, for `durationMs` (default: now). */
+  readonly startedAt?: number;
+};
+
+type SupervisedRun = {
+  readonly result: SandboxExecResult;
+  /** A timeout or abort started the kill. */
+  readonly killed: boolean;
+  /**
+   * The process ran and exited on its own with a status: for a container
+   * client, the container's own exit, which `--rm` cleans up.
+   */
+  readonly clean: boolean;
 };
 
 /**
- * Runs one exec for both backends: the process leads its own group, output
- * is capped as it arrives (half kept from the start, half from the end),
- * and a timeout or abort kills the group — after starting `stopRemote`,
- * which for docker/podman is what actually stops the container. Once the
- * process is gone, reading stops after a short grace even if something it
- * left behind still holds a pipe, and the result says so.
+ * Runs one process for both backends: it leads its own group, output is
+ * capped as it arrives (half kept from the start, half from the end), and a
+ * timeout or abort kills the group — after starting `stopRemote`, which for
+ * docker/podman is what actually stops the container. Once the process is
+ * gone, reading stops after a short grace even if something it left behind
+ * still holds a pipe, and the result says so.
  */
-async function superviseExec(o: SuperviseOptions): Promise<SandboxExecResult> {
-  const t0 = performance.now();
+async function superviseExec(o: SuperviseOptions): Promise<SupervisedRun> {
+  const t0 = o.startedAt ?? performance.now();
   const tailBytes = Math.floor(o.maxOutputBytes / 2);
   const headBytes = o.maxOutputBytes - tailBytes;
   const liveOut = liveForwarder("stdout", o.onStdoutChunk, headBytes);
@@ -548,7 +659,7 @@ async function superviseExec(o: SuperviseOptions): Promise<SandboxExecResult> {
     maxStderrBytes: o.maxOutputBytes,
     tailBytes,
     ...(o.signal !== undefined ? { signal: o.signal } : {}),
-    killGraceMs: KILL_GRACE_MS,
+    killGraceMs: o.killGraceMs,
     drainGraceMs: DRAIN_GRACE_MS,
     onKill: (why) => {
       reason = why;
@@ -565,9 +676,6 @@ async function superviseExec(o: SuperviseOptions): Promise<SandboxExecResult> {
     liveErr?.end();
   }
   if (stopping !== undefined) await stopping;
-  if (reason !== undefined && o.afterKill !== undefined) {
-    await o.afterKill().catch(() => undefined);
-  }
 
   const out = keptText(
     "stdout",
@@ -586,27 +694,93 @@ async function superviseExec(o: SuperviseOptions): Promise<SandboxExecResult> {
     r.stderrOmittedBytes,
   );
   return {
-    stdout: out.text,
-    stderr: err.text,
-    exitCode: r.exitCode ?? signalExitCode(r.signal) ?? -1,
-    // The first of timeout and abort is the one reported.
-    timedOut: r.timedOut && reason !== "abort",
-    aborted: r.aborted && reason !== "timeout",
-    durationMs: performance.now() - t0,
-    stdoutBytes: r.stdoutBytes,
-    stderrBytes: r.stderrBytes,
-    stdoutDroppedBytes: out.dropped,
-    stderrDroppedBytes: err.dropped,
-    outputComplete: r.outputComplete,
+    result: {
+      stdout: out.text,
+      stderr: err.text,
+      exitCode: r.exitCode ?? signalExitCode(r.signal) ?? -1,
+      // The first of timeout and abort is the one reported.
+      timedOut: r.timedOut && reason !== "abort",
+      aborted: r.aborted && reason !== "timeout",
+      durationMs: performance.now() - t0,
+      stdoutBytes: r.stdoutBytes,
+      stderrBytes: r.stderrBytes,
+      stdoutDroppedBytes: out.dropped,
+      stderrDroppedBytes: err.dropped,
+      outputComplete: r.outputComplete,
+    },
+    killed: reason !== undefined,
+    clean: reason === undefined && r.pid !== undefined && r.exitCode !== null,
   };
 }
 
+/** A run that never reached its program: nothing ran, nothing was read. */
+function notStarted(
+  startedAt: number,
+  stopped: "timeout" | "abort" | undefined,
+  stray?: SandboxStrayContainer,
+): SandboxExecResult {
+  return {
+    stdout: "",
+    stderr: "",
+    exitCode: -1,
+    timedOut: stopped === "timeout",
+    aborted: stopped === "abort",
+    durationMs: performance.now() - startedAt,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    stdoutDroppedBytes: 0,
+    stderrDroppedBytes: 0,
+    outputComplete: true,
+    ...(stray !== undefined ? { strayContainer: stray } : {}),
+  };
+}
+
+/**
+ * Watches for the first of a run's timeout and its caller's abort while the
+ * container is being created, WITHOUT stopping the create: `cut` aborts
+ * only {@link CREATE_STOP_GRACE_MS} after it.
+ */
+function watchStop(
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): {
+  readonly cut: AbortSignal;
+  readonly reason: () => "timeout" | "abort" | undefined;
+  readonly dispose: () => void;
+} {
+  const cut = new AbortController();
+  let reason: "timeout" | "abort" | undefined;
+  let grace: ReturnType<typeof setTimeout> | undefined;
+  const begin = (why: "timeout" | "abort"): void => {
+    if (reason !== undefined) return;
+    reason = why;
+    grace = setTimeout(() => cut.abort(), CREATE_STOP_GRACE_MS);
+  };
+  const deadline =
+    timeoutMs <= MAX_TIMER_MS ? setTimeout(() => begin("timeout"), timeoutMs) : undefined;
+  const unsubscribe = onAbort(signal, () => begin("abort"));
+  return {
+    cut: cut.signal,
+    reason: () => reason,
+    dispose: () => {
+      clearTimeout(deadline);
+      clearTimeout(grace);
+      unsubscribe();
+    },
+  };
+}
+
+type Removal =
+  | { readonly ok: true; readonly existed: boolean }
+  | { readonly ok: false; readonly reason: string };
+
 class DockerLikeSandbox implements Sandbox {
   readonly backend: SandboxBackend;
+  readonly execDefaults: { readonly timeoutMs: number };
   private readonly cli: string;
   private readonly allowedImages: ReadonlySet<string>;
   private readonly mountWhitelist: ReadonlyArray<string>;
-  readonly defaultTimeoutMs: number;
+  private readonly defaultTimeoutMs: number;
   private readonly maxOutputBytes: number;
   private readonly memory: string;
   private readonly cpus: string;
@@ -631,6 +805,7 @@ class DockerLikeSandbox implements Sandbox {
       return p;
     });
     this.defaultTimeoutMs = parseTimeoutMs(opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.execDefaults = { timeoutMs: this.defaultTimeoutMs };
     this.maxOutputBytes = parseMaxOutputBytes(opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
     this.memory = opts.memory ?? DEFAULT_MEMORY;
     this.cpus = opts.cpus ?? DEFAULT_CPUS;
@@ -644,16 +819,46 @@ class DockerLikeSandbox implements Sandbox {
     for (const m of mounts) validateMount(m, this.mountWhitelist);
     const timeoutMs = parseTimeoutMs(opts.timeoutMs ?? this.defaultTimeoutMs);
     const maxOutputBytes = parseMaxOutputBytes(opts.maxOutputBytes ?? this.maxOutputBytes);
-
-    // Never derived from input: the name is how a timeout or abort finds
-    // the container to kill.
+    // Never derived from input: the name is how every stop finds the container.
     const name = `crewhaus-sbx-${randomBytes(8).toString("hex")}`;
-    const cliArgs: string[] = [
-      "run",
+    const createArgs = this.createArgs(name, opts, mounts);
+    const startedAt = performance.now();
+    if (opts.signal?.aborted === true) return notStarted(startedAt, "abort");
+
+    // Registered before the CLI starts and until every stop has finished, so
+    // a host that exits at any point in between stops the container too.
+    trackContainer(name, this.cli);
+    const cancelWatchdog = Number.isFinite(timeoutMs)
+      ? startReaper(this.cli, name, [Math.ceil(timeoutMs / 1000) + WATCHDOG_GRACE_S])
+      : () => undefined;
+    try {
+      return await this.createAndStart(
+        name,
+        createArgs,
+        opts,
+        timeoutMs,
+        maxOutputBytes,
+        startedAt,
+      );
+    } finally {
+      untrackContainer(name);
+      cancelWatchdog();
+    }
+  }
+
+  private createArgs(
+    name: string,
+    opts: SandboxExecOptions,
+    mounts: ReadonlyArray<SandboxMount>,
+  ): string[] {
+    const args: string[] = [
+      "create",
       "--rm",
       "-i",
       "--name",
       name,
+      "--label",
+      `${SANDBOX_CONTAINER_LABEL}=1`,
       this.network ? "--network=bridge" : "--network=none",
       `--memory=${this.memory}`,
       `--cpus=${this.cpus}`,
@@ -663,51 +868,170 @@ class DockerLikeSandbox implements Sandbox {
       "--security-opt",
       "no-new-privileges",
     ];
-    const cpuLimit = cpuTimeLimitSeconds(timeoutMs, this.cpus);
-    if (cpuLimit !== undefined) cliArgs.push("--ulimit", `cpu=${cpuLimit}:${cpuLimit}`);
     for (const m of mounts) {
       const ro = m.readonly !== false;
-      cliArgs.push("-v", `${m.src}:${m.dst}${ro ? ":ro" : ""}`);
+      args.push("-v", `${m.src}:${m.dst}${ro ? ":ro" : ""}`);
     }
     if (opts.env !== undefined) {
       for (const [k, v] of Object.entries(opts.env)) {
         validateEnvKey(k);
-        cliArgs.push("-e", `${k}=${v}`);
+        args.push("-e", `${k}=${v}`);
       }
     }
-    cliArgs.push(opts.image, ...opts.argv);
+    args.push(opts.image, ...opts.argv);
+    return args;
+  }
 
-    // `kill` stops a running container at once (`stop` would wait 10 s);
-    // `rm -f` then removes one that was created but never started when the
-    // kill landed (`--rm` covers every container that ran). Each is bounded,
-    // and "No such container" is the expected answer when there is nothing
-    // left to do.
-    const control = async (verb: ReadonlyArray<string>): Promise<void> => {
-      await spawnBounded({
-        cmd: [this.cli, ...verb, name],
-        timeoutMs: CONTAINER_CONTROL_TIMEOUT_MS,
-        maxStdoutBytes: 4_096,
-        maxStderrBytes: 4_096,
-      });
-    };
-    // Registered before the CLI starts and until every stop has finished, so
-    // a host that exits at any point in between stops the container too.
-    trackContainer(name, this.cli);
+  private async createAndStart(
+    name: string,
+    createArgs: ReadonlyArray<string>,
+    opts: SandboxExecOptions,
+    timeoutMs: number,
+    maxOutputBytes: number,
+    startedAt: number,
+  ): Promise<SandboxExecResult> {
+    // 1. Create. A timeout or abort does not cut the create off: a daemon
+    // commits a create whether or not its client is still there, so a
+    // `kill` or `rm -f` sent before the answer can find nothing and the
+    // container appear after it. The answer is waited for, up to
+    // CREATE_STOP_GRACE_MS, and then what it made is removed.
+    const stop = watchStop(timeoutMs, opts.signal);
+    let created: SpawnBoundedResult;
     try {
-      return await superviseExec({
-        cmd: [this.cli, ...cliArgs],
+      created = await spawnBounded({
+        cmd: [this.cli, ...createArgs],
+        timeoutMs: Number.POSITIVE_INFINITY,
+        maxStdoutBytes: CREATE_OUTPUT_BYTES,
+        maxStderrBytes: CREATE_OUTPUT_BYTES,
+        tailBytes: CREATE_OUTPUT_BYTES / 2,
+        signal: stop.cut,
+        killGraceMs: 0,
+      });
+    } finally {
+      stop.dispose();
+    }
+    if (created.spawnError !== undefined) {
+      throw new SandboxError(`could not start ${this.cli}: ${created.spawnError}`);
+    }
+    const stopped = stop.reason();
+    if (created.exitCode === null) {
+      // No answer: cut off after the grace, or killed from outside. The
+      // daemon may still create the container; nothing will start it.
+      const gone = await this.remove(name, false);
+      if (gone.ok && gone.existed) return notStarted(startedAt, stopped);
+      const why = created.aborted
+        ? `the run was stopped while ${this.cli} was still creating its container, and the create did not answer within ${CREATE_STOP_GRACE_MS / 1000}s`
+        : `${this.cli} create was killed before it answered`;
+      return notStarted(
+        startedAt,
+        stopped,
+        this.leftBehind(name, `${why}; the daemon may still create it (it is never started)`),
+      );
+    }
+    if (created.exitCode !== 0) {
+      // The CLI answered: the create failed, so nothing was made. Its own
+      // message is the run's stderr, and the status is 125, as `<cli> run`
+      // reported a container it could not create (`create` exits 1 for a
+      // daemon error).
+      const err = keptText(
+        "stderr",
+        created.stderr,
+        created.stderrTruncated,
+        created.stderrTail,
+        created.stderrBytes,
+        created.stderrOmittedBytes,
+      );
+      return {
+        ...notStarted(startedAt, stopped),
+        stderr: err.text,
+        exitCode: CREATE_FAILED_EXIT_CODE,
+        stderrBytes: created.stderrBytes,
+        stderrDroppedBytes: err.dropped,
+      };
+    }
+    const remaining = timeoutMs - (performance.now() - startedAt);
+    if (stopped !== undefined || remaining <= 0) {
+      const gone = await this.remove(name, false);
+      return notStarted(
+        startedAt,
+        stopped ?? "timeout",
+        gone.ok ? undefined : this.leftBehind(name, gone.reason),
+      );
+    }
+
+    // 2. Start it attached, for what is left of the timeout. A SIGTERM buys
+    // nothing here: the container is stopped by name, and a client that
+    // proxies TERM to the container lives on — so the group gets SIGKILL.
+    let run: SupervisedRun;
+    try {
+      run = await superviseExec({
+        cmd: [this.cli, "start", "-a", "-i", name],
         ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
-        timeoutMs,
+        timeoutMs: remaining,
         maxOutputBytes,
         ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
         ...(opts.onStdoutChunk !== undefined ? { onStdoutChunk: opts.onStdoutChunk } : {}),
         ...(opts.onStderrChunk !== undefined ? { onStderrChunk: opts.onStderrChunk } : {}),
-        stopRemote: () => control(["kill"]),
-        afterKill: () => control(["rm", "-f"]),
+        killGraceMs: 0,
+        stopRemote: async () => {
+          await this.control(["kill"], name);
+        },
+        startedAt,
       });
-    } finally {
-      untrackContainer(name);
+    } catch (err) {
+      const gone = await this.remove(name, false);
+      if (!gone.ok) this.leftBehind(name, gone.reason);
+      throw err;
     }
+    if (run.clean) return run.result;
+    // Stopped, never reaped, or the CLI died of a signal nobody here sent:
+    // the container may be left, created or running.
+    const gone = await this.remove(name, !run.killed);
+    return gone.ok
+      ? run.result
+      : { ...run.result, strayContainer: this.leftBehind(name, gone.reason) };
+  }
+
+  /** `<cli> <verb…> <name>`, bounded. "No such container" is an answer, not an error. */
+  private control(verb: ReadonlyArray<string>, name: string): Promise<SpawnBoundedResult> {
+    return spawnBounded({
+      cmd: [this.cli, ...verb, name],
+      timeoutMs: CONTAINER_CONTROL_TIMEOUT_MS,
+      maxStdoutBytes: 4_096,
+      maxStderrBytes: 4_096,
+      killGraceMs: 0,
+    });
+  }
+
+  /**
+   * `<cli> rm -f <name>`, after `<cli> kill` when the container may still
+   * be running (`rm -f` alone waits out podman's stop timeout). `ok` when
+   * the container is gone or going; `existed` when this removed it.
+   */
+  private async remove(name: string, killFirst: boolean): Promise<Removal> {
+    if (killFirst) await this.control(["kill"], name);
+    const r = await this.control(["rm", "-f"], name);
+    if (r.spawnError !== undefined) {
+      return { ok: false, reason: `could not run ${this.cli} rm -f: ${r.spawnError}` };
+    }
+    if (r.timedOut) {
+      return {
+        ok: false,
+        reason: `${this.cli} rm -f did not answer within ${CONTAINER_CONTROL_TIMEOUT_MS / 1000}s`,
+      };
+    }
+    if (GONE_RE.test(r.stderr)) return { ok: true, existed: false };
+    if (r.exitCode === 0) return { ok: true, existed: true };
+    return {
+      ok: false,
+      reason: `${this.cli} rm -f failed: ${firstLine(r.stderr) || `exit ${r.exitCode ?? r.signal}`}`,
+    };
+  }
+
+  /** Hands a container that may be left to a detached retry, and says so. */
+  private leftBehind(name: string, reason: string): SandboxStrayContainer {
+    startReaper(this.cli, name, STRAY_RETRY_DELAYS_S);
+    return { name, reason };
   }
 
   async close(): Promise<void> {
@@ -717,9 +1041,10 @@ class DockerLikeSandbox implements Sandbox {
 
 class NoopSandbox implements Sandbox {
   readonly backend: SandboxBackend = "noop";
+  readonly execDefaults: { readonly timeoutMs: number };
   private readonly allowedImages: ReadonlySet<string>;
   private readonly mountWhitelist: ReadonlyArray<string>;
-  readonly defaultTimeoutMs: number;
+  private readonly defaultTimeoutMs: number;
   private readonly maxOutputBytes: number;
   private closed = false;
 
@@ -739,6 +1064,7 @@ class NoopSandbox implements Sandbox {
       return p;
     });
     this.defaultTimeoutMs = parseTimeoutMs(opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS);
+    this.execDefaults = { timeoutMs: this.defaultTimeoutMs };
     this.maxOutputBytes = parseMaxOutputBytes(opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
   }
 
@@ -758,7 +1084,7 @@ class NoopSandbox implements Sandbox {
     // without a docker daemon. Production paths reject this backend at
     // the permission layer (`requiresSandbox` denial). The program still
     // leads its own process group, so a timeout takes down what it started.
-    return superviseExec({
+    const run = await superviseExec({
       cmd: [...opts.argv],
       ...(opts.env !== undefined ? { env: { ...process.env, ...opts.env } } : {}),
       ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
@@ -767,7 +1093,9 @@ class NoopSandbox implements Sandbox {
       ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       ...(opts.onStdoutChunk !== undefined ? { onStdoutChunk: opts.onStdoutChunk } : {}),
       ...(opts.onStderrChunk !== undefined ? { onStderrChunk: opts.onStderrChunk } : {}),
+      killGraceMs: KILL_GRACE_MS,
     });
+    return run.result;
   }
 
   async close(): Promise<void> {

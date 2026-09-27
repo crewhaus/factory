@@ -21,10 +21,11 @@ class StubSandbox implements Sandbox {
   readonly backend = "noop" as const;
   readonly calls: SandboxExecOptions[] = [];
   result: Partial<SandboxExecResult> = {};
-  readonly defaultTimeoutMs: number | undefined;
+  readonly execDefaults: { readonly timeoutMs: number } | undefined;
   constructor(opts: Partial<SandboxExecResult> = {}, defaultTimeoutMs?: number) {
     this.result = opts;
-    this.defaultTimeoutMs = defaultTimeoutMs;
+    this.execDefaults =
+      defaultTimeoutMs === undefined ? undefined : { timeoutMs: defaultTimeoutMs };
   }
   async exec(opts: SandboxExecOptions): Promise<SandboxExecResult> {
     this.calls.push(opts);
@@ -227,6 +228,26 @@ describe("a run that did not finish on its own says so", () => {
     expect(out.endsWith("[exit] 137 (cancelled after 812ms)")).toBe(true);
   });
 
+  test("a container the sandbox could not confirm gone is named in the result", async () => {
+    const stub = new StubSandbox({
+      aborted: true,
+      exitCode: -1,
+      durationMs: 5_100,
+      strayContainer: {
+        name: "crewhaus-sbx-0123456789abcdef",
+        reason: "docker rm -f did not answer within 5s",
+      },
+    });
+    registerCodeExecutionConfig({ sandbox: stub });
+    const out = String(await shell.execute({ code: "sleep 60" }));
+    expect(out).toBe(
+      [
+        "[sandbox] container crewhaus-sbx-0123456789abcdef may still exist: docker rm -f did not answer within 5s. The sandbox retries the removal in the background.",
+        "[exit] -1 (cancelled after 5100ms)",
+      ].join("\n"),
+    );
+  });
+
   test("a drain cut short is flagged, not presented as the whole output", async () => {
     const stub = new StubSandbox({ stdout: "first line\n", outputComplete: false });
     registerCodeExecutionConfig({ sandbox: stub });
@@ -376,7 +397,38 @@ describe("max_timeout_ms caps every call", () => {
       expect(() =>
         registerCodeExecutionConfig({ max_timeout_ms: bad as unknown as number }),
       ).toThrow(/max_timeout_ms must be a number of milliseconds > 0/);
+      // Under either spelling, whatever the other one says.
+      expect(() =>
+        registerCodeExecutionConfig({
+          maxTimeoutMs: 1_000,
+          max_timeout_ms: bad as unknown as number,
+        }),
+      ).toThrow(/max_timeout_ms must be a number of milliseconds > 0/);
     }
+  });
+
+  // C169: `max_timeout_ms: 1000` next to `maxTimeoutMs: 600000` ran calls for
+  // 600 s — the camelCase spelling won, and the operator's cap was gone.
+  test("a cap written under both spellings holds at the smaller, in either order", async () => {
+    for (const [camel, snake] of [
+      [600_000, 1_000],
+      [1_000, 600_000],
+    ] as const) {
+      const stub = new StubSandbox({});
+      registerCodeExecutionConfig({ sandbox: stub, maxTimeoutMs: camel, max_timeout_ms: snake });
+      await python.execute({ code: "x", timeout: 600_000 });
+      expect(stub.calls[0]?.timeoutMs).toBe(1_000);
+    }
+  });
+
+  test("a candidate's cap written under both spellings holds at the smaller", async () => {
+    const stub = new StubSandbox({});
+    registerCodeExecutionConfig({ sandbox: stub, max_timeout_ms: 60_000 });
+    await python.execute(
+      { code: "x", timeout: 600_000 },
+      { toolConfig: { maxTimeoutMs: 30_000, max_timeout_ms: 2_000 } },
+    );
+    expect(stub.calls[0]?.timeoutMs).toBe(2_000);
   });
 
   test("the model is told the timeout can be capped", () => {
