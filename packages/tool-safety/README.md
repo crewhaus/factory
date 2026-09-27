@@ -117,7 +117,7 @@ At the deadline the caller's event loop is free. The worker thread, though, can'
 
 Every budget is parsed before anything is read. A `maxBytes` that is NaN, negative or missing throws a `RangeError`. It used to become NaN, and every file and stream then read as empty and complete, so a scanner handed `Number(config.maxBytes)` with the key unset reported "nothing found". The same applies to `tailBytes`, `position`, `timeoutMs` and the grace periods.
 
-A caller's `AbortSignal` is watched without ever being left listener-less. Measured on Bun 1.3.14, removing the last listener from an `AbortSignal.timeout()` signal cancels its timer for good. A helper that added and removed its own listener therefore disarmed the caller's deadline for the next call it was passed to.
+A caller's `AbortSignal` is watched without ever being left listener-less. Measured on Bun 1.3.14, removing the last listener from an `AbortSignal.timeout()` signal cancels its timer for good. A helper that added and removed its own listener therefore disarmed the caller's deadline for the next call it was passed to. `onAbort(signal, fn)` is exported for a caller that watches the same signal alongside these helpers: it returns the unsubscribe and never leaves the signal bare.
 
 ### `collectBounded(stream, { maxBytes, tailBytes?, onChunk?, signal? })`
 

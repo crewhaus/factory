@@ -228,6 +228,26 @@ describe("a run that did not finish on its own says so", () => {
     expect(out.endsWith("[exit] 137 (cancelled after 812ms)")).toBe(true);
   });
 
+  test("a container the sandbox could not confirm gone is named in the result", async () => {
+    const stub = new StubSandbox({
+      aborted: true,
+      exitCode: -1,
+      durationMs: 5_100,
+      strayContainer: {
+        name: "crewhaus-sbx-0123456789abcdef",
+        reason: "docker rm -f did not answer within 5s",
+      },
+    });
+    registerCodeExecutionConfig({ sandbox: stub });
+    const out = String(await shell.execute({ code: "sleep 60" }));
+    expect(out).toBe(
+      [
+        "[sandbox] container crewhaus-sbx-0123456789abcdef may still exist: docker rm -f did not answer within 5s. The sandbox retries the removal in the background.",
+        "[exit] -1 (cancelled after 5100ms)",
+      ].join("\n"),
+    );
+  });
+
   test("a drain cut short is flagged, not presented as the whole output", async () => {
     const stub = new StubSandbox({ stdout: "first line\n", outputComplete: false });
     registerCodeExecutionConfig({ sandbox: stub });

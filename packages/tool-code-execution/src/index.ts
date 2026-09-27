@@ -209,6 +209,11 @@ function formatResult(result: SandboxExecResult, timeoutNote: string | undefined
       "[output incomplete: reading stopped before the output ended (something the program started still held it open), so the text above may not be all of it]",
     );
   }
+  if (result.strayContainer !== undefined) {
+    parts.push(
+      `[sandbox] container ${result.strayContainer.name} may still exist: ${result.strayContainer.reason}. The sandbox retries the removal in the background.`,
+    );
+  }
   const ms = Math.round(result.durationMs);
   const how =
     result.aborted === true

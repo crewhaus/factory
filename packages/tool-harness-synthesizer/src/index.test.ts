@@ -344,6 +344,25 @@ describe("runVerifierInSandbox error branches", () => {
     ).rejects.toThrow(/timed out after 1234ms/);
   });
 
+  test("a timed-out verifier whose container may be left says so", async () => {
+    const sandbox = new ScriptedSandbox({
+      stdout: "",
+      stderr: "",
+      exitCode: -1,
+      timedOut: true,
+      durationMs: 1,
+      strayContainer: {
+        name: "crewhaus-sbx-0123456789abcdef",
+        reason: "docker rm -f did not answer within 5s",
+      },
+    });
+    await expect(
+      runVerifierInSandbox(sandbox, "return true", ioSamples, { timeoutMs: 1234 }),
+    ).rejects.toThrow(
+      "verifier evaluation timed out after 1234ms (container crewhaus-sbx-0123456789abcdef may still exist: docker rm -f did not answer within 5s)",
+    );
+  });
+
   test("throws with stderr tail when the harness exits nonzero and emits no result", async () => {
     const sandbox = new ScriptedSandbox({
       stdout: "no sentinel here",
@@ -570,7 +589,7 @@ describe.if(liveDocker())(
         options: Record<string, unknown>,
       ) => {
         const at = argv.indexOf("--name");
-        if (argv[1] === "run" && at > 0) names.push(argv[at + 1] as string);
+        if (argv[1] === "create" && at > 0) names.push(argv[at + 1] as string);
         return orig([...argv], options);
         // biome-ignore lint/suspicious/noExplicitAny: pass-through spy on Bun.spawn
       }) as any);

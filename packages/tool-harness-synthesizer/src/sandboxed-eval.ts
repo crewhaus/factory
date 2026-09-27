@@ -11,7 +11,8 @@
  * the container never receives the `expected` labels.
  *
  * The wall-clock kill stops the container itself (the sandbox runs
- * `docker kill` on a timeout), and the verifier's output is capped per
+ * `docker kill` on a timeout, and says so when it cannot confirm the
+ * container gone), and the verifier's output is capped per
  * stream as it arrives ({@link verifierOutputCap}), so code that loops or
  * prints without end costs neither a stuck call nor host memory
  * (security-6#0, security-6#8).
@@ -197,7 +198,12 @@ export async function runVerifierInSandbox(
   });
 
   if (result.timedOut) {
-    throw new HarnessSynthesizerError(`verifier evaluation timed out after ${timeoutMs}ms`);
+    // The sandbox names a container it could not confirm gone; so does this.
+    const stray =
+      result.strayContainer === undefined
+        ? ""
+        : ` (container ${result.strayContainer.name} may still exist: ${result.strayContainer.reason})`;
+    throw new HarnessSynthesizerError(`verifier evaluation timed out after ${timeoutMs}ms${stray}`);
   }
   const parsed = parseHarnessResult(result.stdout);
   if (parsed === undefined) {
