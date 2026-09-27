@@ -35,6 +35,7 @@ import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   HTTP_TOOLS,
+  HttpPermissionError,
   __setPrivateHostsAllowedForTest,
   _resetHttpConfig,
   _setDnsLookup,
@@ -60,9 +61,13 @@ import {
   webhookVerify,
 } from "./index";
 
+/** Run a tool, with the runtime's cancel signal when one is given. */
 // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed JSON shape directly.
-async function run(tool: RegisteredTool, input: unknown): Promise<any> {
-  const out = await tool.execute(input);
+async function run(tool: RegisteredTool, input: unknown, signal?: AbortSignal): Promise<any> {
+  const out = await tool.execute(
+    input,
+    signal === undefined ? undefined : { toolUseId: "t", signal },
+  );
   if (typeof out !== "string") throw new Error("expected a string result");
   try {
     return JSON.parse(out);
@@ -101,6 +106,19 @@ function busy(ms: number): void {
   while (performance.now() - started < ms) {
     // spin
   }
+}
+
+/**
+ * A fetch that never answers: it settles only when its request is aborted,
+ * as a hung server's would. One started on an aborted signal fails at once,
+ * which is what a real fetch does too.
+ */
+function hangUntilAborted(req: Request): Promise<Response> {
+  return new Promise((_resolve, reject) => {
+    const fail = (): void => reject(req.signal.reason);
+    if (req.signal.aborted) fail();
+    else req.signal.addEventListener("abort", fail, { once: true });
+  });
 }
 
 const TOKEN_VAR = "CREWHAUS_TEST_HTTP_TOKEN";
@@ -849,6 +867,40 @@ describe("HttpRequest", () => {
     expect(result.attempts).toBe(1);
   });
 
+  test("a cancel during the retry backoff starts no further request", async () => {
+    // A cancel ends the backoff's sleep at once, and the retry after it used
+    // to start anyway: a request that could only fail, after a DNS lookup for
+    // a real host. The stub answers without I/O and ignores its signal, so
+    // it counts every request the tool starts.
+    const runtime = new AbortController();
+    let issued = 0;
+    _setRawFetch(async () => {
+      issued++;
+      return new Response("busy", { status: 503 });
+    });
+    const cancel = setTimeout(() => runtime.abort(), 20);
+    try {
+      const out = await run(
+        httpRequest,
+        {
+          url: `${origin}/flaky`,
+          retryOnStatus: [503],
+          maxRetries: 3,
+          retryBaseMs: 1_000,
+          timeoutMs: 30_000,
+        },
+        runtime.signal,
+      );
+      expect({ out, issued }).toEqual({
+        out: "the request was aborted before it completed",
+        issued: 1,
+      });
+    } finally {
+      clearTimeout(cancel);
+      _setRawFetch(undefined);
+    }
+  });
+
   test("the body cap cuts the response and says so rather than pinning memory", async () => {
     const result = await run(httpRequest, { url: `${origin}/big`, maxBytes: 1024 });
     expect(result.truncated).toBe(true);
@@ -872,6 +924,33 @@ describe("HttpRequest", () => {
 // ---------------------------------------------------------------------------
 
 describe("HttpPaginate", () => {
+  test("a walk whose call is already cancelled requests nothing", async () => {
+    // The page gate asked the clock, which never sees a cancel, so the first
+    // page was requested on an aborted signal and the walk came back as a
+    // failed request.
+    const runtime = new AbortController();
+    runtime.abort();
+    let issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      return hangUntilAborted(req);
+    });
+    try {
+      const result = await run(
+        httpPaginate,
+        { url: `${origin}/link?page=1`, style: "link", maxPages: 5, timeoutMs: 5_000 },
+        runtime.signal,
+      );
+      expect({ issued, pages: result.pages, stoppedBy: result.stoppedBy }).toEqual({
+        issued: 0,
+        pages: 0,
+        stoppedBy: "aborted",
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
+
   test("follows Link rel=next to the end and concatenates the items", async () => {
     const result = await run(httpPaginate, {
       url: `${origin}/link?page=1`,
@@ -1146,6 +1225,77 @@ describe("HttpBatch", () => {
     expect(result.results.some((r: { error?: string }) => r.error?.includes("skipped"))).toBe(true);
   });
 
+  // The skip gate asked the clock, which lags the deadline's timer and never
+  // sees a cancel. A request it let through started on an aborted signal:
+  // a DNS lookup for nothing, and a row saying the request failed when it
+  // was never made. In both tests below the stub hangs until aborted and
+  // counts every request the batch starts.
+
+  test("once the batch deadline fires, the requests still queued are skipped", async () => {
+    // The clock is frozen, so only the timer can say the deadline is spent.
+    let issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      return hangUntilAborted(req);
+    });
+    const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const result = await run(httpBatch, {
+        requests: [{ url: `${origin}/json` }, { url: `${origin}/json` }, { url: `${origin}/json` }],
+        concurrency: 1,
+        timeoutMs: 60_000,
+        totalTimeoutMs: 50,
+      });
+      expect({ issued, errors: result.results.map((r: { error?: string }) => r.error) }).toEqual({
+        issued: 1,
+        errors: [
+          "deadline elapsed before the request completed",
+          "skipped: the batch deadline elapsed before this request was issued",
+          "skipped: the batch deadline elapsed before this request was issued",
+        ],
+      });
+    } finally {
+      now.mockRestore();
+      _setRawFetch(undefined);
+    }
+  });
+
+  test("a cancel skips the requests still queued, and says it was a cancel", async () => {
+    const runtime = new AbortController();
+    let issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      // The runtime cancels while the first request is in flight.
+      runtime.abort();
+      return hangUntilAborted(req);
+    });
+    try {
+      const result = await run(
+        httpBatch,
+        {
+          requests: [
+            { url: `${origin}/json` },
+            { url: `${origin}/json` },
+            { url: `${origin}/json` },
+          ],
+          concurrency: 1,
+          timeoutMs: 60_000,
+        },
+        runtime.signal,
+      );
+      expect({ issued, errors: result.results.map((r: { error?: string }) => r.error) }).toEqual({
+        issued: 1,
+        errors: [
+          "the request was aborted before it completed",
+          "skipped: the batch was cancelled before this request was issued",
+          "skipped: the batch was cancelled before this request was issued",
+        ],
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
+
   test("the batch auth profile applies to every request", async () => {
     const result = await run(httpBatch, {
       requests: [{ url: `${origin}/echo` }, { url: `${origin}/echo` }],
@@ -1396,6 +1546,76 @@ describe("HeadRequest / UrlReachable / LinkCheck", () => {
     ]);
     expect(result.results[2].error).toContain("not in allowed_origins");
   });
+
+  // As HttpBatch's: the sweep gate asked the clock, so after the timer or a
+  // cancel each URL left was requested on an aborted signal and reported as
+  // broken — a link nobody checked.
+
+  test("LinkCheck skips the URLs left once the sweep deadline fires", async () => {
+    let issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      return hangUntilAborted(req);
+    });
+    const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const result = await run(linkCheck, {
+        urls: [`${origin}/a`, `${origin}/b`, `${origin}/c`],
+        concurrency: 1,
+        timeoutMs: 50,
+      });
+      expect({
+        issued,
+        brokenCount: result.brokenCount,
+        skippedCount: result.skippedCount,
+        errors: result.results.map((r: { error?: string }) => r.error),
+      }).toEqual({
+        issued: 1,
+        brokenCount: 1,
+        skippedCount: 2,
+        errors: [
+          "deadline elapsed before the request completed",
+          "skipped: the sweep deadline elapsed before this URL was checked",
+          "skipped: the sweep deadline elapsed before this URL was checked",
+        ],
+      });
+    } finally {
+      now.mockRestore();
+      _setRawFetch(undefined);
+    }
+  });
+
+  test("LinkCheck skips the URLs left after a cancel, and says it was a cancel", async () => {
+    const runtime = new AbortController();
+    let issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      runtime.abort();
+      return hangUntilAborted(req);
+    });
+    try {
+      const result = await run(
+        linkCheck,
+        { urls: [`${origin}/a`, `${origin}/b`, `${origin}/c`], concurrency: 1, timeoutMs: 60_000 },
+        runtime.signal,
+      );
+      expect({
+        issued,
+        skippedCount: result.skippedCount,
+        errors: result.results.map((r: { error?: string }) => r.error),
+      }).toEqual({
+        issued: 1,
+        skippedCount: 2,
+        errors: [
+          "the request was aborted before it completed",
+          "skipped: the sweep was cancelled before this URL was checked",
+          "skipped: the sweep was cancelled before this URL was checked",
+        ],
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1450,6 +1670,67 @@ describe("HttpWaitFor", () => {
     });
     expect(result).toContain("not in allowed_origins");
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  // The poll looped while the clock said time was left. After a cancel, or
+  // once the timer had fired ahead of the clock, every pass opened a request
+  // on an aborted signal and its sleep returned at once: a busy loop for up
+  // to the whole timeout, and the runtime waits for the tool to return. The
+  // stub answers 503 without I/O and counts the attempts; past 20 it refuses,
+  // which is the one thing that ends a runaway poll, so a regression fails
+  // here instead of hanging the suite.
+  const pollStub = (): { attempts: () => number } => {
+    let attempts = 0;
+    _setRawFetch(async (req) => {
+      attempts++;
+      if (attempts > 20) throw new HttpPermissionError("runaway: the poll kept going");
+      if (req.signal.aborted) throw req.signal.reason;
+      return new Response("", { status: 503 });
+    });
+    return { attempts: () => attempts };
+  };
+
+  test("a cancel ends the poll during its sleep, with no attempt after it", async () => {
+    const runtime = new AbortController();
+    const stub = pollStub();
+    const cancel = setTimeout(() => runtime.abort(), 50);
+    try {
+      const result = await run(
+        httpWaitFor,
+        { url: `${origin}/json`, expectStatus: [200], intervalMs: 1_000, timeoutMs: 5_000 },
+        runtime.signal,
+      );
+      expect({ attempts: stub.attempts(), met: result.met, stoppedBy: result.stoppedBy }).toEqual({
+        attempts: 1,
+        met: false,
+        stoppedBy: "aborted",
+      });
+    } finally {
+      clearTimeout(cancel);
+      _setRawFetch(undefined);
+    }
+  });
+
+  test("the deadline's timer ends the poll while the clock says time is left", async () => {
+    // The clock is frozen: it says the whole 100ms is left for good.
+    const stub = pollStub();
+    const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const result = await run(httpWaitFor, {
+        url: `${origin}/json`,
+        expectStatus: [200],
+        intervalMs: 1_000,
+        timeoutMs: 100,
+      });
+      expect({ attempts: stub.attempts(), met: result.met, stoppedBy: result.stoppedBy }).toEqual({
+        attempts: 1,
+        met: false,
+        stoppedBy: "deadline",
+      });
+    } finally {
+      now.mockRestore();
+      _setRawFetch(undefined);
+    }
   });
 });
 

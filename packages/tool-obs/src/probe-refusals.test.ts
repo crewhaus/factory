@@ -9,11 +9,21 @@
  * answer with), and it and a skipped probe carry `ok: null`: neither
  * healthy nor unhealthy. A name that does not resolve is still unhealthy.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
 import {
   __setPrivateHostsAllowedForTest,
   _resetObsConfig,
   _setDnsLookup,
+  _setRawFetch,
   healthProbe,
   registerObsConfig,
 } from "./index";
@@ -103,4 +113,81 @@ describe("HealthProbe separates refused from unhealthy (C119)", () => {
     expect(result.healthy).toBe(0);
     expect(hits.includes("/fine")).toBe(false);
   }, 20_000);
+});
+
+describe("HealthProbe probes nothing once its signal has aborted", () => {
+  // The skip gate asked the clock, which lags the deadline's timer and never
+  // sees a cancel. A probe it let through started on an aborted signal and
+  // failed at once, so an endpoint nobody reached was counted unhealthy. The
+  // stub hangs until aborted and counts every probe the sweep starts.
+  let issued = 0;
+  beforeEach(() => {
+    issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      return await new Promise<Response>((_resolve, reject) => {
+        const fail = (): void => reject(req.signal.reason);
+        if (req.signal.aborted) fail();
+        else req.signal.addEventListener("abort", fail, { once: true });
+      });
+    });
+  });
+  afterEach(() => {
+    _setRawFetch(undefined);
+  });
+
+  const urls = (): string[] => [`${origin}/a`, `${origin}/b`, `${origin}/c`];
+
+  test("the sweep deadline's timer skips the endpoints left, while the clock says time is left", async () => {
+    const now = spyOn(Date, "now").mockReturnValue(1_000_000);
+    try {
+      const result = await probe({ urls: urls(), deadlineMs: 50, concurrency: 1 });
+      expect({
+        issued,
+        counts: [result.healthy, result.unhealthy, result.skipped],
+        errors: result.probes.map((p: { error?: string }) => p.error),
+      }).toEqual({
+        issued: 1,
+        counts: [0, 1, 2],
+        errors: [
+          "deadline elapsed before the request completed",
+          "the sweep deadline elapsed before this endpoint was probed",
+          "the sweep deadline elapsed before this endpoint was probed",
+        ],
+      });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  test("a cancel skips the endpoints left, and says it was a cancel", async () => {
+    const runtime = new AbortController();
+    _setRawFetch(async (req) => {
+      issued++;
+      // The runtime cancels while the first probe is in flight.
+      runtime.abort();
+      throw req.signal.reason;
+    });
+    const result = JSON.parse(
+      String(
+        await healthProbe.execute(
+          { urls: urls(), deadlineMs: 60_000, concurrency: 1 },
+          { toolUseId: "t", signal: runtime.signal },
+        ),
+      ),
+    );
+    expect({
+      issued,
+      counts: [result.healthy, result.unhealthy, result.skipped],
+      errors: result.probes.map((p: { error?: string }) => p.error),
+    }).toEqual({
+      issued: 1,
+      counts: [0, 1, 2],
+      errors: [
+        "the request was aborted before it completed",
+        "the sweep was cancelled before this endpoint was probed",
+        "the sweep was cancelled before this endpoint was probed",
+      ],
+    });
+  });
 });

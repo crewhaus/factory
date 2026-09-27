@@ -988,11 +988,18 @@ export class DeadlineElapsedError extends Error {
 
 export type Deadline = {
   readonly signal: AbortSignal;
-  /** Milliseconds left; never negative. */
+  /**
+   * Milliseconds left; never negative, and 0 once the signal has aborted —
+   * by the timer, an outer deadline or a cancel — whatever the clock says.
+   * Ask it before starting more work: 0 means start nothing.
+   */
   remaining(): number;
   /**
-   * The clock says the time is up. For scheduling (stop starting new work),
-   * never for saying why something failed — that is {@link timedOut}.
+   * The clock says the time is up. The clock can lag the timer and never
+   * sees a cancel, so it decides neither whether to start more work — that
+   * is {@link remaining} — nor why something failed — that is
+   * {@link timedOut}. It only notes, beside a failure of its own, that the
+   * time had run out as well.
    */
   expired(): boolean;
   /**
@@ -1024,7 +1031,7 @@ export function startDeadline(ms: number, outer?: AbortSignal): Deadline {
   }
   return {
     signal: ctrl.signal,
-    remaining: () => Math.max(0, ms - (Date.now() - startedAt)),
+    remaining: () => (ctrl.signal.aborted ? 0 : Math.max(0, ms - (Date.now() - startedAt))),
     expired: () => Date.now() - startedAt >= ms,
     timedOut: () => ctrl.signal.aborted && ctrl.signal.reason instanceof DeadlineElapsedError,
     cancel: () => {

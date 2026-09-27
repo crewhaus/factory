@@ -24,6 +24,7 @@ import {
   _resetIdempotencyLedger,
   _resetNotifyConfig,
   _setDnsTxtResolver,
+  _setRawFetch,
   chatDelete,
   chatPost,
   chatReact,
@@ -1340,6 +1341,70 @@ describe("WebhookPost", () => {
       }),
     );
     expect(result).toContain("would outlast the deadline");
+  });
+
+  // A cancel ends the backoff's sleep at once, and the retries used to go on
+  // regardless: each started on an aborted signal, failed at once and counted
+  // as an attempt, so the call spent every retry in a few milliseconds and
+  // reported them all as failures. The stub answers without I/O and counts
+  // every attempt the tool starts.
+
+  test("a cancel during the backoff starts no further attempt", async () => {
+    const runtime = new AbortController();
+    let issued = 0;
+    _setRawFetch(async () => {
+      issued++;
+      return new Response("busy", { status: 503 });
+    });
+    const cancel = setTimeout(() => runtime.abort(), 20);
+    try {
+      const result = String(
+        await webhookPost.execute(
+          {
+            url: `${origin}/hook`,
+            payload: { a: 1 },
+            retries: 5,
+            backoffMs: 1_000,
+            timeoutMs: 30_000,
+          },
+          { toolUseId: "t", signal: runtime.signal },
+        ),
+      );
+      expect({ issued, result }).toEqual({
+        issued: 1,
+        result: `nothing was sent: the send was aborted before it completed\n${JSON.stringify({ attempts: [{ attempt: 1, status: 503 }] })}`,
+      });
+    } finally {
+      clearTimeout(cancel);
+      _setRawFetch(undefined);
+    }
+  });
+
+  test("a cancel that fails an attempt is not answered with a retry", async () => {
+    // Nor with "the next backoff would outlast the deadline", which is what a
+    // deadline with nothing left would otherwise say about a cancel.
+    const runtime = new AbortController();
+    let issued = 0;
+    _setRawFetch(async (req) => {
+      issued++;
+      runtime.abort();
+      throw req.signal.reason;
+    });
+    try {
+      const result = String(
+        await webhookPost.execute(
+          { url: `${origin}/hook`, payload: { a: 1 }, retries: 5, backoffMs: 5, timeoutMs: 30_000 },
+          { toolUseId: "t", signal: runtime.signal },
+        ),
+      );
+      const aborted = "the send was aborted before it completed";
+      expect({ issued, result }).toEqual({
+        issued: 1,
+        result: `nothing was sent: ${aborted}\n${JSON.stringify({ attempts: [{ attempt: 1, error: aborted }] })}`,
+      });
+    } finally {
+      _setRawFetch(undefined);
+    }
   });
 
   test("REFUSAL: an inline Authorization header is refused in favour of the auth profile", async () => {
