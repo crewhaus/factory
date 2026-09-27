@@ -282,6 +282,106 @@ describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (p
     expect(readFileSync(join(ws, "src", "app.ts"), "utf8")).toBe("original");
   });
 
+  test("a path deny fires on every spelling of the file it names (permission-integration#1, deny side)", async () => {
+    // The audit's deny-side escapes: `./`, `src/../`, a trailing `/.` and the
+    // absolute in-workspace path all reach the file a relative deny names.
+    const readRules = rules(["alwaysDeny", "Read(.env)"], ["alwaysAllow", "Read"]);
+    const envSpellings = ["./.env", "src/../.env", ".env/.", join(ws, ".env")];
+    for (const path of envSpellings) {
+      expect({ path, decision: await gate("Read", { path }, readRules) }).toEqual({
+        path,
+        decision: "deny",
+      });
+    }
+    const writeRules = rules(["alwaysDeny", "Write(.crewhaus/**)"], ["alwaysAllow", "Write"]);
+    const settingsSpellings = [
+      "./.crewhaus/settings.json",
+      "src/../.crewhaus/settings.json",
+      ".crewhaus//settings.json",
+      join(ws, ".crewhaus", "settings.json"),
+    ];
+    for (const path of settingsSpellings) {
+      expect({ path, decision: await gate("Write", { path, content: "{}" }, writeRules) }).toEqual({
+        path,
+        decision: "deny",
+      });
+    }
+    expect(existsSync(join(ws, ".crewhaus", "settings.json"))).toBe(false);
+    // Control: the bare allow still grants a file the deny does not name.
+    expect(await gate("Read", { path: "./src/app.ts" }, readRules)).toBe("allow");
+  }, 30_000);
+
+  test("a URL or recipient deny fires on every spelling of its destination (C004)", async () => {
+    // WebFetch is read-only, so auto mode runs it unasked: only the rule stands
+    // between the model and the host. Every spelling below is fetched from
+    // evil.example (or api.example/admin) by the tool.
+    const hostDeny = rules(["alwaysDeny", "WebFetch(https://evil.example/**)"]);
+    for (const url of [
+      "https://evil.example/exfil",
+      "https://x@evil.example/exfil",
+      "https://evil.example./exfil",
+      "http://evil.example:8080/exfil",
+    ]) {
+      expect({ url, decision: await gate("WebFetch", { url }, hostDeny, "auto") }).toEqual({
+        url,
+        decision: "deny",
+      });
+    }
+    const pathDeny = rules(["alwaysDeny", "WebFetch(https://api.example/admin/**)"]);
+    for (const url of ["https://api.example/%61dmin/users", "https://api.example//admin/users"]) {
+      expect({ url, decision: await gate("WebFetch", { url }, pathDeny, "auto") }).toEqual({
+        url,
+        decision: "deny",
+      });
+    }
+    const mailDeny = rules(["alwaysDeny", "EmailSend(ceo@corp.example)"]);
+    const mail = {
+      from: { address: "bot@corp.example" },
+      host: "smtp.corp.example",
+      subject: "s",
+      text: "t",
+      date: "2026-09-24T09:00:00Z",
+    };
+    for (const address of ["CEO@corp.example", "ceo@CORP.EXAMPLE", "ceo@corp.example."]) {
+      const input = { ...mail, to: [{ address }] };
+      expect({ address, decision: await gate("EmailSend", input, mailDeny) }).toEqual({
+        address,
+        decision: "deny",
+      });
+    }
+    // Control: a recipient the rule does not name is asked, not denied.
+    expect(
+      await gate("EmailSend", { ...mail, to: [{ address: "cfo@corp.example" }] }, mailDeny),
+    ).toBe("ask");
+  }, 30_000);
+
+  // The folding above must not widen a rule that names a scheme or a port
+  // rather than a host: on the real tools and loop, in auto mode (WebFetch is
+  // read-only and runs unasked) and behind a bare allow.
+  test("a URL rule that names a scheme or a port keeps to it", async () => {
+    const https = "https://api.github.com/repos/crewhaus/factory";
+    for (const type of ["alwaysDeny", "alwaysAsk"] as const) {
+      const noPlainHttp = rules([type, "WebFetch(http://**)"]);
+      expect({
+        type,
+        decision: await gate("WebFetch", { url: https }, noPlainHttp, "auto"),
+      }).toEqual({ type, decision: "allow" });
+      expect(await gate("WebFetch", { url: "http://api.github.com/x" }, noPlainHttp, "auto")).toBe(
+        type === "alwaysDeny" ? "deny" : "ask",
+      );
+    }
+    const noDb = rules(
+      ["alwaysDeny", "HttpRequest(http://localhost:5432/**)"],
+      ["alwaysAllow", "HttpRequest"],
+    );
+    expect(
+      await gate("HttpRequest", { method: "GET", url: "http://localhost:3000/health" }, noDb),
+    ).toBe("allow");
+    expect(await gate("HttpRequest", { method: "GET", url: "http://localhost:5432/q" }, noDb)).toBe(
+      "deny",
+    );
+  }, 30_000);
+
   test("Grep(src/**) is not satisfied by a regex that names src/", async () => {
     expect(
       await gate(
@@ -398,6 +498,77 @@ describe("F3b — every builtin's declaration is what a rule reads (permission-i
         rs,
       ),
     ).toBe("ask");
+  });
+});
+
+// C033 (permission-integration#3, #4). On 0.7.0 a scoped allow on a tool
+// outside the ten-name table had to match EVERY string in the call, so
+// `RunCommand(git status*)` and `HttpRequest(https://api.example.com/**)`
+// never fired and operators granted the bare name. Every acting builtin now
+// declares its operative field, and an allow is read against that field
+// alone. A boolean switch is still not operative (the documented 0.8 key
+// work): the last test pins that, so a change to it is deliberate.
+describe("C033 — a scoped allow on a multi-field builtin is usable", () => {
+  test("RunCommand(git status*) allows `git status` and nothing else", async () => {
+    const rs = rules(["alwaysAllow", "RunCommand(git status*)"]);
+    expect(await gate("RunCommand", { argv: ["git", "status"] }, rs)).toBe("allow");
+    expect(await gate("RunCommand", { argv: ["git", "status", "--short"] }, rs)).toBe("allow");
+    expect(await gate("RunCommand", { argv: ["rm", "-rf", "src"] }, rs)).toBe("ask");
+  });
+
+  test("HttpRequest(https://api.example.com/**) allows a call with a method and headers", async () => {
+    const rs = rules(["alwaysAllow", "HttpRequest(https://api.example.com/**)"]);
+    const call = {
+      url: "https://api.example.com/v1/items",
+      method: "GET",
+      headers: { accept: "application/json" },
+    };
+    expect(await gate("HttpRequest", call, rs)).toBe("allow");
+    expect(await gate("HttpRequest", { ...call, url: "https://evil.example/v1" }, rs)).toBe("ask");
+  });
+
+  // The same argv is another program in another directory: `./build.sh` in
+  // src/ runs src/build.sh, a file a scoped `Write(src/**)` lets the model
+  // write. The working directory was invisible to every rule, so this allow
+  // ran it.
+  test("a scoped command allow covers the workspace root, not another directory", async () => {
+    const rs = rules(
+      ["alwaysAllow", "RunCommand(./build.sh)"],
+      ["alwaysAllow", "ProcessStart(./build.sh)"],
+      ["alwaysAllow", "Retry(./build.sh)"],
+      ["alwaysAllow", "RunPipeline(./build.sh)"],
+    );
+    const argv = ["./build.sh"];
+    const extra: Record<string, object> = {
+      RunCommand: {},
+      ProcessStart: {},
+      Retry: { maxAttempts: 2, backoff: { kind: "fixed", delayMs: 0 } },
+    };
+    for (const [tool, more] of Object.entries(extra)) {
+      const at = async (cwd?: string) =>
+        gate(tool, cwd === undefined ? { argv, ...more } : { argv, cwd, ...more }, rs);
+      expect({ tool, root: await at(), dot: await at("."), src: await at("src") }).toEqual({
+        tool,
+        root: "allow",
+        dot: "allow",
+        src: "ask",
+      });
+    }
+    const pipe = async (input: unknown) => gate("RunPipeline", input, rs);
+    expect(await pipe({ steps: [{ argv }] })).toBe("allow");
+    expect(await pipe({ steps: [{ argv }], cwd: "src" })).toBe("ask");
+    expect(await pipe({ steps: [{ argv }, { argv, cwd: "src" }] })).toBe("ask");
+    // A deny still reads the command wherever it runs.
+    const deny = rules(["alwaysDeny", "RunCommand(rm*)"], ["alwaysAllow", "RunCommand"]);
+    expect(await gate("RunCommand", { argv: ["rm", "-rf", "x"], cwd: "src" }, deny)).toBe("deny");
+    expect(await gate("RunCommand", { argv: ["ls"], cwd: "src" }, deny)).toBe("allow");
+  }, 30_000);
+
+  test("a boolean switch is not part of what a rule sees (documented; 0.8)", async () => {
+    const rs = rules(["alwaysAllow", "RemovePath(build/**)"]);
+    const call = { path: "build/nothing-here", recursive: true, dryRun: false };
+    expect(await gate("RemovePath", call, rs)).toBe("allow");
+    expect(await gate("RemovePath", { ...call, path: "src/app.ts" }, rs)).toBe("ask");
   });
 });
 

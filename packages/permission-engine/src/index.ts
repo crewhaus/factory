@@ -5,7 +5,8 @@
  *   default — ask on first encounter; rules can pre-decide
  *   plan    — read-only; non-readOnly tools always denied. Only deny and ask
  *             rules are consulted (both deny); allow rules are ignored, so
- *             plan mode can never be widened
+ *             plan mode can never be widened, and the sandbox floor holds —
+ *             plan never allows what auto would not
  *   auto    — read-only auto-allow; destructive auto-ask; rules can override
  *   bypass  — allow everything (CLI flag only — see security note)
  *
@@ -237,6 +238,16 @@ function firstMatchingRule(
 }
 
 /**
+ * Why a sandboxed tool was refused for want of a sandbox. The runtime reads
+ * CREWHAUS_SANDBOX through the sandbox's own parser: unset means docker, so
+ * the floor only closes on `noop` or a value that names no backend — or in a
+ * runtime that never said a sandbox exists.
+ */
+function noSandboxReason(toolName: string): string {
+  return `tool "${toolName}" requires a sandbox, and the runtime reports none (CREWHAUS_SANDBOX is noop or names no backend — set it to docker or podman, or leave it unset for docker)`;
+}
+
+/**
  * Decide allow/deny/ask for one tool call. Pure.
  */
 export function evaluate(
@@ -275,7 +286,14 @@ export function evaluateWithReason(
             : `plan mode: the rule alwaysAsk ${guard.pattern} (${guard.source}) needs a person to approve \`${call.toolName}\`, and plan mode cannot ask, so it is denied`,
       };
     }
-    return { decision: call.readOnly ? "allow" : "deny" };
+    if (!call.readOnly) return { decision: "deny" };
+    // The sandbox floor holds here too. A read-only tool that runs in a
+    // sandbox is refused in auto mode when there is none, so plan mode —
+    // which must never be wider than auto — refuses it as well.
+    if (call.requiresSandbox === true && opts.sandboxAvailable !== true) {
+      return { decision: "deny", reason: noSandboxReason(call.toolName) };
+    }
+    return { decision: "allow" };
   }
 
   // Section 18 production safety floor: a tool that declared
@@ -300,10 +318,7 @@ export function evaluateWithReason(
 
   if (call.requiresSandbox === true) {
     if (opts.sandboxAvailable !== true) {
-      return {
-        decision: "deny",
-        reason: `tool "${call.toolName}" requires a sandbox but none is configured (CREWHAUS_SANDBOX must be set to docker or podman)`,
-      };
+      return { decision: "deny", reason: noSandboxReason(call.toolName) };
     }
     if (baseDecision !== "allow") {
       return {

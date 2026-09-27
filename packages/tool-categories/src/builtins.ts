@@ -368,6 +368,23 @@ export type ChainBootConfig = {
   };
 };
 
+/**
+ * The tools the run loop adds itself: `ListTools` on every tool-carrying
+ * loop, `Consult` and `Escalate` when a model pool declares them. They are
+ * not on a composition root's catalog when plugin tools register, and the
+ * loop keeps a tool it is handed under one of these names instead of its own
+ * — so a plugin's `ListTools` replaced the loop's, and took the builtin
+ * `alwaysAllow ListTools` with it. Every composition root (the cli and
+ * channel bundles, `crewhaus run` and `dev`, runChatLoop's `plugins` option)
+ * skips a plugin tool so named, as it skips one named after a tool already
+ * on its catalog.
+ */
+export const LOOP_TOOL_NAMES: ReadonlyArray<string> = Object.freeze([
+  "ListTools",
+  "Consult",
+  "Escalate",
+]);
+
 const EVM_WALLET_UNBOUND =
   "no custody provider that can sign ships in this release, so every call returns an error; evmSimulate runs the same transaction without signing";
 

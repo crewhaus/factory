@@ -1561,6 +1561,34 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
     expect(c).toContain("if (defaultCatalog.get(__t.name) !== undefined)");
   });
 
+  // C016 — the run loop adds ListTools (and a pool's Consult / Escalate)
+  // AFTER plugin tools register, and keeps a tool it is handed under one of
+  // those names. The emitted block is run here against a stand-in catalog.
+  test("plugin registration skips the names the run loop adds itself, and says so", () => {
+    const c = emitCli(baseIr({ plugins: ["acme-tools"] })).files[0]?.content ?? "";
+    const start = c.indexOf("const __loopOwned = ");
+    const end = c.indexOf("defaultCatalog.register(__t);\n}", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const block = c.slice(start, end + "defaultCatalog.register(__t);\n}".length);
+    const registered: string[] = [];
+    const lines: string[] = [];
+    const catalog = {
+      get: (name: string) => (name === "Read" ? {} : undefined),
+      register: (t: { name: string }) => registered.push(t.name),
+    };
+    const proc = { stderr: { write: (line: string) => lines.push(line) } };
+    const plugins = {
+      tools: ["ListTools", "Consult", "Escalate", "Read", "PluginOnly"].map((name) => ({ name })),
+    };
+    new Function("__plugins", "defaultCatalog", "process", block)(plugins, catalog, proc);
+    expect(registered).toEqual(["PluginOnly"]);
+    expect(lines.filter((l) => l.includes("is the run loop's own"))).toHaveLength(3);
+    expect(lines.filter((l) => l.includes("already registered"))).toEqual([
+      '[plugins] tool "Read" already registered — plugin contribution skipped\n',
+    ]);
+  });
+
   test("plugins feed their skill dirs into discoverSkills (non-continuity path)", () => {
     const c = emitCli(baseIr({ plugins: ["acme-tools"] })).files[0]?.content ?? "";
     expect(c).toContain("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })");
@@ -1587,6 +1615,84 @@ describe("emitCli — plugin activation (Item 3 / G32)", () => {
     expect(c).toContain("const __plugins = await activatePlugins(");
     expect(c).toContain("defaultCatalog.register(__t);");
     expect(c).not.toContain("pluginDirs: __plugins.skillDirs");
+  });
+
+  // extension-path#1 — 0.7.0 registered plugin tools right after the extension
+  // boot, BEFORE Task, wireMemory (FocusRead, PlanRead, … and the continuity
+  // Skill tool), MCP and Retrieve. A plugin tool named after any of those made
+  // the later first-party register throw "already registered" and the bundle
+  // exit 1, while `crewhaus run` skipped the plugin tool as documented.
+  describe("plugin tools register after every first-party registration (extension-path#1)", () => {
+    const everything = (continuity: boolean): string =>
+      emitCli(
+        baseIr({
+          plugins: ["acme-tools"],
+          tools: ["read"],
+          ...(continuity
+            ? {
+                continuity: {
+                  plan: true,
+                  proof: "ladder",
+                  ledger: true,
+                  handoff: true,
+                  scope: "spec",
+                },
+              }
+            : {}),
+          subAgents: [
+            {
+              name: "summarizer",
+              description: "summarize text",
+              instructions: "Summarize.",
+              tools: [],
+              permissions: "scoped",
+              inheritBypass: false,
+            },
+          ],
+          mcp_servers: {
+            things: { transport: "stdio", command: "node", args: ["server.js"] },
+            maybe: { transport: "stdio", command: "node", args: ["m.js"], required: false },
+          },
+          knowledge: {
+            vectorBackend: "in-memory",
+            defaultK: 5,
+            chunkSize: 400,
+            chunkOverlap: 0,
+            sources: [{ kind: "path", path: "docs/manual.md" }],
+          },
+        }),
+      ).files[0]?.content ?? "";
+
+    for (const continuity of [true, false]) {
+      test(`continuity ${continuity ? "on" : "off"}`, () => {
+        const c = everything(continuity);
+        const register = c.indexOf("for (const __t of __plugins.tools)");
+        // Every first-party registration the bundle makes, each present.
+        const firstParty = [
+          "defaultCatalog.register(read);",
+          "defaultCatalog.register(createSkillTool(__skills));",
+          "createTaskTool({ subAgents: __subAgents })",
+          "registerMcpServer(mcpHost,",
+          "registerOptionalMcpServer(",
+          "defaultCatalog.register(__knowledgeTool);",
+          ...(continuity ? ["await wireMemory("] : []),
+        ];
+        const positions = firstParty.map((needle) => ({ needle, at: c.lastIndexOf(needle) }));
+        expect(positions.filter((p) => p.at < 0)).toEqual([]);
+        expect(register).toBeGreaterThan(-1);
+        expect(positions.filter((p) => p.at > register)).toEqual([]);
+        // …and still before the loop reads the catalog.
+        expect(register).toBeLessThan(c.indexOf("await runChatLoop("));
+        // Activation stays early: its skill dirs feed discovery.
+        const activate = c.indexOf("const __plugins = await activatePlugins(");
+        expect(activate).toBeGreaterThan(-1);
+        expect(activate).toBeLessThan(
+          continuity
+            ? c.indexOf("await wireMemory(")
+            : c.indexOf("discoverSkills({ cwd: __cwd, pluginDirs: __plugins.skillDirs })"),
+        );
+      });
+    }
   });
 });
 

@@ -1126,6 +1126,74 @@ describe("runChatLoop — Section 8 orchestrator", () => {
     // execution already costs what serial would, so no wall-clock number can
     // separate the two. The start/finish ordering above can, on any machine.
   });
+
+  // C121 — the post-stream path ran every concurrency-safe batch before any
+  // serial call, so [Get, Set, Get] ran Get, Get, Set and the second Get
+  // returned the value from before the Set, while its tool_result sat after
+  // the Set in the transcript. Groups now run in the model's order, which is
+  // also what the streaming executor does: both paths must agree.
+  for (const streaming of [false, true]) {
+    test(`a read issued after a write in the same turn sees the write (streaming: ${streaming})`, async () => {
+      let value = "old";
+      const order: string[] = [];
+      const setTool = buildTool({
+        name: "Set",
+        description: "set the value",
+        inputSchema: z.object({}),
+        destructive: true,
+        execute: async () => {
+          order.push("Set");
+          value = "new";
+          return "set";
+        },
+      });
+      const getTool = buildTool({
+        name: "Get",
+        description: "get the value",
+        inputSchema: z.object({}),
+        readOnly: true,
+        concurrencySafe: true,
+        execute: async () => {
+          order.push("Get");
+          return value;
+        },
+      });
+      const use = (id: string, name: string): Anthropic.ToolUseBlock =>
+        ({ type: "tool_use", id, name, input: {} }) as Anthropic.ToolUseBlock;
+      const { adapter, capturedMessages } = makeScriptedClient([
+        [use("tu_g0", "Get"), use("tu_s", "Set"), use("tu_g2", "Get")],
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      const input = new PassThrough();
+      input.write("go\n");
+      input.end();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        _adapter: adapter,
+        input,
+        tools: [getTool, setTool],
+        permissionMode: "bypass",
+        streaming,
+      });
+
+      expect(order).toEqual(["Get", "Set", "Get"]);
+      const second = capturedMessages()[1] ?? [];
+      const last = second[second.length - 1];
+      const results = new Map<string, unknown>();
+      for (const block of (last?.content ?? []) as Anthropic.ToolResultBlockParam[]) {
+        if (block.type === "tool_result") results.set(block.tool_use_id, block.content);
+      }
+      const text = (id: string): string => {
+        const c = results.get(id);
+        if (typeof c === "string") return c;
+        return ((c ?? []) as Anthropic.TextBlockParam[]).map((b) => b.text).join("");
+      };
+      expect(text("tu_g0")).toBe("old");
+      expect(text("tu_s")).toBe("set");
+      expect(text("tu_g2")).toBe("new");
+    });
+  }
 });
 
 describe("runChatLoop — Section 8 loop detection", () => {
@@ -1237,6 +1305,119 @@ describe("runChatLoop — Section 8 result store", () => {
       expect(match).not.toBeNull();
       const fullPath = match?.[1] ?? "";
       expect(statSync(fullPath).size).toBe(bigPayload.length);
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// C129 — an id-less provider's synthesised id repeats across turns
+// (`gemini_Big_0`). The second turn's pointer named the first turn's file,
+// and its own output was never saved.
+describe("runChatLoop — a tool_use id repeated across turns", () => {
+  test("each turn's preview points at a file holding that turn's output", async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmpRoot = mkdtempSync(join(tmpdir(), "crewhaus-runtime-repeat-id-"));
+    const oldCwd = process.cwd();
+    process.chdir(tmpRoot);
+    try {
+      const payloads = ["first ".repeat(3000), "second ".repeat(3000)];
+      let calls = 0;
+      const bigTool = buildTool({
+        name: "Big",
+        description: "a different large string each call",
+        inputSchema: z.object({}),
+        readOnly: true,
+        execute: async () => payloads[calls++] ?? "",
+      });
+      const use = { type: "tool_use", id: "gemini_Big_0", name: "Big", input: {} };
+      const { adapter, capturedMessages } = makeScriptedClient([
+        [use as Anthropic.ToolUseBlock],
+        [use as Anthropic.ToolUseBlock],
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      const input = new PassThrough();
+      input.write("go\n");
+      input.end();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        _adapter: adapter,
+        input,
+        tools: [bigTool],
+        permissionMode: "bypass",
+      });
+      const pointerIn = (call: number): string => {
+        const msgs = capturedMessages()[call] ?? [];
+        const last = msgs[msgs.length - 1];
+        const block = (last?.content as Anthropic.ToolResultBlockParam[])[0];
+        const text = typeof block?.content === "string" ? block.content : "";
+        const m = /full output at (.+?)\]$/.exec(text);
+        if (m === null) throw new Error(`no pointer in turn ${call}`);
+        return m[1] as string;
+      };
+      const first = pointerIn(1);
+      const second = pointerIn(2);
+      expect(second).not.toBe(first);
+      expect(readFileSync(first, "utf8")).toBe(payloads[0] as string);
+      expect(readFileSync(second, "utf8")).toBe(payloads[1] as string);
+    } finally {
+      process.chdir(oldCwd);
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("runChatLoop — a one-line tool result reaches the model capped (flag-truth-6#4)", () => {
+  test("a 1 MB single-line result is sent as a preview of at most the threshold", async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const tmpRoot = mkdtempSync(join(tmpdir(), "crewhaus-runtime-oneline-"));
+    const oldCwd = process.cwd();
+    process.chdir(tmpRoot);
+    try {
+      // What a JSON-returning builtin produces: one line, however large.
+      const oneLine = JSON.stringify({ stdout: "z".repeat(1_000_000) });
+      const tool = buildTool({
+        name: "OneLine",
+        description: "one long line",
+        inputSchema: z.object({}),
+        readOnly: true,
+        execute: async () => oneLine,
+      });
+      const { adapter, capturedMessages } = makeScriptedClient([
+        [{ type: "tool_use", id: "tu_line", name: "OneLine", input: {} } as Anthropic.ToolUseBlock],
+        [{ type: "text", text: "done", citations: null } as Anthropic.TextBlock],
+      ]);
+      const input = new PassThrough();
+      input.write("go\n");
+      input.end();
+      await runChatLoop({
+        model: "test-model",
+        instructions: "test",
+        _adapter: adapter,
+        input,
+        tools: [tool],
+        permissionMode: "bypass",
+        stdout: () => {},
+      });
+      const secondCall = capturedMessages()[1] ?? [];
+      const userMsg = secondCall.find((m) => m.role === "user" && Array.isArray(m.content));
+      const content = (userMsg?.content as Anthropic.ToolResultBlockParam[])[0]?.content;
+      const preview = typeof content === "string" ? content : "";
+      const marker = preview.lastIndexOf("\n[truncated, full output at ");
+      expect(marker).toBeGreaterThan(0);
+      // Before the fix the whole megabyte went through, plus the marker. (The
+      // line before the marker names the part that continues it.)
+      const partLine = preview.lastIndexOf("\n[part 1 of ", marker);
+      expect(partLine).toBeGreaterThan(0);
+      expect(Buffer.byteLength(preview.slice(0, partLine), "utf8")).toBeLessThanOrEqual(10_240);
+      const fullPath = preview.match(/full output at (.+?)\]$/)?.[1] ?? "";
+      expect(readFileSync(fullPath, "utf8")).toBe(oneLine);
     } finally {
       process.chdir(oldCwd);
       rmSync(tmpRoot, { recursive: true, force: true });

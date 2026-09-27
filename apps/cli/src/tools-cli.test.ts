@@ -108,6 +108,26 @@ describe("buildToolList", () => {
     expect(blob).toContain("python (Python) [destructive, sandbox]");
     expect(blob).toContain("io:network");
   });
+
+  // docs-claims#12 — `show` printed justification-gated and `list` dropped it.
+  it("carries and prints the justification gate, as `show` does", () => {
+    const rows = buildToolList({
+      packageInstall: tool("PackageInstall", {
+        destructive: true,
+        scope: "external",
+        ioCapability: "process",
+        requireJustification: true,
+      }),
+      read: tool("Read", { readOnly: true }),
+    });
+    expect(rows.map((r) => [r.key, r.requireJustification])).toEqual([
+      ["packageInstall", true],
+      ["read", false],
+    ]);
+    expect(formatToolListLines(rows)[0]).toBe(
+      "packageInstall (PackageInstall) [destructive, external, io:process, justification-gated]",
+    );
+  });
 });
 
 // -------- tools suggest --------
@@ -255,6 +275,8 @@ describe("suggestTools — precision", () => {
     // a refused-but-granted tool is still an over-grant candidate
     expect(result.unimplied).toEqual(["imageGenerate"]);
     expect(lines[lines.length - 1]).toContain("literal keyword match");
+    // shape-reach#10 — it reads every site's instructions, not only the agent's.
+    expect(lines[lines.length - 1]).toContain("over the spec's instructions");
   });
 });
 

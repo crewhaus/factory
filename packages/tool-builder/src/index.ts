@@ -99,9 +99,13 @@ const OPERATIVE_ARG_KINDS: ReadonlySet<OperativeArgKind> = new Set([
   "id",
 ]);
 
-/** The kinds whose value can be qualified by another field (`within`). */
+/**
+ * The kinds whose value can be qualified by another field (`within`). For a
+ * `command` the field is the directory it runs in (see OperativeArg).
+ */
 const QUALIFIABLE_KINDS: ReadonlySet<OperativeArgKind> = new Set([
   "path",
+  "command",
   "recipient",
   "text",
   "id",
@@ -347,12 +351,17 @@ function checkOperativeArgs(
  *   tool that opts in. A destructive tool that goes to a place the model
  *   chose (`scope: "external"` with a `url` or `recipient` operative
  *   argument) MUST opt in to `requireJustification`.
- *
- * apps/cli/src/flag-rules.test.ts holds these rules over every builtin.
- * - `scope` defaults to `"internal"`, except for a definitionally outward name
- *   (see {@link isOutwardName}), which defaults to `"external"`.
+ * - `scope` defaults to `"internal"` — the egress classifier does not scan
+ *   the tool's payload — except for a definitionally outward name (see
+ *   {@link isOutwardName}), which defaults to `"external"`. A tool that
+ *   crosses a network or process boundary must say `scope: "external"` and
+ *   declare `ioCapability`.
  * - `classifyOutput: true` — the post-tool injection classifier runs unless
- *   the tool opts out.
+ *   the tool opts out. This is the one flag whose default is the cautious
+ *   value.
+ *
+ * apps/cli/src/flag-rules.test.ts holds these rules over every builtin, and
+ * lists the builtins auto mode runs without asking.
  *
  * `operativeArgs`, when given, is checked against `inputSchema` here: a
  * field the schema does not have throws, so a typo cannot quietly turn every
@@ -374,15 +383,16 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     concurrencySafe: def.concurrencySafe ?? false,
     readOnly: def.readOnly ?? false,
     destructive: def.destructive ?? false,
-    // Section 18: fail-closed for the sandbox flag and default-on for
-    // classification. Tools that legitimately bypass classification must
-    // opt out explicitly.
+    // Section 18: the sandbox floor is opt-in — a tool that needs it must
+    // say `requiresSandbox: true`. Classification is default-on; a tool that
+    // legitimately bypasses it must opt out explicitly.
     requiresSandbox: def.requiresSandbox ?? false,
     classifyOutput: def.classifyOutput ?? true,
-    // Pillar 3 sink-side fabric: fail-closed at "internal" so tools that
-    // actually cross a network/process boundary must opt in to "external"
-    // explicitly. egress-classifier reads this flag to decide whether to
-    // route the call's payload through its substring scan.
+    // Pillar 3 sink-side fabric: defaults to "internal", which the egress
+    // classifier does NOT scan, so a tool that crosses a network/process
+    // boundary must opt in to "external" explicitly. egress-classifier reads
+    // this flag to decide whether to route the call's payload through its
+    // substring scan.
     //
     // FR-002 defense-in-depth: for tools whose NAME is definitionally
     // outward-reaching (Fetch/WebFetch/WebSearch/SendMessage/
@@ -391,11 +401,12 @@ export function buildTool<TInput>(def: ToolDefinition<TInput>): RegisteredTool {
     // annotation still lowers external. An explicit `def.scope` always wins
     // (override still works), so the six built-ins that already set
     // `scope: "external"` are unchanged — no runtime behavior shifts. Every
-    // other (pure-compute) tool still fails closed to "internal".
+    // other tool defaults to "internal".
     scope: def.scope ?? (isOutwardName(def.name) ? "external" : "internal"),
-    // Pillar 3 intent gate: fail-closed at false. Destructive or external
-    // tools should opt in explicitly (see tool-http, tool-evm-tx,
-    // tool-message-channel, federation-router).
+    // Pillar 3 intent gate: off unless the tool opts in. A destructive tool
+    // that goes to a place the model chose must (see tool-http's HttpRequest,
+    // tool-notify's ChatPost and EmailSend, tool-evm-tx,
+    // tool-message-channel).
     requireJustification: def.requireJustification ?? false,
     ...(def.jsonSchema !== undefined ? { jsonSchema: def.jsonSchema } : {}),
     // FR-002 — pass through the io-capability fact verbatim (optional, like

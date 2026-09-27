@@ -403,7 +403,11 @@ export function toolConfigBlockFor(
   toolName: string,
 ): unknown {
   if (toolConfigs === undefined) return undefined;
-  if (toolConfigs[toolName] !== undefined) return toolConfigs[toolName];
+  // Own keys only: a tool may be named after an Object.prototype member
+  // (`toString`), and a spec's block is a plain object that inherits it.
+  if (Object.hasOwn(toolConfigs, toolName) && toolConfigs[toolName] !== undefined) {
+    return toolConfigs[toolName];
+  }
   const builtin = builtinFor(toolName);
   const own = new Set([toolName.toLowerCase()]);
   if (builtin !== undefined) {

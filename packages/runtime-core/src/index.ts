@@ -37,6 +37,7 @@ import {
   type PricingTable,
   computeCostMicros,
   createCostTracker,
+  providerToolLimit,
   resolveCapabilities,
   resolvePricing,
   sumRoleCost,
@@ -164,7 +165,7 @@ import {
   stripJustificationField,
   withJustificationField,
 } from "@crewhaus/tool-catalog";
-import { resolveToolConfigEnv } from "@crewhaus/tool-categories";
+import { LOOP_TOOL_NAMES, resolveToolConfigEnv } from "@crewhaus/tool-categories";
 import { executeTool, preparePermissionSubject } from "@crewhaus/tool-executor";
 import { type LoopDetection, detectLoop } from "@crewhaus/tool-loop-detection";
 import { partitionToolCalls } from "@crewhaus/tool-orchestrator";
@@ -221,6 +222,12 @@ import {
 import { loadProjectMemory } from "./project-memory";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
+import {
+  type ServingModel,
+  type ToolLimitVerdict,
+  checkServingToolLimits,
+  unreportedToolLimitLines,
+} from "./tool-limit";
 
 /**
  * Slice-scope runtime: a multi-turn streaming chat loop with prompt
@@ -249,8 +256,9 @@ import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
  * hit, a synthetic warning user message is appended (deduped per
  * signature) so the model can self-correct. Every tool result flows
  * through `@crewhaus/tool-result-store` — outputs over 10 KB are
- * persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` and the
- * model sees a preview pointing at the full file. Behind a
+ * persisted to `.crewhaus/tool-results/<runId>/<toolUseId>.txt` (or
+ * `<toolUseId>.<n>.txt` when an id-less provider's synthesised id repeats)
+ * and the model sees a preview pointing at the full file. Behind a
  * `streaming: true` option, the loop swaps to
  * `@crewhaus/streaming-tool-executor`, which dispatches tools mid-stream
  * via the SDK's `contentBlock` event.
@@ -3137,25 +3145,52 @@ export function buildTimeoutFailureReport(timeout: TimeoutAbortReason): FailureR
 }
 
 /**
+ * provider-limits#0 — act on a boot tool-limit verdict: no model can take the
+ * run's tools → a `ConfigError` before any model call; some model cannot →
+ * one `[tools]` line per model on stderr, beside the `[failover]` and
+ * `[model_pool]` boot lines. A daemon runs one loop per message, so each
+ * line is written once per process (`unreportedToolLimitLines`).
+ */
+function reportToolLimits(verdict: ToolLimitVerdict): void {
+  if (verdict.fatal !== undefined) throw new ConfigError(verdict.fatal);
+  for (const line of unreportedToolLimitLines(verdict.warnings)) {
+    process.stderr.write(`[tools] ${line}\n`);
+  }
+}
+
+/**
  * Item 3 (G32) — merge plugin-contributed tools into the run's advertised tool
  * set. First-party `base` tools WIN any name collision, so an activated plugin
- * can augment the catalog but never silently shadow a built-in. Returns the
- * `base` array unchanged (same reference) when there are no plugin tools, so a
- * run without the `plugins` option is byte-identical to a pre-G32 runtime.
+ * can augment the catalog but never silently shadow a built-in; nor can it
+ * take a name in `reserved` — the tools the loop adds itself (`ListTools`,
+ * and `Consult` / `Escalate`), which would otherwise give way to it. Returns
+ * the `base` array unchanged (same reference) when there are no plugin tools,
+ * so a run without the `plugins` option is byte-identical to a pre-G32
+ * runtime.
  */
 function mergeEffectiveTools(
   base: ReadonlyArray<RegisteredTool>,
   pluginTools: ReadonlyArray<RegisteredTool> | undefined,
+  reserved: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<RegisteredTool> {
   if (pluginTools === undefined || pluginTools.length === 0) return base;
   const byName = new Set(base.map((t) => t.name));
   const merged: RegisteredTool[] = [...base];
   for (const tool of pluginTools) {
-    if (byName.has(tool.name)) continue; // first-party wins the collision
+    if (byName.has(tool.name) || reserved.has(tool.name)) continue; // first-party wins
     byName.add(tool.name);
     merged.push(tool);
   }
   return merged;
+}
+
+/**
+ * Does `limits` set a limit for `toolName` itself? Own keys only: a tool may
+ * be named after an Object.prototype member (`toString`, `constructor`),
+ * which a plain `rate_limits` object inherits but never sets.
+ */
+function ownLimit(limits: Readonly<Record<string, unknown>>, toolName: string): boolean {
+  return Object.hasOwn(limits, toolName) && limits[toolName] !== undefined;
 }
 
 export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
@@ -3165,7 +3200,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // 0.6.0 — then the hybrid-strategy tools (`Consult` / `Escalate`) the
   // composition root registered, same first-party-wins posture.
   const mergedTools = mergeEffectiveTools(
-    mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools),
+    mergeEffectiveTools(opts.tools ?? [], opts.plugins?.tools, new Set(LOOP_TOOL_NAMES)),
     opts.hybridTools,
   );
   // #405 — the runtime's own toolset-introspection tool rides every
@@ -3274,6 +3309,48 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     throw new ConfigError(
       `model "${opts.model}" (provider ${providerId}) does not support tool use — remove tools or pick a tool-capable model`,
     );
+  }
+  // provider-limits#0 — the same fail-early rule for the tool COUNT: OpenAI
+  // (and Azure OpenAI, Groq) refuse more than 128 tools on one request,
+  // Gemini more than 512, and they refuse every request of the run. The list
+  // is final here (builtins, loop tools, MCP, plugin and hybrid tools), so
+  // this is the check `--model` overrides and MCP servers cannot slip past.
+  // A pool is checked per candidate below, once each candidate's subset is
+  // known.
+  if (opts.modelPool === undefined) {
+    const count = effectiveTools.length;
+    const serving: ServingModel[] =
+      opts.modelTiers !== undefined
+        ? (["fast", "default"] as const).map((tier) => {
+            const model = (opts.modelTiers as NonNullable<typeof opts.modelTiers>)[tier];
+            return {
+              model,
+              toolCount: count,
+              role: "serves",
+              label: `model_tiers.${tier} "${model}"`,
+              whenOver: `the run starts, and every turn routed to the ${tier} tier fails`,
+            } satisfies ServingModel;
+          })
+        : [opts.model, ...modelFallbacks].map(
+            (model, i) =>
+              ({
+                model,
+                toolCount: count,
+                role: "serves",
+                label: i === 0 ? `model "${model}"` : `model_fallbacks[${i - 1}] "${model}"`,
+                whenOver: "the run starts because another model in the chain can serve",
+              }) satisfies ServingModel,
+          );
+    if (opts.budget?.onExceed.kind === "degrade") {
+      serving.push({
+        model: opts.budget.onExceed.model,
+        toolCount: count,
+        role: "degrade",
+        label: `budget degrade model "${opts.budget.onExceed.model}"`,
+        whenOver: "a budget degrade to it would fail every call",
+      });
+    }
+    reportToolLimits(checkServingToolLimits(serving, process.env));
   }
   let compactionAdapter: ProviderAdapter;
   let compactionWireModelId: string;
@@ -4392,6 +4469,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
   const armIdOf = (candidate: PoolCandidate): string =>
     poolCandidateConfigs.get(candidate)?.profile ?? candidate.modelString;
+  // provider-limits#0 — each pool candidate against its provider's
+  // per-request tool limit, counted on the subset IT is advertised. One over
+  // its limit is left out of routing (the `tool-limit` eligibility exclusion
+  // in preRoute); a pool none of whose candidates can accept its tools
+  // cannot make one call, and stops here.
+  if (poolRouter !== undefined) {
+    const serving: ServingModel[] = [];
+    for (const [candidate, ad] of candidateAdvertisements) {
+      serving.push({
+        model: candidate.modelString,
+        toolCount: ad.names.size,
+        role: "serves",
+        label: `model_pool candidate "${armIdOf(candidate)}"`,
+        whenOver: "routing leaves it out",
+      });
+    }
+    if (budgetDegradeRung !== undefined && !candidateAdvertisements.has(budgetDegradeRung)) {
+      serving.push({
+        model: budgetDegradeRung.modelString,
+        toolCount: effectiveTools.length,
+        role: "degrade",
+        label: `budget degrade model "${budgetDegradeRung.modelString}"`,
+        whenOver: "a budget degrade to it would fail every call",
+      });
+    }
+    reportToolLimits(checkServingToolLimits(serving, process.env));
+  }
   {
     const currentToolNames = [...effectiveTools.map((t) => t.name)].sort();
     const prior = resumedToolNames === undefined ? undefined : [...resumedToolNames].sort();
@@ -5121,7 +5225,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
   const hasToolRateBucket = (toolName: string): boolean =>
     runRateLimits !== undefined &&
-    (runRateLimits[toolName] !== undefined || runRateLimits["*"] !== undefined);
+    (ownLimit(runRateLimits, toolName) || ownLimit(runRateLimits, "*"));
 
   // -------------------------------------------------------------------------
   // 0.6.0 §4.4 — the per-candidate plan table. One plan per enabled pool
@@ -5227,7 +5331,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ...(planLimiter !== undefined ? { toolRateLimiter: planLimiter } : {}),
       hasToolRateBucket: (toolName: string): boolean =>
         planRateLimits !== undefined &&
-        (planRateLimits[toolName] !== undefined || planRateLimits["*"] !== undefined),
+        (ownLimit(planRateLimits, toolName) || ownLimit(planRateLimits, "*")),
       // `$VAR` values in a candidate's tool_config are read from the
       // environment here, when the loop starts, as the boot registrations
       // read theirs — never compiled into the bundle. An unset one fails
@@ -6463,10 +6567,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       },
     );
     if (stored.persisted) {
-      runContext.logger.info("tool result persisted", {
+      // A retried call whose bytes were already on disk wrote nothing.
+      runContext.logger.info(
+        stored.reused === true ? "tool result already persisted" : "tool result persisted",
+        { toolUseId: tu.id, toolName: tu.name, fullPath: stored.fullPath },
+      );
+    } else if (stored.unsaved !== undefined) {
+      runContext.logger.warn("tool result could not be persisted; the model sees the preview", {
         toolUseId: tu.id,
         toolName: tu.name,
-        fullPath: stored.fullPath,
+        reason: stored.unsaved,
       });
     }
     // Section 18 — post-tool prompt-injection classifier. Runs after the
@@ -6626,10 +6736,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   }
 
   /**
-   * Run a list of tool calls honouring the orchestrator's partition:
-   * concurrent-safe batches via `Promise.all`, then serial calls one at
-   * a time. Results are returned in the original `toolUses` order so
-   * they line up with the assistant turn's tool_use blocks.
+   * Run a list of tool calls honouring the orchestrator's partition, group
+   * by group in the order the model issued them: a run of concurrency-safe
+   * calls in parallel (up to `maxConcurrentTools`), every other call alone.
+   * A read issued after a write therefore sees the write. Results are
+   * returned in the original `toolUses` order so they line up with the
+   * assistant turn's tool_use blocks.
    */
   async function runToolBatch(
     toolUses: ReadonlyArray<TsmToolUseBlock>,
@@ -6645,31 +6757,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     ]);
     const maxConcurrentTools = opts.maxConcurrentTools ?? DEFAULT_MAX_CONCURRENT_TOOLS;
     runContext.logger.debug("tool partition", {
-      concurrent: partition.concurrent.map((b) => b.length),
-      serial: partition.serial.length,
+      // In order: a number is a concurrent group of that many calls, "S" one
+      // serial call.
+      groups: partition.groups.map((g) => (g.kind === "serial" ? "S" : g.calls.length)),
       maxConcurrentTools,
     });
     // Map each tool_use's identity to its slot in the original order so
     // results can be placed back in order regardless of the
     // concurrent/serial execution shape. `partitionToolCalls` is total —
-    // every input block lands in exactly one partition bucket — and
+    // every input block lands in exactly one group — and
     // `executeOneToolUse` always resolves to a result, so every slot is
     // filled; there is no missing-result case to defend against.
     const indexByBlock = new Map<TsmToolUseBlock, number>();
     toolUses.forEach((tu, idx) => indexByBlock.set(tu, idx));
     const results = new Array<Anthropic.ToolResultBlockParam>(toolUses.length);
-    for (const batch of partition.concurrent) {
-      const settled = await mapWithConcurrency(batch, maxConcurrentTools, (tu) =>
+    for (const group of partition.groups) {
+      if (group.kind === "serial") {
+        // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
+        results[indexByBlock.get(group.call)!] = await executeOneToolUse(group.call);
+        continue;
+      }
+      const settled = await mapWithConcurrency(group.calls, maxConcurrentTools, (tu) =>
         executeOneToolUse(tu),
       );
-      batch.forEach((tu, i) => {
+      group.calls.forEach((tu, i) => {
         // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
         results[indexByBlock.get(tu)!] = settled[i] as Anthropic.ToolResultBlockParam;
       });
-    }
-    for (const tu of partition.serial) {
-      // biome-ignore lint/style/noNonNullAssertion: every block came from toolUses, so its index is registered.
-      results[indexByBlock.get(tu)!] = await executeOneToolUse(tu);
     }
     return results;
   }
@@ -7442,11 +7556,20 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 const maxOutputTokens =
                   cfg?.capabilities?.maxOutputTokens ?? table?.maxOutputTokens;
                 const breakerState = c.breaker?.state();
+                const toolLimit = providerToolLimit(c.modelString, process.env);
                 return {
                   armId: armIdOf(c),
                   modelString: c.modelString,
                   tags: c.tags,
                   ...(breakerState !== undefined ? { breakerState } : {}),
+                  ...(toolLimit !== undefined
+                    ? {
+                        toolLimit: {
+                          toolCount: plan.advertisedNames.size,
+                          maxTools: toolLimit.maxTools,
+                        },
+                      }
+                    : {}),
                   capabilities: {
                     features: plan.features,
                     ...(contextWindow !== undefined ? { contextWindow } : {}),

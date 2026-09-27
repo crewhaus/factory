@@ -111,7 +111,8 @@ export async function loadBuiltinTools(
 ): Promise<Record<string, RegisteredTool>> {
   const packages = new Set<string>();
   for (const key of keys) {
-    const entry = BUILTIN_TOOLS[key];
+    // Own keys only: `constructor` is not a builtin, whatever the prototype says.
+    const entry = Object.hasOwn(BUILTIN_TOOLS, key) ? BUILTIN_TOOLS[key] : undefined;
     if (entry === undefined) throw new Error(`"${key}" is not a builtin tool`);
     packages.add(entry.package);
   }

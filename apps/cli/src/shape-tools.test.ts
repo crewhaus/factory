@@ -17,7 +17,13 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { type CompileResult, compile, lower, toolSitesOf } from "@crewhaus/compiler";
+import {
+  type CompileResult,
+  checkProviderToolLimits,
+  compile,
+  lower,
+  toolSitesOf,
+} from "@crewhaus/compiler";
 import { listFixtureShapes, loadFixture } from "@crewhaus/smoke-harness";
 import { parseSpec } from "@crewhaus/spec";
 import {
@@ -188,6 +194,29 @@ const FIXTURES = listFixtureShapes();
 describe("every shape's fixture compiles every kind of tool, or refuses it by name", () => {
   test("the matrix covers every fixture and every leaf category", () => {
     expect(FIXTURES.length).toBeGreaterThanOrEqual(15);
+    // No fixture is refused for its provider's tool limit: the one whose
+    // model is over one (cli-openai, OpenAI takes 128) is an `openai/` model,
+    // which OPENAI_BASE_URL may send to a server with no such limit, so the
+    // compiler warns (provider-tool-cap-unverified) and the run checks at
+    // start. A refused fixture would mean the matrix proves less than it
+    // claims.
+    const limited = FIXTURES.filter((shape) => {
+      const yaml = withTools(shape, SELECTORS);
+      return (
+        yaml !== undefined && checkProviderToolLimits(lower(parseSpec(yaml))).errors.length > 0
+      );
+    });
+    expect(limited).toEqual([]);
+    const unverified = FIXTURES.filter((shape) => {
+      const yaml = withTools(shape, SELECTORS);
+      return (
+        yaml !== undefined &&
+        checkProviderToolLimits(lower(parseSpec(yaml))).warnings.some(
+          (w) => w.code === "provider-tool-cap-unverified",
+        )
+      );
+    });
+    expect(unverified).toEqual(["cli-openai"]);
     expect(LEAF_PICKS.length).toBe(leafCategories().length);
     expect(LEAF_PICKS.length).toBeGreaterThanOrEqual(50);
     expect(EXPECTED_KEYS.length).toBeGreaterThanOrEqual(150);
@@ -203,11 +232,25 @@ describe("every shape's fixture compiles every kind of tool, or refuses it by na
     test(shape, () => {
       const target = parseSpec(loadFixture(shape)).target as ToolShape;
       const profile = SHAPE_TOOL_PROFILES[target];
-      const yaml = withTools(shape, SELECTORS);
+      let yaml = withTools(shape, SELECTORS);
       if (yaml === undefined) {
         // A shape with no tool site at all: its schema has no tools: key.
         expect(profile.runtime).toBe("none");
         return;
+      }
+      let expectedKeys = EXPECTED_KEYS;
+      // provider-limits#0 — a fixture whose model accepts fewer tools on one
+      // request than the matrix injects (cli-openai: OpenAI takes 128) must
+      // be refused with the limit named, not emitted. Its reach is then
+      // proved with the leaf picks alone, which fit.
+      const limits = checkProviderToolLimits(lower(parseSpec(yaml)));
+      if (limits.errors.length > 0) {
+        const first = limits.errors[0];
+        expect(first?.message).toMatch(/exceed the \d+-tool limit/);
+        expect(() => compile(yaml as string)).toThrow(first?.message);
+        yaml = withTools(shape, LEAF_PICKS) as string;
+        expect(checkProviderToolLimits(lower(parseSpec(yaml))).errors).toEqual([]);
+        expectedKeys = LEAF_PICKS;
       }
       const result: CompileResult = compile(yaml);
       if (profile.runtime === "none") {
@@ -222,7 +265,7 @@ describe("every shape's fixture compiles every kind of tool, or refuses it by na
       }
       const deps = new Set(collectCrewhausDeps(result.files));
       const source = result.files.map((f) => f.content).join("\n");
-      const missing = EXPECTED_KEYS.filter((key) => {
+      const missing = expectedKeys.filter((key) => {
         const pkg = BUILTIN_TOOLS[key]?.package as string;
         return !deps.has(pkg) || !source.includes(`from "${pkg}"`);
       });

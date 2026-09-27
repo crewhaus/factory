@@ -176,6 +176,13 @@ describe("emitChannelBot — evalEntry variant (cluster S)", () => {
     expect(entryOf(MIN_IR)).not.toContain("mcp_servers declared but not booted");
   });
 
+  test("plugins declared ⇒ a generated honesty note (the bridge does not activate them)", () => {
+    const note = "plugins: declared but not activated by the eval bridge entry";
+    expect(entryOf({ ...MIN_IR, plugins: ["two-tools"] })).toContain(note);
+    expect(entryOf(MIN_IR)).not.toContain(note);
+    expect(entryOf({ ...MIN_IR, plugins: [] })).not.toContain(note);
+  });
+
   test("eval-entry.ts is syntactically valid TypeScript", () => {
     const t = new Bun.Transpiler({ loader: "ts" });
     expect(() => t.transformSync(entryOf(MIN_IR))).not.toThrow();

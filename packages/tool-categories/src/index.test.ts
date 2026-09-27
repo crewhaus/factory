@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  BUILTIN_TOOLS,
   CATEGORIES,
+  LOCAL_TOOLS_IN_NETWORK_ROLLUP,
+  NETWORK_LEAVES_OUTSIDE_ROLLUP,
+  NETWORK_TOOLS_OUTSIDE_ROLLUP,
   ToolCategoryError,
   allRegisteredTools,
   categoriesForTool,
@@ -231,6 +235,88 @@ describe("expandToolSelectors — errors", () => {
   });
 });
 
+// flag-truth-6#10 — inertness was judged per KEY: every key an exclusion
+// named had to be included, so `-all-network` failed after `all-code` because
+// most network tools are not code tools, although it removed eight that are.
+describe("expandToolSelectors — each exclusion is judged on its own", () => {
+  const code = toolsInCategory("code");
+  const network = new Set(toolsInCategory("network"));
+
+  test("-all-<category> that only partly overlaps the includes subtracts the overlap", () => {
+    const overlap = code.filter((k) => network.has(k));
+    // The case is only this one while the overlap is partial on both sides.
+    expect(overlap.length).toBeGreaterThanOrEqual(8);
+    expect([...network].some((k) => !code.includes(k))).toBe(true);
+    const out = expandToolSelectors(["all-code", "-all-network"]);
+    expect(out.tools).toEqual(code.filter((k) => !network.has(k)));
+    expect(out.tools).toContain("read");
+    expect(out.tools).not.toContain("registrySearch");
+    expect(out.tools).not.toContain("dependencyAudit");
+  });
+
+  test("a roll-up minus a leaf set it only half holds", () => {
+    const filesystem = new Set(toolsInCategory("filesystem"));
+    const fsx = toolsInCategory("fsx");
+    expect(fsx.filter((k) => filesystem.has(k)).length).toBeGreaterThan(0);
+    expect([...filesystem].some((k) => !fsx.includes(k))).toBe(true);
+    expect(expandToolSelectors(["all-fsx", "-all-filesystem"]).tools).toEqual(
+      fsx.filter((k) => !filesystem.has(k)),
+    );
+  });
+
+  test("a category exclusion that removes nothing is still refused, by its own name", () => {
+    expect(toolsInCategory("chain").filter((k) => toolsInCategory("fs").includes(k))).toEqual([]);
+    expect(() => expandToolSelectors(["all-fs", "-all-chain"])).toThrow(
+      'tools: "-all-chain" excludes a category none of whose tools is included.',
+    );
+  });
+
+  test("a bare exclusion is judged alone, beside a category exclusion that does remove something", () => {
+    expect(code).not.toContain("dnsLookup");
+    let message = "";
+    try {
+      expandToolSelectors(["all-code", "-all-network", "-dnsLookup"]);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toStartWith('tools: "-dnsLookup" excludes a tool that nothing includes.');
+    expect(message).not.toContain('"-all-network"');
+  });
+
+  test("both kinds of inert exclusion are reported together", () => {
+    expect(() => expandToolSelectors(["all-fs", "-gitPush", "-all-chain"])).toThrow(
+      'tools: "-gitPush" excludes a tool that nothing includes; "-all-chain" excludes a category none of whose tools is included.',
+    );
+  });
+});
+
+// security-12#14 — `CATEGORIES` is an object literal, so a category named
+// after an Object.prototype member resolved to that member: `all-constructor`
+// expanded to no tools and `-all-hasOwnProperty` was a silent no-op, where
+// every other unknown name is refused.
+describe("a category name is never an Object.prototype member", () => {
+  const inherited = Object.getOwnPropertyNames(Object.prototype);
+
+  test("each one is an unknown category, as an include and as an exclusion", () => {
+    expect(inherited).toContain("constructor");
+    expect(inherited).toContain("__proto__");
+    expect(inherited.length).toBeGreaterThanOrEqual(12);
+    for (const name of inherited) {
+      expect(() => toolsInCategory(name)).toThrow(ToolCategoryError);
+      expect(() => expandToolSelectors([`all-${name}`])).toThrow(
+        `tools: unknown tool category "all-${name}"`,
+      );
+      expect(() => expandToolSelectors(["read", `-all-${name}`])).toThrow(
+        `tools: unknown tool category "all-${name}"`,
+      );
+    }
+  });
+
+  test("a real category still resolves", () => {
+    expect(toolsInCategory("git")).toContain("gitCommit");
+  });
+});
+
 describe("registry shape", () => {
   test("every category is either a leaf or a roll-up, never both and never neither", () => {
     for (const [name, def] of Object.entries(CATEGORIES)) {
@@ -299,5 +385,123 @@ describe("lookup helpers", () => {
 
   test("categoriesForTool is empty for an unknown key", () => {
     expect(categoriesForTool("definitelyNotATool")).toEqual([]);
+    expect(categoriesForTool("constructor")).toEqual([]);
+  });
+
+  // docs-claims#14 — the docstrings said "leaf first", and the order was
+  // alphabetical: gitCommit read `code, git`.
+  test("categoriesForTool lists the owning leaf first, then the roll-ups alphabetically", () => {
+    expect(categoriesForTool("gitCommit")).toEqual(["git", "code"]);
+    expect(categoriesForTool("abiDecode")).toEqual(["onchain", "chain", "compute"]);
+    const leaves = new Set(leafCategories());
+    const all = allRegisteredTools();
+    expect(all.length).toBeGreaterThanOrEqual(500);
+    const bad = all.filter((k) => {
+      const cats = categoriesForTool(k);
+      const rollUps = cats.slice(1);
+      return (
+        !leaves.has(cats[0] ?? "") ||
+        rollUps.some((c) => leaves.has(c)) ||
+        rollUps.join() !== [...rollUps].sort().join()
+      );
+    });
+    expect(bad).toEqual([]);
+  });
+});
+
+// C038 — the `network` roll-up was titled "Everything that reaches the
+// network" while half the builtins whose row says io: "network" sat outside
+// it, and it held four tools that never touch the network. Its title now
+// says what it holds; this guard keeps the roll-up, the two exemption lists
+// and the builtin table's io column (itself checked against every tool by
+// apps/cli/src/tool-registry.test.ts) in agreement, both ways.
+describe("the network roll-up and the io column agree", () => {
+  const inRollup = new Set(toolsInCategory("network"));
+  const leafOf = (key: string): string | undefined =>
+    leafCategories().find((c) => (CATEGORIES[c]?.tools ?? []).includes(key));
+  const networkBuiltins = Object.entries(BUILTIN_TOOLS)
+    .filter(([, e]) => e.io === "network")
+    .map(([k]) => k);
+  // A shape-specific builtin (sendMessage, evmSendTransaction) is in no
+  // category at all, so no roll-up can hold it.
+  const categorized = networkBuiltins.filter((k) => BUILTIN_TOOLS[k]?.shapes === undefined);
+
+  test("every categorized network builtin is in the roll-up or listed outside it", () => {
+    const unlisted = categorized.filter(
+      (k) =>
+        !inRollup.has(k) &&
+        !((leafOf(k) ?? "") in NETWORK_LEAVES_OUTSIDE_ROLLUP) &&
+        !(k in NETWORK_TOOLS_OUTSIDE_ROLLUP),
+    );
+    expect(unlisted).toEqual([]);
+    // The guard's hit count: the lists really carry the tools left out.
+    const outside = categorized.filter((k) => !inRollup.has(k));
+    expect(outside.length).toBeGreaterThan(40);
+    expect(networkBuiltins.length - categorized.length).toBe(2);
+  });
+
+  test("every listed leaf still reaches the network and is still outside the roll-up", () => {
+    const rollupLeaves = new Set(
+      (CATEGORIES["network"]?.includes ?? []).flatMap((c) =>
+        CATEGORIES[c]?.tools !== undefined ? [c] : (CATEGORIES[c]?.includes ?? []),
+      ),
+    );
+    const stale: string[] = [];
+    for (const leaf of Object.keys(NETWORK_LEAVES_OUTSIDE_ROLLUP)) {
+      const tools = CATEGORIES[leaf]?.tools;
+      if (tools === undefined) stale.push(`${leaf}: not a leaf`);
+      else if (!tools.some((k) => BUILTIN_TOOLS[k]?.io === "network"))
+        stale.push(`${leaf}: no network tool`);
+      if (rollupLeaves.has(leaf)) stale.push(`${leaf}: now in the roll-up`);
+    }
+    expect(stale).toEqual([]);
+    expect(Object.keys(NETWORK_LEAVES_OUTSIDE_ROLLUP).length).toBeGreaterThan(0);
+  });
+
+  test("every listed tool still reaches the network, from a leaf the roll-up and the leaf list leave out", () => {
+    const stale: string[] = [];
+    for (const key of Object.keys(NETWORK_TOOLS_OUTSIDE_ROLLUP)) {
+      if (BUILTIN_TOOLS[key]?.io !== "network") stale.push(`${key}: not a network builtin`);
+      if (inRollup.has(key)) stale.push(`${key}: now in the roll-up`);
+      if ((leafOf(key) ?? "") in NETWORK_LEAVES_OUTSIDE_ROLLUP)
+        stale.push(`${key}: its whole leaf is listed`);
+    }
+    expect(stale).toEqual([]);
+    expect(Object.keys(NETWORK_TOOLS_OUTSIDE_ROLLUP).length).toBeGreaterThan(0);
+  });
+
+  test("the only roll-up members with no network I/O are the named local helpers", () => {
+    const local = [...inRollup].filter((k) => BUILTIN_TOOLS[k]?.io !== "network").sort();
+    expect(local).toEqual([...LOCAL_TOOLS_IN_NETWORK_ROLLUP].sort());
+  });
+
+  test("the note names every leaf and tool left out, and the title no longer claims everything", () => {
+    const def = CATEGORIES["network"];
+    expect(def?.title).not.toMatch(/^everything/i);
+    const note = def?.note ?? "";
+    for (const leaf of Object.keys(NETWORK_LEAVES_OUTSIDE_ROLLUP)) {
+      expect(note).toContain(`all-${leaf}`);
+    }
+    for (const key of Object.keys(NETWORK_TOOLS_OUTSIDE_ROLLUP)) expect(note).toContain(key);
+  });
+
+  test("the roll-up grants what it granted on 0.7.0", () => {
+    // Retitled, not widened: a spec that wrote all-network keeps its grant.
+    expect([...inRollup].sort()).toEqual(
+      [
+        "web",
+        "http",
+        "registry",
+        "supplychain",
+        "containers",
+        "chainread",
+        "chaincall",
+        "token",
+        "defi",
+      ]
+        .flatMap((c) => toolsInCategory(c))
+        .filter((k, i, a) => a.indexOf(k) === i)
+        .sort(),
+    );
   });
 });

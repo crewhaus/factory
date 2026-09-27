@@ -23,9 +23,25 @@
  * requirement: an emitter must never have to know what a category is.
  */
 import { CrewhausError } from "@crewhaus/errors";
-import { CATEGORIES, type CategoryDef, leafCategories, rollUpCategories } from "./registry";
+import {
+  CATEGORIES,
+  type CategoryDef,
+  LOCAL_TOOLS_IN_NETWORK_ROLLUP,
+  NETWORK_LEAVES_OUTSIDE_ROLLUP,
+  NETWORK_TOOLS_OUTSIDE_ROLLUP,
+  leafCategories,
+  rollUpCategories,
+} from "./registry";
 
-export { CATEGORIES, type CategoryDef, leafCategories, rollUpCategories };
+export {
+  CATEGORIES,
+  type CategoryDef,
+  LOCAL_TOOLS_IN_NETWORK_ROLLUP,
+  NETWORK_LEAVES_OUTSIDE_ROLLUP,
+  NETWORK_TOOLS_OUTSIDE_ROLLUP,
+  leafCategories,
+  rollUpCategories,
+};
 export {
   BUILTIN_TOOLS,
   type BootRegistrar,
@@ -33,6 +49,7 @@ export {
   type BuiltinToolEntry,
   type ChainBootConfig,
   HOST_BOOT_SEAMS,
+  LOOP_TOOL_NAMES,
   OPTIONAL_BOOT_SEAMS,
   TOOL_BOOT_REGISTRARS,
 } from "./builtins";
@@ -79,6 +96,11 @@ export {
   SANDBOX_AVAILABLE_SYMBOL,
   unknownToolMessage,
 } from "./shapes";
+/**
+ * The case-insensitive edit distance compile's "did you mean" hints rank by,
+ * so `crewhaus tools show` can offer the same near miss for a typo.
+ */
+export { distance as nameDistance } from "./distance";
 
 export class ToolCategoryError extends CrewhausError {
   override readonly name = "ToolCategoryError";
@@ -126,7 +148,13 @@ export function toolsInCategory(name: string): ReadonlyArray<string> {
   const walk = (cat: string, trail: ReadonlyArray<string>): void => {
     if (seen.has(cat)) return;
     seen.add(cat);
-    const def: CategoryDef | undefined = CATEGORIES[cat];
+    // An own key only: `CATEGORIES` is an object literal, so `constructor`,
+    // `__proto__` or `toString` would otherwise resolve to an Object.prototype
+    // member — no tools, no includes — and `all-constructor` would expand to
+    // nothing instead of being refused (security-12#14).
+    const def: CategoryDef | undefined = Object.hasOwn(CATEGORIES, cat)
+      ? CATEGORIES[cat]
+      : undefined;
     if (def === undefined) {
       throw new ToolCategoryError(unknownCategoryMessage(cat, trail));
     }
@@ -174,6 +202,12 @@ export type ExpandResult = {
  * that removes nothing — a `-gitPush` that matches no included tool is
  * almost always a typo or a stale copy-paste, and silently ignoring it would
  * leave the author believing a tool is gated when it is not.
+ *
+ * Each exclusion is judged on its own. A `-<tool>` removes nothing unless
+ * that tool is included. A `-all-<category>` removes nothing only when none
+ * of its tools is included: it need not be a subset of the includes, so
+ * `[all-code, -all-network]` keeps the code tools that do not touch the
+ * network (flag-truth-6#10).
  */
 export function expandToolSelectors(
   selectors: ReadonlyArray<string>,
@@ -191,32 +225,59 @@ export function expandToolSelectors(
   const parsed = selectors.map(parseSelector);
   const included = new Set<string>();
   const excluded = new Set<string>();
+  // Every exclusion as written, with the keys it removes, so an inert one is
+  // judged per selector rather than per key.
+  const exclusions: Array<{
+    readonly kind: Selector["kind"];
+    readonly label: string;
+    readonly keys: ReadonlyArray<string>;
+  }> = [];
   const categoryErrors: string[] = [];
 
   for (const sel of parsed) {
     const sink = sel.exclude ? excluded : included;
     if (sel.kind === "category") {
       try {
-        for (const key of toolsInCategory(sel.name)) sink.add(key);
+        const keys = toolsInCategory(sel.name);
+        for (const key of keys) sink.add(key);
+        if (sel.exclude) exclusions.push({ kind: "category", label: `-all-${sel.name}`, keys });
       } catch (err) {
         categoryErrors.push(err instanceof Error ? err.message : String(err));
       }
       continue;
     }
     sink.add(sel.key);
+    if (sel.exclude) exclusions.push({ kind: "tool", label: `-${sel.key}`, keys: [sel.key] });
   }
 
   if (categoryErrors.length > 0) {
     throw new ToolCategoryError(`${path}: ${categoryErrors.join("; ")}`);
   }
 
-  const inert = [...excluded].filter((key) => !included.has(key)).sort();
+  const inert = exclusions.filter((x) => !x.keys.some((key) => included.has(key)));
   if (inert.length > 0) {
-    const names = inert.map((k) => `"-${k}"`).join(", ");
-    const verb = inert.length === 1 ? "excludes a tool that" : "exclude tools that";
+    const listed = (xs: ReadonlyArray<{ readonly label: string }>): string =>
+      [...new Set(xs.map((x) => `"${x.label}"`))].sort().join(", ");
+    const tools = inert.filter((x) => x.kind === "tool");
+    const categories = inert.filter((x) => x.kind === "category");
+    const parts: string[] = [];
+    if (tools.length > 0) {
+      const verb =
+        new Set(tools.map((x) => x.label)).size === 1
+          ? "excludes a tool that"
+          : "exclude tools that";
+      parts.push(`${listed(tools)} ${verb} nothing includes`);
+    }
+    if (categories.length > 0) {
+      const verb =
+        new Set(categories.map((x) => x.label)).size === 1
+          ? "excludes a category none of whose tools is included"
+          : "exclude categories none of whose tools is included";
+      parts.push(`${listed(categories)} ${verb}`);
+    }
     const have = [...included].sort().join(", ") || "(nothing)";
     throw new ToolCategoryError(
-      `${path}: ${names} ${verb} nothing includes. Remove the exclusion, or add the category that provides it. Currently included: ${have}`,
+      `${path}: ${parts.join("; ")}. Remove the exclusion, or add the category that provides it. Currently included: ${have}`,
     );
   }
 
@@ -233,17 +294,19 @@ export function allRegisteredTools(): ReadonlyArray<string> {
   return [...out].sort();
 }
 
-/** Which categories own a given tool key. Leaves first, then roll-ups. */
+/**
+ * Which categories own a given tool key: the leaf that lists it first (a
+ * builtin is in exactly one leaf), then every roll-up that reaches it,
+ * alphabetically. So `categories[0]` is the narrowest grant — `tools show`
+ * and the tool manifest both print this order (docs-claims#14).
+ */
 export function categoriesForTool(key: string): ReadonlyArray<string> {
-  const out: string[] = [];
-  for (const name of Object.keys(CATEGORIES).sort()) {
-    let owns = false;
+  const owns = (name: string): boolean => {
     try {
-      owns = toolsInCategory(name).includes(key);
+      return toolsInCategory(name).includes(key);
     } catch {
-      owns = false;
+      return false;
     }
-    if (owns) out.push(name);
-  }
-  return out;
+  };
+  return [...leafCategories().filter(owns), ...rollUpCategories().filter(owns)];
 }

@@ -101,6 +101,21 @@ describe("0.7.0 tools and categories compile on every host shape", () => {
       /nodes\.plan\.tools: unknown tool "jsonQury" — Did you mean "jsonQuery"\?/,
     );
   });
+
+  // security-12#14's sibling: 0.7.0 compiled this to `import {  } from
+  // "undefined"` and `defaultCatalog.register(undefined)`.
+  test("an Object.prototype name is an unknown tool, not an empty import", () => {
+    for (const yaml of [cli("[read, constructor]"), graph("[read, __proto__]")]) {
+      let message = "";
+      try {
+        compile(yaml);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toMatch(/tools: unknown tool "(constructor|__proto__)"/);
+      expect(message).not.toContain("undefined");
+    }
+  });
 });
 
 describe("toolSitesOf", () => {
@@ -165,6 +180,48 @@ describe("shapes without a tool catalog say so (shape-reach#7)", () => {
     const readme = result.files.find((f) => f.path === "README.md")?.content ?? "";
     expect(readme).toContain("| `gitStatus` | agent | not wired |");
   });
+
+  // C140 — both chain shapes, both keys, and nothing when neither is declared.
+  const game = [
+    "name: og",
+    "target: onchain-game",
+    "agent: { model: claude-sonnet-4-6, instructions: i }",
+    "chain:",
+    "  id: c1",
+    "  kind: evm",
+    '  rpcUrls: ["https://rpc.test"]',
+    "  finality: { kind: finalized }",
+    "wallet: { id: w1, chainId: c1, custody: user-controlled }",
+    "game:",
+    '  contract: { id: g1, chainId: c1, address: "0x1", abiRef: "abi://erc20" }',
+    "  stateReader: readState",
+  ].join("\n");
+  const base = { onchain: onchain.replace("\ntools: [gitStatus]", ""), "onchain-game": game };
+  const unwiredPaths = (spec: string): string[] =>
+    compile(spec)
+      .warnings.filter((w) => w.code === "accepted-but-unwired")
+      .map((w) => w.path)
+      .filter((p) => p === "tools" || p === "tool_config")
+      .sort();
+
+  for (const [shape, spec] of Object.entries(base)) {
+    test(`${shape}: tools and tool_config each warn, and only when declared`, () => {
+      const both = `${spec}\ntools: [gitStatus]\ntool_config: { gitStatus: { maxEntries: 5 } }`;
+      const result = compile(both);
+      const warned = result.warnings.filter(
+        (w) =>
+          w.code === "accepted-but-unwired" && (w.path === "tools" || w.path === "tool_config"),
+      );
+      expect(warned.map((w) => w.path).sort()).toEqual(["tool_config", "tools"]);
+      for (const w of warned) expect(w.message).toContain(`on the ${shape} shape`);
+      const readme = result.files.find((f) => f.path === "README.md")?.content ?? "";
+      expect(readme).toContain("| `gitStatus` | agent | not wired |");
+      expect(readme).not.toContain("| `gitStatus` | agent | built-in |");
+      // Controls: nothing declared, and an empty list, warn about neither.
+      expect(unwiredPaths(spec)).toEqual([]);
+      expect(unwiredPaths(`${spec}\ntools: []`)).toEqual([]);
+    });
+  }
 });
 
 describe("assertCfWorkerToolsEdgeSafe", () => {

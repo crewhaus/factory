@@ -246,6 +246,19 @@ describe("a model pool candidate's block", () => {
     expect(toolConfigBlockFor(undefined, "Fetch")).toBeUndefined();
   });
 
+  // A plugin tool may be named after an Object.prototype member, and a
+  // spec's block is a plain object that inherits it: `toolConfigs.toString`
+  // was the inherited function, handed to the call as its block.
+  test("a tool named after an Object.prototype member reads only an own key", () => {
+    for (const name of ["toString", "valueOf", "constructor", "hasOwnProperty", "__proto__"]) {
+      expect({ name, block: toolConfigBlockFor({ http: HTTP }, name) }).toEqual({
+        name,
+        block: undefined,
+      });
+    }
+    expect(toolConfigBlockFor({ toString: { a: 1 } }, "toString")).toEqual({ a: 1 });
+  });
+
   test("conflicts are per tool, and an unknown key is left for MCP and plugin tools", () => {
     const check = checkCandidateToolConfigs(
       ["httpRequest"],

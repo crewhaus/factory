@@ -29,7 +29,14 @@
  *    - a `command` held as an array (an argv) is joined with spaces; each
  *      word is kept as another spelling, so a deny or ask rule naming one
  *      word (`RunCommand(rm)`) still fires on the whole argv.
- *    - a field declared `within` another is written `<qualifier>/<value>`.
+ *    - a field declared `within` another is written `<qualifier>/<value>` —
+ *      except a `command`, whose `within` names the directory it runs in:
+ *      the program `./build.sh` names is another program in `src/`. A
+ *      command run anywhere but the workspace root keeps its spellings for a
+ *      deny or ask, and loses its canonical value, so no scoped allow
+ *      covers it (the call asks). A command inside an array of objects
+ *      (`steps.argv`) runs in its element's own directory field when it has
+ *      one, else the top-level one.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
  *      hash) is marked `caseInsensitive`: its letter case is at most an
  *      EIP-55 checksum, so a deny or ask rule must not be dodged by it.
@@ -126,7 +133,7 @@ export function operativeValuesOf(
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
   for (const arg of operativeArgs) {
-    for (const { value: raw, words } of readField(parsedInput, arg)) {
+    for (const { value: raw, words, runsIn } of readField(parsedInput, arg)) {
       switch (arg.kind) {
         case "path":
           values.push(...canonicalizePath(raw));
@@ -134,12 +141,26 @@ export function operativeValuesOf(
         case "url":
           values.push(canonicalUrl(raw));
           break;
+        case "command":
+          if (runsIn !== undefined && !namesWorkspaceRoot(canonicalizePath(runsIn))) {
+            // Run in another directory, the same words may be another
+            // program: nothing canonical for an allow to grant; a deny or ask
+            // still reads what was written.
+            values.push({ kind: "command", canonical: [], spellings: [raw, ...(words ?? [])] });
+            break;
+          }
+          values.push({
+            kind: "command",
+            canonical: [raw],
+            ...(words !== undefined ? { spellings: words } : {}),
+          });
+          break;
         default:
           values.push({
             kind: arg.kind,
             canonical: [raw],
             ...(words !== undefined ? { spellings: words } : {}),
-            ...(arg.kind !== "command" && HEX_ID.test(raw) ? { caseInsensitive: true } : {}),
+            ...(HEX_ID.test(raw) ? { caseInsensitive: true } : {}),
           });
       }
     }
@@ -150,8 +171,22 @@ export function operativeValuesOf(
 /** A value that ends in a `0x` hex id, after any `<qualifier>/`. */
 const HEX_ID = /(?:^|\/)0x[0-9a-fA-F]+$/;
 
-/** One value of a declared field; `words` is the argv it was joined from. */
-type FieldReading = { readonly value: string; readonly words?: ReadonlyArray<string> };
+/**
+ * One value of a declared field; `words` is the argv it was joined from, and
+ * `runsIn` the directory a `command` declared `within` one runs in.
+ */
+type FieldReading = {
+  readonly value: string;
+  readonly words?: ReadonlyArray<string>;
+  readonly runsIn?: string;
+};
+
+/** Do these canonical values name the workspace root itself, and nothing else? */
+function namesWorkspaceRoot(values: ReadonlyArray<OperativeValue>): boolean {
+  return (
+    values.length > 0 && values.every((v) => v.outsideWorkspace !== true && v.canonical[0] === ".")
+  );
+}
 
 /**
  * Every value of one declared field. Dots descend into objects; an array
@@ -166,7 +201,15 @@ export function readOperativeField(input: unknown, arg: OperativeArg): string[] 
 function readField(input: unknown, arg: OperativeArg): FieldReading[] {
   const segments = arg.field.split(".");
   const out: FieldReading[] = [];
-  const walk = (value: unknown, i: number, depth: number): void => {
+  const topQualifier = arg.within !== undefined ? qualifierOf(input, arg.within) : undefined;
+  // A command runs in its own object's directory field (a pipeline step's
+  // `cwd`), else the top-level one.
+  const runsInOf = (owner: unknown): { runsIn?: string } => {
+    if (arg.kind !== "command" || arg.within === undefined) return {};
+    const dir = qualifierOf(owner, arg.within) ?? topQualifier;
+    return dir !== undefined ? { runsIn: dir } : {};
+  };
+  const walk = (value: unknown, i: number, depth: number, owner: unknown): void => {
     if (depth > 64) return;
     if (Array.isArray(value)) {
       if (
@@ -175,14 +218,14 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
         value.length > 0 &&
         value.every((v) => typeof v === "string")
       ) {
-        out.push({ value: value.join(" "), words: value as string[] });
+        out.push({ value: value.join(" "), words: value as string[], ...runsInOf(owner) });
         return;
       }
-      for (const element of value) walk(element, i, depth + 1);
+      for (const element of value) walk(element, i, depth + 1, owner);
       return;
     }
     if (i === segments.length) {
-      if (typeof value === "string") out.push({ value });
+      if (typeof value === "string") out.push({ value, ...runsInOf(owner) });
       else if (arg.kind === "id" && typeof value === "number" && Number.isFinite(value)) {
         out.push({ value: String(value) });
       }
@@ -191,11 +234,15 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     if (value === null || typeof value !== "object") return;
     const key = segments[i] as string;
     if (!Object.hasOwn(value, key)) return;
-    walk((value as Record<string, unknown>)[key], i + 1, depth + 1);
+    walk((value as Record<string, unknown>)[key], i + 1, depth + 1, value);
   };
-  walk(input, 0, 0);
-  if (out.length === 0 && arg.default !== undefined) out.push({ value: arg.default });
-  const qualifier = arg.within !== undefined ? qualifierOf(input, arg.within) : undefined;
+  walk(input, 0, 0, input);
+  if (out.length === 0 && arg.default !== undefined) {
+    out.push({ value: arg.default, ...runsInOf(input) });
+  }
+  // A command's `within` is where it runs, carried as `runsIn` above.
+  if (arg.kind === "command") return out;
+  const qualifier = topQualifier;
   if (qualifier === undefined) return out;
   return out.map((r) =>
     // A path relative to a directory field; an absolute one ignores it.

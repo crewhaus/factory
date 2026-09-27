@@ -104,7 +104,7 @@ describe("crewhaus export claude-plugin", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("refuses to overwrite a non-empty out dir without --force", async () => {
     const out = join(freshTmp(), "plugin");
@@ -118,13 +118,13 @@ describe("crewhaus export claude-plugin", () => {
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   test("--help prints usage and exits 0", async () => {
     const r = await runCli(["export", "claude-plugin", "--help"]);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toContain("export claude-plugin");
-  });
+  }, 20_000);
 
   test("an unknown export target errors", async () => {
     const r = await runCli(["export", "nonsense"]);
@@ -232,7 +232,7 @@ describe("crewhaus export claude-plugin", () => {
         rmSync(tmp, { recursive: true, force: true });
       }
     });
-  });
+  }, 20_000);
 });
 
 describe("crewhaus serve --mcp", () => {

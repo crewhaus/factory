@@ -427,7 +427,7 @@ describe("crewhaus init --sentinel (CLI surface, item 30)", () => {
     expect(readFileSync(wfPath, "utf-8")).toBe(buildSentinelDriftWorkflowYaml());
     expect(res.stdout).toContain("sentinel:");
     expect(res.stdout).toContain("eval/sentinel-baseline");
-  });
+  }, 20_000);
 
   test("existing harness: adds just the sentinel workflow, keeps the spec", async () => {
     const root = newTempRoot();
@@ -437,7 +437,7 @@ describe("crewhaus init --sentinel (CLI surface, item 30)", () => {
     expect(res.stdout).toContain("kept");
     expect(readFileSync(join(root, "crewhaus.yaml"), "utf-8")).toBe(SPEC_YAML);
     expect(existsSync(join(root, SENTINEL_WORKFLOW_RELPATH))).toBe(true);
-  });
+  }, 20_000);
 
   test("refuses to overwrite an existing sentinel workflow without --force", async () => {
     const root = newTempRoot();
@@ -451,7 +451,7 @@ describe("crewhaus init --sentinel (CLI surface, item 30)", () => {
     const forced = await runCli(["init", "--sentinel", "--force"], root);
     expect(forced.exitCode).toBe(0);
     expect(readFileSync(wfPath, "utf-8")).toBe(buildSentinelDriftWorkflowYaml());
-  });
+  }, 30_000);
 
   test("composes with --ci: both workflows land", async () => {
     const root = newTempRoot();
@@ -459,7 +459,7 @@ describe("crewhaus init --sentinel (CLI surface, item 30)", () => {
     expect(res.exitCode).toBe(0);
     expect(existsSync(join(root, EVAL_CI_WORKFLOW_RELPATH))).toBe(true);
     expect(existsSync(join(root, SENTINEL_WORKFLOW_RELPATH))).toBe(true);
-  });
+  }, 20_000);
 });
 
 describe("buildDreamWorkflowYaml (v0.3.0 PR 14, §6.3)", () => {

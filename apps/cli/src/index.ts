@@ -419,6 +419,7 @@ import {
   type JustificationJudge,
   PermissionConfigError,
   type PermissionMode,
+  type PermissionRule,
   type RuleSet,
   appendSettingsRule,
   parsePermissionsConfig,
@@ -477,8 +478,10 @@ import { type RegisteredTool, ToolCatalog, mcpToolName } from "@crewhaus/tool-ca
 import {
   BUILTIN_TOOLS,
   CATEGORIES,
+  LOOP_TOOL_NAMES,
   SHAPE_TOOL_PROFILES,
   type SpecChainBlocks,
+  ToolCategoryError,
   type ToolShape,
   builtinKeyForName,
   builtinToolsFor,
@@ -1234,6 +1237,7 @@ import {
   runStagedOptimize,
   writeBackStagedResult,
 } from "./optimize-stages";
+import { guardsOverridden, overrideNote } from "./permissions-override";
 // AUTOMATION-OPPORTUNITIES.md item 51 — `crewhaus pii tune` core (hashed
 // redaction-history aggregation → false-positive over-redaction candidates +
 // coverage gaps → reviewed .crewhaus/pii-policy.json). Side-effect-free; never
@@ -1540,6 +1544,7 @@ import {
   buildToolDetail,
   buildToolList,
   buildToolUsage,
+  exactToolKey,
   formatAuditLines,
   formatCategoryLines,
   formatSearchLines,
@@ -1548,6 +1553,7 @@ import {
   formatToolListLines,
   literalToolKeys,
   nearestToolKeys,
+  resolveToolKey,
   searchTools,
   suggestTools,
 } from "./tools-cli";
@@ -1899,6 +1905,12 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  every call fails), tool-config-unused (a tool_config block no listed\n" +
         "  tool reads, so the setting is not in force), sub-agent-tool-ungranted\n" +
         "  (a sub-agent lists a builtin its parent never registers),\n" +
+        "  provider-tool-cap (informational — a fallback, tier or pool model\n" +
+        "  whose provider refuses that many tools on one request: OpenAI,\n" +
+        "  Azure OpenAI and Groq take 128, Gemini 512; when no model can take\n" +
+        "  them it is an error), provider-tool-cap-unverified (informational —\n" +
+        "  an openai/ model over OpenAI's 128; OPENAI_BASE_URL may send it to a\n" +
+        "  server that takes more, and the run checks at start),\n" +
         "  channel-reactions-join\n" +
         "  (informational — reaction feedback attributes to the exact turn\n" +
         "  only once the outbound-ts join file accumulates),\n" +
@@ -1912,7 +1924,8 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "  --strict   Escalate compile warnings to errors: any remediable\n" +
         "             warning fails the compile (exit 1) before files are\n" +
         "             written. Informational codes (channel-reactions-join,\n" +
-        "             channel-plugins-at-start,\n" +
+        "             channel-plugins-at-start, provider-tool-cap,\n" +
+        "             provider-tool-cap-unverified,\n" +
         "             cli-autodistill-toolchain, model-plan-candidate-only,\n" +
         "             model-capabilities-unknown, model-sunset,\n" +
         "             model-strongest-crosses-provider) still print but\n" +
@@ -2172,11 +2185,21 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // 0.7.1 — mcp-server-name is informational for the same reason as
   // model-sunset: the key ran on 0.7.0, and a spec that compiled under
   // --strict before the upgrade must still compile after it.
+  //
+  // 0.7.1 — provider-tool-cap and provider-tool-cap-unverified are
+  // informational for that reason too. A fallback, tier or pool model over
+  // its provider's tool limit sat beside a model that serves, and the spec
+  // passed --strict on 0.7.0; an `openai/` model may be sent by
+  // OPENAI_BASE_URL to a server with no such limit, which only the running
+  // process can see (it checks again at start). A site no model can serve is
+  // still a compile error.
   const INFORMATIONAL_WARNING_CODES = new Set([
     "channel-reactions-join",
     "channel-plugins-at-start",
     "cli-autodistill-toolchain",
     "mcp-server-name",
+    "provider-tool-cap",
+    "provider-tool-cap-unverified",
     "model-plan-candidate-only",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",
@@ -2349,9 +2372,14 @@ async function buildToolResolver(): Promise<{
   resolve: (name: string) => RegisteredTool | undefined;
 }> {
   const toolMap = await loadToolMap();
-  const byRegisteredName: Record<string, RegisteredTool> = {};
-  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
-  return { resolve: (name) => toolMap[name] ?? byRegisteredName[name] };
+  // The spec key or the registered name, exactly, and own keys only:
+  // `constructor` is no tool, so lint treats it as the unknown name it is.
+  return {
+    resolve: (name) => {
+      const key = exactToolKey(name, toolMap);
+      return key === undefined ? undefined : toolMap[key];
+    },
+  };
 }
 
 /**
@@ -4254,6 +4282,32 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
 }
 
 /**
+ * Append the activated plugins' tools to `tools`, skipping any a first-party
+ * tool already holds the name of, and any named after a tool the run loop
+ * adds itself (`LOOP_TOOL_NAMES`: ListTools, Consult, Escalate). The loop
+ * keeps a tool it is handed under one of those names instead of its own, so
+ * a plugin's ListTools replaced the loop's, and took its builtin allow. The
+ * compiled bundles skip the same names (target-cli, target-channel-bot).
+ */
+function addPluginTools(tools: RegisteredTool[], pluginTools: ReadonlyArray<RegisteredTool>): void {
+  const loopOwned = new Set(LOOP_TOOL_NAMES);
+  for (const t of pluginTools) {
+    if (loopOwned.has(t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" is the run loop's own — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    if (tools.some((existing) => existing.name === t.name)) {
+      process.stdout.write(
+        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
+      );
+      continue;
+    }
+    tools.push(t);
+  }
+}
+/**
  * cli-target run path. Multi-turn interactive REPL, session-store backed,
  * loads hooks/skills/slash-commands/sub-agents from the user's workspace,
  * and wires every spec-declared MCP server.
@@ -4871,15 +4925,7 @@ async function runRunCli(
   // named after a built-in / skill / memory / MCP / sub-agent tool is skipped
   // (first-party wins the collision), mirroring the compiled bundle's
   // register-late boot.
-  for (const t of pluginTools) {
-    if (tools.some((existing) => existing.name === t.name)) {
-      process.stdout.write(
-        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
-      );
-      continue;
-    }
-    tools.push(t);
-  }
+  addPluginTools(tools, pluginTools);
 
   // Section 18 — wire the sandbox floor for code-execution tools. #18 made
   // python/javascript/shell RESOLVABLE at run time, but the run path never set
@@ -6065,15 +6111,7 @@ async function buildServeRuntime(
 
   // Plugin tools register LAST — a plugin tool named after a built-in / skill /
   // MCP tool is skipped so first-party wins the collision.
-  for (const t of pluginTools) {
-    if (tools.some((existing) => existing.name === t.name)) {
-      process.stdout.write(
-        `[plugins] tool "${t.name}" already registered — plugin contribution skipped\n`,
-      );
-      continue;
-    }
-    tools.push(t);
-  }
+  addPluginTools(tools, pluginTools);
 
   const hasCodeExecTools = ir.tools.some(
     (t) => t === "python" || t === "javascript" || t === "shell",
@@ -14564,10 +14602,13 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       "usage: crewhaus tools <list|categories|show|search|suggest|audit>\n" +
         "\n" +
         "  categories               every tool category + what it turns on\n" +
-        "  show <tool>              one tool in full: flags, categories, inputs\n" +
+        "  show <tool>              one tool in full: flags, categories, inputs,\n" +
+        "                           and the shapes that run it (by spec key or\n" +
+        "                           registered name, in any case)\n" +
         "  search <query>           find a tool by name, description or category\n" +
         "  list [--category NAME]   print every builtin tool + its metadata\n" +
-        "  suggest [spec.yaml]      rank builtins against agent.instructions\n" +
+        "  suggest [spec.yaml]      rank the builtins the spec's shape runs against\n" +
+        "                           its instructions — agent, steps, nodes, roles\n" +
         "                           (deterministic keyword match; default spec\n" +
         "                           is ./crewhaus.yaml)\n" +
         "  audit [--sessions N|all] mine tool_stats across sessions vs. the\n" +
@@ -14593,8 +14634,17 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
   }
 
   if (action === "show") {
-    const key = args.positional[0];
-    if (key === undefined) die("usage: crewhaus tools show <tool>");
+    const query = args.positional[0];
+    if (query === undefined) die("usage: crewhaus tools show <tool>");
+    // docs-claims#12 — the spec key, the registered name session logs and
+    // rules record (`GitCommit`), or either in any case; the detail names
+    // the spec key a tools: list takes.
+    const key = resolveToolKey(query, BUILTIN_TOOLS);
+    if (key === undefined) {
+      const near = nearestToolKeys(query, Object.keys(BUILTIN_TOOLS));
+      const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
+      die(`no builtin tool named "${query}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+    }
     const detail = buildToolDetail(key, toolMap, categoriesForTool);
     const shapeOnly = BUILTIN_TOOLS[key];
     if (detail === undefined && shapeOnly !== undefined) {
@@ -14615,9 +14665,7 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       return;
     }
     if (detail === undefined) {
-      const near = nearestToolKeys(key, Object.keys(toolMap));
-      const hint = near.length > 0 ? ` — did you mean ${near.join(", ")}?` : "";
-      die(`no builtin tool named "${key}"${hint}\nrun \`crewhaus tools list\` to see them all`);
+      die(`no builtin tool named "${query}"\nrun \`crewhaus tools list\` to see them all`);
     }
     if (jsonMode) {
       process.stdout.write(`${JSON.stringify(detail, null, 2)}\n`);
@@ -14645,7 +14693,15 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
     const category = args.flags["category"];
     let map = toolMap;
     if (typeof category === "string") {
-      const wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      let wanted: ReadonlySet<string>;
+      try {
+        wanted = new Set(toolsInCategory(category.replace(/^all-/, "")));
+      } catch (err) {
+        // docs-claims#12 — an unknown category is a usage error, said in one
+        // line like every other bad argument here, not a stack trace.
+        if (err instanceof ToolCategoryError) die(err.message);
+        throw err;
+      }
       map = Object.fromEntries(Object.entries(toolMap).filter(([k]) => wanted.has(k)));
     }
     const rows = buildToolList(map);
@@ -14816,6 +14872,11 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
   const { verifyRule } = await import("@crewhaus/tool-approvals");
   const suggestions: PermissionSuggestion[] = [];
   const rejected: Array<{ pattern: string; reason: string }> = [];
+  // An allow written to settings is read before the spec's rules and the
+  // builtin floor, so it takes every call it covers away from their denies
+  // and asks. Each proposal says which ones it would override
+  // (permission-integration#8).
+  const overrideCheck = specGuardRules(process.cwd());
   for (const suggestion of rankSuggestions(aggregates, readOnly)) {
     const agg = aggregates.get(suggestion.toolName);
     const scoped = agg !== undefined && isArgScoped(agg);
@@ -14825,8 +14886,34 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
       scoped ? agg.argSamples[0] : undefined,
       scoped ? agg.argKind : undefined,
     );
-    if (verdict.ok) suggestions.push(suggestion);
-    else rejected.push({ pattern: suggestion.rule.pattern, reason: verdict.reason });
+    if (!verdict.ok) {
+      rejected.push({ pattern: suggestion.rule.pattern, reason: verdict.reason });
+      continue;
+    }
+    if (suggestion.rule.type !== "alwaysAllow") {
+      suggestions.push(suggestion);
+      continue;
+    }
+    const overridden = guardsOverridden(
+      {
+        toolName: suggestion.toolName,
+        ...(scoped && agg.argSamples[0] !== undefined ? { scopedValue: agg.argSamples[0] } : {}),
+        ...(scoped && agg.argKind !== undefined ? { valueKind: agg.argKind } : {}),
+      },
+      overrideCheck.rules,
+      process.cwd(),
+    );
+    suggestions.push(
+      overridden.length === 0
+        ? suggestion
+        : {
+            ...suggestion,
+            evidence: [
+              ...suggestion.evidence,
+              ...overridden.map((g) => overrideNote(g, overrideCheck.label)),
+            ],
+          },
+    );
   }
 
   // Existing settings rules (the exact shape buildRuleSet consumes).
@@ -14844,13 +14931,31 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
 
   if (args.flags["json"] === true) {
     process.stdout.write(
-      `${JSON.stringify({ sessionIds: sessions.map((s) => s.sessionId), suggestions, rejected, diff }, null, 2)}\n`,
+      `${JSON.stringify(
+        {
+          sessionIds: sessions.map((s) => s.sessionId),
+          suggestions,
+          rejected,
+          diff,
+          overrideCheck: {
+            spec: overrideCheck.spec ?? null,
+            ...(overrideCheck.unread !== undefined ? { unread: overrideCheck.unread } : {}),
+          },
+        },
+        null,
+        2,
+      )}\n`,
     );
     if (args.flags["apply"] !== true) return;
   } else {
     process.stdout.write(
       `permissions: ${suggestions.length} suggestion(s) from ${sessions.length} session(s)\n`,
     );
+    if (overrideCheck.unread !== undefined) {
+      process.stdout.write(
+        `note: ${overrideCheck.unread} — the proposals were not checked against its deny and ask rules\n`,
+      );
+    }
     if (suggestions.length === 0) {
       process.stdout.write("no recurring ask/deny patterns to turn into rules\n");
     }
@@ -14893,6 +14998,46 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
   mkdirSync(dirname(settingsPath), { recursive: true });
   writeFileSync(settingsPath, `${JSON.stringify(newRoot, null, 2)}\n`);
   process.stdout.write(`[permissions] wrote ${diff.additions.length} rule(s) to ${settingsPath}\n`);
+}
+
+/**
+ * The deny and ask rules a settings-layer allow is read ahead of: the spec's
+ * (`./crewhaus.yaml`, when there is one) and the builtin floor's. A spec that
+ * exists but cannot be read is reported as unread, never as "no rules".
+ */
+function specGuardRules(cwd: string): {
+  readonly rules: ReadonlyArray<PermissionRule>;
+  readonly label: string;
+  readonly spec?: string;
+  readonly unread?: string;
+} {
+  const specPath = join(cwd, "crewhaus.yaml");
+  if (!existsSync(specPath)) {
+    return { rules: BUILTIN_DEFAULT_RULES, label: "the spec" };
+  }
+  try {
+    const ir = lower(parseSpec(readFileSync(specPath, "utf-8"))) as {
+      readonly permissions?: {
+        readonly rules?: ReadonlyArray<{
+          type: "alwaysAllow" | "alwaysDeny" | "alwaysAsk";
+          pattern: string;
+        }>;
+      };
+    };
+    const yaml = tagRules(ir.permissions?.rules ?? [], "yaml");
+    return {
+      rules: [...yaml, ...BUILTIN_DEFAULT_RULES],
+      label: "crewhaus.yaml",
+      spec: "crewhaus.yaml",
+    };
+  } catch (err) {
+    const why = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    return {
+      rules: BUILTIN_DEFAULT_RULES,
+      label: "the spec",
+      unread: `could not read the permission rules in crewhaus.yaml (${why})`,
+    };
+  }
 }
 
 /**

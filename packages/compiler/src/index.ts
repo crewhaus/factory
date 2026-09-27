@@ -5,12 +5,15 @@ import {
   type RosterMember,
   STRONGEST_SENTINEL,
   crossesProvider,
+  describeToolLimitOverrun,
   findSunset,
+  limitIsUnverified,
   providerOfSpecString,
   resolveCapabilities,
   resolveCheapestForSlot,
   resolveStrongestForSlot,
   satisfiesCapabilities,
+  toolLimitOverrun,
 } from "@crewhaus/cost-tracker";
 import { CompilerError } from "@crewhaus/errors";
 import { assertNever } from "@crewhaus/infra-utils";
@@ -254,7 +257,11 @@ export type LowerOptions = {
  * 0.6.0 the field-precise model-plan notices `"model-plan-ignored-on-shape"`,
  * `"model-plan-ignored-on-slot"`, `"model-plan-candidate-only"`,
  * `"model-plan-self-judge"`, `"model-sunset"`, `"model-capabilities-unknown"`,
- * `"model-strongest-crosses-provider"`), `path` the spec key it concerns
+ * `"model-strongest-crosses-provider"`, and from 0.7.1 `"provider-tool-cap"`
+ * for a model whose provider refuses the site's tool count and
+ * `"provider-tool-cap-unverified"` for an `openai/` model over OpenAI's
+ * limit, which `OPENAI_BASE_URL` may send elsewhere; both informational),
+ * `path` the spec key it concerns
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged.
  */
@@ -752,6 +759,26 @@ export type IrToolSite = {
     readonly path: string;
     readonly toolConfigs?: Readonly<Record<string, unknown>>;
   }>;
+  /**
+   * The block that owns the site (an agent, step, node or role) and its spec
+   * path: the models that can be sent the site's tools. Read by the
+   * provider tool-limit check.
+   */
+  readonly owner?: { readonly path: string; readonly models: SiteModels };
+};
+
+/** The model routing of a block that owns a tool site, as the IR carries it. */
+export type SiteModels = {
+  readonly model?: string;
+  readonly modelFallbacks?: ReadonlyArray<string>;
+  readonly modelTiers?: { readonly fast: string; readonly default: string };
+  readonly modelPool?: {
+    readonly candidates: ReadonlyArray<{
+      readonly model: string;
+      readonly tools?: ReadonlyArray<string>;
+      readonly enabled?: false;
+    }>;
+  };
 };
 
 /** The pool candidates of the block that owns a site (an agent, step, node or role). */
@@ -771,9 +798,10 @@ function candidatesOf(
   });
 }
 
-function withCandidates(site: IrToolSite, owner: unknown, ownerPath: string): IrToolSite {
+function withCandidates(site: IrToolSite, owner: SiteModels, ownerPath: string): IrToolSite {
   const candidates = candidatesOf(owner, ownerPath);
-  return candidates === undefined ? site : { ...site, candidates };
+  const owned: IrToolSite = { ...site, owner: { path: ownerPath, models: owner } };
+  return candidates === undefined ? owned : { ...owned, candidates };
 }
 
 /** The spec path of a site's `tool_config`: its `tools` path with the last key swapped. */
@@ -818,7 +846,9 @@ export function toolSitesOf(ir: IrNode): ReadonlyArray<IrToolSite> {
         ),
       ];
     case "eval":
-      return [{ path: "agent.tools", tools: ir.agent.tools }];
+      return [
+        { path: "agent.tools", tools: ir.agent.tools, owner: { path: "agent", models: ir.agent } },
+      ];
     case "workflow":
       return ir.steps.map((step, i) =>
         withCandidates(
@@ -893,6 +923,118 @@ export function checkShapeTools(ir: IrNode): {
   const config = checkToolConfigDelivery(ir);
   errors.push(...config.errors);
   warnings.push(...config.warnings);
+  const limits = checkProviderToolLimits(ir);
+  errors.push(...limits.errors);
+  warnings.push(...limits.warnings);
+  return { errors, warnings };
+}
+
+/**
+ * provider-limits#0 — the tool list a site sends against the limit its
+ * models' providers put on one request (`@crewhaus/cost-tracker`'s
+ * `providerToolLimit`: 128 for OpenAI, Azure OpenAI and Groq, 512 for
+ * Gemini). The category grammar makes it one line to cross: `all-code` alone
+ * is more than 128 tools, and on 0.7.0 every call to such a model came back
+ * as a provider 400 with nothing at compile time to say why.
+ *
+ * The count here is the site's builtin tools — a lower bound, since the loop
+ * adds its own tools (ListTools, continuity, memory, MCP) at boot, where
+ * runtime-core checks the full list again. The models are the ones that can
+ * be sent the site's tools: the pool's enabled candidates (each with its
+ * profile's `tools` subset), else both tiers, else the model and its
+ * fallbacks.
+ *
+ * - when EVERY one of those models is over a limit that certainly applies,
+ *   the site can never make a call that succeeds: an ERROR naming the count,
+ *   the limit and the fix. No spec that ran on 0.7.0 is refused by this —
+ *   none of its calls could have been answered;
+ * - otherwise one WARNING per model over its limit: `provider-tool-cap` for
+ *   a route whose server is fixed (the spec runs while a model within its
+ *   limit serves, and every call routed to this one fails), and
+ *   `provider-tool-cap-unverified` for an `openai/` model, whose limit is
+ *   api.openai.com's: `OPENAI_BASE_URL` can send it to an OpenAI-compatible
+ *   server with no such limit (the documented way to reach a gateway or a
+ *   proxy), and only the running process can see where it goes, so
+ *   runtime-core checks it again at boot, against the real endpoint, before
+ *   any call. Both are informational — `compile --strict` does not fail on
+ *   them: a spec that passed `--strict` on 0.7.0 with an over-limit
+ *   fallback still runs on its primary, and must still pass.
+ */
+export function checkProviderToolLimits(ir: IrNode): {
+  readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>;
+  readonly warnings: ReadonlyArray<CompileWarning>;
+} {
+  const errors: Array<{ path: string; message: string }> = [];
+  const warnings: CompileWarning[] = [];
+  const fix =
+    "Narrow tools: — smaller all-<category> roll-ups, -<tool> exclusions, or a model_pool profile `tools:` subset for that model.";
+  for (const site of toolSitesOf(ir)) {
+    const owner = site.owner;
+    const keys = new Set(site.tools);
+    if (owner === undefined || keys.size === 0) continue;
+    const { models, path } = owner;
+    const serving: Array<{
+      readonly model: string;
+      readonly count: number;
+      readonly path: string;
+    }> = [];
+    if (models.modelPool !== undefined) {
+      models.modelPool.candidates.forEach((c, i) => {
+        if (c.enabled === false) return;
+        const subset = c.tools;
+        const count =
+          subset === undefined ? keys.size : [...keys].filter((k) => subset.includes(k)).length;
+        serving.push({ model: c.model, count, path: `${path}.model_pool.candidates[${i}]` });
+      });
+    } else if (models.modelTiers !== undefined) {
+      serving.push(
+        { model: models.modelTiers.fast, count: keys.size, path: `${path}.model_tiers.fast` },
+        { model: models.modelTiers.default, count: keys.size, path: `${path}.model_tiers.default` },
+      );
+    } else {
+      if (models.model !== undefined) {
+        serving.push({ model: models.model, count: keys.size, path: `${path}.model` });
+      }
+      (models.modelFallbacks ?? []).forEach((model, i) => {
+        serving.push({ model, count: keys.size, path: `${path}.model_fallbacks[${i}]` });
+      });
+    }
+    const over = serving.flatMap((s) => {
+      const o = toolLimitOverrun(s.model, s.count);
+      return o === undefined ? [] : [{ site: s, overrun: o }];
+    });
+    if (over.length === 0) continue;
+    // An `openai/` model's limit is unverified (OPENAI_BASE_URL may send it
+    // to a server without one), so a site is refused only when every model
+    // is over a limit that certainly applies.
+    const certain = over.filter((x) => !limitIsUnverified(x.overrun.limit));
+    if (over.length === serving.length && certain.length === over.length) {
+      const why = over.map((x) => describeToolLimitOverrun(x.overrun, "from tools:")).join("; ");
+      const no =
+        over.length === 1
+          ? "The site has no other model to run on."
+          : "None of its models accepts that many.";
+      errors.push({ path: site.path, message: `${why}. ${no} ${fix}` });
+      continue;
+    }
+    for (const x of over) {
+      const described = describeToolLimitOverrun(x.overrun, `from ${site.path}`);
+      const endpoint = x.overrun.limit.endpoint;
+      warnings.push(
+        endpoint !== undefined
+          ? {
+              code: "provider-tool-cap-unverified",
+              path: x.site.path,
+              message: `${described}. It runs only if ${endpoint.env} sends the model to an OpenAI-compatible server that takes more; the run checks this when it starts, where it can see ${endpoint.env}, and stops before the first call if not. ${fix}`,
+            }
+          : {
+              code: "provider-tool-cap",
+              path: x.site.path,
+              message: `${described}; the spec runs while another model serves. ${fix}`,
+            },
+      );
+    }
+  }
   return { errors, warnings };
 }
 

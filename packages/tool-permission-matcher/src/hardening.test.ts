@@ -127,6 +127,24 @@ describe("the linear-time glob accepts exactly the old regex's language", () => 
   });
 });
 
+// C037 — the cases a plain two-pointer "back up to the last star" matcher
+// gets wrong when `*` (no `/`) and `**` (anything) mix, and the regex's
+// UTF-16 code-unit reading of `?`; each row is checked against the 0.7.0
+// regex too, so the rows themselves cannot be wrong.
+describe("the linear-time glob keeps the cases a naive matcher breaks", () => {
+  test.each([
+    ["**x*y", "x/xay", true],
+    ["**x*y", "xa/y", false],
+    ["a*b**c", "a/b/c", false],
+    ["a*b**c", "axb/c", true],
+    ["?", "\u{1F600}", false],
+    ["??", "\u{1F600}", true],
+  ] as const)("%j against %j is %p", (glob, value, want) => {
+    expect(oracleGlobToRegex(glob).test(value)).toBe(want);
+    expect(compilePattern(`T(${glob})`)._argRe?.test(value)).toBe(want);
+  });
+});
+
 describe("security-8#2 — a glob cannot stall the event loop", () => {
   // The audit's reproductions. Under the old regex the first took 12 s at
   // 18 KB (cubic), and the second did not finish inside 110 s at 20 KB.
@@ -433,11 +451,21 @@ describe("declared operative values", () => {
       true,
     );
     expect(matchesPattern(deny, "EvmCall", {}, { ...allow, operativeValues: [lower] })).toBe(false);
-    // Without the mark, an id is compared as written, as before.
-    const plain: OperativeValue = { kind: "id", canonical: lower.canonical };
-    expect(matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [plain] })).toBe(
+    // Every id already folds case for a deny or ask; the mark is what carries
+    // the same protection to a hex value held as text or a recipient, which
+    // are otherwise compared as written.
+    const plainId: OperativeValue = { kind: "id", canonical: lower.canonical };
+    expect(matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [plainId] })).toBe(
+      true,
+    );
+    const plainText: OperativeValue = { kind: "text", canonical: lower.canonical };
+    expect(matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [plainText] })).toBe(
       false,
     );
+    const markedText: OperativeValue = { ...plainText, caseInsensitive: true };
+    expect(
+      matchesPattern(deny, "EvmCall", {}, { ...restrict, operativeValues: [markedText] }),
+    ).toBe(true);
     // Folding widens only what a deny or ask catches, never what it names.
     const other: OperativeValue = {
       ...lower,
@@ -462,8 +490,191 @@ describe("declared operative values", () => {
 });
 
 // ---------------------------------------------------------------------------
+// C004 — a deny or ask on a URL, a recipient, an id or a command is not
+// dodged by another spelling of the same destination
+// ---------------------------------------------------------------------------
+
+describe("a restrict rule reads every spelling of a destination", () => {
+  // What the runtime hands the matcher for a URL: the WHATWG href.
+  const url = (raw: string): OperativeValue => ({
+    kind: "url",
+    canonical: [new URL(raw).href],
+    spellings: [raw],
+  });
+  const fires = (
+    pattern: string,
+    value: OperativeValue,
+    opts: { readonly polarity: "allow" | "restrict" } = restrict,
+  ) => matchesPattern(compilePattern(pattern), "T", {}, { ...opts, operativeValues: [value] });
+
+  test("a host deny fires on userinfo, a root dot, a port and the other scheme", () => {
+    const rule = "T(https://evil.example/**)";
+    const spellings = [
+      "https://evil.example/exfil",
+      "https://x@evil.example/exfil",
+      "https://user:pw@evil.example/exfil",
+      "https://evil.example./exfil",
+      "https://evil.example../exfil",
+      "https://evil.example:8443/exfil",
+      "http://evil.example/exfil",
+      "https://EVIL.Example/exfil#frag",
+    ];
+    const hits = spellings.filter((s) => fires(rule, url(s)));
+    expect(hits).toEqual(spellings);
+    // Control: another host is not caught by the folding.
+    expect(fires(rule, url("https://evil.example.org/exfil"))).toBe(false);
+    expect(fires(rule, url("https://good.example/evil.example/"))).toBe(false);
+  });
+
+  // A rule that names a scheme or a port, and not a host, is about that
+  // scheme or port: folding http into https (or every port into none) made
+  // `alwaysDeny WebFetch(http://**)` — "no plain HTTP" — deny every https
+  // fetch, and `http://localhost:5432/**` deny localhost:3000.
+  test("a rule that leaves the host a wildcard keeps to the scheme and port it names", () => {
+    const plain = "T(http://**)";
+    expect(fires(plain, url("http://a.example/x"))).toBe(true);
+    expect(fires(plain, url("http://a.example:8080/x"))).toBe(true);
+    expect(fires(plain, url("https://a.example/x"))).toBe(false);
+    expect(fires(plain, url("https://a.example:8080/x"))).toBe(false);
+    const altPort = "T(https://*:8443/**)";
+    expect(fires(altPort, url("https://a.example:8443/x"))).toBe(true);
+    expect(fires(altPort, url("https://a.example/x"))).toBe(false);
+    expect(fires(altPort, url("http://a.example:8443/x"))).toBe(false);
+  });
+
+  test("a rule that names a port keeps to it, over either scheme", () => {
+    const db = "T(http://localhost:5432/**)";
+    expect(fires(db, url("http://localhost:5432/q"))).toBe(true);
+    expect(fires(db, url("https://localhost:5432/q"))).toBe(true);
+    expect(fires(db, url("http://localhost:3000/health"))).toBe(false);
+    expect(fires(db, url("http://localhost/health"))).toBe(false);
+  });
+
+  test("a rule that names a host and no port covers the host on every port (0.7.1)", () => {
+    const hits = [
+      "http://localhost/x",
+      "http://localhost:3000/x",
+      "https://localhost:8443/x",
+      "http://x@localhost:3000/x",
+    ].filter((s) => fires("T(http://localhost/**)", url(s)));
+    expect(hits).toHaveLength(4);
+    expect(fires("T(http://*.corp.example/**)", url("https://db.corp.example:8443/x"))).toBe(true);
+  });
+
+  // An IPv4-mapped IPv6 literal reaches the IPv4 host (a socket bound only to
+  // 127.0.0.1 answers http://[::ffff:127.0.0.1]:<port>/), and WHATWG writes
+  // it in hex, so a deny on the dotted address never saw it.
+  test("a deny on an IPv4 address fires on its IPv4-mapped and NAT64 IPv6 literals", () => {
+    const rule = "T(https://93.184.215.14/**)";
+    const spellings = [
+      "https://93.184.215.14/x",
+      "https://1572394766/x",
+      "https://[::ffff:93.184.215.14]/x",
+      "https://[::ffff:5db8:d70e]/x",
+      "https://[0:0:0:0:0:ffff:5db8:d70e]/x",
+      "https://[64:ff9b::5db8:d70e]/x",
+      "http://[::ffff:93.184.215.14]:8080/x",
+    ];
+    expect(spellings.filter((s) => fires(rule, url(s)))).toEqual(spellings);
+    // Controls: IPv6 literals that do not reach that IPv4 host.
+    for (const other of ["https://[::1]/x", "https://[2001:db8::5db8:d70e]/x"]) {
+      expect({ other, fired: fires(rule, url(other)) }).toEqual({ other, fired: false });
+    }
+    // An allow is not widened: the mapped literal is not granted by the dotted rule.
+    expect(fires(rule, url("https://[::ffff:5db8:d70e]/x"), allow)).toBe(false);
+  });
+
+  test("a path deny fires on an escaped letter, a doubled slash, a dot segment and case", () => {
+    const rule = "T(https://api.example/admin/**)";
+    const spellings = [
+      "https://api.example/admin/users",
+      "https://api.example/%61dmin/users",
+      "https://api.example//admin/users",
+      "https://api.example/public/..%2Fadmin/users",
+      "https://api.example/public/..%5cadmin/users",
+      "https://api.example/ADMIN/users",
+    ];
+    const hits = spellings.filter((s) => fires(rule, url(s)));
+    expect(hits).toEqual(spellings);
+    expect(fires(rule, url("https://api.example/administrator"))).toBe(false);
+    // A rule written in capitals meets the lower-case href too.
+    expect(fires("T(https://API.example/**)", url("https://api.example/x"))).toBe(true);
+  });
+
+  test("an allow never grants a URL with userinfo or an escaped climb out", () => {
+    expect(fires("T(https://*.example/**)", url("https://a.example/x"), allow)).toBe(true);
+    expect(fires("T(https://*/**)", url("https://u:p@a.example/x"), allow)).toBe(false);
+    expect(fires("T(https://a.example/public/**)", url("https://a.example/public/x"), allow)).toBe(
+      true,
+    );
+    expect(
+      fires("T(https://a.example/public/**)", url("https://a.example/public/..%2Fadmin"), allow),
+    ).toBe(false);
+    // An allow is not widened by the folding: a capitalised or dotted host is not granted.
+    expect(fires("T(https://a.example/**)", url("https://a.example./x"), allow)).toBe(false);
+  });
+
+  test("a recipient deny fires on case, a root dot, a +tag, a display name and phone punctuation", () => {
+    const mail = (raw: string): OperativeValue => ({ kind: "recipient", canonical: [raw] });
+    const rule = "T(ceo@corp.example)";
+    const spellings = [
+      "ceo@corp.example",
+      "CEO@corp.example",
+      "ceo@CORP.EXAMPLE",
+      "ceo@corp.example.",
+      "ceo+board@corp.example",
+      "The CEO <ceo@corp.example>",
+    ];
+    expect(spellings.filter((s) => fires(rule, mail(s)))).toEqual(spellings);
+    expect(fires(rule, mail("cfo@corp.example"))).toBe(false);
+    expect(fires(rule, mail("ceo@corp.example.org"))).toBe(false);
+    const phones = ["+15551234567", "+1 (555) 123-4567", "+1.555.123.4567"];
+    expect(phones.filter((s) => fires("T(+15551234567)", mail(s)))).toEqual(phones);
+    expect(fires("T(+15551234567)", mail("+15551234568"))).toBe(false);
+    expect(fires("T(db.corp.example)", mail("DB.Corp.Example."))).toBe(true);
+    // An allow compares only what was written.
+    expect(fires("T(*@corp.example)", mail("ops@CORP.example"), allow)).toBe(false);
+  });
+
+  test("an id or a program name is compared ignoring case", () => {
+    const id: OperativeValue = { kind: "id", canonical: ["CrewHaus/Factory"] };
+    expect(fires("T(crewhaus/factory)", id)).toBe(true);
+    expect(fires("T(crewhaus/factory)", id, allow)).toBe(false);
+    const cmd: OperativeValue = { kind: "command", canonical: ["RM -rf src"], spellings: ["RM"] };
+    expect(fires("T(rm)", cmd)).toBe(true);
+    expect(fires("T(rm)", cmd, allow)).toBe(false);
+    // `text` keeps its case: nothing says what reads it.
+    const text: OperativeValue = { kind: "text", canonical: ["Hello"] };
+    expect(fires("T(hello)", text)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // MCP names (flag-truth-1#1)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// A tool named after an Object.prototype member (C202, in the matcher)
+// ---------------------------------------------------------------------------
+
+describe("a tool named after an Object.prototype member", () => {
+  // The name table was read with `OPERATIVE_ARG_FIELDS[toolName]`, so
+  // `toString` found the inherited function and `for … of` threw. The engine
+  // caught it and failed closed: every deny or ask on the name fired and no
+  // scoped allow ever matched.
+  test("falls back to the input's string values, like any undeclared tool", () => {
+    const names = ["toString", "valueOf", "constructor", "hasOwnProperty", "__proto__"];
+    for (const name of names) {
+      const secret = { a: "secret.txt" };
+      expect({
+        name,
+        restrict: matchesPattern(compilePattern(`${name}(secret*)`), name, secret, restrict),
+        allow: matchesPattern(compilePattern(`${name}(secret*)`), name, secret, allow),
+        other: matchesPattern(compilePattern(`${name}(secret*)`), name, { a: "public" }, restrict),
+      }).toEqual({ name, restrict: true, allow: true, other: false });
+    }
+  });
+});
 
 describe("MCP tool names", () => {
   test("a documented mcp__ rule and a pre-0.7.1 rule both govern the registered name", () => {

@@ -5,7 +5,8 @@
  *   list          — every builtin's name/description/scope/ioCapability/
  *                   readOnly/destructive, from the RegisteredTool metadata
  *                   the runtime already carries.
- *   suggest <spec> — rank builtins against `agent.instructions` by a
+ *   suggest <spec> — rank the builtins the spec's shape runs against its
+ *                   instructions (agent, steps, nodes, roles) by a
  *                   deterministic keyword match (no model — the tool
  *                   implication is the same shape scaffold-evals uses).
  *   audit         — mine `tool_stats` + `tool_use` events across sessions
@@ -29,7 +30,15 @@
 import type { SessionEvents } from "@crewhaus/harness-advice/advise-rules";
 import { payloadOf } from "@crewhaus/harness-advice/advise-rules";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { builtinToolsFor, registeredToolName, toolConfigHint } from "@crewhaus/tool-categories";
+import {
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinToolsFor,
+  checkBuiltinTool,
+  nameDistance,
+  registeredToolName,
+  toolConfigHint,
+} from "@crewhaus/tool-categories";
 
 // -------- tools list --------
 
@@ -45,6 +54,8 @@ export type ToolListRow = {
   readonly scope: string;
   readonly ioCapability?: string;
   readonly requiresSandbox: boolean;
+  /** Every call carries a justification the intent gate judges. */
+  readonly requireJustification: boolean;
 };
 
 /** Project a tool map (key → RegisteredTool) into sorted list rows. */
@@ -59,6 +70,7 @@ export function buildToolList(toolMap: Readonly<Record<string, RegisteredTool>>)
       scope: t.scope,
       ...(t.ioCapability !== undefined ? { ioCapability: t.ioCapability } : {}),
       requiresSandbox: t.requiresSandbox,
+      requireJustification: t.requireJustification === true,
     }))
     .sort((a, b) => a.key.localeCompare(b.key));
 }
@@ -73,6 +85,8 @@ export function formatToolListLines(rows: ReadonlyArray<ToolListRow>): string[] 
       r.scope === "external" ? "external" : undefined,
       r.ioCapability !== undefined ? `io:${r.ioCapability}` : undefined,
       r.requiresSandbox ? "sandbox" : undefined,
+      // docs-claims#12 — `show` printed it and `list` dropped it.
+      r.requireJustification ? "justification-gated" : undefined,
     ].filter((f): f is string => f !== undefined);
     const tags = flags.length > 0 ? ` [${flags.join(", ")}]` : "";
     lines.push(`${r.key} (${r.name})${tags}`);
@@ -1172,7 +1186,7 @@ export function formatSuggestLines(result: ToolSuggestResult): string[] {
     );
   }
   lines.push(
-    "heuristic: literal keyword match over agent.instructions, not a model — wording it doesn't recognize won't be suggested; `crewhaus tools list` shows every builtin",
+    "heuristic: literal keyword match over the spec's instructions, not a model — wording it doesn't recognize won't be suggested; `crewhaus tools list` shows every builtin",
   );
   return lines;
 }
@@ -1466,6 +1480,8 @@ export type CategoryRow = {
   readonly tools: ReadonlyArray<string>;
   /** For a roll-up, the categories it rolls up. */
   readonly includes?: ReadonlyArray<string>;
+  /** What the title cannot say in a line (the network roll-up's gaps). */
+  readonly note?: string;
 };
 
 /**
@@ -1477,7 +1493,12 @@ export function buildCategoryRows(
   categories: Readonly<
     Record<
       string,
-      { title: string; tools?: ReadonlyArray<string>; includes?: ReadonlyArray<string> }
+      {
+        title: string;
+        tools?: ReadonlyArray<string>;
+        includes?: ReadonlyArray<string>;
+        note?: string;
+      }
     >
   >,
   resolve: (name: string) => ReadonlyArray<string>,
@@ -1490,6 +1511,7 @@ export function buildCategoryRows(
       kind: (def.tools !== undefined ? "leaf" : "roll-up") as "leaf" | "roll-up",
       tools: resolve(name),
       ...(def.includes !== undefined ? { includes: [...def.includes] } : {}),
+      ...(def.note !== undefined ? { note: def.note } : {}),
     }))
     .sort((a, b) => {
       // Leaves first, then roll-ups: an operator scanning for "what can I
@@ -1509,6 +1531,7 @@ export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] 
     for (const r of leaves) {
       lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
       lines.push(`    ${r.tools.join(", ")}`);
+      if (r.note !== undefined) lines.push(`    note: ${r.note}`);
     }
   }
   if (rollUps.length > 0) {
@@ -1517,6 +1540,7 @@ export function formatCategoryLines(rows: ReadonlyArray<CategoryRow>): string[] 
     for (const r of rollUps) {
       lines.push(`  ${r.selector}  (${r.tools.length})  ${r.title}`);
       lines.push(`    = ${(r.includes ?? []).map((c) => `all-${c}`).join(" + ")}`);
+      if (r.note !== undefined) lines.push(`    note: ${r.note}`);
     }
   }
   lines.push("");
@@ -1541,7 +1565,40 @@ export type ToolDetail = {
   readonly inputFields: ReadonlyArray<string>;
   /** What a spec writes to configure it (`tool_config.http`), when it takes any. */
   readonly configure?: string;
+  /**
+   * The shapes whose bundles run it — a shape that carries no tools at all
+   * (pipeline, voice, onchain) is never listed. Empty for a key the builtin
+   * table does not know.
+   */
+  readonly shapes: ReadonlyArray<ToolShape>;
 };
+
+/**
+ * The shapes that compile `key` into a bundle that runs it: the ones the
+ * compiler accepts it on, less the shapes that register no tools (which
+ * accept any list and ignore it).
+ */
+export function shapesRunning(key: string): ReadonlyArray<ToolShape> {
+  return (Object.keys(SHAPE_TOOL_PROFILES) as ToolShape[]).filter((shape) => {
+    if (SHAPE_TOOL_PROFILES[shape].runtime === "none") return false;
+    const kind = checkBuiltinTool(key, shape).kind;
+    return kind === "ok" || kind === "inert";
+  });
+}
+
+/** `tools show`'s "runs on" wording for a tool's shapes. */
+function shapesLine(shapes: ReadonlyArray<ToolShape>): string {
+  const host = (Object.keys(SHAPE_TOOL_PROFILES) as ToolShape[]).filter(
+    (s) => SHAPE_TOOL_PROFILES[s].runtime === "host",
+  );
+  const edge = shapes.includes("cf-worker");
+  if (host.every((s) => shapes.includes(s))) {
+    return edge
+      ? "every shape that runs tools, the cf-worker edge included"
+      : "every shape that runs tools, except the cf-worker edge";
+  }
+  return `${shapes.join(", ")} only`;
+}
 
 /**
  * Project one tool into its detail record. `key` is the camelCase spec key;
@@ -1554,7 +1611,8 @@ export function buildToolDetail(
   toolMap: Readonly<Record<string, ToolLike>>,
   categoriesFor: (key: string) => ReadonlyArray<string>,
 ): ToolDetail | undefined {
-  const tool = toolMap[key];
+  // An own key only: `toolMap.constructor` is Object, which is no tool.
+  const tool = Object.hasOwn(toolMap, key) ? toolMap[key] : undefined;
   if (tool === undefined) return undefined;
   return {
     key,
@@ -1570,6 +1628,7 @@ export function buildToolDetail(
     concurrencySafe: tool.concurrencySafe ?? false,
     inputFields: inputFieldNames(tool),
     ...(toolConfigHint(key) !== undefined ? { configure: toolConfigHint(key) } : {}),
+    shapes: shapesRunning(key),
   };
 }
 
@@ -1630,6 +1689,8 @@ export function formatToolDetailLines(d: ToolDetail): string[] {
     `  categories  ${d.categories.length > 0 ? d.categories.map((c) => `all-${c}`).join(", ") : "(uncategorized)"}`,
     `  input       ${d.inputFields.length > 0 ? d.inputFields.join(", ") : "(no declared fields)"}`,
     ...(d.configure !== undefined ? [`  configure   ${d.configure}`] : []),
+    // shape-reach#10 — say where it runs, rather than implying everywhere.
+    ...(d.shapes.length > 0 ? [`  runs on     ${shapesLine(d.shapes)}`] : []),
     "",
     `  enable with  tools: [${d.key}]`,
   ];
@@ -1705,8 +1766,48 @@ export function formatSearchLines(query: string, hits: ReadonlyArray<SearchHit>)
 }
 
 /**
+ * The builtin a name means exactly: its spec key (`gitCommit`), or the
+ * registered name session logs and permission rules record (`GitCommit`).
+ * Own keys only, so `constructor` names nothing. Undefined when no builtin,
+ * or more than one, answers to it.
+ */
+export function exactToolKey(
+  query: string,
+  tools: Readonly<Record<string, { readonly name: string }>>,
+): string | undefined {
+  if (Object.hasOwn(tools, query)) return query;
+  const byName = Object.keys(tools).filter((k) => tools[k]?.name === query);
+  return byName.length === 1 ? byName[0] : undefined;
+}
+
+/**
+ * The spec key a `tools show` argument names: the key or the registered
+ * name exactly, or else either one in any case (`gitcommit`), as long as
+ * exactly one builtin answers to it. Undefined otherwise, so the caller can
+ * suggest near misses (docs-claims#12).
+ */
+export function resolveToolKey(
+  query: string,
+  tools: Readonly<Record<string, { readonly name: string }>>,
+): string | undefined {
+  const exact = exactToolKey(query, tools);
+  if (exact !== undefined) return exact;
+  const lower = query.toLowerCase();
+  const hits = Object.keys(tools).filter(
+    (k) => k.toLowerCase() === lower || tools[k]?.name.toLowerCase() === lower,
+  );
+  return hits.length === 1 ? hits[0] : undefined;
+}
+
+/**
  * Suggest near-miss keys for an unknown `tools show` argument, so a typo
- * gets a pointer instead of a bare "not found".
+ * gets a pointer instead of a bare "not found". Ranked before the limit is
+ * applied — a same-letters match, then a key that starts with or contains
+ * the whole query, then a spelling within two edits (closest first:
+ * `gitcomit` → gitCommit, the key compile's own hint names), then a key the
+ * query contains (`gitStats` holds `stat`, but meant gitStatus), then a
+ * shared first three letters; ties alphabetical — so the likely tool is
+ * offered first rather than whichever the table lists first.
  */
 export function nearestToolKeys(
   key: string,
@@ -1714,10 +1815,27 @@ export function nearestToolKeys(
   limit = 3,
 ): ReadonlyArray<string> {
   const k = key.toLowerCase();
+  const rank = (candidate: string): { readonly tier: number; readonly d: number } | undefined => {
+    const c = candidate.toLowerCase();
+    if (c === k) return { tier: 0, d: 0 };
+    if (c.startsWith(k)) return { tier: 1, d: 0 };
+    if (c.includes(k)) return { tier: 2, d: 0 };
+    // The distance is at least the length difference, so only a candidate
+    // within two letters of the query's length is measured.
+    if (Math.abs(c.length - k.length) <= 2) {
+      const d = nameDistance(k, c);
+      if (d <= 2 && d < k.length) return { tier: 3, d };
+    }
+    if (k.includes(c)) return { tier: 4, d: 0 };
+    if (c.startsWith(k.slice(0, 3))) return { tier: 5, d: 0 };
+    return undefined;
+  };
   return known
-    .filter((candidate) => {
-      const c = candidate.toLowerCase();
-      return c.includes(k) || k.includes(c) || c.startsWith(k.slice(0, 3));
+    .flatMap((candidate) => {
+      const r = rank(candidate);
+      return r === undefined ? [] : [{ candidate, ...r }];
     })
-    .slice(0, limit);
+    .sort((a, b) => a.tier - b.tier || a.d - b.d || a.candidate.localeCompare(b.candidate))
+    .slice(0, limit)
+    .map((x) => x.candidate);
 }
