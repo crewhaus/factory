@@ -414,7 +414,9 @@ export type ChainFiles =
  * symbolic link, FIFO, device or directory is refused). {@link verify} walks
  * exactly this list, and a caller that bounds the walk by size (AuditVerify)
  * sums the same sizes, so the pre-check and the walk vet the same set.
- * Throws when the directory itself cannot be listed.
+ * Throws when the directory itself cannot be listed, or an entry cannot be
+ * examined (a permission error, say): that is "could not verify", never a
+ * tamper finding.
  */
 export function listChainFiles(rootDir: string): ChainFiles {
   const files = readdirSync(rootDir)
@@ -426,7 +428,7 @@ export function listChainFiles(rootDir: string): ChainFiles {
     const probe = probeKind(join(rootDir, name), { given: name });
     if (!probe.ok) {
       if (probe.code === "not-found") continue; // removed since the listing
-      return { ok: false, file: name, reason: `"${name}" could not be examined` };
+      throw new AuditLogError(couldNotVerify(probe.reason));
     }
     if (probe.kind !== "file") {
       return { ok: false, file: name, reason: notRegularReason(name, probe.kind) };
@@ -450,21 +452,35 @@ export function listChainFiles(rootDir: string): ChainFiles {
 }
 
 /**
+ * The message for a chain the verifier could not read (a permission error,
+ * an I/O error): the answer is "could not verify", which is not a verdict.
+ * Audit files are created 0600, so another user or a CI job verifying them
+ * meets this without anything having been tampered with.
+ */
+function couldNotVerify(reason: string): string {
+  return `the audit chain could not be verified, which is not a tamper finding: ${reason}`;
+}
+
+/**
  * Open `name` in `rootDir` for streaming, refusing a link or special file at
  * it (`O_NOFOLLOW`, checked on the open descriptor). The stream owns the fd.
+ * `tamper` says whether the refusal is evidence (a link or special file at a
+ * name the writer only ever creates as a regular file) or only a failure to
+ * read (`permission denied`).
  */
 function openChainFile(
   rootDir: string,
   name: string,
-): { ok: true; stream: ReturnType<typeof createReadStream> } | { ok: false; reason: string } {
+):
+  | { ok: true; stream: ReturnType<typeof createReadStream> }
+  | { ok: false; tamper: boolean; reason: string } {
   const opened = openForReadFd(rootDir, name, { followLeafSymlink: false });
   if (!opened.ok) {
+    const tamper = opened.code === "is-symlink" || opened.code === "not-regular-file";
     return {
       ok: false,
-      reason:
-        opened.code === "is-symlink" || opened.code === "not-regular-file"
-          ? notRegularReason(name, opened.kind ?? "symlink")
-          : opened.reason,
+      tamper,
+      reason: tamper ? notRegularReason(name, opened.kind ?? "symlink") : opened.reason,
     };
   }
   try {
@@ -652,6 +668,11 @@ export type VerifyOptions = {
  * `externalAnchorChecked` whether an off-host anchor was supplied and
  * cross-checked; `false` on either means that gap could not be ruled out
  * (a limitation, not a pass — see the file header on same-uid tamper).
+ *
+ * THROWS {@link AuditLogError} when a chain file cannot be read at all
+ * (permission denied, an I/O error): that is "could not verify", and is
+ * never returned as a broken link. A link, FIFO, device or directory at a
+ * chain file's name IS returned as the break: the writer never makes one.
  */
 export async function verify(rootDir: string, options: VerifyOptions = {}): Promise<VerifyResult> {
   // Fetch the external anchor BEFORE the walk so the walk can capture the
@@ -704,6 +725,7 @@ export async function verify(rootDir: string, options: VerifyOptions = {}): Prom
     const file = join(rootDir, f);
     const opened = openChainFile(rootDir, f);
     if (!opened.ok) {
+      if (!opened.tamper) throw new AuditLogError(couldNotVerify(opened.reason));
       return { ok: false, recordsChecked, file, line: 0, reason: opened.reason };
     }
     const stream = opened.stream;

@@ -112,6 +112,54 @@ describe("verify refuses what the writer never makes", () => {
     expect(listed.bytes).toBe(lstatSync(join(tmp, `${DAY}.jsonl`)).size);
     expect(listed.tailBytes).toBe(lstatSync(join(tmp, CHAIN_TAIL_FILENAME)).size);
   });
+
+  // The ops review: a chain file the verifier cannot READ (audit files are
+  // created 0600, so any other user or CI job meets this) came back as a
+  // break, which `crewhaus audit verify` prints as "✗ tamper finding" and
+  // doctor fails on. 0.7.0 threw. "Could not verify" is not a verdict.
+  // Root reads a 0o000 file anyway, so the case means nothing there.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "a chain file that cannot be read is an error, never a tamper finding",
+    async () => {
+      await seed();
+      const day = join(tmp, `${DAY}.jsonl`);
+      chmodSync(day, 0o000);
+      try {
+        const err = await verify(tmp).then(
+          (r) => r,
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(AuditLogError);
+        expect((err as Error).message).toContain(
+          "could not be verified, which is not a tamper finding",
+        );
+        expect((err as Error).message).toContain(`"${DAY}.jsonl" cannot be read`);
+        expect((err as Error).message).not.toContain(tmp);
+      } finally {
+        chmodSync(day, 0o600);
+      }
+      // Readable again, the same chain verifies: nothing was wrong with it.
+      expect((await verify(tmp)).ok).toBe(true);
+    },
+  );
+
+  // A directory that can be listed but not searched: `lstat` of an entry
+  // fails with EACCES, which the pre-check reported as the break.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "an entry that cannot be examined is an error from the listing too",
+    async () => {
+      await seed();
+      chmodSync(tmp, 0o400);
+      try {
+        expect(() => listChainFiles(tmp)).toThrow(AuditLogError);
+        expect(() => listChainFiles(tmp)).toThrow(
+          /could not be verified, which is not a tamper finding/,
+        );
+      } finally {
+        chmodSync(tmp, 0o700);
+      }
+    },
+  );
 });
 
 describe("the writer never writes through a link", () => {

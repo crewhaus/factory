@@ -39,6 +39,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import {
+  AuditLogError,
   type ChainFiles,
   type VerifyResult,
   listChainFiles,
@@ -936,11 +937,18 @@ export const auditVerify: RegisteredTool = buildTool({
     // to be a regular file: a chain file linked out of the directory, or a
     // FIFO, is tamper evidence and is reported as the break — never read,
     // never counted as zero bytes (security-5#2, flag-truth-3#6).
+    // "Could not verify" (a chain file this user cannot read: they are
+    // created 0600) is its own answer, never a break: a break is tamper
+    // evidence. audit-log's message names the chain file only, never a path.
+    const couldNot = (err: unknown, fallback: string): string =>
+      err instanceof AuditLogError
+        ? `audit log at "${renderPath(rel)}": ${err.message}`
+        : `audit log at "${renderPath(rel)}" ${fallback}`;
     let chain: ChainFiles;
     try {
       chain = listChainFiles(dir.value.real);
-    } catch {
-      return `audit log at "${renderPath(rel)}" could not be listed`;
+    } catch (err) {
+      return couldNot(err, "could not be listed");
     }
     const dirShown = dir.value.rel === "" ? "." : dir.value.rel;
     if (!chain.ok) {
@@ -958,9 +966,9 @@ export const auditVerify: RegisteredTool = buildTool({
     let result: VerifyResult;
     try {
       result = await verifyAuditChain(dir.value.real);
-    } catch {
-      // Not the error text: a node error carries the absolute path.
-      return `audit log at "${renderPath(rel)}" could not be verified (an entry could not be read)`;
+    } catch (err) {
+      // Not a node error's text: it carries the absolute path.
+      return couldNot(err, "could not be verified (an entry could not be read)");
     }
     if (result.ok) {
       return json({

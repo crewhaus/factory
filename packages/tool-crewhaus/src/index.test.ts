@@ -840,6 +840,28 @@ describe("AuditVerify", () => {
     expect(JSON.parse(raw).ok).toBe(false);
   });
 
+  // The ops review: a chain file this user cannot read came back as
+  // `{ ok: false, break }`, a tamper finding; 0.7.0 threw. Root reads a
+  // 0o000 file anyway, so the case means nothing there.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "a chain file that cannot be read is 'could not verify', not a break",
+    async () => {
+      await seedAudit();
+      const file = auditFiles()[0] as string;
+      chmodSync(file, 0o000);
+      let raw: string;
+      try {
+        raw = await call(auditVerify, {});
+      } finally {
+        chmodSync(file, 0o600);
+      }
+      expect(raw).toContain("could not be verified, which is not a tamper finding");
+      expect(raw).toContain("cannot be read");
+      expect(raw).not.toContain('"break"');
+      expect(raw).not.toContain(tmp);
+    },
+  );
+
   // In a child process: before the fix a FIFO blocked the walk for ever, even
   // with maxBytes 1 (it stat's as 0 bytes), and a blocked test hangs the suite.
   test.skipIf(process.platform === "win32")(
