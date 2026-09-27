@@ -229,6 +229,9 @@ function magicMismatch(coding: Coding, head: Uint8Array): boolean {
   return false;
 }
 
+/** How many leading encoded bytes {@link makeDecoder} and {@link magicMismatch} look at. */
+const SNIFF_BYTES = 4;
+
 function declaredLength(res: Response): number | undefined {
   const raw = res.headers.get("content-length");
   if (raw === null || !/^\d+$/.test(raw.trim())) return undefined;
@@ -379,9 +382,19 @@ async function* iterate(
   const corrupt = (): Promise<void> =>
     failWith("decode-error", `the ${contentEncoding} body is corrupt: ${decoder?.error}`);
 
+  /**
+   * Encoded bytes held until the format can be told from its first
+   * {@link SNIFF_BYTES}: deflate's zlib-or-raw choice reads two bytes, and
+   * zstd's signature four. The network may split them across chunks; a
+   * sniff of a one-byte first chunk read deflate as raw and failed a good
+   * body as corrupt (net regression review).
+   */
+  let held: Uint8Array | undefined;
+
   let finished = false;
   try {
     reading: for (;;) {
+      let chunk: Uint8Array;
       let next: Raced<Awaited<ReturnType<typeof reader.read>>>;
       try {
         next = await race(reader.read(), signal, idleMs);
@@ -395,12 +408,22 @@ async function* iterate(
       }
       if (next.value.done) {
         readerDone = true;
-        break;
+        // The body ended inside the sniff window: decode what there is.
+        if (held === undefined) break;
+        chunk = held;
+        held = undefined;
+      } else {
+        chunk = next.value.value;
+        if (chunk.length === 0) continue;
+        encodedBytes += chunk.length;
+        if (contentEncoding !== null && decoder === undefined) {
+          held =
+            held === undefined ? chunk : concatBytes([held, chunk], held.length + chunk.length);
+          if (held.length < SNIFF_BYTES) continue;
+          chunk = held;
+          held = undefined;
+        }
       }
-      const chunk = next.value.value;
-      if (chunk.length === 0) continue;
-      const before = encodedBytes;
-      encodedBytes += chunk.length;
 
       if (contentEncoding === null) {
         accept(chunk);
@@ -412,7 +435,7 @@ async function* iterate(
           );
           return;
         }
-        if (before === 0) {
+        if (decoder === undefined) {
           if (magicMismatch(contentEncoding, chunk)) {
             await failWith(
               "auto-decompressed",
@@ -451,7 +474,7 @@ async function* iterate(
         }
       }
       while (pending.length > 0) yield pending.shift() as Uint8Array;
-      if (full) break;
+      if (full || readerDone) break;
     }
 
     if (decoder !== undefined && !full && !decoder.complete) {

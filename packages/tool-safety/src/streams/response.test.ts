@@ -357,6 +357,20 @@ function chunked(bytes: Uint8Array, size: number, encoding: string, endless = fa
   };
 }
 
+/** A response whose body arrives in exactly these chunks. */
+function inParts(parts: readonly Uint8Array[], encoding: string): Response {
+  let at = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      const part = parts[at];
+      at += 1;
+      if (part === undefined) controller.close();
+      else controller.enqueue(part);
+    },
+  });
+  return new Response(stream, { headers: { "content-encoding": encoding } });
+}
+
 describe("a corrupt compressed body fails, and never holds the reader", () => {
   const text = "a body long enough to corrupt in the middle, ".repeat(400);
   const corruptMiddle = (body: Uint8Array): Uint8Array => {
@@ -467,6 +481,55 @@ describe("what counts as the body", () => {
     }
     expect(checked).toBe(3);
   });
+
+  test("net regression review: the format is sniffed from its first bytes however the network splits them", async () => {
+    // A zlib-wrapped deflate body whose first byte arrived alone was read
+    // as raw deflate and refused as corrupt; 0.7.0 decoded it.
+    const splits = (body: Uint8Array): Uint8Array[][] => [
+      [body.slice(0, 1), body.slice(1)],
+      [body.slice(0, 1), body.slice(1, 2), body.slice(2, 3), body.slice(3)],
+      Array.from(body, (b) => new Uint8Array([b])),
+    ];
+    const bodies: [string, Uint8Array][] = [
+      ["deflate", zlib.deflateSync(text)],
+      ["deflate", zlib.deflateRawSync(text)],
+      ["gzip", zlib.gzipSync(text)],
+      ["br", zlib.brotliCompressSync(text)],
+    ];
+    if (hasZstd) bodies.push(["zstd", Bun.zstdCompressSync(new TextEncoder().encode(text))]);
+    let checked = 0;
+    for (const [encoding, body] of bodies) {
+      for (const parts of splits(body)) {
+        const r = await readResponseBounded(inParts(parts, encoding), {
+          maxBytes: 1_000,
+          signal: AbortSignal.timeout(10_000),
+        });
+        expect({ encoding, first: parts[0]?.length, r }).toMatchObject({
+          encoding,
+          first: 1,
+          r: { ok: true, text, truncated: false },
+        });
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(bodies.length * 3);
+    // A body shorter than the sniff window is decoded when it ends: an
+    // empty raw deflate stream is two bytes.
+    const empty = zlib.deflateRawSync("");
+    expect(empty.length).toBeLessThan(4);
+    const r = await readResponseBounded(inParts([empty.slice(0, 1), empty.slice(1)], "deflate"), {
+      maxBytes: 1_000,
+      signal: AbortSignal.timeout(10_000),
+    });
+    expect(r).toMatchObject({ ok: true, text: "", truncated: false });
+    // The signature check still sees four bytes split across chunks.
+    const notZstd = new TextEncoder().encode("plain text, not zstd");
+    const refused = await readResponseBounded(
+      inParts([notZstd.slice(0, 1), notZstd.slice(1, 3), notZstd.slice(3)], "zstd"),
+      { maxBytes: 1_000, signal: AbortSignal.timeout(10_000) },
+    );
+    expect(refused).toMatchObject({ ok: false, code: "auto-decompressed" });
+  }, 20_000);
 
   test("a member followed by an endless stream is read, and the rest is cancelled, not read", async () => {
     const { res, cancelled } = chunked(gz, 4, "gzip", true);

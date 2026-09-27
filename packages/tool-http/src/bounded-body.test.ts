@@ -12,7 +12,7 @@
  * and through a hostname pinned to its vetted address.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { brotliCompressSync, createGzip, gzipSync } from "node:zlib";
+import { brotliCompressSync, createGzip, deflateSync, gzipSync } from "node:zlib";
 import {
   __setPrivateHostsAllowedForTest,
   _resetHttpConfig,
@@ -85,6 +85,21 @@ beforeAll(async () => {
         const gz = gzipSync('{"ok":true}');
         return new Response(new Uint8Array(Buffer.concat([gz, Buffer.from("\r\n")])), {
           headers: { "content-encoding": "gzip", "content-type": "application/json" },
+        });
+      }
+      if (path === "/deflate-split") {
+        // A zlib-wrapped deflate reply whose first byte is sent on its own.
+        const payload = deflateSync('{"ok":true,"items":[1,2,3]}');
+        const body = new ReadableStream<Uint8Array>({
+          async start(c) {
+            c.enqueue(payload.subarray(0, 1));
+            await Bun.sleep(30);
+            c.enqueue(payload.subarray(1));
+            c.close();
+          },
+        });
+        return new Response(body, {
+          headers: { "content-encoding": "deflate", "content-type": "application/json" },
         });
       }
       if (path === "/none") {
@@ -193,6 +208,15 @@ describe("a compressed body costs at most its cap", () => {
       String(await httpRequest.execute({ url: `${origin}/gzip-crlf`, parseJson: true })),
     );
     expect(out.json).toEqual({ ok: true });
+  });
+
+  test("net regression review: a deflate reply whose first byte arrives alone is decoded, as 0.7.0 decoded it", async () => {
+    const origin = `http://127.0.0.1:${port}`;
+    registerHttpConfig({ allowed_origins: [origin] });
+    const out = JSON.parse(
+      String(await httpRequest.execute({ url: `${origin}/deflate-split`, parseJson: true })),
+    );
+    expect(out.json).toEqual({ ok: true, items: [1, 2, 3] });
   });
 
   test("net-review: a Content-Encoding that names no coding is read as it is, and reported", async () => {
