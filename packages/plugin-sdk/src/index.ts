@@ -407,38 +407,71 @@ export function validatePluginManifestRecord(m: unknown): PluginManifest {
 
 /** One version in a range: `1`, `1.2`, `1.2.3`, `1.x`, `*`, `1.2.3-beta.1+build`. */
 const RANGE_PARTIAL =
-  /^v?(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)?)?$/;
-const RANGE_OPERATOR = /^(?:<=|>=|<|>|=|~|\^)/;
+  /^(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:\.(?:0|[1-9]\d*|[xX*])(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)?)?$/;
+/** A comparator: an optional operator (npm's `~>` is `~`), npm's `v`/`=` prefix, a version. */
+const RANGE_COMPARATOR = /^(<=|>=|<|>|=|~>?|\^)?[v=]*(.*)$/;
 const MAX_RANGE_LENGTH = 256;
+
+/** `token` as a comparator Bun.semver reads as npm does, or undefined when it is not one. */
+function rangeComparator(token: string): string | undefined {
+  const m = RANGE_COMPARATOR.exec(token);
+  const op = m?.[1] ?? "";
+  const version = m?.[2] ?? "";
+  if (!RANGE_PARTIAL.test(version)) return undefined;
+  return `${op === "~>" ? "~" : op === "=" ? "" : op}${version}`;
+}
+
+/**
+ * `range` as crewhaus checks it, or undefined when it is not a semver range.
+ * The npm grammar, read the way npm reads it: comparator sets joined by
+ * `||`, each a space-separated list of versions with an optional `<`, `<=`,
+ * `>`, `>=`, `=`, `~` (or `~>`) or `^`, or a hyphen range `1.2.3 - 2.3.4`.
+ * Versions may be partial (`1.2`) or use `x`/`*`. An operator may be
+ * followed by spaces (`>= 1.2.3`), and an empty set — the empty range, or
+ * an empty side of `||` — matches every version, as it does for npm. The
+ * result is spelled so that `Bun.semver.satisfies` reads it the same way.
+ */
+function normalizedEngineRange(range: string): string | undefined {
+  if (typeof range !== "string" || range.length > MAX_RANGE_LENGTH) return undefined;
+  const sets: string[] = [];
+  for (const raw of range.split("||")) {
+    const set = raw.trim().replace(/(<=|>=|<|>|=|~>?|\^)\s+/g, "$1");
+    if (set === "") {
+      sets.push("*");
+      continue;
+    }
+    const hyphen = set.match(/^(\S+)\s+-\s+(\S+)$/);
+    if (hyphen !== null) {
+      const from = rangeComparator(hyphen[1] ?? "");
+      const to = rangeComparator(hyphen[2] ?? "");
+      // A hyphen range's ends are plain versions.
+      if (from === undefined || to === undefined || !RANGE_PARTIAL.test(from)) return undefined;
+      if (!RANGE_PARTIAL.test(to)) return undefined;
+      sets.push(`${from} - ${to}`);
+      continue;
+    }
+    const comparators: string[] = [];
+    for (const token of set.split(/\s+/)) {
+      const comparator = rangeComparator(token);
+      if (comparator === undefined) return undefined;
+      comparators.push(comparator);
+    }
+    sets.push(comparators.join(" "));
+  }
+  return sets.join(" || ");
+}
 
 /**
  * Is `range` a semver range crewhaus can check a version against? The npm
- * grammar: comparator sets joined by `||`, each a space-separated list of
- * versions with an optional `<`, `<=`, `>`, `>=`, `=`, `~` or `^`, or a
- * hyphen range `1.2.3 - 2.3.4`. Versions may be partial (`1.2`) or use `x`/`*`.
+ * grammar, as npm reads it (see {@link crewhausEngineProblem}): a range npm
+ * accepts is accepted, `~>0.7.0` and an empty side of `||` included.
  *
  * Checked on its own because `Bun.semver.satisfies` answers `true` for text
  * that is not a range at all ("not a range", "garbage>=1"), which would let a
  * plugin that declares nonsense run anywhere.
  */
 export function isValidEngineRange(range: string): boolean {
-  if (typeof range !== "string" || range.length > MAX_RANGE_LENGTH) return false;
-  for (const raw of range.split("||")) {
-    // `>= 1.2.3` is the same comparator as `>=1.2.3`.
-    // An empty set leaves one empty token, which is not a version.
-    const set = raw.trim().replace(/(<=|>=|<|>|=|~|\^)\s+/g, "$1");
-    const hyphen = set.match(/^(\S+)\s+-\s+(\S+)$/);
-    if (hyphen !== null) {
-      if (!RANGE_PARTIAL.test(hyphen[1] ?? "") || !RANGE_PARTIAL.test(hyphen[2] ?? "")) {
-        return false;
-      }
-      continue;
-    }
-    for (const token of set.split(/\s+/)) {
-      if (!RANGE_PARTIAL.test(token.replace(RANGE_OPERATOR, ""))) return false;
-    }
-  }
-  return true;
+  return normalizedEngineRange(range) !== undefined;
 }
 
 /**
@@ -455,11 +488,12 @@ export function crewhausEngineProblem(
   const range = manifest.engines?.crewhaus;
   if (range === undefined) return undefined;
   const who = `plugin "${manifest.name}" ${manifest.version}`;
-  if (!isValidEngineRange(range)) {
+  const normalized = normalizedEngineRange(range);
+  if (normalized === undefined) {
     return `${who} declares engines.crewhaus ${JSON.stringify(range)}, which is not a semver range, so crewhaus cannot tell whether it runs on ${hostVersion}`;
   }
   const release = hostVersion.match(/^\d+\.\d+\.\d+/)?.[0] ?? hostVersion;
-  if (Bun.semver.satisfies(release, range)) return undefined;
+  if (Bun.semver.satisfies(release, normalized)) return undefined;
   return `${who} requires crewhaus ${range}, and this is crewhaus ${hostVersion}`;
 }
 
