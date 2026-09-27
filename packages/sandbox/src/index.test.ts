@@ -357,7 +357,7 @@ async function waitGone(pid: number, budgetMs: number): Promise<boolean> {
   return !alive(pid);
 }
 
-/** Kills the detached reapers (retries) started for `names` by processes the test cannot reach. */
+/** Kills the detached reapers (watchdogs, retries) started for `names` by processes the test cannot reach. */
 function killReapersFor(names: ReadonlyArray<string>): void {
   if (names.length === 0) return;
   const ps = Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe", stderr: "ignore" });
@@ -894,6 +894,7 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     expect(result.aborted).toBe(true);
     const verbs = cliCalls().map((c) => `${c.argv[0]} ${c.argv[1]}`);
     expect(verbs).toEqual(["podman create", "podman start", "podman kill", "podman rm"]);
+    expect(reaperCalls().map((c) => c.argv[4])).toEqual(["podman"]);
   }, 20_000);
 
   // C012: the CLI was killed while the daemon was still creating the
@@ -1024,25 +1025,9 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     expect(cliLog().slice(-2)).toEqual([`kill ${name}`, `rm -f ${name}`]);
   }, 30_000);
 
-  // The backstop for a host killed outright: the kernel, not the host, ends
-  // a program that has used its timeout's worth of CPU (at the --cpus cap).
-  test("every run carries a CPU-time limit the kernel enforces: its timeout's worth plus a grace", async () => {
-    const ulimitOf = (i: number): string | undefined => {
-      const argv = cliCalls().filter((c) => c.argv[1] === "create")[i]?.argv ?? [];
-      const at = argv.indexOf("--ulimit");
-      return at === -1 ? undefined : argv[at + 1];
-    };
-    await runExec(createSandbox({ backend: "docker" }), {
-      image: "alpine:3.19",
-      argv: ["true"],
-      timeoutMs: 1_000,
-    });
-    await runExec(createSandbox({ backend: "docker" }), { image: "alpine:3.19", argv: ["true"] });
-    await runExec(createSandbox({ backend: "docker", cpus: "2.5" }), {
-      image: "alpine:3.19",
-      argv: ["true"],
-      timeoutMs: 1_000,
-    });
+  // A host killed outright can run nothing. The watchdog is a detached
+  // process started with the run, cancelled when it ends.
+  test("every run with a timeout has a detached watchdog, cancelled when the run ends", async () => {
     await runExec(createSandbox({ backend: "docker" }), {
       image: "alpine:3.19",
       argv: ["true"],
@@ -1053,13 +1038,19 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
       argv: ["true"],
       timeoutMs: Number.POSITIVE_INFINITY,
     });
-    expect([0, 1, 2, 3, 4].map(ulimitOf)).toEqual([
-      "cpu=11:11",
-      "cpu=70:70",
-      "cpu=13:13",
-      "cpu=12:12",
-      undefined, // no timeout, no limit
-    ]);
+    const reapers = reaperCalls();
+    // One per run with a timeout: 2 s (rounded up) + the 10 s grace.
+    expect(reapers.map((c) => c.argv.slice(4))).toEqual([["docker", nameOf(cliLog()[0]), "12"]]);
+    expect(reapers[0]?.argv.slice(0, 2)).toEqual(["/bin/sh", "-c"]);
+    expect(reapers[0]?.options).toMatchObject({
+      detached: true,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const proc = reapers[0]?.proc;
+    await proc?.exited;
+    expect(proc?.signalCode).toBe("SIGKILL");
   }, 20_000);
 
   test("a sandbox says the default timeout a call without one runs with", () => {
@@ -1074,13 +1065,13 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
 
   // C012: the timeout and the abort live in the host. A host that went away
   // mid-run — process.exit, a SIGINT or SIGTERM it does not handle, a second
-  // Ctrl-C right after the first one's abort — left the container running
-  // with no limit at all. The host here is a separate process whose
+  // Ctrl-C right after the first one's abort, a SIGKILL — left the container
+  // running with no limit at all. The host here is a separate process whose
   // `docker` is the fake CLI.
   describe("when the host goes away mid-run", () => {
     const sandboxModule = join(import.meta.dir, "index.ts");
 
-    type HostMode = "exit" | "abort-exit" | "unhandled" | "once";
+    type HostMode = "exit" | "abort-exit" | "unhandled" | "once" | "watchdog";
     let hosts: Array<ReturnType<typeof Bun.spawn>> = [];
 
     afterEach(() => {
@@ -1094,6 +1085,8 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
         }
       }
       hosts = [];
+      // The watchdog of a host that went away outlives it on purpose.
+      killReapersFor([hostContainer()]);
     });
 
     function startHost(mode: HostMode, env: Record<string, string> = {}) {
@@ -1113,7 +1106,7 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
           "const run = createSandbox({ backend: 'docker' }).exec({",
           "  image: 'alpine:3.19',",
           "  argv: mode === 'once' ? ['sh', '-c', 'sleep 1; echo finished'] : ['sh', '-c', 'while :; do sleep 0.05; done'],",
-          "  timeoutMs: 120_000,",
+          "  timeoutMs: mode === 'watchdog' ? 4_000 : 120_000,",
           "  signal: controller.signal,",
           "});",
           "const poll = setInterval(() => {",
@@ -1141,6 +1134,16 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
 
     function hostContainer(): string {
       return nameOf(log().find((l) => l.startsWith("create ")));
+    }
+
+    /** Resolves once the CLI log has `line`, within `budgetMs`. */
+    async function eventually(line: string, budgetMs: number): Promise<boolean> {
+      const until = performance.now() + budgetMs;
+      while (performance.now() < until) {
+        if (log().includes(line)) return true;
+        await Bun.sleep(20);
+      }
+      return log().includes(line);
     }
 
     test("process.exit stops the container by name before the host is gone", async () => {
@@ -1199,6 +1202,22 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
         [],
       );
     }, 30_000);
+
+    // Nothing on the host can run after a SIGKILL. The watchdog started with
+    // the run can: 10 s after the run's timeout it stops the container,
+    // whatever the program inside does.
+    test("a host killed outright: the watchdog stops the container after its timeout", async () => {
+      const h = startHost("watchdog");
+      await containerStarted(15_000);
+      const name = hostContainer();
+      h.kill("SIGKILL");
+      await h.exited;
+      expect(alive(containerPid(name))).toBe(true);
+      // Timeout 4 s → the watchdog fires 14 s after the run began.
+      expect(await waitGone(containerPid(name), 25_000)).toBe(true);
+      expect(await eventually(`rm -f ${name}`, 5_000)).toBe(true);
+      expect(records()).toEqual([]);
+    }, 50_000);
   });
 });
 
@@ -1576,19 +1595,27 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
   }
 
   /**
-   * A host process that starts a busy loop in a container and says so once
-   * the loop runs. `exit`: it then calls process.exit. `wait`: it waits for
-   * the test to kill it.
+   * A host process that starts `program` in a container and says so once
+   * it runs. `exit`: it then calls process.exit. `wait`: it waits for the
+   * test to kill it. `running` resolves to the container's name, which the
+   * host prints as it creates it: the host's watchdog outlives the host on
+   * purpose, and the test ends it by that name.
    */
-  function busyHost(mode: "exit" | "wait", token: string, timeoutMs: number) {
+  function busyHost(mode: "exit" | "wait", token: string, timeoutMs: number, program: string) {
     const script = join(tmpdir(), `sandbox-live-host-${token}.ts`);
     writeFileSync(
       script,
       [
         `import { createSandbox } from ${JSON.stringify(join(import.meta.dir, "index.ts"))};`,
+        "const spawn = Bun.spawn.bind(Bun);",
+        "Bun.spawn = ((argv: string[], options: Record<string, unknown>) => {",
+        "  const at = argv.indexOf('--name');",
+        "  if (argv[1] === 'create' && at > 0) console.log(`name ${argv[at + 1]}`);",
+        "  return spawn(argv, options);",
+        "}) as typeof Bun.spawn;",
         "await createSandbox({ backend: 'docker' }).exec({",
         "  image: 'alpine:3.19',",
-        `  argv: ['sh', '-c', ${JSON.stringify(`echo started; : ${token}; while :; do :; done`)}],`,
+        `  argv: ['sh', '-c', ${JSON.stringify(`echo started; : ${token}; ${program}`)}],`,
         `  timeoutMs: ${timeoutMs},`,
         "  onStdoutChunk: (c) => {",
         "    if (!c.includes('started')) return;",
@@ -1599,7 +1626,7 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
       ].join("\n"),
     );
     const h = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "ignore" });
-    const running = (async () => {
+    const running = (async (): Promise<string> => {
       const reader = (h.stdout as ReadableStream<Uint8Array>).getReader();
       let seen = "";
       while (!seen.includes("running")) {
@@ -1609,38 +1636,49 @@ describe.if(dockerReady())("docker backend against a real daemon", () => {
       }
       reader.releaseLock();
       rmSync(script, { force: true });
+      return /^name (\S+)$/m.exec(seen)?.[1] ?? "";
     })();
     return { h, running };
   }
 
   test("a host that exits mid-run leaves no container behind", async () => {
     const token = `exit-${randomUUID()}`;
-    const { h, running } = busyHost("exit", token, 120_000);
+    const { h, running } = busyHost("exit", token, 120_000, "while :; do :; done");
+    let name = "";
     try {
-      await running;
+      name = await running;
+      expect(name).toMatch(/^crewhaus-sbx-[0-9a-f]{16}$/);
       await h.exited;
       expect(h.exitCode).toBe(0);
       expect(withToken(token)).toEqual([]);
     } finally {
-      for (const name of withToken(token)) names.push(name);
+      for (const leftover of withToken(token)) names.push(leftover);
+      killReapersFor([name]);
     }
   }, 60_000);
 
-  // Nothing on the host can run after a SIGKILL: the CPU-time limit inside
-  // the container is what ends the loop (1 s timeout → 11 s of CPU).
-  test("a host killed outright: the kernel ends the orphaned busy loop", async () => {
+  // Nothing on the host can run after a SIGKILL. The watchdog started with
+  // the run can, and it stops the whole container: a program that keeps
+  // forking new processes ends as surely as one busy loop (a per-process
+  // CPU limit let this one run on).
+  test("a host killed outright: the watchdog stops a forking loop after the timeout", async () => {
     const token = `sigkill-${randomUUID()}`;
-    const { h, running } = busyHost("wait", token, 1_000);
+    const forking =
+      'while :; do sh -c "i=0; while [ \\$i -lt 200000 ]; do i=\\$((i+1)); done"; done';
+    const { h, running } = busyHost("wait", token, 2_000, forking);
+    let name = "";
     try {
-      await running;
+      name = await running;
       h.kill("SIGKILL");
       await h.exited;
-      expect(withToken(token)).toHaveLength(1);
-      const until = performance.now() + 45_000;
+      expect(withToken(token)).toEqual([name]);
+      // Timeout 2 s → the watchdog fires 12 s after the run began.
+      const until = performance.now() + 40_000;
       while (withToken(token).length > 0 && performance.now() < until) await Bun.sleep(500);
       expect(withToken(token)).toEqual([]);
     } finally {
-      for (const name of withToken(token)) names.push(name);
+      for (const leftover of withToken(token)) names.push(leftover);
+      killReapersFor([name]);
     }
   }, 60_000);
 

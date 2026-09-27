@@ -32,9 +32,6 @@ import {
  *   --name crewhaus-sbx-<random>, so the run can be stopped by name
  *   --label crewhaus.sandbox=1, so a leftover can be found:
  *     `docker ps -a --filter label=crewhaus.sandbox`
- *   --ulimit cpu=<the timeout's worth of CPU time, plus a grace>, a limit
- *     the kernel enforces inside the container even if nothing on the host
- *     is left to (see below)
  *   60 second default wall-clock timeout (a caller may pass its own)
  *   1 MiB of stdout and 1 MiB of stderr kept (head and tail), the rest
  *   counted and dropped as it arrives
@@ -59,11 +56,13 @@ import {
  * neither handles nor ignores (a terminal Ctrl-C, a supervisor's stop), the
  * sandbox runs `<cli> kill` and `<cli> rm -f` for them synchronously before
  * the host is gone. The CLI leads its own process group, so a terminal
- * Ctrl-C no longer reaches it, and the timeout lived in the host. For a
- * host killed outright (SIGKILL, a crash), `--ulimit cpu` is the backstop:
- * the kernel kills a program that has used its timeout's worth of CPU, so
- * an orphaned busy loop does not burn a CPU forever. It assumes `--cpus` is
- * enforced, which the safety floor already does.
+ * Ctrl-C no longer reaches it, and the timeout lived in the host.
+ * For a host killed outright (SIGKILL, a crash), every run with a timeout
+ * also has a watchdog: a detached `sh` that, 10 s after the run's timeout,
+ * runs `<cli> kill` and `<cli> rm -f` for its container. It is its own
+ * session, so it outlives the host, and it stops the whole container — a
+ * program that keeps forking is ended as surely as one busy loop. It is
+ * cancelled when the run ends. A run with no timeout has none.
  *
  * Image allowlist: any image string requested by `exec()` must appear
  * in the constructor's `allowedImages` set OR in
@@ -270,11 +269,10 @@ const CREATE_FAILED_EXIT_CODE = 125;
  */
 const HOST_EXIT_CONTROL_TIMEOUT_MS = 3_000;
 /**
- * CPU seconds past the run's own timeout (scaled by `cpus`) before the
- * kernel kills the program. Only an orphan reaches it: while the host lives
- * its timeout fires first, and `--cpus` holds CPU time to wall time × cpus.
+ * Seconds past a run's timeout before its watchdog stops the container: the
+ * host's own stop comes first while the host lives.
  */
-const CPU_LIMIT_GRACE_S = 10;
+const WATCHDOG_GRACE_S = 10;
 /** When a stopped run's container could not be confirmed gone: retry after these many seconds. */
 const STRAY_RETRY_DELAYS_S: ReadonlyArray<number> = [5, 30];
 /** The longest delay `setTimeout` honours; a longer one fires at once. */
@@ -287,7 +285,7 @@ const GONE_RE = /no such container|already in progress/i;
  * `docker ps -a --filter label=crewhaus.sandbox`.
  */
 export const SANDBOX_CONTAINER_LABEL = "crewhaus.sandbox";
-/** `$0` of the detached retry processes, as `ps` shows it. */
+/** `$0` of the detached watchdog and retry processes, as `ps` shows it. */
 export const SANDBOX_REAPER_TAG = "crewhaus-sandbox-reaper";
 
 /**
@@ -497,19 +495,6 @@ function signalExitCode(signal: string | null): number | undefined {
   return n === undefined ? undefined : 128 + n;
 }
 
-/**
- * The `--ulimit cpu` value, in whole seconds, for a run with this timeout
- * and CPU cap: its timeout's worth of CPU time at the cap, plus
- * {@link CPU_LIMIT_GRACE_S}. Undefined — no limit — for a run with no
- * timeout, or a `cpus` value that is not a positive number.
- */
-function cpuTimeLimitSeconds(timeoutMs: number, cpus: string): number | undefined {
-  if (!Number.isFinite(timeoutMs)) return undefined;
-  const n = Number(cpus);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  return Math.ceil((timeoutMs / 1000) * Math.max(1, n)) + CPU_LIMIT_GRACE_S;
-}
-
 /** The first line of a CLI's message, for a reason shown to the caller. */
 function firstLine(text: string): string {
   const line = text.split("\n", 1)[0] ?? "";
@@ -585,7 +570,7 @@ function stopLiveContainersNow(): void {
           detached: true,
         });
       } catch {
-        // The host is going away; there is nothing else to try.
+        // The host is going away; the watchdog is still there.
       }
     }
   }
@@ -822,13 +807,16 @@ class DockerLikeSandbox implements Sandbox {
     const maxOutputBytes = parseMaxOutputBytes(opts.maxOutputBytes ?? this.maxOutputBytes);
     // Never derived from input: the name is how every stop finds the container.
     const name = `crewhaus-sbx-${randomBytes(8).toString("hex")}`;
-    const createArgs = this.createArgs(name, opts, mounts, timeoutMs);
+    const createArgs = this.createArgs(name, opts, mounts);
     const startedAt = performance.now();
     if (opts.signal?.aborted === true) return notStarted(startedAt, "abort");
 
     // Registered before the CLI starts and until every stop has finished, so
     // a host that exits at any point in between stops the container too.
     trackContainer(name, this.cli);
+    const cancelWatchdog = Number.isFinite(timeoutMs)
+      ? startReaper(this.cli, name, [Math.ceil(timeoutMs / 1000) + WATCHDOG_GRACE_S])
+      : () => undefined;
     try {
       return await this.createAndStart(
         name,
@@ -840,6 +828,7 @@ class DockerLikeSandbox implements Sandbox {
       );
     } finally {
       untrackContainer(name);
+      cancelWatchdog();
     }
   }
 
@@ -847,7 +836,6 @@ class DockerLikeSandbox implements Sandbox {
     name: string,
     opts: SandboxExecOptions,
     mounts: ReadonlyArray<SandboxMount>,
-    timeoutMs: number,
   ): string[] {
     const args: string[] = [
       "create",
@@ -866,8 +854,6 @@ class DockerLikeSandbox implements Sandbox {
       "--security-opt",
       "no-new-privileges",
     ];
-    const cpuLimit = cpuTimeLimitSeconds(timeoutMs, this.cpus);
-    if (cpuLimit !== undefined) args.push("--ulimit", `cpu=${cpuLimit}:${cpuLimit}`);
     for (const m of mounts) {
       const ro = m.readonly !== false;
       args.push("-v", `${m.src}:${m.dst}${ro ? ":ro" : ""}`);
