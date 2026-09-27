@@ -174,4 +174,19 @@ describe("ImageGenerate is bounded", () => {
     } as unknown as Ctx);
     expect(await settle(p, 2000)).toMatch(/^rejected: tool_config\.imageGenerate\.timeoutMs/);
   });
+
+  // Attacker review: a timeoutMs past 2^31-1 overflowed the timer, which then
+  // fired after 1 ms, so every call "timed out after 3000000000 ms" at once.
+  test("a timeoutMs longer than a timer can hold is refused, at boot and per call", async () => {
+    const tooLong = 3_000_000_000;
+    expect(() => registerImageGenerationConfig({ timeoutMs: tooLong })).toThrow(
+      "tool_config.imageGenerate.timeoutMs is 3000000000 ms, longer than a timer can wait (2147483647 ms",
+    );
+    expect(() => registerImageGenerationConfig({ timeoutMs: 2_147_483_647 })).not.toThrow();
+    registerImageGenerationConfig({});
+    const p = imageGenerate.execute({ prompt: "a cat" }, {
+      toolConfig: { provider: "openai", fetch: hangingFetch({}), timeoutMs: tooLong },
+    } as unknown as Ctx);
+    expect(await settle(p, 2000)).toMatch(/^rejected: .*longer than a timer can wait/);
+  });
 });

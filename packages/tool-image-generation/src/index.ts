@@ -70,9 +70,17 @@ const DEFAULT_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 const ERROR_BODY_BYTES = 4096;
 
 /**
+ * The longest `timeoutMs` a timer can hold: a delay past 2^31-1 ms (about
+ * 24.8 days) overflows, and the runtime fires it after 1 ms instead.
+ */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/**
  * Read `timeoutMs` / `maxResponseBytes` from a config block: a positive whole
- * number, else the default. Anything else is refused with the key named, so
- * a typo never silently becomes "no limit".
+ * number (a `timeoutMs` no longer than {@link MAX_TIMEOUT_MS}), else the
+ * default. Anything else is refused with the key named, so a typo never
+ * silently becomes "no limit" — nor, for a timeout too long for a timer, a
+ * call that gives up after 1 ms and reports it timed out.
  */
 function positiveLimit(
   cfg: ImageGenerationConfig,
@@ -86,6 +94,11 @@ function positiveLimit(
       `tool_config.imageGenerate.${key} must be a positive whole number${
         key === "timeoutMs" ? " of milliseconds" : " of bytes"
       }. Remove it for the default (${fallback}).`,
+    );
+  }
+  if (key === "timeoutMs" && value > MAX_TIMEOUT_MS) {
+    throw new ImageGenerationError(
+      `tool_config.imageGenerate.timeoutMs is ${value} ms, longer than a timer can wait (${MAX_TIMEOUT_MS} ms, about 24 days). Use a smaller value, or remove it for the default (${fallback}).`,
     );
   }
   return value;
