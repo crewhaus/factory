@@ -55,7 +55,10 @@
  * and the redaction notice (the slug stays, so a REFLECT pass can still find
  * and fix it), and the others render normally. Per-article classification
  * also keeps each unit inside the classifier's window, which a whole large
- * result would not be. A non-blocked unit is `tagContent`-ed into
+ * result would not be. List rows are checked by the local layers one by one,
+ * but go to a model-backed classifier (Layer 3) in chunks of rows, so a long
+ * list costs a few model calls rather than one per row; see `classifyRows`.
+ * A non-blocked unit is `tagContent`-ed into
  * `RunContext.dataLineage` under origin `"memory"` (the skills-registry
  * two-site pattern) so the sink-side egress fabric can attribute a later
  * exfiltration to the memory boundary.
@@ -379,28 +382,112 @@ function named(ref: { readonly slug: unknown; readonly version: unknown }): stri
 }
 
 /**
- * One list row, classified as ONE unit: `prefix` (text from the article that
- * the row shows before the ref line, e.g. wiki_list's `updatedAt`) and the
- * ref line together. Returns the row, or its slug and version with the
- * notice when any of it carries an injection. `updatedAt` used to be printed
- * outside the unit, so a planted article's timestamp reached the model
- * unredacted while wiki_get redacted the same article.
+ * The most row text one classification sees at once: well inside the
+ * classifier's window (64 KiB), so every row in a chunk is analysed in full.
  */
-async function safeRefLine(ref: WikiRef, rc: RunContext | undefined, prefix = ""): Promise<string> {
-  const c = await classifyMemory(`${prefix}${refLine(ref)}`, rc);
-  return c.safe ? c.text : `${named(ref)} — ${c.notice}`;
-}
+const ROW_CHUNK_CHARS = 16 * 1024;
 
-/** How many list rows are classified at once. */
+/** How many chunk or row classifications run at once. */
 const ROW_CLASSIFY_CONCURRENCY = 8;
 
 /**
- * {@link safeRefLine} over many rows, in order, at most
- * {@link ROW_CLASSIFY_CONCURRENCY} at a time. Each row stays its own unit —
- * one classification of the joined rows would see only the head and tail of
- * a long list, and decode a bounded number of blobs across all of them — but
- * a model-backed classifier (Layer 3) is no longer awaited once per row in
- * sequence.
+ * A Layer-3 stand-in that answers nothing: passed per call, it makes a
+ * classification run only the local layers (regex and structural).
+ */
+const LOCAL_LAYERS_ONLY = async (): Promise<undefined> => undefined;
+
+/** Run `fn` over `items` in order, at most {@link ROW_CLASSIFY_CONCURRENCY} at a time. */
+async function mapPooled<T, R>(items: ReadonlyArray<T>, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) out[i] = await fn(items[i] as T);
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(ROW_CLASSIFY_CONCURRENCY, items.length) }, () => worker()),
+  );
+  return out;
+}
+
+/**
+ * Classify many list rows at origin `"memory"`, each row its own unit for
+ * the verdict, without paying one model call per row.
+ *
+ *  1. The local layers (regex, structural, decoded variants) run on each row
+ *     alone, so a row's encoded payload is decoded however many rows sit
+ *     beside it. A malicious verdict there is final: the model layer can
+ *     raise a verdict but never lower one. This pass bypasses the verdict
+ *     cache, so a local-only verdict never stands in for a full one.
+ *  2. The rows that pass are joined into chunks of at most
+ *     {@link ROW_CHUNK_CHARS} and each chunk is classified in full, Layer 3
+ *     included when the runtime registered one: one model call per chunk,
+ *     not per row (a 400-row wiki_search used to make 400).
+ *  3. Only inside a chunk that comes back malicious is each row classified
+ *     in full on its own, so only the row that carries the injection is
+ *     redacted, never its neighbours.
+ *
+ * A row that passes is tagged into the run's data lineage at `"memory"`.
+ */
+async function classifyRows(
+  rows: ReadonlyArray<string>,
+  rc: RunContext | undefined,
+): Promise<Classified[]> {
+  const out = new Array<Classified | undefined>(rows.length);
+  const local = await mapPooled(rows, (row) =>
+    classifyBoundary(row, {
+      origin: "memory",
+      llmClassifier: LOCAL_LAYERS_ONLY,
+      bypassCache: true,
+    }),
+  );
+  const chunks: number[][] = [];
+  let chunk: number[] = [];
+  let chunkChars = 0;
+  local.forEach((result, i) => {
+    if (result.action === "redact") {
+      out[i] = {
+        safe: false,
+        notice: result.redacted ?? buildRedactionNotice(result.verdict.hits),
+      };
+      return;
+    }
+    const length = (rows[i] as string).length + 1;
+    if (chunk.length > 0 && chunkChars + length > ROW_CHUNK_CHARS) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkChars = 0;
+    }
+    chunk.push(i);
+    chunkChars += length;
+  });
+  if (chunk.length > 0) chunks.push(chunk);
+  const flagged: number[] = [];
+  await mapPooled(chunks, async (members) => {
+    const whole = await classifyBoundary(members.map((i) => rows[i]).join("\n"), {
+      origin: "memory",
+    });
+    if (whole.action === "redact") flagged.push(...members);
+    else for (const i of members) out[i] = { safe: true, text: rows[i] as string };
+  });
+  const each = await mapPooled(flagged, (i) => classifyMemory(rows[i] as string, undefined));
+  flagged.forEach((i, j) => {
+    out[i] = each[j];
+  });
+  return out.map((c) => {
+    const result = c as Classified;
+    if (result.safe && rc !== undefined) tagContent(rc, result.text, "memory");
+    return result;
+  });
+}
+
+/**
+ * Many list rows, classified by {@link classifyRows}: each row is `prefix`
+ * (text from the article that the row shows before the ref line, e.g.
+ * wiki_list's `updatedAt`) and the ref line, as one unit. A row that carries
+ * an injection anywhere in it becomes its slug and version with the notice.
+ * `updatedAt` used to be printed outside the unit, so a planted article's
+ * timestamp reached the model unredacted while wiki_get redacted the same
+ * article.
  */
 async function safeRefLines<R extends WikiRef>(
   refs: ReadonlyArray<R>,
@@ -408,18 +495,14 @@ async function safeRefLines<R extends WikiRef>(
   render: (ref: R, line: string) => string = (_ref, line) => line,
   prefix: (ref: R) => string = () => "",
 ): Promise<string[]> {
-  const out = new Array<string>(refs.length);
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    for (let i = next++; i < refs.length; i = next++) {
-      const ref = refs[i] as R;
-      out[i] = render(ref, await safeRefLine(ref, rc, prefix(ref)));
-    }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(ROW_CLASSIFY_CONCURRENCY, refs.length) }, () => worker()),
+  const verdicts = await classifyRows(
+    refs.map((ref) => `${prefix(ref)}${refLine(ref)}`),
+    rc,
   );
-  return out;
+  return refs.map((ref, i) => {
+    const c = verdicts[i] as Classified;
+    return render(ref, c.safe ? c.text : `${named(ref)} — ${c.notice}`);
+  });
 }
 
 function hitHeader(hit: WikiHit): string {

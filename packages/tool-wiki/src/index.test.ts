@@ -413,48 +413,132 @@ describe("Pillar 3 — memory-origin classification + lineage tagging on reads",
     expect(out).toContain("2026-09-01T00:00:00.000Z  clean (v1");
   });
 
-  test("list rows are classified a few at a time, and keep their order", async () => {
-    const bundle = makeBundle();
-    for (let i = 0; i < 20; i++) {
+  // Regression review (Layer-3 cost): every row used to be one full
+  // classification, so with the model-backed classifier registered a
+  // 400-row wiki_search made 400 model calls.
+  describe("list rows and the model-backed classifier", () => {
+    const TITLE_PAD = "a steady walk through brewing ratios and water temperature ".repeat(10);
+
+    async function seedWidgets(bundle: ReturnType<typeof makeBundle>, n: number): Promise<void> {
+      for (let i = 0; i < n; i++) {
+        await bundle.store.write({
+          slug: `widget-${String(i).padStart(2, "0")}`,
+          title: `Widget ${i} ${TITLE_PAD}`,
+          body: `widget number ${i}`,
+          tags: ["widget"],
+        });
+      }
+    }
+
+    function counting(flag?: string) {
+      const seen: string[] = [];
+      let inFlight = 0;
+      let most = 0;
+      const classifier = async (text: string) => {
+        seen.push(text);
+        inFlight++;
+        most = Math.max(most, inFlight);
+        await new Promise((r) => setTimeout(r, 2));
+        inFlight--;
+        return {
+          verdict:
+            flag !== undefined && text.includes(flag) ? ("malicious" as const) : ("clean" as const),
+        };
+      };
+      return { classifier, seen, most: () => most };
+    }
+
+    test("one model call per chunk of rows, not per row, and the rows keep their order", async () => {
+      const bundle = makeBundle();
+      await seedWidgets(bundle, 60);
+      const stub = counting();
+      setDefaultBoundaryLlmClassifier(stub.classifier);
+      try {
+        const out = String(await bundle.search.execute({ query: "widget" }));
+        const rows = out.split("\n").slice(1);
+        const rowChars = rows.reduce((n, r) => n + r.length, 0);
+        // Every row reached the model, inside a chunk no larger than the
+        // classifier analyses in full...
+        expect(stub.seen.every((t) => t.length <= 16 * 1024)).toBe(true);
+        for (const r of rows) {
+          const slug = /widget-\d\d/.exec(r)?.[0] ?? "?";
+          expect(`${slug}:${stub.seen.some((t) => t.includes(`${slug} (v1`))}`).toBe(
+            `${slug}:true`,
+          );
+        }
+        // ...in a handful of calls rather than sixty.
+        expect(stub.seen.length).toBeLessThanOrEqual(Math.ceil(rowChars / (16 * 1024)) + 1);
+        expect(stub.seen.length).toBeLessThan(10);
+        expect(stub.most()).toBeLessThanOrEqual(8);
+        const slugs = rows.map((l) => /widget-\d\d/.exec(l)?.[0]);
+        expect(slugs).toHaveLength(60);
+        const ranked = (await bundle.store.search("widget")).map((r) => r.slug);
+        expect(slugs).toEqual(ranked);
+      } finally {
+        setDefaultBoundaryLlmClassifier(undefined);
+      }
+    });
+
+    test("a row only the model flags is redacted alone; its chunk-mates render", async () => {
+      const bundle = makeBundle();
+      await seedWidgets(bundle, 60);
+      const marker = "zebra quartz lantern";
       await bundle.store.write({
-        slug: `widget-${String(i).padStart(2, "0")}`,
-        title: `Widget ${i}`,
-        body: `widget number ${i}`,
+        slug: "widget-flagged",
+        title: `Widget flagged ${marker}`,
+        body: "widget flagged",
         tags: ["widget"],
       });
-    }
-    let inFlight = 0;
-    let most = 0;
-    let calls = 0;
-    const classifier = async () => {
-      calls++;
-      inFlight++;
-      most = Math.max(most, inFlight);
-      await new Promise((r) => setTimeout(r, 5));
-      inFlight--;
-      return { verdict: "clean" as const };
-    };
-    setDefaultBoundaryLlmClassifier(classifier);
-    try {
-      const out = String(await bundle.search.execute({ query: "widget" }));
-      // Each row is still its own unit...
-      expect(calls).toBe(20);
-      // ...but a model-backed classifier is no longer awaited once per row
-      // in sequence, and never more than the cap at once.
-      expect(most).toBeGreaterThan(1);
-      expect(most).toBeLessThanOrEqual(8);
-      const slugs = out
-        .split("\n")
-        .slice(1)
-        .map((l) => /widget-\d\d/.exec(l)?.[0]);
-      expect(slugs).toHaveLength(20);
-      expect(slugs.every((slug) => slug !== undefined)).toBe(true);
-      // Same order the store ranked them in.
-      const ranked = (await bundle.store.search("widget")).map((r) => r.slug);
-      expect(slugs).toEqual(ranked);
-    } finally {
-      setDefaultBoundaryLlmClassifier(undefined);
-    }
+      const stub = counting(marker);
+      setDefaultBoundaryLlmClassifier(stub.classifier);
+      try {
+        const out = String(await bundle.search.execute({ query: "widget" }));
+        expect(out).not.toContain(marker);
+        expect(out).toMatch(/widget-flagged \(v1\) — \[tool output redacted/);
+        // Every other row still renders in full.
+        const rendered = out.split("\n").filter((l) => l.includes("brewing ratios"));
+        expect(rendered).toHaveLength(60);
+        // Chunks, plus one call per row of the one flagged chunk only.
+        const chunkCalls = stub.seen.filter((t) => t.split("\n").length > 1).length;
+        const rowCalls = stub.seen.length - chunkCalls;
+        expect(chunkCalls).toBeGreaterThan(1);
+        expect(rowCalls).toBeGreaterThan(0);
+        expect(rowCalls).toBeLessThan(61);
+        expect(stub.seen.length).toBeLessThan(40);
+        expect(stub.most()).toBeLessThanOrEqual(8);
+      } finally {
+        setDefaultBoundaryLlmClassifier(undefined);
+      }
+    });
+
+    test("an encoded payload is decoded on its own row, however many encoded neighbours it has", async () => {
+      const bundle = makeBundle();
+      // Each neighbour carries hex tokens the decoder spends its bounded
+      // attempts on when rows are classified together.
+      const hex = (i: number, j: number) =>
+        `${i.toString(16).padStart(4, "0")}${"ab".repeat(8)}${j}`;
+      for (let i = 0; i < 12; i++) {
+        await bundle.store.write({
+          slug: `digest-${String(i).padStart(2, "0")}`,
+          title: `Digest ${i} ${[0, 1, 2, 3, 4, 5, 6, 7, 8].map((j) => hex(i, j)).join(" ")}`,
+          body: "digest",
+          tags: ["digest"],
+        });
+      }
+      const encoded = Buffer.from(MALICIOUS_BODY).toString("base64");
+      // A long body ranks it last, after every neighbour's hex tokens.
+      await bundle.store.write({
+        slug: "digest-zz",
+        title: `Digest encoded ${encoded}`,
+        body: `digest ${"filler ".repeat(500)}`,
+        tags: ["digest"],
+      });
+      const out = String(await bundle.search.execute({ query: "digest" }));
+      expect((await bundle.store.search("digest")).at(-1)?.slug).toBe("digest-zz");
+      expect(out).not.toContain(encoded);
+      expect(out).toMatch(/digest-zz \(v1\) — \[tool output redacted/);
+      expect(out.split("\n").filter((l) => /digest-\d\d \(v1, published/.test(l))).toHaveLength(12);
+    });
   });
 
   // C154 (attacker review): a planted index.json put injection text in the
