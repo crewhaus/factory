@@ -83,11 +83,14 @@ describe("the compute roll-up says what its members read", () => {
     const reads = impureReads(packages);
     // tool-flow: Date.now() behind DeadlineCheck, ErrorClassify and
     // SequenceRun; tool-encode: the CSPRNG behind plain Uuid v4;
-    // tool-datetime: TZ (and NODE_ENV, its test gate) behind LocalTime.
+    // tool-datetime: TZ (and NODE_ENV, its test gate) behind LocalTime;
+    // tool-schema: performance.now() timing a caller's regex against its
+    // deadline (and a give-up), which the title states as the time limit.
     expect([...reads.keys()].sort()).toEqual([
       "@crewhaus/tool-datetime",
       "@crewhaus/tool-encode",
       "@crewhaus/tool-flow",
+      "@crewhaus/tool-schema",
     ]);
     // Every one of them is a real read, not a pattern that matches nothing.
     for (const count of reads.values()) expect(count).toBeGreaterThan(0);
@@ -96,6 +99,7 @@ describe("the compute roll-up says what its members read", () => {
   test("the title names each exception and no longer promises no I/O at all", () => {
     const title = CATEGORIES["compute"]?.title ?? "";
     expect(title).not.toContain("no I/O at all");
+    expect(title).toContain("a caller's regex runs under a time limit");
     const named = ["DeadlineCheck", "ErrorClassify", "SequenceRun", "Uuid", "LocalTime"];
     expect(named.filter((name) => !title.includes(name))).toEqual([]);
     const computeNames = toolsInCategory("compute").map((key) => BUILTIN_TOOLS[key]?.name);
