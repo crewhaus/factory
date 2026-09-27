@@ -373,7 +373,7 @@ describe("parseRemotes", () => {
         `persistent-https::https://oauth2:${glpat}@gitlab.com/o/r.git`,
         "persistent-https::https://***@gitlab.com/o/r.git",
       ],
-      [`gcrypt::https://u:pw@h.example/r.git`, "gcrypt::https://***@h.example/r.git"],
+      ["gcrypt::https://u:pw@h.example/r.git", "gcrypt::https://***@h.example/r.git"],
       [`codecommit::https://${tok}@h.example/r`, "codecommit::https://***@h.example/r"],
       ["gcrypt::rsync://h.example/r", "gcrypt::rsync://h.example/r"],
       ["persistent-https::https://h.example/r.git", "persistent-https::https://h.example/r.git"],
