@@ -95,6 +95,11 @@ export {
   SANDBOX_AVAILABLE_SYMBOL,
   unknownToolMessage,
 } from "./shapes";
+/**
+ * The case-insensitive edit distance compile's "did you mean" hints rank by,
+ * so `crewhaus tools show` can offer the same near miss for a typo.
+ */
+export { distance as nameDistance } from "./distance";
 
 export class ToolCategoryError extends CrewhausError {
   override readonly name = "ToolCategoryError";

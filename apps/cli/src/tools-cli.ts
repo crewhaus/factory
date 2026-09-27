@@ -35,6 +35,7 @@ import {
   type ToolShape,
   builtinToolsFor,
   checkBuiltinTool,
+  nameDistance,
   registeredToolName,
   toolConfigHint,
 } from "@crewhaus/tool-categories";
@@ -1801,9 +1802,12 @@ export function resolveToolKey(
 /**
  * Suggest near-miss keys for an unknown `tools show` argument, so a typo
  * gets a pointer instead of a bare "not found". Ranked before the limit is
- * applied — a same-letters match, then a prefix, then a substring either
- * way, then a shared first three letters; ties alphabetical — so the likely
- * tool is offered first rather than whichever the table lists first.
+ * applied — a same-letters match, then a key that starts with or contains
+ * the whole query, then a spelling within two edits (closest first:
+ * `gitcomit` → gitCommit, the key compile's own hint names), then a key the
+ * query contains (`gitStats` holds `stat`, but meant gitStatus), then a
+ * shared first three letters; ties alphabetical — so the likely tool is
+ * offered first rather than whichever the table lists first.
  */
 export function nearestToolKeys(
   key: string,
@@ -1811,20 +1815,27 @@ export function nearestToolKeys(
   limit = 3,
 ): ReadonlyArray<string> {
   const k = key.toLowerCase();
-  const rank = (candidate: string): number | undefined => {
+  const rank = (candidate: string): { readonly tier: number; readonly d: number } | undefined => {
     const c = candidate.toLowerCase();
-    if (c === k) return 0;
-    if (c.startsWith(k)) return 1;
-    if (c.includes(k) || k.includes(c)) return 2;
-    if (c.startsWith(k.slice(0, 3))) return 3;
+    if (c === k) return { tier: 0, d: 0 };
+    if (c.startsWith(k)) return { tier: 1, d: 0 };
+    if (c.includes(k)) return { tier: 2, d: 0 };
+    // The distance is at least the length difference, so only a candidate
+    // within two letters of the query's length is measured.
+    if (Math.abs(c.length - k.length) <= 2) {
+      const d = nameDistance(k, c);
+      if (d <= 2 && d < k.length) return { tier: 3, d };
+    }
+    if (k.includes(c)) return { tier: 4, d: 0 };
+    if (c.startsWith(k.slice(0, 3))) return { tier: 5, d: 0 };
     return undefined;
   };
   return known
     .flatMap((candidate) => {
       const r = rank(candidate);
-      return r === undefined ? [] : [{ candidate, r }];
+      return r === undefined ? [] : [{ candidate, ...r }];
     })
-    .sort((a, b) => a.r - b.r || a.candidate.localeCompare(b.candidate))
+    .sort((a, b) => a.tier - b.tier || a.d - b.d || a.candidate.localeCompare(b.candidate))
     .slice(0, limit)
     .map((x) => x.candidate);
 }

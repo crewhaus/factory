@@ -5,7 +5,7 @@
  * than the real builtin set (which `tool-registry.test.ts` covers).
  */
 import { describe, expect, test } from "bun:test";
-import { BUILTIN_TOOLS, categoriesForTool } from "@crewhaus/tool-categories";
+import { BUILTIN_TOOLS, categoriesForTool, unknownToolMessage } from "@crewhaus/tool-categories";
 import { z } from "zod";
 import {
   type ToolLike,
@@ -367,10 +367,36 @@ describe("nearestToolKeys", () => {
     expect(nearestToolKeys("gitcommit", git)[0]).toBe("gitCommit");
     expect(nearestToolKeys("GitCommit", git)[0]).toBe("gitCommit");
     expect(nearestToolKeys("gitc", git)).toEqual(["gitCommit", "gitDiff", "gitLog"]);
+    // A key holding the whole query outranks one the query merely holds.
     expect(nearestToolKeys("readit", ["xreaditx", "readItNow", "rea"])).toEqual([
       "readItNow",
-      "rea",
       "xreaditx",
+      "rea",
     ]);
+  });
+
+  // A typo that is neither a prefix nor a substring fell through to "shares
+  // the first three letters", alphabetically: `gitcomit` was offered gitAdd,
+  // gitApplyPatch, gitBlame, while compile's hint for the same typo names
+  // gitCommit.
+  test("a spelling within two edits ranks above a shared first three letters, closest first", () => {
+    const git = ["gitAdd", "gitApplyPatch", "gitBlame", "gitCommit", "gitCommits"];
+    expect(nearestToolKeys("gitcomit", git)).toEqual(["gitCommit", "gitCommits", "gitAdd"]);
+    expect(nearestToolKeys("GitComit", git)[0]).toBe("gitCommit");
+    // A short key inside a misspelt name is the weaker guess.
+    expect(nearestToolKeys("readFle", ["read", "readFile"])).toEqual(["readFile", "read"]);
+    // Rewriting every letter of a short query is not a near miss.
+    expect(nearestToolKeys("ab", ["xy"])).toEqual([]);
+  });
+
+  test("on the real table, the first suggestion for a typo is the key compile names", () => {
+    const keys = Object.keys(BUILTIN_TOOLS);
+    const got = ["gitcomit", "webfetc", "reed", "gitStats"].map((typo) => ({
+      typo,
+      first: nearestToolKeys(typo, keys)[0],
+      compileNames: unknownToolMessage(typo).match(/Did you mean "([^"]+)"/)?.[1],
+    }));
+    expect(got.filter((g) => g.first === undefined || g.first !== g.compileNames)).toEqual([]);
+    expect(got.map((g) => g.first)).toEqual(["gitCommit", "webFetch", "read", "gitStatus"]);
   });
 });
