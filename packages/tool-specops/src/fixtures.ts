@@ -114,6 +114,114 @@ export const CLI_SPEC_YAML = [
   "",
 ].join("\n");
 
+/**
+ * A workflow spec shaped like the demos starter: two agent steps, one with a
+ * tool grant, and a judge gate step after them (C126).
+ */
+export const WORKFLOW_SPEC_YAML = [
+  "name: hello-workflow",
+  "target: workflow",
+  "model: claude-sonnet-4-6",
+  "steps:",
+  "  - name: list-files",
+  "    instructions: |",
+  "      Use the bash tool to run `ls -la` and report what you find.",
+  "    max_tokens: 2048",
+  "    tools:",
+  "      - bash",
+  "  - name: summarize",
+  "    instructions: Summarise the listing. Do not call any tools.",
+  "  - name: gate",
+  "    kind: judge",
+  "    judge:",
+  "      criteria: the summary names the project type",
+  "      threshold: 0.7",
+  "",
+].join("\n");
+
+/** A workflow whose one step routes through a model pool (C126). */
+export const WORKFLOW_POOL_SPEC_YAML = [
+  "name: pooled-workflow",
+  "target: workflow",
+  "model: claude-sonnet-4-6",
+  "steps:",
+  "  - name: answer",
+  "    instructions: Answer the question.",
+  "    model_pool:",
+  "      candidates:",
+  "        - { model: claude-haiku-4-5, tags: [cheap] }",
+  "        - { model: claude-sonnet-4-6, tags: [balanced] }",
+  "",
+].join("\n");
+
+/** A graph spec shaped like the demos starter, with a human gate on one node (C126). */
+export const GRAPH_SPEC_YAML = [
+  "name: hello-graph",
+  "target: graph",
+  "model: claude-sonnet-4-6",
+  "entry: plan",
+  "nodes:",
+  "  plan:",
+  "    instructions: Produce a 3-bullet plan.",
+  "    max_tokens: 1024",
+  "  execute:",
+  "    instructions: Execute the plan.",
+  "    hitl:",
+  '      prompt: "Approve execute and continue?"',
+  "edges:",
+  "  - from: plan",
+  "    to: execute",
+  "",
+].join("\n");
+
+/** A crew spec with one role (C126). */
+export const CREW_SPEC_YAML = [
+  "name: hello-crew",
+  "target: crew",
+  "model: claude-sonnet-4-6",
+  "entry: lead",
+  "roles:",
+  "  lead:",
+  "    instructions: lead it",
+  "    max_tokens: 1024",
+  "",
+].join("\n");
+
+/** An onchain-game spec: `game` is admitted whole by the optimizer allow-list (C126). */
+export const ONCHAIN_GAME_SPEC_YAML = [
+  "name: hello-game",
+  "target: onchain-game",
+  "agent:",
+  "  model: claude-sonnet-4-6",
+  "  instructions: play well",
+  "chain:",
+  "  id: mainnet",
+  "  kind: evm",
+  "  rpcUrls:",
+  "    - $RPC_URL",
+  "  finality:",
+  "    kind: finalized",
+  "wallet:",
+  "  id: hot",
+  "  chainId: mainnet",
+  "  custody: local",
+  "  keyRef: $WALLET_KEY",
+  "game:",
+  "  contract:",
+  "    id: board",
+  "    chainId: mainnet",
+  '    address: "0x0000000000000000000000000000000000000002"',
+  "    abiRef: abi://erc721",
+  "  stateReader: getState",
+  "  moveTimeoutMs: 1000",
+  "  objective: win the game",
+  "transaction_policy:",
+  '  maxValueWei: "1000"',
+  "  allowedContracts:",
+  "    - board",
+  "",
+].join("\n");
+
 /** The same spec with the tunable leaves already present. */
 export const CLI_SPEC_TUNED_YAML = [
   "name: hello",

@@ -3271,6 +3271,7 @@
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "yaml": "^2.6.0",
         "zod": "^3.23.8",
       },
       "devDependencies": {
