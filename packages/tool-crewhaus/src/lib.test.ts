@@ -1452,6 +1452,106 @@ describe("redactArgs", () => {
     ]);
   });
 
+  // The ops review found each of these printed verbatim after the first
+  // 0.7.1 fix-up: a quoted `sh -c` assignment, a wallet seed phrase, a key
+  // in a URL PATH, curl's `-u user:password`, `--pw`/`--pwd`, a bare token
+  // fragment, and a few spellings of forms already caught.
+  test("a quoted assignment, a seed phrase and curl's -u user:password lose their secret", () => {
+    for (const [args, want] of [
+      [
+        ["-c", `API_KEY='${tok}' exec my-mcp-server`],
+        ["-c", "API_KEY='(redacted)' exec my-mcp-server"],
+      ],
+      [
+        ["-c", `API_KEY="${tok}" exec my-mcp-server`],
+        ["-c", 'API_KEY="(redacted)" exec my-mcp-server'],
+      ],
+      [
+        ["--mnemonic", "abandon ability able about above absent"],
+        ["--mnemonic", "(redacted)"],
+      ],
+      [
+        ["--seed-phrase", tok],
+        ["--seed-phrase", "(redacted)"],
+      ],
+      [
+        ["-e", `WALLET_MNEMONIC=${tok}`],
+        ["-e", "WALLET_MNEMONIC=(redacted)"],
+      ],
+      [
+        ["-u", `admin:${pw}`],
+        ["-u", "admin:(redacted)"],
+      ],
+      [[`--user=admin:${pw}`], ["--user=admin:(redacted)"]],
+      [
+        ["--pw", pw],
+        ["--pw", "(redacted)"],
+      ],
+      [
+        ["--pwd", pw],
+        ["--pwd", "(redacted)"],
+      ],
+      [
+        ["-c", `DB_PW=${pw} server`],
+        ["-c", "DB_PW=(redacted) server"],
+      ],
+      [[`admin:${pw}@db.internal:5432/prod`], ["admin:(redacted)@db.internal:5432/prod"]],
+      [[`-HAuthorization: Bearer ${hdr}`], ["-HAuthorization: (redacted)"]],
+      [[`--token:${tok}`], ["--token:(redacted)"]],
+      [
+        ["--config", `{'apiKey':'${tok}'}`],
+        ["--config", "{'apiKey':'(redacted)'}"],
+      ],
+    ] as const) {
+      expect({ args, out: redactArgs(args).args }).toEqual({ args, out: [...want] });
+    }
+  });
+
+  test("a key in a URL's path or a bare token fragment is withheld; the rest of the URL stays", () => {
+    const key = ["Xk9", "q2Lm", "Pz7Rt", "4Wv8"].join("");
+    for (const [arg, want] of [
+      [
+        `https://eth-mainnet.g.alchemy.com/v2/${key}`,
+        "https://eth-mainnet.g.alchemy.com/v2/(redacted)",
+      ],
+      [
+        `https://hooks.slack.com/services/T000/B000/${key}`,
+        "https://hooks.slack.com/services/T000/B000/(redacted)",
+      ],
+      [
+        `https://discord.com/api/webhooks/123/${key}`,
+        "https://discord.com/api/webhooks/123/(redacted)",
+      ],
+      [
+        `--rpc-url=https://mainnet.infura.io/v3/${key}`,
+        "--rpc-url=https://mainnet.infura.io/v3/(redacted)",
+      ],
+      [`https://h.example/sse#${key}`, "https://h.example/sse#(redacted)"],
+    ] as const) {
+      expect({ arg, out: redactArgs([arg]).args }).toEqual({ arg, out: [want] });
+    }
+  });
+
+  test("the new forms leave ordinary argv readable", () => {
+    const kept = [
+      // `-u` is python's unbuffered switch and docker's uid:gid.
+      "python",
+      "-u",
+      "server.py",
+      "-u",
+      "1000:1000",
+      // A pinned image is `name:tag@sha256:…`, not user:password@host.
+      "node:20@sha256:0123abcd",
+      // A version or a word in a URL path is not a key.
+      "https://api.example.com/v1/models/claude-sonnet",
+      "https://github.com/org/repo/blob/main/README.md#usage",
+      // Playwright's variables start with PW; they are not passwords.
+      "PW_TEST_HTML_REPORT_OPEN=never",
+      "RANDOM_SEED=42",
+    ];
+    expect(redactArgs(kept)).toEqual({ args: [...kept], redacted: 0 });
+  });
+
   test("an env reference in a header, and a URL with nothing to hide, stay as written", () => {
     const args = [
       "mcp-remote",
