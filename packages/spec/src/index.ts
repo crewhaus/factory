@@ -343,11 +343,16 @@ const codeExecutionConfigSchema = z
     // trusted operator config and is intentionally NOT settable from a spec.
     defaultTimeoutMs: z.number().int().positive().optional(),
     default_timeout_ms: z.number().int().positive().optional(),
+    // The longest timeout any call may run with — the model's `timeout`
+    // included (security-6#15). It can only narrow what a spec could already
+    // allow, so a spec may set it; 600 000 is the model's own limit.
+    maxTimeoutMs: z.number().int().positive().max(600_000).optional(),
+    max_timeout_ms: z.number().int().positive().max(600_000).optional(),
     warmPoolSize: z.number().int().nonnegative().optional(),
     warm_pool_size: z.number().int().nonnegative().optional(),
   })
   .strict(
-    `code-execution config may only set non-security knobs (defaultTimeoutMs, warmPoolSize); sandbox-boundary keys (${SANDBOX_OVERRIDE_KEYS.join(", ")}) are owned by trusted operator config and rejected from specs`,
+    `code-execution config may only set non-security knobs (defaultTimeoutMs, maxTimeoutMs, warmPoolSize); sandbox-boundary keys (${SANDBOX_OVERRIDE_KEYS.join(", ")}) are owned by trusted operator config and rejected from specs`,
   );
 
 const toolConfigBlock = z

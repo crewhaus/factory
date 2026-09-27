@@ -305,30 +305,165 @@ describe.if(posix)("spawnBounded", () => {
 });
 
 /**
+ * The hooks a caller uses when the child is only a client of the process
+ * doing the work (the sandbox's `docker run`): `onKill` to stop that work
+ * when the kill starts, and the chunk hooks to show output live.
+ */
+describe.if(posix)("spawnBounded hooks", () => {
+  /** A child that prints its pid first, so the chunk hook learns it. */
+  const PID_THEN = (rest: string) => ["sh", "-c", `echo $$; ${rest}`];
+
+  async function runWithHooks(
+    extra: Partial<Parameters<typeof spawnBounded>[0]>,
+    rest = "exec sleep 30",
+  ): Promise<{
+    r: Awaited<ReturnType<typeof spawnBounded>>;
+    reasons: string[];
+    aliveAtKill: boolean[];
+    pid: number;
+  }> {
+    const reasons: string[] = [];
+    const aliveAtKill: boolean[] = [];
+    let pid = 0;
+    let firstLine = "";
+    const r = await spawnBounded({
+      cmd: PID_THEN(rest),
+      timeoutMs: 60_000,
+      maxStdoutBytes: 1_000,
+      maxStderrBytes: 1_000,
+      killGraceMs: 500,
+      onStdoutChunk: (chunk) => {
+        if (pid !== 0) return;
+        firstLine += new TextDecoder().decode(chunk);
+        if (firstLine.includes("\n")) pid = Number(firstLine.split("\n")[0]);
+      },
+      onKill: (why) => {
+        reasons.push(why);
+        aliveAtKill.push(pid > 0 && alive(pid));
+      },
+      ...extra,
+    });
+    return { r, reasons, aliveAtKill, pid };
+  }
+
+  test("onKill is told the reason once, while the child is still there to stop", async () => {
+    const { r, reasons, aliveAtKill, pid } = await runWithHooks({ timeoutMs: 500 });
+    try {
+      expect(r.timedOut).toBe(true);
+      expect(reasons).toEqual(["timeout"]);
+      expect(aliveAtKill).toEqual([true]);
+      expect(await waitGone(pid, 10_000)).toBe(true);
+    } finally {
+      killGroup(r.pid);
+    }
+  }, 30_000);
+
+  test("onKill says abort for an abort and overflow for an overflow kill", async () => {
+    const controller = new AbortController();
+    const aborted = runWithHooks({ signal: controller.signal });
+    setTimeout(() => controller.abort(), 300);
+    const a = await aborted;
+    const o = await runWithHooks(
+      { onOverflow: "kill", maxStdoutBytes: 64 },
+      "while :; do echo yyyyyyyyyyyyyyyyyyyy; done",
+    );
+    try {
+      expect(a.reasons).toEqual(["abort"]);
+      expect(o.reasons).toEqual(["overflow"]);
+      expect(o.r.killedForOverflow).toBe(true);
+    } finally {
+      killGroup(a.r.pid);
+      killGroup(o.r.pid);
+    }
+  }, 30_000);
+
+  test("a command that exits on its own never calls onKill", async () => {
+    const { r, reasons } = await runWithHooks({}, "echo done");
+    expect(r.exitCode).toBe(0);
+    expect(reasons).toEqual([]);
+  }, 30_000);
+
+  test("an onKill that throws does not stop the kill", async () => {
+    const t0 = performance.now();
+    const { r, pid } = await runWithHooks({
+      timeoutMs: 300,
+      onKill: () => {
+        throw new Error("hook broke");
+      },
+    });
+    try {
+      expect(r.timedOut).toBe(true);
+      expect(await waitGone(pid, 10_000)).toBe(true);
+      expect(performance.now() - t0).toBeLessThan(20_000);
+    } finally {
+      killGroup(r.pid);
+    }
+  }, 30_000);
+
+  test("the chunk hooks see every byte, past the cap too, with running totals", async () => {
+    const seen = { out: 0, err: 0, lastOut: 0, lastErr: 0 };
+    const r = await spawnBounded({
+      cmd: ["sh", "-c", "head -c 100000 /dev/zero; head -c 5000 /dev/zero >&2"],
+      timeoutMs: 20_000,
+      maxStdoutBytes: 1_000,
+      maxStderrBytes: 10,
+      onStdoutChunk: (chunk, total) => {
+        seen.out += chunk.length;
+        seen.lastOut = total;
+      },
+      onStderrChunk: (chunk, total) => {
+        seen.err += chunk.length;
+        seen.lastErr = total;
+        throw new Error("a consumer's error must not stop the drain");
+      },
+    });
+    expect(seen).toEqual({ out: 100_000, err: 5_000, lastOut: 100_000, lastErr: 5_000 });
+    expect(r).toMatchObject({
+      stdoutBytes: 100_000,
+      stderrBytes: 5_000,
+      stdoutTruncated: true,
+      outputComplete: true,
+    });
+  }, 30_000);
+});
+
+/**
  * The host process is a separate Bun process running this child script, so
  * its signals and exit can be driven without touching the test runner.
  */
 describe.if(posix)("when the host goes away", () => {
   const spawnModule = join(import.meta.dir, "spawn.ts");
 
-  async function host(mode: "sigint" | "exit" | "own-handler"): Promise<{
+  type Mode = "sigint" | "exit" | "own-handler" | "once-handler" | "hook-exit" | "hook-sigint";
+
+  /** The marker an `addHostExitHook` hook writes, synchronously. */
+  const hookMarker = (mode: Mode): string => join(scratch, `${mode}.hook-ran`);
+
+  async function host(mode: Mode): Promise<{
     host: ReturnType<typeof Bun.spawn>;
     sleeper: number;
   }> {
     const pidFile = join(scratch, `${mode}.pid`);
     const script = join(scratch, `${mode}-host.ts`);
+    const exits = mode === "exit" || mode === "hook-exit";
     writeFileSync(
       script,
       [
-        `import { spawnBounded } from ${JSON.stringify(spawnModule)};`,
+        `import { addHostExitHook, spawnBounded } from ${JSON.stringify(spawnModule)};`,
         mode === "own-handler" ? `process.on("SIGINT", () => console.log("host handles it"));` : "",
+        mode === "once-handler"
+          ? `process.once("SIGINT", () => console.log("host handles it once"));`
+          : "",
+        mode.startsWith("hook-")
+          ? `addHostExitHook(() => require("node:fs").writeFileSync(${JSON.stringify(hookMarker(mode))}, "ran"));`
+          : "",
         `void spawnBounded({ cmd: ["sh", "-c", ${JSON.stringify(`echo $$ > ${pidFile}; exec sleep 60`)}], timeoutMs: 120_000, maxStdoutBytes: 100, maxStderrBytes: 100 });`,
-        mode === "exit"
+        exits
           ? `const t = setInterval(() => { if (require("node:fs").existsSync(${JSON.stringify(pidFile)})) process.exit(0); }, 20);`
           : "setInterval(() => {}, 1000);",
       ].join("\n"),
     );
-    const proc = Bun.spawn([process.execPath, script], { stdout: "ignore", stderr: "ignore" });
+    const proc = Bun.spawn([process.execPath, script], { stdout: "pipe", stderr: "ignore" });
     const until = performance.now() + 15_000;
     while (!existsSync(pidFile) || readFileSync(pidFile, "utf8").trim() === "") {
       if (performance.now() > until) throw new Error("the host never started its command");
@@ -357,6 +492,73 @@ describe.if(posix)("when the host goes away", () => {
       await h.exited;
       expect(h.exitCode).toBe(0);
       expect(await waitGone(sleeper, 10_000)).toBe(true);
+    } finally {
+      if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
+    }
+  }, 30_000);
+
+  // eval-runner's pattern. The once-wrapper removes itself before later
+  // listeners run, so a listener added after it counted the host as having
+  // no handler of its own, killed the group and re-raised: the host died.
+  test("a host whose handler is process.once keeps its policy too", async () => {
+    const { host: h, sleeper } = await host("once-handler");
+    try {
+      await Bun.sleep(100);
+      h.kill("SIGINT");
+      await Bun.sleep(500);
+      expect({ exitCode: h.exitCode, signal: h.signalCode }).toEqual({
+        exitCode: null,
+        signal: null,
+      });
+      expect(alive(sleeper)).toBe(true);
+    } finally {
+      h.kill("SIGKILL");
+      await h.exited;
+      if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
+    }
+    expect(await new Response(h.stdout).text()).toContain("host handles it once");
+  }, 30_000);
+
+  test("addHostExitHook: process.exit runs the hook, after the group is killed", async () => {
+    const { host: h, sleeper } = await host("hook-exit");
+    try {
+      await h.exited;
+      expect(h.exitCode).toBe(0);
+      expect(existsSync(hookMarker("hook-exit"))).toBe(true);
+      expect(await waitGone(sleeper, 10_000)).toBe(true);
+    } finally {
+      if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
+    }
+  }, 30_000);
+
+  test("addHostExitHook: a hook registered while nothing runs is still run on exit", async () => {
+    const marker = join(scratch, "hook-only.hook-ran");
+    const script = join(scratch, "hook-only-host.ts");
+    writeFileSync(
+      script,
+      [
+        `import { addHostExitHook } from ${JSON.stringify(spawnModule)};`,
+        `const remove = addHostExitHook(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran"));`,
+        `addHostExitHook(() => require("node:fs").writeFileSync(${JSON.stringify(`${marker}.removed`)}, "ran"))();`,
+        "setTimeout(() => process.exit(0), 20);",
+      ].join("\n"),
+    );
+    const h = Bun.spawn([process.execPath, script], { stdout: "ignore", stderr: "ignore" });
+    await h.exited;
+    expect(h.exitCode).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+    // Unregistered, it does not run.
+    expect(existsSync(`${marker}.removed`)).toBe(false);
+  }, 30_000);
+
+  test("addHostExitHook: a SIGINT the host does not handle runs the hook before the host dies of it", async () => {
+    const { host: h, sleeper } = await host("hook-sigint");
+    try {
+      await Bun.sleep(100);
+      h.kill("SIGINT");
+      await h.exited;
+      expect(h.signalCode).toBe("SIGINT");
+      expect(existsSync(hookMarker("hook-sigint"))).toBe(true);
     } finally {
       if (alive(sleeper)) process.kill(sleeper, "SIGKILL");
     }

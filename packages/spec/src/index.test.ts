@@ -213,6 +213,20 @@ describe("tool_config code-execution sandbox-override hardening", () => {
     });
   }
 
+  // security-6#15: the operator's cap on the model's `timeout`.
+  test("max_timeout_ms is a code-execution knob a spec may set, up to the model's own limit", () => {
+    for (const cfgKey of ["codeExecution", "python", "Shell"]) {
+      const spec = parseSpec(specWith(cfgKey, "max_timeout_ms: 120000\n    maxTimeoutMs: 60000"));
+      if (spec.target !== "cli") expect.unreachable();
+      expect(spec.tool_config?.[cfgKey]).toEqual({ max_timeout_ms: 120000, maxTimeoutMs: 60000 });
+    }
+    for (const bad of ["0", "600001", "-5", "1.5", '"60000"']) {
+      expect(() => parseSpec(specWith("python", `max_timeout_ms: ${bad}`))).toThrow(
+        /tool_config\.python\.max_timeout_ms/,
+      );
+    }
+  });
+
   test("does not constrain non-code-execution tool configs (fetch stays opaque)", () => {
     const spec = parseSpec(
       "\nname: hello\ntarget: cli\nagent:\n  model: m\n  instructions: i\ntools:\n  - fetch\ntool_config:\n  fetch:\n    allowedImages:\n      - anything\n    backend: whatever\n",

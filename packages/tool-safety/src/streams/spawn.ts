@@ -27,7 +27,9 @@ import { byteBudget, deadlineMs, graceMs, optionalByteBudget } from "./limits";
  * for that signal — the host then dies of it as it would have. A host that
  * handles those signals itself keeps that policy; it should pass the turn's
  * abort signal to every call, and its own exit path is covered by the exit
- * hook. {@link setHostExitCleanup} turns this off.
+ * hook. A child that is only a client of the process doing the work (a
+ * `docker run` CLI) registers {@link addHostExitHook} for the work itself.
+ * {@link setHostExitCleanup} turns all of this off.
  *
  * POSIX only for the group kill. On Windows the tree is stopped with
  * `taskkill /T /F`, best effort, and there is no host-exit cleanup.
@@ -73,6 +75,22 @@ export type SpawnBoundedOptions = {
   readonly drainGraceMs?: number;
   /** After SIGKILL, how long to wait for the child to be reaped before giving up on it. Default 1000. */
   readonly reapGraceMs?: number;
+  /**
+   * Called once when a timeout, an abort or an overflow starts the kill,
+   * just before the group is signalled. For a child that is only a client
+   * of the process doing the work, this is where that work is stopped: a
+   * `docker run` CLI can be killed while its container runs on, so the
+   * sandbox runs `docker kill <name>` from here. Not awaited; a caller that
+   * starts something waits for it itself. A throw is ignored.
+   */
+  readonly onKill?: (reason: "timeout" | "abort" | "overflow") => void;
+  /**
+   * Each stdout chunk as it arrives, before the cap drops any of it, with
+   * the running byte total: for a caller that shows the output live and
+   * stops at its own cap. A throw is ignored.
+   */
+  readonly onStdoutChunk?: (chunk: Uint8Array, totalBytes: number) => void;
+  readonly onStderrChunk?: (chunk: Uint8Array, totalBytes: number) => void;
 };
 
 export type SpawnBoundedResult = {
@@ -160,11 +178,17 @@ function killTree(pid: number, sig: "SIGTERM" | "SIGKILL", fallback: (s: string)
 
 /** Process groups of commands still running, or still being killed. */
 const liveGroups = new Set<number>();
+/** Synchronous cleanups to run if the host goes away (see {@link addHostExitHook}). */
+const exitHooks = new Set<() => void>();
 let cleanupEnabled = true;
 let hooksInstalled = false;
 const HOST_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
-function killLiveGroups(): void {
+/**
+ * The host is going away: SIGKILL every live group first, so nothing they
+ * run can start more work, then run the registered hooks, each on its own.
+ */
+function cleanUpForHostExit(): void {
   for (const pid of liveGroups) {
     try {
       process.kill(-pid, "SIGKILL");
@@ -173,10 +197,19 @@ function killLiveGroups(): void {
     }
   }
   liveGroups.clear();
+  const hooks = [...exitHooks];
+  exitHooks.clear();
   uninstallHooks();
+  for (const hook of hooks) {
+    try {
+      hook();
+    } catch {
+      // One hook's failure must not stop the others.
+    }
+  }
 }
 
-/** Track a group; the host hooks exist only while some group is tracked. */
+/** Track a group; the host hooks exist only while some group or hook is registered. */
 function track(group: number): void {
   if (isWindows) return;
   liveGroups.add(group);
@@ -185,16 +218,19 @@ function track(group: number): void {
 
 function untrack(group: number): void {
   liveGroups.delete(group);
-  if (liveGroups.size === 0) uninstallHooks();
+  if (liveGroups.size === 0 && exitHooks.size === 0) uninstallHooks();
 }
 
-const onHostExit = (): void => killLiveGroups();
+const onHostExit = (): void => cleanUpForHostExit();
 
 function onHostSignal(sig: NodeJS.Signals): void {
   // Another listener means the host has its own policy for this signal
-  // (a first Ctrl-C that only aborts the turn, say). Leave it alone.
+  // (a first Ctrl-C that only aborts the turn, say). Leave it alone. This
+  // listener is PREPENDED, so it runs first: a host's `process.once`
+  // handler is still registered when it is counted — run after it, the
+  // once-wrapper has already removed itself and the host looked handler-less.
   if (process.listenerCount(sig) > 1) return;
-  killLiveGroups();
+  cleanUpForHostExit();
   // Die of the signal, as the host would have without this listener.
   process.kill(process.pid, sig);
 }
@@ -203,7 +239,7 @@ function installHooks(): void {
   if (hooksInstalled || !cleanupEnabled || isWindows) return;
   hooksInstalled = true;
   process.on("exit", onHostExit);
-  for (const sig of HOST_SIGNALS) process.on(sig, onHostSignal);
+  for (const sig of HOST_SIGNALS) process.prependListener(sig, onHostSignal);
 }
 
 function uninstallHooks(): void {
@@ -214,14 +250,37 @@ function uninstallHooks(): void {
 }
 
 /**
- * Whether the process groups of commands still running are killed when the
- * host exits (default true; see the module comment). The listeners exist
- * only while a command runs. Turning this off removes them; turning it on
- * again installs them at the next spawn.
+ * Registers synchronous work to do if the host goes away while something is
+ * in flight: on `process.exit` (or the end of the event loop), and on
+ * SIGINT, SIGTERM or SIGHUP when the host does not handle that signal
+ * itself — the same moments a live group is killed, and after it is. For
+ * work a killed child cannot stop on its own: the sandbox removes the
+ * containers its `docker run` clients started. The hook must be synchronous
+ * and bounded (`Bun.spawnSync` with a `timeout`); a throw is ignored. It
+ * runs at most once. Returns a function that unregisters it. POSIX only,
+ * like the rest of the host-exit cleanup; a no-op while
+ * {@link setHostExitCleanup} is off.
+ */
+export function addHostExitHook(hook: () => void): () => void {
+  if (isWindows) return () => undefined;
+  exitHooks.add(hook);
+  installHooks();
+  return () => {
+    exitHooks.delete(hook);
+    if (liveGroups.size === 0 && exitHooks.size === 0) uninstallHooks();
+  };
+}
+
+/**
+ * Whether the process groups of commands still running are killed, and the
+ * {@link addHostExitHook} hooks run, when the host exits (default true; see
+ * the module comment). The listeners exist only while a command runs or a
+ * hook is registered. Turning this off removes them; turning it on again
+ * installs them at once if anything is registered, else at the next spawn.
  */
 export function setHostExitCleanup(enabled: boolean): void {
   cleanupEnabled = enabled;
-  if (enabled && liveGroups.size > 0) installHooks();
+  if (enabled && (liveGroups.size > 0 || exitHooks.size > 0)) installHooks();
   if (!enabled) uninstallHooks();
 }
 
@@ -316,9 +375,14 @@ export async function spawnBounded(options: SpawnBoundedOptions): Promise<SpawnB
       // Already gone.
     }
   };
-  const beginKill = (): void => {
+  const beginKill = (reason: "timeout" | "abort" | "overflow"): void => {
     if (killStarted) return;
     killStarted = true;
+    try {
+      options.onKill?.(reason);
+    } catch {
+      // The caller's hook must not stop the kill.
+    }
     killTree(group, "SIGTERM", signalChild);
     // Not cleared when the child exits: another member of its group may
     // ignore SIGTERM, and "then SIGKILL" is the promise. The timer is
@@ -335,31 +399,50 @@ export async function spawnBounded(options: SpawnBoundedOptions): Promise<SpawnB
   };
 
   const drainStop = new AbortController();
-  const collect = (stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<CollectResult> =>
+  const collect = (
+    stream: ReadableStream<Uint8Array>,
+    maxBytes: number,
+    onChunk: ((chunk: Uint8Array, totalBytes: number) => void) | undefined,
+  ): Promise<CollectResult> =>
     collectBounded(stream, {
       maxBytes,
       tailBytes,
       signal: drainStop.signal,
-      onChunk: (_chunk, total) => {
+      onChunk: (chunk, total) => {
+        if (onChunk !== undefined) {
+          try {
+            onChunk(chunk, total);
+          } catch {
+            // A consumer's error must not stop the drain.
+          }
+        }
         if (total > maxBytes && options.onOverflow === "kill" && !killStarted) {
           killedForOverflow = true;
-          beginKill();
+          beginKill("overflow");
         }
       },
     });
-  const stdoutP = collect(proc.stdout as ReadableStream<Uint8Array>, maxStdoutBytes);
-  const stderrP = collect(proc.stderr as ReadableStream<Uint8Array>, maxStderrBytes);
+  const stdoutP = collect(
+    proc.stdout as ReadableStream<Uint8Array>,
+    maxStdoutBytes,
+    options.onStdoutChunk,
+  );
+  const stderrP = collect(
+    proc.stderr as ReadableStream<Uint8Array>,
+    maxStderrBytes,
+    options.onStderrChunk,
+  );
 
   const deadline =
     timeoutDelay === undefined
       ? undefined
       : setTimeout(() => {
           timedOut = true;
-          beginKill();
+          beginKill("timeout");
         }, timeoutDelay);
   const unsubscribe = onAbort(options.signal, () => {
     aborted = true;
-    beginKill();
+    beginKill("abort");
   });
 
   let abandoned = false;

@@ -186,6 +186,32 @@ describe("what the compile refuses, and what it warns about", () => {
       "agent.model_pool.candidates[0].tool_config.http and agent.model_pool.candidates[0].tool_config.HttpRequest both configure httpRequest",
     );
   });
+
+  test("a candidate's code-execution cap under one tool's key, with the others listed, is a warning", () => {
+    const pool = (block: string): string =>
+      cli(
+        [
+          "  model_pool:",
+          "    candidates:",
+          "      - model: claude-haiku-4-5",
+          `        tool_config: ${block}`,
+          "      - model: claude-opus-4-8",
+          "tools: [python, shell]",
+          "",
+        ].join("\n"),
+      );
+    const partial = (block: string) =>
+      compile(pool(block)).warnings.filter((w) => w.code === "tool-config-partial-cap");
+    expect(partial("{ python: { max_timeout_ms: 1000 } }")).toEqual([
+      {
+        code: "tool-config-partial-cap",
+        path: "agent.model_pool.candidates[0].tool_config.python",
+        message:
+          "caps Python only: a model pool candidate's block applies to the tool it is written under, so Shell keeps the boot cap for this candidate. To cap all of them, write it under agent.model_pool.candidates[0].tool_config.codeExecution.",
+      },
+    ]);
+    expect(partial("{ codeExecution: { max_timeout_ms: 1000 } }")).toEqual([]);
+  });
 });
 
 describe("$VAR in tool_config", () => {

@@ -258,6 +258,42 @@ describe("a model pool candidate's block", () => {
     expect(check.unused.map((u) => u.path)).toEqual([
       "agent.model_pool.candidates[0].tool_config.fetch",
     ]);
+    expect(check.partialCaps).toEqual([]);
+  });
+
+  // A candidate's `python.max_timeout_ms` capped Python calls only, though
+  // the same block at boot caps all three code tools: the model could move
+  // to Shell to run past the candidate's cap.
+  test("a cap written for one tool of a shared registration, with others listed, is named", () => {
+    const at = "agent.model_pool.candidates[0].tool_config";
+    const tools = ["python", "javascript", "shell"];
+    const partial = (blocks: Record<string, unknown>, listed: ReadonlyArray<string> = tools) =>
+      checkCandidateToolConfigs(listed, blocks, at).partialCaps;
+    expect(partial({ python: { max_timeout_ms: 1_000 } })).toEqual([
+      {
+        path: `${at}.python`,
+        message: `caps Python only: a model pool candidate's block applies to the tool it is written under, so JavaScript, Shell keep the boot cap for this candidate. To cap all of them, write it under ${at}.codeExecution.`,
+      },
+    ]);
+    expect(
+      partial({ Shell: { maxTimeoutMs: 1_000 } }, ["python", "shell"]).map((n) => n.message),
+    ).toEqual([
+      `caps Shell only: a model pool candidate's block applies to the tool it is written under, so Python keeps the boot cap for this candidate. To cap all of them, write it under ${at}.codeExecution.`,
+    ]);
+    // Every listed tool capped, the family key used, one tool listed, or a
+    // knob that is not a cap: nothing to say.
+    for (const blocks of [
+      {
+        python: { max_timeout_ms: 1 },
+        javascript: { max_timeout_ms: 2 },
+        shell: { max_timeout_ms: 3 },
+      },
+      { python: { max_timeout_ms: 1 }, codeExecution: { max_timeout_ms: 5 } },
+      { python: { default_timeout_ms: 1_000 } },
+    ]) {
+      expect(partial(blocks)).toEqual([]);
+    }
+    expect(partial({ python: { max_timeout_ms: 1 } }, ["python", "read"])).toEqual([]);
   });
 });
 

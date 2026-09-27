@@ -1,6 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { OptimizerState } from "@crewhaus/prompt-optimizer";
-import type { Sandbox, SandboxExecOptions, SandboxExecResult } from "@crewhaus/sandbox";
+import {
+  type Sandbox,
+  type SandboxExecOptions,
+  type SandboxExecResult,
+  createSandbox,
+} from "@crewhaus/sandbox";
 import {
   HarnessSynthesizerError,
   VerifierMutationProvider,
@@ -9,7 +14,13 @@ import {
   synthesizeVerifier,
   thompsonPick,
 } from "./index";
-import { VERIFIER_SENTINEL, evalVerifierPayload, runVerifierInSandbox } from "./sandboxed-eval";
+import {
+  VERIFIER_MAX_OUTPUT_BYTES,
+  VERIFIER_SENTINEL,
+  evalVerifierPayload,
+  runVerifierInSandbox,
+  verifierOutputCap,
+} from "./sandboxed-eval";
 
 /**
  * Test double for `@crewhaus/sandbox`. Reports `backend: "docker"` so it
@@ -417,6 +428,184 @@ describe("parseHarnessResult edge cases (via runVerifierInSandbox)", () => {
     );
   });
 });
+
+// security-6#8: the verifier's stdout was buffered whole on the host — 256 MiB
+// of output printed by untrusted verifier code cost 2.6 GiB of host memory.
+describe("verifier output is capped", () => {
+  const scored = (stdout: string, dropped: number): SandboxExecResult => ({
+    stdout,
+    stderr: "",
+    exitCode: 0,
+    timedOut: false,
+    durationMs: 1,
+    stdoutBytes: Buffer.byteLength(stdout) + dropped,
+    stdoutDroppedBytes: dropped,
+  });
+
+  test("every run asks the sandbox for a cap: 1 MiB for an ordinary sample set", async () => {
+    const sandbox = new FakeDockerSandbox();
+    await runVerifier("return true", evenSamples, { sandbox });
+    expect(VERIFIER_MAX_OUTPUT_BYTES).toBe(1 << 20);
+    expect(sandbox.calls[0]?.maxOutputBytes).toBe(VERIFIER_MAX_OUTPUT_BYTES);
+  });
+
+  // A fixed 1 MiB cap kept 512 KiB of the end, and the result line of a
+  // quiet verifier over ~180 000 samples is longer than that: the line was
+  // cut and a run that flooded nothing failed.
+  test("the cap grows with the sample count, so the kept end always holds the longest result line", () => {
+    expect(verifierOutputCap(0)).toBe(VERIFIER_MAX_OUTPUT_BYTES);
+    expect(verifierOutputCap(50_000)).toBe(VERIFIER_MAX_OUTPUT_BYTES);
+    for (const n of [200_000, 1_000_000]) {
+      const longest = Buffer.byteLength(
+        `${VERIFIER_SENTINEL}${JSON.stringify({ verdicts: new Array(n).fill(false), errors: n })}`,
+      );
+      // The sandbox keeps floor(cap / 2) bytes of the end.
+      const keptEnd = Math.floor(verifierOutputCap(n) / 2);
+      expect({ n, fits: keptEnd >= longest + 60_000 }).toEqual({ n, fits: true });
+    }
+  });
+
+  test("the result line, written last, survives output dropped before it", async () => {
+    const stdout = `${"junk".repeat(1000)}\n[stdout truncated: 5000000 bytes dropped]\n${"more".repeat(10)}${VERIFIER_SENTINEL}${JSON.stringify({ verdicts: [true], errors: 0 })}`;
+    const r = await runVerifierInSandbox(
+      new ScriptedSandbox(scored(stdout, 5_000_000)),
+      "x",
+      ioSamples,
+    );
+    expect(r).toEqual({ verdicts: [true], heuristic: 1, errors: 0 });
+  });
+
+  test("output that pushed the result line out fails closed and says why", async () => {
+    const stdout = `${"junk".repeat(1000)}\n[stdout truncated: 5000000 bytes dropped]\n${"junk".repeat(10)}`;
+    await expect(
+      runVerifierInSandbox(new ScriptedSandbox(scored(stdout, 5_000_000)), "x", ioSamples),
+    ).rejects.toThrow(
+      /verifier output passed the 1048576-byte cap and the result line was not in the part kept/,
+    );
+  });
+});
+
+/**
+ * The real sandbox's capped read, with no daemon: the noop backend runs the
+ * harness under this Bun (`bun -e` reads the same script `node -e` does),
+ * and reports `docker` so runVerifier's isolation gate lets it through. The
+ * verifier strings here are trusted.
+ */
+function hostRunSandbox(): Sandbox & { readonly caps: number[] } {
+  const inner = createSandbox({ backend: "noop" });
+  const caps: number[] = [];
+  return {
+    backend: "docker",
+    caps,
+    exec: (opts) => {
+      caps.push(opts.maxOutputBytes ?? -1);
+      return inner.exec({ ...opts, argv: [process.execPath, "-e", opts.argv[2] ?? ""] });
+    },
+    close: () => inner.close(),
+  };
+}
+
+describe.if(process.platform !== "win32")("a large sample set is scored whole", () => {
+  test("a quiet verifier over 250 000 samples, whose result line alone passes 512 KiB", async () => {
+    const samples = Array.from({ length: 250_000 }, (_, i) => ({
+      input: i,
+      output: i,
+      expected: i % 7 !== 0,
+    }));
+    const sandbox = hostRunSandbox();
+    const r = await runVerifier("return input % 7 !== 0;", samples, { sandbox, timeoutMs: 60_000 });
+    expect(sandbox.caps[0]).toBe(verifierOutputCap(250_000));
+    expect({ heuristic: r.heuristic, verdicts: r.verdicts.length }).toEqual({
+      heuristic: 1,
+      verdicts: 250_000,
+    });
+  }, 60_000);
+
+  test("a verifier that logs every sample before its result is scored too", async () => {
+    const samples = Array.from({ length: 120_000 }, (_, i) => ({
+      input: i,
+      output: i,
+      expected: false,
+    }));
+    const sandbox = hostRunSandbox();
+    const r = await runVerifier("console.log('checking sample', input); return false;", samples, {
+      sandbox,
+      timeoutMs: 60_000,
+    });
+    expect({ heuristic: r.heuristic, verdicts: r.verdicts.length }).toEqual({
+      heuristic: 1,
+      verdicts: 120_000,
+    });
+  }, 60_000);
+});
+
+/** Where a daemon and node:22-alpine are already here (never pulls). */
+function liveDocker(): boolean {
+  if (process.env["CREWHAUS_VERIFIER_LIVE_DOCKER"] !== "1") return false;
+  try {
+    return (
+      Bun.spawnSync(["docker", "image", "inspect", "node:22-alpine"], {
+        stdout: "ignore",
+        stderr: "ignore",
+        timeout: 5_000,
+      }).exitCode === 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+// security-12#5: a verifier stuck in a loop held runVerifier until it ended on
+// its own, and its container outlived the timeout.
+describe.if(liveDocker())(
+  "runVerifier against a real daemon (CREWHAUS_VERIFIER_LIVE_DOCKER=1)",
+  () => {
+    let names: string[] = [];
+    let spawnSpy: ReturnType<typeof spyOn> | undefined;
+    beforeEach(() => {
+      names = [];
+      const orig = Bun.spawn.bind(Bun);
+      spawnSpy = spyOn(Bun, "spawn").mockImplementation(((
+        argv: readonly string[],
+        options: Record<string, unknown>,
+      ) => {
+        const at = argv.indexOf("--name");
+        if (argv[1] === "run" && at > 0) names.push(argv[at + 1] as string);
+        return orig([...argv], options);
+        // biome-ignore lint/suspicious/noExplicitAny: pass-through spy on Bun.spawn
+      }) as any);
+    });
+    afterEach(() => {
+      spawnSpy?.mockRestore();
+      for (const name of names) {
+        Bun.spawnSync(["docker", "rm", "-f", name], { stdout: "ignore", stderr: "ignore" });
+      }
+    });
+
+    test("a verifier that never returns is stopped at the timeout, container and all", async () => {
+      const t0 = performance.now();
+      await expect(
+        runVerifier("while (true) {}", evenSamples, {
+          sandbox: createSandbox({ backend: "docker" }),
+          timeoutMs: 1_000,
+        }),
+      ).rejects.toThrow(/timed out after 1000ms/);
+      expect(performance.now() - t0).toBeLessThan(20_000);
+      expect(names).toHaveLength(1);
+      const ps = Bun.spawnSync(["docker", "ps", "-a", "-q", "--filter", `name=${names[0]}`]);
+      expect(new TextDecoder().decode(ps.stdout).trim()).toBe("");
+    }, 30_000);
+
+    test("a verifier that floods stdout is still scored, from a capped read", async () => {
+      const r = await runVerifier(
+        "process.stdout.write('x'.repeat(3000000)); return typeof output === 'number' && output % 2 === 0",
+        evenSamples,
+        { sandbox: createSandbox({ backend: "docker" }), timeoutMs: 20_000 },
+      );
+      expect(r.heuristic).toBe(1);
+    }, 30_000);
+  },
+);
 
 describe("runVerifier (live docker — gated by CREWHAUS_VERIFIER_LIVE_DOCKER=1)", () => {
   test("scores a basic verifier in a real container", async () => {

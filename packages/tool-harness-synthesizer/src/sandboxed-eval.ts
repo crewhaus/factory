@@ -10,6 +10,12 @@
  * `no-new-privileges`) and scores the returned verdicts on the host —
  * the container never receives the `expected` labels.
  *
+ * The wall-clock kill stops the container itself (the sandbox runs
+ * `docker kill` on a timeout), and the verifier's output is capped per
+ * stream as it arrives ({@link verifierOutputCap}), so code that loops or
+ * prints without end costs neither a stuck call nor host memory
+ * (security-6#0, security-6#8).
+ *
  * The container runs `VERIFIER_HARNESS` (a fixed `node -e` script). The
  * untrusted `code` is delivered as STDIN DATA, never interpolated into
  * that script string — so it cannot break out of the harness.
@@ -22,6 +28,35 @@ export const VERIFIER_SENTINEL = "__CREWHAUS_VERIFIER__";
 
 const VERIFIER_IMAGE = "node:22-alpine";
 const DEFAULT_TIMEOUT_MS = 10_000;
+
+/**
+ * The least verifier output (per stream) kept on the host; see
+ * {@link verifierOutputCap} for a large sample set.
+ */
+export const VERIFIER_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/** The most one sample adds to the result line: `false,`. */
+const RESULT_BYTES_PER_SAMPLE = 6;
+/** Room in the kept end for the result line's frame (sentinel, keys, error count) and more. */
+const RESULT_MARGIN_BYTES = 64 * 1024;
+
+/**
+ * Bytes of verifier stdout (and of stderr) kept on the host for a run over
+ * `sampleCount` samples. The harness writes its one result line last, and
+ * the sandbox keeps the END of a stream that overflows (half the cap), so
+ * the result survives anything the verifier prints first — as long as that
+ * half can hold the whole line. The line grows with the sample count, so
+ * the cap does too: never less than {@link VERIFIER_MAX_OUTPUT_BYTES}, and
+ * always twice the longest line the samples can produce plus a margin. A
+ * fixed cap cut the line of a quiet verifier over about 180 000 samples and
+ * failed a run that had not flooded anything.
+ */
+export function verifierOutputCap(sampleCount: number): number {
+  return Math.max(
+    VERIFIER_MAX_OUTPUT_BYTES,
+    2 * (RESULT_BYTES_PER_SAMPLE * sampleCount + RESULT_MARGIN_BYTES),
+  );
+}
 
 /** Input/output pair handed to the verifier (labels stripped). */
 type VerifierIO = { readonly input: unknown; readonly output: unknown };
@@ -152,11 +187,13 @@ export async function runVerifierInSandbox(
   }
 
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxOutputBytes = verifierOutputCap(samples.length);
   const result = await sandbox.exec({
     image: opts.image ?? VERIFIER_IMAGE,
     argv: ["node", "-e", VERIFIER_HARNESS],
     stdin,
     timeoutMs,
+    maxOutputBytes,
   });
 
   if (result.timedOut) {
@@ -164,6 +201,11 @@ export async function runVerifierInSandbox(
   }
   const parsed = parseHarnessResult(result.stdout);
   if (parsed === undefined) {
+    if ((result.stdoutDroppedBytes ?? 0) > 0) {
+      throw new HarnessSynthesizerError(
+        `verifier output passed the ${maxOutputBytes}-byte cap and the result line was not in the part kept: the verifier printed after its result, or never wrote one`,
+      );
+    }
     if (result.exitCode !== 0) {
       throw new HarnessSynthesizerError(
         `verifier harness exited ${result.exitCode}: ${result.stderr.slice(-500)}`,
