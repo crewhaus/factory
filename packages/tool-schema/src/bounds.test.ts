@@ -406,6 +406,31 @@ describe("enum candidates and patternProperties tests cost what they do", () => 
     );
     expect(listed).toBeLessThanOrEqual(3);
   });
+
+  test("an object with no keys does no work per pattern", () => {
+    // The compiled list was copied into a fresh array for every object, so
+    // 1,000 empty objects under 1,000 patterns did a million uncharged steps
+    // (4,000 x 4,000 took 144 ms and grew with the product). Counting the
+    // array writes makes that visible without timing anything.
+    const map = Object.fromEntries(Array.from({ length: 1_000 }, (_, i) => [`^z${i}$`, true]));
+    const objects = Array.from({ length: 1_000 }, () => ({}));
+    const push = Array.prototype.push;
+    let pushes = 0;
+    Array.prototype.push = function (this: unknown[], ...items: unknown[]) {
+      pushes += 1;
+      return push.apply(this, items);
+    };
+    let valid: boolean;
+    try {
+      valid = validateValue(objects, { type: "array", items: { patternProperties: map } }).valid;
+    } finally {
+      Array.prototype.push = push;
+    }
+    expect(valid).toBe(true);
+    // The patterns are compiled once (1,000 writes), plus a few per object.
+    expect(pushes).toBeGreaterThanOrEqual(1_000);
+    expect(pushes).toBeLessThan(10 * objects.length);
+  });
 });
 
 describe("a union's message keeps each branch's decisive reason", () => {

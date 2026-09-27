@@ -503,27 +503,30 @@ function inEnum(candidates: unknown[], value: unknown, ctx: Ctx): boolean {
 /**
  * The patterns of one `patternProperties` map, compiled once per map, not
  * once per object the map is checked on: 4,000 empty objects under 4,000
- * patterns compiled 16 million regexes and charged nothing for it.
+ * patterns compiled 16 million regexes and charged nothing for it. The
+ * compiled list is kept whole, so an object with no keys costs nothing per
+ * pattern either; only the invalid ones are looked at again, to report them.
  */
-type CompiledPatterns = ReadonlyArray<{
-  readonly source: string;
-  readonly re: RegExp | null;
-  readonly error?: string;
-}>;
+type CompiledPatterns = {
+  readonly valid: ReadonlyArray<readonly [string, RegExp]>;
+  readonly invalid: ReadonlyArray<{ readonly source: string; readonly error: string }>;
+};
 const compiledPatterns = new WeakMap<Record<string, unknown>, CompiledPatterns>();
 
 function patternsOf(map: Record<string, unknown>, ctx: Ctx): CompiledPatterns {
   const known = compiledPatterns.get(map);
   if (known !== undefined) return known;
-  const out: Array<{ source: string; re: RegExp | null; error?: string }> = [];
+  const valid: Array<readonly [string, RegExp]> = [];
+  const invalid: Array<{ source: string; error: string }> = [];
   for (const source of Object.keys(map)) {
     charge(ctx, 1 + Math.floor(source.length / CHARS_PER_UNIT));
     try {
-      out.push({ source, re: new RegExp(source) });
+      valid.push([source, new RegExp(source)]);
     } catch (err) {
-      out.push({ source, re: null, error: (err as Error).message });
+      invalid.push({ source, error: (err as Error).message });
     }
   }
+  const out = { valid, invalid };
   compiledPatterns.set(map, out);
   return out;
 }
@@ -928,19 +931,17 @@ function validateObject(
     }
   }
 
-  const patterns: Array<[string, RegExp]> = [];
+  let patterns: CompiledPatterns["valid"] = [];
   if (isPlainObject(patternProperties)) {
-    for (const compiled of patternsOf(patternProperties, ctx)) {
-      if (compiled.re !== null) {
-        patterns.push([compiled.source, compiled.re]);
-        continue;
-      }
+    const compiled = patternsOf(patternProperties, ctx);
+    patterns = compiled.valid;
+    for (const bad of compiled.invalid) {
       fail(
         ctx,
         path,
         "patternProperties",
-        joinPointer(joinPointer(sp, "patternProperties"), compiled.source),
-        `the schema's pattern is not a valid regular expression: ${compiled.error}`,
+        joinPointer(joinPointer(sp, "patternProperties"), bad.source),
+        `the schema's pattern is not a valid regular expression: ${bad.error}`,
       );
     }
   }
