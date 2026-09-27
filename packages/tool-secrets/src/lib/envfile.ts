@@ -199,8 +199,14 @@ export function shellDivergence(value: string, exported: boolean): string | unde
   return undefined;
 }
 
-/** A C0 or C1 control character, or DEL. */
-const CONTROL = /[\u0000-\u001f\u007f-\u009f]/;
+/** The first C0 or C1 control character, or DEL, in `value`. */
+function firstControl(value: string): string | undefined {
+  for (const ch of value) {
+    const code = ch.codePointAt(0) as number;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return ch;
+  }
+  return undefined;
+}
 /** Half of a surrogate pair on its own: not text, and not writable as UTF-8. */
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
@@ -245,9 +251,9 @@ export function encodeBare(
       `the value for ${key} is not valid Unicode text (it holds half of a surrogate pair), so it cannot be written as UTF-8 without changing.`,
     );
   }
-  const control = CONTROL.exec(value);
-  if (control !== null) {
-    const code = (control[0].codePointAt(0) as number).toString(16).toUpperCase().padStart(4, "0");
+  const control = firstControl(value);
+  if (control !== undefined) {
+    const code = (control.codePointAt(0) as number).toString(16).toUpperCase().padStart(4, "0");
     return refuse(
       `the value for ${key} contains a control character (U+${code}), which an editor or a terminal showing the file hides or acts on. Write this value by hand, or use one without control characters.`,
     );
