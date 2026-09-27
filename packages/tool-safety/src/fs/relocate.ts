@@ -46,6 +46,15 @@ import { lexicalIn } from "./write";
 export type RelocateOptions = {
   /** Most links checked; more refuses the move as `too-large`. Default 100 000. */
   readonly maxLinks?: number;
+  /**
+   * A link that leads outside the destination root from where the rename
+   * puts it: `refuse` (the default), or `keep-unchanged` to accept it when
+   * it leads to exactly where it leads from where it is now (an absolute
+   * link to an interpreter, say), so the move reaches nothing it did not.
+   * `keep-unchanged` applies only when both roots are one; such links are
+   * listed in `outsideLinks`.
+   */
+  readonly outsideLinks?: "refuse" | "keep-unchanged";
   /** Most entries listed, of every kind; more refuses as `too-large`. Default 1 000 000. */
   readonly maxVisited?: number;
 };
@@ -57,6 +66,11 @@ export type RelocateResult =
       readonly links: number;
       /** Entries listed. */
       readonly visited: number;
+      /**
+       * Destination paths of links that will lead outside the destination
+       * root exactly where they lead now (`keep-unchanged` only).
+       */
+      readonly outsideLinks: readonly string[];
     }
   | SafeFsFailure;
 
@@ -89,6 +103,15 @@ function movedTree(srcTop: string, dstTop: string): Overlay {
   };
   // `walk` in resolve.ts asks only `get` and `has`.
   return { get, has: (p: string) => get(p) !== undefined } as unknown as Overlay;
+}
+
+/** Whether the link at `real`, with text `text`, leads to `target` from where it is now. */
+function landsNowAt(real: string, text: string, target: string): boolean {
+  try {
+    return physicalFrom(path.dirname(real), text) === target;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -171,6 +194,9 @@ export function checkRelocatedLinks(
   const join = (a: string, b: string): string => (b === "" ? a : a === "" ? b : `${a}/${b}`);
   let links = 0;
   let visited = 0;
+  const keepUnchanged =
+    options.outsideLinks === "keep-unchanged" && sRoot.physical === dRoot.physical;
+  const outsideLinks: string[] = [];
 
   const judge = (rel: string, srcReal: string): SafeFsFailure | undefined => {
     links += 1;
@@ -195,6 +221,10 @@ export function checkRelocatedLinks(
       return unresolvable(join(srcRel, rel), err);
     }
     if (isWithin(dRoot.physical, target)) return undefined;
+    if (keepUnchanged && landsNowAt(srcReal, text, target)) {
+      outsideLinks.push(join(dstRel, rel));
+      return undefined;
+    }
     const at = join(srcRel, rel);
     return fail(
       "escapes-root",
@@ -205,9 +235,9 @@ export function checkRelocatedLinks(
 
   if (top.isSymbolicLink()) {
     const refused = judge("", srcTop);
-    return refused ?? { ok: true, links, visited };
+    return refused ?? { ok: true, links, visited, outsideLinks };
   }
-  if (!top.isDirectory()) return { ok: true, links, visited };
+  if (!top.isDirectory()) return { ok: true, links, visited, outsideLinks };
 
   const stack: Array<{ real: string; rel: string; stats: Stats }> = [
     { real: srcTop, rel: "", stats: top },
@@ -256,5 +286,5 @@ export function checkRelocatedLinks(
       }
     }
   }
-  return { ok: true, links, visited };
+  return { ok: true, links, visited, outsideLinks };
 }

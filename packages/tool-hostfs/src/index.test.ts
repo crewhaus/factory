@@ -66,6 +66,14 @@ import {
 import { removeClaimedInfoFile } from "./lib/trash-engine";
 import type { RunRequest, RunResult } from "./run";
 
+/**
+ * The uid the tests run as. The trash checks that every directory it writes
+ * through belongs to the user, so the identity is the real owner of the
+ * files these tests create, not an invented one.
+ */
+const UID = typeof process.getuid === "function" ? process.getuid() : 1000;
+/** Running as root defeats a mode-based unwritable directory; such tests are skipped, not faked. */
+const canTestUnwritable = (process.getuid?.() ?? 0) !== 0;
 const originalCwd = process.cwd();
 let workspace: string;
 /** Every command a test's tool call tried to run, in order. */
@@ -138,11 +146,17 @@ type Emit = (eventType: string, filename: string | null) => void;
 /**
  * A watcher that replays a script instead of asking the kernel.
  *
- * Bursts are emitted SYNCHRONOUSLY: a timer cannot fire between two
- * synchronous calls, so events in one burst always land in one settle window
- * no matter how loaded the machine is. Separate bursts are spaced by a real
- * sleep that is an order of magnitude longer than the window, which a slow
- * box can only make longer still.
+ * Emitting a burst synchronously is NOT enough to keep it in one settle
+ * window. A group closes on the NEXT event's own monotonic stamp
+ * (`Coalescer.push` calls `advanceTo(event.atMs)`), and each stamp is taken
+ * when the event is recorded, after the real `writeFileSync` and `lstat`
+ * before it. On a loaded runner those can take longer than the window, and
+ * the burst then splits with no timer involved: that is how "three
+ * notifications for one save" once reported `rawCount` 1 on CI. So a test
+ * whose burst must fold holds the monotonic clock still across it with
+ * {@link holdMonotonicClock} and advances it once, at the end. Separate
+ * bursts are spaced by a real sleep an order of magnitude longer than the
+ * window, which a slow box can only make longer still.
  */
 function scriptedWatcher(script: (emit: Emit) => void | Promise<void>): void {
   _setWatchFactory((_target, _options, emit) => {
@@ -154,6 +168,21 @@ function scriptedWatcher(script: (emit: Emit) => void | Promise<void>): void {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Hold the watcher's monotonic clock still until the test advances it, so
+ * every event of a burst carries the same stamp however long the real I/O
+ * between them took. `_resetHostSeams()` in afterEach lets go of it.
+ */
+function holdMonotonicClock(start = 1_000): { advance(ms: number): void } {
+  let mono = start;
+  _setMonotonicClock(() => mono);
+  return {
+    advance(ms: number): void {
+      mono += ms;
+    },
+  };
+}
 
 describe("WatchPath: containment and input", () => {
   test("a path outside the workspace is refused", async () => {
@@ -171,6 +200,18 @@ describe("WatchPath: containment and input", () => {
     symlinkSync(tmpdir(), join(workspace, "out"));
     const result = await call(watchPath, { path: "out", timeoutMs: 50 });
     expect(result).toContain("refused path");
+  });
+
+  test("a dangling link's target is walked as the kernel walks it (C068)", async () => {
+    // `a/y -> ..` is the workspace root, so `a/y/..` is the workspace's
+    // parent. Folded as text, `a/y/../nowhere` read as the in-root
+    // `a/nowhere` and was answered "no such path" instead of refused.
+    mkdirSync(join(workspace, "a"));
+    symlinkSync("..", join(workspace, "a", "y"));
+    symlinkSync("a/y/../nowhere", join(workspace, "evil"));
+    const result = await call(watchPath, { path: "evil", timeoutMs: 50 });
+    expect(result).toContain("refused path");
+    expect(result).toContain("outside the workspace root");
   });
 
   test("a path that does not exist is refused with that reason", async () => {
@@ -252,6 +293,9 @@ describe("WatchPath: the bounds", () => {
 
 describe("WatchPath: what it reports", () => {
   test("three notifications for one save are reported as one event", async () => {
+    // The clock is held still across the burst (see scriptedWatcher): real
+    // I/O between the emits once split this fold on a loaded CI runner.
+    const clock = holdMonotonicClock();
     writeFileSync(join(workspace, "app.ts"), "x");
     scriptedWatcher((emit) => {
       // The recorded Linux shape: one logical save, three writes, three
@@ -263,6 +307,8 @@ describe("WatchPath: what it reports", () => {
       emit("change", "app.ts");
       writeFileSync(join(workspace, "app.ts"), "yyzz");
       emit("change", "app.ts");
+      // Only now may the window close.
+      clock.advance(1_000);
     });
     const result = await callJson(watchPath, {
       path: ".",
@@ -512,8 +558,7 @@ describe("WatchPath: what it reports", () => {
     // scheduler's business, not this package's. With room for both, the
     // assertion is the real claim: the save is reported, and the temp is
     // dropped BECAUSE it is transient.
-    let mono = 1_000;
-    _setMonotonicClock(() => mono);
+    const clock = holdMonotonicClock();
     writeFileSync(join(workspace, "doc.md"), "one");
     scriptedWatcher((emit) => {
       writeFileSync(join(workspace, "doc.md.tmpABC"), "x");
@@ -523,7 +568,7 @@ describe("WatchPath: what it reports", () => {
       emit("rename", "doc.md.tmpABC");
       // Only now may the window close. However long those two lines took,
       // both events carry the same stamp and fold together.
-      mono += 1_000;
+      clock.advance(1_000);
     });
     const result = await callJson(watchPath, {
       path: ".",
@@ -559,6 +604,14 @@ describe("WatchPath: what it reports", () => {
     // correction or a laptop waking up mid-watch cannot leave a window that
     // never closes. Here the wall clock lurches backwards by an hour while
     // the events arrive, and the answer is unchanged.
+    //
+    // The deadline is the tool's maximum, far past this test's own budget,
+    // so only the monotonic settle window can end the watch: a fold that
+    // settled on the wall clock would never close and would fail at the
+    // test timeout instead of passing on the deadline's final flush. And
+    // under the held clock the duration is exactly the one advance, which a
+    // watch ended any other way would not report.
+    const clock = holdMonotonicClock();
     writeFileSync(join(workspace, "app.ts"), "x");
     let wall = Date.parse("2026-09-19T01:29:18Z");
     _setClock(() => {
@@ -570,14 +623,16 @@ describe("WatchPath: what it reports", () => {
       emit("change", "app.ts");
       writeFileSync(join(workspace, "app.ts"), "xxyy");
       emit("change", "app.ts");
+      clock.advance(1_000);
     });
     const result = await callJson(watchPath, {
       path: ".",
-      timeoutMs: 5_000,
+      timeoutMs: 600_000,
       maxEvents: 1,
       settleMs: 20,
     });
     expect(result["stoppedBy"]).toBe("eventCap");
+    expect(result["durationMs"]).toBe(1_000);
     expect((result["events"] as Array<Record<string, unknown>>)[0]?.["rawCount"]).toBe(2);
   }, 20_000);
 
@@ -609,8 +664,200 @@ describe("WatchPath: what it reports", () => {
     const result = await callJson(watchPath, { path: ".", timeoutMs: 400, settleMs: 20 });
     expect(result["eventCount"]).toBe(0);
     expect(result["stoppedBy"]).toBe("deadline");
-    expect((result["notes"] as string[]).join(" ")).toContain("unchanged");
+    expect((result["notes"] as string[]).join(" ")).toContain(
+      "1 notification(s) named a path whose modification time, inode-change time and size had not moved",
+    );
   }, 15_000);
+
+  describe("equal timestamps inside one coarse clock tick (C124)", () => {
+    /**
+     * A probe that reports what Linux reports inside one tick of its coarse
+     * inode clock: real facts, except that every non-directory keeps the SAME
+     * mtime and ctime however often it is written. `stampMs` is the stamp's
+     * age anchor, a wall-clock time.
+     */
+    function coarseTickProbe(stampMs: number): void {
+      const tick = `${BigInt(stampMs) * 1_000_000n}`;
+      _setPathProbe((p): PathFacts | undefined => {
+        const st = lstatSync(p, { bigint: true, throwIfNoEntry: false });
+        if (st === undefined) return undefined;
+        const dir = st.isDirectory();
+        return {
+          exists: true,
+          device: Number(st.dev),
+          isDirectory: dir,
+          isSymlink: st.isSymbolicLink(),
+          mode: Number(st.mode),
+          mtimeMs: dir ? Number(st.mtimeMs) : stampMs,
+          ctimeMs: dir ? Number(st.ctimeMs) : stampMs,
+          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${tick}:${tick}`,
+          sizeBytes: Number(st.size),
+          uid: Number(st.uid),
+        };
+      });
+    }
+
+    test("a same-size rewrite in the snapshot's tick is still an event", async () => {
+      const clock = holdMonotonicClock();
+      coarseTickProbe(Date.now());
+      writeFileSync(join(workspace, "a.txt"), "aa");
+      scriptedWatcher((emit) => {
+        writeFileSync(join(workspace, "a.txt"), "bb");
+        emit("change", "a.txt");
+        clock.advance(1_000);
+      });
+      const result = await callJson(watchPath, {
+        path: ".",
+        timeoutMs: 5_000,
+        maxEvents: 1,
+        settleMs: 20,
+      });
+      expect(result["eventCount"]).toBe(1);
+      expect(result["stoppedBy"]).toBe("eventCap");
+      expect((result["events"] as Array<Record<string, unknown>>)[0]?.["kind"]).toBe("modified");
+      expect(result["notes"]).toBeUndefined();
+    }, 20_000);
+
+    test("the same notification about content that did not change is still not an event", async () => {
+      coarseTickProbe(Date.now());
+      writeFileSync(join(workspace, "settled.txt"), "same");
+      scriptedWatcher((emit) => {
+        writeFileSync(join(workspace, "settled.txt"), "same");
+        emit("rename", "settled.txt");
+      });
+      const result = await callJson(watchPath, { path: ".", timeoutMs: 300, settleMs: 20 });
+      expect(result["eventCount"]).toBe(0);
+      expect(result["stoppedBy"]).toBe("deadline");
+      expect((result["notes"] as string[]).join(" ")).toContain("1 notification(s) named a path");
+    }, 15_000);
+
+    test("a second rewrite in the same tick as a counted one is caught too", async () => {
+      const clock = holdMonotonicClock();
+      coarseTickProbe(Date.now());
+      writeFileSync(join(workspace, "a.txt"), "aa");
+      scriptedWatcher(async (emit) => {
+        writeFileSync(join(workspace, "a.txt"), "bb");
+        emit("change", "a.txt");
+        clock.advance(1_000);
+        await sleep(200);
+        // Same size, same stamps as the change just counted.
+        writeFileSync(join(workspace, "a.txt"), "cc");
+        emit("change", "a.txt");
+        clock.advance(1_000);
+      });
+      const result = await callJson(watchPath, {
+        path: ".",
+        timeoutMs: 5_000,
+        maxEvents: 2,
+        settleMs: 20,
+      });
+      expect(result["eventCount"]).toBe(2);
+      expect(result["stoppedBy"]).toBe("eventCap");
+    }, 20_000);
+
+    test("a recent file too large to compare is counted, and the note says why", async () => {
+      const clock = holdMonotonicClock();
+      coarseTickProbe(Date.now());
+      const big = "z".repeat(1024 * 1024 + 1);
+      writeFileSync(join(workspace, "big.bin"), big);
+      scriptedWatcher((emit) => {
+        emit("change", "big.bin");
+        clock.advance(1_000);
+      });
+      const result = await callJson(watchPath, {
+        path: ".",
+        timeoutMs: 5_000,
+        maxEvents: 1,
+        settleMs: 20,
+      });
+      expect(result["eventCount"]).toBe(1);
+      expect((result["notes"] as string[]).join(" ")).toContain(
+        "1 notification(s) named a recently written file whose timestamps and size had not moved but which was too large to compare, and were counted",
+      );
+    }, 20_000);
+
+    test("a stamp older than the trust window is trusted, and nothing is read", async () => {
+      // Equal stamps from long before the watch prove nothing moved: a write
+      // would have restamped the file. The content is not consulted.
+      coarseTickProbe(Date.now() - 60_000);
+      writeFileSync(join(workspace, "old.txt"), "aa");
+      scriptedWatcher((emit) => {
+        emit("rename", "old.txt");
+      });
+      const result = await callJson(watchPath, { path: ".", timeoutMs: 300, settleMs: 20 });
+      expect(result["eventCount"]).toBe(0);
+      expect((result["notes"] as string[]).join(" ")).toContain("1 notification(s) named a path");
+    }, 15_000);
+  });
+
+  describe("equal stamps from a nanosecond clock are trusted, as 0.7.0 trusted them (0.7.1 review)", () => {
+    /**
+     * Real facts, except that every non-directory reports the same fixed
+     * stamps: `stampMs` plus `subMsNs` nanoseconds. APFS stamps carry a
+     * sub-millisecond part; HFS+ (whole seconds) and a test's coarse tick
+     * do not.
+     */
+    function fixedStampProbe(stampMs: number, subMsNs: bigint): void {
+      const ns = `${BigInt(stampMs) * 1_000_000n + subMsNs}`;
+      _setPathProbe((p): PathFacts | undefined => {
+        const st = lstatSync(p, { bigint: true, throwIfNoEntry: false });
+        if (st === undefined) return undefined;
+        const dir = st.isDirectory();
+        return {
+          exists: true,
+          device: Number(st.dev),
+          isDirectory: dir,
+          isSymlink: st.isSymbolicLink(),
+          mode: Number(st.mode),
+          mtimeMs: dir ? Number(st.mtimeMs) : stampMs,
+          ctimeMs: dir ? Number(st.ctimeMs) : stampMs,
+          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${ns}:${ns}`,
+          sizeBytes: Number(st.size),
+          uid: Number(st.uid),
+        };
+      });
+    }
+
+    /** A 2 MiB file written just before the watch, and one notification about it. */
+    async function bigWriteThenWatch(): Promise<Record<string, unknown>> {
+      writeFileSync(join(workspace, "big.bin"), "z".repeat(2 * 1024 * 1024));
+      scriptedWatcher((emit) => {
+        emit("change", "big.bin");
+      });
+      return await callJson(watchPath, { path: ".", timeoutMs: 400, maxEvents: 1, settleMs: 20 });
+    }
+
+    test("on macOS, a file too large to hash written just before the watch gives no event", async () => {
+      // macOS delivers a write made just before the watch as its first
+      // event. 0.7.1 before this distrusted every recent stamp and could not
+      // hash 2 MiB, so it reported [big.bin, modified] at once.
+      _setPlatform("darwin");
+      fixedStampProbe(Date.now(), 123_457n);
+      const result = await bigWriteThenWatch();
+      expect(result["eventCount"]).toBe(0);
+      expect(result["stoppedBy"]).toBe("deadline");
+      expect((result["notes"] as string[]).join(" ")).toContain(
+        "1 notification(s) named a path whose modification time, inode-change time and size had not moved",
+      );
+    }, 15_000);
+
+    test("the same stamps on Linux prove nothing: the notification is counted", async () => {
+      // Linux's coarse clock gives stamps full nanosecond digits that stand
+      // still for a whole tick, so digits alone are not trusted there.
+      _setPlatform("linux");
+      fixedStampProbe(Date.now(), 123_457n);
+      const result = await bigWriteThenWatch();
+      expect(result["eventCount"]).toBe(1);
+      expect((result["notes"] as string[]).join(" ")).toContain("too large to compare");
+    }, 15_000);
+
+    test("on macOS, a stamp with no sub-millisecond part (HFS+) is not trusted", async () => {
+      _setPlatform("darwin");
+      fixedStampProbe(Math.floor(Date.now() / 1000) * 1000, 0n);
+      const result = await bigWriteThenWatch();
+      expect(result["eventCount"]).toBe(1);
+    }, 15_000);
+  });
 
   test("a chmod is a change, even though it leaves mtime alone", async () => {
     // Which is why ctime is compared too: a permission change moves ctime
@@ -718,7 +965,7 @@ function linuxHost(home = join(workspace, "home")): string {
   // The trash writes a DeletionDate into a file whose bytes a test asserts.
   _setClock(() => FIXED_NOW);
   mkdirSync(home, { recursive: true });
-  _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+  _setIdentity({ home, xdgDataHome: undefined, uid: UID });
   return join(home, ".local/share/Trash");
 }
 
@@ -740,6 +987,7 @@ function facts(path: string, device: number): PathFacts | undefined {
       mtimeMs: Number(stats.mtimeMs),
       changeStamp: `${stats.mtimeNs}:${stats.ctimeNs}`,
       sizeBytes: Number(stats.size),
+      uid: Number(stats.uid),
     };
   } catch {
     return undefined;
@@ -860,7 +1108,7 @@ describe("TrashPath: the FreeDesktop move", () => {
     _setClock(() => FIXED_NOW);
     const data = join(workspace, "xdg");
     mkdirSync(data, { recursive: true });
-    _setIdentity({ home: join(workspace, "home"), xdgDataHome: data, uid: 1000 });
+    _setIdentity({ home: join(workspace, "home"), xdgDataHome: data, uid: UID });
     writeFileSync(join(workspace, "a.txt"), "x");
     await call(trashPath, { paths: ["a.txt"] });
     expect(existsSync(join(data, "Trash/files/a.txt"))).toBe(true);
@@ -869,7 +1117,7 @@ describe("TrashPath: the FreeDesktop move", () => {
   test("with no home at all the call is refused, not redirected somewhere", async () => {
     _setPlatform("linux");
     _setClock(() => FIXED_NOW);
-    _setIdentity({ home: undefined, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home: undefined, xdgDataHome: undefined, uid: UID });
     writeFileSync(join(workspace, "a.txt"), "x");
     const result = await callJson(trashPath, { paths: ["a.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
@@ -967,7 +1215,7 @@ describe("TrashPath: what it refuses to guess", () => {
     _setClock(() => FIXED_NOW);
     const home = join(workspace, "home");
     mkdirSync(home, { recursive: true });
-    _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home, xdgDataHome: undefined, uid: UID });
     const result = await callJson(trashPath, { paths: ["home"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
     expect(String(entries[0]?.["reason"])).toContain("into itself");
@@ -981,7 +1229,7 @@ describe("TrashPath: what it refuses to guess", () => {
     _setClock(() => FIXED_NOW);
     const home = join(workspace, "home");
     mkdirSync(join(home, ".local/share/Trash/files"), { recursive: true });
-    _setIdentity({ home, xdgDataHome: undefined, uid: 1000 });
+    _setIdentity({ home, xdgDataHome: undefined, uid: UID });
     writeFileSync(join(home, ".local/share/Trash/files/old.txt"), "x");
     const result = await callJson(trashPath, {
       paths: ["home/.local/share/Trash/files/old.txt"],
@@ -1024,8 +1272,8 @@ describe("TrashPath: the same-filesystem rule", () => {
     const entries = result["entries"] as Array<Record<string, unknown>>;
     // The spec's answer to a cross-device delete is a trash directory at the
     // top of the other filesystem, NOT a copy into the home trash.
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash-1000"));
-    expect(readFileSync(join(volume, ".Trash-1000/files/onvol.txt"), "utf8")).toBe("precious\n");
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
+    expect(readFileSync(join(volume, `.Trash-${UID}/files/onvol.txt`), "utf8")).toBe("precious\n");
     expect(existsSync(join(volume, "onvol.txt"))).toBe(false);
   });
 
@@ -1036,7 +1284,7 @@ describe("TrashPath: the same-filesystem rule", () => {
     writeFileSync(join(volume, "onvol.txt"), "x\n");
     pretendSeparateFilesystem(volume);
     await call(trashPath, { paths: ["volume/onvol.txt"] });
-    const record = readFileSync(join(volume, ".Trash-1000/info/onvol.txt.trashinfo"), "utf8");
+    const record = readFileSync(join(volume, `.Trash-${UID}/info/onvol.txt.trashinfo`), "utf8");
     // So the entry still means something when the volume is mounted
     // somewhere else, which a removable disk does every time.
     expect(record).toContain("Path=onvol.txt\n");
@@ -1051,8 +1299,8 @@ describe("TrashPath: the same-filesystem rule", () => {
 
     const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash/1000"));
-    expect(existsSync(join(volume, ".Trash/1000/files/onvol.txt"))).toBe(true);
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash/${UID}`));
+    expect(existsSync(join(volume, `.Trash/${UID}/files/onvol.txt`))).toBe(true);
   });
 
   test("a $topdir/.Trash WITHOUT the sticky bit is not used", async () => {
@@ -1066,7 +1314,7 @@ describe("TrashPath: the same-filesystem rule", () => {
 
     const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash-1000"));
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
     expect(readdirSync(join(volume, ".Trash"))).toEqual([]);
   });
 
@@ -1081,30 +1329,33 @@ describe("TrashPath: the same-filesystem rule", () => {
 
     const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
     const entries = result["entries"] as Array<Record<string, unknown>>;
-    expect(entries[0]?.["trashDir"]).toBe(join(volume, ".Trash-1000"));
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
     // Nothing was written through the link.
     expect(readdirSync(join(workspace, "attacker"))).toEqual([]);
   });
 
-  test("a volume whose trash cannot be created refuses, and the file stays", async () => {
-    linuxHost();
-    const volume = join(workspace, "volume");
-    mkdirSync(volume, { recursive: true });
-    writeFileSync(join(volume, "onvol.txt"), "precious\n");
-    pretendSeparateFilesystem(volume);
-    // Read-only volume: `mkdir` fails, and the only correct answer is to
-    // leave the file where it is.
-    chmodSync(volume, 0o500);
-    try {
-      const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
-      const entries = result["entries"] as Array<Record<string, unknown>>;
-      expect(result["trashed"]).toBe(0);
-      expect(entries[0]?.["status"]).toBe("refused");
-      expect(readFileSync(join(volume, "onvol.txt"), "utf8")).toBe("precious\n");
-    } finally {
-      chmodSync(volume, 0o700);
-    }
-  });
+  test.if(canTestUnwritable)(
+    "a volume whose trash cannot be created refuses, and the file stays",
+    async () => {
+      linuxHost();
+      const volume = join(workspace, "volume");
+      mkdirSync(volume, { recursive: true });
+      writeFileSync(join(volume, "onvol.txt"), "precious\n");
+      pretendSeparateFilesystem(volume);
+      // Read-only volume: `mkdir` fails, and the only correct answer is to
+      // leave the file where it is.
+      chmodSync(volume, 0o500);
+      try {
+        const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+        const entries = result["entries"] as Array<Record<string, unknown>>;
+        expect(result["trashed"]).toBe(0);
+        expect(entries[0]?.["status"]).toBe("refused");
+        expect(readFileSync(join(volume, "onvol.txt"), "utf8")).toBe("precious\n");
+      } finally {
+        chmodSync(volume, 0o700);
+      }
+    },
+  );
 
   test("an EXDEV from the move leaves the file AND removes the claimed record", async () => {
     const trash = linuxHost();
@@ -1132,6 +1383,133 @@ describe("TrashPath: the same-filesystem rule", () => {
       expect(entries[0]?.["record"]).toBeUndefined();
     } finally {
       _setRenamer(undefined);
+    }
+  });
+
+  test("a volume trash whose files/ or info/ is a link out is refused, dryRun included", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    const attacker = join(workspace, "attacker");
+    mkdirSync(join(volume, `.Trash-${UID}`), { recursive: true });
+    mkdirSync(join(attacker, "files"), { recursive: true });
+    mkdirSync(join(attacker, "info"), { recursive: true });
+    // What a cloned repository can carry: git checks out symlinks.
+    writeFileSync(join(attacker, "files/.bashrc"), "the user's own\n");
+    symlinkSync(join(attacker, "files"), join(volume, `.Trash-${UID}/files`));
+    symlinkSync(join(attacker, "info"), join(volume, `.Trash-${UID}/info`));
+    writeFileSync(join(volume, ".bashrc"), "from the workspace\n");
+    pretendSeparateFilesystem(volume);
+
+    for (const dryRun of [true, false]) {
+      const result = await callJson(trashPath, { paths: ["volume/.bashrc"], dryRun });
+      const entries = result["entries"] as Array<Record<string, unknown>>;
+      expect(entries[0]?.["status"]).toBe("refused");
+      expect(String(entries[0]?.["reason"])).toContain("is a symbolic link");
+    }
+    // On 0.7.0 the move went through the link and REPLACED this file.
+    expect(readFileSync(join(attacker, "files/.bashrc"), "utf8")).toBe("the user's own\n");
+    expect(readdirSync(join(attacker, "info"))).toEqual([]);
+    expect(readFileSync(join(volume, ".bashrc"), "utf8")).toBe("from the workspace\n");
+  });
+
+  test("an info/ link alone is refused too, and nothing is written through it", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    const attacker = join(workspace, "attacker");
+    mkdirSync(join(volume, `.Trash-${UID}/files`), { recursive: true });
+    mkdirSync(attacker, { recursive: true });
+    symlinkSync(attacker, join(volume, `.Trash-${UID}/info`));
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    pretendSeparateFilesystem(volume);
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(String(entries[0]?.["reason"])).toContain(`.Trash-${UID}/info is a symbolic link`);
+    expect(readdirSync(attacker)).toEqual([]);
+    expect(existsSync(join(volume, "onvol.txt"))).toBe(true);
+  });
+
+  test("a linked $topdir/.Trash/$uid is not used: the call falls back to .Trash-$uid", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    const attacker = join(workspace, "attacker/t2");
+    mkdirSync(join(volume, ".Trash"), { recursive: true });
+    mkdirSync(attacker, { recursive: true });
+    symlinkSync(attacker, join(volume, `.Trash/${UID}`));
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    pretendSeparateFilesystem(volume, true);
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(entries[0]?.["trashDir"]).toBe(join(volume, `.Trash-${UID}`));
+    expect(entries[0]?.["status"]).toBe("trashed");
+    expect(readdirSync(attacker)).toEqual([]);
+  });
+
+  test("a trash directory owned by another user is refused", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    mkdirSync(join(volume, `.Trash-${UID}`), { recursive: true });
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    // Ownership cannot be changed without root, so the probe reports it.
+    _setPathProbe((path) => {
+      const found = facts(path, path.startsWith(volume) ? 99 : 1);
+      if (found !== undefined && path === join(volume, `.Trash-${UID}`)) {
+        return { ...found, uid: UID + 1 };
+      }
+      return found;
+    });
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(String(entries[0]?.["reason"])).toContain(`belongs to another user (uid ${UID + 1})`);
+    expect(existsSync(join(volume, "onvol.txt"))).toBe(true);
+  });
+
+  test("the trash is checked again after the name is claimed, just before the move", async () => {
+    const trash = linuxHost();
+    writeFileSync(join(workspace, "a.txt"), "x\n");
+    // files/ turns into a link the moment the record exists: the window
+    // between the claim and the rename.
+    _setPathProbe((path) => {
+      const found = facts(path, 1);
+      if (path === join(trash, "files") && existsSync(join(trash, "info/a.txt.trashinfo"))) {
+        return found === undefined ? undefined : { ...found, isSymlink: true, isDirectory: false };
+      }
+      return found;
+    });
+    const result = await callJson(trashPath, { paths: ["a.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(String(entries[0]?.["reason"])).toContain("files is a symbolic link");
+    expect(existsSync(join(workspace, "a.txt"))).toBe(true);
+    // The claimed record is withdrawn, not left pointing at nothing.
+    expect(readdirSync(join(trash, "info"))).toEqual([]);
+  });
+
+  test("a files/ name taken after the record was claimed moves the call to the next name", async () => {
+    const trash = linuxHost();
+    writeFileSync(join(workspace, "a.txt"), "x\n");
+    // files/a.txt "appears" once info/a.txt.trashinfo has been claimed.
+    _setPathProbe((path) => {
+      if (path === join(trash, "files/a.txt") && existsSync(join(trash, "info/a.txt.trashinfo"))) {
+        return facts(join(workspace, "a.txt"), 1);
+      }
+      return facts(path, 1);
+    });
+    const result = await callJson(trashPath, { paths: ["a.txt"] });
+    const entries = result["entries"] as Array<Record<string, unknown>>;
+    expect(entries[0]?.["storedAs"]).toBe("a.2.txt");
+    // The first claim was withdrawn; only the record for the name used is left.
+    expect(readdirSync(join(trash, "info"))).toEqual(["a.2.txt.trashinfo"]);
+  });
+
+  test("a volume trash this call creates is 0700 all the way down", async () => {
+    linuxHost();
+    const volume = join(workspace, "volume");
+    mkdirSync(volume, { recursive: true });
+    writeFileSync(join(volume, "onvol.txt"), "x\n");
+    pretendSeparateFilesystem(volume);
+    const result = await callJson(trashPath, { paths: ["volume/onvol.txt"] });
+    expect(result["trashed"]).toBe(1);
+    for (const dir of [`.Trash-${UID}`, `.Trash-${UID}/files`, `.Trash-${UID}/info`]) {
+      expect(lstatSync(join(volume, dir)).mode & 0o777).toBe(0o700);
     }
   });
 
@@ -1627,6 +2005,23 @@ describe("TrashPath: the dry run predicts the destination the real call uses", (
     expect(
       (preview["entries"] as Array<Record<string, unknown>>).map((entry) => entry["wouldStoreAs"]),
     ).toEqual(["notes.txt", "notes.2.txt", "notes.3.txt"]);
+  });
+
+  test("a file already in files/ with no record is never overwritten", async () => {
+    const trash = linuxHost();
+    mkdirSync(join(trash, "files"), { recursive: true });
+    mkdirSync(join(trash, "info"), { recursive: true });
+    writeFileSync(join(trash, "files/notes.txt"), "EARLIER\n");
+    writeFileSync(join(workspace, "notes.txt"), "new\n");
+    const preview = await callJson(trashPath, { paths: ["notes.txt"], dryRun: true });
+    const real = await callJson(trashPath, { paths: ["notes.txt"] });
+    const predicted = (preview["entries"] as Array<Record<string, unknown>>)[0];
+    const actual = (real["entries"] as Array<Record<string, unknown>>)[0];
+    expect(predicted?.["wouldStoreAs"]).toBe("notes.2.txt");
+    // On 0.7.0 the claim looked only at info/, so the rename replaced it.
+    expect(actual?.["storedAs"]).toBe("notes.2.txt");
+    expect(readFileSync(join(trash, "files/notes.txt"), "utf8")).toBe("EARLIER\n");
+    expect(readFileSync(join(trash, "files/notes.2.txt"), "utf8")).toBe("new\n");
   });
 });
 

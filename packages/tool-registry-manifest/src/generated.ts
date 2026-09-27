@@ -192,7 +192,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "archiveExtract",
     name: "ArchiveExtract",
     description:
-      "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped.",
+      "Extract a tar, tar.gz or zip archive into a destination inside the workspace, refusing any member that would escape it. Use `dryRun` to see the member list, the total size and the verdict first; extraction happens into a staging directory and is only accepted once nothing has escaped and no more than `maxBytes` was written.",
     readOnly: false,
     destructive: true,
     scope: "external",
@@ -211,7 +211,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "archiveList",
     name: "ArchiveList",
     description:
-      "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
+      "List a tar, tar.gz or zip archive's members with their sizes and kinds, and flag any whose path or link would escape a destination. Use it before extracting anything you did not build yourself — the entry names come from the archive's own index, read in this process, not from another program's printed listing.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -1028,7 +1028,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "copyPath",
     name: "CopyPath",
     description:
-      "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists.",
+      "Copy a file or a whole directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` first on anything large — it lists every path that would be written and every one that already exists. Symlinks are copied as links, and only when, from where the copy puts them, they point inside the workspace or exactly where the original points; an existing symlink under the destination is never written through.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -3531,7 +3531,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "grep",
     name: "Grep",
     description:
-      "Search for a regex pattern across files in the workspace (or a subdirectory). Vendored directories (node_modules, __pycache__) are skipped unless `path` points inside one. Returns lines as path:lineNo:match.",
+      "Search for a regex pattern across files in the workspace (or a subdirectory). Vendored directories (node_modules, __pycache__) are skipped unless `path` points inside one. Returns lines as path:lineNo:match, and names any lines it could not search.",
     readOnly: true,
     destructive: false,
     scope: "internal",
@@ -5042,7 +5042,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "movePath",
     name: "MovePath",
     description:
-      "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone.",
+      "Move or rename a file or directory inside the workspace, refusing to overwrite unless told to. Use `dryRun` to see what would be replaced before anything is gone. A move is refused when it would leave a symlink pointing outside the workspace somewhere it did not point before.",
     readOnly: false,
     destructive: true,
     scope: "internal",
@@ -6176,7 +6176,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "readLines",
     name: "ReadLines",
     description:
-      "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context.",
+      "Return a numbered line range from a file, reading only as far as the range needs. Use it to look at one region of a large log or data file without pulling the whole thing into context. The lines returned share a character budget (maxChars, default 262144): a line that would pass it is cut and reported with its full length, and the range stops there.",
     readOnly: true,
     destructive: false,
     scope: "internal",

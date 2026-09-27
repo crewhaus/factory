@@ -116,6 +116,14 @@ const MAX_OVERFETCH = 10_000;
 const TRUNCATED_LISTING_CAVEAT =
   "the backend's output was cut at this package's capture ceiling, so this listing is incomplete and the entry it was cut in the middle of was dropped rather than reported as a path — narrow the query or the roots";
 
+const INCOMPLETE_LISTING_CAVEAT =
+  "the backend's output could not be read to its end (something it started kept the pipe open), so this listing may be incomplete and its last entry was dropped rather than reported as a path";
+
+/** Why a listing is not the whole answer, for a run whose stdout was cut short. */
+function truncatedListingCaveat(run: RunResult): string {
+  return run.outputIncomplete === true ? INCOMPLETE_LISTING_CAVEAT : TRUNCATED_LISTING_CAVEAT;
+}
+
 // ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
@@ -253,7 +261,12 @@ export const watchPath: RegisteredTool = buildTool({
     }
     if (outcome.staleNotifications > 0) {
       notes.push(
-        `${outcome.staleNotifications} notification(s) named a path that was unchanged (same modification time, inode-change time and size) and were not counted — macOS can deliver a write made just before the watch started`,
+        `${outcome.staleNotifications} notification(s) named a path whose modification time, inode-change time and size had not moved (and, for a file written moments before, whose content was the same) and were not counted — macOS can deliver a write made just before the watch started`,
+      );
+    }
+    if (outcome.unverifiedNotifications > 0) {
+      notes.push(
+        `${outcome.unverifiedNotifications} notification(s) named a recently written file whose timestamps and size had not moved but which was too large to compare, and were counted: on a filesystem with a coarse clock (Linux, HFS+, FAT) equal timestamps do not prove nothing changed`,
       );
     }
     if (outcome.reconciledEvents > 0) {
@@ -663,7 +676,7 @@ async function searchSpotlight(options: SpotlightOptions): Promise<string> {
   // object literal silently replaces an earlier one, which is how a caller
   // stops hearing about the first thing that was wrong.
   const caveats: string[] = [];
-  if (run.stdoutTruncated === true) caveats.push(TRUNCATED_LISTING_CAVEAT);
+  if (run.stdoutTruncated === true) caveats.push(truncatedListingCaveat(run));
   if (empty && index?.state === "unknown") {
     caveats.push(
       "nothing matched, and mdutil could not say whether the volume is indexed, so this is not evidence the file is absent — use FindFiles, which walks the tree instead of asking an index",
@@ -818,7 +831,7 @@ async function searchLocate(options: LocateOptions): Promise<string> {
   // at once, and a later `caveat:` key silently replacing an earlier one is
   // how a caller stops hearing about the first thing that was wrong.
   const caveats: string[] = [];
-  if (truncatedOutput) caveats.push(TRUNCATED_LISTING_CAVEAT);
+  if (truncatedOutput) caveats.push(truncatedListingCaveat(run));
   if (hitFetchCap) {
     caveats.push(
       `the backend returned its full ${fetchLimit} hits before filtering, so matches inside the roots may exist beyond them — narrow the query`,

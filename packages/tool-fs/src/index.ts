@@ -1,21 +1,25 @@
-import { randomBytes } from "node:crypto";
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readSync,
-  readlinkSync,
-  realpathSync,
-} from "node:fs";
-import { rename, unlink } from "node:fs/promises";
+import { closeSync } from "node:fs";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  type SafeFsFailure,
+  openForReadFd,
+  resolveContained,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
+import {
+  type RegexRejectCode,
+  describeRegexOutcome,
+  openRegexSession,
+  screenUserRegex,
+} from "@crewhaus/tool-safety/regex";
+import { readFileBoundedSync, readOpenedFileSync } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 import { renderEditDiff } from "./diff";
+import { requiredLiterals } from "./literals";
+import { BASE_LINE_CAP, REFUSED_CHAIN, lineCapForChain, repeatChainLength } from "./repeat-chain";
 
 /**
  * Built-in filesystem tools, sandboxed to the process's current working
@@ -42,70 +46,6 @@ export class ToolPermissionError extends CrewhausError {
   }
 }
 
-/**
- * True when the NAME exists, whether or not it leads anywhere.
- *
- * `existsSync` follows symlinks, so it answers false for a link whose target
- * is missing — and a missing target is exactly the case that matters here: a
- * dangling link is still a door. Probing with `lstat` keeps that name in the
- * part of the path that gets RESOLVED rather than in the "does not exist
- * yet" tail that is appended to the root verbatim.
- */
-function nameExists(p: string): boolean {
-  try {
-    lstatSync(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Where `target` would actually land, with every symlink on the way already
- * followed — including one whose own target does not exist yet.
- *
- * `realpathSync` gives up with ENOENT on a dangling link, which would leave
- * that link unresolved and let it stand in for a plain missing file. So the
- * deepest ancestor that exists as a NAME is resolved, a dangling one is
- * followed a hop by hand, and the components that do not exist are appended.
- * The result is the path an `open` would create, which is the only path
- * worth checking containment against.
- */
-function resolveLocation(target: string, depth = 0): string {
-  if (depth > 40) throw new Error(`symlink chain at "${target}" is too long to resolve`);
-  let probe = target;
-  const tail: string[] = [];
-  while (!nameExists(probe)) {
-    tail.unshift(path.basename(probe));
-    const parent = path.dirname(probe);
-    if (parent === probe) break; // reached the filesystem root
-    probe = parent;
-  }
-  let probeReal: string;
-  try {
-    probeReal = realpathSync(probe);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    // The name is there but `realpath` cannot finish it: a symlink with a
-    // missing target. `readlinkSync` throws EINVAL on anything else, which
-    // fails closed. A relative target resolves against the link's directory.
-    // Recursing (rather than returning the raw target) is what resolves an
-    // absolute target such as /var/folders/... to its real /private/var/...
-    // form, so a legitimate in-workspace dangling link is not wrongly refused.
-    const link = readlinkSync(probe);
-    // A RELATIVE target resolves against the directory that actually CONTAINS
-    // the link, which is not the link's lexical parent when that parent is
-    // itself reached through a symlink. `<root>/dirlink/x -> ../y` with
-    // `dirlink` pointing out of the root really lands at `<elsewhere>/y`, but
-    // measured from the lexical parent it reads as `<root>/y` — an in-root
-    // path the caller's path does not lead to. So the parent is made real
-    // first. An absolute target ignores the base.
-    const base = realpathSync(path.dirname(probe));
-    probeReal = resolveLocation(path.resolve(base, link), depth + 1);
-  }
-  return tail.length > 0 ? path.join(probeReal, ...tail) : probeReal;
-}
-
 function resolveSafe(toolName: string, rel: string, root: string = process.cwd()): string {
   const rootResolved = path.resolve(root);
   const abs = path.resolve(rootResolved, rel);
@@ -116,61 +56,126 @@ function resolveSafe(toolName: string, rel: string, root: string = process.cwd()
   }
   // 2) Symlink-aware containment (CWE-59). The lexical check above is fooled
   //    by an in-root symlink that points outside the workspace, so re-check
-  //    the REAL path. The leaf may not exist yet (Write/Edit create it), so
-  //    resolve the deepest ancestor that EXISTS AS A NAME and re-append the
-  //    missing tail. "Exists as a name" rather than "exists": a symlink whose
-  //    target is not there yet is still followed by `open(…, "w")`, so it is
-  //    resolved here too rather than treated as a plain missing leaf.
-  //    Fails closed if realpath errors for any reason other than the walk.
-  let real: string;
-  try {
-    const rootReal = realpathSync(rootResolved);
-    real = resolveLocation(abs);
-    if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) {
-      throw new ToolPermissionError(toolName, rel);
-    }
-  } catch (err) {
-    if (err instanceof ToolPermissionError) throw err;
-    throw new ToolPermissionError(toolName, rel);
-  }
-  // Return the validated REAL path, not the lexical one: I/O on the realpath
-  // (with any in-root symlinks already resolved) plus an O_NOFOLLOW open at the
-  // read site closes the check-to-use TOCTOU (CWE-367) — a leaf swapped to a
-  // symlink after this returns is rejected at open, while a legitimate in-root
-  // symlink (resolved here to its real target) still reads fine.
+  //    where the path PHYSICALLY lands: tool-safety's resolveContained walks
+  //    it one component at a time as the kernel does, following dangling
+  //    links too (`open(…, "w")` through one creates its target), with `..`
+  //    in a link's target climbing from where the link really led. The copy
+  //    that lived here folded a dangling link's target as text, so
+  //    `evil -> a/y/../x` with `a/y -> ..` read as inside while the kernel
+  //    lands one level above the workspace (C068). Fails closed.
+  const resolved = resolveContained(rootResolved, abs);
+  if (!resolved.ok) throw new ToolPermissionError(toolName, rel);
+  const real = resolved.real;
+  // Read, Write and Edit then do their I/O through tool-safety, which
+  // resolves the caller's path again, physically, and checks the open
+  // descriptor (reads) or the directory it wrote into (writes), so a leaf or
+  // directory swapped after this check is refused there. This check stays
+  // first so an escape is the same ToolPermissionError it always was.
   return real;
 }
 
 /**
- * Read a resolveSafe-validated file with O_NOFOLLOW. If the final path
- * component was swapped to a symlink after the containment check, the open
- * fails (ELOOP) and we reject rather than follow it out of the workspace.
- * (Residual: an intermediate-directory swap needs openat-style resolution,
- * which node does not expose — a much harder attack on a much smaller window.)
+ * The most bytes Read and Edit take in. A file is held whole in memory (as
+ * bytes, then as a string twice its size), so 0.7.0's uncapped read let one
+ * call on a multi-gigabyte log or a sparse file exhaust the process. The cap
+ * matches Grep's per-call budget. A tool result over 10 KB is already stored
+ * on disk and previewed by the runtime, so the cap is about memory, not about
+ * the model's context.
  */
-function readFileNoFollow(toolName: string, absPath: string): Buffer {
-  let fd: number;
+export const READ_MAX_BYTES = 64 * 1024 * 1024;
+let readMaxBytes = READ_MAX_BYTES;
+
+/** Test seam: a smaller Read/Edit cap, so the limit is exercised without a 64 MiB file. `undefined` restores. */
+export function _setReadMaxBytesForTest(bytes: number | undefined): void {
+  readMaxBytes = bytes ?? READ_MAX_BYTES;
+}
+
+/**
+ * Turn a tool-safety refusal into this package's error. An escape stays the
+ * `ToolPermissionError` every caller already matches on; anything else keeps
+ * the helper's reason, which names the caller's path and never where a link
+ * led.
+ */
+function fsError(toolName: string, given: string, failure: SafeFsFailure): Error {
+  if (failure.code === "escapes-root") return new ToolPermissionError(toolName, given);
+  return new CrewhausError("tool", `${toolName}: ${failure.reason}`);
+}
+
+const BOM_KEEPING_DECODER = new TextDecoder("utf-8", { ignoreBOM: true });
+
+const READ_TOO_LARGE_HINT =
+  "read part of it with a line-range tool (ReadLines, TailFile) if you have one, or search it with Grep";
+
+/** `size` undefined: the file grew past the cap while it was being read. */
+function tooLarge(toolName: string, given: string, size: number | undefined): Error {
+  const what =
+    size === undefined
+      ? `grew past the ${readMaxBytes}-byte limit while it was read`
+      : `is ${size} bytes, over the ${readMaxBytes}-byte limit`;
+  return new CrewhausError(
+    "tool",
+    `${toolName}: ${JSON.stringify(given)} ${what}; ${READ_TOO_LARGE_HINT}`,
+  );
+}
+
+/**
+ * Read a workspace file whole, as UTF-8, through tool-safety's contained
+ * open: the path is resolved physically and must land in the workspace, a
+ * FIFO, socket or device is refused BEFORE it is opened (opening a FIFO
+ * blocks the event loop until a writer appears, and no timeout or abort
+ * reaches a blocked open), and a leaf or directory swapped for a link out of
+ * the workspace is refused on the descriptor. A file over the cap is refused
+ * from its size before a byte is read; one that grows past it mid-read is
+ * refused too, never returned cut short.
+ */
+function readWorkspaceText(toolName: string, given: string): string {
+  const opened = openForReadFd(process.cwd(), given);
+  if (!opened.ok) throw fsError(toolName, given, opened);
   try {
-    fd = openSync(absPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ELOOP") {
-      throw new ToolPermissionError(toolName, absPath);
+    if (opened.stats.size > readMaxBytes) throw tooLarge(toolName, given, opened.stats.size);
+    const r = readOpenedFileSync(
+      { ok: true, fd: opened.fd, stats: opened.stats },
+      { maxBytes: readMaxBytes },
+    );
+    if (!r.ok) {
+      throw new CrewhausError("tool", `${toolName}: ${JSON.stringify(given)} could not be read`);
     }
-    throw err;
-  }
-  try {
-    const { size } = fstatSync(fd);
-    const buf = Buffer.allocUnsafe(size);
-    let offset = 0;
-    while (offset < size) {
-      const n = readSync(fd, buf, offset, size - offset, offset);
-      if (n === 0) break;
-      offset += n;
-    }
-    return offset === size ? buf : buf.subarray(0, offset);
+    if (r.truncated) throw tooLarge(toolName, given, undefined);
+    // Decoded here, keeping a leading byte-order mark, not taken from
+    // `r.text`: tool-safety decodes with TextDecoder's default, which drops
+    // the BOM. Read then showed text the file does not start with, and Edit
+    // wrote the file back without it, changing bytes nobody asked it to
+    // touch (a Windows .cs or .csproj, a CSV meant for Excel), while its
+    // diff showed line 1 as unchanged. 0.7.0 kept it.
+    return BOM_KEEPING_DECODER.decode(r.bytes);
   } finally {
-    closeSync(fd);
+    closeSync(opened.fd);
   }
+}
+
+/**
+ * Replace `given`'s content atomically, keeping its permission bits.
+ *
+ * tool-safety's writeFileSafe writes a temp created with O_EXCL|O_NOFOLLOW
+ * under a random name beside the file (at 0600 until it is complete) and
+ * renames it into place. 0.7.0 staged through `Bun.write`, which created the
+ * temp at 0644 and never restored the old mode: an edited script lost its
+ * execute bit and a 0600 `.env` became world-readable. A link at the leaf
+ * that stays inside the workspace is written through (the link stays a
+ * link), as before; one that leads out is refused.
+ */
+function writeWorkspaceText(
+  toolName: string,
+  given: string,
+  content: string,
+  createParents: boolean,
+): void {
+  const w = writeFileSafe(process.cwd(), given, content, {
+    overwrite: true,
+    createParents,
+    leafSymlink: "follow-contained",
+  });
+  if (!w.ok) throw fsError(toolName, given, w);
 }
 
 function rejectTraversalPattern(toolName: string, pattern: string): void {
@@ -231,8 +236,8 @@ export const read: RegisteredTool = buildTool({
   concurrencySafe: true,
   operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
-    const abs = resolveSafe("Read", input.path);
-    return readFileNoFollow("Read", abs).toString("utf8");
+    resolveSafe("Read", input.path);
+    return readWorkspaceText("Read", input.path);
   },
 });
 
@@ -245,15 +250,8 @@ export const write: RegisteredTool = buildTool({
   destructive: true,
   operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
-    const abs = resolveSafe("Write", input.path);
-    const tmp = `${abs}.tmp.${randomBytes(6).toString("hex")}`;
-    try {
-      await Bun.write(tmp, input.content);
-      await rename(tmp, abs);
-    } catch (err) {
-      await unlink(tmp).catch(() => {});
-      throw err;
-    }
+    resolveSafe("Write", input.path);
+    writeWorkspaceText("Write", input.path, input.content, true);
     return `wrote ${input.content.length} bytes to ${input.path}`;
   },
 });
@@ -271,8 +269,8 @@ export const edit: RegisteredTool = buildTool({
   destructive: true,
   operativeArgs: [{ field: "path", kind: "path" }],
   execute: async (input) => {
-    const abs = resolveSafe("Edit", input.path);
-    const original = readFileNoFollow("Edit", abs).toString("utf8");
+    resolveSafe("Edit", input.path);
+    const original = readWorkspaceText("Edit", input.path);
     const occurrences = original.split(input.oldString).length - 1;
     if (occurrences === 0) {
       throw new Error(`oldString not found in "${input.path}"`);
@@ -282,15 +280,14 @@ export const edit: RegisteredTool = buildTool({
         `oldString matches ${occurrences} times in "${input.path}" — provide more surrounding context to make it unique`,
       );
     }
-    const next = original.replace(input.oldString, input.newString);
-    const tmp = `${abs}.tmp.${randomBytes(6).toString("hex")}`;
-    try {
-      await Bun.write(tmp, next);
-      await rename(tmp, abs);
-    } catch (err) {
-      await unlink(tmp).catch(() => {});
-      throw err;
-    }
+    // Spliced by index, never `original.replace(oldString, newString)`: a
+    // string replacement expands `$$`, `$&`, `` $` `` and `$'` in newString,
+    // so a Makefile's `$$` or JS's "\\$&" was written as something else
+    // while the diff below showed the text the caller asked for.
+    const at = original.indexOf(input.oldString);
+    const next =
+      original.slice(0, at) + input.newString + original.slice(at + input.oldString.length);
+    writeWorkspaceText("Edit", input.path, next, false);
     // M3.3 — return a unified-diff style hunk so the CLI (and the model
     // on subsequent turns) can see exactly what changed. The header
     // line "edited <path>" stays first for backward compatibility with
@@ -344,27 +341,130 @@ const grepSchema = z.object({
   path: z.string().optional(),
 });
 
-// ReDoS bounds. The Grep pattern is model-supplied and model output is
-// attacker-steerable, so a catastrophic-backtracking pattern run over the
-// workspace could pin a CPU core. We bound it three ways:
-//  1. reject nested-quantifier (star-height >= 2) patterns up front — the
-//     shape behind exponential backtracking, which no input cap can save;
-//  2. skip over-long lines so a "safe" (linear/polynomial) pattern can't be
-//     fed a pathological input length;
-//  3. a wall-clock deadline + a scanned-bytes cap bound the aggregate work.
-const GREP_MAX_LINE_LENGTH = 10_000;
+// The Grep pattern is model-supplied, and model output is attacker-steerable.
+// A synchronous RegExp call cannot be interrupted: no timer fires and no
+// abort is seen while it runs, so a catastrophic pattern froze every session
+// in the process. Worse, JavaScriptCore stops a runaway match after a fixed
+// backtracking budget and answers "no match", indistinguishable from a real
+// one: `(\w|\d)*!|NEEDLE` over 64-character hex lines returned a bare "no
+// matches" after 6 s with NEEDLE on line 5, and the deadline, read only
+// every 1024 lines, let one file run for minutes (security-6#6). So:
+//  1. the pattern is screened up front (tool-safety's `screenUserRegex`,
+//     which refuses nested quantifiers AND overlapping alternation, plus
+//     this package's older nested-quantifier check, which is stricter about
+//     bounded repeats such as `(.*a){10}`);
+//  2. the match runs in tool-safety's regex worker, under the call's deadline
+//     and abort signal: at the deadline the worker is terminated and the
+//     caller's thread is free. Lines go to the worker in batches of up to
+//     GREP_BATCH_CHARS, gathered across files and split inside a big one, so
+//     neither a thousand small files nor one lockfile over the worker's
+//     input limit changes what is searched (one call per file cost a round
+//     trip each, and a file over the limit ended the whole scan). A line
+//     without any of the literals every match must contain (`./literals`)
+//     is a definite miss and never goes to the worker, which keeps a search
+//     for a word as fast as 0.7.0's;
+//  3. one match attempt cannot be interrupted, so the longest line a pattern
+//     runs on is chosen from how many of its repeats can split the same text
+//     (`./repeat-chain`), which bounds how long an abandoned worker keeps a
+//     core busy; a pattern with too many is refused;
+//  4. an answer the engine gave up on (a slow "no match") is UNDETERMINED,
+//     and so is a line too long to run: the result lists what it could not
+//     search and never says a bare "no matches" when anything went unsearched.
+const GREP_MAX_LINE_LENGTH = BASE_LINE_CAP;
 const GREP_MAX_PATTERN_LENGTH = 1_000;
 const GREP_DEADLINE_MS = 2_000;
 const GREP_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
+/**
+ * Characters (plus one per line) sent to the regex worker in one batch: its
+ * own default input limit, passed explicitly so the two cannot drift apart.
+ */
+const GREP_BATCH_CHARS = 1_000_000;
+/** Examples of unsearched lines named in the note; the rest are counted. */
+const GREP_UNSEARCHED_EXAMPLES = 5;
+
+type GrepLimits = {
+  readonly deadlineMs: number;
+  readonly giveUpMs: number | undefined;
+  readonly now: () => number;
+  /** Characters (plus one per line) gathered before a batch goes to the worker. */
+  readonly batchChars: number;
+  /** The input limit the worker is told; equal to `batchChars` except in a test. */
+  readonly workerInputChars: number;
+};
+const GREP_DEFAULT_LIMITS: GrepLimits = {
+  deadlineMs: GREP_DEADLINE_MS,
+  giveUpMs: undefined,
+  now: () => Date.now(),
+  batchChars: GREP_BATCH_CHARS,
+  workerInputChars: GREP_BATCH_CHARS,
+};
+let grepLimits: GrepLimits = GREP_DEFAULT_LIMITS;
+
+/**
+ * Test seam: the deadline, the regex worker's give-up threshold (a no-match
+ * slower than this is undetermined; 0 makes every no-match undetermined, to
+ * exercise that path without a pathological pattern), the clock, and the
+ * batch size and worker input limit (set apart only to exercise a refusal
+ * that cannot otherwise happen). Pass `undefined` to restore.
+ */
+export function _setGrepLimitsForTest(limits: Partial<GrepLimits> | undefined): void {
+  grepLimits = { ...GREP_DEFAULT_LIMITS, ...limits };
+}
+
+const REJECTION_LABELS: Partial<Record<RegexRejectCode, string>> = {
+  "nested-quantifier": "nested quantifiers",
+  "overlapping-alternation": "overlapping alternation",
+  "invalid-syntax": "invalid syntax",
+  "pattern-too-long": "too long",
+  unanalysable: "too complex to check",
+};
+
+/**
+ * Refuse a pattern that could backtrack catastrophically, with the reason,
+ * and say how long a line the rest may run on. Throws the tool's usual
+ * "invalid regex pattern" error.
+ */
+function screenGrepPattern(pattern: string): { lineCap: number; chain: number } {
+  if (pattern.length > GREP_MAX_PATTERN_LENGTH) {
+    throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
+  }
+  const screened = screenUserRegex(pattern, "", { maxPatternChars: GREP_MAX_PATTERN_LENGTH });
+  if (!screened.ok) {
+    const label = REJECTION_LABELS[screened.code] ?? screened.code;
+    throw new Error(`invalid regex pattern: ${label} — ${screened.reason}`);
+  }
+  if (hasNestedQuantifier(pattern)) {
+    throw new Error(
+      "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
+    );
+  }
+  const chain = repeatChainLength(pattern);
+  if (chain >= REFUSED_CHAIN) {
+    throw new Error(
+      `invalid regex pattern: stacked repeats — ${chain} repeats (such as \\w* or .*) can split the same text one after another, which backtracks for minutes on an ordinary line; put something between them that they cannot both match, or use a negated class such as [^,]*`,
+    );
+  }
+  return { lineCap: lineCapForChain(chain), chain };
+}
 
 /**
  * True if the pattern nests one unbounded/large quantifier inside another
- * (star-height >= 2, e.g. `(a+)+`, `(a*)*`, `(.*a)+`, `((\d+)x)*`). That is
- * the structural cause of exponential backtracking. Heuristic, not a full
- * analysis — alternation-overlap ReDoS is only partly covered, which is why
- * the line/scan caps exist as a backstop.
+ * (star-height >= 2, e.g. `(a+)+`, `(a*)*`, `(.*a)+`, `((\d+)x)*`), or
+ * repeats an alternation whose branches can match the same text
+ * (`(\w|\d)*`, `(a|ab)*`). Both are shapes behind exponential
+ * backtracking. The alternation half, and the precise nested-quantifier
+ * analysis, are tool-safety's `screenUserRegex`; the structural check below
+ * is the older, stricter one about bounded repeats, kept so no pattern this
+ * refused before is accepted now.
  */
 export function hasNestedQuantifier(pattern: string): boolean {
+  const screened = screenUserRegex(pattern, "", { maxPatternChars: Number.MAX_SAFE_INTEGER });
+  if (
+    !screened.ok &&
+    (screened.code === "nested-quantifier" || screened.code === "overlapping-alternation")
+  ) {
+    return true;
+  }
   // Per group-nesting level, did the body so far contain a quantifier?
   const quantInGroup: boolean[] = [false];
   const isBigQuant = (s: string, at: number): boolean => {
@@ -433,10 +533,69 @@ export function hasNestedQuantifier(pattern: string): boolean {
   return false;
 }
 
+/** What a Grep call could not search, for the note that says so. */
+type Unsearched = {
+  /** Lines the engine gave up on: they may or may not match. */
+  gaveUp: number;
+  /** Lines longer than the pattern's line cap, not run at all. */
+  tooLong: number;
+  /** Files that could not be read (not symlinks, which are skipped by design). */
+  unreadable: number;
+  /** Lines the worker refused to take, and why (it should never happen: see GREP_BATCH_CHARS). */
+  refused: { lines: number; reason: string } | undefined;
+  /** A few `path:line` examples of undetermined lines. */
+  examples: string[];
+  /** Why the scan stopped before the end, when it did. */
+  stopped: string | undefined;
+};
+
+function unsearchedNote(u: Unsearched, lineCap: number, chain: number): string {
+  const parts: string[] = [];
+  if (u.gaveUp > 0) {
+    const shown = u.examples.slice(0, GREP_UNSEARCHED_EXAMPLES).join(", ");
+    parts.push(
+      `\n[grep: ${u.gaveUp} line(s) could not be evaluated — the regex engine gave up on them (${shown}${u.gaveUp > GREP_UNSEARCHED_EXAMPLES ? ", …" : ""}), so they may or may not match; simplify the pattern]`,
+    );
+  }
+  if (u.tooLong > 0) {
+    const why =
+      lineCap < GREP_MAX_LINE_LENGTH
+        ? ` — this pattern has ${chain} repeats that can split the same text one after another, which is too slow to run on longer lines; put something between them that they cannot both match to search up to ${GREP_MAX_LINE_LENGTH}`
+        : "";
+    parts.push(
+      `\n[grep: ${u.tooLong} line(s) longer than ${lineCap} characters were not searched${why}]`,
+    );
+  }
+  if (u.unreadable > 0) {
+    parts.push(`\n[grep: ${u.unreadable} file(s) could not be read and were not searched]`);
+  }
+  if (u.refused !== undefined) {
+    parts.push(`\n[grep: ${u.refused.lines} line(s) were not searched: ${u.refused.reason}]`);
+  }
+  if (u.stopped !== undefined) parts.push(`\n[grep: scan stopped early — ${u.stopped}]`);
+  return parts.join("");
+}
+
+/** Lines waiting to go to the regex worker, and where each came from. */
+type GrepBatch = {
+  inputs: string[];
+  /** Per input: its index in `files`. */
+  fileOf: number[];
+  /** Per input: its 1-based line number. */
+  lineOf: number[];
+  files: string[];
+  /** Characters plus one per input, as the worker counts them. */
+  chars: number;
+};
+
+function emptyBatch(): GrepBatch {
+  return { inputs: [], fileOf: [], lineOf: [], files: [], chars: 0 };
+}
+
 export const grep: RegisteredTool = buildTool({
   name: "Grep",
   description:
-    "Search for a regex pattern across files in the workspace (or a subdirectory). Vendored directories (node_modules, __pycache__) are skipped unless `path` points inside one. Returns lines as path:lineNo:match.",
+    "Search for a regex pattern across files in the workspace (or a subdirectory). Vendored directories (node_modules, __pycache__) are skipped unless `path` points inside one. Returns lines as path:lineNo:match, and names any lines it could not search.",
   inputSchema: grepSchema,
   readOnly: true,
   concurrencySafe: true,
@@ -448,7 +607,7 @@ export const grep: RegisteredTool = buildTool({
     { field: "pattern", kind: "text" },
     { field: "path", kind: "path", default: "." },
   ],
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     const root = process.cwd();
     let baseAbs = root;
     let baseRel = "";
@@ -456,25 +615,20 @@ export const grep: RegisteredTool = buildTool({
       baseAbs = resolveSafe("Grep", input.path, root);
       baseRel = path.relative(root, baseAbs);
     }
-    if (input.pattern.length > GREP_MAX_PATTERN_LENGTH) {
-      throw new Error(`invalid regex pattern: too long (max ${GREP_MAX_PATTERN_LENGTH} chars)`);
-    }
-    if (hasNestedQuantifier(input.pattern)) {
-      throw new Error(
-        "invalid regex pattern: nested quantifiers (e.g. (a+)+) risk catastrophic backtracking — rewrite without a repetition inside a repeated group",
-      );
-    }
-    let regex: RegExp;
-    try {
-      regex = new RegExp(input.pattern);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`invalid regex pattern: ${msg}`);
-    }
+    const { lineCap, chain } = screenGrepPattern(input.pattern);
+    const literals = requiredLiterals(input.pattern);
 
-    const deadline = Date.now() + GREP_DEADLINE_MS;
+    const limits = grepLimits;
+    const deadline = limits.now() + limits.deadlineMs;
     let scannedBytes = 0;
-    let truncated = false;
+    const unsearched: Unsearched = {
+      gaveUp: 0,
+      tooLong: 0,
+      unreadable: 0,
+      refused: undefined,
+      examples: [],
+      stopped: undefined,
+    };
     // Pointing `path` at (or inside) a vendored directory opts into searching
     // it; otherwise its contents are skipped before they cost a read.
     const ignored = activeIgnoredDirs(input.path ?? "");
@@ -482,48 +636,154 @@ export const grep: RegisteredTool = buildTool({
     const hits: string[] = [];
     const hiddenDirs = new Set<string>();
     let hidden = 0;
-    outer: for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
-      const skippedBy = ignoredSegmentOf(rel, ignored);
-      if (skippedBy !== undefined) {
-        hidden++;
-        hiddenDirs.add(skippedBy);
-        continue;
+    const session = openRegexSession();
+    let batch = emptyBatch();
+    const where = (b: GrepBatch, index: number): string =>
+      `${b.files[b.fileOf[index] as number]}:${b.lineOf[index]}`;
+
+    /**
+     * Run the pending lines. True to keep scanning; false when the scan must
+     * stop (the deadline, an abort, a worker that cannot run), with
+     * `unsearched.stopped` saying why and from where.
+     */
+    const flush = async (): Promise<boolean> => {
+      const b = batch;
+      batch = emptyBatch();
+      if (b.inputs.length === 0) return true;
+      const remainingMs = deadline - limits.now();
+      if (remainingMs <= 0) {
+        unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed before ${where(b, 0)} was searched; it and everything after it were not searched`;
+        return false;
       }
-      const fileAbs = path.join(baseAbs, rel);
-      const display = baseRel === "" ? rel : path.join(baseRel, rel);
-      let text: string;
-      try {
-        // O_NOFOLLOW: skip (don't follow) any symlinked entry the glob surfaced.
-        text = readFileNoFollow("Grep", fileAbs).toString("utf8");
-      } catch {
-        continue;
+      const outcome = await session.run({
+        op: "testEach",
+        pattern: input.pattern,
+        inputs: b.inputs,
+        onGiveUp: "skip",
+        maxItemChars: lineCap,
+        maxInputChars: limits.workerInputChars,
+        maxMatches: b.inputs.length,
+        deadlineMs: remainingMs,
+        ...(limits.giveUpMs !== undefined ? { giveUpMs: limits.giveUpMs } : {}),
+        ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
+        ...(ctx?.runContext?.sessionId !== undefined
+          ? { runawayKey: ctx.runContext.sessionId }
+          : {}),
+      });
+      const answered = outcome.status === "ok" ? outcome.result : undefined;
+      const partial =
+        answered ??
+        (outcome.status === "timeout" || outcome.status === "gave-up"
+          ? outcome.partial
+          : undefined);
+      for (const index of partial?.matched ?? []) {
+        hits.push(`${where(b, index)}:${b.inputs[index] ?? ""}`);
       }
-      scannedBytes += text.length;
-      if (scannedBytes > GREP_MAX_TOTAL_BYTES) {
-        truncated = true;
-        break;
-      }
-      const lines = text.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        // Check the deadline between lines — bounds aggregate work even though
-        // it can't interrupt a single `.test()` (which the pattern guard +
-        // line cap keep cheap).
-        if ((i & 0x3ff) === 0 && Date.now() > deadline) {
-          truncated = true;
-          break outer;
+      for (const index of partial?.undetermined ?? []) {
+        unsearched.gaveUp++;
+        if (unsearched.examples.length < GREP_UNSEARCHED_EXAMPLES) {
+          unsearched.examples.push(where(b, index));
         }
-        const line = lines[i] ?? "";
-        if (line.length > GREP_MAX_LINE_LENGTH) continue;
-        if (regex.test(line)) {
-          hits.push(`${display}:${i + 1}:${line}`);
+      }
+      if (answered !== undefined) return true;
+      if (outcome.status === "input-too-large") {
+        // Cannot happen while GREP_BATCH_CHARS and the line cap are what the
+        // worker is told; if it ever does, these lines are named as
+        // unsearched and the scan goes on, rather than ending at them.
+        unsearched.refused = {
+          lines: (unsearched.refused?.lines ?? 0) + b.inputs.length,
+          reason: outcome.reason,
+        };
+        return true;
+      }
+      // Anything else ends the scan: the deadline, an abort, a worker that
+      // could not run. The lines not answered and every file after them
+      // were not searched, and the note says so.
+      const first =
+        outcome.status === "timeout"
+          ? (outcome.completed ?? outcome.partial?.scanned ?? 0)
+          : outcome.status === "gave-up"
+            ? (outcome.partial?.scanned ?? 0)
+            : 0;
+      const from = where(b, Math.min(first, b.inputs.length - 1));
+      unsearched.stopped =
+        outcome.status === "timeout"
+          ? `the ${limits.deadlineMs} ms deadline passed while searching ${from}; it and everything after it were not searched`
+          : `${describeRegexOutcome(outcome)} (at ${from}); it and everything after it were not searched`;
+      return false;
+    };
+
+    try {
+      scan: for await (const rel of matcher.scan({ cwd: baseAbs, onlyFiles: true })) {
+        const skippedBy = ignoredSegmentOf(rel, ignored);
+        if (skippedBy !== undefined) {
+          hidden++;
+          hiddenDirs.add(skippedBy);
+          continue;
+        }
+        const display = baseRel === "" ? rel : path.join(baseRel, rel);
+        if (deadline - limits.now() <= 0) {
+          // Lines read but not yet searched are named by flush(), which
+          // finds the deadline passed; with none pending, this file is.
+          if (await flush()) {
+            unsearched.stopped = `the ${limits.deadlineMs} ms deadline passed; ${display} and the files after it were not searched`;
+          }
+          break;
+        }
+        const fileAbs = path.join(baseAbs, rel);
+        // Bounded by what is left of the byte budget, never following a
+        // link, and refusing a FIFO before it is opened (it would block).
+        const budget = GREP_MAX_TOTAL_BYTES - scannedBytes;
+        const read = readFileBoundedSync(fileAbs, { maxBytes: budget, followSymlinks: false });
+        if (!read.ok) {
+          // A symlinked entry is skipped by design; anything else is a file
+          // this call did not search, and says so.
+          if (read.code !== "symlink-refused") unsearched.unreadable++;
+          continue;
+        }
+        if (read.truncated) {
+          if (await flush()) {
+            unsearched.stopped = `the ${GREP_MAX_TOTAL_BYTES / (1024 * 1024)} MiB scan budget ran out at ${display}; it and the files after it were not searched`;
+          }
+          break;
+        }
+        scannedBytes += read.bytes.length;
+        const lines = read.text.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i] as string;
+          // A line holding none of the pattern's required literals cannot
+          // match: a definite answer, however long the line, with no worker.
+          if (literals !== undefined && !literals.some((l) => line.includes(l))) continue;
+          if (line.length > lineCap) {
+            unsearched.tooLong++;
+            continue;
+          }
+          if (batch.chars + line.length + 1 > limits.batchChars && !(await flush())) break scan;
+          if (batch.files[batch.files.length - 1] !== display) batch.files.push(display);
+          batch.inputs.push(line);
+          batch.fileOf.push(batch.files.length - 1);
+          batch.lineOf.push(i + 1);
+          batch.chars += line.length + 1;
         }
       }
+      if (unsearched.stopped === undefined) await flush();
+    } finally {
+      session.close();
     }
-    const note = truncated ? "\n[grep: scan stopped early — workspace too large or slow]" : "";
+    const incomplete =
+      unsearched.gaveUp > 0 ||
+      unsearched.tooLong > 0 ||
+      unsearched.unreadable > 0 ||
+      unsearched.refused !== undefined ||
+      unsearched.stopped !== undefined;
+    const body =
+      hits.length > 0
+        ? hits.join("\n")
+        : incomplete
+          ? "no matches in the lines searched"
+          : "no matches";
     return (
-      (hits.length === 0 ? "no matches" : hits.join("\n")) +
-      note +
-      hiddenNote("Grep", hidden, hiddenDirs)
+      body + unsearchedNote(unsearched, lineCap, chain) + hiddenNote("Grep", hidden, hiddenDirs)
     );
   },
 });

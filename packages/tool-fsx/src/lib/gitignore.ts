@@ -22,7 +22,7 @@
  * ignore file are likewise out of scope — only `.gitignore` files inside the
  * walked tree are read.
  */
-import { globToRegExpSource } from "./glob";
+import { compileGlob } from "./glob";
 
 /** One compiled line from a `.gitignore` file. */
 export type IgnoreRule = {
@@ -32,7 +32,11 @@ export type IgnoreRule = {
   readonly dirOnly: boolean;
   /** Contains a `/`, so it matches a path relative to the file's directory. */
   readonly anchored: boolean;
-  readonly regex: RegExp;
+  /**
+   * The compiled pattern: whole-string, segment-aware, never a RegExp (a
+   * committed line like `*a*a*a*a*a*a*b` made a backtracking one hang).
+   */
+  readonly test: (subject: string) => boolean;
   /** The original line, for explaining a decision back to the caller. */
   readonly source: string;
 };
@@ -102,7 +106,7 @@ export function compileIgnoreRule(rawLine: string): IgnoreRule | undefined {
     negated,
     dirOnly,
     anchored,
-    regex: new RegExp(`^${globToRegExpSource(pattern)}$`),
+    test: compileGlob(pattern),
     source,
   };
 }
@@ -148,7 +152,7 @@ export function isIgnored(
     const base = basenameOf(subject);
     for (const rule of layer.rules) {
       if (rule.dirOnly && !isDirectory) continue;
-      if (rule.regex.test(rule.anchored ? subject : base)) {
+      if (rule.test(rule.anchored ? subject : base)) {
         ignored = !rule.negated;
       }
     }

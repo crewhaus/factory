@@ -10,7 +10,8 @@
     { "path": "../tool-builder" },
     { "path": "../tool-validate" },
     { "path": "../tool-permission-matcher" },
-    { "path": "../tool-executor" }
+    { "path": "../tool-executor" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

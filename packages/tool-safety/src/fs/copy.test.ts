@@ -241,6 +241,91 @@ describe.if(posix)(
   },
 );
 
+describe.if(posix)("copy-no-new-reach: a link may lead outside only where its source led", () => {
+  const reach = { ...opts, symlinks: "copy-no-new-reach" } as const;
+  mkdirSync(join(f.ws, "venv", "bin"), { recursive: true });
+  writeFileSync(join(f.outside, "python3"), "#!interpreter\n");
+  symlinkSync(join(f.outside, "python3"), join(f.ws, "venv", "bin", "python"));
+
+  test("an absolute outside link is refused by copy-contained, kept and listed by copy-no-new-reach", () => {
+    expect(copyTreeSafe(f.ws, "venv", f.ws, "venv-refused", opts)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+      path: "venv/bin/python",
+    });
+    expect(existsSync(join(f.ws, "venv-refused"))).toBe(false);
+    const r = copyTreeSafe(f.ws, "venv", f.ws, "venv-copy", reach);
+    expect(r).toMatchObject({ ok: true, symlinks: 1, outsideLinks: ["venv-copy/bin/python"] });
+    expect(readlinkSync(join(f.ws, "venv-copy", "bin", "python"))).toBe(join(f.outside, "python3"));
+    // The target's bytes were never copied in.
+    expect(readdirSync(join(f.ws, "venv-copy", "bin"))).toEqual(["python"]);
+  });
+
+  test("a relative link that already led out is kept at the same depth, refused where it would reach further", () => {
+    mkdirSync(join(f.ws, "esc"));
+    symlinkSync("../..", join(f.ws, "esc", "up"));
+    expect(copyTreeSafe(f.ws, "esc", f.ws, "esc2", reach)).toMatchObject({
+      ok: true,
+      outsideLinks: ["esc2/up"],
+    });
+    // At depth 0 the same text leads two levels above ws: new reach.
+    expect(copyTreeSafe(f.ws, "esc/up", f.ws, "up0", reach)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+      path: "esc/up",
+    });
+    expect(existsSync(join(f.ws, "up0"))).toBe(false);
+    // One level deeper it leads inside ws: an ordinary contained link.
+    expect(
+      copyTreeSafe(f.ws, "esc", f.ws, "deeper/esc", { ...reach, createParents: true }),
+    ).toMatchObject({
+      ok: true,
+      outsideLinks: [],
+    });
+  });
+
+  test("a link inside the workspace that would leave at the new depth is still refused", () => {
+    mkdirSync(join(f.ws, "nr", "d1", "d2"), { recursive: true });
+    writeFileSync(join(f.ws, "nr", "target.txt"), "sibling");
+    symlinkSync("../../target.txt", join(f.ws, "nr", "d1", "d2", "l"));
+    expect(copyTreeSafe(f.ws, "nr/d1/d2", f.ws, "nr-dest", reach)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+      path: "nr/d1/d2/l",
+    });
+  });
+
+  test("across roots it keeps nothing: the destination root never had that reach", () => {
+    mkdirSync(join(f.ws, "root2"));
+    expect(copyTreeSafe(f.ws, "venv", join(f.ws, "root2"), "venv", reach)).toMatchObject({
+      ok: false,
+      code: "escapes-root",
+    });
+    expect(existsSync(join(f.ws, "root2", "venv"))).toBe(false);
+  });
+
+  test("a kept link whose landing moves during the copy is removed after it", () => {
+    // pivot is outside the copied tree; t/x leads through it to outside/A/f.
+    mkdirSync(join(f.outside, "A"));
+    mkdirSync(join(f.outside, "B"));
+    symlinkSync(join(f.outside, "A"), join(f.ws, "pivot"));
+    mkdirSync(join(f.ws, "t"));
+    symlinkSync("../pivot/f", join(f.ws, "t", "x"));
+    let swapped = 0;
+    _setBeforeCopyEntryForTest((destination) => {
+      if (destination !== "u/x") return;
+      swapped += 1;
+      renameSync(join(f.ws, "pivot"), join(f.ws, "pivot-old"));
+      symlinkSync(join(f.outside, "B"), join(f.ws, "pivot"));
+    });
+    const r = copyTreeSafe(f.ws, "t", f.ws, "u", reach);
+    expect(swapped).toBe(1);
+    expect(r).toMatchObject({ ok: false, code: "changed", path: "u/x" });
+    expect(existsSync(join(f.ws, "u", "x"))).toBe(false);
+    expect(() => lstatSync(join(f.ws, "u", "x"))).toThrow();
+  });
+});
+
 describe.if(posix)("links are judged from their NEW location (security-11#2)", () => {
   test("a relative link inside the workspace that would escape at the new depth is refused", () => {
     // ws/rel/d1/d2/l -> ../../target.txt resolves to ws/rel/target.txt: inside.

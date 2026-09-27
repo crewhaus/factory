@@ -5,7 +5,9 @@
     { "path": "../errors" },
     { "path": "../tool-catalog" },
     { "path": "../tool-builder" },
-    { "path": "../tool-executor" }
+    { "path": "../tool-executor" },
+    { "path": "../tool-safety" }
   ],
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["**/*.test.ts", "**/*.test.tsx", "src/archive-fixtures.ts"]
 }
