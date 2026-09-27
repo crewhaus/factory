@@ -497,9 +497,52 @@ describe("classifyError", () => {
     });
 
     test("an ISO instant that carries its own offset is still read", () => {
-      for (const text of ["2026-09-23T10:00:00Z", "2026-09-23T19:00:00+09:00"]) {
-        expect(inZone("America/New_York", () => parseRetryAfter(text, now).waitMs)).toBe(3_600_000);
+      const forms = [
+        "2026-09-23T10:00:00Z",
+        "2026-09-23T19:00:00+09:00",
+        "2026-09-23T19:00:00+0900",
+        // RFC 3339 allows a space for the T; Python's str(datetime) writes
+        // it, with microseconds. 0.7.0 read all three on every host.
+        "2026-09-23 10:00:00+00:00",
+        "2026-09-23 10:00:00.000000+00:00",
+        "2026-09-23 10:00:00Z",
+      ];
+      for (const text of forms) {
+        expect({
+          text,
+          waitMs: inZone("America/New_York", () => parseRetryAfter(text, now).waitMs),
+        }).toEqual({ text, waitMs: 3_600_000 });
       }
+      expect(parseRetryAfter("2026-09-23 10:00:00.123456+00:00", now).waitMs).toBe(3_600_123);
+      // Still refused without the offset, whichever separator.
+      expect(parseRetryAfter("2026-09-23 10:00:00", now)).toEqual({ waitMs: null, retryAt: null });
+    });
+
+    test("a date that does not exist is refused, not rolled over, and a year is read as written", () => {
+      // Date.parse rolled 30 Feb over to 2 March and read hour 24 as the
+      // next day; each is a malformed header, not a time to wait for.
+      for (const text of [
+        "2026-02-30T10:00:00Z",
+        "2026-13-01T10:00:00Z",
+        "2026-09-23T24:00:00Z",
+        "2026-09-23T10:60:00Z",
+        "2026-09-23T10:00:00+24:00",
+        "Mon, 29 Feb 2027 10:00:00 GMT",
+      ]) {
+        expect({ text, got: parseRetryAfter(text, now) }).toEqual({
+          text,
+          got: { waitMs: null, retryAt: null },
+        });
+      }
+      expect(parseRetryAfter("2028-02-29T10:00:00Z", now).retryAt).toBe("2028-02-29T10:00:00.000Z");
+      // Date.UTC maps the years 0-99 to 1900-1999; the header said 0026.
+      expect(parseRetryAfter("Sat, 26 Sep 0026 10:00:00 GMT", now)).toEqual({
+        waitMs: 0,
+        retryAt: "0026-09-26T10:00:00.000Z",
+      });
+      expect(parseHttpDate("Sat, 26 Sep 0026 10:00:00 GMT")).toBe(
+        Date.parse("0026-09-26T10:00:00Z"),
+      );
     });
 
     test("an rfc850 two-digit year is placed by the RFC's 50-year rule, and needs a now", () => {

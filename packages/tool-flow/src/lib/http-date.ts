@@ -7,8 +7,8 @@
  * an offset-less ISO-8601 string meant 10:00 UTC on one machine and 01:00
  * UTC on another, so ErrorClassify's wait for the same header differed by
  * the operator's timezone. This reads exactly the three forms the RFC
- * defines, all of which are GMT by definition, builds the instant with
- * `Date.UTC`, and answers undefined for anything else — never a guess.
+ * defines, all of which are GMT by definition, builds the instant from
+ * its UTC fields, and answers undefined for anything else — never a guess.
  * Two unambiguous non-HTTP forms that 0.7.0 read correctly are read too,
  * each only with its zone written: an RFC 5322 date-time and an ISO-8601
  * instant with an offset.
@@ -34,6 +34,33 @@ const RFC850_DATE = /^([A-Za-z]{6,9}), (\d{2})-([A-Za-z]{3})-(\d{2}) (\d{2}):(\d
 /** asctime-date (obsolete): `Sun Nov  6 08:49:37 1994`, GMT with no zone written. */
 const ASCTIME_DATE = /^([A-Za-z]{3}) ([A-Za-z]{3}) ( \d|\d{2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/i;
 
+/**
+ * The epoch milliseconds of a UTC calendar time, or undefined when any field
+ * is out of range. The year is used as written: `Date.UTC` maps 0-99 to
+ * 1900-1999, which read `Sat, 26 Sep 0026 …` as 1926.
+ */
+function utcInstant(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  ms = 0,
+): number | undefined {
+  if (month < 0 || month > 11 || day < 1 || hour > 23 || minute > 59 || second > 60) {
+    return undefined;
+  }
+  const date = new Date(0);
+  date.setUTCFullYear(year, month, day);
+  // Refuse a day the month does not have (31 Nov, 30 Feb), rather than
+  // rolling over into the next month as Date does.
+  if (date.getUTCMonth() !== month || date.getUTCDate() !== day) return undefined;
+  // A leap second is legal on the wire; it names the same instant as :59
+  // plus one second, which is what adding 60 seconds gives.
+  return date.getTime() + ((hour * 60 + minute) * 60 + second) * 1000 + ms;
+}
+
 function instant(
   year: number,
   monthName: string,
@@ -42,15 +69,7 @@ function instant(
   minute: number,
   second: number,
 ): number | undefined {
-  const month = MONTHS.indexOf(monthName.toLowerCase());
-  if (month < 0 || hour > 23 || minute > 59 || second > 60) return undefined;
-  // A leap second is legal on the wire; it names the same instant as :59
-  // plus one second, which is what Date.UTC gives for 60.
-  const ms = Date.UTC(year, month, day, hour, minute, second);
-  const check = new Date(Date.UTC(year, month, day));
-  // Refuse a day the month does not have (31 Nov), rather than rolling over.
-  if (check.getUTCMonth() !== month || check.getUTCDate() !== day) return undefined;
-  return ms;
+  return utcInstant(year, MONTHS.indexOf(monthName.toLowerCase()), day, hour, minute, second);
 }
 
 /**
@@ -160,17 +179,40 @@ export function parseRfc5322WithZone(text: string): number | undefined {
 }
 
 /**
- * An ISO-8601 date-time that carries its own UTC offset (`Z` or `±hh:mm`).
- * Not an HTTP-date, but unambiguous, and `Date.parse` read it correctly on
+ * An ISO-8601 / RFC 3339 date-time that carries its own UTC offset (`Z`,
+ * `±hh:mm` or `±hhmm`), with `T` or a single space between date and time
+ * (RFC 3339 §5.6 allows the space; Python's `str(datetime)` writes it). Not
+ * an HTTP-date, but unambiguous, and `Date.parse` read it correctly on
  * 0.7.0, so a server that sends one keeps working. Without the offset it is
  * refused like any other zone-less time.
+ *
+ * The fields are checked here, not by `Date.parse`, which rolls an
+ * impossible day over (`2026-02-30` became 2 March). Fractional seconds past
+ * the millisecond are dropped, as `Date.parse` drops them.
  */
 const ISO_WITH_OFFSET =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:?\d{2})$/i;
 
 export function parseIsoInstantWithOffset(text: string): number | undefined {
-  const t = text.trim();
-  if (!ISO_WITH_OFFSET.test(t)) return undefined;
-  const ms = Date.parse(t);
-  return Number.isNaN(ms) ? undefined : ms;
+  const m = ISO_WITH_OFFSET.exec(text.trim());
+  if (m === null) return undefined;
+  const zone = (m[8] as string).toUpperCase();
+  let offsetMinutes = 0;
+  if (zone !== "Z") {
+    const digits = zone.slice(1).replace(":", "");
+    const hours = Number(digits.slice(0, 2));
+    const minutes = Number(digits.slice(2, 4));
+    if (hours > 23 || minutes > 59) return undefined;
+    offsetMinutes = (zone.startsWith("-") ? -1 : 1) * (hours * 60 + minutes);
+  }
+  const ms = utcInstant(
+    Number(m[1]),
+    Number(m[2]) - 1,
+    Number(m[3]),
+    Number(m[4]),
+    Number(m[5]),
+    Number(m[6] ?? "0"),
+    Number(`${m[7] ?? ""}000`.slice(0, 3)),
+  );
+  return ms === undefined ? undefined : ms - offsetMinutes * 60_000;
 }

@@ -144,8 +144,9 @@ Two details worth knowing:
 - **A `Retry-After` date is read only with its zone written.** The RFC 9110
   HTTP-date forms (GMT by definition), an RFC 5322 date with its zone
   (`+0200`, `UTC`, `-0000`, `PDT`), and an ISO-8601 instant with an offset
-  are the same instant on every machine; a date with no zone is not read at
-  all, rather than read as the host's local time.
+  (`T` or a space before the time) are the same instant on every machine; a
+  date with no zone is not read at all, rather than read as the host's local
+  time. A date that does not exist (30 February, hour 24) is not read either.
 - **Message matching uses substrings, not regular expressions.** That text
   comes from a remote server, and a pattern with nested quantifiers there is
   a denial of service waiting to happen. Caller-supplied rules may use a
