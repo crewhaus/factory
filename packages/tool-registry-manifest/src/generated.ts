@@ -1680,7 +1680,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "cwd", kind: "path", default: "." },
-      { field: "endpoint", kind: "url", default: "https://api.osv.dev" },
+      { field: "endpoint", kind: "url", default: "https://api.osv.dev", relocates: true },
     ],
     categories: ["supplychain", "code", "network"],
     package: "@crewhaus/tool-supplychain",

@@ -164,7 +164,8 @@ export function operativeValuesOf(
       anyQualifier,
     } of readField(parsedInput, arg)) {
       if (arg.relocates === true && defaulted === true) {
-        relocated.push(...canonicalizePath(raw));
+        if (arg.kind === "url") relocated.push(canonicalUrl(raw));
+        else relocated.push(...canonicalizePath(raw));
         continue;
       }
       switch (arg.kind) {

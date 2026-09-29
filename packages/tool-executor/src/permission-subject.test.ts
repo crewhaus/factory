@@ -498,6 +498,36 @@ describe("a relocating field's default (C004)", () => {
     ).toBe(true);
   });
 
+  test("a url default that only moves the tool off its fixed service reads as a url", () => {
+    // DependencyAudit: the lockfile's versions go to the public OSV
+    // database unless the call names another endpoint.
+    const audit = buildTool({
+      name: "AuditLike",
+      description: "audit",
+      inputSchema: z.object({ cwd: z.string().optional(), endpoint: z.string().optional() }),
+      readOnly: true,
+      operativeArgs: [
+        { field: "cwd", kind: "path", default: "." },
+        { field: "endpoint", kind: "url", default: "https://api.osv.dev", relocates: true },
+      ],
+      execute: async () => "ok",
+    });
+    const values = operativeValuesFor(audit, { cwd: "." }) ?? [];
+    expect(values.map((v) => [v.kind, v.canonical, v.restrictOnly === true])).toEqual([
+      ["path", ["."], false],
+      ["url", ["https://api.osv.dev/", "https://api.osv.dev"], true],
+    ]);
+    const on = (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(
+        compilePattern(pattern),
+        "AuditLike",
+        {},
+        { polarity, operativeValues: values },
+      );
+    expect(on("AuditLike(.)", "allow")).toBe(true);
+    expect(on("AuditLike(https://api.osv.dev/**)", "restrict")).toBe(true);
+  });
+
   test("a default without relocates is one more value every rule reads", () => {
     const plain = buildTool({
       name: "PlainLike",

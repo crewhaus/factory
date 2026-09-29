@@ -337,6 +337,34 @@ describe("C004 — a store the call leaves out, and a call that names no operati
   });
 });
 
+describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
+  test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
+    // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as
+    // a plain default made every allow also have to match https://api.osv.dev.
+    for (const pattern of ["DependencyAudit(.)", "DependencyAudit(./**)", "DependencyAudit(*)"]) {
+      const rs = rules(["alwaysAllow", pattern]);
+      for (const input of [{ cwd: "." }, { cwd: ".", ecosystems: ["npm"] }]) {
+        const got = await gate("DependencyAudit", input, rs);
+        expect({ pattern, input, got }).toEqual({ pattern, input, got: "allow" });
+      }
+    }
+    // An endpoint the call names must still be covered by the allow.
+    const named = { cwd: ".", endpoint: "https://osv.internal.example" };
+    expect(await gate("DependencyAudit", named, rules(["alwaysAllow", "DependencyAudit(.)"]))).toBe(
+      "ask",
+    );
+    // A deny on the public database still fires when the call leaves it out.
+    const deny = rules(
+      ["alwaysDeny", "DependencyAudit(https://api.osv.dev/**)"],
+      ["alwaysAllow", "DependencyAudit"],
+    );
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const got = await gate("DependencyAudit", { cwd: "." }, deny, mode);
+      expect({ mode, got }).toEqual({ mode, got: "deny" });
+    }
+  });
+});
+
 describe("C004 — a search that reaches a denied repository", () => {
   test("a search that reaches a denied repository meets the deny (SearchCode, SearchIssues)", async () => {
     for (const name of ["SearchCode", "SearchIssues"]) {

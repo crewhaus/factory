@@ -245,7 +245,9 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * `relocates: true` marks a `path` field that only moves the tool off its
  * usual place: the store its other operative fields name a record in
  * (`stateDir`, `registryDir`, `evalsDir`), or the repository a branch
- * operation runs in (`cwd`). It needs a `default`. A deny or ask rule sees
+ * operation runs in (`cwd`) — or a `url` field that only moves it off the
+ * fixed service it is built to use (DependencyAudit's `endpoint`, the
+ * public OSV database). It needs a `default`. A deny or ask rule sees
  * that default when the call leaves the field out, so
  * `alwaysDeny KvDelete(.crewhaus/state/**)` fires on the ordinary call. An
  * allow rule is about the record: when the call leaves the field out AND

@@ -299,7 +299,9 @@ function checkOperativeArgs(
     const { relocates } = arg;
     if (relocates !== undefined) {
       if (relocates !== true) fail(`${at}.relocates is either true or left out`);
-      if (kind !== "path") fail(`${at}.relocates: only a "path" field can relocate a tool`);
+      if (kind !== "path" && kind !== "url") {
+        fail(`${at}.relocates: only a "path" or "url" field can relocate a tool`);
+      }
       if (arg.default === undefined) {
         fail(
           `${at}.relocates needs a default: the place the tool uses when "${field}" is omitted, which a deny or ask rule must see`,

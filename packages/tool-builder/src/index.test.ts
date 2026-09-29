@@ -369,12 +369,21 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
       default: ".crewhaus/state",
       relocates: true,
     });
+    // A url that only moves the tool off its fixed service relocates too.
+    expect(
+      build({
+        field: "target.url",
+        kind: "url",
+        default: "https://api.osv.dev",
+        relocates: true,
+      })().operativeArgs?.[0]?.relocates,
+    ).toBe(true);
     // A relocating field without a default would leave a deny nothing to read.
     expect(build({ field: "path", kind: "path", relocates: true })).toThrow(
       /relocates needs a default/,
     );
     expect(build({ field: "mode", kind: "text", default: "fast", relocates: true })).toThrow(
-      /only a "path" field can relocate/,
+      /only a "path" or "url" field can relocate/,
     );
     expect(build({ field: "path", kind: "path", default: ".", relocates: "yes" })).toThrow(
       /relocates is either true or left out/,

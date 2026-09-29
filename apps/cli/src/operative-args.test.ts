@@ -244,6 +244,7 @@ describe("an optional operative field says what leaving it out means (C004)", ()
       ["EvalBaselinePin.evalsDir", ".crewhaus/evals"],
       ["ExperimentLedger.experimentsDir", ".crewhaus/experiments"],
       ["GitBranchDelete.cwd", "."],
+      ["DependencyAudit.endpoint", "https://api.osv.dev"],
     ] as const) {
       expect({ field, place: declared.get(field) }).toEqual({ field, place });
     }
