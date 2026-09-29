@@ -1659,6 +1659,7 @@
         "@crewhaus/tool-loop-detection": "workspace:*",
         "@crewhaus/tool-orchestrator": "workspace:*",
         "@crewhaus/tool-result-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
