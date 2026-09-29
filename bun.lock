@@ -931,6 +931,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/exporter-datadog": {
@@ -1766,6 +1767,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/single-binary-cli": {

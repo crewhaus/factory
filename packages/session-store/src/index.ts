@@ -14,8 +14,14 @@
  * `updatedAt` — so that `touch -t YYYYMMDD0000 <id>.json` is a sufficient
  * way to test or force expiry from the shell.
  *
- * Atomic writes: every `create`/`update` writes to `<id>.json.tmp` and then
- * `rename`s, mirroring the `tool-fs` atomic-write pattern.
+ * Atomic writes: every `create`/`update` writes to a temp created with
+ * `O_EXCL|O_NOFOLLOW` under a random name beside `<id>.json`, and renames it
+ * into place (@crewhaus/tool-safety's `writeFileSafe`). Until 0.7.1 the temp
+ * was the fixed name `<id>.json.tmp`, opened through any link: a model that
+ * could plant a symlink there (GitApplyPatch creates one from a patch) had the
+ * runtime's own per-turn save overwrite a file anywhere the process could
+ * write. A symlink, FIFO or directory at `<id>.json` itself is refused on
+ * write and on read, naming the file and the reason.
  *
  * Path-traversal guard: every public method that consumes an `id` validates
  * it against `/^sess_[0-9a-f]{16}$/`. A malformed id throws `RuntimeError`
@@ -24,20 +30,17 @@
  * References: `claude-code/utils/sessionStorage.ts`, `agent-framework/_sessions.py`.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import {
-  appendFile,
-  mkdir,
-  readFile,
-  readdir,
-  rename,
-  stat,
-  unlink,
-  writeFile,
-} from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
 import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
+import {
+  type SafeFsFailure,
+  appendContained,
+  openForRead,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/sessions";
 export const DEFAULT_TTL_DAYS = 30;
@@ -158,6 +161,33 @@ function fencePath(absPath: string): string {
     assertSamePath(absPath, requireTenant().sessionRoot);
   }
   return absPath;
+}
+
+/**
+ * The largest session record `get()` reads. A record is a few hundred bytes of
+ * metadata; anything near this is not one, and is refused rather than buffered.
+ */
+const MAX_SESSION_RECORD_BYTES = 1024 * 1024;
+
+/**
+ * Write `data` at the absolute `absPath`, rooted at its own directory: the temp
+ * is random and `O_EXCL|O_NOFOLLOW`, and a link, FIFO or directory at the name
+ * is refused. The directory itself may be a link (an operator can keep the
+ * store elsewhere); it is resolved first, as the store's root.
+ */
+function writeContained(absPath: string, data: string, what: string): void {
+  const written = writeFileSafe(dirname(absPath), basename(absPath), data, {
+    overwrite: true,
+    mode: 0o600,
+  });
+  if (!written.ok) throw refusal("write", what, absPath, written);
+}
+
+/** The error for a store file tool-safety refused: the file and the reason. */
+function refusal(op: string, what: string, absPath: string, failure: SafeFsFailure): RuntimeError {
+  return new RuntimeError(
+    `session-store: refusing to ${op} ${what} at ${absPath}: ${failure.reason} (code ${failure.code})`,
+  );
 }
 
 function sessionPath(rootDir: string, id: string): string {
@@ -313,21 +343,28 @@ export function createSessionStore(opts: SessionStoreOptions = {}): SessionStore
 
   async function writeAtomic(session: Session): Promise<void> {
     await mkdir(rootDir, { recursive: true });
-    const finalPath = pathFor(session.id);
-    const tmpPath = `${finalPath}.tmp`;
-    await writeFile(tmpPath, JSON.stringify(session, null, 2), { mode: 0o600 });
-    await rename(tmpPath, finalPath);
+    writeContained(pathFor(session.id), JSON.stringify(session, null, 2), "the session record");
   }
 
   async function readSession(id: string): Promise<Session | null> {
-    let raw: string;
-    try {
-      raw = await readFile(pathFor(id), "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw err;
+    const absPath = pathFor(id);
+    if (!existsSync(dirname(absPath))) return null;
+    // Never through a link at the name: a planted `<id>.json -> elsewhere`
+    // would hand `--resume` another file's bytes.
+    const read = await openForRead(dirname(absPath), basename(absPath), {
+      maxBytes: MAX_SESSION_RECORD_BYTES,
+      followLeafSymlink: false,
+    });
+    if (!read.ok) {
+      if (read.code === "not-found") return null;
+      throw refusal("read", `session "${id}"`, absPath, read);
     }
-    return parseSession(raw, id);
+    if (read.truncated) {
+      throw new RuntimeError(
+        `session-store: session "${id}" is larger than ${MAX_SESSION_RECORD_BYTES} bytes, so it is not a session record`,
+      );
+    }
+    return parseSession(read.text, id);
   }
 
   function parseSession(raw: string, id: string): Session {
@@ -602,9 +639,11 @@ export function summarizeSessionIntoIndex(
   if (events.length === 0) return undefined;
   const summary = summarizeSession(sessionId, events, { now });
   mkdirSync(indexDir, { recursive: true });
-  writeFileSync(join(indexDir, `${sessionId}.json`), `${JSON.stringify(summary, null, 2)}\n`, {
-    mode: 0o600,
-  });
+  writeContained(
+    resolve(indexDir, `${sessionId}.json`),
+    `${JSON.stringify(summary, null, 2)}\n`,
+    "the session summary",
+  );
   return summary;
 }
 
@@ -785,7 +824,7 @@ function isPendingApprovalShape(value: unknown): value is PendingApproval {
 /**
  * A file-backed {@link PendingApprovalStore}: one append-only JSONL beside the
  * session files. Reads fold the log last-wins per `id`; `list()` additionally
- * compacts (atomic tmp+rename) and evicts records older than `ttlDays`. The
+ * compacts (atomic temp+rename) and evicts records older than `ttlDays`. The
  * path-traversal fence + tenant fence from the session store apply — the file
  * always resolves inside `rootDir`.
  */
@@ -861,11 +900,8 @@ async function sweepExpiredApprovals(
   }
   try {
     await mkdir(rootDir, { recursive: true });
-    const finalPath = approvalsPath(rootDir);
-    const tmpPath = `${finalPath}.tmp`;
     const body = live.map((a) => JSON.stringify(a)).join("\n");
-    await writeFile(tmpPath, body.length > 0 ? `${body}\n` : "", { mode: 0o600 });
-    await rename(tmpPath, finalPath);
+    writeContained(approvalsPath(rootDir), body.length > 0 ? `${body}\n` : "", "the approvals log");
   } catch (err) {
     // Best-effort compaction — a rewrite failure must not break listing.
     console.error("session-store: approvals compaction failed", err);
@@ -925,7 +961,16 @@ export function createPendingApprovalStore(
 
   async function append(approval: PendingApproval): Promise<void> {
     await mkdir(rootDir, { recursive: true });
-    await appendFile(filePath(), `${JSON.stringify(approval)}\n`, { mode: 0o600 });
+    const absPath = filePath();
+    // In place, one write per record (atomic against other appenders), never
+    // through a link or into a FIFO at the name.
+    const appended = appendContained(
+      dirname(absPath),
+      basename(absPath),
+      `${JSON.stringify(approval)}\n`,
+      { mode: 0o600 },
+    );
+    if (!appended.ok) throw refusal("append to", "the approvals log", absPath, appended);
   }
 
   return {

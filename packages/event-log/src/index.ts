@@ -6,13 +6,18 @@
  * `{ ts, version: 1, kind, payload }`. The schema-version field is
  * stamped onto every event so future migrations can fan out on it.
  *
- * Append semantics: each `append()` calls `appendFileSync(...)` with
- * mode 0o600 (owner-only) per the
- * `claude-code/utils/sessionStorage.ts` precedent. Synchronous append on
- * POSIX is atomic per line (when `len < PIPE_BUF`), so concurrent runs
- * cannot interleave partial JSON. The API is async to keep the door open
- * for a future buffered-writer optimisation; today it resolves
- * immediately.
+ * Append semantics: each `append()` appends one line in place with mode
+ * 0o600 (owner-only) per the `claude-code/utils/sessionStorage.ts`
+ * precedent. Synchronous append on POSIX is atomic per line (when
+ * `len < PIPE_BUF`), so concurrent runs cannot interleave partial JSON. The
+ * API is async to keep the door open for a future buffered-writer
+ * optimisation; today it resolves immediately.
+ *
+ * 0.7.1: the append goes through @crewhaus/tool-safety's `appendContained`,
+ * so a symlink, FIFO or directory at `<sessionId>.jsonl` is refused instead
+ * of followed. A model that could plant a link there (GitApplyPatch creates
+ * one from a patch) had every event of the run appended to a file of its
+ * choosing, a shell rc file included.
  *
  * Read semantics: `read({ since?, until? })` opens a fresh read stream
  * via `node:readline`, parses each line as JSON, and yields events in
@@ -24,11 +29,12 @@
  * Reference: `claude-code/utils/sessionStorage.ts`,
  * `AI-Harness-Systems.md` §append-only event history.
  */
-import { appendFileSync, createReadStream, existsSync, mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { createReadStream, existsSync, mkdirSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { RuntimeError } from "@crewhaus/errors";
 import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
+import { appendContained } from "@crewhaus/tool-safety/fs";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/sessions";
 const ID_REGEX = /^sess_[0-9a-f]{16}$/;
@@ -352,7 +358,14 @@ export async function openEventLog(
         payload: event.payload,
       };
       const line = `${JSON.stringify(wire)}\n`;
-      appendFileSync(fullPath, line, { mode: 0o600 });
+      const appended = appendContained(dirname(fullPath), basename(fullPath), line, {
+        mode: 0o600,
+      });
+      if (!appended.ok) {
+        throw new RuntimeError(
+          `event-log: refusing to append to ${fullPath}: ${appended.reason} (code ${appended.code})`,
+        );
+      }
     },
 
     read(readOpts: { since?: number; until?: number } = {}): AsyncIterable<Event> {
