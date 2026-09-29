@@ -24,5 +24,12 @@
     "incremental": true,
     "useDefineForClassFields": true
   },
-  "exclude": ["**/*.test.ts", "**/*.test.tsx"]
+  "exclude": [
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/fixtures.ts",
+    "**/*-fixtures.ts",
+    "**/fixtures/**",
+    "**/__fixtures__/**"
+  ]
 }
