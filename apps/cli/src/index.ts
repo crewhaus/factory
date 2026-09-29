@@ -1928,6 +1928,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
         "             provider-tool-cap-unverified,\n" +
         "             cli-autodistill-toolchain, model-plan-candidate-only,\n" +
         "             model-plan-tool-config-widens,\n" +
+        "             model-plan-tool-config-narrowed,\n" +
         "             model-capabilities-unknown, model-sunset,\n" +
         "             model-strongest-crosses-provider) still print but\n" +
         "             never fail --strict. (The FR-002 scope\n" +
@@ -2189,6 +2190,11 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // model-plan-tool-config-widens: a pool candidate's tool_config REPLACES
   // the agent-level block by design, the wider list may be intended, and the
   // same spec compiled under --strict on 0.7.0.
+  // model-plan-tool-config-narrowed is its counterpart for the chain readers
+  // and FederationDiscover, whose candidate list narrows the agent's: an
+  // origin only the candidate lists is never reached, which is harmless.
+  // model-plan-tool-config-unreachable is NOT informational — a candidate
+  // whose list keeps no origin refuses every call it makes.
   //
   // 0.7.1 — provider-tool-cap and provider-tool-cap-unverified are
   // informational for that reason too. A fallback, tier or pool model over
@@ -2210,6 +2216,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
     "permission-rule-note",
     "model-plan-candidate-only",
     "model-plan-tool-config-widens",
+    "model-plan-tool-config-narrowed",
     "model-capabilities-unknown",
     "model-strongest-crosses-provider",
     "model-sunset",

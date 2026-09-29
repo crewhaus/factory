@@ -36,10 +36,29 @@
  * lists beyond the agent-level block is named. A candidate block for a tool
  * with no agent-level block is not compared: there is no operator list for
  * it to undermine.
+ *
+ * Two families do not replace: for the chain readers and FederationDiscover
+ * (`candidateNarrows` on their registrar) a candidate's `allowed_origins`
+ * narrows the agent's, per call. A candidate origin the agent does not list
+ * is then never reached (`model-plan-tool-config-narrowed`, informational),
+ * and a candidate list that keeps none reaches nothing at all
+ * (`model-plan-tool-config-unreachable`, which `--strict` fails on).
  */
-import { BUILTIN_TOOLS, toolConfigBlockFor } from "@crewhaus/tool-categories";
+import { BUILTIN_TOOLS, TOOL_BOOT_REGISTRARS, toolConfigBlockFor } from "@crewhaus/tool-categories";
 
-export type ToolConfigWidening = { readonly path: string; readonly message: string };
+export type ToolConfigWidening = {
+  readonly path: string;
+  readonly message: string;
+  /**
+   * `model-plan-tool-config-widens` (the default, informational) for a
+   * candidate block that REPLACES the agent's and admits more;
+   * `model-plan-tool-config-narrowed` (informational) for a candidate origin
+   * a narrowing family drops; `model-plan-tool-config-unreachable`
+   * (remediable) for a narrowing family's candidate list that keeps no
+   * origin at all, so every call of that candidate is refused.
+   */
+  readonly code?: "model-plan-tool-config-narrowed" | "model-plan-tool-config-unreachable";
+};
 
 type Block = Readonly<Record<string, unknown>>;
 
@@ -91,6 +110,25 @@ function originExtras(narrow: Block, wide: Block): readonly string[] {
     canonicalOrigin,
   );
   return [...new Set(candidate.filter((o) => !agent.has(o)))];
+}
+
+/**
+ * For a family whose candidate list narrows the agent's: the candidate
+ * origins the agent list drops, and the ones it keeps. `undefined` when
+ * either block sets no list, or nothing is dropped.
+ */
+function narrowing(
+  agentBlock: Block,
+  candidateBlock: Block,
+): { readonly kept: readonly string[]; readonly dropped: readonly string[] } | undefined {
+  const agentList = listField(agentBlock, "allowed_origins", "allowedOrigins");
+  const candidateList = listField(candidateBlock, "allowed_origins", "allowedOrigins");
+  if (agentList === undefined || candidateList === undefined) return undefined;
+  const agent = new Set(agentList.map(canonicalOrigin));
+  const candidate = [...new Set(candidateList.map(canonicalOrigin))];
+  const dropped = candidate.filter((o) => !agent.has(o));
+  if (dropped.length === 0) return undefined;
+  return { kept: candidate.filter((o) => agent.has(o)), dropped };
 }
 
 /** A value in a candidate block beyond the agent-level one, as text for a notice. */
@@ -334,6 +372,32 @@ export function toolConfigWidenings(
     if (agent === undefined || candidate === undefined) continue;
     const candidateKey = keyOf(candidateBlocks, candidateRaw);
     const agentKey = keyOf(agentBlocks, agentRaw);
+    if (
+      entry.initSymbol !== undefined &&
+      TOOL_BOOT_REGISTRARS[entry.initSymbol]?.candidateNarrows === true
+    ) {
+      const id = `${candidateKey}\u0000allowed_origins`;
+      if (seen.has(id)) continue;
+      const narrowed = narrowing(agent, candidate);
+      if (narrowed === undefined) continue;
+      seen.add(id);
+      const at = `${agentPath}.${agentKey}.allowed_origins`;
+      const dropped = narrowed.dropped.map((e) => `"${e}"`).join(", ");
+      out.push(
+        narrowed.kept.length === 0
+          ? {
+              code: "model-plan-tool-config-unreachable",
+              path: `${candidatePath}.${candidateKey}.allowed_origins`,
+              message: `this candidate's ${entry.name} lists ${dropped}, none of which ${at} allows. For ${entry.name} a candidate's list NARROWS the agent-level one — a call reaches only origins on both — so this candidate reaches no origin and every call it makes is refused. List origins the agent-level block allows.`,
+            }
+          : {
+              code: "model-plan-tool-config-narrowed",
+              path: `${candidatePath}.${candidateKey}.allowed_origins`,
+              message: `this candidate's ${entry.name} lists ${dropped}, which ${at} does not allow. For ${entry.name} a candidate's list NARROWS the agent-level one — a call reaches only origins on both — so ${narrowed.dropped.length === 1 ? "it is" : "they are"} never reached.`,
+            },
+      );
+      continue;
+    }
     const isWebFetch = entry.initSymbol === "registerWebFetchConfig";
     const field = isWebFetch ? "allowed_domains" : "allowed_origins";
     const id = `${candidateKey}\u0000${field}`;
