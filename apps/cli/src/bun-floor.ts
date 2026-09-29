@@ -15,7 +15,9 @@
  *   first 0.7.1 floor was 1.3.11, which promised the guarantee exactly where
  *   CI refuted it.
  * - On 1.3.13 and 1.3.14 both pass on Linux arm64, and on 1.3.14 on macOS,
- *   where this whole tree is developed and tested.
+ *   where this whole tree is developed and tested. They also pass with the
+ *   x64 builds of 1.3.13 and 1.3.14 (macOS, under Rosetta), so the x64 code
+ *   generator is not what failed; the Bun version is the difference we can see.
  *
  * So the floor is 1.3.14, and CI's and the release jobs' Bun pins EQUAL it
  * (scripts/bun-floor.test.ts): the gating ubuntu x64 `ci` job is what proves
