@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, spyOn, test } from "bun:test";
 import {
   mkdirSync,
   mkdtempSync,
@@ -268,4 +268,40 @@ describe("budgets, offsets and the open descriptor", () => {
       }
     },
   );
+});
+
+describe("a read's cost (bounds review)", () => {
+  // A caller that needs only the bytes (a size, a hash, a PDF, a decode of
+  // its own that keeps a BOM) paid for a string of the whole file and a copy
+  // of its bytes: BundleSizeCheck grew 3.5x a large binary's size.
+  test("the text is decoded on first use only, once, and the bytes are not copied", async () => {
+    const file = join(dir, "lazy.txt");
+    writeFileSync(file, `\ufeff${"é".repeat(40_000)}`);
+    for (const [, read] of readers) {
+      const decode = spyOn(TextDecoder.prototype, "decode");
+      try {
+        const r = await read(file, { maxBytes: 1024 * 1024 });
+        if (!r.ok) throw new Error(r.reason);
+        expect(decode).toHaveBeenCalledTimes(0);
+        // A view over the buffer that was read into, not a copy of it.
+        expect(r.bytes.buffer.byteLength - r.bytes.byteLength).toBeLessThanOrEqual(64 * 1024);
+        expect(r.bytes.byteLength).toBe(3 + 80_000);
+        expect(r.text).toBe("é".repeat(40_000));
+        expect(r.text.length).toBe(40_000);
+        expect(decode).toHaveBeenCalledTimes(1);
+      } finally {
+        decode.mockRestore();
+      }
+    }
+  });
+
+  test("a capped read of a large file holds no more than the cap", async () => {
+    const file = join(dir, "small.txt");
+    writeFileSync(file, "x".repeat(100_000));
+    const r = await readFileBounded(file, { maxBytes: 10 });
+    if (!r.ok) throw new Error(r.reason);
+    expect(r.truncated).toBe(true);
+    expect(r.bytes.buffer.byteLength).toBeLessThanOrEqual(10 + 64 * 1024);
+    expect(r.text).toBe("x".repeat(10));
+  });
 });
