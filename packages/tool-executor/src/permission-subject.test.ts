@@ -689,6 +689,11 @@ describe("url, command and id values", () => {
     const words = { V: Array.from({ length: 65 }, (_, i) => `w${i}`).join(" ") };
     for (const envSet of [many, long, words]) {
       expect(at("restrict", "Run(nothing-like-it)", { argv: ["git"], envSet })).toBe(true);
+      // An allow naming a command still asks; one naming every command still
+      // covers it, as 0.7.0's `Run(**)` did — which program runs is all the
+      // environment decides (a >8 KiB JSON config in one variable asked).
+      expect(at("allow", "Run(git*)", { argv: ["git"], envSet })).toBe(false);
+      expect(at("allow", "Run(**)", { argv: ["git"], envSet })).toBe(true);
     }
     const within = Object.fromEntries(Array.from({ length: 64 }, (_, i) => [`V${i}`, "x"]));
     expect(at("restrict", "Run(nothing-like-it)", { argv: ["git"], envSet: within })).toBe(false);

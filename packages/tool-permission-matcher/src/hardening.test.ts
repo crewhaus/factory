@@ -807,18 +807,33 @@ describe("declared operative values", () => {
     expect(
       ["C(*)", "C(sh *)", "C(sh release.sh)", "C(**release.sh)", "C(?**)"].filter(grants),
     ).toEqual([]);
-    // Unreadable (outsideWorkspace) is granted by nothing.
-    expect(
+    // Unreadable (outsideWorkspace: an environment too large to read) is
+    // granted by the same allows and no others. It says which program runs
+    // could not be worked out, and an allow naming every command does not
+    // need to know; 0.7.0's `RunCommand(**)` covered such a call.
+    const unreadable = (pattern: string) =>
       matchesPattern(
-        compilePattern("C(**)"),
+        compilePattern(pattern),
         "C",
         {},
         {
           polarity: "allow",
           operativeValues: [{ ...elsewhere, outsideWorkspace: true }],
         },
+      );
+    expect(["C(**)", "C(***)", "C(*)", "C(sh *)", "C(?**)"].filter(unreadable)).toEqual([
+      "C(**)",
+      "C(***)",
+    ]);
+    // …and every deny or ask fires on it.
+    expect(
+      matchesPattern(
+        compilePattern("C(nothing-like-it)"),
+        "C",
+        {},
+        { polarity: "restrict", operativeValues: [{ ...elsewhere, outsideWorkspace: true }] },
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   test("non-path values are not filtered by absoluteness", () => {

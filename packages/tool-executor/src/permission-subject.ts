@@ -66,7 +66,8 @@
  *      {@link MAX_ENV_VARS} variables, {@link MAX_ENV_WORDS} words in a
  *      value, or a value longer than {@link MAX_ENV_VALUE_CHARS} characters)
  *      is flagged `outsideWorkspace`: which program runs could not be worked
- *      out, so every deny or ask fires.
+ *      out, so every deny or ask fires, and only an allow naming every
+ *      command covers it.
  *    - a field left out whose declared default is `*` stands for every
  *      value (`standsForAny`), whatever its kind: a deny or ask naming any
  *      one value there fires on it, and an allow grants it only when it

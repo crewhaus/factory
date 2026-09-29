@@ -544,7 +544,10 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   these, so a rule written against either form is not dodged.
  * - `outsideWorkspace` — the path lands outside the workspace, or where it
  *   lands could not be worked out. It never satisfies an allow rule and
- *   always satisfies a deny or ask rule.
+ *   always satisfies a deny or ask rule — except that a command with no
+ *   canonical value (its environment too large to read) is still granted by
+ *   a glob that matches every command, as above: which program it runs is
+ *   all that could not be worked out.
  * - `caseInsensitive` — the value names the same thing in any letter case: a
  *   path on a filesystem that does not tell names apart by case (macOS and
  *   Windows by default, or the runtime could not find out), or a `0x` hex id
@@ -979,15 +982,16 @@ function valueMatches(
   absoluteGlob: boolean,
   polarity: RulePolarity,
 ): boolean {
-  if (value.outsideWorkspace === true) return polarity === "restrict";
   // A command with no canonical spelling runs where its words may name
   // another program — another directory, or an environment the call set
   // (PATH, BASH_ENV) — so no allow that names a command covers it. One that
   // names EVERY command (`RunCommand(**)`) still does: whichever program it
-  // turns out to be is one it names.
+  // turns out to be is one it names — even when the environment was too
+  // large to read (`outsideWorkspace`), which only decides WHICH program.
   if (polarity === "allow" && value.kind === "command" && value.canonical.length === 0) {
     return argRe.matchesEveryAfter("", anyValueTail(value.kind));
   }
+  if (value.outsideWorkspace === true) return polarity === "restrict";
   // A value that stands for every value (a field left out whose default is
   // `*`) is granted only by a glob that matches every value there: its
   // canonical spelling `<prefix>*` is not a literal `*`, so `EvmGetLogs(1/?)`
