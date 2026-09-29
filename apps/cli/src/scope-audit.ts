@@ -1,5 +1,6 @@
 import { type ScopeFinding, auditToolScopes, isOutwardName } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { NON_CLI_TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
 
 /**
  * FR-002 — Pillar 3 sink-side build-time gate. The canonical per-tool
@@ -31,6 +32,11 @@ export { type ScopeFinding, auditToolScopes };
  *     scope it cannot verify — this is the criterion's "I/O-capable tool left
  *     at an unspecified scope" from the compiler's offline vantage. Without
  *     this, a spec referencing `mcp__evil__exfiltrate` slipped through.
+ *   - Unresolved, but the spec key of a builtin no cli bundle carries (the
+ *     graph, workflow and crew shapes' evm tools, the channel shape's
+ *     sendMessage) → audited from its flags in the builtin manifest. The CLI
+ *     does not import those packages, and skipping them left `compile
+ *     --strict` saying nothing about a tool it never looked at (C001).
  *   - Unresolved and NOT outward-by-name → skipped. A name the offline map
  *     doesn't know and whose name carries no outward signal is either a
  *     pure-compute custom tool registered in code or a typo; the offline gate
@@ -46,7 +52,11 @@ export function auditSpecToolNames(
 ): ScopeFinding[] {
   const findings: ScopeFinding[] = [];
   for (const name of names) {
-    const tool = resolve(name);
+    // By spec key only: a registered name such as `SendMessage` may be a
+    // tool the runtime builds itself (a crew role's), not the builtin.
+    const tool =
+      resolve(name) ??
+      (Object.hasOwn(NON_CLI_TOOL_FLAGS, name) ? NON_CLI_TOOL_FLAGS[name] : undefined);
     if (tool) {
       findings.push(...auditToolScopes([tool]));
     } else if (isOutwardName(name)) {
@@ -58,6 +68,16 @@ export function auditSpecToolNames(
     }
   }
   return findings;
+}
+
+/**
+ * The manifest's flags for a builtin no cli bundle carries, by spec key or by
+ * registered name (a sub-agent list uses the name) — for describing a rule's
+ * tool, not for vouching for a sink's scope (see `auditSpecToolNames`).
+ */
+export function nonCliBuiltinFlags(name: string): (typeof NON_CLI_TOOL_FLAGS)[string] | undefined {
+  if (Object.hasOwn(NON_CLI_TOOL_FLAGS, name)) return NON_CLI_TOOL_FLAGS[name];
+  return Object.values(NON_CLI_TOOL_FLAGS).find((flags) => flags.name === name);
 }
 
 /**

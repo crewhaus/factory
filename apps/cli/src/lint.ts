@@ -1,21 +1,39 @@
 import { type IrNode, checkShapeTools, lower } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
-import { type Spec, SpecParseError, mcpServerNameWarnings, parseSpec } from "@crewhaus/spec";
+import {
+  type Spec,
+  SpecParseError,
+  mcpServerNameWarnings,
+  parseSpec,
+  parseSpecIssues,
+  specJsonSchema,
+} from "@crewhaus/spec";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import {
+  BUILTIN_TOOLS,
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinKeyForName,
+  builtinToolsFor,
+} from "@crewhaus/tool-categories";
 import {
   type PermissionRuleProblem,
   type RuleToolDescriptor,
   permissionRuleProblems,
+  specPermissionRuleLists,
 } from "@crewhaus/tool-permission-matcher";
 import {
+  NON_CLI_TOOL_FLAGS,
   RUNTIME_TOOL_NAMES,
+  THREDZ_TOOL_NAMES,
   TOOL_FLAGS,
   TOOL_FLAGS_BY_NAME,
 } from "@crewhaus/tool-registry-manifest/flags";
+import { type Document, type Scalar, isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
 import { auditModelPlan } from "./model-plan-lint";
-import { auditSpecToolNames, collectToolNames } from "./scope-audit";
+import { auditSpecToolNames, collectToolNames, nonCliBuiltinFlags } from "./scope-audit";
 
 /**
  * Item 41 — `crewhaus lint`. A check-only command: `parseSpec` +
@@ -129,6 +147,10 @@ export function runLint(
   for (const w of shapeTools.warnings) {
     findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
   }
+  // A typo in a list that narrows a site's tools (a sub-agent's, a model
+  // profile's) compiles — the name just never matches — so it is a warning,
+  // the one `lint --fix` would rewrite (C025).
+  findings.push(...narrowingListFindings(yamlText, resolveTool));
 
   // Stage 4 — tool-scope audit over the IR's tool names, sharing the exact
   // gate `compile --strict` uses. A resolvable built-in is audited by
@@ -188,10 +210,10 @@ export function runLint(
   // near-miss tool name, an MCP server the spec does not declare, an
   // argument pattern that cannot match the field the tool declares. Shared
   // with `compile` (which fails on them under --strict) and PermissionAudit.
-  for (const p of permissionRuleProblemsOf(ir, resolveTool)) {
+  for (const p of permissionRuleProblemsOf(spec, ir, resolveTool)) {
     findings.push({
       message: p.message,
-      path: `permissions.rules[${p.type} ${p.pattern}]`,
+      path: p.path,
       severity: "warning",
       rule: `permission-rule:${p.code}`,
     });
@@ -210,29 +232,65 @@ export function runLint(
  */
 export const KNOWN_TOOLS: ReadonlyArray<RuleToolDescriptor> = [
   ...Object.values(TOOL_FLAGS),
+  ...Object.values(NON_CLI_TOOL_FLAGS),
   ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
 ];
 
 /**
- * The permission rules of a lowered spec that can never do what they say
- * (see `permissionRuleProblems`). A granted tool is described by the live
- * tool `resolveTool` returns, falling back to the builtin manifest, so the
- * check sees the same declarations the runtime will.
+ * The tools a spec's `thredz:` block registers under their bare names
+ * (`goal_list`, `task_complete`, …; the messaging set too when a block says
+ * `messaging: true`), or none when the spec has no block. A crew carries a
+ * block per role as well as the crew-wide one.
+ */
+export function thredzToolNamesOf(ir: IrNode): string[] {
+  const blocks: Array<{ readonly messaging?: unknown }> = [];
+  const top = (ir as { readonly thredz?: { readonly messaging?: unknown } }).thredz;
+  if (top !== undefined) blocks.push(top);
+  const roles = (ir as { readonly roles?: unknown }).roles;
+  if (Array.isArray(roles)) {
+    for (const role of roles) {
+      const block = (role as { readonly thredz?: { readonly messaging?: unknown } } | null)?.thredz;
+      if (block !== undefined) blocks.push(block);
+    }
+  }
+  if (blocks.length === 0) return [];
+  return [
+    ...THREDZ_TOOL_NAMES.memory,
+    ...(blocks.some((b) => b.messaging === true) ? THREDZ_TOOL_NAMES.messaging : []),
+  ];
+}
+
+/** A rule that can never do what it says, and where the spec holds it. */
+export type LocatedRuleProblem = PermissionRuleProblem & {
+  /** The list that holds the rule, e.g. `models.fast.permissions.deny`. */
+  readonly list: string;
+  /** `<list>[<type> <pattern>]`, e.g. `models.fast.permissions.deny[alwaysDeny fetch]`. */
+  readonly path: string;
+};
+
+/**
+ * The permission rules of a spec that can never do what they say (see
+ * `permissionRuleProblems`), in every list the spec carries (see
+ * `specPermissionRuleLists`: the shape's rules, each model profile's and
+ * pool candidate's deny/ask, each sub-agent's allow/deny). A granted tool is
+ * one the lowered spec lists, described by the live tool `resolveTool`
+ * returns, falling back to the builtin manifest, so the check sees the same
+ * declarations the runtime will; the tools a `thredz:` block registers are
+ * known in a spec that has one.
  */
 export function permissionRuleProblemsOf(
+  spec: unknown,
   ir: IrNode,
   resolveTool: (name: string) => RegisteredTool | undefined,
-): PermissionRuleProblem[] {
-  const node = ir as {
-    readonly permissions?: { readonly rules?: ReadonlyArray<{ type: string; pattern: string }> };
-    readonly mcp_servers?: Readonly<Record<string, unknown>>;
-  };
-  const rules = node.permissions?.rules ?? [];
-  if (rules.length === 0) return [];
+): LocatedRuleProblem[] {
+  const lists = specPermissionRuleLists(spec);
+  if (lists.length === 0) return [];
+  const node = ir as { readonly mcp_servers?: Readonly<Record<string, unknown>> };
   const granted: RuleToolDescriptor[] = [];
   for (const name of collectToolNames(ir)) {
     const live = resolveTool(name);
-    const described = live ?? TOOL_FLAGS[name] ?? TOOL_FLAGS_BY_NAME.get(name);
+    const described =
+      live ?? TOOL_FLAGS[name] ?? TOOL_FLAGS_BY_NAME.get(name) ?? nonCliBuiltinFlags(name);
     if (described === undefined) continue;
     granted.push({
       name: described.name,
@@ -240,12 +298,61 @@ export function permissionRuleProblemsOf(
       ...(described.operativeArgs !== undefined ? { operativeArgs: described.operativeArgs } : {}),
     });
   }
-  return permissionRuleProblems({
-    rules,
-    granted,
-    known: KNOWN_TOOLS,
-    mcpServers: Object.keys(node.mcp_servers ?? {}),
-  });
+  const thredz = thredzToolNamesOf(ir);
+  const known =
+    thredz.length === 0 ? KNOWN_TOOLS : [...KNOWN_TOOLS, ...thredz.map((name) => ({ name }))];
+  const mcpServers = Object.keys(node.mcp_servers ?? {});
+  const out: LocatedRuleProblem[] = [];
+  for (const list of lists) {
+    for (const p of permissionRuleProblems({ rules: list.rules, granted, known, mcpServers })) {
+      out.push({ ...p, list: list.path, path: `${list.path}[${p.type} ${p.pattern}]` });
+    }
+  }
+  return out;
+}
+
+/** Rule findings that inform without saying the rule is dead: never escalated by --strict. */
+const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
+  "builtin-not-reached",
+  "tool-not-known",
+]);
+
+/**
+ * The permission rules in a spec that can never do what they say, as compile
+ * warnings (code `permission-rule`, or `permission-rule-note` for a note
+ * --strict does not escalate), in every list the spec carries. A spec that
+ * does not parse or lower has none here — the compile itself reports why.
+ *
+ * `loadTools` imports every builtin package the CLI carries (about half a
+ * second), so it is called only when the spec has a rule to check: a
+ * rule-less compile does not pay for it.
+ */
+export async function permissionRuleWarnings(
+  yamlText: string,
+  loadTools: () => Promise<Readonly<Record<string, RegisteredTool>>>,
+): Promise<Array<{ code: string; path: string; message: string }>> {
+  let spec: Spec;
+  let ir: IrNode;
+  try {
+    spec = parseSpec(yamlText);
+    ir = lower(spec);
+  } catch {
+    return [];
+  }
+  if (specPermissionRuleLists(spec).length === 0) return [];
+  const toolMap = await loadTools();
+  const byRegisteredName: Record<string, RegisteredTool> = {};
+  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  // A `builtin-not-reached` note is about a rule that still fires (on a
+  // declared MCP server's tools), and a `tool-not-known` one about a name a
+  // plugin or custom tool may still supply, so --strict escalates neither.
+  return permissionRuleProblemsOf(spec, ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
+    (p) => ({
+      code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
+      path: p.list,
+      message: p.message,
+    }),
+  );
 }
 
 /** Re-exported for the CLI wrapper's philosophy-alignment parity note. */
@@ -253,8 +360,8 @@ export { auditToolScopes };
 
 // -------------------------------------------------------------------------
 // --fix: mechanical corrections for the findings a nearest-match / typo scan
-// can resolve. Pure suggesters; the CLI wrapper applies chosen edits via
-// spec-patch.
+// can resolve. Pure suggesters; `applyLintFixes` below applies them to the
+// YAML document, and the CLI wrapper writes the result.
 // -------------------------------------------------------------------------
 
 /** A single mechanical fix suggestion for a lint finding. */
@@ -412,6 +519,494 @@ export function suggestSafeName(name: string): string | undefined {
     .trim();
   if (fixed === "" || !SAFE_NAME_RE.test(fixed)) return undefined;
   return fixed;
+}
+
+// -------------------------------------------------------------------------
+// --fix, applied: a walk over the YAML document, not over its lines (C025).
+// -------------------------------------------------------------------------
+
+/** One replacement of a scalar's source text. */
+type ScalarEdit = { readonly start: number; readonly end: number; readonly text: string };
+
+/** What `lint --fix` would change, and what it would only suggest. */
+export type LintFixResult = {
+  /** The spec text with every applied fix in it (the input when there is none). */
+  readonly text: string;
+  /** One line per applied fix. */
+  readonly applied: string[];
+  /** One line per typo it will not pick a fix for. */
+  readonly suggested: string[];
+  /**
+   * Why nothing was looked at, when the file could not be walked (it is not
+   * valid YAML) — so "no fixes" is never said of a file nobody read.
+   */
+  readonly skipped?: string;
+};
+
+/** A path through a YAML document: a mapping key, or `[]` for a sequence item. */
+type DocPath = ReadonlyArray<string>;
+
+const SEQ_ITEM = "[]";
+
+/** Where each shape's spec holds a `tools:` list, read once per shape. */
+const toolListPathCache = new Map<string, ReadonlyArray<DocPath>>();
+
+/**
+ * Every place a spec of this `target` holds a `tools:` list of names, read
+ * from the spec's own JSON schema: `*` is any mapping key (a sub-agent's or a
+ * node's name), `[]` any sequence item. Reading the schema instead of
+ * listing the places keeps a new site (a pool candidate's `tools`) from being
+ * missed, and keeps `tools` anywhere else — an MCP server's `args`, a
+ * `tool_config` block, text inside `instructions: |` — from being touched.
+ */
+export function toolListPaths(target: string | undefined): ReadonlyArray<DocPath> {
+  const key = target ?? "";
+  const cached = toolListPathCache.get(key);
+  if (cached !== undefined) return cached;
+  const schema = specJsonSchema();
+  const definitions = asJson(schema["definitions"]) ?? {};
+  const root =
+    target !== undefined && Object.hasOwn(definitions, target) ? definitions[target] : schema;
+  const resolve = (ref: string): unknown => {
+    let at: unknown = schema;
+    for (const seg of ref.replace(/^#\//, "").split("/")) {
+      at = asJson(at)?.[seg.replace(/~1/g, "/").replace(/~0/g, "~")];
+    }
+    return at;
+  };
+  const deref = (node: unknown): Record<string, unknown> | undefined => {
+    let at = asJson(node);
+    for (let i = 0; i < 32 && typeof at?.["$ref"] === "string"; i++) {
+      at = asJson(resolve(at["$ref"] as string));
+    }
+    return at;
+  };
+  const found = new Map<string, DocPath>();
+  const walk = (node: unknown, path: string[], refs: ReadonlySet<string>): void => {
+    const n = asJson(node);
+    // A tools list sits a few levels down; nothing recursive holds one.
+    if (n === undefined || path.length > 16) return;
+    const ref = n["$ref"];
+    if (typeof ref === "string") {
+      if (refs.has(ref)) return;
+      walk(resolve(ref), path, new Set([...refs, ref]));
+      return;
+    }
+    for (const combinator of ["anyOf", "oneOf", "allOf"]) {
+      const branches = n[combinator];
+      if (Array.isArray(branches)) for (const b of branches) walk(b, path, refs);
+    }
+    for (const [prop, value] of Object.entries(asJson(n["properties"]) ?? {})) {
+      if (prop === "tools" && deref(value)?.["type"] === "array") {
+        found.set([...path, prop].join("\u0000"), [...path, prop]);
+      }
+      walk(value, [...path, prop], refs);
+    }
+    if (asJson(n["additionalProperties"]) !== undefined) {
+      walk(n["additionalProperties"], [...path, "*"], refs);
+    }
+    if (n["items"] !== undefined) walk(n["items"], [...path, SEQ_ITEM], refs);
+  };
+  walk(root, [], new Set());
+  const paths = [...found.values()];
+  toolListPathCache.set(key, paths);
+  return paths;
+}
+
+function asJson(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function pathMatches(pattern: DocPath, path: DocPath): boolean {
+  if (pattern.length !== path.length) return false;
+  return pattern.every((seg, i) => seg === path[i] || (seg === "*" && path[i] !== SEQ_ITEM));
+}
+
+/**
+ * A `tools:` list that narrows what its site registers — a sub-agent's, a
+ * model profile's, a pool candidate's — takes a builtin under either
+ * spelling; the others register tools and take the spec key.
+ */
+function isNarrowingList(path: DocPath): boolean {
+  return path[0] === "models" || path.includes("sub_agents") || path.includes("model_pool");
+}
+
+/** The spec's `target:` as written, and the shape whose tools a fix may name. */
+function shapeOf(doc: Document): { target?: string; shape: ToolShape } {
+  const target = doc.get("target");
+  const shape =
+    typeof target === "string" && Object.hasOwn(SHAPE_TOOL_PROFILES, target)
+      ? (target as ToolShape)
+      : "cli";
+  return typeof target === "string" ? { target, shape } : { shape };
+}
+
+/**
+ * Names a `tools:` list may hold that are not builtins, and must never be
+ * "fixed" into one: the tools the runtime adds on its own, a `thredz:`
+ * block's tools, and MCP tools (`mcp__server__tool`, or `server__tool`).
+ */
+function isKnownNonBuiltin(token: string, doc: Document): boolean {
+  if (token.includes("__")) return true;
+  if (RUNTIME_TOOL_NAMES.includes(token)) return true;
+  const thredz = doc.get("thredz");
+  if (thredz === undefined || thredz === false || thredz === null) return false;
+  return THREDZ_TOOL_NAMES.memory.includes(token) || THREDZ_TOOL_NAMES.messaging.includes(token);
+}
+
+/** One `tools:` item a fix names, or a typo it will only suggest a fix for. */
+type ToolListFix = {
+  /** The list's path in the spec, dot-joined (`agent.sub_agents.helper.tools`). */
+  readonly list: string;
+  readonly narrowing: boolean;
+  readonly token: string;
+  readonly node: Scalar;
+  readonly to?: string;
+  readonly candidates?: readonly string[];
+  /**
+   * Where the same item is read again through a YAML alias of it (or of a
+   * node holding it) that is not a `tools:` list of the same kind — an MCP
+   * server's `args: *shared`. Editing the item edits those too, so the fix
+   * is suggested, not applied.
+   */
+  readonly aliasedAt?: readonly string[];
+};
+
+/** Every YAML alias in the document, by the anchor it names, with where it sits. */
+function aliasesByAnchor(doc: Document): Map<string, DocPath[]> {
+  const out = new Map<string, DocPath[]>();
+  const visit = (node: unknown, path: string[], depth: number): void => {
+    if (depth > 64) return;
+    if (isAlias(node)) {
+      const at = out.get(node.source) ?? [];
+      at.push(path);
+      out.set(node.source, at);
+    } else if (isMap(node)) {
+      for (const pair of node.items) {
+        const k = isScalar(pair.key) ? pair.key.value : pair.key;
+        visit(pair.value, [...path, String(k)], depth + 1);
+      }
+    } else if (isSeq(node)) {
+      for (const item of node.items) visit(item, [...path, SEQ_ITEM], depth + 1);
+    }
+  };
+  visit(doc.contents, [], 0);
+  return out;
+}
+
+/** A node's anchor, when it carries one. */
+function anchorOf(node: unknown): string | undefined {
+  const anchor = (node as { readonly anchor?: unknown } | null)?.anchor;
+  return typeof anchor === "string" && anchor !== "" ? anchor : undefined;
+}
+
+/**
+ * Every item of every `tools:` list in the document that names no tool the
+ * list takes and is a typo of one: the nearest legal name, or, when the
+ * nearest names differ in what they may do, the tied names to choose from.
+ *
+ * On a shape whose runtime carries no tools (voice, onchain), compile
+ * accepts a `tools:` list and ignores it, and lint says nothing about it, so
+ * there is nothing to fix.
+ */
+function toolListFixes(
+  doc: Document,
+  getReadOnly: (candidateName: string) => boolean | undefined,
+): ToolListFix[] {
+  const { target, shape } = shapeOf(doc);
+  const patterns = toolListPaths(target);
+  // A typo is fixed to a spelling `compile` accepts on THIS spec's shape: the
+  // camelCase spec key, which every tools: list takes (a narrowing list maps
+  // it to the registered name). A narrowing list also takes the registered
+  // name (`Read`, as 0.7.0 documented), so a typo there is fixed in the
+  // spelling it was written in.
+  const keys = builtinToolsFor(shape);
+  if (keys.length === 0) return [];
+  const names = keys.map((k) => BUILTIN_TOOLS[k]?.name ?? k);
+  const aliases = aliasesByAnchor(doc);
+  const isToolList = (path: DocPath, narrowing: boolean): boolean =>
+    path[path.length - 1] === "tools" &&
+    patterns.some((p) => pathMatches(p, path)) &&
+    isNarrowingList(path) === narrowing;
+  // Where an item at `itemPath` is also read through an alias of a node on
+  // the way to it (`anchored`, each with its path), when that is not an item
+  // of a tools: list of the same kind.
+  const aliasedOutside = (
+    itemPath: DocPath,
+    anchored: ReadonlyArray<{ readonly anchor: string; readonly path: DocPath }>,
+    narrowing: boolean,
+  ): string[] => {
+    const out: string[] = [];
+    for (const { anchor, path } of anchored) {
+      for (const aliasPath of aliases.get(anchor) ?? []) {
+        const effective = [...aliasPath, ...itemPath.slice(path.length)];
+        const list = effective.slice(0, -1);
+        if (effective[effective.length - 1] === SEQ_ITEM && isToolList(list, narrowing)) continue;
+        out.push(aliasPath.join("."));
+      }
+    }
+    return out;
+  };
+  const out: ToolListFix[] = [];
+  const visit = (
+    node: unknown,
+    path: string[],
+    anchored: ReadonlyArray<{ readonly anchor: string; readonly path: DocPath }>,
+  ): void => {
+    const own = anchorOf(node);
+    const here = own !== undefined ? [...anchored, { anchor: own, path }] : anchored;
+    if (isMap(node)) {
+      for (const pair of node.items) {
+        const k = isScalar(pair.key) ? pair.key.value : pair.key;
+        if (typeof k !== "string" && typeof k !== "number") continue;
+        const key = String(k);
+        const at = [...path, key];
+        if (key === "tools" && isSeq(pair.value) && patterns.some((p) => pathMatches(p, at))) {
+          const narrowing = isNarrowingList(at);
+          const seqAnchor = anchorOf(pair.value);
+          const listAnchored =
+            seqAnchor !== undefined ? [...here, { anchor: seqAnchor, path: at }] : here;
+          for (const item of pair.value.items) {
+            if (!isScalar(item) || typeof item.value !== "string") continue;
+            const token = item.value;
+            if (!/^[A-Za-z]\w*$/.test(token) || isKnownNonBuiltin(token, doc)) continue;
+            if (narrowing && builtinKeyForName(token) !== undefined) continue;
+            const candidates = narrowing && /^[A-Z]/.test(token) ? names : keys;
+            const nearest = nearestToolName(token, candidates, undefined, getReadOnly);
+            const list = at.join(".");
+            const itemPath = [...at, SEQ_ITEM];
+            const itemAnchor = anchorOf(item);
+            const aliasedAt = aliasedOutside(
+              itemPath,
+              itemAnchor !== undefined
+                ? [...listAnchored, { anchor: itemAnchor, path: itemPath }]
+                : listAnchored,
+              narrowing,
+            );
+            const aliased = aliasedAt.length > 0 ? { aliasedAt } : {};
+            if (nearest?.kind === "match") {
+              out.push({ list, narrowing, token, node: item, to: nearest.name, ...aliased });
+            } else if (nearest?.kind === "ambiguous") {
+              out.push({
+                list,
+                narrowing,
+                token,
+                node: item,
+                candidates: nearest.candidates,
+                ...aliased,
+              });
+            }
+          }
+        }
+        visit(pair.value, at, here);
+      }
+    } else if (isSeq(node)) {
+      for (const item of node.items) visit(item, [...path, SEQ_ITEM], here);
+    }
+  };
+  visit(doc.contents, [], []);
+  return out;
+}
+
+/** A replacement for a scalar's source that keeps how it was quoted. */
+function scalarEdit(src: string, node: Scalar, value: string): ScalarEdit | undefined {
+  const range = node.range;
+  if (range === undefined || range === null) return undefined;
+  if (node.type === "BLOCK_LITERAL" || node.type === "BLOCK_FOLDED") return undefined;
+  const [start, end] = range;
+  const written = src.slice(start, end);
+  const quote = written.startsWith('"') ? '"' : written.startsWith("'") ? "'" : "";
+  const text =
+    quote !== ""
+      ? `${quote}${value}${quote}`
+      : /^[A-Za-z0-9_$][\w.$-]*$/.test(value)
+        ? value
+        : JSON.stringify(value);
+  return { start, end, text };
+}
+
+function applyEdits(src: string, edits: ReadonlyArray<ScalarEdit>): string {
+  let out = src;
+  for (const e of [...edits].sort((a, b) => b.start - a.start)) {
+    out = `${out.slice(0, e.start)}${e.text}${out.slice(e.end)}`;
+  }
+  return out;
+}
+
+/**
+ * A `lint` finding for each typo in a list that NARROWS a site's tools (a
+ * sub-agent's, a model profile's, a pool candidate's). compile passes such a
+ * list — the name just never matches a tool — so it was clean to `lint`,
+ * while `lint --fix` rewrote it. The site lists are compile errors already.
+ */
+function narrowingListFindings(
+  yamlText: string,
+  resolveTool: (name: string) => RegisteredTool | undefined,
+): LintFinding[] {
+  const doc = parseDocument(yamlText);
+  if (doc.errors.length > 0) return [];
+  return toolListFixes(doc, (name) => resolveTool(name)?.readOnly)
+    .filter((f) => f.narrowing)
+    .map((f) => ({
+      message:
+        f.to !== undefined
+          ? `tools: "${f.token}" is no tool, so this list never grants it — did you mean "${f.to}"? ${f.aliasedAt !== undefined ? `(not auto-fixed: the list is also read through an alias at ${f.aliasedAt.join(", ")})` : "(lint --fix writes it.)"}`
+          : `tools: "${f.token}" is no tool, so this list never grants it — did you mean ${(f.candidates ?? []).map((c) => `"${c}"`).join(" or ")}? (not auto-fixed: they differ in what they may do)`,
+      path: f.list,
+      severity: "warning" as const,
+      rule: "tool-list-typo",
+    }));
+}
+
+/** The compile error for a malformed `$` credential, and the value it names. */
+const CREDENTIAL_ENV_REF_ERROR =
+  /^(\S+) value ("(?:[^"\\]|\\.)*") looks like an environment reference but is not a valid one/;
+const WALLET_KEY_REF_ERROR =
+  /^wallet "[^"]*" keyRef "(\$[^"]*)" is not a permitted signing-key reference/;
+
+/**
+ * The scalar a compile credential error is about: at the field it names, or,
+ * where that label is not the spec's path (a crew role's `thredz` key, a
+ * server name with a dot), the first scalar under the same top-level key that
+ * holds the value under the same field name — or is the whole block
+ * (`thredz: $key`).
+ */
+function credentialScalar(doc: Document, label: string, raw: string): Scalar | undefined {
+  const segments = label.split(".");
+  const direct = doc.getIn(segments, true);
+  if (isScalar(direct) && direct.value === raw) return direct;
+  const top = segments[0] ?? "";
+  const field = segments[segments.length - 1] ?? "";
+  const root = doc.get(top, true);
+  if (isScalar(root)) return root.value === raw ? root : undefined;
+  let hit: Scalar | undefined;
+  const visit = (node: unknown, key: string | undefined): void => {
+    if (hit !== undefined) return;
+    if (isScalar(node)) {
+      if (node.value === raw && key === field) hit = node;
+    } else if (isMap(node)) {
+      for (const pair of node.items) {
+        const k = isScalar(pair.key) ? String(pair.key.value) : undefined;
+        visit(pair.value, k);
+      }
+    } else if (isSeq(node)) {
+      for (const item of node.items) visit(item, key);
+    }
+  };
+  visit(root, undefined);
+  return hit;
+}
+
+/**
+ * `lint --fix`: the mechanical corrections, made on the parsed YAML document
+ * so only the fields they are about change and everything else — comments,
+ * quoting, text inside `instructions: |` — stays byte-for-byte (C025).
+ *
+ * - A typo in a `tools:` list (at a place the spec's schema says holds one)
+ *   → the nearest tool the list takes; a typo equidistant from tools that
+ *   differ in what they may do is returned in `suggested` instead.
+ * - An unsafe `name` the spec rejects → sanitised.
+ * - A credential `compile` rejects as a malformed `$` reference →
+ *   `$UPPER_SNAKE_CASE`. Only what compile rejects: `model: $fast` is a
+ *   profile reference, and is never touched.
+ *
+ * A document that is not valid YAML is left alone — there is nothing to walk
+ * — and `skipped` says so. A typo in a list that is also read through a YAML
+ * alias somewhere that is not a `tools:` list (`args: *shared`) is only
+ * suggested: the edit would change that place too.
+ */
+export function applyLintFixes(
+  yamlText: string,
+  resolveTool: (name: string) => RegisteredTool | undefined,
+): LintFixResult {
+  const applied: string[] = [];
+  const suggested: string[] = [];
+  const doc = parseDocument(yamlText);
+  if (doc.errors.length > 0) {
+    const first = (doc.errors[0]?.message ?? "").split("\n")[0] ?? "";
+    return {
+      text: yamlText,
+      applied,
+      suggested,
+      skipped: `the file is not valid YAML${first !== "" ? ` (${first})` : ""}`,
+    };
+  }
+
+  const edits: ScalarEdit[] = [];
+  for (const fix of toolListFixes(doc, (name) => resolveTool(name)?.readOnly)) {
+    if (fix.aliasedAt !== undefined) {
+      const options =
+        fix.to !== undefined
+          ? `"${fix.to}"`
+          : (fix.candidates ?? []).map((c) => `"${c}"`).join(" or ");
+      suggested.push(
+        `tool "${fix.token}" — did you mean ${options}? (not auto-fixed — ${fix.list} is also read through an alias at ${fix.aliasedAt.join(", ")}, which the edit would change too)`,
+      );
+    } else if (fix.to !== undefined) {
+      const edit = scalarEdit(yamlText, fix.node, fix.to);
+      if (edit === undefined) continue;
+      edits.push(edit);
+      applied.push(`tool "${fix.token}" → "${fix.to}" (nearest match)`);
+    } else {
+      const options = (fix.candidates ?? []).map((c) => `"${c}"`).join(" or ");
+      suggested.push(
+        `tool "${fix.token}" — did you mean ${options}? (not auto-fixed — ambiguous across tool capabilities)`,
+      );
+    }
+  }
+  // An unsafe name, where the spec's own validation rejects it.
+  const fixedNames = new Set<unknown>();
+  for (const issue of parseSpecIssues(yamlText)) {
+    if (issue.path[issue.path.length - 1] !== "name") continue;
+    const node = doc.getIn(issue.path, true);
+    if (!isScalar(node) || typeof node.value !== "string" || fixedNames.has(node)) continue;
+    const safe = suggestSafeName(node.value);
+    if (safe === undefined) continue;
+    const edit = scalarEdit(yamlText, node, safe);
+    if (edit === undefined) continue;
+    fixedNames.add(node);
+    edits.push(edit);
+    applied.push(`name "${node.value}" → "${safe}" (unsafe characters)`);
+  }
+  let text = applyEdits(yamlText, edits);
+
+  // A malformed credential reference, one per round, where compile names it.
+  const seen = new Set<string>();
+  for (let round = 0; round < 64; round++) {
+    let message: string;
+    try {
+      lower(parseSpec(text));
+      break;
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    const credential = CREDENTIAL_ENV_REF_ERROR.exec(message);
+    const wallet = credential === null ? WALLET_KEY_REF_ERROR.exec(message) : null;
+    let label: string;
+    let raw: string;
+    if (credential !== null) {
+      label = credential[1] as string;
+      raw = JSON.parse(credential[2] as string) as string;
+    } else if (wallet !== null) {
+      label = "wallets.keyRef";
+      raw = wallet[1] as string;
+    } else {
+      break;
+    }
+    if (seen.has(`${label}\u0000${raw}`)) break;
+    seen.add(`${label}\u0000${raw}`);
+    const fixed = suggestSecretFix(raw);
+    if (fixed === undefined) break;
+    const current = parseDocument(text);
+    const node = credentialScalar(current, label, raw);
+    const edit = node !== undefined ? scalarEdit(text, node, fixed) : undefined;
+    if (edit === undefined) break;
+    text = applyEdits(text, [edit]);
+    applied.push(`secret "${raw}" → "${fixed}" ($UPPER_SNAKE_CASE)`);
+  }
+  return { text, applied, suggested };
 }
 
 /** Render the lint findings as the human-readable `text` report. Returns the

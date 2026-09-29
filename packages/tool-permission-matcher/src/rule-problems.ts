@@ -8,12 +8,13 @@
  * fallback. `crewhaus lint`, `compile` and `PermissionAudit` use this to say
  * so while the spec is being written (permission-integration#12).
  *
- * Only what can be shown is reported. A rule naming a tool this module has
- * never heard of is NOT reported as dead — the runtime adds tools a spec does
- * not list (`Task`, `Consult`, a sub-agent's tools from disk) — unless the
- * name is one or two letters away from a tool it does know. The caller's
- * `known` list must therefore carry the tools the runtime registers on its
- * own (`Skill`, the browser shape's `Type`), not only the builtins, or a real
+ * Only what can be shown is reported as dead. A rule naming a tool this
+ * module has never heard of is not — a plugin or a custom tool may register
+ * it — unless the name is one or two letters away from a tool it does know;
+ * otherwise it gets an informational `tool-not-known` note, which `compile
+ * --strict` does not escalate. The caller's `known` list must therefore carry
+ * the tools the runtime registers on its own (`Skill`, the browser shape's
+ * `Type`, a `thredz:` block's `goal_list`), not only the builtins, or a real
  * tool name reads as a typo of a builtin.
  *
  * A correction never widens an allow: when the nearest name belongs to a tool
@@ -67,7 +68,14 @@ export type PermissionRuleProblemCode =
    * MCP server, and reaches no granted builtin whose key or spelling it
    * resembles. It still fires on the MCP tools; the note names the builtins.
    */
-  | "builtin-not-reached";
+  | "builtin-not-reached"
+  /**
+   * INFORMATIONAL: a literal name that is no tool the caller knows and is
+   * close to none. It never fires unless something the checker cannot see
+   * offline — a plugin, a custom tool, an MCP server's pre-0.7.1
+   * `<server>__<tool>` spelling — registers a tool by that name.
+   */
+  | "tool-not-known";
 
 export type PermissionRuleProblem = {
   readonly type: string;
@@ -227,6 +235,29 @@ function mcpServersReached(glob: string, servers: ReadonlySet<string>): string[]
       (start) => fixed.startsWith(start) || start.startsWith(fixed),
     ),
   );
+}
+
+/**
+ * The declared MCP servers whose tools a rule's tool half can match, in
+ * either spelling (see {@link mcpServersReached}); none for a malformed
+ * pattern. Such a rule may fire on a tool no offline check can list — the
+ * server says which tools it has when it starts.
+ */
+export function mcpServersReachedBy(pattern: string, servers: ReadonlyArray<string>): string[] {
+  const paren = pattern.indexOf("(");
+  if (paren !== -1 && !pattern.endsWith(")")) return [];
+  const toolGlob = (paren === -1 ? pattern : pattern.slice(0, paren)).trim();
+  if (toolGlob === "") return [];
+  const reached = new Set(mcpServersReached(toolGlob, new Set(servers)));
+  // An exact `mcp__<server>__<tool>` name, which mcpServersReached leaves to
+  // the `mcp__` rules' own check.
+  if (!GLOB_META.test(toolGlob)) {
+    for (const server of servers) {
+      const start = `mcp__${server}__`;
+      if (toolGlob.startsWith(start) && toolGlob.length > start.length) reached.add(server);
+    }
+  }
+  return [...reached].sort();
 }
 
 /** `a`, `a and b`, `a, b and c`; past six, the first five and a count. */
@@ -444,7 +475,19 @@ export function permissionRuleProblems(
           .filter((c) => c.d <= 2)
           .sort((a, b) => a.d - b.d || (a.name < b.name ? -1 : 1));
         const best = near[0];
-        if (best !== undefined && near.filter((c) => c.d === best.d).length === 1) {
+        const tied = best === undefined ? [] : near.filter((c) => c.d === best.d);
+        if (best === undefined || tied.length > 1) {
+          // Known to nothing, and close to no one tool (or to several alike):
+          // say so, without a fix, and without calling it dead outright.
+          report(
+            "tool-not-known",
+            `rule "${rule.pattern}" names ${toolGlob}, which is no builtin and no tool the runtime adds${
+              tied.length > 1
+                ? ` (it is equally close to ${listNames(tied.map((c) => c.name))})`
+                : ""
+            }, so it never fires unless a plugin, a custom tool or an MCP server's "<server>__<tool>" spelling registers a tool by that name. Check the name, or remove the rule.`,
+          );
+        } else {
           const fixed = withTool(rule.pattern, best.name);
           const widens =
             rule.type === "alwaysAllow" &&
@@ -506,4 +549,101 @@ export function permissionRuleProblems(
     }
   }
   return problems;
+}
+
+/** One list of permission patterns a spec carries, each typed the way the engine applies it. */
+export type PermissionRuleList = {
+  /** Where it sits in the spec, e.g. `models.fast.permissions.deny`. */
+  readonly path: string;
+  readonly rules: ReadonlyArray<{ readonly type: string; readonly pattern: string }>;
+};
+
+/**
+ * Every list of permission patterns a spec document carries (as parsed,
+ * before lowering), in document order:
+ *
+ * - the shape's `permissions.rules`;
+ * - each model profile's `models.<name>.permissions.deny` / `ask`, and each
+ *   pool candidate's own (`….model_pool.candidates[i].permissions.deny` /
+ *   `ask`) — they narrow whatever the profile or candidate serves;
+ * - each sub-agent's `….sub_agents.<name>.permissions.allow` / `deny` —
+ *   they replace or narrow the parent's for the sub-agent (`agent.sub_agents`
+ *   on the cli and channel shapes, `roles.<role>.sub_agents` on a crew).
+ *
+ * All of them are matched against a tool's registered name, so a spec key or
+ * a misspelling is as dead in one as in another (C146). `crewhaus lint`,
+ * `compile` and `PermissionAudit` read the lists from here, so the three
+ * cannot disagree about which lists exist.
+ */
+export function specPermissionRuleLists(spec: unknown): PermissionRuleList[] {
+  const lists: PermissionRuleList[] = [];
+  const record = (v: unknown): Record<string, unknown> | undefined =>
+    v !== null && typeof v === "object" && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : undefined;
+  const patterns = (type: string, value: unknown) =>
+    Array.isArray(value)
+      ? value
+          .filter((p): p is string => typeof p === "string")
+          .map((pattern) => ({ type, pattern }))
+      : [];
+  const typedLists = (
+    at: string,
+    block: Record<string, unknown>,
+    fields: ReadonlyArray<readonly [string, string]>,
+  ): void => {
+    for (const [field, type] of fields) {
+      const rules = patterns(type, block[field]);
+      if (rules.length > 0) lists.push({ path: `${at}.${field}`, rules });
+    }
+  };
+  const top = record(record(spec)?.["permissions"]);
+  const topRules: Array<{ type: string; pattern: string }> = [];
+  if (Array.isArray(top?.["rules"])) {
+    for (const raw of top["rules"] as unknown[]) {
+      const rule = record(raw);
+      if (typeof rule?.["type"] === "string" && typeof rule["pattern"] === "string") {
+        topRules.push({ type: rule["type"], pattern: rule["pattern"] });
+      }
+    }
+  }
+  if (topRules.length > 0) lists.push({ path: "permissions.rules", rules: topRules });
+  // `segments` holds each key, and `[i]` for an array element.
+  const visit = (node: unknown, segments: readonly string[], depth: number): void => {
+    if (depth > 16) return;
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => visit(item, [...segments, `[${i}]`], depth + 1));
+      return;
+    }
+    const map = record(node);
+    if (map === undefined) return;
+    const n = segments.length;
+    const at = segments.reduce(
+      (acc, s) => (s.startsWith("[") ? `${acc}${s}` : acc === "" ? s : `${acc}.${s}`),
+      "",
+    );
+    const perms = n > 0 ? record(map["permissions"]) : undefined;
+    if (perms !== undefined) {
+      if (n >= 2 && segments[n - 2] === "sub_agents") {
+        typedLists(`${at}.permissions`, perms, [
+          ["allow", "alwaysAllow"],
+          ["deny", "alwaysDeny"],
+        ]);
+      } else if (
+        (n === 2 && segments[0] === "models") ||
+        (n >= 3 && segments[n - 2] === "candidates" && segments[n - 3] === "model_pool")
+      ) {
+        typedLists(`${at}.permissions`, perms, [
+          ["deny", "alwaysDeny"],
+          ["ask", "alwaysAsk"],
+        ]);
+      }
+    }
+    for (const [key, value] of Object.entries(map)) {
+      if (key === "permissions" || key === "mcp_servers" || key === "tool_config") continue;
+      visit(value, [...segments, key], depth + 1);
+    }
+  };
+  visit(spec, [], 0);
+  return lists;
 }

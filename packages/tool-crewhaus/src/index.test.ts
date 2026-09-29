@@ -409,6 +409,120 @@ describe("ToolInventory", () => {
     expect(result.note).toBeUndefined();
   });
 
+  // C001 (wave III): the check read the cli set whatever the spec's shape, so
+  // a graph node's `evmCall`, which compiles there, came back unknown.
+  test("builtins are checked for the spec's own shape", async () => {
+    const graph = [
+      "name: g",
+      "target: graph",
+      "model: claude-sonnet-5",
+      "entry: plan",
+      "nodes:",
+      "  plan:",
+      "    instructions: plan",
+      "    tools: [evmCall, jsonQuery]",
+      "edges: []",
+    ].join("\n");
+    const onGraph = await callJson<{
+      unknown: string[];
+      notOnShape: Array<{ tool: string; reason: string }>;
+      shape: string;
+    }>(toolInventory, { spec: graph });
+    expect([onGraph.shape, onGraph.unknown, onGraph.notOnShape]).toEqual(["graph", [], []]);
+    const cli = CLI_SPEC.replace("tools: [read, write, bash]", "tools: [read, evmCall]");
+    const onCli = await callJson<{
+      unknown: string[];
+      notOnShape: Array<{ tool: string; reason: string }>;
+    }>(toolInventory, { spec: cli });
+    expect(onCli.unknown).toEqual([]);
+    expect(onCli.notOnShape.map((n) => n.tool)).toEqual(["evmCall"]);
+    expect(onCli.notOnShape[0]?.reason).toContain(
+      "only the graph, workflow and crew shapes carry it",
+    );
+  });
+
+  test("a sub-agent's registered names and the runtime's own tools are real", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: m",
+      "  instructions: go",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: h",
+      "      tools: [Read, CodeGraphSearch, Skill, NoSuchThing]",
+      "tools: [read, codegraphSearch]",
+    ].join("\n");
+    const result = await callJson<{ unknown: string[] }>(toolInventory, { spec });
+    expect(result.unknown).toEqual(["NoSuchThing"]);
+  });
+
+  // wave III review: cf09645e accepted any registered name, runtime name or
+  // thredz name anywhere, so a site list compile rejects (`tools: [Read,
+  // Skill, goal_list]`) came back with nothing unknown.
+  test("a site list takes spec keys, as compile reads it; a narrowing list also takes the rest", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "thredz: true",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tools: [Read, Skill] }",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: $fast, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong], tools: [Read, goal_list] }",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: h",
+      "      tools: [Read, Skill, goal_list, EvmGetLogs]",
+      "tools: [Read, goal_list, Skill, evmCall, WebFetch, read]",
+    ].join("\n");
+    const result = await callJson<{
+      unknown: string[];
+      unknownAt: Array<{ tool: string; site: string; reason?: string }>;
+      notOnShape: Array<{ tool: string; site: string }>;
+    }>(toolInventory, { spec });
+    expect(result.unknown).toEqual(["Read", "Skill", "WebFetch", "goal_list"]);
+    expect(result.unknownAt.map((u) => `${u.site}: ${u.tool}`)).toEqual([
+      "<root>: Read",
+      "<root>: goal_list",
+      "<root>: Skill",
+      "<root>: WebFetch",
+    ]);
+    // With compile's own words.
+    expect(result.unknownAt[0]?.reason).toContain('write "read"');
+    expect(result.notOnShape.map((n) => `${n.site}: ${n.tool}`)).toEqual([
+      "<root>: evmCall",
+      "agent.sub_agents.helper: EvmGetLogs",
+    ]);
+    // A graph node's list is a site list too.
+    const graph = [
+      "name: g",
+      "target: graph",
+      "model: claude-sonnet-5",
+      "entry: plan",
+      "nodes:",
+      "  plan:",
+      "    instructions: plan",
+      "    tools: [evmCall, EvmGetLogs, sendMessage]",
+      "edges: []",
+    ].join("\n");
+    const onGraph = await callJson<{ unknown: string[]; notOnShape: Array<{ tool: string }> }>(
+      toolInventory,
+      { spec: graph },
+    );
+    expect([onGraph.unknown, onGraph.notOnShape.map((n) => n.tool)]).toEqual([
+      ["EvmGetLogs"],
+      ["sendMessage"],
+    ]);
+  });
+
   test("a spec of real tools reports nothing unknown", async () => {
     const result = await callJson<{ unknown: string[] }>(toolInventory, { spec: CLI_SPEC });
     expect(result.unknown).toEqual([]);
@@ -519,6 +633,281 @@ describe("PermissionAudit", () => {
       { spec },
     );
     expect(result.tools[0]?.destructive).toBe(true);
+  });
+
+  // back-compat (wave III): the trader starter's `alwaysAllow goal_list`
+  // is live with a `thredz:` block (the runtime registers goal_list under
+  // that name), and was reported as a near miss of GoalList.
+  test("a thredz: block's tool names are known; without the block they are near misses", async () => {
+    const spec = (thredz: string) =>
+      [
+        "name: demo",
+        "target: cli",
+        ...(thredz === "" ? [] : [thredz]),
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: go",
+        "tools: [read]",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        "    - { type: alwaysAllow, pattern: goal_list }",
+        "    - { type: alwaysAllow, pattern: goal_write }",
+        "    - { type: alwaysAllow, pattern: agent_list }",
+      ].join("\n");
+    const problems = async (thredz: string) =>
+      (
+        await callJson<{ ruleProblems: Array<{ pattern: string; code: string }> }>(
+          permissionAudit,
+          { spec: spec(thredz) },
+        )
+      ).ruleProblems.map((p) => [p.pattern, p.code]);
+    expect(await problems("thredz: { api_key: $THREDZ_API_KEY, goals: true }")).toEqual([
+      ["agent_list", "tool-not-known"],
+    ]);
+    expect(await problems("thredz: { api_key: $THREDZ_API_KEY, messaging: true }")).toEqual([]);
+    expect(await problems("")).toEqual([
+      ["goal_list", "unknown-tool"],
+      ["goal_write", "unknown-tool"],
+      ["agent_list", "tool-not-known"],
+    ]);
+  });
+
+  // wave III review (C146): lint and compile --strict read the model
+  // profiles' and sub-agents' lists; PermissionAudit read only
+  // `permissions.rules`, so it reported none of the dead rules below and
+  // presented those deny lists as if they worked.
+  test("every rule list the spec carries is checked, and each problem names its list", async () => {
+    const cli = [
+      "name: demo",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, permissions: { deny: ['removePath(src/**)', 'REMOVEPATH', 'fetch'] } }",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: $fast, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong], permissions: { ask: ['webfetch'] } }",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: help",
+      "      tools: [RemovePath, Fetch]",
+      "      permissions:",
+      "        allow: ['Fetch']",
+      "        deny: ['removePath(src/**)', 'fetch(https://evil.example/**)']",
+      "tools: [removePath, fetch, webFetch]",
+      "permissions:",
+      "  mode: auto",
+    ].join("\n");
+    const crew = [
+      "name: hello-crew",
+      "target: crew",
+      "model: claude-sonnet-5",
+      "entry: researcher",
+      "permissions:",
+      "  mode: auto",
+      "roles:",
+      "  researcher:",
+      "    instructions: research",
+      "    tools: [read, fetch]",
+      "    sub_agents:",
+      "      digger:",
+      "        description: digs",
+      "        instructions: dig",
+      "        tools: [Read, Fetch]",
+      "        permissions:",
+      "          allow: ['Read']",
+      "          deny: ['fetch(https://evil.example/**)', 'removePath']",
+      "  writer:",
+      "    instructions: write",
+    ].join("\n");
+    const problems = async (spec: string) =>
+      (
+        await callJson<{ ruleProblems: Array<{ list: string; pattern: string; code: string }> }>(
+          permissionAudit,
+          { spec },
+        )
+      ).ruleProblems.map((p) => `${p.list}: ${p.code} ${p.pattern}`);
+    expect(await problems(cli)).toEqual([
+      "models.fast.permissions.deny: tool-key-not-name removePath(src/**)",
+      "models.fast.permissions.deny: unknown-tool REMOVEPATH",
+      "models.fast.permissions.deny: tool-key-not-name fetch",
+      "agent.model_pool.candidates[1].permissions.ask: unknown-tool webfetch",
+      "agent.sub_agents.helper.permissions.deny: tool-key-not-name removePath(src/**)",
+      "agent.sub_agents.helper.permissions.deny: tool-key-not-name fetch(https://evil.example/**)",
+    ]);
+    expect(await problems(crew)).toEqual([
+      "roles.researcher.sub_agents.digger.permissions.deny: tool-key-not-name fetch(https://evil.example/**)",
+      "roles.researcher.sub_agents.digger.permissions.deny: tool-key-not-name removePath",
+    ]);
+    // The shape's own rules carry their list too.
+    expect(
+      await problems(
+        cli.replace(
+          "  mode: auto",
+          "  mode: auto\n  rules:\n    - { type: alwaysDeny, pattern: fetch }",
+        ),
+      ),
+    ).toContain("permissions.rules: tool-key-not-name fetch");
+  });
+
+  // wave III review: with a `thredz:` block the runtime registers goal_list,
+  // message_send, … under those names, so the trader starter's allows are
+  // live — and were listed under unusedRules, "the rules that match
+  // nothing". So were its `broker__*` rules, which fire on the declared
+  // broker server's tools.
+  test("rules on a thredz: block's tools, or a declared MCP server's, are not reported as matching nothing", async () => {
+    const spec = (thredz: string) =>
+      [
+        "name: demo",
+        "target: cli",
+        ...(thredz === "" ? [] : [thredz]),
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: go",
+        "tools: [read]",
+        "mcp_servers:",
+        "  broker: { transport: stdio, command: bunx }",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        "    - { type: alwaysAllow, pattern: goal_list }",
+        "    - { type: alwaysAllow, pattern: message_send }",
+        "    - { type: alwaysAllow, pattern: broker__paper_buy }",
+        "    - { type: alwaysAllow, pattern: mcp__broker__quote }",
+        "    - { type: alwaysAllow, pattern: other__thing }",
+      ].join("\n");
+    type Audit = {
+      tools: Array<{ tool: string; decision: string; rule?: { pattern: string } }>;
+      unusedRules: Array<{ pattern: string }>;
+      mcpServerRules: Array<{ pattern: string; servers: string[] }>;
+    };
+    const audit = async (thredz: string) =>
+      callJson<Audit>(permissionAudit, { spec: spec(thredz) });
+    const withMessaging = await audit("thredz: { api_key: $THREDZ_API_KEY, messaging: true }");
+    expect(withMessaging.unusedRules.map((r) => r.pattern)).toEqual(["other__thing"]);
+    expect(withMessaging.mcpServerRules).toEqual([
+      { type: "alwaysAllow", pattern: "broker__paper_buy", servers: ["broker"] },
+      { type: "alwaysAllow", pattern: "mcp__broker__quote", servers: ["broker"] },
+    ] as never);
+    // The thredz tools are granted, under their own names, and ruled.
+    const row = (a: Audit, tool: string) => a.tools.find((t) => t.tool === tool);
+    expect(row(withMessaging, "goal_list")).toMatchObject({
+      decision: "allow",
+      rule: { pattern: "goal_list" },
+    });
+    expect(row(withMessaging, "message_send")?.decision).toBe("allow");
+    // Without messaging, message_send is not registered; without a block,
+    // neither is goal_list.
+    const memoryOnly = await audit("thredz: { api_key: $THREDZ_API_KEY }");
+    expect(memoryOnly.unusedRules.map((r) => r.pattern)).toEqual(["message_send", "other__thing"]);
+    const none = await audit("");
+    expect(row(none, "goal_list")).toBeUndefined();
+    expect(none.unusedRules.map((r) => r.pattern)).toEqual([
+      "goal_list",
+      "message_send",
+      "other__thing",
+    ]);
+  });
+
+  // A rule that speaks to only some calls of a tool leaves the rules after
+  // it reachable: the trader's `Edit(eval/**)` after `Edit(curriculum.md)`
+  // was listed as matching nothing.
+  test("a rule after an argument-scoped one for the same tool is reachable; one after a bare rule is not", async () => {
+    const spec = (first: string) =>
+      [
+        "name: demo",
+        "target: cli",
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: go",
+        "tools: [edit]",
+        "permissions:",
+        "  rules:",
+        `    - { type: alwaysAllow, pattern: "${first}" }`,
+        '    - { type: alwaysAllow, pattern: "Edit(eval/**)" }',
+      ].join("\n");
+    const unused = async (first: string) =>
+      (
+        await callJson<{ unusedRules: Array<{ pattern: string }> }>(permissionAudit, {
+          spec: spec(first),
+        })
+      ).unusedRules.map((r) => r.pattern);
+    expect(await unused("Edit(curriculum.md)")).toEqual([]);
+    expect(await unused("Edit")).toEqual(["Edit(eval/**)"]);
+  });
+
+  // wave III fix-up: with `learning.exam` the cli runtime registers
+  // `run_exam` (the trader starter's bundle wires createExamRunner), yet its
+  // `alwaysAllow run_exam` was listed under unusedRules, "the rules that
+  // match nothing" — as was `alwaysAllow Skill`, which the same audit had
+  // just said names a real tool. Whether the runtime adds such a tool
+  // depends on wiring the audit does not model, so it says that instead.
+  test("a rule naming a tool the runtime may add is reported as such, not as matching nothing", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "learning:",
+      "  domain: trading",
+      "  exam: { dataset: eval/dataset.jsonl, graders: eval/graders.yaml }",
+      "tools: [read]",
+      "permissions:",
+      "  rules:",
+      "    - { type: alwaysAllow, pattern: run_exam }",
+      "    - { type: alwaysAllow, pattern: Skill }",
+      "    - { type: alwaysAsk, pattern: 'Evm*' }",
+      "    - { type: alwaysAllow, pattern: Nonexistent }",
+      "    - { type: alwaysAllow, pattern: skill }",
+    ].join("\n");
+    const result = await callJson<{
+      unusedRules: Array<{ pattern: string }>;
+      runtimeToolRules: Array<{ type: string; pattern: string; tools: string[] }>;
+      tools: Array<{ tool: string }>;
+    }>(permissionAudit, { spec });
+    expect(result.runtimeToolRules.map((r) => [r.pattern, r.tools.length])).toEqual([
+      ["Evm*", 8],
+      ["Skill", 1],
+      ["run_exam", 1],
+    ]);
+    expect(result.runtimeToolRules.find((r) => r.pattern === "run_exam")?.tools).toEqual([
+      "run_exam",
+    ]);
+    // A name no tool has is still unused, and so is a near miss the rule
+    // checker calls dead (`skill` is not `Skill`: the engine matches case).
+    expect(result.unusedRules.map((r) => r.pattern)).toEqual(["Nonexistent", "skill"]);
+    // Nothing is granted on the audit's say-so: no row for a tool it cannot
+    // confirm the runtime adds.
+    expect(result.tools.map((t) => t.tool)).toEqual(["read"]);
+    // Plan mode ignores every allow, so those match nothing whatever the
+    // runtime adds — nor does an allow on a declared server's tools; an ask
+    // still names the tools it would gate.
+    const plan = await callJson<{
+      unusedRules: Array<{ pattern: string }>;
+      runtimeToolRules: Array<{ pattern: string }>;
+      mcpServerRules: Array<{ pattern: string }>;
+    }>(permissionAudit, {
+      spec: spec
+        .replace(
+          "permissions:",
+          "mcp_servers:\n  broker: { transport: stdio, command: bunx }\npermissions:\n  mode: plan",
+        )
+        .concat("\n    - { type: alwaysAllow, pattern: broker__quote }"),
+    });
+    expect(plan.runtimeToolRules.map((r) => r.pattern)).toEqual(["Evm*"]);
+    expect(plan.mcpServerRules).toEqual([]);
+    expect(plan.unusedRules.map((r) => r.pattern)).toEqual([
+      "Nonexistent",
+      "Skill",
+      "broker__quote",
+      "run_exam",
+      "skill",
+    ]);
   });
 
   test("a rule that names nothing granted is reported as unused", async () => {

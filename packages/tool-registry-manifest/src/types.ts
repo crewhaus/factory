@@ -21,6 +21,8 @@ export type RegistryOperativeArg = {
   readonly within?: string;
   /** The field only moves the tool; its default is read by a deny or ask. */
   readonly relocates?: true;
+  /** For a `command`: the field holding the environment its call sets. */
+  readonly env?: string;
 };
 
 export type RegistryEntry = {
@@ -114,6 +116,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.default !== undefined ? { default: arg.default } : {}),
     ...(arg.within !== undefined ? { within: arg.within } : {}),
     ...(arg.relocates === true ? { relocates: true as const } : {}),
+    ...(arg.env !== undefined ? { env: arg.env } : {}),
   };
 }
 

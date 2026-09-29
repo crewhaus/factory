@@ -53,11 +53,20 @@ import {
   runPreflight,
 } from "@crewhaus/preflight";
 import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
-import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
+  BUILTIN_TOOLS,
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinKeyForName,
+  checkBuiltinTool,
+} from "@crewhaus/tool-categories";
+import { specPermissionRuleLists } from "@crewhaus/tool-permission-matcher";
+import {
+  NON_CLI_TOOL_FLAGS,
   RUNTIME_TOOL_NAMES,
+  THREDZ_TOOL_NAMES,
   TOOL_FLAGS,
   TOOL_FLAGS_BY_NAME,
 } from "@crewhaus/tool-registry-manifest/flags";
@@ -528,34 +537,70 @@ export const toolInventory: RegisteredTool = buildTool({
     // checked against a runtime that is not this one — a bundle compiled from
     // another release has a different builtin set.
     //
-    // The set comes from `BUILTIN_TOOL_MAP` and NOT from the manifest's main
-    // entry, although the manifest has the same keys. This tool needs the key
-    // SET; the main entry is 455 KB of key set plus description prose, which
-    // every bundle granting any tool-crewhaus tool would then load — and
-    // `crewhaus` sits inside the `all-operations` roll-up. (PermissionAudit,
-    // in this package, reads the manifest's `/flags` table, which carries no
-    // prose; `apps/cli/src/tool-registry.test.ts` holds that line.) `target-cli`
-    // is already in this package's dependency closure via `@crewhaus/compiler`,
-    // so this costs nothing. That the two key sets are identical is not an
-    // assumption: `apps/cli/src/tool-registry.test.ts` asserts it in both
-    // directions on every run.
+    // By default each name is checked the way the compiler checks it, for the
+    // spec's own shape, from the one builtin table (`@crewhaus/tool-categories`,
+    // data only): a graph spec's `evmCall` is a real tool, not `unknown` as it
+    // was when the check read the cli set (C001); a builtin this shape cannot
+    // run is `notOnShape`, with compile's reason. A narrowing list may name a
+    // builtin by its registered name (`Read`), and a tool the runtime adds
+    // itself (`Skill`, a thredz: block's `goal_list`) is real too.
     const usedCallerList = input.knownTools !== undefined;
-    const known = usedCallerList
-      ? new Set(input.knownTools)
-      : new Set(Object.keys(BUILTIN_TOOL_MAP));
+    const callerKnown = new Set(input.knownTools ?? []);
+    const target = asRecord(parsed.value)?.["target"];
+    const shape: ToolShape =
+      typeof target === "string" && Object.hasOwn(SHAPE_TOOL_PROFILES, target)
+        ? (target as ToolShape)
+        : "cli";
+    const runtimeKnown = new Set([...RUNTIME_TOOL_NAMES, ...thredzToolNamesOfSpec(parsed.value)]);
 
     const builtin: string[] = [];
     const mcp: Array<{ tool: string; server: string; declared: boolean }> = [];
-    const unknown: string[] = [];
+    const unknown = new Set<string>();
+    const unknownAt: Array<{ tool: string; site: string; reason?: string }> = [];
+    const notOnShape: Array<{ tool: string; site: string; reason: string }> = [];
     for (const tool of resolved.tools) {
       if (tool.startsWith("mcp__")) {
         const server = mcpServerOf(tool, servers);
         mcp.push({ tool, server, declared: servers.has(server) });
-        continue;
+      } else {
+        builtin.push(tool);
       }
-      builtin.push(tool);
-      if (!known.has(tool) && !known.has(toRegisteredName(tool))) {
-        unknown.push(tool);
+    }
+    // Each name is judged where it is listed, as compile judges it: a site's
+    // list registers tools and takes the spec key (`read`), so a registered
+    // name (`Read`), a tool the runtime adds itself (`Skill`) or a thredz
+    // name there is refused; a list that narrows one (a sub-agent's, a model
+    // profile's, a pool candidate's) also takes the registered name, and a
+    // tool the runtime or a thredz: block adds is real there.
+    for (const site of resolved.toolSites) {
+      const narrowing = isNarrowingToolSite(site.path);
+      for (const tool of new Set(site.tools)) {
+        if (tool.startsWith("mcp__")) continue;
+        const miss = (reason?: string) => {
+          unknown.add(tool);
+          unknownAt.push({ tool, site: site.path, ...(reason !== undefined ? { reason } : {}) });
+        };
+        if (usedCallerList) {
+          if (!callerKnown.has(tool) && !callerKnown.has(toRegisteredName(tool))) miss();
+          continue;
+        }
+        if (!narrowing) {
+          const verdict = checkBuiltinTool(tool, shape);
+          if (verdict.kind === "unknown") miss(verdict.message);
+          else if (verdict.kind === "refused") {
+            notOnShape.push({ tool, site: site.path, reason: verdict.message });
+          }
+          continue;
+        }
+        const key = Object.hasOwn(BUILTIN_TOOLS, tool) ? tool : builtinKeyForName(tool);
+        if (key === undefined) {
+          if (!runtimeKnown.has(tool)) miss();
+          continue;
+        }
+        const verdict = checkBuiltinTool(key, shape);
+        if (verdict.kind === "refused") {
+          notOnShape.push({ tool, site: site.path, reason: verdict.message });
+        }
       }
     }
 
@@ -566,13 +611,47 @@ export const toolInventory: RegisteredTool = buildTool({
       builtin,
       mcp,
       dangling: mcp.filter((m) => !m.declared).map((m) => m.tool),
-      unknown,
+      unknown: [...unknown].sort(compareStrings),
+      unknownAt,
+      ...(usedCallerList ? {} : { shape, notOnShape }),
       checkedAgainst: usedCallerList ? "the knownTools you passed" : "this release's builtins",
       sites: resolved.toolSites,
       declaredSelectors: declared.toolSites,
     });
   },
 });
+
+/**
+ * Does the `tools:` list at this site (a `collectToolSites` path) narrow
+ * what a site registers — a sub-agent's, a model profile's or a pool
+ * candidate's — rather than register tools itself?
+ */
+function isNarrowingToolSite(sitePath: string): boolean {
+  return (
+    sitePath.startsWith("models.") ||
+    /(^|\.)sub_agents\./.test(sitePath) ||
+    /(^|\.)model_pool(\.|$)/.test(sitePath)
+  );
+}
+
+/**
+ * The bare tool names a spec's `thredz:` block registers (the goal, task,
+ * wiki and space tools; the messaging tools too when the block, or one of a
+ * crew's per-role blocks, says `messaging: true`), or none without a block.
+ */
+function thredzToolNamesOfSpec(spec: unknown): readonly string[] {
+  const block = asRecord(spec)?.["thredz"];
+  if (block === undefined || block === false || block === null) return [];
+  const record = asRecord(block);
+  const messaging =
+    record?.["messaging"] === true ||
+    Object.values(asRecord(record?.["roles"]) ?? {}).some(
+      (role) => asRecord(role)?.["messaging"] === true,
+    );
+  return messaging
+    ? [...THREDZ_TOOL_NAMES.memory, ...THREDZ_TOOL_NAMES.messaging]
+    : THREDZ_TOOL_NAMES.memory;
+}
 
 /**
  * The server an `mcp__<server>__<tool>` name belongs to: the longest declared
@@ -643,6 +722,10 @@ export const permissionAudit: RegisteredTool = buildTool({
     ];
     const result = auditPermissions({
       tools: view.tools,
+      // A `thredz:` block registers its tools under their bare names
+      // (`goal_list`, `message_send`, …) with no `tools:` entry, so they are
+      // granted too, and a rule naming one covers it.
+      runtimeTools: thredzToolNamesOfSpec(parsed.value),
       mode: view.permissions.mode,
       askMode: view.permissions.askMode,
       rules: view.permissions.rules,
@@ -651,11 +734,29 @@ export const permissionAudit: RegisteredTool = buildTool({
       // from the manifest generated off the tools themselves, instead of
       // "external" read off six legacy names and "destructive" read off
       // nothing.
-      flagsOf: (tool) => TOOL_FLAGS[tool] ?? TOOL_FLAGS_BY_NAME.get(tool),
+      flagsOf: (tool) =>
+        TOOL_FLAGS[tool] ??
+        TOOL_FLAGS_BY_NAME.get(tool) ??
+        NON_CLI_TOOL_FLAGS[tool] ??
+        Object.values(NON_CLI_TOOL_FLAGS).find((flags) => flags.name === tool),
       // The builtins, and the tools the runtime registers without a spec
-      // listing them — `alwaysAllow Skill` names a real tool.
-      knownTools: [...Object.values(TOOL_FLAGS), ...RUNTIME_TOOL_NAMES.map((name) => ({ name }))],
+      // listing them — `alwaysAllow Skill` names a real tool, and so does
+      // `alwaysAllow goal_list` in a spec with a `thredz:` block.
+      knownTools: [
+        ...Object.values(TOOL_FLAGS),
+        ...Object.values(NON_CLI_TOOL_FLAGS),
+        ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
+        ...thredzToolNamesOfSpec(parsed.value).map((name) => ({ name })),
+      ],
       mcpServers: view.mcpServers.map((s) => s.name),
+      // `alwaysAllow run_exam` on a spec with `learning.exam`, or `alwaysAllow
+      // Skill`, names a tool the runtime adds when it is wired: not dead.
+      mayRegisterTools: RUNTIME_TOOL_NAMES,
+      // The model profiles', pool candidates' and sub-agents' lists, checked
+      // for rules that never fire, as lint and compile check them (C146).
+      otherRuleLists: specPermissionRuleLists(expanded).filter(
+        (list) => list.path !== "permissions.rules",
+      ),
       ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });
     return json({

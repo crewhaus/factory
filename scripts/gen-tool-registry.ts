@@ -37,6 +37,10 @@ import { fileURLToPath } from "node:url";
 import { runtimeToolNames } from "../apps/cli/src/runtime-tool-names";
 import { TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
 import {
+  THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_MESSAGING_TOOL_NAMES,
+} from "../packages/memory-service/src/thredz";
+import {
   BUILTIN_TOOLS,
   builtinToolsFor,
   categoriesForTool,
@@ -85,10 +89,11 @@ type ToolLike = {
   readonly operativeArgs?: ReadonlyArray<RegistryOperativeArg>;
 };
 
-const rows: string[] = [];
-const flagRows: string[] = [];
-const builtinNames = new Set<string>();
-for (const key of keys) {
+/** The manifest row of one builtin, read off the tool the table says exports it. */
+async function projectBuiltin(key: string): Promise<{
+  readonly tool: ToolLike;
+  readonly projected: ReturnType<typeof projectRegistryEntry>;
+}> {
   const entry = BUILTIN_TOOLS[key];
   if (entry === undefined) throw new Error(`no builtin table entry for ${key}`);
   // Workspace deps are linked per package, not hoisted to the root, so a
@@ -113,9 +118,29 @@ for (const key of keys) {
     package: entry.package,
     keywords: TOOL_KEYWORDS[key] ?? [],
   });
+  return { tool, projected };
+}
+
+const rows: string[] = [];
+const flagRows: string[] = [];
+const builtinNames = new Set<string>();
+for (const key of keys) {
+  const { tool, projected } = await projectBuiltin(key);
   builtinNames.add(tool.name);
   rows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projected)},`);
   flagRows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projectToolFlags(projected))},`);
+}
+
+// The builtins no cli bundle carries — the evm tools of the graph, workflow
+// and crew shapes, the channel shape's SendMessage — get flag rows of their
+// own, so a check of a spec of THOSE shapes (the compile --strict scope gate,
+// the rule checker) reads their real flags instead of skipping them.
+const cliKeys = new Set(keys);
+const nonCliFlagRows: string[] = [];
+for (const key of Object.keys(BUILTIN_TOOLS).sort()) {
+  if (cliKeys.has(key)) continue;
+  const { projected } = await projectBuiltin(key);
+  nonCliFlagRows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projectToolFlags(projected))},`);
 }
 
 writeFileSync(
@@ -178,6 +203,17 @@ export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
 );
 
 /**
+ * How the builtins that no cli bundle carries are gated: the evm tools of the
+ * graph, workflow and crew shapes, and the channel shape's SendMessage.
+ * {@link TOOL_FLAGS} mirrors the cli manifest (\`TOOL_REGISTRY\`, what
+ * \`crewhaus tools\` offers a cli spec), so these are kept apart; a check of a
+ * spec of another shape reads them from here rather than skip the tool.
+ */
+export const NON_CLI_TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
+${nonCliFlagRows.join("\n")}
+};
+
+/**
  * The other tools this release defines: ones the runtime registers without a
  * spec listing them (\`Skill\`, \`ListTools\`, \`Task\`, the browser shape's
  * \`Type\`, the memory and plan tools, \`Consult\`, …). Names only — how
@@ -188,6 +224,22 @@ export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
  * out; \`apps/cli/src/tool-registry.test.ts\` fails when it is stale.
  */
 export const RUNTIME_TOOL_NAMES: ReadonlyArray<string> = ${JSON.stringify(runtimeToolNames(REPO_ROOT, builtinNames))};
+
+/**
+ * The bare names a \`thredz:\` block registers from the Thredz MCP server
+ * (\`goal_list\`, \`task_complete\`, \`wiki_space_create\`, …): \`memory\` always,
+ * \`messaging\` too when the block says \`messaging: true\`. A permission rule
+ * naming one of them is a real rule in a spec with that block, and a near
+ * miss of a builtin (\`goal_list\` of GoalList) in a spec without one.
+ *
+ * Copied from \`@crewhaus/memory-service\` (\`THREDZ_ALIAS_TOOL_NAMES\`,
+ * \`THREDZ_MESSAGING_TOOL_NAMES\`) so a bundle that checks rules need not
+ * import it; \`apps/cli/src/runtime-tool-names.test.ts\` fails when it is stale.
+ */
+export const THREDZ_TOOL_NAMES: {
+  readonly memory: ReadonlyArray<string>;
+  readonly messaging: ReadonlyArray<string>;
+} = ${JSON.stringify({ memory: [...THREDZ_ALIAS_TOOL_NAMES], messaging: [...THREDZ_MESSAGING_TOOL_NAMES] })};
 `,
 );
 

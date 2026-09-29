@@ -1505,7 +1505,9 @@ export const hooksManage: RegisteredTool = buildTool({
   name: "HooksManage",
   operativeArgs: [
     { field: "dir", kind: "path", default: "." },
-    { field: "command", kind: "command" },
+    // The supervisor runs the hook from the harness root, and resolves a
+    // `./prep.sh` there: the command is another program in another `dir`.
+    { field: "command", kind: "command", within: "dir" },
   ],
   description:
     "List, set and remove the MANAGER hooks (postCompile, preSpawn) in a harness's .crewhaus/settings.json — the steps @crewhaus/harness-supervisor runs between a compile and a spawn — and report what each declaration PARSES to. It never executes a hook. The grammar is the supervisor's: a string is ONE command with no arguments, never word-split; an array is an argv. So \"bun run prep.ts\" names a file with spaces in it and is refused, with the array form spelled out. A command path is checked for existence and the execute bit (a directory or a dangling link is not executable); a bare name is left to the OS at spawn time. Writes keep every other key, are atomic, keep the file's mode, and are refused when the existing file does not parse. The settings file is contained before it is read, so a symlinked one is refused, on list too. After a write the file is re-read through the supervisor's own reader to confirm the argv came back. dryRun defaults to true.",

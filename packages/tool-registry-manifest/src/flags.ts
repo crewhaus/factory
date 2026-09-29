@@ -1912,7 +1912,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "paths", kind: "path", default: ".", within: "cwd" },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "cwd" },
     ],
   },
   formatCheck: {
@@ -2532,7 +2532,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "dir", kind: "path", default: "." },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "dir" },
     ],
   },
   htmlForms: {
@@ -3978,7 +3978,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   processStatus: {
     key: "processStatus",
@@ -4302,7 +4302,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   robotsCheck: {
     key: "robotsCheck",
@@ -4363,7 +4363,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "cwd", kind: "path", default: ".", relocates: true },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "cwd" },
     ],
   },
   runCommand: {
@@ -4375,7 +4375,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   runPipeline: {
     key: "runPipeline",
@@ -4386,7 +4386,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   runTests: {
     key: "runTests",
@@ -4399,7 +4399,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "cwd", kind: "path", default: ".", relocates: true },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "cwd" },
     ],
   },
   runTimeline: {
@@ -5633,6 +5633,115 @@ export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
 );
 
 /**
+ * How the builtins that no cli bundle carries are gated: the evm tools of the
+ * graph, workflow and crew shapes, and the channel shape's SendMessage.
+ * {@link TOOL_FLAGS} mirrors the cli manifest (`TOOL_REGISTRY`, what
+ * `crewhaus tools` offers a cli spec), so these are kept apart; a check of a
+ * spec of another shape reads them from here rather than skip the tool.
+ */
+export const NON_CLI_TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
+  evmBlockNumber: {
+    key: "evmBlockNumber",
+    name: "EvmBlockNumber",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "chainId", kind: "id" }],
+  },
+  evmCall: {
+    key: "evmCall",
+    name: "EvmCall",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "to", kind: "id", within: "chainId" }],
+  },
+  evmGetBalance: {
+    key: "evmGetBalance",
+    name: "EvmGetBalance",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "address", kind: "id", within: "chainId" }],
+  },
+  evmGetLogs: {
+    key: "evmGetLogs",
+    name: "EvmGetLogs",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "address", kind: "id", default: "*", within: "chainId" }],
+  },
+  evmGetTransaction: {
+    key: "evmGetTransaction",
+    name: "EvmGetTransaction",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "txHash", kind: "id", within: "chainId" }],
+  },
+  evmGetTransactionReceipt: {
+    key: "evmGetTransactionReceipt",
+    name: "EvmGetTransactionReceipt",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "txHash", kind: "id", within: "chainId" }],
+  },
+  evmSendTransaction: {
+    key: "evmSendTransaction",
+    name: "EvmSendTransaction",
+    readOnly: false,
+    destructive: true,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: true,
+    operativeArgs: [{ field: "to", kind: "recipient" }],
+  },
+  evmSimulate: {
+    key: "evmSimulate",
+    name: "EvmSimulate",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "to", kind: "id" }],
+  },
+  sendMessage: {
+    key: "sendMessage",
+    name: "SendMessage",
+    readOnly: false,
+    destructive: true,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: true,
+    operativeArgs: [{ field: "channel", kind: "id" }],
+  },
+};
+
+/**
  * The other tools this release defines: ones the runtime registers without a
  * spec listing them (`Skill`, `ListTools`, `Task`, the browser shape's
  * `Type`, the memory and plan tools, `Consult`, …). Names only — how
@@ -5692,3 +5801,51 @@ export const RUNTIME_TOOL_NAMES: ReadonlyArray<string> = [
   "wiki_stats",
   "wiki_write",
 ];
+
+/**
+ * The bare names a `thredz:` block registers from the Thredz MCP server
+ * (`goal_list`, `task_complete`, `wiki_space_create`, …): `memory` always,
+ * `messaging` too when the block says `messaging: true`. A permission rule
+ * naming one of them is a real rule in a spec with that block, and a near
+ * miss of a builtin (`goal_list` of GoalList) in a spec without one.
+ *
+ * Copied from `@crewhaus/memory-service` (`THREDZ_ALIAS_TOOL_NAMES`,
+ * `THREDZ_MESSAGING_TOOL_NAMES`) so a bundle that checks rules need not
+ * import it; `apps/cli/src/runtime-tool-names.test.ts` fails when it is stale.
+ */
+export const THREDZ_TOOL_NAMES: {
+  readonly memory: ReadonlyArray<string>;
+  readonly messaging: ReadonlyArray<string>;
+} = {
+  memory: [
+    "wiki_recall",
+    "wiki_semantic_search",
+    "wiki_search",
+    "wiki_get",
+    "wiki_write",
+    "wiki_list",
+    "wiki_related",
+    "wiki_set_signals",
+    "wiki_stats",
+    "log_knowledge_gap",
+    "goal_list",
+    "goal_get",
+    "goal_write",
+    "goal_update",
+    "task_list",
+    "task_complete",
+    "wiki_space_list",
+    "wiki_space_create",
+  ],
+  messaging: [
+    "agent_register",
+    "agent_update",
+    "agent_list",
+    "message_send",
+    "inbox_poll",
+    "message_ack",
+    "thread_get",
+    "agent_block",
+    "agent_unblock",
+  ],
+};

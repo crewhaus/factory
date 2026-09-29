@@ -626,6 +626,45 @@ describe("crewhaus compile", () => {
     expect(noted.exitCode).toBe(0);
   }, 60_000);
 
+  // C146 / back-compat (wave III): a model profile's deny and a sub-agent's
+  // deny are checked like the shape's rules, so --strict refuses a dead one;
+  // the trader starter's `alwaysAllow goal_list` is live with a thredz:
+  // block and passes --strict as it did on 0.7.0; a name nothing knows is a
+  // note --strict does not escalate.
+  test("compile --strict reads every rule list, and knows a thredz: block's tools", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const head = "agent:\n  model: claude-sonnet-4-6\n  instructions: tidy up\n";
+    writeFileSync(
+      specPath,
+      `name: lists\ntarget: cli\nmodels:\n  fast: { model: claude-haiku-4-5, permissions: { deny: [fetch] } }\n${head}  model_pool:\n    candidates:\n      - { model: $fast, tags: [cheap] }\n      - { model: claude-opus-4-8, tags: [strong] }\n  sub_agents:\n    helper:\n      description: d\n      instructions: help\n      tools: [RemovePath]\n      permissions: { allow: [], deny: ["removePath(src/**)"] }\ntools: [removePath, fetch]\n`,
+    );
+    const dead = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "a")],
+      { cwd: tmp },
+    );
+    expect(dead.exitCode).toBe(1);
+    expect(dead.stderr).toContain(
+      'warning[permission-rule] models.fast.permissions.deny: rule "fetch"',
+    );
+    expect(dead.stderr).toContain(
+      'warning[permission-rule] agent.sub_agents.helper.permissions.deny: rule "removePath(src/**)"',
+    );
+    writeFileSync(
+      specPath,
+      `name: goals\ntarget: cli\nthredz: { api_key: $THREDZ_API_KEY, goals: true }\n${head}tools: [read]\npermissions:\n  rules:\n    - { type: alwaysAllow, pattern: goal_list }\n    - { type: alwaysAllow, pattern: goal_write }\n    - { type: alwaysAllow, pattern: goal_update }\n    - { type: alwaysAllow, pattern: "NoSuchTool(**)" }\n`,
+    );
+    const live = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "b")],
+      { cwd: tmp },
+    );
+    expect(live.stderr).not.toContain("goal_");
+    expect(live.stderr).toContain(
+      'warning[permission-rule-note] permissions.rules: rule "NoSuchTool(**)" names NoSuchTool',
+    );
+    expect(live.stderr).not.toContain("escalated to errors");
+    expect(live.exitCode).toBe(0);
+  }, 60_000);
+
   // provider-limits#0 — 0.7.0 compiled `tools: [all-code]` on a 128-tool
   // provider (even under --strict) and every call then failed with the
   // provider's 400. A site no model can serve is now refused. The warnings
@@ -1466,7 +1505,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(result.stdout).toContain('"edit"');
     expect(result.stdout).toContain("ambiguous");
     expect(result.stdout).not.toContain("fixed: tool");
-  });
+  }, 30_000);
 
   test("an unambiguous tool-name typo still auto-fixes", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -1488,7 +1527,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       env: { ANTHROPIC_API_KEY: "test" },
     });
     expect(compiled.exitCode).toBe(0);
-  });
+  }, 30_000);
 
   test("a sub-agent's registered names are left alone, and its typo keeps their spelling", async () => {
     // `tools: [Read, Grep]` is how 0.7.0 documented a sub-agent's list, and it
@@ -1522,7 +1561,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     const typo = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
     expect(typo.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
     expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
-  });
+  }, 30_000);
 
   test("a bare word in a list that is not tools: is left alone", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -1531,7 +1570,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     writeFileSync(specPath, original);
     await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
     expect(readFileSync(specPath, "utf-8")).toBe(original);
-  });
+  }, 30_000);
 
   test("an MCP server's args are not tool names, and a flow tools: list is fixed to spec keys", async () => {
     // shape-reach#6 — the fixer used to rewrite any bare-word list item within
@@ -1565,7 +1604,56 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       'fixed: tool "webfetch" → "webFetch" (nearest match)',
     ]);
     expect(readFileSync(specPath, "utf-8")).toBe(spec("read, webFetch"));
-  });
+  }, 30_000);
+
+  // C025 (wave III): the per-line fixer rewrote a `tools:` example inside
+  // `instructions: |` and turned the profile reference `$fast` into `$FAST`,
+  // after which the spec no longer compiled.
+  test("lint --fix leaves prompt text and a profile reference alone", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original = [
+      "name: t",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5 }",
+      "agent:",
+      "  model: $fast",
+      "  instructions: |",
+      "    Always emit this block exactly:",
+      "    tools:",
+      "      - files",
+      "      - reports",
+      "    tools: [logs, draft]",
+      "tools: [read]",
+      "",
+    ].join("\n");
+    writeFileSync(specPath, original);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toContain("lint --fix: no mechanical fixes applicable.");
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+    const compiled = await runCli(
+      ["compile", specPath, "--no-register", "-o", join(tmp, "profile-out")],
+      { env: { ANTHROPIC_API_KEY: "test" } },
+    );
+    expect(compiled.exitCode).toBe(0);
+  }, 30_000);
+
+  // wave III review: a file --fix could not parse got "no mechanical fixes
+  // applicable", a definite answer about a file it never read.
+  test("lint --fix says it skipped a file that is not valid YAML", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const broken =
+      "name: my agent: v2\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools: [raed]\n";
+    writeFileSync(specPath, broken);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toMatch(/lint --fix: skipped — the file is not valid YAML \(.+\)\./);
+    expect(result.stdout).not.toContain("no mechanical fixes applicable");
+    expect(readFileSync(specPath, "utf-8")).toBe(broken);
+  }, 30_000);
 
   test("lint reports a tool the spec's shape cannot compile, in compile's words", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -1579,7 +1667,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       '[tool] tools: tool "evmCall" is a builtin, but the cli shape cannot run it',
     );
     expect(result.stdout).toContain('[tool] tools: unknown tool "nosuchtool"');
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

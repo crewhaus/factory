@@ -810,6 +810,155 @@ describe("C033 — a scoped allow on a multi-field builtin is usable", () => {
     }
   }, 30_000);
 
+  // merge-seams (wave III): the deny that refused `[sh, scripts/release.sh]`
+  // allowed `[sh, release.sh]` with `cwd: scripts`, and the script ran.
+  test("a deny naming a script by its workspace path holds when the call runs it from its directory", async () => {
+    mkdirSync(join(ws, "scripts"));
+    writeFileSync(join(ws, "scripts", "release.sh"), 'echo released > "$PWD/../RELEASED"\n');
+    mkdirSync(join(ws, "node_modules", ".bin"), { recursive: true });
+    writeFileSync(join(ws, "node_modules", ".bin", "eslint"), "#!/bin/sh\necho linted > RAN\n", {
+      mode: 0o755,
+    });
+    const retry = { maxAttempts: 1, backoff: { kind: "fixed", delayMs: 0 } };
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["RunCommand", { argv: ["sh", "release.sh"], cwd: "scripts" }],
+      ["RunCommand", { argv: ["sh", "./release.sh"], cwd: "./scripts/" }],
+      ["ProcessStart", { argv: ["sh", "release.sh"], cwd: "scripts" }],
+      ["Retry", { argv: ["sh", "release.sh"], cwd: "scripts", ...retry }],
+      ["RunPipeline", { steps: [{ argv: ["sh", "release.sh"], cwd: "scripts" }] }],
+      ["RunPipeline", { cwd: "scripts", steps: [{ argv: ["sh", "release.sh"] }] }],
+    ];
+    const decisions: string[] = [];
+    for (const [tool, input] of calls) {
+      const rs = rules(["alwaysDeny", `${tool}(*scripts/release.sh*)`], ["alwaysAllow", tool]);
+      decisions.push(`${tool} ${JSON.stringify(input)}: ${await gate(tool, input, rs)}`);
+    }
+    expect(decisions.filter((d) => !d.endsWith(": deny"))).toEqual([]);
+    expect(existsSync(join(ws, "RELEASED"))).toBe(false);
+    // A deny on a directory of programs, and the binary run from inside it.
+    const bin = rules(
+      ["alwaysDeny", "RunCommand(**node_modules/.bin/**)"],
+      ["alwaysAllow", "RunCommand"],
+    );
+    expect(await gate("RunCommand", { argv: ["./eslint"], cwd: "node_modules/.bin" }, bin)).toBe(
+      "deny",
+    );
+    expect(existsSync(join(ws, "node_modules", ".bin", "RAN"))).toBe(false);
+    // The same words in another directory are another program, and run.
+    expect(
+      await gate(
+        "RunCommand",
+        { argv: ["sh", "-c", "true"], cwd: "src" },
+        rules(["alwaysDeny", "RunCommand(*scripts/release.sh*)"], ["alwaysAllow", "RunCommand"]),
+      ),
+    ).toBe("allow");
+  }, 30_000);
+
+  // wave III review: the same seam on the tool-code runners (their command
+  // ran in `cwd` but was not declared within it), and the child's
+  // environment — `envSet` wins over the pinned PATH, and `BASH_ENV` runs a
+  // file before any `bash -c`. The script ran each time.
+  test("a deny naming a script holds when the call reaches it through cwd on the code runners, or through the environment", async () => {
+    mkdirSync(join(ws, "scripts"));
+    const marker = join(ws, "RELEASED");
+    writeFileSync(join(ws, "scripts", "release.sh"), `#!/bin/sh\necho released > "${marker}"\n`, {
+      mode: 0o755,
+    });
+    const retry = { maxAttempts: 1, backoff: { kind: "fixed", delayMs: 0 } };
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["RunBuild", { command: ["sh", "release.sh"], cwd: "scripts" }],
+      ["RunTests", { command: ["sh", "release.sh"], cwd: "scripts" }],
+      ["Format", { command: ["sh", "release.sh"], cwd: "scripts" }],
+      ["RunCommand", { argv: ["release.sh"], envSet: { PATH: "scripts" } }],
+      ["RunCommand", { argv: ["release.sh"], envSet: { PATH: `${ws}/scripts:/usr/bin:/bin` } }],
+      ["RunCommand", { argv: ["bash", "-c", "true"], envSet: { BASH_ENV: "scripts/release.sh" } }],
+      ["Retry", { argv: ["release.sh"], envSet: { PATH: "scripts" }, ...retry }],
+      ["ProcessStart", { argv: ["release.sh"], envSet: { PATH: "scripts" } }],
+      ["RunPipeline", { steps: [{ argv: ["release.sh"] }], envSet: { PATH: "scripts" } }],
+    ];
+    const decisions: string[] = [];
+    for (const [tool, input] of calls) {
+      const rs = rules(["alwaysDeny", `${tool}(*scripts/release.sh*)`], ["alwaysAllow", tool]);
+      decisions.push(`${tool} ${JSON.stringify(input)}: ${await gate(tool, input, rs)}`);
+    }
+    expect(decisions.filter((d) => !d.endsWith(": deny"))).toEqual([]);
+    expect(existsSync(marker)).toBe(false);
+    // The same calls with the directory or the environment left out are
+    // another program, and a scoped allow still covers a code runner at the
+    // root.
+    const rs = rules(["alwaysDeny", "RunBuild(*scripts/release.sh*)"], ["alwaysAllow", "RunBuild"]);
+    expect(await gate("RunBuild", { command: ["sh", "-c", "true"], cwd: "src" }, rs)).toBe("allow");
+    expect(
+      await gate(
+        "RunCommand",
+        { argv: ["sh", "-c", "true"], envSet: { CI: "1" } },
+        rules(["alwaysDeny", "RunCommand(*scripts/release.sh*)"], ["alwaysAllow", "RunCommand"]),
+      ),
+    ).toBe("allow");
+    // A scoped allow names the command; the environment may change what it
+    // runs, so a call that sets one asks.
+    const scoped = rules(["alwaysAllow", "RunCommand(sh -c true)"]);
+    expect(await gate("RunCommand", { argv: ["sh", "-c", "true"] }, scoped)).toBe("allow");
+    expect(
+      await gate("RunCommand", { argv: ["sh", "-c", "true"], envSet: { BASH_ENV: "x" } }, scoped),
+    ).toBe("ask");
+    // One that names every command covers it wherever and however it runs,
+    // as 0.7.0's did.
+    const every = rules(["alwaysAllow", "RunCommand(**)"]);
+    expect({
+      env: await gate("RunCommand", { argv: ["sh", "-c", "true"], envSet: { CI: "1" } }, every),
+      cwd: await gate("RunCommand", { argv: ["sh", "-c", "true"], cwd: "src" }, every),
+      build: await gate(
+        "RunBuild",
+        { command: ["sh", "-c", "true"], cwd: "src" },
+        rules(["alwaysAllow", "RunBuild(**)"]),
+      ),
+    }).toEqual({ env: "allow", cwd: "allow", build: "allow" });
+  }, 60_000);
+
+  // wave III review: the joined spellings included the workspace's own
+  // absolute path and a `./sub` form the call never wrote, and the bare
+  // program, so a deny or ask stopped ordinary commands run in a
+  // subdirectory — through the real canonicaliser, which the unit tests did
+  // not use.
+  test("a deny or ask does not fire on an ordinary command because it runs in a subdirectory", async () => {
+    const root = join(ws, "prod-agent");
+    mkdirSync(join(root, "packages", "api"), { recursive: true });
+    process.chdir(root);
+    const allowAll = (type: PermissionRule["type"], pattern: string) =>
+      rules([type, pattern], ["alwaysAllow", "RunCommand"]);
+    const sub = { argv: ["git", "status"], cwd: "packages/api" };
+    const touch = { argv: ["touch", "ran-sub"], cwd: "packages/api" };
+    const got = {
+      denyDotStar: await gate("RunCommand", sub, allowAll("alwaysDeny", "RunCommand(./**)")),
+      askDotStar: await gate("RunCommand", sub, allowAll("alwaysAsk", "RunCommand(./**)")),
+      denyProd: await gate("RunCommand", touch, allowAll("alwaysDeny", "RunCommand(**prod**)")),
+      denyAbove: await gate(
+        "RunCommand",
+        touch,
+        allowAll("alwaysDeny", `RunCommand(${ws.split("/").slice(0, 3).join("/")}/**)`),
+      ),
+    };
+    expect(got).toEqual({
+      denyDotStar: "allow",
+      askDotStar: "allow",
+      denyProd: "allow",
+      denyAbove: "allow",
+    });
+    expect(existsSync(join(root, "packages", "api", "ran-sub"))).toBe(true);
+    // What the call named is still read.
+    expect(
+      await gate(
+        "RunCommand",
+        { argv: ["sh", "./x.sh"], cwd: "packages/api" },
+        allowAll("alwaysDeny", "RunCommand(./**)"),
+      ),
+    ).toBe("deny");
+    expect(
+      await gate("RunCommand", touch, allowAll("alwaysDeny", "RunCommand(packages/api/ran-sub)")),
+    ).toBe("deny");
+  }, 60_000);
+
   test("a boolean switch is not part of what a rule sees (documented; 0.8)", async () => {
     const rs = rules(["alwaysAllow", "RemovePath(build/**)"]);
     const call = { path: "build/nothing-here", recursive: true, dryRun: false };

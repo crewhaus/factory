@@ -220,6 +220,98 @@ describe("matchesSegmentAfter: a glob against a prefix and ANY one segment", () 
   });
 });
 
+// merge-seams (0.7.1 wave III) — a value that stands for every value is read
+// by a deny through `matchesSomeAfter` (a path, a URL and a command may hold
+// `/`, so their tail is any run) and granted by an allow only through
+// `matchesEveryAfter`, never by comparing its `*` sentinel as a literal.
+describe("matchesSomeAfter / matchesEveryAfter: a glob against a prefix and some or every continuation", () => {
+  test("agree with trying every short continuation against the 0.7.0 compiler", () => {
+    // Every continuation of at most five characters from the glob's own
+    // literals plus one it never names. For globs this short a rejected
+    // continuation, when there is one, is at most that long.
+    const continuations = (alphabet: readonly string[]): string[] => {
+      const out = [""];
+      for (let len = 1; len <= 5; len++) {
+        for (const base of out.filter((x) => x.length === len - 1)) {
+          for (const c of alphabet) out.push(base + c);
+        }
+      }
+      return out;
+    };
+    const tails = {
+      segment: continuations(["a", "b", "c", "*"]),
+      run: continuations(["a", "b", "c", "*", "/"]),
+    } as const;
+    const rand = prng(0xa11);
+    const globAlphabet = ["a", "b", "/", "*", "**", "?", "\\*"];
+    const prefixes = ["", "a", "a/", "b/", "a/b/", "/"];
+    const tally = { compared: 0, some: 0, every: 0 };
+    for (let g = 0; g < 400; g++) {
+      let glob = "";
+      const glen = 1 + Math.floor(rand() * 5);
+      for (let i = 0; i < glen; i++) {
+        glob += globAlphabet[Math.floor(rand() * globAlphabet.length)];
+      }
+      const oracle = oracleGlobToRegex(glob);
+      const argRe = compilePattern(`T(${glob})`)._argRe;
+      if (argRe === null) throw new Error("expected an arg glob");
+      for (const prefix of prefixes) {
+        for (const tail of ["segment", "run"] as const) {
+          const wantSome = tails[tail].some((t) => oracle.test(prefix + t));
+          const wantEvery = tails[tail].every((t) => oracle.test(prefix + t));
+          const gotSome = argRe.matchesSomeAfter(prefix, tail);
+          const gotEvery = argRe.matchesEveryAfter(prefix, tail);
+          if (gotSome !== wantSome || gotEvery !== wantEvery) {
+            throw new Error(
+              `glob ${JSON.stringify(glob)} after ${JSON.stringify(prefix)} (${tail}): oracle some=${wantSome} every=${wantEvery}, got some=${gotSome} every=${gotEvery}`,
+            );
+          }
+          tally.compared++;
+          if (wantSome) tally.some++;
+          if (wantEvery) tally.every++;
+        }
+      }
+    }
+    expect(tally.compared).toBe(400 * 6 * 2);
+    // Both answers of both questions occur, so neither is vacuous.
+    expect(tally.some).toBeGreaterThan(500);
+    expect(tally.compared - tally.some).toBeGreaterThan(500);
+    expect(tally.every).toBeGreaterThan(100);
+    expect(tally.some - tally.every).toBeGreaterThan(500);
+    // 400 globs × 12 questions, each against up to 3,906 continuations: about
+    // 0.3 s alone, but 9.4 s was measured under the full suite's load (and CI
+    // runners are slower still), so it declares a budget rather than racing
+    // bun's 5 s default.
+  }, 60_000);
+
+  test("matchesSegmentAfter is matchesSomeAfter with a segment tail", () => {
+    for (const glob of ["1/*", "1/**", "**x", "1/a/b", "?", "1/?"]) {
+      const argRe = compilePattern(`T(${glob})`)._argRe;
+      if (argRe === null) throw new Error("expected an arg glob");
+      for (const prefix of ["", "1/", "2/"]) {
+        expect(argRe.matchesSegmentAfter(prefix)).toBe(argRe.matchesSomeAfter(prefix, "segment"));
+      }
+    }
+  });
+
+  test("a literal glob never matches every continuation; `?` is one character, not every one", () => {
+    const every = (glob: string, prefix: string, tail: "segment" | "run") =>
+      compilePattern(`T(${glob})`)._argRe?.matchesEveryAfter(prefix, tail);
+    expect(every("1/*", "1/", "segment")).toBe(true);
+    expect(every("1/**", "1/", "segment")).toBe(true);
+    expect(every("1/?", "1/", "segment")).toBe(false);
+    expect(every("1/\\*", "1/", "segment")).toBe(false);
+    expect(every("1/0x*", "1/", "segment")).toBe(false);
+    expect(every("1/*", "2/", "segment")).toBe(false);
+    // One segment is not every run: `*` stops at `/`.
+    expect(every("*", "", "segment")).toBe(true);
+    expect(every("*", "", "run")).toBe(false);
+    expect(every("**", "", "run")).toBe(true);
+    expect(every("src/**", "", "run")).toBe(false);
+    expect(every("src/**", "src/", "run")).toBe(true);
+  });
+});
+
 // C037 — the cases a plain two-pointer "back up to the last star" matcher
 // gets wrong when `*` (no `/`) and `**` (anything) mix, and the regex's
 // UTF-16 code-unit reading of `?`; each row is checked against the 0.7.0
@@ -659,8 +751,18 @@ describe("declared operative values", () => {
     expect(fires("SearchCode(other/secret)")).toBe(false);
     // A path is folded only where its filesystem ignores case, and a URL by
     // its own rules: the prefix fold is for values compared ignoring case.
-    const pathValue: OperativeValue = { ...ownerWide, kind: "path" };
+    // A path's prefix stands for every path UNDER it (any run, not one
+    // segment), so its twin carries only the owner prefix: with the root
+    // prefix "" as well it would stand for every path in the workspace, and
+    // every deny fires on it — failing closed, as the last line pins.
+    const pathValue: OperativeValue = {
+      kind: "path",
+      canonical: ["ACME/*"],
+      standsForAny: ["ACME/"],
+    };
     expect(fires("SearchCode(acme/secret)", pathValue)).toBe(false);
+    expect(fires("SearchCode(acme/secret)", { ...pathValue, caseInsensitive: true })).toBe(true);
+    expect(fires("SearchCode(acme/secret)", { ...ownerWide, kind: "path" })).toBe(true);
   });
 
   test("a value whose qualifier was left out too stands for every <qualifier>/<value>", () => {
@@ -709,6 +811,172 @@ describe("declared operative values", () => {
     // An allow still reads only the canonical value.
     expect(grants("SearchIssues(acme/secret)")).toBe(false);
     expect(grants("SearchIssues(*)")).toBe(true);
+  });
+
+  // merge-seams (wave III): the every-contract query on `base` was caught by
+  // `alwaysDeny EvmGetLogs(base/0x…)` but not by the same deny spelled
+  // `Base/…`, which caught the one-contract query; and `EvmGetLogs(1/?)`
+  // granted the every-contract read, `?` matching the literal `*`.
+  test("a value that stands for any value: a deny is folded like its kind, an allow must cover every value", () => {
+    const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+    const every: OperativeValue = {
+      kind: "id",
+      canonical: ["base/*"],
+      spellings: ["*", "base"],
+      standsForAny: ["base/", ""],
+    };
+    const on = (polarity: "allow" | "restrict") => (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "EvmGetLogs",
+        {},
+        {
+          polarity,
+          operativeValues: [every],
+        },
+      );
+    const fires = on("restrict");
+    const grants = on("allow");
+    const denies = [
+      `EvmGetLogs(Base/${USDT})`,
+      `EvmGetLogs(BASE/${USDT.toLowerCase()})`,
+      "EvmGetLogs(Base/*)",
+      "EvmGetLogs(Base/0x*)",
+    ];
+    expect(denies.filter(fires)).toEqual(denies);
+    expect([`EvmGetLogs(Basel/${USDT})`, `EvmGetLogs(137/${USDT})`].filter(fires)).toEqual([]);
+    // Only a glob that covers every address on the chain grants the read of
+    // them all; an allow keeps the chain's case as written.
+    const allows = ["EvmGetLogs(base/*)", "EvmGetLogs(base/**)", "EvmGetLogs(**)"];
+    expect(allows.filter(grants)).toEqual(allows);
+    expect(
+      [
+        "EvmGetLogs(base/?)",
+        "EvmGetLogs(base/\\*)",
+        "EvmGetLogs(base/0x*)",
+        `EvmGetLogs(base/${USDT})`,
+        "EvmGetLogs(*)",
+        "EvmGetLogs(Base/*)",
+      ].filter(grants),
+    ).toEqual([]);
+  });
+
+  test("a path, URL or command that stands for any value reads any run after its prefix", () => {
+    const check = (value: OperativeValue, tool: string) => ({
+      fires: (pattern: string) =>
+        matchesPattern(
+          compilePattern(pattern),
+          tool,
+          {},
+          {
+            ...restrict,
+            operativeValues: [value],
+          },
+        ),
+      grants: (pattern: string) =>
+        matchesPattern(
+          compilePattern(pattern),
+          tool,
+          {},
+          {
+            ...allow,
+            operativeValues: [value],
+          },
+        ),
+    });
+    // Every path under the workspace root, as the runtime spells it.
+    const root = check(
+      { kind: "path", canonical: ["*", "/ws/*"], standsForAny: ["", "/ws/"] },
+      "P",
+    );
+    expect(
+      ["P(secret/**)", "P(**/.env)", "P(/ws/secret/**)", "P(*.pem)"].filter(root.fires),
+    ).toHaveLength(4);
+    expect(["P(/etc/**)", "P(/other/**)"].filter(root.fires)).toEqual([]);
+    expect(["P(**)", "P(/ws/**)"].filter(root.grants)).toHaveLength(2);
+    expect(["P(*)", "P(?)", "P(src/**)", "P(\\*)"].filter(root.grants)).toEqual([]);
+    // Every path under one directory.
+    const sub = check(
+      {
+        kind: "path",
+        canonical: ["pkg/*"],
+        standsForAny: ["pkg/", "./pkg/"],
+        caseInsensitive: true,
+      },
+      "P",
+    );
+    expect(["P(pkg/secret/**)", "P(PKG/**)", "P(./pkg/x)"].filter(sub.fires)).toHaveLength(3);
+    expect(["P(other/**)", "P(pkgx/**)"].filter(sub.fires)).toEqual([]);
+    expect(["P(pkg/**)", "P(**)"].filter(sub.grants)).toHaveLength(2);
+    expect(["P(pkg/*)", "P(PKG/**)"].filter(sub.grants)).toEqual([]);
+    // Every URL.
+    const url = check({ kind: "url", canonical: ["*"], standsForAny: [""] }, "U");
+    expect(
+      ["U(https://evil.example/**)", "U(HTTPS://EVIL.example/x)"].filter(url.fires),
+    ).toHaveLength(2);
+    expect(url.grants("U(**)")).toBe(true);
+    expect(["U(https://**)", "U(*)"].filter(url.grants)).toEqual([]);
+    // Every command, run where no allow can name it: only one that names
+    // every command grants it.
+    const cmd = check(
+      { kind: "command", canonical: [], spellings: ["*"], standsForAny: [""] },
+      "C",
+    );
+    expect(["C(*scripts/release.sh*)", "C(RM*)", "C(rm -rf /)"].filter(cmd.fires)).toHaveLength(3);
+    expect(["C(**)", "C(*)"].filter(cmd.grants)).toEqual(["C(**)"]);
+  });
+
+  // wave III: a command with no canonical spelling (run in another
+  // directory, or with an environment the call set) asked under every
+  // scoped allow, `RunCommand(**)` included — which 0.7.0 honoured for any
+  // call, since every string matched it.
+  test("a command no allow can name is granted only by one that names every command", () => {
+    const elsewhere: OperativeValue = {
+      kind: "command",
+      canonical: [],
+      spellings: ["sh release.sh", "sh", "release.sh", "scripts/release.sh"],
+    };
+    const grants = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "C",
+        {},
+        {
+          polarity: "allow",
+          operativeValues: [elsewhere],
+        },
+      );
+    expect(["C(**)", "C(***)"].filter(grants)).toEqual(["C(**)", "C(***)"]);
+    expect(
+      ["C(*)", "C(sh *)", "C(sh release.sh)", "C(**release.sh)", "C(?**)"].filter(grants),
+    ).toEqual([]);
+    // Unreadable (outsideWorkspace: an environment too large to read) is
+    // granted by the same allows and no others. It says which program runs
+    // could not be worked out, and an allow naming every command does not
+    // need to know; 0.7.0's `RunCommand(**)` covered such a call.
+    const unreadable = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "C",
+        {},
+        {
+          polarity: "allow",
+          operativeValues: [{ ...elsewhere, outsideWorkspace: true }],
+        },
+      );
+    expect(["C(**)", "C(***)", "C(*)", "C(sh *)", "C(?**)"].filter(unreadable)).toEqual([
+      "C(**)",
+      "C(***)",
+    ]);
+    // …and every deny or ask fires on it.
+    expect(
+      matchesPattern(
+        compilePattern("C(nothing-like-it)"),
+        "C",
+        {},
+        { polarity: "restrict", operativeValues: [{ ...elsewhere, outsideWorkspace: true }] },
+      ),
+    ).toBe(true);
   });
 
   test("non-path values are not filtered by absoluteness", () => {

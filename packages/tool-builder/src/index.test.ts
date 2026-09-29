@@ -516,6 +516,60 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     });
   });
 
+  describe("env — the environment a command's call sets for its child", () => {
+    const runSchema = z.object({
+      argv: z.array(z.string()),
+      cwd: z.string().optional(),
+      envSet: z.record(z.string()).optional(),
+      counts: z.record(z.number()).optional(),
+      names: z.array(z.string()).optional(),
+      label: z.string().optional(),
+    });
+    const def = { name: "Run", description: "d", inputSchema: runSchema, execute: exec };
+
+    test("a command names a top-level map of variable names to values", () => {
+      const tool = buildTool({
+        ...def,
+        operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
+      });
+      expect(tool.operativeArgs).toEqual([
+        { field: "argv", kind: "command", within: "cwd", env: "envSet" },
+      ]);
+    });
+
+    test("each way an env declaration can be wrong is refused, saying why", () => {
+      const bad = (env: string, kind: "command" | "text" = "command") => {
+        try {
+          buildTool({ ...def, operativeArgs: [{ field: "argv", kind, within: "cwd", env }] });
+          return "accepted";
+        } catch (err) {
+          return (err as Error).message;
+        }
+      };
+      // Every refusal, and why — a missed one would let a declaration name a
+      // field the subject builder then reads as no environment at all.
+      expect({
+        text: bad("envSet", "text"),
+        missing: bad("missing"),
+        list: bad("names"),
+        scalar: bad("label"),
+        numbers: bad("counts"),
+        nested: bad("envSet.PATH"),
+        self: bad("argv"),
+        within: bad("cwd"),
+      }).toEqual({
+        text: expect.stringMatching(/only a "command" runs in an environment/),
+        missing: expect.stringMatching(/has no top-level field "missing"/),
+        list: expect.stringMatching(/field "names" is not a map of variable names to values/),
+        scalar: expect.stringMatching(/field "label" is not a map of variable names to values/),
+        numbers: expect.stringMatching(/field "counts" does not map names to string values/),
+        nested: expect.stringMatching(/must name one top-level input field/),
+        self: expect.stringMatching(/names "argv", which is already used/),
+        within: expect.stringMatching(/names "cwd", which is already used/),
+      });
+    });
+  });
+
   test("an opaque schema (an MCP tool's z.unknown()) accepts any field", () => {
     const tool = buildTool({
       name: "Opaque",

@@ -21,11 +21,23 @@
  */
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import {
+  THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_MESSAGING_TOOL_NAMES,
+  thredzAliasToolNames,
+} from "@crewhaus/memory-service";
 import { BUILTIN_BOOKKEEPING_RULES } from "@crewhaus/permission-engine";
 import { RETAINED_LOOP_TOOL_NAMES } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { BUILTIN_TOOLS, builtinToolsFor } from "@crewhaus/tool-categories";
 import { permissionRuleProblems } from "@crewhaus/tool-permission-matcher";
-import { RUNTIME_TOOL_NAMES, TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
+import { projectRegistryEntry, projectToolFlags } from "@crewhaus/tool-registry-manifest";
+import {
+  NON_CLI_TOOL_FLAGS,
+  RUNTIME_TOOL_NAMES,
+  THREDZ_TOOL_NAMES,
+  TOOL_FLAGS,
+} from "@crewhaus/tool-registry-manifest/flags";
 import { KNOWN_TOOLS, runLint } from "./lint";
 import { runtimeToolNames, scanToolDefinitions } from "./runtime-tool-names";
 
@@ -68,6 +80,48 @@ describe("RUNTIME_TOOL_NAMES", () => {
   });
 });
 
+// C001 (wave III): the builtins no cli bundle carries had no flags anywhere
+// the CLI could read, so `compile --strict` skipped them instead of auditing.
+describe("NON_CLI_TOOL_FLAGS", () => {
+  test("is every builtin the cli shape does not carry, read off the tool itself", async () => {
+    const cli = new Set(builtinToolsFor("cli"));
+    const expected = Object.keys(BUILTIN_TOOLS)
+      .filter((k) => !cli.has(k))
+      .sort();
+    expect(Object.keys(NON_CLI_TOOL_FLAGS)).toEqual(expected);
+    expect(expected.length).toBeGreaterThanOrEqual(9);
+    for (const key of expected) {
+      const entry = BUILTIN_TOOLS[key];
+      if (entry === undefined) throw new Error(key);
+      // The generator imports each package by file; so does this check.
+      const mod = (await import(
+        join(REPO, "packages", entry.package.replace("@crewhaus/", ""), "src", "index.ts")
+      )) as Record<string, Parameters<typeof projectRegistryEntry>[0]["tool"]>;
+      const tool = mod[entry.export];
+      if (tool === undefined) throw new Error(`${entry.package} lacks ${entry.export}`);
+      const fresh = projectToolFlags(
+        projectRegistryEntry({ key, tool, categories: [], package: entry.package, keywords: [] }),
+      );
+      expect({ key, flags: NON_CLI_TOOL_FLAGS[key] }).toEqual({ key, flags: fresh });
+    }
+  }, 30_000);
+});
+
+describe("THREDZ_TOOL_NAMES", () => {
+  test("is the vocabulary connectThredz registers (re-run scripts/gen-tool-registry.ts when it is not)", () => {
+    expect([...THREDZ_TOOL_NAMES.memory]).toEqual([...THREDZ_ALIAS_TOOL_NAMES]);
+    expect([...THREDZ_TOOL_NAMES.messaging]).toEqual([...THREDZ_MESSAGING_TOOL_NAMES]);
+    // What connectThredz actually passes, with and without messaging.
+    expect([...thredzAliasToolNames(false)]).toEqual([...THREDZ_TOOL_NAMES.memory]);
+    expect([...thredzAliasToolNames(true)]).toEqual([
+      ...THREDZ_TOOL_NAMES.memory,
+      ...THREDZ_TOOL_NAMES.messaging,
+    ]);
+    expect(THREDZ_TOOL_NAMES.memory.length).toBe(18);
+    expect(THREDZ_TOOL_NAMES.messaging.length).toBe(9);
+  });
+});
+
 describe("a rule naming a real tool is never reported as naming no tool", () => {
   test("for every tool name the source defines, with every builtin granted", () => {
     // Granting every builtin is the worst case: each is a near-miss candidate.
@@ -80,7 +134,9 @@ describe("a rule naming a real tool is never reported as naming no tool", () => 
         known: KNOWN_TOOLS,
         mcpServers: [],
       });
-      if (problems.some((p) => p.code === "unknown-tool")) reported.push(name);
+      if (problems.some((p) => p.code === "unknown-tool" || p.code === "tool-not-known")) {
+        reported.push(name);
+      }
     }
     expect(scanned.size).toBeGreaterThanOrEqual(550);
     expect(reported).toEqual([]);
