@@ -38,7 +38,8 @@ import {
   describeRegexOutcome,
   openRegexSession,
 } from "@crewhaus/tool-safety/regex";
-import { compareStrings, matchAll } from "./text";
+import { LiteralSearch } from "./literal";
+import { compareStrings } from "./text";
 import { lineStarts, locate } from "./text";
 
 export const POLICY_RULE_KINDS = [
@@ -99,10 +100,6 @@ const EXCERPT_CHARS = 120;
 
 export class PolicyError extends Error {
   override readonly name = "PolicyError";
-}
-
-function escapeRegex(literal: string): string {
-  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /** Wall-clock budget for all of one check's patterns, shared in rule order. */
@@ -174,9 +171,11 @@ async function findPattern(
 /**
  * Evaluate every rule against the text. One pass per rule, no early exit.
  *
- * Phrase rules are literals, matched on this thread (a literal search is
- * linear). Pattern rules run in the regex worker, one after another in one
- * session, sharing {@link POLICY_PATTERN_DEADLINE_MS}.
+ * Phrase rules are literals, matched on this thread by a search that passes
+ * each character of the text once, whatever the phrase ({@link LiteralSearch};
+ * 0.7.0's case-insensitive regex cost the text's length times the phrase's).
+ * Pattern rules run in the regex worker, one after another in one session,
+ * sharing {@link POLICY_PATTERN_DEADLINE_MS}.
  */
 export async function evaluatePolicy(
   text: string,
@@ -200,6 +199,7 @@ export async function evaluatePolicy(
   const deadlineMs = options.deadlineMs ?? POLICY_PATTERN_DEADLINE_MS;
   const started = performance.now();
   let session: RegexSession | undefined;
+  let literals: LiteralSearch | undefined;
 
   try {
     for (const rule of rules) {
@@ -239,14 +239,13 @@ export async function evaluatePolicy(
       } else {
         // A literal: linear to search, so it runs here, counted in full and
         // located for the first few.
-        const re = new RegExp(escapeRegex(rule.value), rule.caseSensitive === true ? "g" : "gi");
-        const first: { index: number; match: string }[] = [];
-        let count = 0;
-        for (const { index, match } of matchAll(text, re)) {
-          count += 1;
-          if (first.length < MAX_MATCHES_PER_RULE) first.push({ index, match: match[0] });
-        }
-        found = { matches: first, count, lowerBound: false };
+        literals ??= new LiteralSearch(text);
+        const { matches, count } = literals.find(
+          rule.value,
+          rule.caseSensitive === true,
+          MAX_MATCHES_PER_RULE,
+        );
+        found = { matches, count, lowerBound: false };
       }
       outcomes.push(judge(rule, found, starts));
     }
