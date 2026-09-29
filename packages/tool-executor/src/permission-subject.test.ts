@@ -283,6 +283,25 @@ describe("url, command and id values", () => {
     expect(operativeValuesFor(tool, { chainId: "1", address: "0xab" })?.[0]?.standsForAny).toBe(
       undefined,
     );
+    // Its qualifier left out as well, it stands for every <qualifier>/<value>
+    // — a code search naming no owner reaches every repository (C004).
+    const search = buildTool({
+      name: "Search",
+      description: "d",
+      inputSchema: z.object({ owner: z.string().optional(), repo: z.string().optional() }),
+      operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*" }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    const unscoped = operativeValuesFor(search, {});
+    expect(unscoped).toEqual([
+      { kind: "id", canonical: ["*"], standsForAny: [""], anyQualifier: true },
+    ]);
+    expect(operativeValuesFor(search, { owner: "acme" })?.[0]?.anyQualifier).toBe(undefined);
+    const deny = compilePattern("Search(acme/secret)");
+    expect(
+      matchesPattern(deny, "Search", {}, { polarity: "restrict", operativeValues: unscoped }),
+    ).toBe(true);
     // Any other default is a value, not "every value".
     const dot = buildTool({
       name: "Dot",

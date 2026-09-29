@@ -138,8 +138,9 @@ A tool that overstates its coverage is worse than one that is narrow and says so
   whole owner with no `repo` — or the search is refused with the fields to set; and an `owner`
   alone needs `org:` or `user:` in the query, because the two are different qualifiers. A
   qualifier behind `NOT` or inside parentheses still counts; only a leading `-`, which narrows,
-  is left alone. A search that names no owner covers every repository the token can read: a
-  deny naming one repository does not fire on it, so deny the tool itself if that matters.
+  and text inside a double-quoted phrase, which GitHub searches for as written, are left alone.
+  A rule reads an owner in any letter case, as GitHub does. A search that names no owner covers
+  every repository the token can read, so a deny naming any repository fires on it.
   GitLab's issue search is per project or instance-wide, so an `owner` without a `repo` is
   refused there rather than silently searching the whole instance.
 - **Rate limits.** GitHub has a real endpoint. GitLab does not, so the tool makes one cheap

@@ -1099,6 +1099,26 @@ describe("queryScopes: the repositories a GitHub query reaches (C004)", () => {
       { qualifier: "repo", owner: "solo", repo: "" },
     ]);
   });
+
+  test("a qualifier inside a quoted phrase is text GitHub searches for, not a scope", () => {
+    expect(queryScopes('"curl -u user:$TOKEN" repo:acme/app')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "app" },
+    ]);
+    expect(queryScopes('"see repo:foo/bar for details"')).toEqual([]);
+    expect(queryScopes('label:"good first issue" org:acme')).toEqual([
+      { qualifier: "org", owner: "acme" },
+    ]);
+    // A phrase ends the term it interrupts: what follows it is still read.
+    expect(queryScopes('"x"repo:acme/secret')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+    ]);
+  });
+
+  test("quotes that do not pair up cannot hide a qualifier", () => {
+    expect(queryScopes('"password repo:acme/secret')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+    ]);
+  });
 });
 
 describe("githubSearchQuery: the fields and the query agree, or nothing is searched", () => {
@@ -1145,6 +1165,28 @@ describe("githubSearchQuery: the fields and the query agree, or nothing is searc
     const orphan = q("x", undefined, "widget");
     expect(orphan.ok).toBe(false);
     if (!orphan.ok) expect(orphan.message).toContain("repo needs owner");
+  });
+
+  test("a quoted phrase holding a qualifier is searched as written", () => {
+    // 0.7.0 sent these; reading the phrase as a scope refused them with
+    // advice no call could follow.
+    expect(q('"curl -u user:$TOKEN" repo:acme/app', "acme", "app")).toEqual({
+      ok: true,
+      q: '"curl -u user:$TOKEN" repo:acme/app',
+    });
+    expect(q('"see repo:foo/bar for details"', "acme", "app")).toEqual({
+      ok: true,
+      q: '"see repo:foo/bar for details" repo:acme/app',
+    });
+  });
+
+  test("a qualifier that names no GitHub account is refused without suggesting it", () => {
+    const r = q("x user:$TOKEN", "acme");
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain("does not name a GitHub account");
+      expect(r.message).not.toContain("name the same scope there");
+    }
   });
 
   test("a name that would add a qualifier of its own is refused before it is written", () => {

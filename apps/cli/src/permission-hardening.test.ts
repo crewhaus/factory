@@ -343,6 +343,25 @@ describe("C004 — a search that reaches a denied repository", () => {
       expect({ name, got: await gate(name, other, rs) }).toEqual({ name, got: "allow" });
     }
   });
+
+  test("the owner written in another letter case, or left out, still meets the deny", async () => {
+    // GitHub logins are case-insensitive, so org:ACME searches acme/secret;
+    // and a search that names no owner covers every repository the token
+    // can read, acme/secret among them.
+    for (const name of ["SearchCode", "SearchIssues"]) {
+      const rs = rules(["alwaysDeny", `${name}(acme/secret)`], ["alwaysAllow", name]);
+      for (const [mode, input] of [
+        ["default", { owner: "ACME", query: "password org:ACME" }],
+        ["default", { owner: "Acme", query: "password user:Acme" }],
+        ["default", { query: "password" }],
+        ["auto", { query: "password" }],
+        ["plan", { owner: "ACME", query: "password org:ACME" }],
+      ] as const) {
+        const got = await gate(name, input, rs, mode);
+        expect({ name, mode, input, got }).toEqual({ name, mode, input, got: "deny" });
+      }
+    }
+  });
 });
 
 describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (permission-integration#1, #2)", () => {

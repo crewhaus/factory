@@ -45,7 +45,10 @@
  *      widened by leaving the qualifier out.
  *    - a field left out whose declared default is `*` stands for every
  *      value (`standsForAny`): a deny or ask naming any one value there
- *      fires on it.
+ *      fires on it. When the field is declared `within` another that the
+ *      call leaves out as well, it stands for every `<qualifier>/<value>`
+ *      (`anyQualifier`): a code search naming no owner reaches every
+ *      repository.
  *    - a `relocates` field left out stands in with its default, which a
  *      deny or ask reads; when the call carries another operative value an
  *      allow skips it (`restrictOnly`), because the grant is about the
@@ -151,10 +154,15 @@ export function operativeValuesOf(
   // last (see `relocates` on OperativeArg).
   const relocated: OperativeValue[] = [];
   for (const arg of operativeArgs) {
-    for (const { value: raw, words, runsIn, unqualified, anyAfter, defaulted } of readField(
-      parsedInput,
-      arg,
-    )) {
+    for (const {
+      value: raw,
+      words,
+      runsIn,
+      unqualified,
+      anyAfter,
+      defaulted,
+      anyQualifier,
+    } of readField(parsedInput, arg)) {
       if (arg.relocates === true && defaulted === true) {
         relocated.push(...canonicalizePath(raw));
         continue;
@@ -189,6 +197,7 @@ export function operativeValuesOf(
             ...(spellings.length > 0 ? { spellings } : {}),
             ...(HEX_ID.test(raw) ? { caseInsensitive: true } : {}),
             ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
+            ...(anyQualifier === true ? { anyQualifier: true } : {}),
           });
         }
       }
@@ -224,6 +233,8 @@ type FieldReading = {
   readonly anyAfter?: ReadonlyArray<string>;
   /** The declared default, standing in for a field the call left out. */
   readonly defaulted?: true;
+  /** With `anyAfter`: the `within` qualifier was left out too. */
+  readonly anyQualifier?: true;
 };
 
 /** Do these canonical values name the workspace root itself, and nothing else? */
@@ -293,7 +304,14 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
   // A command's `within` is where it runs, carried as `runsIn` above.
   if (arg.kind === "command") return anyValue(out);
   const qualifier = topQualifier;
-  if (qualifier === undefined) return anyValue(out);
+  if (qualifier === undefined) {
+    // The qualifier is left out as well: a code search with no owner reaches
+    // every repository, so the value stands for every `<owner>/<repo>` too.
+    const read = anyValue(out);
+    return every && arg.within !== undefined
+      ? read.map((r) => ({ ...r, anyQualifier: true as const }))
+      : read;
+  }
   return out.map((r) => {
     // A path relative to a directory field; an absolute one ignores it.
     if (arg.kind === "path") {

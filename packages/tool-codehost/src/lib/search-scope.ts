@@ -19,7 +19,10 @@
  *
  * Deliberately conservative: a qualifier behind `NOT`, or inside
  * parentheses, still counts as a scope to be covered. Only a leading `-`
- * (GitHub's exclusion) is left alone, because it narrows.
+ * (GitHub's exclusion) is left alone, because it narrows, and so is text
+ * inside a double-quoted phrase, which GitHub searches for as written
+ * (`"curl -u user:$TOKEN"` is not a `user:` scope). A query whose quotes do
+ * not pair up is read both ways, so a stray quote cannot hide a qualifier.
  */
 
 /** One scope the query names. `repo` is absent for `org:` and `user:`. */
@@ -31,10 +34,67 @@ type QueryScope = {
 
 const SCOPE_TOKEN = /^(repo|org|user):(.+)$/i;
 
-/** The scope qualifiers a GitHub query carries, exclusions left out. */
+/**
+ * The query's terms, split at whitespace outside double quotes. A quoted
+ * section right after `repo:`, `org:` or `user:` is that qualifier's value
+ * and stays in its term (`repo:"acme/widget"`); any other quoted section is
+ * a phrase or another qualifier's value, is dropped, and ends the term it
+ * interrupts, so `"x"repo:a/b` still yields `repo:a/b`. `null` when the
+ * quotes do not pair up.
+ */
+function quotedTerms(query: string): string[] | null {
+  const terms: string[] = [];
+  let term = "";
+  const flush = (): void => {
+    if (term !== "") terms.push(term);
+    term = "";
+  };
+  let i = 0;
+  while (i < query.length) {
+    const ch = query.charAt(i);
+    if (ch === '"') {
+      const close = query.indexOf('"', i + 1);
+      if (close < 0) return null;
+      const section = query.slice(i, close + 1);
+      if (SCOPE_PREFIX.test(term)) term += section;
+      else flush();
+      i = close + 1;
+      continue;
+    }
+    if (/\s/.test(ch)) flush();
+    else term += ch;
+    i++;
+  }
+  flush();
+  return terms;
+}
+
+/** A term that so far is a scope qualifier waiting for its value. */
+const SCOPE_PREFIX = /^[(-]*(repo|org|user):$/i;
+
+/** The scope qualifiers a GitHub query carries, exclusions and quoted phrases left out. */
 export function queryScopes(query: string): QueryScope[] {
+  const terms = quotedTerms(query);
+  if (terms === null) {
+    // Unpaired quotes: whether the host reads a phrase or not, a qualifier
+    // either way is a scope.
+    const seen = new Set<string>();
+    return [
+      ...scopesOf(query.split(/\s+/)),
+      ...scopesOf(query.replaceAll('"', " ").split(/\s+/)),
+    ].filter((scope) => {
+      const key = JSON.stringify(scope);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+  return scopesOf(terms);
+}
+
+function scopesOf(terms: ReadonlyArray<string>): QueryScope[] {
   const out: QueryScope[] = [];
-  for (const raw of query.split(/\s+/)) {
+  for (const raw of terms) {
     // `(repo:a/b` and `repo:a/b)` inside a boolean group are still scopes.
     const token = raw.replace(/^\(+/, "").replace(/\)+$/, "");
     if (token.startsWith("-")) continue;
@@ -112,6 +172,17 @@ export function githubSearchQuery(
         ? `repo:${scope.owner}/${scope.repo}`
         : `${scope.qualifier}:${scope.owner}`,
     );
+    // A qualifier that names no GitHub account or repository cannot be
+    // named in the fields either: say so rather than suggest it.
+    const unnamed =
+      nameProblem("owner", scope.owner) ??
+      (scope.qualifier === "repo" ? nameProblem("repo", scope.repo ?? "") : undefined);
+    if (unnamed !== undefined) {
+      return {
+        ok: false,
+        message: `${tool}: the query's qualifier ${written} does not name a GitHub ${scope.qualifier === "repo" ? "repository as owner/repo" : "account"} (${unnamed}). Remove it, or put the text in double quotes to search for it as written. Nothing was searched.`,
+      };
+    }
     const covered =
       owner !== undefined &&
       same(scope.owner, owner) &&

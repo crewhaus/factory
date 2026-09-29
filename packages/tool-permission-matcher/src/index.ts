@@ -171,9 +171,11 @@ export type GlobMatcher = {
   /**
    * Whether the glob matches `prefix` followed by SOME run of characters
    * without a `/` (possibly none): for a value that stands for every value
-   * in its last segment (see `OperativeValue.standsForAny`).
+   * in its last segment (see `OperativeValue.standsForAny`). With `segments`
+   * above 1, that many such runs joined by `/` — a value that stands for
+   * every `<qualifier>/<value>` (see `OperativeValue.anyQualifier`).
    */
-  readonly matchesSegmentAfter: (prefix: string) => boolean;
+  readonly matchesSegmentAfter: (prefix: string, segments?: number) => boolean;
 };
 
 function compileGlob(glob: string): GlobMatcher {
@@ -188,8 +190,9 @@ function compileGlob(glob: string): GlobMatcher {
         if (work !== undefined) work.steps += value.length;
         return value === literal;
       },
-      matchesSegmentAfter: (prefix: string) =>
-        literal.startsWith(prefix) && !literal.slice(prefix.length).includes("/"),
+      matchesSegmentAfter: (prefix: string, segments = 1) =>
+        literal.startsWith(prefix) &&
+        literal.slice(prefix.length).split("/").length === Math.max(1, segments),
     };
   }
 
@@ -285,9 +288,10 @@ function compileGlob(glob: string): GlobMatcher {
       }
       return done(current.includes(0));
     },
-    matchesSegmentAfter(prefix: string): boolean {
+    matchesSegmentAfter(prefix: string, segments = 1): boolean {
       // Run the prefix like `test` does, then ask whether the accepting
-      // state can be reached reading only characters that are not `/`.
+      // state can be reached reading characters that are not `/`, with
+      // exactly `segments - 1` slashes between them.
       let current = [start];
       for (let i = 0; i < prefix.length; i++) {
         const c = prefix.charCodeAt(i);
@@ -311,18 +315,33 @@ function compileGlob(glob: string): GlobMatcher {
         if (following.length === 0) return false;
         current = following;
       }
-      const seen = new Uint8Array(count);
-      const stack = [...current];
-      while (stack.length > 0) {
-        const s = stack.pop() as number;
-        if (seen[s] === 1) continue;
-        seen[s] = 1;
-        const st = states[s] as GlobState;
-        if (st.t === "accept") return true;
-        if (st.t === "split") stack.push(st.b, st.a);
-        else if ((st.t === "lit" && st.c !== SLASH) || st.t === "notSlash" || st.t === "anyChar") {
-          stack.push(st.out);
+      const slashes = Math.max(1, segments) - 1;
+      for (let level = 0; level <= slashes; level++) {
+        // The states reachable at this level reading no `/`; a transition
+        // that can read one leads to the next level.
+        const seen = new Uint8Array(count);
+        const stack = [...current];
+        const next: number[] = [];
+        while (stack.length > 0) {
+          const s = stack.pop() as number;
+          if (seen[s] === 1) continue;
+          seen[s] = 1;
+          const st = states[s] as GlobState;
+          if (st.t === "accept") {
+            if (level === slashes) return true;
+            continue;
+          }
+          if (st.t === "split") {
+            stack.push(st.b, st.a);
+            continue;
+          }
+          if ((st.t === "lit" && st.c !== SLASH) || st.t === "notSlash" || st.t === "anyChar") {
+            stack.push(st.out);
+          }
+          if ((st.t === "lit" && st.c === SLASH) || st.t === "anyChar") next.push(st.out);
         }
+        if (next.length === 0) return false;
+        current = next;
       }
       return false;
     },
@@ -467,6 +486,15 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   among all the others, and `EvmGetLogs(137/…)` does not. An allow rule
  *   still matches only `canonical` — naming one contract does not grant a
  *   read of all of them.
+ *   A value that names the same thing in any letter case (an `id`, a
+ *   `command`, a `recipient`, or a `0x` hex value) is compared ignoring case
+ *   here too, so an owner-wide code search written `ACME/*` still meets
+ *   `alwaysDeny SearchCode(acme/secret)`.
+ * - `anyQualifier` — with `standsForAny`: the field is declared `within`
+ *   another that the call left out as well, so the value also stands for
+ *   every `<qualifier>/<value>`. A code search that names no owner reaches
+ *   every repository the token can read, and `alwaysDeny
+ *   SearchCode(acme/secret)` fires on it.
  * - `restrictOnly` — the declared default of a field that only relocates
  *   the tool (a store directory, the repository a branch operation runs
  *   in), standing in for a field the call left out while it carries another
@@ -500,6 +528,7 @@ export type OperativeValue = {
   readonly outsideWorkspace?: boolean;
   readonly caseInsensitive?: boolean;
   readonly standsForAny?: ReadonlyArray<string>;
+  readonly anyQualifier?: boolean;
   readonly restrictOnly?: boolean;
 };
 
@@ -904,10 +933,24 @@ function valueMatches(
   }
   if (polarity !== "restrict") return false;
   // A field the call left out whose default is `*` stands for every value, so
-  // a deny or ask naming any one value there fires on it.
+  // a deny or ask naming any one value there fires on it — in any letter
+  // case the value itself is compared in, and, when its qualifier was left
+  // out too, under any qualifier.
   if (value.standsForAny !== undefined) {
+    const caseFolds =
+      value.caseInsensitive === true ||
+      value.kind === "id" ||
+      value.kind === "command" ||
+      value.kind === "recipient";
+    const lower = caseFolds ? foldedArgMatcher(compiled, "lower") : undefined;
+    const widths = value.anyQualifier === true ? [1, 2] : [1];
     for (const prefix of value.standsForAny) {
-      if (argRe.matchesSegmentAfter(prefix)) return true;
+      for (const width of widths) {
+        if (argRe.matchesSegmentAfter(prefix, width)) return true;
+        if (lower?.matchesSegmentAfter(prefix.normalize("NFC").toLowerCase(), width) === true) {
+          return true;
+        }
+      }
     }
   }
   // A deny or ask on a path is not dodged by spelling the name another way
