@@ -18,6 +18,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -26,7 +28,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { MAX_OUTPUT_CHARS, failure, runGit, skippedPatchPaths, unquoteGitPath } from "./git-run";
+import {
+  MAX_OUTPUT_CHARS,
+  failure,
+  runGit,
+  skippedPatchPaths,
+  symlinksCreatedByPatch,
+  unquoteGitPath,
+} from "./git-run";
 import {
   GIT_TOOLS,
   gitAdd,
@@ -452,6 +461,178 @@ describe("containment of the repository git discovers", () => {
         leaked: false,
       });
     }
+  });
+
+  test("chained alternates are followed: an in-workspace alternate whose own alternates name the victim is refused", async () => {
+    // C071 bypass: the first `info/alternates` names an in-workspace object
+    // dir (which passes a first-level check), and THAT dir's own alternates
+    // name the victim's store. git follows the chain; the check must too.
+    const victim = victimRepo("chain");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const mid = join(workspace, "mid");
+    mkdirSync(join(mid, "info"), { recursive: true });
+    writeFileSync(join(mid, "info", "alternates"), `${join(victim, ".git", "objects")}\n`);
+    const c = join(workspace, "c");
+    mkdirSync(c);
+    git(["init", "-q", "-b", "main"], c);
+    writeFileSync(join(c, ".git", "objects", "info", "alternates"), `${mid}\n`);
+    // Plain git reads the victim's committed file through the chain.
+    expect(git(["show", `${victimHead}:creds.txt`], c).stdout).toContain("victim-secret");
+
+    const shown = String(await gitShow.execute({ cwd: "c", ref: victimHead, path: "creds.txt" }));
+    expect(shown).toContain("borrows from a repository outside the workspace");
+    // The refusal names the file that actually holds the outward entry —
+    // mid/info/alternates — not the repository's own objects/info/alternates,
+    // which in this layout names only the in-workspace `mid`.
+    expect(shown).toContain("mid/info/alternates");
+    expect(shown).not.toContain("(objects/info/alternates)");
+    expect(shown).not.toContain("victim-secret");
+    expect(shown).not.toContain(victim);
+  });
+
+  test("a chain of in-workspace alternates that never leaves the workspace still opens", async () => {
+    // The recursion refuses only a store that leads OUT: a legitimate chain
+    // of in-workspace alternates (a shared object cache linked twice) opens.
+    const cache = join(workspace, "cache");
+    mkdirSync(cache);
+    git(["init", "-q", "-b", "main", "--bare"], cache);
+    const mid = join(workspace, "mid2");
+    mkdirSync(join(mid, "info"), { recursive: true });
+    writeFileSync(join(mid, "info", "alternates"), `${join(cache, "objects")}\n`);
+    const c = join(workspace, "c2");
+    mkdirSync(c);
+    git(["init", "-q", "-b", "main"], c);
+    writeFileSync(join(c, ".git", "objects", "info", "alternates"), `${mid}\n`);
+    writeFileSync(join(c, "f.txt"), "in-workspace\n");
+    commitAll(c, "c commit", D3);
+    const out = JSON.parse(String(await gitLog.execute({ cwd: "c2" })));
+    expect(out.commits[0].subject).toBe("c commit");
+  });
+
+  test("a link deep under refs/ or objects/pack/ is refused, not only one at depth one", async () => {
+    // C071 bypass: linkLeadingOut scanned <gitdir>/<sub>/<name> only, so a
+    // link at refs/remotes/v (depth 3) or objects/pack/<file> (depth 3) went
+    // unseen while git read the victim's refs and packs through it.
+    const victim = victimRepo("deep");
+    git(["gc", "-q"], victim);
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+
+    // (a) a directory link deep under refs/: refs/remotes/v -> victim heads.
+    const refsRepo = join(workspace, "refs-repo");
+    mkdirSync(refsRepo);
+    git(["init", "-q", "-b", "main"], refsRepo);
+    mkdirSync(join(refsRepo, ".git", "refs", "remotes"), { recursive: true });
+    symlinkSync(
+      join(victim, ".git", "refs", "heads"),
+      join(refsRepo, ".git", "refs", "remotes", "v"),
+    );
+    const bySha = String(await gitShow.execute({ cwd: "refs-repo", ref: victimHead }));
+    expect(bySha).toContain("holds a link (refs/remotes/v)");
+    expect(bySha).not.toContain("victim-secret");
+    const byRef = String(
+      await gitShow.execute({ cwd: "refs-repo", ref: "refs/remotes/v/main", path: "creds.txt" }),
+    );
+    expect(byRef).toContain("holds a link (refs/remotes/v)");
+    expect(byRef).not.toContain("victim-secret");
+
+    // (b) a file link deep under objects/pack/: the victim's pack files.
+    const packRepo = join(workspace, "pack-repo");
+    mkdirSync(packRepo);
+    git(["init", "-q", "-b", "main"], packRepo);
+    const victimPack = join(victim, ".git", "objects", "pack");
+    for (const f of readdirSync(victimPack)) {
+      symlinkSync(join(victimPack, f), join(packRepo, ".git", "objects", "pack", f));
+    }
+    const packShown = String(await gitShow.execute({ cwd: "pack-repo", ref: victimHead }));
+    expect(packShown).toContain("objects/pack/");
+    expect(packShown).not.toContain("victim-secret");
+  });
+
+  test("a loose-object leaf link is refused: objects/<fanout>/<rest> leading out (C071)", async () => {
+    // C071 residual: the deep scan walked objects/pack and objects/info but
+    // left the loose fan-out at depth one, so a symlink planted at a real
+    // fan-out dir's leaf — objects/ab/cdef… -> the victim's loose object —
+    // was never seen, and git read the borrowed object by hash. A fresh,
+    // un-gc'd repository keeps every object loose, so this is the common case.
+    const victim = victimRepo("loose");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const fanout = victimHead.slice(0, 2);
+    const rest = victimHead.slice(2);
+    // The victim's commit object is loose (no gc): confirm the fixture.
+    expect(existsSync(join(victim, ".git", "objects", fanout, rest))).toBe(true);
+
+    const looseRepo = join(workspace, "loose-repo");
+    mkdirSync(looseRepo);
+    git(["init", "-q", "-b", "main"], looseRepo);
+    const dir = join(looseRepo, ".git", "objects", fanout);
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(join(victim, ".git", "objects", fanout, rest), join(dir, rest));
+
+    const shown = String(await gitShow.execute({ cwd: "loose-repo", ref: victimHead }));
+    expect(shown).toContain(`holds a link (objects/${fanout}/${rest})`);
+    expect(shown).toContain("outside the workspace");
+    expect(shown).not.toContain("victim-secret");
+  });
+
+  test("a link at objects/info/<file> leading out is refused (objects/info stays covered)", async () => {
+    // Kills a mutant that drops objects/info from the deep scan: git reads
+    // objects/info/{packs,commit-graph,…} by name, so a link there leaks the
+    // file it names just as objects/pack does.
+    const out = outsideDir("info-target");
+    writeFileSync(join(out, "borrowed"), "x\n");
+    const infoRepo = join(workspace, "info-repo");
+    mkdirSync(infoRepo);
+    git(["init", "-q", "-b", "main"], infoRepo);
+    mkdirSync(join(infoRepo, ".git", "objects", "info"), { recursive: true });
+    symlinkSync(join(out, "borrowed"), join(infoRepo, ".git", "objects", "info", "commit-graph"));
+
+    const shown = String(await gitLog.execute({ cwd: "info-repo" }));
+    expect(shown).toContain("holds a link (objects/info/commit-graph)");
+    expect(shown).toContain("outside the workspace");
+  });
+
+  test("an inside-staying refs/ directory link whose child leads out is refused (C071)", async () => {
+    // C071 residual: deepLinkLeadingOut `continue`d on any link staying inside
+    // the workspace, so it never looked beneath an in-workspace directory
+    // link. refs/remotes -> ws/stage (inside) with ws/stage/v -> the victim's
+    // heads (outside) let git resolve refs/remotes/v/main to the victim's ref
+    // file, and bootstrapped the victim tip SHA from GitBranchList's error.
+    const victim = victimRepo("refs-double");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const stage = join(workspace, "stage");
+    mkdirSync(stage);
+    const double = join(workspace, "double");
+    mkdirSync(double);
+    git(["init", "-q", "-b", "main"], double);
+    symlinkSync(stage, join(double, ".git", "refs", "remotes"));
+    symlinkSync(join(victim, ".git", "refs", "heads"), join(stage, "v"));
+    // Plain git resolves the victim's ref through the two links.
+    expect(git(["rev-parse", "refs/remotes/v/main"], double).stdout.trim()).toBe(victimHead);
+
+    const byRef = String(
+      await gitShow.execute({ cwd: "double", ref: "refs/remotes/v/main", path: "creds.txt" }),
+    );
+    expect(byRef).toContain("holds a link (refs/remotes/v)");
+    expect(byRef).toContain("outside the workspace");
+    expect(byRef).not.toContain("victim-secret");
+    // The branch listing must not disclose the victim tip SHA in its error.
+    const branches = String(await gitBranchList.execute({ cwd: "double", remote: true }));
+    expect(branches).toContain("outside the workspace");
+    expect(branches).not.toContain(victimHead);
+  });
+
+  test("an inside-staying refs/ link that points at an ancestor does not loop the scan", async () => {
+    // The descent into inside-staying directory links is realpath-guarded, so
+    // a link pointing back up (refs/loop -> the git dir) terminates instead of
+    // recursing forever; a normal repository still opens.
+    const loopRepo = join(workspace, "loop-repo");
+    mkdirSync(loopRepo);
+    git(["init", "-q", "-b", "main"], loopRepo);
+    writeFileSync(join(loopRepo, "f.txt"), "in-workspace\n");
+    commitAll(loopRepo, "loop commit", D3);
+    symlinkSync(join(loopRepo, ".git"), join(loopRepo, ".git", "refs", "loop"));
+    const out = JSON.parse(String(await gitLog.execute({ cwd: "loop-repo" })));
+    expect(out.commits[0].subject).toBe("loop commit");
   });
 
   test("a .git/hooks, .git/lfs or info/exclude linked outside is not history: the repository still works", async () => {
@@ -1241,6 +1422,16 @@ describe("GitTagCreate", () => {
 });
 
 describe("GitApplyPatch", () => {
+  const linkOutsideDirs: string[] = [];
+  const outsideForLinks = (): string => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-tool-git-link-")));
+    linkOutsideDirs.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    for (const dir of linkOutsideDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
   test("checks a patch without changing anything, then applies it", async () => {
     writeFileSync(join(repo, "README.md"), "hello\nworld\npatched\n");
     const diff = await call(gitDiff, { mode: "patch" });
@@ -1286,6 +1477,120 @@ describe("GitApplyPatch", () => {
     // The refusal is only worth anything if the file really is not there.
     expect(existsSync(join(workspace, "escape.txt"))).toBe(false);
     expect(existsSync(join(repo, "escape.txt"))).toBe(false);
+  });
+
+  describe("a patch creating a symbolic link out of the workspace is refused (C070 enabler)", () => {
+    const linkPatch = (path: string, target: string): string =>
+      [
+        `diff --git a/${path} b/${path}`,
+        "new file mode 120000",
+        "index 0000000..1111111",
+        "--- /dev/null",
+        `+++ b/${path}`,
+        "@@ -0,0 +1 @@",
+        `+${target}`,
+        "\\ No newline at end of file",
+        "",
+      ].join("\n");
+
+    test("an absolute target outside the workspace is refused, nothing planted", async () => {
+      const outside = join(outsideForLinks(), "planted.rc");
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("evil", outside) });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (evil)");
+      expect(out.reason).toContain("outside the workspace");
+      expect(existsSync(join(repo, "evil"))).toBe(false);
+      expect(existsSync(outside)).toBe(false);
+    });
+
+    test("a ../ target that climbs out of the workspace is refused", async () => {
+      // repo is one level under the workspace root, so `../../x` leaves it.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("up", "../../outside.rc"),
+      });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (up)");
+      expect(existsSync(join(repo, "up"))).toBe(false);
+    });
+
+    test("check mode refuses too, so it never reports 'would apply' for an escaping link", async () => {
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("evil2", "/etc/passwd"),
+        check: true,
+      });
+      expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
+      expect(existsSync(join(repo, "evil2"))).toBe(false);
+    });
+
+    test("a link that stays inside the workspace still applies", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("good", "README.md") });
+      expect(out.applied).toBe(true);
+      expect(lstatSync(join(repo, "good")).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(repo, "good"))).toBe("README.md");
+    });
+
+    test("a link into a sibling directory of the repo applies: target inside the workspace, outside the repo", async () => {
+      // The workspace holds sibling directories (here `repo` and `plain`); a
+      // link from one into another points INSIDE the workspace and is
+      // legitimate — a vendored dependency, a shared asset. It was wrongly
+      // refused, and mislabelled "outside the workspace", when the bound was
+      // the repository's top level instead of the workspace root.
+      expect(existsSync(join(workspace, "plain"))).toBe(true);
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("sib", "../plain") });
+      expect(out.applied).toBe(true);
+      expect(lstatSync(join(repo, "sib")).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(repo, "sib"))).toBe("../plain");
+    });
+
+    test("the escaping-link check honours strip, not a fixed -p1", async () => {
+      // Kills a mutant that always passes strip 1: the patch header carries an
+      // extra component, so only strip 2 gives the real link path `deep/link`
+      // and resolves `../../../outside` out of the workspace. Read with strip
+      // 1 the path and its `..` climb land back inside, and the escape is
+      // missed while git (run with -p2) still creates it.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("x/deep/link", "../../../outside"),
+        strip: 2,
+      });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (deep/link)");
+      expect(existsSync(join(repo, "deep", "link"))).toBe(false);
+    });
+  });
+
+  test("symlinksCreatedByPatch reads targets and honours -p; a deletion contributes none", () => {
+    const patch = [
+      "diff --git a/dir/link b/dir/link",
+      "new file mode 120000",
+      "index 0000000..1111111",
+      "--- /dev/null",
+      "+++ b/dir/link",
+      "@@ -0,0 +1 @@",
+      "+/etc/passwd",
+      "\\ No newline at end of file",
+      "diff --git a/gone b/gone",
+      "deleted file mode 120000",
+      "index 1111111..0000000",
+      "--- a/gone",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-/was/here",
+      "diff --git a/plain.txt b/plain.txt",
+      "new file mode 100644",
+      "index 0000000..2222222",
+      "--- /dev/null",
+      "+++ b/plain.txt",
+      "@@ -0,0 +1 @@",
+      "+not a link",
+      "",
+    ].join("\n");
+    // -p1 (git's default) drops the a/ or b/ prefix.
+    expect(symlinksCreatedByPatch(patch, 1)).toEqual([{ path: "dir/link", target: "/etc/passwd" }]);
+    // -p2 drops one more component.
+    expect(symlinksCreatedByPatch(patch, 2)).toEqual([{ path: "link", target: "/etc/passwd" }]);
   });
 
   test("git's quoted path names are read back to the file they name", () => {

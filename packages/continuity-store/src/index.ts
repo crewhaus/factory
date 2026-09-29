@@ -36,10 +36,11 @@
  * session-store enforces (CWE-1230): with a tenant present, any resolved
  * path outside the tenant's root throws.
  */
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readdir } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Tenant, assertSamePath, currentTenantContext } from "@crewhaus/tenancy";
+import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import YAML from "yaml";
 import {
   type EvidenceRef,
@@ -119,6 +120,12 @@ export const DEFAULT_ROOT_DIR = ".crewhaus/state";
 export const DEFAULT_FOCUS_MAX_CHARS = 4096;
 /** §2.3 ledger cap: oldest-first eviction with a `[ledger truncated]` marker. */
 export const REQUIREMENTS_LEDGER_MAX_BYTES = 16_384;
+/**
+ * Largest store file (focus.md, goals.yaml, a plan, handoff.md) read back.
+ * Every one the store writes is far smaller; a bigger one is refused rather
+ * than buffered whole.
+ */
+export const STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 
 export const FOCUS_MARKER = "<!-- crewhaus:focus -->";
 const ACTIVE_PLAN_MARKER = "<!-- crewhaus:active-plan -->";
@@ -518,25 +525,96 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
   const lockPath = join(storeDir, ".lock");
   const retentionPath = join(crewhausDir, "retention.json");
   const sessionRootDir = resolve(opts.sessionRootDir ?? join(crewhausDir, "sessions"));
+
+  /**
+   * The root `retention.json` is contained within. Without a tenant it is the
+   * harness root (the parent of `.crewhaus`), so an operator may keep the
+   * retention policy in a sibling `config/` and link `.crewhaus/retention.json`
+   * to it; a link OUT of the workspace is still refused. Under a tenant it is
+   * the tenant's own root, so pins never reach outside the tenant.
+   */
+  function retentionRoot(): string {
+    const tenant = opts.tenant ?? currentTenantContext()?.tenant;
+    return tenant !== undefined ? tenantRootOf(tenant) : resolve(crewhausDir, "..");
+  }
   // Fail closed at construction, not just on first I/O.
   fence(storeDir);
 
-  async function writeAtomic(path: string, content: string): Promise<void> {
-    fence(path);
-    await mkdir(dirname(path), { recursive: true });
-    const tmpPath = `${path}.tmp`;
-    await writeFile(tmpPath, content, { mode: 0o600 });
-    await rename(tmpPath, path);
+  /** A store path as the store names it in messages: `focus.md`, `plans/plan-0001-x.md`. */
+  function storeRel(absPath: string): string {
+    return relative(storeDir, absPath).split("\\").join("/");
   }
 
+  /**
+   * Write `content` at `absPath` without writing THROUGH anything planted
+   * OUTSIDE the store (C070). The bytes go to an `O_EXCL|O_NOFOLLOW` temp
+   * under a random name in the file's physical directory, which must be
+   * inside the store, and the temp is renamed into place. The fixed temp name
+   * (`focus.md.tmp`, `goals.yaml.tmp`) used to be opened with link
+   * following, so a symlink planted there, dangling or not, created or
+   * overwrote a file anywhere the process could write, with the model's
+   * focus or goal text. A `plans/` directory or a leaf link leading OUT of
+   * the store is refused, naming the store path; a link that stays inside the
+   * store is followed (`focus.md -> focus-kept.md` in the store edits the
+   * target), and a FIFO at the leaf is refused rather than blocked on.
+   */
+  async function writeAtomic(path: string, content: string): Promise<void> {
+    fence(path);
+    // The store directory itself may be a link (an operator keeping state on
+    // another disk); what is contained is everything below it.
+    await mkdir(storeDir, { recursive: true });
+    const rel = storeRel(path);
+    const written = writeFileSafe(storeDir, rel, content, {
+      overwrite: true,
+      createParents: true,
+      mode: 0o600,
+      leafSymlink: "follow-contained",
+    });
+    if (!written.ok) {
+      throw new ContinuityStoreError(
+        written.code === "escapes-root"
+          ? outsideStoreMessage("write", rel)
+          : `continuity-store: refusing to write ${rel}: ${written.reason}`,
+      );
+    }
+  }
+
+  /**
+   * At most {@link STATE_FILE_MAX_BYTES} of a regular file inside the store,
+   * never through a symlink leading OUT of it (a planted
+   * `focus.md -> ~/.ssh/...` is not read), or `null` when nothing is there. A
+   * link that stays inside the store is followed; a FIFO is refused, not
+   * waited on.
+   */
   async function readText(path: string): Promise<string | null> {
     fence(path);
-    try {
-      return await readFile(path, "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw err;
+    const rel = storeRel(path);
+    const read = await openForRead(storeDir, rel, {
+      maxBytes: STATE_FILE_MAX_BYTES,
+    });
+    if (!read.ok) {
+      if (read.code === "not-found") return null;
+      throw new ContinuityStoreError(
+        read.code === "escapes-root"
+          ? outsideStoreMessage("read", rel)
+          : `continuity-store: refusing to read ${rel}: ${read.reason}`,
+      );
     }
+    if (read.truncated) {
+      throw new ContinuityStoreError(
+        `continuity-store: ${rel} is larger than ${STATE_FILE_MAX_BYTES} bytes, so it was not read. Trim it, or clear it with MemoryClear.`,
+      );
+    }
+    return read.text;
+  }
+
+  /**
+   * The refusal for a store path that resolves outside the store: a
+   * symlinked file, or a symlinked `plans/` directory leading out. The
+   * helper's own reason says "the workspace", which is the store here.
+   */
+  function outsideStoreMessage(op: "read" | "write", rel: string): string {
+    return `continuity-store: refusing to ${op} ${rel}: it resolves outside the continuity store, through a symlinked file or a symlinked plans/ directory. Keep the store's files and plans/ inside it; to keep the state somewhere else, link the store's own directory instead.`;
   }
 
   function locked<T>(fn: () => Promise<T>): Promise<T> {
@@ -923,13 +1001,18 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
           status: "proven",
           proofs: mergeProofs(current.proofs, proofs),
         }));
-        await writePlan(next);
-        // Proof lifetime (§2.4): pin every cited session so TTL eviction
-        // cannot orphan a live proven record.
+        // Proof lifetime (§2.4): pin every cited session BEFORE the proven
+        // status lands, so a retention file that cannot be written (a link
+        // out of the workspace, malformed JSON) fails the whole transition
+        // rather than leaving a proven record whose evidence TTL eviction can
+        // then orphan. Over-pinning if the status write later fails is a
+        // harmless GC hint; a proven-but-unpinned record is not.
         await appendRetentionPins(
           proofs.map((p) => p.sessionId),
           fence(retentionPath),
+          retentionRoot(),
         );
+        await writePlan(next);
         return next;
       });
     },
@@ -998,15 +1081,19 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
           ...(mergedProofs !== undefined ? { proofs: mergedProofs } : {}),
           updatedAt: now().toISOString(),
         };
-        const nextGoals = [...goals];
-        nextGoals[idx] = next;
-        await writeGoals(nextGoals);
+        // Pin the cited sessions BEFORE the proven goal lands, so a retention
+        // file that cannot be written fails the transition instead of leaving
+        // a proven goal whose evidence can be TTL-evicted (see proveStep).
         if (proofs.length > 0) {
           await appendRetentionPins(
             proofs.map((p) => p.sessionId),
             fence(retentionPath),
+            retentionRoot(),
           );
         }
+        const nextGoals = [...goals];
+        nextGoals[idx] = next;
+        await writeGoals(nextGoals);
         return next;
       });
     },

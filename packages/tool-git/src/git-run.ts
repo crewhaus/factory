@@ -719,9 +719,10 @@ export async function locateRepository(
         return outside(`its .git directory holds a link (${link}) leading outside the workspace`);
       }
     }
-    if (alternateLeadingOut(commonDir, rootReal) !== undefined) {
+    const alternate = alternateLeadingOut(commonDir, rootReal);
+    if (alternate !== undefined) {
       return outside(
-        "its object store borrows from a repository outside the workspace (objects/info/alternates)",
+        `its object store borrows from a repository outside the workspace (${alternate})`,
       );
     }
     return { ok: true, value: { root: top, gitDir, commonDir } };
@@ -911,6 +912,92 @@ export function conflictedPatchPaths(stderr: string): string[] {
   for (const line of stderr.split("\n")) {
     const name = applyLineName(line.replace(/\r$/, ""), "Applied patch to '", "' with conflicts.");
     if (name !== undefined) out.push(name);
+  }
+  return out;
+}
+
+/** git's file mode for a symbolic link. */
+const SYMLINK_MODE = "120000";
+
+/**
+ * A symbolic link a patch would create, or turn a file into: the path it
+ * lands at (the post-image, `b/…` side) and the target it would point at (the
+ * link's blob, i.e. the hunk's added text). Parsed from the patch, which git
+ * writes in one shape; a deletion contributes none.
+ */
+export type PatchSymlink = { readonly path: string; readonly target: string };
+
+/**
+ * Every symbolic link a unified diff creates or changes a file into, with its
+ * target. git stores a symlink's target AS the file's blob, so a `mode 120000`
+ * file section's added lines are the target it would point at. Renames and
+ * mode changes to a link are included; a `deleted file mode 120000` is not,
+ * since it removes a link rather than making one.
+ *
+ * The path is the post-image side (`+++ b/…`, or `rename to …`) with `strip`
+ * leading components dropped, as git drops them when it applies — so it is the
+ * path relative to the directory git runs in, ready to be contained. Both
+ * paths and the target are un-C-quoted the way git quotes them.
+ */
+export function symlinksCreatedByPatch(patchText: string, strip: number): PatchSymlink[] {
+  const dropComponents = (p: string, n: number): string | undefined => {
+    // git's `-p<n>` drops n leading components; too few means git skips the
+    // file, so it creates nothing to contain.
+    const parts = p.split("/");
+    if (parts.length <= n) return undefined;
+    return parts.slice(n).join("/");
+  };
+  const out: PatchSymlink[] = [];
+  const lines = patchText.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    if (!lines[i]?.startsWith("diff --git ")) {
+      i++;
+      continue;
+    }
+    // One file section: from this `diff --git` to the next (or the end).
+    let j = i + 1;
+    while (j < lines.length && !lines[j]?.startsWith("diff --git ")) j++;
+    const section = lines.slice(i, j);
+    i = j;
+
+    const isDeletion = section.some((l) => l.startsWith("deleted file mode "));
+    const becomesSymlink = section.some(
+      (l) => l === `new file mode ${SYMLINK_MODE}` || l === `new mode ${SYMLINK_MODE}`,
+    );
+    if (isDeletion || !becomesSymlink) continue;
+
+    // The post-image path: the `+++ ` header, or `rename to ` for a rename
+    // (a rename may carry no hunk, so its target text is then empty).
+    let rawPath: string | undefined;
+    for (const l of section) {
+      if (l.startsWith("+++ ")) {
+        const field = l.slice(4).replace(/\t.*$/, "");
+        rawPath = field === "/dev/null" ? undefined : field;
+        break;
+      }
+    }
+    if (rawPath === undefined) {
+      const rename = section.find((l) => l.startsWith("rename to "));
+      if (rename !== undefined) rawPath = `b/${rename.slice("rename to ".length)}`;
+    }
+    if (rawPath === undefined) continue;
+    const stripped = dropComponents(unquoteGitPath(rawPath), strip);
+    if (stripped === undefined || stripped === "") continue;
+
+    // The target: the added lines of the section's hunks (a symlink blob is
+    // its target). Header lines that begin with `+` (`+++ `) are not content.
+    const added: string[] = [];
+    let inHunk = false;
+    for (const l of section) {
+      if (l.startsWith("@@")) {
+        inHunk = true;
+        continue;
+      }
+      if (!inHunk) continue;
+      if (l.startsWith("+")) added.push(l.slice(1));
+    }
+    out.push({ path: stripped, target: added.join("\n") });
   }
   return out;
 }

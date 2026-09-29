@@ -603,6 +603,7 @@
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "yaml": "^2.6.0",
       },
     },

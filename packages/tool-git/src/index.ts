@@ -40,6 +40,7 @@ import {
   openRepo,
   resolveInsideRoot,
   skippedPatchPaths,
+  symlinksCreatedByPatch,
   truncationNote,
   unmergedApplyPaths,
   withoutApplyProgress,
@@ -62,7 +63,7 @@ import {
   parseWorktrees,
   splitNul,
 } from "./lib/parse";
-import { realOrUndefined } from "./repo-bounds";
+import { isInside, realOrUndefined } from "./repo-bounds";
 
 // ---------------------------------------------------------------------------
 // shared schema fragments and flag sets
@@ -1118,6 +1119,43 @@ function unreverseRename(shown: string): string {
   return parts.length === 2 ? `${parts[1]} => ${parts[0]}` : shown;
 }
 
+/**
+ * The first symbolic link a patch would create whose target leaves the
+ * WORKSPACE, as the link's own path, or undefined. git applies paths relative
+ * to the directory it runs in (`repo.cwd`), so the link lands at
+ * `cwd/<path>`; a relative target resolves against the link's own directory,
+ * an absolute one stands as written. The parent directory is realpath'd (it
+ * is inside the tree), the target joined onto it and normalised, and the
+ * result must be inside the workspace root. A target that cannot be resolved
+ * is treated as leading out — git would still create the link.
+ *
+ * The bound is the workspace root (the directory the harness runs from), NOT
+ * `repo.root`: the workspace may hold sibling repositories, so a link from
+ * one into another (`app/vendor-lib -> ../lib`) points inside the workspace
+ * and is fine — matching every other containment check in these tools, which
+ * measure against the workspace, not the repository. Checking against
+ * `repo.root` refused that legitimate link and, worse, said it "points
+ * outside the workspace" when it did not.
+ */
+function escapingSymlink(
+  patchText: string,
+  repo: { readonly cwd: string },
+  strip: number,
+): string | undefined {
+  const rootReal = realOrUndefined(process.cwd());
+  if (rootReal === undefined) return undefined;
+  for (const link of symlinksCreatedByPatch(patchText, strip)) {
+    if (link.target === "") continue; // a rename with no hunk keeps the target
+    const linkAbs = nodePath.resolve(repo.cwd, link.path);
+    const parentReal = realOrUndefined(nodePath.dirname(linkAbs)) ?? nodePath.dirname(linkAbs);
+    const resolved = nodePath.isAbsolute(link.target)
+      ? nodePath.resolve(link.target)
+      : nodePath.resolve(parentReal, link.target);
+    if (!isInside(rootReal, resolved)) return link.path;
+  }
+  return undefined;
+}
+
 export const gitApplyPatch: RegisteredTool = buildTool({
   name: "GitApplyPatch",
   operativeArgs: [{ field: "cwd", kind: "path", default: "." }],
@@ -1186,6 +1224,22 @@ export const gitApplyPatch: RegisteredTool = buildTool({
     }
     const skippedSources = skippedPatchPaths(sources.stderr).map(unreverseRename);
     if (skippedSources.length > 0) return refuseSkipped(skippedSources);
+
+    // A symlink git creates inside the working tree may still point OUT of it:
+    // git stores the target as the file's content and never rejects one, so
+    // `new file mode 120000` with a `/etc/…` or `../…` target plants a link a
+    // later write follows out of the workspace (C070's model-only enabler).
+    // git's own path rule contains the link's LOCATION, not its target, so
+    // this refuses the patch whole before anything is written.
+    const escaping = escapingSymlink(input.patch, repo, input.strip ?? 1);
+    if (escaping !== undefined) {
+      return json({
+        applied: false,
+        checkedOnly,
+        wouldApply: false,
+        reason: `GitApplyPatch: the patch would create a symbolic link (${escaping}) whose target points outside the workspace. git stores a link's target as its content and applies it without a word, so a later write through the link would leave the workspace. Nothing was applied. Remove that link from the patch, or point it inside the workspace.`,
+      });
+    }
 
     const args = [
       "apply",

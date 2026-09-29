@@ -214,7 +214,7 @@ describe("resolveEvidence (non-throwing)", () => {
 describe("appendRetentionPins", () => {
   test("creates retention.json with pins when absent", async () => {
     const path = join(tmp, "retention.json");
-    const { added } = await appendRetentionPins([PARENT], path);
+    const { added } = await appendRetentionPins([PARENT], path, tmp);
     expect(added).toEqual([PARENT]);
     const config = JSON.parse(readFileSync(path, "utf8")) as { version: number; pins: string[] };
     expect(config.version).toBe(1);
@@ -232,7 +232,7 @@ describe("appendRetentionPins", () => {
         auditWindows: [{ frameworkId: "soc2", controlId: "CC6.1", expiresAt: "2027-01-01" }],
       }),
     );
-    const { added } = await appendRetentionPins([PARENT, CHILD], path);
+    const { added } = await appendRetentionPins([PARENT, CHILD], path, tmp);
     expect(added).toEqual([CHILD]);
     const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     expect((config["sessions"] as { maxAgeDays: number }).maxAgeDays).toBe(60);
@@ -244,20 +244,20 @@ describe("appendRetentionPins", () => {
     const path = join(tmp, "retention.json");
     writeFileSync(path, JSON.stringify({ pins: [PARENT] }));
     const before = readFileSync(path, "utf8");
-    const { added } = await appendRetentionPins([PARENT], path);
+    const { added } = await appendRetentionPins([PARENT], path, tmp);
     expect(added).toEqual([]);
     expect(readFileSync(path, "utf8")).toBe(before);
   });
 
   test("invalid session ids are never written as pins", async () => {
     const path = join(tmp, "retention.json");
-    const { added } = await appendRetentionPins(["../../etc/passwd", "sess_nothex"], path);
+    const { added } = await appendRetentionPins(["../../etc/passwd", "sess_nothex"], path, tmp);
     expect(added).toEqual([]);
   });
 
   test("malformed retention.json fails closed with an instructive error", async () => {
     const path = join(tmp, "retention.json");
     writeFileSync(path, "{not json");
-    await expect(appendRetentionPins([PARENT], path)).rejects.toThrow(/malformed JSON/);
+    await expect(appendRetentionPins([PARENT], path, tmp)).rejects.toThrow(/malformed JSON/);
   });
 });

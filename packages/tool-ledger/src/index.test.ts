@@ -9,7 +9,17 @@ import { Database } from "bun:sqlite";
  * test that proves nothing.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +33,7 @@ import {
   ledgerQuery,
   ledgerReconcile,
 } from "./index";
+import { canonicalJson, sha256Hex } from "./lib/amount";
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 const originalCwd = process.cwd();
@@ -785,6 +796,124 @@ describe("InvoiceRender", () => {
   test("no temporary file is left behind", async () => {
     await call(invoiceRender, invoiceInput({ outDir: "docs" }));
     expect(readdirSync(join(workspace, "docs")).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+  });
+
+  describe("files land only where the workspace says", () => {
+    let outside: string;
+    beforeEach(() => {
+      outside = mkdtempSync(join(tmpdir(), "crewhaus-ledger-outside-"));
+    });
+    afterEach(() => {
+      rmSync(outside, { recursive: true, force: true });
+    });
+
+    // 0.7.0 wrote `<target>.<first 8 hex of payloadHash>.tmp` and renamed it.
+    // The hash is of the caller's own input, so the name was known in
+    // advance, and a link planted there was written through. This recomputes
+    // that name for the input below exactly as 0.7.0 did.
+    const oldTempName = (input: ReturnType<typeof invoiceInput>, target: string): string => {
+      const hash = sha256Hex(
+        canonicalJson({
+          kind: input.kind,
+          seller: input.seller,
+          buyer: input.buyer,
+          lines: input.lines,
+          currency: "USD",
+          exponent: 2,
+          issueDate: input.issueDate,
+          dueDate: input.dueDate,
+          reference: null,
+          notes: null,
+          paymentInstructions: null,
+          numbering: { prefix: "INV-", pad: 5, resetYearly: false, start: 1 },
+          template: null,
+          numberFormat: null,
+          outputs: [...input.outputs].sort(),
+          explicitNumber: null,
+        }),
+      );
+      return `${target}.${hash.slice(0, 8)}.tmp`;
+    };
+
+    test("a link planted at the old predictable temp name is not written through", async () => {
+      const input = invoiceInput({ outputs: ["markdown"], outDir: "out" });
+      mkdirSync(join(workspace, "out"));
+      const victim = join(outside, "victim.rc");
+      writeFileSync(victim, "ORIGINAL\n");
+      const target = join(workspace, "out", "INV-00001.md");
+      symlinkSync(victim, oldTempName(input, target));
+
+      const result = await call(invoiceRender, input);
+      expect(result["number"]).toBe("INV-00001");
+      expect(readFileSync(victim, "utf8")).toBe("ORIGINAL\n");
+      expect(lstatSync(target).isFile()).toBe(true);
+      expect(readFileSync(target, "utf8")).toContain("INV-00001");
+    });
+
+    test("a link at the target leading OUT is refused; the number is kept and a replay writes the file", async () => {
+      const input = invoiceInput({ outputs: ["markdown"], outDir: "out" });
+      mkdirSync(join(workspace, "out"));
+      const victim = join(outside, "victim.md");
+      writeFileSync(victim, "ORIGINAL\n");
+      const target = join(workspace, "out", "INV-00001.md");
+      symlinkSync(victim, target);
+
+      // Assert the PROPERTY, not the wording: the number is allocated and
+      // recorded (not burnt), the outside file is untouched, and the message
+      // tells the caller how to recover — whatever the reason phrasing.
+      let message = "";
+      try {
+        await raw(invoiceRender, input);
+        throw new Error("expected a refusal");
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toMatch(/INV-00001 is allocated and recorded.*same idempotencyKey/s);
+      // The refusal does not repeat itself: the removed duplicate clause is gone.
+      expect(message).not.toContain("Nothing was written through it");
+      expect(readFileSync(victim, "utf8")).toBe("ORIGINAL\n");
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+
+      // The number was not burnt: moving the link aside and replaying under
+      // the same key writes the same document under the same number.
+      rmSync(target);
+      const again = await call(invoiceRender, input);
+      expect(again["number"]).toBe("INV-00001");
+      expect(again["replayed"]).toBe(true);
+      expect(lstatSync(target).isFile()).toBe(true);
+    });
+
+    test("a link at the target that stays inside the workspace is followed: the invoice lands in the target", async () => {
+      // An operator who archives invoices behind a link kept working on 0.7.0;
+      // an in-workspace link is followed, not refused (only an escape is).
+      const input = invoiceInput({ outputs: ["markdown"], outDir: "out" });
+      mkdirSync(join(workspace, "out"));
+      mkdirSync(join(workspace, "archive"));
+      const archived = join(workspace, "archive", "INV-00001.md");
+      writeFileSync(archived, "OLD\n");
+      const target = join(workspace, "out", "INV-00001.md");
+      symlinkSync(archived, target);
+
+      const result = await call(invoiceRender, input);
+      expect(result["number"]).toBe("INV-00001");
+      // Written THROUGH the link into the in-workspace target; the link kept.
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(readFileSync(archived, "utf8")).toContain("INV-00001");
+    });
+
+    test("a FIFO at the target is refused, though outDir resolves fine (only the leaf check catches it)", async () => {
+      // resolveSafe(outDir) passes — "out" is a real directory — so this is a
+      // case ONLY writeFileSafe's leaf check catches. The FIFO is neither
+      // opened (which would block) nor replaced.
+      const input = invoiceInput({ outputs: ["markdown"], outDir: "out" });
+      mkdirSync(join(workspace, "out"));
+      const target = join(workspace, "out", "INV-00001.md");
+      expect(Bun.spawnSync(["mkfifo", target]).exitCode).toBe(0);
+      await expect(raw(invoiceRender, input)).rejects.toThrow(
+        /INV-00001 is allocated and recorded.*is a fifo/s,
+      );
+      expect(lstatSync(target).isFIFO()).toBe(true);
+    }, 10_000);
   });
 
   test("an outDir outside the workspace is refused, and costs no number", async () => {
