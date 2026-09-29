@@ -186,6 +186,119 @@ describe("a secret escaped character by character (C050 residual)", () => {
   });
 });
 
+describe("escapes inside escapes, script escapes and UTF-16 (C050 residual, bounds review)", () => {
+  const KEY = ["wJalrXUtnFEMI", "K7MDENG+bPxRfiCY", "EXAMPLEKEY"].join("/");
+  const PIECES = ["wJalrXUtnFEMI", "K7MDENG", "bPxRfiCY", "EXAMPLEKEY"];
+  const shown = (text: string): string[] =>
+    PIECES.filter((p) => text.replaceAll("\u0000", "").includes(p));
+  const stj = JSON.stringify({ key: "X" }).replace("X", KEY.replaceAll("+", "\\u002B"));
+  const utf16 = (s: string, order: "le" | "be"): string =>
+    [...s].map((c) => (order === "le" ? `${c}\u0000` : `\u0000${c}`)).join("");
+  const spellings: Record<string, string> = {
+    // System.Text.Json's echo as a JSON string inside a JSON body: its
+    // `\u002B` arrives as `\\u002B`, which one decode turns into `\u002B`.
+    stjInJson: JSON.stringify({ raw: stj }),
+    stjInJsonInJson: JSON.stringify({ outer: JSON.stringify({ raw: stj }) }),
+    jsHex: `var k = '${KEY.replaceAll("/", "\\x2F").replaceAll("+", "\\x2B")}';`,
+    jsCodePoint: `k = "${KEY.replaceAll("/", "\\u{2F}").replaceAll("+", "\\u{2b}")}"`,
+    // A browser reads a numeric reference without its `;` (`&#x2B` would
+    // swallow the hex digit `b` after it, in a browser too, so decimal here).
+    htmlNoSemicolon: `<p>${KEY.replaceAll("/", "&#47").replaceAll("+", "&#43")}</p>`,
+    percentOfPercent: `q=${KEY.replaceAll("/", "%252F").replaceAll("+", "%252B")}`,
+    // A UTF-16 body read as UTF-8: a NUL beside every ASCII character.
+    utf16le: utf16(`key=${KEY}`, "le"),
+    utf16be: utf16(`key=${KEY}`, "be"),
+    utf16Escaped: utf16(`{"key":"${KEY.replaceAll("+", "\\u002B")}"}`, "le"),
+  };
+
+  for (const [name, spelled] of Object.entries(spellings)) {
+    test(`the ${name} spelling is found and redacted`, () => {
+      expect(shown(spelled)).toEqual(PIECES);
+      expect(containsKnownSecret(spelled, [KEY])).toBe(true);
+      const out = redactKnownSecrets(spelled, [KEY]);
+      expect(shown(out)).toEqual([]);
+      expect(out).toContain(REDACTED);
+    });
+  }
+
+  test("only the secret's own span goes: the JSON around a nested echo is kept", () => {
+    expect(redactKnownSecrets(spellings.stjInJson as string, [KEY])).toBe(
+      `{"raw":"{\\"key\\":\\"${REDACTED}\\"}"}`,
+    );
+    expect(redactKnownSecrets(spellings.jsHex as string, [KEY])).toBe(`var k = '${REDACTED}';`);
+    expect(redactKnownSecrets(`x\u0000${utf16(KEY, "le")}y`, [KEY])).toBe(
+      `x\u0000${REDACTED}\u0000y`,
+    );
+  });
+
+  test("the passes stop: a secret under more layers than the view decodes is not claimed", () => {
+    // Five layers of `%25`: past the pass bound. Documented, not a promise
+    // to find everything — the bound is what keeps the view linear.
+    let deep = "%2F";
+    for (let k = 0; k < 5; k++) deep = deep.replace("%", "%25");
+    const text = `${KEY.split("/")[0]}${deep}${KEY.slice(KEY.indexOf("/") + 1)}`;
+    expect(containsKnownSecret(text, [KEY])).toBe(false);
+  });
+
+  test("any mixture of spellings maps back to exactly the secret's span", () => {
+    // Deterministic pseudo-random mixtures: each character of the secret in
+    // one of eight spellings, between random text that decodes to nothing
+    // secret. The text around the echo must survive byte for byte.
+    let seed = 7;
+    const rand = (n: number): number => {
+      // mulberry32
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) % n;
+    };
+    const spell = (c: string): string => {
+      const code = c.charCodeAt(0);
+      const hex = code.toString(16).padStart(2, "0");
+      const forms = [
+        c,
+        `\\u${hex.padStart(4, "0")}`,
+        `\\x${hex}`,
+        `%${hex}`,
+        `&#${code};`,
+        `&#x${hex.toUpperCase()};`,
+        `${c}\u0000`,
+        `\\\\u${hex.padStart(4, "0")}`.replace("\\\\", "\\u005C"),
+      ];
+      return forms[rand(forms.length)] as string;
+    };
+    const noise = ["a", "%zz", "&", "\\q", " ", "&amp;", "%41", "\\n", "é", "😀"];
+    for (let round = 0; round < 300; round++) {
+      let before = "";
+      let after = "";
+      for (let k = rand(6); k > 0; k--) before += noise[rand(noise.length)];
+      for (let k = rand(6); k > 0; k--) after += noise[rand(noise.length)];
+      // A separator that cannot join an escape on either side.
+      const echoed = [...KEY].map(spell).join("");
+      const text = `${before}|${echoed}|${after}`;
+      expect(containsKnownSecret(text, [KEY])).toBe(true);
+      // A NUL after the secret's last character is outside its span: it stays.
+      expect(redactKnownSecrets(text, [KEY]).replaceAll("\u0000", "")).toBe(
+        `${before}|${REDACTED}|${after}`,
+      );
+    }
+  });
+
+  test("a 25 MiB body of escapes costs about its size, not an object per escape (bounds review)", () => {
+    // 0.7.1's first cut built one segment object and one string per escape:
+    // about 1.1 GiB of RSS for this body, on every authenticated HttpRequest
+    // or DownloadFile that returned it.
+    const text = "%41".repeat(Math.floor((25 * 1024 * 1024) / 3));
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    expect(containsKnownSecret(text, [KEY])).toBe(false);
+    expect(redactKnownSecrets(text, [KEY]).length).toBe(text.length);
+    expect(redactKnownSecretsDeep({ body: text }, [KEY]).body.length).toBe(text.length);
+    const grew = process.memoryUsage().rss - before;
+    expect(grew).toBeLessThan(256 * 1024 * 1024);
+  }, 60_000);
+});
+
 describe("redactKnownSecrets", () => {
   test("a secret echoed in a response body is replaced (config-delivery#4, security-8#4)", () => {
     const body = `{"headers":{"x-anything":"${SECRET}"},"ok":true}`;

@@ -53,8 +53,21 @@ beforeAll(() => {
         htmldec: `<p>got ${v.replaceAll("/", "&#47;").replaceAll("+", "&plus;")}</p>`,
         mixed: `{"key":"${v.replaceAll("+", "\\u002B").replaceAll("/", "\\/")}"}`,
         echo: JSON.stringify({ headers: { "x-api-key": v }, status: "ready" }),
+        // Bounds review: an STJ echo as a JSON string in a JSON body (its
+        // `\u002B` arrives as `\\u002B`), a script's `\x2F`, and a UTF-16
+        // body, which is read as UTF-8 with a NUL beside every character.
+        nestedstj: JSON.stringify({ raw: stjOf(v) }),
+        jsx: `var k = '${v.replaceAll("/", "\\x2F").replaceAll("+", "\\x2B")}';`,
+        nestedecho: JSON.stringify({ status: "ready", outer: JSON.stringify({ raw: stjOf(v) }) }),
       };
-      return new Response(bodies[new URL(req.url).pathname.slice(1)] ?? "?");
+      const at = new URL(req.url).pathname.slice(1);
+      if (at === "utf16") {
+        return new Response(new Uint8Array(Buffer.from(`key=${v}`, "utf16le")), {
+          headers: { "content-type": "text/plain; charset=utf-16le" },
+        });
+      }
+      if (at === "escapes") return new Response(bigEscapes);
+      return new Response(bodies[at] ?? "?");
     },
   });
   origin = `http://127.0.0.1:${server.port}`;
@@ -79,10 +92,29 @@ afterEach(() => {
   _resetHttpConfig();
 });
 
-const visiblePieces = (text: string): string[] => PIECES.filter((p) => text.includes(p));
+const visiblePieces = (text: string): string[] =>
+  PIECES.filter((p) => text.replaceAll("\u0000", "").includes(p));
+
+/** System.Text.Json's default spelling of the key: `+` as `\u002B`. */
+function stjOf(v: string): string {
+  return JSON.stringify({ key: "X" }).replace("X", v.replaceAll("+", "\\u002B"));
+}
+
+/** 25 MiB (tool-http's largest maxBytes) of escapes that spell nothing secret. */
+const bigEscapes = "%41".repeat(Math.floor((25 * 1024 * 1024 - 64) / 3));
 
 describe("an echo escaped character by character is scrubbed (C050)", () => {
-  for (const spelling of ["stj", "stjlower", "lowerpct", "html", "htmldec", "mixed"]) {
+  for (const spelling of [
+    "stj",
+    "stjlower",
+    "lowerpct",
+    "html",
+    "htmldec",
+    "mixed",
+    "nestedstj",
+    "jsx",
+    "utf16",
+  ]) {
     test(`HttpRequest: the ${spelling} echo shows none of the credential`, async () => {
       const out = String(await httpRequest.execute({ url: `${origin}/${spelling}`, auth }, {}));
       const body = JSON.parse(out).body as string;
@@ -98,7 +130,7 @@ describe("an echo escaped character by character is scrubbed (C050)", () => {
 });
 
 describe("DownloadFile does not write an escaped echo (C050)", () => {
-  for (const spelling of ["stj", "lowerpct", "html"]) {
+  for (const spelling of ["stj", "lowerpct", "html", "nestedstj", "jsx", "utf16"]) {
     test(`the ${spelling} echo is refused and nothing is written`, async () => {
       const file = `${spelling}.out`;
       const out = String(
@@ -132,6 +164,29 @@ describe("HttpWaitFor is judged on the scrubbed body, so it is no oracle (C050)"
     expect(JSON.parse(String(await waitFor(SECRET))).met).toBe(false);
   });
 
+  test("an echo nested as a JSON string in a JSON string is no oracle either (bounds review)", async () => {
+    const ask = async (value: string): Promise<boolean> =>
+      JSON.parse(
+        String(
+          await httpWaitFor.execute(
+            {
+              url: `${origin}/nestedecho`,
+              auth,
+              expectJson: { path: "outer", op: "contains", value },
+              intervalMs: 50,
+              timeoutMs: 300,
+            },
+            {},
+          ),
+        ),
+      ).met;
+    expect(await ask(SECRET.slice(0, 10))).toBe(false);
+    expect(await ask("ZZZZZZZZZZ")).toBe(false);
+    expect(await ask(SECRET.slice(0, 14))).toBe(false);
+    // The field's other text is still judged.
+    expect(await ask('"raw"')).toBe(true);
+  });
+
   test("a condition on a field that holds no credential still works", async () => {
     const out = JSON.parse(
       String(
@@ -149,4 +204,32 @@ describe("HttpWaitFor is judged on the scrubbed body, so it is no oracle (C050)"
     );
     expect(out.met).toBe(true);
   });
+});
+
+describe("scrubbing a large escaped body costs about its size (bounds review)", () => {
+  // 0.7.1's first cut of the escaped-spelling scrubber built an object per
+  // escape: +1.1 GiB of RSS for this body in either tool, where the same
+  // call without a credential grew about 150 MiB. One test, both tools:
+  // RSS rarely falls back, so a second test would start above a first's
+  // high-water mark and prove nothing.
+  test("HttpRequest and DownloadFile with a credential, on 25 MiB of escapes", async () => {
+    const maxBytes = 25 * 1024 * 1024;
+    Bun.gc(true);
+    const before = process.memoryUsage().rss;
+    const request = String(
+      await httpRequest.execute({ url: `${origin}/escapes`, auth, maxBytes }, {}),
+    );
+    const download = String(
+      await downloadFile.execute(
+        { url: `${origin}/escapes`, path: "escapes.bin", auth, maxBytes },
+        {},
+      ),
+    );
+    const grew = process.memoryUsage().rss - before;
+    // Booleans, not the text: a failure must not print 25 MiB.
+    expect(request.startsWith('{"status":200')).toBe(true);
+    expect(request.includes("<redacted>%41")).toBe(false);
+    expect(download.includes('"path":"escapes.bin"')).toBe(true);
+    expect(grew).toBeLessThan(512 * 1024 * 1024);
+  }, 60_000);
 });
