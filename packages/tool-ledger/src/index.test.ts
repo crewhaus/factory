@@ -850,7 +850,7 @@ describe("InvoiceRender", () => {
       expect(readFileSync(target, "utf8")).toContain("INV-00001");
     });
 
-    test("a link at the target is refused; the number is kept and a replay writes the file", async () => {
+    test("a link at the target leading OUT is refused; the number is kept and a replay writes the file", async () => {
       const input = invoiceInput({ outputs: ["markdown"], outDir: "out" });
       mkdirSync(join(workspace, "out"));
       const victim = join(outside, "victim.md");
@@ -858,9 +858,19 @@ describe("InvoiceRender", () => {
       const target = join(workspace, "out", "INV-00001.md");
       symlinkSync(victim, target);
 
-      await expect(raw(invoiceRender, input)).rejects.toThrow(
-        /INV-00001 is allocated and recorded, but "out\/INV-00001\.md" is a symbolic link.*same idempotencyKey/,
-      );
+      // Assert the PROPERTY, not the wording: the number is allocated and
+      // recorded (not burnt), the outside file is untouched, and the message
+      // tells the caller how to recover — whatever the reason phrasing.
+      let message = "";
+      try {
+        await raw(invoiceRender, input);
+        throw new Error("expected a refusal");
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toMatch(/INV-00001 is allocated and recorded.*same idempotencyKey/s);
+      // The refusal does not repeat itself: the removed duplicate clause is gone.
+      expect(message).not.toContain("Nothing was written through it");
       expect(readFileSync(victim, "utf8")).toBe("ORIGINAL\n");
       expect(lstatSync(target).isSymbolicLink()).toBe(true);
 
@@ -873,13 +883,37 @@ describe("InvoiceRender", () => {
       expect(lstatSync(target).isFile()).toBe(true);
     });
 
-    test("a directory under outDir linked out is refused before anything lands outside", async () => {
-      symlinkSync(outside, join(workspace, "linked"));
-      await expect(
-        raw(invoiceRender, invoiceInput({ outputs: ["markdown"], outDir: "linked/sub" })),
-      ).rejects.toThrow(/escapes the workspace root/);
-      expect(readdirSync(outside)).toEqual([]);
+    test("a link at the target that stays inside the workspace is followed: the invoice lands in the target", async () => {
+      // An operator who archives invoices behind a link kept working on 0.7.0;
+      // an in-workspace link is followed, not refused (only an escape is).
+      const input = invoiceInput({ outputs: ["markdown"], outDir: "out" });
+      mkdirSync(join(workspace, "out"));
+      mkdirSync(join(workspace, "archive"));
+      const archived = join(workspace, "archive", "INV-00001.md");
+      writeFileSync(archived, "OLD\n");
+      const target = join(workspace, "out", "INV-00001.md");
+      symlinkSync(archived, target);
+
+      const result = await call(invoiceRender, input);
+      expect(result["number"]).toBe("INV-00001");
+      // Written THROUGH the link into the in-workspace target; the link kept.
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+      expect(readFileSync(archived, "utf8")).toContain("INV-00001");
     });
+
+    test("a FIFO at the target is refused, though outDir resolves fine (only the leaf check catches it)", async () => {
+      // resolveSafe(outDir) passes — "out" is a real directory — so this is a
+      // case ONLY writeFileSafe's leaf check catches. The FIFO is neither
+      // opened (which would block) nor replaced.
+      const input = invoiceInput({ outputs: ["markdown"], outDir: "out" });
+      mkdirSync(join(workspace, "out"));
+      const target = join(workspace, "out", "INV-00001.md");
+      expect(Bun.spawnSync(["mkfifo", target]).exitCode).toBe(0);
+      await expect(raw(invoiceRender, input)).rejects.toThrow(
+        /INV-00001 is allocated and recorded.*is a fifo/s,
+      );
+      expect(lstatSync(target).isFIFO()).toBe(true);
+    }, 10_000);
   });
 
   test("an outDir outside the workspace is refused, and costs no number", async () => {

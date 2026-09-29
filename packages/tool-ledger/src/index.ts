@@ -1019,21 +1019,27 @@ export const invoiceRender: RegisteredTool = buildTool({
         // writeFileSafe writes a temp under a RANDOM name, created
         // O_EXCL|O_NOFOLLOW beside the target, and renames it into place: a
         // reader never sees half an invoice, a crash leaves the previous file,
-        // and nothing is written through a link. The old temp name
-        // (`<target>.<hash8>.tmp`) was predictable from the caller's own input,
-        // so a link planted there wrote the invoice outside the workspace and
-        // left the target linked out. Missing directories under outDir are
-        // created one at a time, each checked; a link or FIFO at the target is
-        // refused.
+        // and nothing is written through a link that LEAVES the workspace. The
+        // old temp name (`<target>.<hash8>.tmp`) was predictable from the
+        // caller's own input, so a link planted there wrote the invoice
+        // outside the workspace and left the target linked out. Missing
+        // directories under outDir are created one at a time, each checked. A
+        // link at the target that stays inside the workspace is followed (an
+        // operator who archives invoices behind a link keeps working, as on
+        // 0.7.0); a link OUT of the workspace, or a FIFO or other special
+        // file, is refused.
         const written = writeFileSafe(workspaceRoot(), rel, text, {
           overwrite: true,
           createParents: true,
+          leafSymlink: "follow-contained",
         });
         if (!written.ok) {
           // The number is already allocated and recorded with this payload, so
           // it is not lost: a replay under the same key re-renders these bytes.
+          // written.reason already states nothing was written, so it is not
+          // repeated here.
           throw new LedgerError(
-            `InvoiceRender: ${allocation.number} is allocated and recorded, but ${written.reason}. Nothing was written through it. Fix the destination (move the link or special file aside, or choose another outDir) and repeat the call with the same idempotencyKey to write the same files.`,
+            `InvoiceRender: ${allocation.number} is allocated and recorded, but its file could not be written — ${written.reason}. Fix the destination (a link out of the workspace, or a special file at the target: move it aside, or choose another outDir) and repeat the call with the same idempotencyKey to write the same files.`,
           );
         }
         files.push(`${dir.rel}/${name}`);
