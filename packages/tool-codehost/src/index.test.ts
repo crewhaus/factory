@@ -97,6 +97,8 @@ let seen: Array<{
   auth: string | null;
   body: string;
   host: string | null;
+  /** The search query the request carried, when it carried one. */
+  q?: string | null;
 }> = [];
 /** Whether the second origin ever received a credential header. */
 let otherSawCredential = false;
@@ -159,7 +161,14 @@ async function mainHandler(req: Request): Promise<Response> {
   const p = url.pathname;
   const auth = req.headers.get("authorization") ?? req.headers.get("private-token");
   const body = req.method === "GET" ? "" : await req.text();
-  seen.push({ method: req.method, path: p, auth, body, host: req.headers.get("host") });
+  seen.push({
+    method: req.method,
+    path: p,
+    auth,
+    body,
+    host: req.headers.get("host"),
+    q: url.searchParams.get("q"),
+  });
 
   // --- GitLab dialect -----------------------------------------------------
   if (p.startsWith("/api/v4/")) return gitlabHandler(req, p, body);
@@ -726,7 +735,7 @@ describe("the token never leaves in a result", () => {
       [releaseGet, gh({})],
       [releaseList, gh({})],
       [repoGet, gh({ repo: "leaky" })],
-      [searchCode, { query: "repo:acme/widget x" }],
+      [searchCode, gh({ query: "repo:acme/widget x" })],
       [searchIssues, { query: "is:open" }],
       [workflowRunRerun, gh({ runId: 42 })],
       [workflowRunLogs, gh({ runId: 42 })],
@@ -1122,6 +1131,44 @@ describe("releases, repository, comparison, search, quota", () => {
     expect(sorted.matches.map((m: { path: string }) => m.path)).toEqual(["src/a.ts", "src/b.ts"]);
   });
 
+  test("a scope the query names must be the scope owner and repo name (C004)", async () => {
+    // The dodge: a permission rule reads owner/repo, so a scope written only
+    // in the query was invisible to `alwaysDeny SearchCode(acme/secret)`.
+    for (const tool of [searchCode, searchIssues]) {
+      const dodge = String(await tool.execute({ query: "password repo:acme/secret" }));
+      expect(dodge).toContain('the query searches "repo:acme/secret"');
+      expect(dodge).toContain('owner "acme" and repo "secret"');
+      const elsewhere = String(await tool.execute(gh({ query: "password repo:other/secret" })));
+      expect(elsewhere).toContain("do not cover");
+      const orgWide = String(await tool.execute(gh({ query: "password org:acme" })));
+      expect(orgWide).toContain('owner "acme" and no repo');
+    }
+    // Nothing was searched for any of them.
+    expect(seen.filter((r) => r.path.startsWith("/search/"))).toEqual([]);
+  });
+
+  test("owner and repo scope the search they name (C004)", async () => {
+    await run(searchCode, gh({ query: "password" }));
+    await run(searchIssues, gh({ query: "is:open" }));
+    // Written into the query, so what is searched is what a rule saw.
+    await run(searchIssues, { owner: "acme", query: "is:open org:acme" });
+    // An exclusion only narrows, and a scope the fields cover is kept as written.
+    await run(searchCode, gh({ query: "x repo:acme/widget -repo:acme/old" }));
+    expect(seen.map((r) => r.q)).toEqual([
+      "password repo:acme/widget",
+      "is:open repo:acme/widget",
+      "is:open org:acme",
+      "x repo:acme/widget -repo:acme/old",
+    ]);
+    // An owner alone must say which kind of account it is.
+    const bare = String(await searchIssues.execute({ owner: "acme", query: "is:open" }));
+    expect(bare).toContain("add org:acme or user:acme");
+    // And a name is checked before it is written into a query.
+    const injected = String(await searchCode.execute(gh({ repo: "widget org:evil", query: "x" })));
+    expect(injected).toContain("is not a GitHub name");
+    expect(seen).toHaveLength(4);
+  });
+
   test("SearchIssues marks which results are pull requests", async () => {
     const result = await run(searchIssues, { query: "is:open" });
     expect(result.issues[0].isPullRequest).toBe(false);
@@ -1310,6 +1357,19 @@ describe("the GitLab dialect", () => {
     expect(result).toContain("project-scoped");
     const scoped = await run(searchCode, gl({ query: "x" }));
     expect(scoped.matches[0]).toMatchObject({ path: "src/a.ts", startLine: 12 });
+  });
+
+  test("SearchIssues refuses an owner without a repo rather than searching the instance (C004)", async () => {
+    const result = String(
+      await searchIssues.execute({
+        host: "gitlab",
+        baseUrl: `${origin}/api/v4`,
+        owner: "acme",
+        query: "bug",
+      }),
+    );
+    expect(result).toContain("pass owner and repo together, or neither");
+    expect(seen.filter((r) => r.path.includes("search"))).toEqual([]);
   });
 
   test("CompareRefs derives the line counts GitLab does not state", async () => {

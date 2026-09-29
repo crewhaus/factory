@@ -4389,7 +4389,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", default: "*", within: "owner" }],
   },
   searchIssues: {
     key: "searchIssues",
@@ -4400,7 +4400,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+    operativeArgs: [{ field: "repo", kind: "id", default: "*", within: "owner" }],
   },
   secretLookup: {
     key: "secretLookup",

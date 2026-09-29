@@ -237,6 +237,22 @@ describe("p14 — leaving out a field the tool fills with a default (permission-
   });
 });
 
+describe("C004 — a search that reaches a denied repository", () => {
+  test("a search that reaches a denied repository meets the deny (SearchCode, SearchIssues)", async () => {
+    for (const name of ["SearchCode", "SearchIssues"]) {
+      const rs = rules(["alwaysDeny", `${name}(acme/secret)`], ["alwaysAllow", name]);
+      // The repository named outright, and the whole owner it belongs to.
+      const named = { owner: "acme", repo: "secret", query: "password" };
+      const ownerWide = { owner: "acme", query: "password org:acme" };
+      expect({ name, got: await gate(name, named, rs) }).toEqual({ name, got: "deny" });
+      expect({ name, got: await gate(name, ownerWide, rs) }).toEqual({ name, got: "deny" });
+      // Another owner's search is not this rule's business.
+      const other = { owner: "other", query: "password org:other" };
+      expect({ name, got: await gate(name, other, rs) }).toEqual({ name, got: "allow" });
+    }
+  });
+});
+
 describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (permission-integration#1, #2)", () => {
   test("Write(src/**) does not reach .crewhaus/settings.json by a decoy or by `..`", async () => {
     const rs = rules(["alwaysAllow", "Write(src/**)"]);

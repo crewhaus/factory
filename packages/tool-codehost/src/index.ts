@@ -63,6 +63,7 @@ import {
   gitlabProjectPath,
   joinCommaList,
 } from "./lib/refs";
+import { githubSearchQuery } from "./lib/search-scope";
 import {
   type Rec,
   apiErrorMessage,
@@ -1465,9 +1466,12 @@ export const compareRefs: RegisteredTool = readTool({
 
 export const searchCode: RegisteredTool = readTool({
   name: "SearchCode",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  // Left out, the repository is every one the search reaches: an owner-wide
+  // search is read as `owner/*`, so a deny naming any repository of that
+  // owner fires on it. See lib/search-scope.ts for how the query is held to it.
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*" }],
   description:
-    "Search the host's code index and return the matching paths, paginated. Use it to find where a symbol or string lives across repositories before reading any file. Results are in the host's relevance order by default, which is the answer being asked for; pass order \"path\" to sort them instead. Two host limits: GitHub's code search covers the default branch of indexed repositories only and needs a qualifier such as repo: or org: in the query, and GitLab's blob search is per-project here, so it requires owner and repo.",
+    "Search the host's code index and return the matching paths, paginated. Use it to find where a symbol or string lives across repositories before reading any file. Results are in the host's relevance order by default, which is the answer being asked for; pass order \"path\" to sort them instead. owner and repo are the search's scope, and what a permission rule reads: on GitHub they are added to the query as repo:owner/repo, and a repo:, org: or user: qualifier already in the query must name the same scope in owner (and repo) or the search is refused. Two host limits: GitHub's code search covers the default branch of indexed repositories only and needs a qualifier such as repo: or org:, and GitLab's blob search is per-project here, so it requires owner and repo.",
   inputSchema: z.object({
     host: hostSchema,
     baseUrl: baseUrlSchema,
@@ -1521,9 +1525,11 @@ export const searchCode: RegisteredTool = readTool({
         });
       }
 
+      const scoped = githubSearchQuery("SearchCode", input.query, input.owner, input.repo);
+      if (!scoped.ok) return scoped.message;
       const listing = await apiList(
         c,
-        { method: "GET", path: "/search/code", query: { q: input.query } },
+        { method: "GET", path: "/search/code", query: { q: scoped.q } },
         pages,
       );
       const problem = bodyProblem(listing.last, c.maxBytes);
@@ -1555,9 +1561,9 @@ export const searchCode: RegisteredTool = readTool({
 
 export const searchIssues: RegisteredTool = readTool({
   name: "SearchIssues",
-  operativeArgs: [{ field: "repo", kind: "id", within: "owner" }],
+  operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*" }],
   description:
-    'Search issues and pull requests across repositories and return them as normalised records. Use it to answer "has anyone reported this" or "what is assigned to me across the org" in one call. Results are in the host\'s relevance order by default; pass order "number" to sort them. GitHub\'s search syntax (is:open, repo:, label:) goes in the query verbatim and is not validated here, so a malformed query comes back as the host\'s own 422; on GitLab the search is scoped to a project when owner and repo are given and instance-wide otherwise.',
+    'Search issues and pull requests across repositories and return them as normalised records. Use it to answer "has anyone reported this" or "what is assigned to me across the org" in one call. Results are in the host\'s relevance order by default; pass order "number" to sort them. GitHub\'s search syntax (is:open, label:) goes in the query verbatim, so a malformed query comes back as the host\'s own 422. owner and repo are the search\'s scope, and what a permission rule reads: on GitHub they are added to the query as repo:owner/repo, and a repo:, org: or user: qualifier already in the query must name the same scope in owner (and repo) or the search is refused. On GitLab the search covers one project when owner and repo are given and the whole instance when neither is.',
   inputSchema: z.object({
     host: hostSchema,
     baseUrl: baseUrlSchema,
@@ -1575,6 +1581,11 @@ export const searchIssues: RegisteredTool = readTool({
     withCall(input, ctx, async (c) => {
       const pages = { perPage: input.perPage ?? 30, maxPages: input.maxPages ?? 1 };
       if (c.host === "gitlab") {
+        if ((input.owner === undefined) !== (input.repo === undefined)) {
+          // Not a group search: this would have searched the whole instance
+          // while the call said one owner.
+          return "SearchIssues: GitLab issue search here is per project or instance-wide — pass owner and repo together, or neither. Nothing was searched.";
+        }
         let path = "/search";
         if (input.owner !== undefined && input.repo !== undefined) {
           const target = repoPath(c.host, input.owner, input.repo);
@@ -1598,9 +1609,11 @@ export const searchIssues: RegisteredTool = readTool({
         });
       }
 
+      const scoped = githubSearchQuery("SearchIssues", input.query, input.owner, input.repo);
+      if (!scoped.ok) return scoped.message;
       const listing = await apiList(
         c,
-        { method: "GET", path: "/search/issues", query: { q: input.query } },
+        { method: "GET", path: "/search/issues", query: { q: scoped.q } },
         pages,
       );
       const problem = bodyProblem(listing.last, c.maxBytes);
