@@ -36,10 +36,11 @@
  * session-store enforces (CWE-1230): with a tenant present, any resolved
  * path outside the tenant's root throws.
  */
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { mkdir, readdir } from "node:fs/promises";
+import { join, relative, resolve } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { type Tenant, assertSamePath, currentTenantContext } from "@crewhaus/tenancy";
+import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import YAML from "yaml";
 import {
   type EvidenceRef,
@@ -119,6 +120,12 @@ export const DEFAULT_ROOT_DIR = ".crewhaus/state";
 export const DEFAULT_FOCUS_MAX_CHARS = 4096;
 /** §2.3 ledger cap: oldest-first eviction with a `[ledger truncated]` marker. */
 export const REQUIREMENTS_LEDGER_MAX_BYTES = 16_384;
+/**
+ * Largest store file (focus.md, goals.yaml, a plan, handoff.md) read back.
+ * Every one the store writes is far smaller; a bigger one is refused rather
+ * than buffered whole.
+ */
+export const STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 
 export const FOCUS_MARKER = "<!-- crewhaus:focus -->";
 const ACTIVE_PLAN_MARKER = "<!-- crewhaus:active-plan -->";
@@ -521,22 +528,77 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
   // Fail closed at construction, not just on first I/O.
   fence(storeDir);
 
-  async function writeAtomic(path: string, content: string): Promise<void> {
-    fence(path);
-    await mkdir(dirname(path), { recursive: true });
-    const tmpPath = `${path}.tmp`;
-    await writeFile(tmpPath, content, { mode: 0o600 });
-    await rename(tmpPath, path);
+  /** A store path as the store names it in messages: `focus.md`, `plans/plan-0001-x.md`. */
+  function storeRel(absPath: string): string {
+    return relative(storeDir, absPath).split("\\").join("/");
   }
 
+  /**
+   * Write `content` at `absPath` without writing THROUGH anything planted in
+   * the store (C070). The bytes go to an `O_EXCL|O_NOFOLLOW` temp under a
+   * random name in the file's physical directory, which must be inside the
+   * store, and the temp is renamed into place. The fixed temp name
+   * (`focus.md.tmp`, `goals.yaml.tmp`) used to be opened with link
+   * following, so a symlink planted there, dangling or not, created or
+   * overwrote a file anywhere the process could write, with the model's
+   * focus or goal text. A symlinked leaf, a `plans/` directory leading out,
+   * or a FIFO at the leaf is refused, naming the store path.
+   */
+  async function writeAtomic(path: string, content: string): Promise<void> {
+    fence(path);
+    // The store directory itself may be a link (an operator keeping state on
+    // another disk); what is contained is everything below it.
+    await mkdir(storeDir, { recursive: true });
+    const rel = storeRel(path);
+    const written = writeFileSafe(storeDir, rel, content, {
+      overwrite: true,
+      createParents: true,
+      mode: 0o600,
+    });
+    if (!written.ok) {
+      throw new ContinuityStoreError(
+        written.code === "escapes-root"
+          ? outsideStoreMessage("write", rel)
+          : `continuity-store: refusing to write ${rel}: ${written.reason}`,
+      );
+    }
+  }
+
+  /**
+   * At most {@link STATE_FILE_MAX_BYTES} of a regular file inside the store,
+   * never through a symlink (a planted `focus.md -> ~/.ssh/...` is not
+   * read), or `null` when nothing is there. A FIFO is refused, not waited on.
+   */
   async function readText(path: string): Promise<string | null> {
     fence(path);
-    try {
-      return await readFile(path, "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-      throw err;
+    const rel = storeRel(path);
+    const read = await openForRead(storeDir, rel, {
+      maxBytes: STATE_FILE_MAX_BYTES,
+      followLeafSymlink: false,
+    });
+    if (!read.ok) {
+      if (read.code === "not-found") return null;
+      throw new ContinuityStoreError(
+        read.code === "escapes-root"
+          ? outsideStoreMessage("read", rel)
+          : `continuity-store: refusing to read ${rel}: ${read.reason}`,
+      );
     }
+    if (read.truncated) {
+      throw new ContinuityStoreError(
+        `continuity-store: ${rel} is larger than ${STATE_FILE_MAX_BYTES} bytes, so it was not read. Trim it, or clear it with MemoryClear.`,
+      );
+    }
+    return read.text;
+  }
+
+  /**
+   * The refusal for a store path that resolves outside the store: a
+   * symlinked file, or a symlinked `plans/` directory leading out. The
+   * helper's own reason says "the workspace", which is the store here.
+   */
+  function outsideStoreMessage(op: "read" | "write", rel: string): string {
+    return `continuity-store: refusing to ${op} ${rel}: it resolves outside the continuity store, through a symlinked file or a symlinked plans/ directory. Keep the store's files and plans/ inside it; to keep the state somewhere else, link the store's own directory instead.`;
   }
 
   function locked<T>(fn: () => Promise<T>): Promise<T> {

@@ -8,7 +8,8 @@
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../infra-utils" },
-    { "path": "../tenancy" }
+    { "path": "../tenancy" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }
