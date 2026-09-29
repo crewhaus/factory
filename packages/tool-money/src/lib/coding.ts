@@ -65,11 +65,25 @@ type RuleVerdict =
   | { readonly verdict: "undetermined"; readonly reason: string };
 
 /**
+ * Whether `check` gets as far as running its pattern on `line`: its path
+ * resolves to a string. Asked of the evaluator itself (tool-schema's
+ * `askCheckPatterns` asks exactly the questions `runChecks` will), so the
+ * two cannot disagree.
+ */
+function reachesPattern(line: Record<string, unknown>, check: Check): boolean {
+  const probe = new RegexAnswers();
+  askCheckPatterns(line, [check], probe);
+  return probe.pending > 0;
+}
+
+/**
  * Whether `rule` holds for `line`, three ways. A condition whose pattern
  * could not be run to an answer is undetermined, and so is one whose
  * pattern the screen refused: the rule is malformed, and reading it as "did
  * not match" let a lower-priority rule code the line (C073). A condition
- * that definitely failed still decides the rule.
+ * that definitely failed still decides the rule, and so does one that fails
+ * before its pattern would run — the field is absent, or not a string — as
+ * it did on 0.7.0, whatever the pattern (bounds review).
  */
 function ruleVerdict(
   line: Record<string, unknown>,
@@ -82,9 +96,12 @@ function ruleVerdict(
   const open: string[] = [];
   for (const failure of report.failures) {
     const check = rule.when[failure.index] as Check;
+    if (failure.undetermined === true) {
+      open.push(failure.reason);
+      continue;
+    }
     const refusal = refused(check);
-    if (refusal !== undefined) open.push(refusal);
-    else if (failure.undetermined === true) open.push(failure.reason);
+    if (refusal !== undefined && reachesPattern(line, check)) open.push(refusal);
     else return { verdict: "fail" };
   }
   return { verdict: "undetermined", reason: open.join("; ") };
