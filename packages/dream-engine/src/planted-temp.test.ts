@@ -9,12 +9,14 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createDreamEngine } from "./index";
 import {
   DREAM_IDEMPOTENCY_FILENAME,
   DREAM_STATE_FILENAME,
@@ -71,5 +73,75 @@ describe("dream state writes never go through a planted link (0.7.1)", () => {
     await store.put({ key: "k", completedAt: "2026-09-29T00:00:00.000Z" } as never);
     expect(readFileSync(victim, "utf8")).toBe("ORIGINAL\n");
     expect((await store.get("k"))?.key).toBe("k");
+  });
+});
+
+/**
+ * 0.7.1 — the writes are rooted at `.crewhaus`, not at the lazily created
+ * `dream/` or `dream/<spec>/` directory. Rooted at its own directory, a write
+ * followed a link planted there as the root, and state.json, idempotency.json
+ * and the run lock landed wherever the link pointed.
+ */
+function dirLinkLayout(link: "dream" | "spec"): { crewhaus: string; outside: string } {
+  const base = mkdtempSync(join(tmpdir(), "dream-dirlinks-"));
+  ROOTS.push(base);
+  const crewhaus = join(base, "ws", ".crewhaus");
+  const outside = join(base, "outside");
+  mkdirSync(crewhaus, { recursive: true });
+  mkdirSync(join(outside, "spec"), { recursive: true });
+  if (link === "dream") symlinkSync(outside, join(crewhaus, "dream"));
+  else {
+    mkdirSync(join(crewhaus, "dream"));
+    symlinkSync(join(outside, "spec"), join(crewhaus, "dream", "spec"));
+  }
+  return { crewhaus, outside };
+}
+
+const listing = (dir: string): string[] => readdirSync(dir, { recursive: true }) as string[];
+
+describe("a directory link planted in .crewhaus/dream is refused (0.7.1)", () => {
+  for (const link of ["dream", "spec"] as const) {
+    test(`state.json, with the link at ${link === "dream" ? ".crewhaus/dream" : ".crewhaus/dream/<spec>"}`, async () => {
+      const { crewhaus, outside } = dirLinkLayout(link);
+      await expect(writeDreamState(join(crewhaus, "dream", "spec"), STATE)).rejects.toThrow(
+        /\(code escapes-root\)/,
+      );
+      expect(listing(outside)).toEqual(["spec"]);
+    });
+
+    test(`idempotency.json and its lock, with the link at ${link === "dream" ? ".crewhaus/dream" : ".crewhaus/dream/<spec>"}`, async () => {
+      const { crewhaus, outside } = dirLinkLayout(link);
+      const store = createFileIdempotencyStore(
+        join(crewhaus, "dream", "spec", DREAM_IDEMPOTENCY_FILENAME),
+      );
+      await expect(
+        store.put({ key: "k", completedAt: "2026-09-29T00:00:00.000Z" } as never),
+      ).rejects.toThrow(/\(code escapes-root\)/);
+      expect(listing(outside)).toEqual(["spec"]);
+    });
+  }
+
+  test("a dream run refuses before its run lock is taken, and writes nothing outside", async () => {
+    const { crewhaus, outside } = dirLinkLayout("dream");
+    const engine = createDreamEngine({
+      specName: "spec",
+      crewhausDir: crewhaus,
+      dream: { everyMs: 86_400_000, mode: "deterministic" },
+    });
+    await expect(engine.run()).rejects.toThrow(/refusing to use .*\(code escapes-root\)/);
+    expect(listing(outside)).toEqual(["spec"]);
+  });
+
+  test("control: an ordinary run writes its state under .crewhaus/dream/<spec>", async () => {
+    const base = mkdtempSync(join(tmpdir(), "dream-dirlinks-"));
+    ROOTS.push(base);
+    const crewhaus = join(base, ".crewhaus");
+    const engine = createDreamEngine({
+      specName: "spec",
+      crewhausDir: crewhaus,
+      dream: { everyMs: 86_400_000, mode: "deterministic" },
+    });
+    await engine.run();
+    expect(lstatSync(join(crewhaus, "dream", "spec", DREAM_STATE_FILENAME)).isFile()).toBe(true);
   });
 });

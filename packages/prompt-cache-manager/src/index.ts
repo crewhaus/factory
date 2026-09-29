@@ -26,7 +26,7 @@
  * store's read/write round-trip.
  */
 import { mkdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type {
   CanonicalCacheControl,
   CanonicalTextBlockParam,
@@ -287,17 +287,24 @@ export function createPromptCacheRotationStore(
         specName: opts.specName,
         lastRotatedAt: rotatedAt,
       };
-      await mkdir(rootDir, { recursive: true });
       // 0.7.1 — a random O_EXCL|O_NOFOLLOW temp, never the fixed
       // `<spec>.json.tmp`, which was opened through any link planted there; a
-      // link at the record itself is refused too.
+      // link at the record itself is refused too. The write is rooted at the
+      // record directory's PARENT (`.crewhaus` by default), so the lazily
+      // created `prompt-cache/` directory is contained as well: rooted at
+      // itself, a link planted there was followed as the root and the record
+      // landed wherever it pointed. The parent is the operator's.
+      const dir = resolve(rootDir);
+      const parent = dirname(dir);
+      await mkdir(parent, { recursive: true });
       const written = writeFileSafe(
-        rootDir,
-        `${opts.specName}.json`,
+        parent,
+        `${basename(dir)}/${opts.specName}.json`,
         `${JSON.stringify(record)}\n`,
         {
           overwrite: true,
           mode: 0o600,
+          createParents: true,
         },
       );
       if (!written.ok) {

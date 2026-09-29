@@ -17,13 +17,13 @@
  *      across process restarts (including under `fleet run` parallelism —
  *      the store's read-modify-write holds the shared infra-utils lock).
  */
-import { existsSync } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { existsSync, mkdirSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import type { IdempotencyRecord, IdempotencyStore } from "@crewhaus/durable-execution";
 import { CrewhausError } from "@crewhaus/errors";
 import { withFileLock } from "@crewhaus/infra-utils";
-import { writeFileSafe } from "@crewhaus/tool-safety/fs";
+import { ensureDirContained, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import type { DreamPhase1Counts } from "./phase1";
 
 /** How a dream run ended. `deterministic`/`full` are the success outcomes
@@ -90,15 +90,52 @@ export async function readDreamState(dreamDir: string): Promise<DreamState | nul
 }
 
 /**
+ * The directory every dream-engine file is contained in: the harness
+ * `.crewhaus`, two levels above a `<crewhaus>/dream/<spec>` directory. The
+ * engine passes its `crewhausDir` explicitly; this is the default for a
+ * caller that passes only the spec's directory.
+ *
+ * 0.7.1: rooting a write at the file's own directory followed a link planted
+ * at that lazily created directory (`.crewhaus/dream -> <outside>`) as the
+ * root, so state.json, idempotency.json and the run lock landed wherever the
+ * link pointed. Rooted here, with the path below it relative, each directory
+ * on the way is contained: a link that leads out of `.crewhaus` is refused.
+ * `.crewhaus` itself is the operator's, and may be a link.
+ */
+export function dreamStoreRoot(dreamDir: string): string {
+  return dirname(dirname(resolve(dreamDir)));
+}
+
+/**
+ * Create `dir` (and any missing parent) inside `root`, one contained component
+ * at a time; a link on the way that leads out of `root` is refused. Run before
+ * a lock is taken in `dir`, since the lock's own `mkdir -p` follows links.
+ */
+export function ensureDreamDir(dir: string, root: string = dreamStoreRoot(dir)): void {
+  const absRoot = resolve(root);
+  mkdirSync(absRoot, { recursive: true });
+  const made = ensureDirContained(absRoot, relative(absRoot, resolve(dir)), { mode: 0o700 });
+  if (!made.ok) {
+    throw new DreamStateError(
+      `dream-engine: refusing to use ${resolve(dir)}: ${made.reason} (code ${made.code})`,
+    );
+  }
+}
+
+/**
  * Replace `absPath` atomically: a random O_EXCL|O_NOFOLLOW temp beside it,
  * renamed into place (@crewhaus/tool-safety). 0.7.1 — the temp was the fixed
  * `<file>.tmp`, opened through any link planted there, and a link at the file
- * itself was written through; both are refused now, naming the file.
+ * itself was written through; both are refused now, naming the file. The
+ * write is rooted at `root` (see {@link dreamStoreRoot}).
  */
-function replaceFile(absPath: string, data: string): void {
-  const written = writeFileSafe(dirname(absPath), basename(absPath), data, {
+function replaceFile(root: string, absPath: string, data: string): void {
+  const absRoot = resolve(root);
+  mkdirSync(absRoot, { recursive: true });
+  const written = writeFileSafe(absRoot, relative(absRoot, resolve(absPath)), data, {
     overwrite: true,
     mode: 0o600,
+    createParents: true,
   });
   if (!written.ok) {
     throw new DreamStateError(
@@ -108,10 +145,12 @@ function replaceFile(absPath: string, data: string): void {
 }
 
 /** temp+rename atomic — a reader never observes a torn state.json. */
-export async function writeDreamState(dreamDir: string, state: DreamState): Promise<void> {
-  const path = join(dreamDir, DREAM_STATE_FILENAME);
-  await mkdir(dirname(path), { recursive: true });
-  replaceFile(path, `${JSON.stringify(state, null, 2)}\n`);
+export async function writeDreamState(
+  dreamDir: string,
+  state: DreamState,
+  root: string = dreamStoreRoot(dreamDir),
+): Promise<void> {
+  replaceFile(root, join(dreamDir, DREAM_STATE_FILENAME), `${JSON.stringify(state, null, 2)}\n`);
 }
 
 type IdempotencyFileShape = {
@@ -131,9 +170,14 @@ const DEFAULT_MAX_IDEMPOTENCY_RECORDS = 24;
  */
 export function createFileIdempotencyStore(
   path: string,
-  opts: { readonly maxRecords?: number } = {},
+  opts: {
+    readonly maxRecords?: number;
+    /** Where the file is contained; default {@link dreamStoreRoot} of its directory. */
+    readonly root?: string;
+  } = {},
 ): IdempotencyStore {
   const maxRecords = opts.maxRecords ?? DEFAULT_MAX_IDEMPOTENCY_RECORDS;
+  const root = opts.root ?? dreamStoreRoot(dirname(path));
 
   async function readAll(): Promise<IdempotencyFileShape> {
     if (!existsSync(path)) return { version: 1, records: {} };
@@ -154,6 +198,7 @@ export function createFileIdempotencyStore(
       return all.records[key];
     },
     async put(record) {
+      ensureDreamDir(dirname(path), root);
       await withFileLock(
         `${path}.lock`,
         async () => {
@@ -163,8 +208,7 @@ export function createFileIdempotencyStore(
             b.completedAt.localeCompare(a.completedAt),
           );
           const pruned = Object.fromEntries(entries.slice(0, maxRecords));
-          await mkdir(dirname(path), { recursive: true });
-          replaceFile(path, `${JSON.stringify({ version: 1, records: pruned })}\n`);
+          replaceFile(root, path, `${JSON.stringify({ version: 1, records: pruned })}\n`);
         },
         {
           label: "dream-engine",

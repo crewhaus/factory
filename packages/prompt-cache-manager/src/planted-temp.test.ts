@@ -9,6 +9,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -43,5 +44,38 @@ describe("the rotation record never goes through a planted link (0.7.1)", () => 
     symlinkSync(victim, join(rootDir, "other.json"));
     await expect(other.write(1)).rejects.toThrow(/\(code is-symlink\)/);
     expect(readFileSync(victim, "utf8")).toBe("ORIGINAL\n");
+  });
+
+  test("a directory link planted at .crewhaus/prompt-cache is refused: nothing lands outside", async () => {
+    const base = mkdtempSync(join(tmpdir(), "prompt-cache-dirlink-"));
+    ROOTS.push(base);
+    const crewhaus = join(base, "ws", ".crewhaus");
+    mkdirSync(crewhaus, { recursive: true });
+    const outside = join(base, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "spec.json"), "ORIGINAL\n");
+    // The directory is created lazily on the first write, so a model can
+    // plant it first; rooted at itself, the write followed it as the root.
+    symlinkSync(outside, join(crewhaus, "prompt-cache"));
+    const store = createPromptCacheRotationStore({
+      specName: "spec",
+      rootDir: join(crewhaus, "prompt-cache"),
+    });
+    await expect(store.write(1234)).rejects.toThrow(/\(code escapes-root\)/);
+    expect(readdirSync(outside)).toEqual(["spec.json"]);
+    expect(readFileSync(join(outside, "spec.json"), "utf8")).toBe("ORIGINAL\n");
+  });
+
+  test("control: the default root still lands under .crewhaus/prompt-cache", async () => {
+    const base = mkdtempSync(join(tmpdir(), "prompt-cache-default-"));
+    ROOTS.push(base);
+    const cwd = process.cwd();
+    process.chdir(base);
+    try {
+      await createPromptCacheRotationStore({ specName: "spec" }).write(99);
+      expect(lstatSync(join(base, ".crewhaus", "prompt-cache", "spec.json")).isFile()).toBe(true);
+    } finally {
+      process.chdir(cwd);
+    }
   });
 });
