@@ -70,8 +70,18 @@ export type ScopeFinding = { toolName: string; reason: string };
  * The irreducible residual a static check cannot reach is a tool that declares
  * NEITHER its capability NOR an outward name; that is the documented limit of
  * an annotation-based gate short of full dataflow analysis.
+ *
+ * Only the three facts it keys on are read, so a caller that has a tool's
+ * flags as data (the builtin manifest, for a tool it cannot import) audits
+ * it the same way.
  */
-export function auditToolScopes(tools: ReadonlyArray<RegisteredTool>): ScopeFinding[] {
+export function auditToolScopes(
+  tools: ReadonlyArray<{
+    readonly name: string;
+    readonly scope: string;
+    readonly ioCapability?: string;
+  }>,
+): ScopeFinding[] {
   const findings: ScopeFinding[] = [];
   for (const tool of tools) {
     if (tool.scope === "external") continue;

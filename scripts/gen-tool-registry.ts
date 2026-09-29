@@ -35,11 +35,11 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runtimeToolNames } from "../apps/cli/src/runtime-tool-names";
+import { TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
 import {
   THREDZ_ALIAS_TOOL_NAMES,
   THREDZ_MESSAGING_TOOL_NAMES,
 } from "../packages/memory-service/src/thredz";
-import { TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
 import {
   BUILTIN_TOOLS,
   builtinToolsFor,
@@ -89,10 +89,11 @@ type ToolLike = {
   readonly operativeArgs?: ReadonlyArray<RegistryOperativeArg>;
 };
 
-const rows: string[] = [];
-const flagRows: string[] = [];
-const builtinNames = new Set<string>();
-for (const key of keys) {
+/** The manifest row of one builtin, read off the tool the table says exports it. */
+async function projectBuiltin(key: string): Promise<{
+  readonly tool: ToolLike;
+  readonly projected: ReturnType<typeof projectRegistryEntry>;
+}> {
   const entry = BUILTIN_TOOLS[key];
   if (entry === undefined) throw new Error(`no builtin table entry for ${key}`);
   // Workspace deps are linked per package, not hoisted to the root, so a
@@ -117,9 +118,29 @@ for (const key of keys) {
     package: entry.package,
     keywords: TOOL_KEYWORDS[key] ?? [],
   });
+  return { tool, projected };
+}
+
+const rows: string[] = [];
+const flagRows: string[] = [];
+const builtinNames = new Set<string>();
+for (const key of keys) {
+  const { tool, projected } = await projectBuiltin(key);
   builtinNames.add(tool.name);
   rows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projected)},`);
   flagRows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projectToolFlags(projected))},`);
+}
+
+// The builtins no cli bundle carries — the evm tools of the graph, workflow
+// and crew shapes, the channel shape's SendMessage — get flag rows of their
+// own, so a check of a spec of THOSE shapes (the compile --strict scope gate,
+// the rule checker) reads their real flags instead of skipping them.
+const cliKeys = new Set(keys);
+const nonCliFlagRows: string[] = [];
+for (const key of Object.keys(BUILTIN_TOOLS).sort()) {
+  if (cliKeys.has(key)) continue;
+  const { projected } = await projectBuiltin(key);
+  nonCliFlagRows.push(`  ${JSON.stringify(key)}: ${JSON.stringify(projectToolFlags(projected))},`);
 }
 
 writeFileSync(
@@ -180,6 +201,17 @@ ${flagRows.join("\n")}
 export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
   Object.values(TOOL_FLAGS).map((flags) => [flags.name, flags]),
 );
+
+/**
+ * How the builtins that no cli bundle carries are gated: the evm tools of the
+ * graph, workflow and crew shapes, and the channel shape's SendMessage.
+ * {@link TOOL_FLAGS} mirrors the cli manifest (\`TOOL_REGISTRY\`, what
+ * \`crewhaus tools\` offers a cli spec), so these are kept apart; a check of a
+ * spec of another shape reads them from here rather than skip the tool.
+ */
+export const NON_CLI_TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
+${nonCliFlagRows.join("\n")}
+};
 
 /**
  * The other tools this release defines: ones the runtime registers without a

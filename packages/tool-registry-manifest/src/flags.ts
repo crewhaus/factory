@@ -5535,6 +5535,115 @@ export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
 );
 
 /**
+ * How the builtins that no cli bundle carries are gated: the evm tools of the
+ * graph, workflow and crew shapes, and the channel shape's SendMessage.
+ * {@link TOOL_FLAGS} mirrors the cli manifest (`TOOL_REGISTRY`, what
+ * `crewhaus tools` offers a cli spec), so these are kept apart; a check of a
+ * spec of another shape reads them from here rather than skip the tool.
+ */
+export const NON_CLI_TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
+  evmBlockNumber: {
+    key: "evmBlockNumber",
+    name: "EvmBlockNumber",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "chainId", kind: "id" }],
+  },
+  evmCall: {
+    key: "evmCall",
+    name: "EvmCall",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "to", kind: "id", within: "chainId" }],
+  },
+  evmGetBalance: {
+    key: "evmGetBalance",
+    name: "EvmGetBalance",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "address", kind: "id", within: "chainId" }],
+  },
+  evmGetLogs: {
+    key: "evmGetLogs",
+    name: "EvmGetLogs",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "address", kind: "id", default: "*", within: "chainId" }],
+  },
+  evmGetTransaction: {
+    key: "evmGetTransaction",
+    name: "EvmGetTransaction",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "txHash", kind: "id", within: "chainId" }],
+  },
+  evmGetTransactionReceipt: {
+    key: "evmGetTransactionReceipt",
+    name: "EvmGetTransactionReceipt",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "txHash", kind: "id", within: "chainId" }],
+  },
+  evmSendTransaction: {
+    key: "evmSendTransaction",
+    name: "EvmSendTransaction",
+    readOnly: false,
+    destructive: true,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: true,
+    operativeArgs: [{ field: "to", kind: "recipient" }],
+  },
+  evmSimulate: {
+    key: "evmSimulate",
+    name: "EvmSimulate",
+    readOnly: true,
+    destructive: false,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "to", kind: "id" }],
+  },
+  sendMessage: {
+    key: "sendMessage",
+    name: "SendMessage",
+    readOnly: false,
+    destructive: true,
+    scope: "external",
+    ioCapability: "network",
+    requiresSandbox: false,
+    requireJustification: true,
+    operativeArgs: [{ field: "channel", kind: "id" }],
+  },
+};
+
+/**
  * The other tools this release defines: ones the runtime registers without a
  * spec listing them (`Skill`, `ListTools`, `Task`, the browser shape's
  * `Type`, the memory and plan tools, `Consult`, …). Names only — how

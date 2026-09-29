@@ -20,6 +20,7 @@
     "@crewhaus/target-cli": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*",
     "@crewhaus/tool-permission-matcher": "workspace:*",
     "@crewhaus/tool-registry-manifest": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*",

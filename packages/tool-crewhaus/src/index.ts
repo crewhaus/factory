@@ -53,10 +53,17 @@ import {
   runPreflight,
 } from "@crewhaus/preflight";
 import { type Spec, parseSpec, parseSpecIssues } from "@crewhaus/spec";
-import { BUILTIN_TOOL_MAP } from "@crewhaus/target-cli";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
+  BUILTIN_TOOLS,
+  SHAPE_TOOL_PROFILES,
+  type ToolShape,
+  builtinKeyForName,
+  checkBuiltinTool,
+} from "@crewhaus/tool-categories";
+import {
+  NON_CLI_TOOL_FLAGS,
   RUNTIME_TOOL_NAMES,
   THREDZ_TOOL_NAMES,
   TOOL_FLAGS,
@@ -529,25 +536,26 @@ export const toolInventory: RegisteredTool = buildTool({
     // checked against a runtime that is not this one — a bundle compiled from
     // another release has a different builtin set.
     //
-    // The set comes from `BUILTIN_TOOL_MAP` and NOT from the manifest's main
-    // entry, although the manifest has the same keys. This tool needs the key
-    // SET; the main entry is 455 KB of key set plus description prose, which
-    // every bundle granting any tool-crewhaus tool would then load — and
-    // `crewhaus` sits inside the `all-operations` roll-up. (PermissionAudit,
-    // in this package, reads the manifest's `/flags` table, which carries no
-    // prose; `apps/cli/src/tool-registry.test.ts` holds that line.) `target-cli`
-    // is already in this package's dependency closure via `@crewhaus/compiler`,
-    // so this costs nothing. That the two key sets are identical is not an
-    // assumption: `apps/cli/src/tool-registry.test.ts` asserts it in both
-    // directions on every run.
+    // By default each name is checked the way the compiler checks it, for the
+    // spec's own shape, from the one builtin table (`@crewhaus/tool-categories`,
+    // data only): a graph spec's `evmCall` is a real tool, not `unknown` as it
+    // was when the check read the cli set (C001); a builtin this shape cannot
+    // run is `notOnShape`, with compile's reason. A narrowing list may name a
+    // builtin by its registered name (`Read`), and a tool the runtime adds
+    // itself (`Skill`, a thredz: block's `goal_list`) is real too.
     const usedCallerList = input.knownTools !== undefined;
-    const known = usedCallerList
-      ? new Set(input.knownTools)
-      : new Set(Object.keys(BUILTIN_TOOL_MAP));
+    const callerKnown = new Set(input.knownTools ?? []);
+    const target = asRecord(parsed.value)?.["target"];
+    const shape: ToolShape =
+      typeof target === "string" && Object.hasOwn(SHAPE_TOOL_PROFILES, target)
+        ? (target as ToolShape)
+        : "cli";
+    const runtimeKnown = new Set([...RUNTIME_TOOL_NAMES, ...thredzToolNamesOfSpec(parsed.value)]);
 
     const builtin: string[] = [];
     const mcp: Array<{ tool: string; server: string; declared: boolean }> = [];
     const unknown: string[] = [];
+    const notOnShape: Array<{ tool: string; reason: string }> = [];
     for (const tool of resolved.tools) {
       if (tool.startsWith("mcp__")) {
         const server = mcpServerOf(tool, servers);
@@ -555,9 +563,19 @@ export const toolInventory: RegisteredTool = buildTool({
         continue;
       }
       builtin.push(tool);
-      if (!known.has(tool) && !known.has(toRegisteredName(tool))) {
-        unknown.push(tool);
+      if (usedCallerList) {
+        if (!callerKnown.has(tool) && !callerKnown.has(toRegisteredName(tool))) {
+          unknown.push(tool);
+        }
+        continue;
       }
+      const key = Object.hasOwn(BUILTIN_TOOLS, tool) ? tool : builtinKeyForName(tool);
+      if (key === undefined) {
+        if (!runtimeKnown.has(tool)) unknown.push(tool);
+        continue;
+      }
+      const verdict = checkBuiltinTool(key, shape);
+      if (verdict.kind === "refused") notOnShape.push({ tool, reason: verdict.message });
     }
 
     return json({
@@ -568,6 +586,7 @@ export const toolInventory: RegisteredTool = buildTool({
       mcp,
       dangling: mcp.filter((m) => !m.declared).map((m) => m.tool),
       unknown,
+      ...(usedCallerList ? {} : { shape, notOnShape }),
       checkedAgainst: usedCallerList ? "the knownTools you passed" : "this release's builtins",
       sites: resolved.toolSites,
       declaredSelectors: declared.toolSites,
@@ -671,12 +690,17 @@ export const permissionAudit: RegisteredTool = buildTool({
       // from the manifest generated off the tools themselves, instead of
       // "external" read off six legacy names and "destructive" read off
       // nothing.
-      flagsOf: (tool) => TOOL_FLAGS[tool] ?? TOOL_FLAGS_BY_NAME.get(tool),
+      flagsOf: (tool) =>
+        TOOL_FLAGS[tool] ??
+        TOOL_FLAGS_BY_NAME.get(tool) ??
+        NON_CLI_TOOL_FLAGS[tool] ??
+        Object.values(NON_CLI_TOOL_FLAGS).find((flags) => flags.name === tool),
       // The builtins, and the tools the runtime registers without a spec
       // listing them — `alwaysAllow Skill` names a real tool, and so does
       // `alwaysAllow goal_list` in a spec with a `thredz:` block.
       knownTools: [
         ...Object.values(TOOL_FLAGS),
+        ...Object.values(NON_CLI_TOOL_FLAGS),
         ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
         ...thredzToolNamesOfSpec(parsed.value).map((name) => ({ name })),
       ],

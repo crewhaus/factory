@@ -29,8 +29,11 @@ import {
 import { BUILTIN_BOOKKEEPING_RULES } from "@crewhaus/permission-engine";
 import { RETAINED_LOOP_TOOL_NAMES } from "@crewhaus/runtime-core";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { BUILTIN_TOOLS, builtinToolsFor } from "@crewhaus/tool-categories";
 import { permissionRuleProblems } from "@crewhaus/tool-permission-matcher";
+import { projectRegistryEntry, projectToolFlags } from "@crewhaus/tool-registry-manifest";
 import {
+  NON_CLI_TOOL_FLAGS,
   RUNTIME_TOOL_NAMES,
   THREDZ_TOOL_NAMES,
   TOOL_FLAGS,
@@ -75,6 +78,33 @@ describe("RUNTIME_TOOL_NAMES", () => {
     const missing = [...bookkeeping, ...RETAINED_LOOP_TOOL_NAMES].filter((n) => !known.has(n));
     expect(missing).toEqual([]);
   });
+});
+
+// C001 (wave III): the builtins no cli bundle carries had no flags anywhere
+// the CLI could read, so `compile --strict` skipped them instead of auditing.
+describe("NON_CLI_TOOL_FLAGS", () => {
+  test("is every builtin the cli shape does not carry, read off the tool itself", async () => {
+    const cli = new Set(builtinToolsFor("cli"));
+    const expected = Object.keys(BUILTIN_TOOLS)
+      .filter((k) => !cli.has(k))
+      .sort();
+    expect(Object.keys(NON_CLI_TOOL_FLAGS)).toEqual(expected);
+    expect(expected.length).toBeGreaterThanOrEqual(9);
+    for (const key of expected) {
+      const entry = BUILTIN_TOOLS[key];
+      if (entry === undefined) throw new Error(key);
+      // The generator imports each package by file; so does this check.
+      const mod = (await import(
+        join(REPO, "packages", entry.package.replace("@crewhaus/", ""), "src", "index.ts")
+      )) as Record<string, Parameters<typeof projectRegistryEntry>[0]["tool"]>;
+      const tool = mod[entry.export];
+      if (tool === undefined) throw new Error(`${entry.package} lacks ${entry.export}`);
+      const fresh = projectToolFlags(
+        projectRegistryEntry({ key, tool, categories: [], package: entry.package, keywords: [] }),
+      );
+      expect({ key, flags: NON_CLI_TOOL_FLAGS[key] }).toEqual({ key, flags: fresh });
+    }
+  }, 30_000);
 });
 
 describe("THREDZ_TOOL_NAMES", () => {

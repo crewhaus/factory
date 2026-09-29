@@ -409,6 +409,56 @@ describe("ToolInventory", () => {
     expect(result.note).toBeUndefined();
   });
 
+  // C001 (wave III): the check read the cli set whatever the spec's shape, so
+  // a graph node's `evmCall`, which compiles there, came back unknown.
+  test("builtins are checked for the spec's own shape", async () => {
+    const graph = [
+      "name: g",
+      "target: graph",
+      "model: claude-sonnet-5",
+      "entry: plan",
+      "nodes:",
+      "  plan:",
+      "    instructions: plan",
+      "    tools: [evmCall, jsonQuery]",
+      "edges: []",
+    ].join("\n");
+    const onGraph = await callJson<{
+      unknown: string[];
+      notOnShape: Array<{ tool: string; reason: string }>;
+      shape: string;
+    }>(toolInventory, { spec: graph });
+    expect([onGraph.shape, onGraph.unknown, onGraph.notOnShape]).toEqual(["graph", [], []]);
+    const cli = CLI_SPEC.replace("tools: [read, write, bash]", "tools: [read, evmCall]");
+    const onCli = await callJson<{
+      unknown: string[];
+      notOnShape: Array<{ tool: string; reason: string }>;
+    }>(toolInventory, { spec: cli });
+    expect(onCli.unknown).toEqual([]);
+    expect(onCli.notOnShape.map((n) => n.tool)).toEqual(["evmCall"]);
+    expect(onCli.notOnShape[0]?.reason).toContain(
+      "only the graph, workflow and crew shapes carry it",
+    );
+  });
+
+  test("a sub-agent's registered names and the runtime's own tools are real", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: m",
+      "  instructions: go",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: h",
+      "      tools: [Read, CodeGraphSearch, Skill, NoSuchThing]",
+      "tools: [read, codegraphSearch]",
+    ].join("\n");
+    const result = await callJson<{ unknown: string[] }>(toolInventory, { spec });
+    expect(result.unknown).toEqual(["NoSuchThing"]);
+  });
+
   test("a spec of real tools reports nothing unknown", async () => {
     const result = await callJson<{ unknown: string[] }>(toolInventory, { spec: CLI_SPEC });
     expect(result.unknown).toEqual([]);

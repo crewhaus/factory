@@ -8,6 +8,7 @@
     { "path": "../preflight" },
     { "path": "../audit-log" },
     { "path": "../tool-catalog" },
+    { "path": "../tool-categories" },
     { "path": "../tool-builder" },
     { "path": "../tool-permission-matcher" },
     { "path": "../tool-registry-manifest" },

@@ -24,6 +24,7 @@ import {
   permissionRuleProblems,
 } from "@crewhaus/tool-permission-matcher";
 import {
+  NON_CLI_TOOL_FLAGS,
   RUNTIME_TOOL_NAMES,
   THREDZ_TOOL_NAMES,
   TOOL_FLAGS,
@@ -31,7 +32,7 @@ import {
 } from "@crewhaus/tool-registry-manifest/flags";
 import { type Document, type Scalar, isMap, isScalar, isSeq, parseDocument } from "yaml";
 import { auditModelPlan } from "./model-plan-lint";
-import { auditSpecToolNames, collectToolNames } from "./scope-audit";
+import { auditSpecToolNames, collectToolNames, nonCliBuiltinFlags } from "./scope-audit";
 
 /**
  * Item 41 — `crewhaus lint`. A check-only command: `parseSpec` +
@@ -230,6 +231,7 @@ export function runLint(
  */
 export const KNOWN_TOOLS: ReadonlyArray<RuleToolDescriptor> = [
   ...Object.values(TOOL_FLAGS),
+  ...Object.values(NON_CLI_TOOL_FLAGS),
   ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
 ];
 
@@ -353,7 +355,8 @@ export function permissionRuleProblemsOf(
   const granted: RuleToolDescriptor[] = [];
   for (const name of collectToolNames(ir)) {
     const live = resolveTool(name);
-    const described = live ?? TOOL_FLAGS[name] ?? TOOL_FLAGS_BY_NAME.get(name);
+    const described =
+      live ?? TOOL_FLAGS[name] ?? TOOL_FLAGS_BY_NAME.get(name) ?? nonCliBuiltinFlags(name);
     if (described === undefined) continue;
     granted.push({
       name: described.name,
