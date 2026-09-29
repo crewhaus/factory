@@ -30,6 +30,10 @@
     "**/fixtures.ts",
     "**/*-fixtures.ts",
     "**/fixtures/**",
-    "**/__fixtures__/**"
+    "**/__fixtures__/**",
+    "**/__test__/**",
+    "**/__tests__/**",
+    "**/test-helpers.ts",
+    "**/testkit.ts"
   ]
 }
