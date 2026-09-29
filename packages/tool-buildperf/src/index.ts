@@ -24,11 +24,12 @@
  * filesystem packages use. Nothing here runs a build, a benchmark or a test:
  * the measurements come in, the honest reading of them comes out.
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { statsKernel } from "@crewhaus/tool-math";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import {
   describeRegexOutcome,
   openRegexSession,
@@ -59,7 +60,7 @@ import {
   joinKey,
   parametersMismatch,
 } from "./lib/size";
-import { resolveSafe, toPosix } from "./paths";
+import { resolveSafe, toPosix, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -69,6 +70,8 @@ const LIMITS = {
   entries: 2_000,
   /** Compressing a file this big to weigh it is not the intended use. */
   fileBytes: 512 * 1024 * 1024,
+  /** A stored size report: entries and totals, never the bundle itself. */
+  baselineBytes: 64 * 1024 * 1024,
   budgets: 200,
   benchmarks: 500,
   samplesPerSide: 10_000,
@@ -221,7 +224,14 @@ function measure(
     if (stats.size > LIMITS.fileBytes) {
       throw new Error(`"${path}" is ${stats.size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
     }
-    const bytes = readFileSync(at.real);
+    // Opened as the regular file the stat saw, without blocking: a name
+    // swapped for a FIFO after the stat is refused, not waited on.
+    const read = openForReadSync(workspaceRoot(), path, { maxBytes: LIMITS.fileBytes });
+    if (!read.ok) throw new Error(`BundleSizeCheck: ${read.reason}`);
+    if (read.truncated) {
+      throw new Error(`"${path}" is ${read.size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
+    }
+    const bytes = Buffer.from(read.bytes.buffer, read.bytes.byteOffset, read.bytes.byteLength);
     return {
       path: at.rel,
       // A custom join is keyed afterwards, in the regex worker.
@@ -453,9 +463,20 @@ export const bundleSizeCheck: RegisteredTool = buildTool({
     let baseline: BaselineInput | undefined = input.baseline;
     if (input.baselineFile !== undefined) {
       const at = resolveSafe("BundleSizeCheck", input.baselineFile);
+      // Opened without blocking, and only as a regular file: a FIFO with no
+      // writer blocks an ordinary open for ever, and this read was
+      // synchronous, so a named pipe named as the baseline stopped the whole
+      // harness (C074). A baseline is a size report, so it is capped too.
+      const read = openForReadSync(workspaceRoot(), input.baselineFile, {
+        maxBytes: LIMITS.baselineBytes,
+      });
+      if (!read.ok) return `baseline file could not be read: ${read.reason}`;
+      if (read.truncated) {
+        return `baseline file "${at.rel}" is over the ${LIMITS.baselineBytes}-byte limit for a size report, so it was not read`;
+      }
       let parsed: unknown;
       try {
-        parsed = JSON.parse(readFileSync(at.real, "utf-8"));
+        parsed = JSON.parse(read.text);
       } catch (err) {
         return `baseline file "${at.rel}" is not valid JSON: ${(err as Error).message}`;
       }

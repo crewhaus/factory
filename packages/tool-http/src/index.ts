@@ -53,6 +53,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import {
   type SecretValue,
+  containsKnownSecret,
   redactKnownSecrets,
   redactKnownSecretsDeep,
   secretForms,
@@ -313,7 +314,12 @@ function holdsSecret(bytes: Uint8Array, secrets: readonly SecretValue[]): boolea
       if (form.length >= 6 && buf.includes(form)) return true;
     }
   }
-  return false;
+  // A spelling escaped character by character (System.Text.Json's `\u002B`
+  // for `+`, a lower-case `%2f`, an HTML `&#x2F;`) is no whole form; it is
+  // found through the decoded text. Non-UTF-8 bytes decode to U+FFFD and
+  // leave an ASCII credential intact.
+  if (secrets.length === 0) return false;
+  return containsKnownSecret(new TextDecoder("utf-8").decode(bytes), secrets);
 }
 
 /** Run `fn` over `items` with at most `limit` in flight, results in input order. */
@@ -1455,7 +1461,14 @@ export const httpWaitFor: RegisteredTool = buildTool({
             );
             const parsed = parseJsonBody(body.text, secrets);
             if (parsed.ok) {
-              jsonOk = matchesPredicateSafely(parsed.value, predicate);
+              // Judged on the body AS THE CALLER MAY SEE IT, credentials
+              // redacted. On the raw body, `contains` and `equals` against
+              // an echoed header answered met/not-met for a guessed prefix,
+              // so a listed credential could be read out one character per
+              // call from any allow-listed origin that echoes (C050).
+              const visible =
+                secrets.length === 0 ? parsed.value : redactKnownSecretsDeep(parsed.value, secrets);
+              jsonOk = matchesPredicateSafely(visible, predicate);
               lastError = undefined;
             } else {
               jsonOk = false;

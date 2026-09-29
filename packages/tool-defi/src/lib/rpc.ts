@@ -25,6 +25,7 @@
 import { assertReadOnlyMethod } from "@crewhaus/chain-adapter-base";
 import { CrewhausError } from "@crewhaus/errors";
 import { parseMulticallMap } from "@crewhaus/tool-onchain";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 /** A refusal this package chose: a missing endpoint, a bad shape, a write attempt. */
 export class DefiError extends CrewhausError {
@@ -260,7 +261,14 @@ export function requireEndpoint(config: DefiConfig, chainId: string): string {
 
 export type DefiFetch = (req: Request) => Promise<Response>;
 
-const realFetch: DefiFetch = (req) => globalThis.fetch(req);
+/**
+ * The body is kept RAW (`fetchRaw`, Bun's `decompress: false`): otherwise Bun
+ * inflates a gzip, deflate, br or zstd reply in native code before any
+ * reader sees a byte, so a 260 KB gzip of zeros from an RPC or price
+ * endpoint cost about 1 GB of RSS before the cap fired (C093). `readCapped`
+ * decodes it, under the cap.
+ */
+const realFetch: DefiFetch = (req) => fetchRaw(req);
 let defiFetch: DefiFetch = realFetch;
 
 /**
@@ -498,14 +506,20 @@ export async function rpcCall<T = unknown>(
       };
     }
 
-    const text = await readCapped(res, MAX_RESPONSE_BYTES);
-    if (text === null) {
+    const read = await readCapped(res, MAX_RESPONSE_BYTES, deadline.signal);
+    if (!read.ok) {
       return {
         ok: false,
-        kind: "malformed",
-        message: `${label} sent more than ${MAX_RESPONSE_BYTES} bytes for ${method} — refusing to answer from a prefix of it`,
+        kind: read.why === "aborted" ? "transport" : "malformed",
+        message:
+          read.why === "too-large"
+            ? `${label} sent more than ${MAX_RESPONSE_BYTES} bytes for ${method} — refusing to answer from a prefix of it`
+            : read.why === "aborted"
+              ? `the deadline elapsed before ${label} finished answering ${method}`
+              : `${label} answered ${method} with a body that could not be decoded (${read.why})`,
       };
     }
+    const text = read.text;
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -665,14 +679,20 @@ async function dialJson(
         ),
       };
     }
-    const text = await readCapped(res, MAX_RESPONSE_BYTES);
-    if (text === null) {
+    const read = await readCapped(res, MAX_RESPONSE_BYTES, deadline.signal);
+    if (!read.ok) {
       return {
         ok: false,
-        kind: "malformed",
-        message: `${label} sent more than ${MAX_RESPONSE_BYTES} bytes`,
+        kind: read.why === "aborted" ? "transport" : "malformed",
+        message:
+          read.why === "too-large"
+            ? `${label} sent more than ${MAX_RESPONSE_BYTES} bytes`
+            : read.why === "aborted"
+              ? `the deadline elapsed before ${label} finished answering`
+              : `${label} answered with a body that could not be decoded (${read.why})`,
       };
     }
+    const text = read.text;
     try {
       return { ok: true, value: JSON.parse(text) };
     } catch (err) {
@@ -755,47 +775,38 @@ async function discard(res: Response): Promise<void> {
   }
 }
 
-/** Read a body with a hard byte cap, cancelling the stream once it is passed. */
-async function readCapped(res: Response, maxBytes: number): Promise<string | null> {
-  if (res.body === null) {
-    const text = await res.text();
-    return new TextEncoder().encode(text).byteLength > maxBytes ? null : text;
-  }
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let over = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        over = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
-  }
-  if (over) return null;
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+type CappedText =
+  | { readonly ok: true; readonly text: string }
+  | {
+      readonly ok: false;
+      /** `too-large`, `aborted`, or why the body could not be decoded. */
+      readonly why: string;
+    };
+
+/**
+ * Read a body with a hard cap on its DECODED size: the body arrives raw (see
+ * `realFetch`), a gzip, deflate, br or zstd body is decoded here in small
+ * steps, and the decoder stops at the cap. A body past it is refused, never
+ * parsed from a prefix.
+ */
+async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<CappedText> {
+  const read = await readResponseBounded(res, { maxBytes, signal });
+  if (read.ok)
+    return read.truncated ? { ok: false, why: "too-large" } : { ok: true, text: read.text };
+  if (read.code === "aborted" || read.code === "stalled") return { ok: false, why: "aborted" };
+  return {
+    ok: false,
+    why:
+      read.code === "unsupported-encoding"
+        ? "a stack of content-encodings this package cannot decode within its cap"
+        : read.code === "read-error"
+          ? "the connection closed before the body ended"
+          : "it is labelled as compressed but is not",
+  };
 }
 
 export type Deadline = { readonly signal: AbortSignal; readonly ms: number; cancel(): void };

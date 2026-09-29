@@ -795,6 +795,8 @@ export {
  * then read (see `./lib/regex-answers`).
  */
 export {
+  CALLER_PATTERN_DEADLINE_MS,
+  MAX_PATTERN_QUESTIONS,
   type RegexAnswer,
   RegexAnswers,
   type RegexRunContext,

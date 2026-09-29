@@ -79,13 +79,14 @@
  *      Nothing here writes a substitute log.
  */
 
-import { readFileSync, readdirSync, realpathSync } from "node:fs";
+import { readdirSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { createDeploymentController } from "@crewhaus/deployment-controller";
 import { autoRegisterSpecVersion, nextVersion } from "@crewhaus/spec-changelog";
 import { type RegistryAdapter, createFileBackedRegistry } from "@crewhaus/spec-registry";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   AUDIT_LOG_UNAVAILABLE,
@@ -125,12 +126,22 @@ import {
 } from "./lib/result";
 import { workspaceRoot } from "./paths";
 
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which changed the
+ * spec SpecPin registers, so a spec pinned on 0.7.0 no longer content-matched
+ * its own version (bounds review).
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
+
 // ---------------------------------------------------------------------------
 // shared plumbing
 // ---------------------------------------------------------------------------
 
 /** Longest actor label accepted, for the same reason paths are bounded. */
 const MAX_ACTOR_CHARS = 200;
+/** The largest spec file SpecPin reads. A spec is configuration, not data. */
+const MAX_SPEC_BYTES = 16 * 1024 * 1024;
 
 /** Ceiling on how many specs one DeployInspect answer enumerates. */
 const DEFAULT_SPEC_LIMIT = 200;
@@ -445,17 +456,26 @@ export const specPin: RegisteredTool = buildTool({
     if (fileProbe.kind === "directory") {
       return refusal(tool, "not-a-directory", `"${render(input.specFile)}" is a directory`);
     }
-    let yaml: string;
-    try {
-      yaml = readFileSync(specFile.value.real, "utf8");
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
+    // Opened without blocking, and only as a regular file: a FIFO with no
+    // writer blocks an ordinary open for ever, and this read was
+    // synchronous, so a named pipe named as the spec stopped the whole
+    // harness, dry run or not (C074). The limit is enforced while reading.
+    const read = openForReadSync(workspaceRoot(), input.specFile, { maxBytes: MAX_SPEC_BYTES });
+    if (!read.ok) {
       return refusal(
         tool,
         "unreadable",
-        `"${render(input.specFile)}" could not be read (${code ?? (err as Error).message})`,
+        `"${render(input.specFile)}" could not be read: ${read.reason}`,
       );
     }
+    if (read.truncated) {
+      return refusal(
+        tool,
+        "unreadable",
+        `"${render(input.specFile)}" is over the ${MAX_SPEC_BYTES}-byte limit for a spec, so it was not read`,
+      );
+    }
+    const yaml = KEEP_BOM.decode(read.bytes);
 
     // Contain the root and the leaves. The version files are not known yet, so
     // this first pass contains what does not depend on them; the manifest read

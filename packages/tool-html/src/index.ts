@@ -12,9 +12,9 @@
  * the browser, the markup will not contain the content, and the tools will
  * correctly report that it does not.
  */
-import { readFileSync, statSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   type TextBudget,
@@ -30,7 +30,7 @@ import {
 } from "./lib/extract";
 import { type Element, attrOf, parseHtml } from "./lib/parse";
 import { createMatchContext, queryAll } from "./lib/select";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -85,11 +85,17 @@ function loadSource(
   }
   if (input.file !== undefined) {
     const at = resolveSafe(tool, input.file);
-    const size = statSync(at.real).size;
-    if (size > LIMITS.fileBytes) {
-      throw new Error(`${at.rel} is ${size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
+    // Opened without blocking, and only as a regular file: a FIFO with no
+    // writer blocks an ordinary open for ever, and this read was synchronous,
+    // so a named pipe in the workspace stopped the whole harness (C074). The
+    // byte limit is enforced while reading, not by a size read before the
+    // open.
+    const read = openForReadSync(workspaceRoot(), input.file, { maxBytes: LIMITS.fileBytes });
+    if (!read.ok) throw new Error(`${tool}: ${read.reason}`);
+    if (read.truncated) {
+      throw new Error(`${at.rel} is ${read.size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
     }
-    const text = readFileSync(at.real, "utf-8");
+    const text = read.text;
     return { root: parseHtml(text), from: at.rel, chars: text.length };
   }
   const text = input.html as string;
@@ -182,6 +188,12 @@ export const htmlQuery: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * What one table costs in the result before its rows and caption: its keys,
+ * counts, flags and brackets (133 characters at their widest, rounded up).
+ */
+const TABLE_ENVELOPE_CHARS = 144;
+
 export const htmlTable: RegisteredTool = buildTool({
   name: "HtmlTable",
   description:
@@ -217,10 +229,16 @@ export const htmlTable: RegisteredTool = buildTool({
     const tables: Array<Record<string, unknown>> = [];
     let tablesOmitted = 0;
     for (const table of chosen) {
-      if (budget.chars <= 0) {
+      // Each table's own fields (rowCount, truncated, the brackets) are
+      // charged before it is read, so a call that matches many empty or
+      // nested tables stops at the budget like one large table does. 0.7.0
+      // charged only cell text, and 100 000 `<table></table>` came back as
+      // 8.5 M characters (C167).
+      if (budget.chars < TABLE_ENVELOPE_CHARS) {
         tablesOmitted += 1;
         continue;
       }
+      budget.chars -= TABLE_ENVELOPE_CHARS;
       const lifted = extractTable(table, {
         maxRows,
         maxColumns: LIMITS.tableColumns,

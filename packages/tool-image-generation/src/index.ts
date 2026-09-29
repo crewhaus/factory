@@ -31,6 +31,7 @@
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { readBodyBounded, withRawBody } from "@crewhaus/tool-fetch/body";
 import { z } from "zod";
 
 export type ImageGenerationProvider = "openai" | "replicate" | "mock";
@@ -333,17 +334,17 @@ function rejectOnAbort(signal: AbortSignal): Promise<never> {
 
 /**
  * Read at most `maxBytes` of a body, racing every read against `signal`.
- * Returns the text and whether more was there; the stream is cancelled at
+ * Returns the bytes and whether more was there; the stream is cancelled at
  * the cap, so the rest is never buffered. A response with no body stream
  * reads as empty.
  */
-async function readBodyCapped(
+async function readBodyCappedBytes(
   res: Response,
   maxBytes: number,
   signal: AbortSignal,
-): Promise<{ readonly text: string; readonly truncated: boolean }> {
+): Promise<{ readonly bytes: Uint8Array; readonly truncated: boolean }> {
   const body = (res as { body?: ReadableStream<Uint8Array> | null }).body;
-  if (body === null || body === undefined) return { text: "", truncated: false };
+  if (body === null || body === undefined) return { bytes: new Uint8Array(0), truncated: false };
   const reader = body.getReader();
   const aborted = rejectOnAbort(signal);
   const chunks: Uint8Array[] = [];
@@ -372,7 +373,41 @@ async function readBodyCapped(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
+  return { bytes, truncated };
+}
+
+/** {@link readBodyCappedBytes}, as UTF-8 text. */
+async function readBodyCapped(
+  res: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<{ readonly text: string; readonly truncated: boolean }> {
+  const { bytes, truncated } = await readBodyCappedBytes(res, maxBytes, signal);
   return { text: new TextDecoder().decode(bytes), truncated };
+}
+
+/**
+ * {@link readBodyCapped} over the RAW body, then decoded with its output
+ * bounded by the same cap (tool-fetch's `readBodyBounded`, which is safe in
+ * a cf-worker bundle). A body that decodes past the cap reads as truncated;
+ * one that cannot be decoded is refused without quoting it.
+ */
+async function readDecoded(
+  res: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<{ readonly text: string; readonly truncated: boolean }> {
+  const encoding = res.headers.get("content-encoding");
+  if (encoding === null) return readBodyCapped(res, maxBytes, signal);
+  const raw = await readBodyCappedBytes(res, maxBytes, signal);
+  if (raw.truncated) return { text: "", truncated: true };
+  const decoded = await readBodyBounded(
+    new Response(raw.bytes, { headers: { "content-encoding": encoding } }),
+    maxBytes,
+  );
+  if (decoded.ok) return { text: new TextDecoder().decode(decoded.bytes), truncated: false };
+  if (decoded.code === "too-large") return { text: "", truncated: true };
+  throw new ImageGenerationError(`OpenAI image-generation response ${decoded.reason}`);
 }
 
 async function generateOpenAI(
@@ -426,20 +461,30 @@ async function generateOpenAI(
   try {
     // Raced as well as signalled: a fetch that ignores its signal (or is
     // handed one already aborted) still cannot hold the turn.
+    // The body is asked for RAW (Bun's `decompress: false`, via tool-fetch's
+    // edge-safe `withRawBody`): otherwise Bun inflates a gzip, deflate, br or
+    // zstd reply in native code before any reader sees a byte, so the
+    // maxResponseBytes cap bounded nothing (C093). `readDecoded` decodes it,
+    // under the cap. On workerd this is a no-op and the body is read as
+    // 0.7.0 read it.
     const res = await Promise.race([
-      fetchFn(`${baseUrl}/images/generations`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body,
-        signal: ctrl.signal,
-      }),
+      fetchFn(
+        `${baseUrl}/images/generations`,
+        withRawBody({
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "Accept-Encoding": "identity",
+          },
+          body,
+          signal: ctrl.signal,
+        }),
+      ),
       rejectOnAbort(ctrl.signal),
     ]);
     if (!res.ok) {
-      const { text } = await readBodyCapped(res, ERROR_BODY_BYTES, ctrl.signal).catch(() => ({
+      const { text } = await readDecoded(res, ERROR_BODY_BYTES, ctrl.signal).catch(() => ({
         text: "",
       }));
       const shown = text.length > 500 ? `${text.slice(0, 500)}… (truncated)` : text;
@@ -447,7 +492,7 @@ async function generateOpenAI(
         `OpenAI image-generation request failed (${res.status} ${res.statusText}): ${shown}`,
       );
     }
-    const read = await readBodyCapped(res, maxResponseBytes, ctrl.signal);
+    const read = await readDecoded(res, maxResponseBytes, ctrl.signal);
     if (read.truncated) {
       throw new ImageGenerationError(
         `OpenAI image-generation response body exceeded ${maxResponseBytes} bytes (tool_config.imageGenerate.maxResponseBytes); nothing past the cap was read`,

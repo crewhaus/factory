@@ -67,7 +67,14 @@ export const FORMAT_TOKENS: ReadonlyArray<{ token: string; means: string }> = Ob
 const TOKEN_RE =
   /\[([^\]]*)\]|GGGG|YYYY|YY|MMMM|MMM|MM|M|DDD|DD|D|dddd|ddd|dd|HH|H|hh|h|mm|m|ss|s|SSS|A|a|ZZZ|ZZ|Z|zz|WW|W|Q|X|x/g;
 
+/**
+ * Month and weekday names by `locale|kind|width|index`. The locale is the
+ * caller's spelling, so the cache is cleared rather than left to grow once
+ * it holds {@link MAX_NAMES}: every spelling of every tag would otherwise
+ * stay for the life of the process.
+ */
 const nameCache = new Map<string, string>();
+const MAX_NAMES = 2_048;
 
 function intlName(
   locale: string,
@@ -88,8 +95,14 @@ function intlName(
   } catch {
     value = kind === "month" ? (MONTH_NAMES[index] ?? "") : (WEEKDAY_NAMES[index] ?? "");
   }
+  if (nameCache.size >= MAX_NAMES) nameCache.clear();
   nameCache.set(key, value);
   return value;
+}
+
+/** Test-only: how many names the cache holds. */
+export function __nameCacheSizeForTest(): number {
+  return nameCache.size;
 }
 
 function monthName(month: number, width: "long" | "short", locale: string): string {

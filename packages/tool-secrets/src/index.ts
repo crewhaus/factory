@@ -41,7 +41,7 @@
  * until you revoke it there. The result says so every time.
  */
 import { randomBytes as cryptoRandomBytes } from "node:crypto";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -65,6 +65,7 @@ import {
   now,
   readJournal,
 } from "./lib/journal";
+import { readWorkspaceText } from "./lib/read";
 import {
   type Resolved,
   type SecretRef,
@@ -440,7 +441,7 @@ function readDocForEdit(toolName: string, path: string): Resolved<OpenedDoc> {
   try {
     return {
       ok: true,
-      value: { real, doc: parseEnvDoc(readFileSync(real, "utf8")), existed: true },
+      value: { real, doc: parseEnvDoc(readWorkspaceText(path)), existed: true },
     };
   } catch (err) {
     return refuse(

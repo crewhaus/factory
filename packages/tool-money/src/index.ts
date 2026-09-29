@@ -17,7 +17,7 @@
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { openForRead } from "@crewhaus/tool-safety/fs";
-import { ASSERT_OPS } from "@crewhaus/tool-schema";
+import { ASSERT_OPS, regexRunContext } from "@crewhaus/tool-schema";
 import { z } from "zod";
 import {
   type OrderLine,
@@ -25,7 +25,7 @@ import {
   SHIPPING_POLICIES,
   computeRefund,
 } from "./lib/allocate";
-import { type CodingRule, codeLines } from "./lib/coding";
+import { type CodingRule, codeLinesAnsweringPatterns } from "./lib/coding";
 import { type Spend, checkSpendLimit, refundAbuseSignals } from "./lib/controls";
 import {
   IDENTIFIER_KINDS,
@@ -558,13 +558,19 @@ export const glCodeSuggest: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) =>
-    json(
-      codeLines(input.lines, input.rules as ReadonlyArray<CodingRule>, {
+  execute: async (input, ctx) => {
+    // `matches` patterns run in the regex worker, before the rules are read,
+    // a chunk of lines at a time: a pattern that cannot be run to an answer
+    // is undetermined, and the line goes to review rather than to a
+    // lower-priority rule.
+    return json(
+      await codeLinesAnsweringPatterns(input.lines, input.rules as ReadonlyArray<CodingRule>, {
         version: input.version,
         defaultAccount: input.defaultAccount,
+        run: regexRunContext(ctx),
       }),
-    ),
+    );
+  },
 });
 
 /**

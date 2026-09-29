@@ -21,6 +21,7 @@
  *      transcript.
  */
 import { assertReadOnlyMethod } from "@crewhaus/chain-adapter-base";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import { type VettedEndpoint, vetEndpoint } from "./endpoint";
 import { ChainReadError } from "./quantity";
 
@@ -77,7 +78,12 @@ const pinnedFetch: RpcFetch = async (req, pinnedIp) => {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (pinnedIp === "" || unbracketed === pinnedIp) return globalThis.fetch(req);
+  // Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`):
+  // otherwise Bun inflates a gzip, deflate, br or zstd reply in native code
+  // before any reader sees a byte, and a 260 KB gzip of zeros cost about
+  // 1 GB of RSS before `maxBytes` fired (C093). `readCapped` decodes it,
+  // under the cap.
+  if (pinnedIp === "" || unbracketed === pinnedIp) return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -95,7 +101,7 @@ const pinnedFetch: RpcFetch = async (req, pinnedIp) => {
     redirect: "manual",
     tls: { serverName: host },
   };
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 };
 
 let rpcFetch: RpcFetch = pinnedFetch;
@@ -246,8 +252,15 @@ async function request(endpoint: VettedEndpoint, spec: RequestSpec): Promise<Rpc
 
     let text: string;
     try {
-      text = await readCapped(res, spec.maxBytes);
+      text = await readCapped(res, spec.maxBytes, timer.signal);
     } catch (err) {
+      if (err instanceof BodyUnreadable) {
+        return {
+          ok: false,
+          kind: "malformed",
+          message: `${origin} answered ${spec.method} with a body that ${err.message}`,
+        };
+      }
       if (err instanceof BodyTooLarge) {
         return {
           ok: false,
@@ -337,41 +350,39 @@ async function request(endpoint: VettedEndpoint, spec: RequestSpec): Promise<Rpc
 }
 
 class BodyTooLarge extends Error {}
+class BodyUnreadable extends Error {}
 
 /**
- * Read a body with a ceiling, WHILE reading.
+ * Read a body with a ceiling on its DECODED size, WHILE reading.
  *
  * `await res.text()` would buffer whatever arrives first and check afterwards,
- * which is no ceiling at all against an endpoint that streams. Stopping at the
- * cap and refusing is also why the result is never parsed as a prefix: half a
- * log array parses to a plausible SHORTER answer, which is the failure mode
- * this whole package is organised against.
+ * which is no ceiling at all against an endpoint that streams — and a
+ * compressed body is inflated by the runtime before any reader sees it, so
+ * it arrives raw (see `pinnedFetch`) and is decoded here, with the decoder
+ * stopped at the cap. Stopping at the cap and refusing is also why the
+ * result is never parsed as a prefix: half a log array parses to a
+ * plausible SHORTER answer, which is the failure mode this whole package is
+ * organised against.
  */
-async function readCapped(res: Response, maxBytes: number): Promise<string> {
-  const body = res.body;
-  if (body === null) return "";
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      total += value.byteLength;
-      if (total > maxBytes) throw new BodyTooLarge();
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
+async function readCapped(res: Response, maxBytes: number, signal: AbortSignal): Promise<string> {
+  const read = await readResponseBounded(res, { maxBytes, signal });
+  if (read.ok) {
+    if (read.truncated) throw new BodyTooLarge();
+    return read.text;
   }
-  const joined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    joined.set(chunk, offset);
-    offset += chunk.byteLength;
+  switch (read.code) {
+    case "unsupported-encoding":
+      throw new BodyUnreadable(
+        "uses a stack of content-encodings this package cannot decode within its cap",
+      );
+    case "decode-error":
+    case "auto-decompressed":
+      throw new BodyUnreadable("is labelled as compressed but could not be decoded");
+    default:
+      // Aborted, stalled, or the connection closed: the caller reports these
+      // as the transport failures they are.
+      throw new Error(read.reason);
   }
-  return new TextDecoder().decode(joined);
 }
 
 /** The longest JSON-RPC error message this package will carry. */

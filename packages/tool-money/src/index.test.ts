@@ -514,6 +514,138 @@ describe("GlCodeSuggest", () => {
     expect(result).toMatchObject({ coded: 1, needsReview: 1 });
   });
 
+  // C073: a higher-priority rule whose pattern could not be evaluated was
+  // read as "did not match", so a lower-priority rule coded the line.
+  const capexFirst = (expected: string) => [
+    {
+      id: "capex",
+      priority: 10,
+      when: [{ path: "vendor", op: "matches" as const, expected }],
+      account: "1500",
+    },
+    {
+      id: "opex",
+      priority: 1,
+      when: [{ path: "vendor", op: "contains" as const, expected: "AWS" }],
+      account: "6500",
+    },
+  ];
+  type Coded = {
+    coded: number;
+    needsReview: number;
+    lines: Array<{
+      account: string | null;
+      needsReview: boolean;
+      reason: string;
+      undetermined?: string[];
+      matched: string[];
+    }>;
+  };
+
+  test("a refused higher-priority pattern sends the line to review, not to a lower rule", async () => {
+    for (const evil of ["(a+)+!$|capex", "(a|aa)+!$|capex"]) {
+      const result = await call<Coded>(glCodeSuggest, {
+        lines: [{ id: "l1", vendor: `${"a".repeat(30)} AWS capex` }],
+        rules: capexFirst(evil),
+      });
+      expect(result.coded).toBe(0);
+      expect(result.lines[0]).toMatchObject({
+        account: null,
+        needsReview: true,
+        undetermined: ["capex"],
+        matched: ["opex"],
+      });
+      expect(result.lines[0]?.reason).toContain('"capex"');
+      expect(result.lines[0]?.reason).toContain("invalid regex");
+    }
+  });
+
+  test("a benign higher-priority pattern still codes, and a lower-priority undetermined rule does not block", async () => {
+    const coded = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS capex" }],
+      rules: capexFirst("capex"),
+    });
+    expect(coded.lines[0]).toMatchObject({ account: "1500", needsReview: false });
+    // The refused rule is BELOW the one that matched: it could not win.
+    const below = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS" }],
+      rules: [
+        {
+          id: "cloud",
+          priority: 5,
+          when: [{ path: "vendor", op: "equals", expected: "AWS" }],
+          account: "6500",
+        },
+        {
+          id: "bad",
+          priority: 1,
+          when: [{ path: "vendor", op: "matches", expected: "(a+)+$" }],
+          account: "1",
+        },
+      ],
+    });
+    expect(below.lines[0]).toMatchObject({ account: "6500", needsReview: false });
+    expect(below.lines[0]?.undetermined).toBeUndefined();
+  });
+
+  test("an unevaluated rule that ties the matching one also sends the line to review", async () => {
+    // At the same priority it might have matched and disagreed: ambiguous.
+    const result = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS" }],
+      rules: [
+        {
+          id: "cloud",
+          priority: 5,
+          when: [{ path: "vendor", op: "equals", expected: "AWS" }],
+          account: "6500",
+        },
+        {
+          id: "bad",
+          priority: 5,
+          when: [{ path: "vendor", op: "matches", expected: "(a+)+$" }],
+          account: "1",
+        },
+      ],
+    });
+    expect(result.lines[0]).toMatchObject({
+      account: null,
+      needsReview: true,
+      undetermined: ["bad"],
+    });
+  });
+
+  test("a rule whose other condition definitely failed is a miss, whatever its pattern", async () => {
+    const result = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "AWS", amount: 5 }],
+      rules: [
+        {
+          id: "big-capex",
+          priority: 10,
+          when: [
+            { path: "amount", op: "greaterThan", expected: 1000 },
+            { path: "vendor", op: "matches", expected: "(a+)+$" },
+          ],
+          account: "1500",
+        },
+        { id: "opex", when: [{ path: "vendor", op: "equals", expected: "AWS" }], account: "6500" },
+      ],
+    });
+    expect(result.lines[0]).toMatchObject({ account: "6500", needsReview: false });
+  });
+
+  test("a rule set with no refused pattern answers exactly as before", async () => {
+    const result = await call<Coded>(glCodeSuggest, {
+      lines: [{ id: "l1", vendor: "Mystery" }],
+      rules: capexFirst("^capex$"),
+      defaultAccount: "9999",
+    });
+    expect(result.lines[0]).toMatchObject({
+      account: "9999",
+      needsReview: true,
+      reason: "no rule matched",
+    });
+  });
+
   test("a rule with no conditions is rejected by the schema", () => {
     expect(
       glCodeSuggest.inputSchema.safeParse({

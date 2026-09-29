@@ -233,6 +233,17 @@ test("the two xclip failures that look identical are told apart by stderr", () =
   expect(read.outcome).toBe("read");
 });
 
+test("a read whose output could not be drained, with nothing arrived, is unknown, not empty", () => {
+  // Exit 0 and no bytes reads as an empty clipboard; when the pipe was still
+  // held open at the drain grace, nothing arriving proves nothing.
+  const held = classifyClipboardRead({ ...FAILED, code: 0, stdout: "", outputIncomplete: true });
+  expect(held.outcome).toBe("unavailable");
+  expect(JSON.stringify(held)).toContain("could not be read to its end");
+  // What did arrive is still read (the tool marks it truncated).
+  const some = classifyClipboardRead({ ...FAILED, code: 0, stdout: "abc", outputIncomplete: true });
+  expect(some).toEqual({ outcome: "read", text: "abc" });
+});
+
 test("the macOS flavour probe tells an empty pasteboard from an image on it", () => {
   expect(classifyClipboardInfo(CLIPBOARD_INFO_EMPTY_STDOUT)).toBe("empty");
   expect(classifyClipboardInfo(CLIPBOARD_INFO_IMAGE_STDOUT)).toBe("noTextFlavour");

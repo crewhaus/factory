@@ -32,6 +32,7 @@
  */
 import { CrewhausError } from "@crewhaus/errors";
 import { assertNotSsrf } from "@crewhaus/tool-fetch";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 /** A refusal by the origin rule, the redirect rule or the byte cap. */
 export class RegistryError extends CrewhausError {
@@ -116,7 +117,12 @@ export type RegistryFetch = (req: Request) => Promise<Response>;
 function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
   const original = new URL(req.url);
   const host = original.hostname;
-  if (host === pinnedIp || pinnedIp === "") return globalThis.fetch(req);
+  // Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`):
+  // otherwise Bun inflates a gzip, deflate, br or zstd body in native code
+  // before any reader sees a byte, and a 260 KB gzip of zeros cost about
+  // 1 GB of RSS before the byte cap fired (C093). `readCapped` decodes it,
+  // under the cap.
+  if (host === pinnedIp || pinnedIp === "") return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -131,7 +137,7 @@ function pinnedFetch(req: Request, pinnedIp: string): Promise<Response> {
     signal: req.signal,
     tls: { serverName: host },
   };
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 }
 
 /**
@@ -318,7 +324,15 @@ export async function getJson(rawUrl: string, options: GetJsonOptions = {}): Pro
       };
     }
 
-    const body = await readCapped(res, maxBytes);
+    const body = await readCapped(res, maxBytes, options.signal);
+    if (body.unreadable !== undefined) {
+      return {
+        ok: false,
+        kind: "malformed",
+        status: res.status,
+        message: `${safeLabel(current)} answered with a body that ${body.unreadable}`,
+      };
+    }
     if (body.truncated) {
       // Parsing the prefix is the tempting mistake: a truncated array can
       // still parse into a shorter, plausible, WRONG list of versions.
@@ -364,59 +378,51 @@ export type CappedBody = {
   readonly text: string;
   readonly bytes: number;
   readonly truncated: boolean;
+  /**
+   * Set when the body could not be read as what it claims to be (an
+   * unsupported or corrupt content-encoding, a connection that closed
+   * early): `text` is then empty, and nothing was parsed.
+   */
+  readonly unreadable?: string;
 };
 
 /**
- * Drain a body with a hard byte cap, cancelling the stream the moment the cap
- * is passed. The cap bounds MEMORY, not just what is kept: chunks past it are
- * never retained and the reader is cancelled rather than drained.
+ * Drain a body with a hard cap on its DECODED size. The cap bounds MEMORY,
+ * not just what is kept: the body arrives raw (see `pinnedFetch`), a gzip,
+ * deflate, br or zstd body is decoded here in small steps, and the decoder
+ * stops once `maxBytes` exist. A body past the cap comes back truncated and
+ * EMPTY, so no caller can parse a prefix. An aborted read throws, as the
+ * runtime's own reader did.
  */
-export async function readCapped(res: Response, maxBytes: number): Promise<CappedBody> {
-  if (res.body === null) {
-    const text = await res.text();
-    const bytes = new TextEncoder().encode(text).byteLength;
-    return bytes > maxBytes
-      ? { text: "", bytes, truncated: true }
-      : { text, bytes, truncated: false };
+export async function readCapped(
+  res: Response,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<CappedBody> {
+  const read = await readResponseBounded(res, {
+    maxBytes,
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  if (read.ok) {
+    return read.truncated
+      ? { text: "", bytes: read.decodedBytes, truncated: true }
+      : { text: read.text, bytes: read.bytes.byteLength, truncated: false };
   }
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let truncated = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || value === undefined) break;
-      if (total + value.byteLength > maxBytes) {
-        truncated = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-      chunks.push(value);
-      total += value.byteLength;
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // already released
-    }
-  }
-  if (truncated) return { text: "", bytes: total, truncated: true };
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+  if (read.code === "aborted" || read.code === "stalled") {
+    const err = new Error("the read was aborted before the body ended");
+    err.name = "AbortError";
+    throw err;
   }
   return {
-    text: new TextDecoder("utf-8", { fatal: false }).decode(merged),
-    bytes: total,
+    text: "",
+    bytes: 0,
     truncated: false,
+    unreadable:
+      read.code === "unsupported-encoding"
+        ? "uses a stack of content-encodings this tool cannot decode within its cap"
+        : read.code === "read-error"
+          ? "ended before it was complete"
+          : "is labelled as compressed but could not be decoded",
   };
 }
 

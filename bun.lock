@@ -632,6 +632,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -2326,6 +2327,7 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-money": "workspace:*",
         "@crewhaus/tool-onchain": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2435,6 +2437,7 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2547,6 +2550,7 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
         "@crewhaus/tool-onchain": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2563,6 +2567,7 @@
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2593,6 +2598,7 @@
         "@crewhaus/template-registry": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2610,6 +2616,7 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-encode": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2623,6 +2630,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2650,6 +2658,7 @@
         "@crewhaus/tool-data": "workspace:*",
         "@crewhaus/tool-datetime": "workspace:*",
         "@crewhaus/tool-money": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2866,6 +2875,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -2910,6 +2920,7 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-fetch": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -2921,6 +2932,7 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/tool-text": "workspace:*",
         "zod": "^3.23.8",
       },
@@ -3219,6 +3231,7 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-code": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3322,6 +3335,7 @@
         "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3397,6 +3411,7 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-code": "workspace:*",
         "@crewhaus/tool-fetch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {
@@ -3412,6 +3427,7 @@
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-data": "workspace:*",
         "@crewhaus/tool-math": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
       "devDependencies": {

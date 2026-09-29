@@ -10,6 +10,7 @@
  * confusion this package is meant to prevent.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { gzipSync } from "node:zlib";
 import {
   CREWHAUS_PRODUCT,
   type ManifestInputs,
@@ -853,15 +854,17 @@ describe("probeAsset: nothing was learned, and the reason says which", () => {
 
   test("a gzipped body is not a short read — Content-Length counts wire bytes", async () => {
     // The CDN default that would otherwise make every asset fail: the length
-    // header describes the compressed bytes, the runtime hands over the
-    // decoded ones, and comparing the two invents a truncation.
+    // header describes the compressed bytes, the hash is over the decoded
+    // ones, and comparing the two invents a truncation. The body arrives raw
+    // (as the production dialler asks for it) and is decoded here.
     dns();
     const url = "https://dl.example.com/tool-1.2.3";
+    const wire = new Uint8Array(gzipSync(ASSET_BYTES["linux-x64"] as Uint8Array));
     _setFetch(
       stubFetch({
         [url]: {
-          body: ASSET_BYTES["linux-x64"],
-          headers: { "content-length": "11", "content-encoding": "gzip" },
+          body: wire,
+          headers: { "content-length": String(wire.byteLength), "content-encoding": "gzip" },
         },
       }).fetch,
     );

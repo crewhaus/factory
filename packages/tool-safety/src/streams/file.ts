@@ -182,6 +182,9 @@ function openFlags(followSymlinks: boolean): number {
   return constants.O_RDONLY | O_NONBLOCK | (followSymlinks ? 0 : O_NOFOLLOW);
 }
 
+/** Unused capacity a result may keep rather than copy its bytes out. */
+const KEEP_SLACK = 64 * 1024;
+
 function finish(
   buffer: Uint8Array,
   filled: number,
@@ -189,8 +192,29 @@ function finish(
   size: number,
 ): FileReadResult {
   const truncated = filled > maxBytes;
-  const bytes = buffer.slice(0, Math.min(filled, maxBytes));
-  return { ok: true, bytes, text: decodeHead(bytes, !truncated), truncated, size };
+  const kept = Math.min(filled, maxBytes);
+  // A view when the buffer is (nearly) all used, which it is whenever the
+  // size was known: copying it doubled the peak for every read.
+  const bytes =
+    buffer.length - kept <= Math.max(KEEP_SLACK, kept >>> 3)
+      ? buffer.subarray(0, kept)
+      : buffer.slice(0, kept);
+  let text: string | undefined;
+  return {
+    ok: true,
+    bytes,
+    // Decoded on first use. A caller that needs only the bytes (a size, a
+    // hash, a PDF, a BOM-keeping decode of its own) never pays for a string
+    // of the whole file: BundleSizeCheck's measure grew 3.5x the file and
+    // ran 25-40x slower on a large binary when this was eager (bounds
+    // review).
+    get text(): string {
+      text ??= decodeHead(bytes, !truncated);
+      return text;
+    },
+    truncated,
+    size,
+  };
 }
 
 /** Initial buffer: what the size claims, but never more than the cap allows. */

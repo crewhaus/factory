@@ -33,6 +33,7 @@
  *   normalised.
  */
 import { Buffer } from "node:buffer";
+import { tidyLines } from "./lines";
 
 export class MailError extends Error {
   constructor(message: string) {
@@ -219,6 +220,22 @@ function splitAddressList(value: string): string[] {
   return out;
 }
 
+/**
+ * `Name <addr>`: what `/^(.*)<([^>]*)>\s*$/s` matched — the piece ends in
+ * `>` (then only whitespace), and the address runs from the last `<` before
+ * it, with no `>` in between — found with two index searches. The regex was
+ * quadratic on a piece of many `<` and no `>`: the greedy prefix backed off
+ * one `<` at a time, and each `<` re-read the rest of the piece.
+ */
+function angleAddr(piece: string): { name: string; address: string } | null {
+  const trimmed = piece.trimEnd();
+  const gt = trimmed.length - 1;
+  if (gt < 1 || trimmed[gt] !== ">") return null;
+  const lt = trimmed.lastIndexOf("<", gt - 1);
+  if (lt === -1 || trimmed.indexOf(">", lt) !== gt) return null;
+  return { name: trimmed.slice(0, lt), address: trimmed.slice(lt + 1, gt) };
+}
+
 export function parseAddressList(value: string | undefined, notes: Set<string>): MailAddress[] {
   if (value === undefined || value.trim() === "") return [];
   // Group syntax: `Managers: a@b, c@d;` — flatten to the members.
@@ -227,11 +244,11 @@ export function parseAddressList(value: string | undefined, notes: Set<string>):
   for (const raw of splitAddressList(flattened)) {
     const piece = raw.trim().replace(/;$/, "");
     if (piece === "") continue;
-    const angle = /^(.*)<([^>]*)>\s*$/s.exec(piece);
+    const angle = angleAddr(piece);
     if (angle !== null) {
-      let name = (angle[1] ?? "").trim().replace(/^"(.*)"$/s, "$1");
+      let name = angle.name.trim().replace(/^"(.*)"$/s, "$1");
       name = decodeEncodedWords(name, notes).trim();
-      const address = (angle[2] ?? "").trim();
+      const address = angle.address.trim();
       out.push(name === "" ? { address } : { name, address });
       continue;
     }
@@ -279,13 +296,34 @@ const OBSOLETE_ZONES: Readonly<Record<string, number>> = {
 };
 
 /**
+ * `value` with each `(…)` comment replaced by a space: exactly
+ * `value.replace(/\([^)]*\)/g, " ")`, in linear time. That regex re-read the
+ * rest of the header from every `(` with no `)` after it, so a Date of
+ * 80 000 `(` took 3.6 s (C090's tool-docs sibling, bounds review).
+ */
+export function replaceComments(value: string): string {
+  let out = "";
+  let at = 0;
+  for (;;) {
+    const open = value.indexOf("(", at);
+    if (open === -1) break;
+    const close = value.indexOf(")", open + 1);
+    // No `)` after this `(`, so none after any later one: nothing more matches.
+    if (close === -1) break;
+    out += `${value.slice(at, open)} `;
+    at = close + 1;
+  }
+  return out + value.slice(at);
+}
+
+/**
  * Parse an RFC 5322 `Date:` to ISO-8601, by hand. The host's `Date` parser
  * accepts and silently reinterprets all sorts of malformed input; a mail
  * date is data, and data gets a real parser.
  */
 export function parseMailDate(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  const cleaned = value.replace(/\([^)]*\)/g, " ").trim();
+  const cleaned = replaceComments(value).trim();
   const match =
     /^(?:[A-Za-z]{3},\s*)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([+-]\d{4}|[A-Za-z]{1,3})?/.exec(
       cleaned,
@@ -556,38 +594,133 @@ export function messagePlainText(message: ParsedMessage): string {
 }
 
 /**
+ * True when `text` holds `word` (lower-case ASCII) at `at`, ASCII case
+ * folded. `text` is never lower-cased: U+0130 lower-cases to two code units
+ * and would shift every index after it.
+ */
+function hasWordAt(text: string, at: number, word: string): boolean {
+  if (at + word.length > text.length) return false;
+  for (let i = 0; i < word.length; i++) {
+    let code = text.charCodeAt(at + i);
+    if (code >= 0x41 && code <= 0x5a) code += 0x20;
+    if (code !== word.charCodeAt(i)) return false;
+  }
+  return true;
+}
+
+const ENTITIES: Readonly<Record<string, string>> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  nbsp: " ",
+};
+
+/**
+ * `html` without its script and style elements: exactly
+ * `html.replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")`, in linear time.
+ *
+ * The regex is quadratic when the closing tag is missing: every `<style`
+ * reads the rest of the text looking for `</style>` and fails. Here the
+ * search for each element's closing tag resumes where the last one ended,
+ * and a search that found none is never repeated.
+ */
+function dropScriptsAndStyles(html: string): string {
+  const out: string[] = [];
+  // Per element name: the last search for its closing tag, as
+  // `[searchedFrom, foundAt]` (-1: none at or after `searchedFrom`).
+  const closes = new Map<string, readonly [number, number]>();
+  const findClose = (name: string, from: number): number => {
+    const known = closes.get(name);
+    if (known !== undefined && from >= known[0] && (known[1] === -1 || known[1] >= from)) {
+      return known[1];
+    }
+    let at = from;
+    for (;;) {
+      at = html.indexOf("</", at);
+      if (at === -1) break;
+      if (hasWordAt(html, at + 2, name) && html[at + 2 + name.length] === ">") break;
+      at += 2;
+    }
+    closes.set(name, [from, at]);
+    return at;
+  };
+  let kept = 0;
+  let at = 0;
+  for (;;) {
+    const lt = html.indexOf("<", at);
+    if (lt === -1) break;
+    const name = hasWordAt(html, lt + 1, "script")
+      ? "script"
+      : hasWordAt(html, lt + 1, "style")
+        ? "style"
+        : undefined;
+    const close = name === undefined ? -1 : findClose(name, lt + 1 + name.length);
+    if (name === undefined || close === -1) {
+      at = lt + 1;
+      continue;
+    }
+    out.push(html.slice(kept, lt));
+    kept = close + name.length + 3;
+    at = kept;
+  }
+  out.push(html.slice(kept));
+  return out.join("");
+}
+
+/**
+ * `text` without its tags: exactly `text.replace(/<[^>]*>/g, "")`, in linear
+ * time. A tag runs from a `<` to the next `>`; once a `<` has no `>` after
+ * it, no later `<` does either, so the rest is text — where the regex
+ * re-read the rest once per `<`.
+ */
+function dropTags(text: string): string {
+  const out: string[] = [];
+  let at = 0;
+  for (;;) {
+    const lt = text.indexOf("<", at);
+    if (lt === -1) break;
+    const gt = text.indexOf(">", lt + 1);
+    if (gt === -1) break;
+    out.push(text.slice(at, lt));
+    at = gt + 1;
+  }
+  out.push(text.slice(at));
+  return out.join("");
+}
+
+/**
  * A deliberately blunt HTML-to-text pass for mail bodies: block tags become
  * newlines, every other tag disappears, and the five predefined entities plus
  * numeric references are decoded. It is not an HTML renderer and does not
  * pretend to be one.
+ *
+ * LINEAR (C090's sibling). 0.7.0 ran the same passes as regexes, and three
+ * of them are quadratic on text without the closer they look for: the
+ * script/style pass on `<style` with no `</style>`, the tag pass on `<`
+ * with no `>`, and the line tidy on a run of blanks with no newline.
+ * DocumentText took 17 s on 336 KB of `<style` and 28 s on 200 000 spaces
+ * and an "x", and EmlParse reached the same code. Those three are now
+ * scans (above, and `tidyLines`) that give the regexes' output exactly; the
+ * two tag regexes left are anchored on a fixed prefix and linear.
  */
 export function stripHtml(html: string): string {
-  return html
-    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n")
-    .replace(/<[^>]*>/g, "")
-    .replace(/&(#x?[0-9A-Fa-f]+|amp|lt|gt|quot|apos|nbsp);/g, (whole, body: string) => {
-      if (body.startsWith("#")) {
-        const hex = body[1] === "x" || body[1] === "X";
-        const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
-        return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
-          ? String.fromCodePoint(code)
-          : whole;
-      }
-      const map: Record<string, string> = {
-        amp: "&",
-        lt: "<",
-        gt: ">",
-        quot: '"',
-        apos: "'",
-        nbsp: " ",
-      };
-      return map[body] ?? whole;
-    })
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  const text = dropTags(
+    dropScriptsAndStyles(html)
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(p|div|tr|li|h[1-6])>/gi, "\n"),
+  ).replace(/&(#x?[0-9A-Fa-f]+|amp|lt|gt|quot|apos|nbsp);/g, (whole, body: string) => {
+    if (body.startsWith("#")) {
+      const hex = body[1] === "x" || body[1] === "X";
+      const code = Number.parseInt(hex ? body.slice(2) : body.slice(1), hex ? 16 : 10);
+      return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
+        ? String.fromCodePoint(code)
+        : whole;
+    }
+    return ENTITIES[body] ?? whole;
+  });
+  return tidyLines(text);
 }
 
 // ---------------------------------------------------------------------------

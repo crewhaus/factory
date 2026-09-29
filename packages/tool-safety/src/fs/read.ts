@@ -102,7 +102,10 @@ function mapRead(target: Contained, r: FileReadResult): ContainedRead {
   return {
     ok: true,
     bytes: r.bytes,
-    text: r.text,
+    // Still decoded on first use only (see streams/file.ts).
+    get text(): string {
+      return r.text;
+    },
     truncated: r.truncated,
     size: r.size,
     real: target.real,
@@ -230,7 +233,10 @@ export function openForReadSync(
     return {
       ok: true,
       bytes: r.bytes,
-      text: r.text,
+      // Still decoded on first use only (see streams/file.ts).
+      get text(): string {
+        return r.text;
+      },
       truncated: r.truncated,
       size: r.size,
       real: opened.real,

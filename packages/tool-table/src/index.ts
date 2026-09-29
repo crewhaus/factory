@@ -15,10 +15,10 @@
  * repository would disagree about quoting and embedded newlines on the same
  * file, in different tools, which is the worst way to disagree.
  */
-import { readFileSync, statSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { parseCsv } from "@crewhaus/tool-data";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { DriftError, compareDrift } from "./lib/drift";
 import { type TableProfile, profileTable } from "./lib/profile";
@@ -31,7 +31,15 @@ import {
   normalizeContact,
 } from "./lib/reconcile";
 import { type FixedField, parseFixedWidth, shardRows, toLong, toWide } from "./lib/reshape";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
+
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which moved
+ * FixedWidthParse's columns by one on a file that starts with one (bounds
+ * review). A CSV's header is unaffected: parseCsv drops the mark itself.
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -46,6 +54,31 @@ const LIMITS = {
   profileBytes: 64 * 1024 * 1024,
 } as const;
 
+/**
+ * A workspace file's text, at most `maxBytes` of it.
+ *
+ * Opened without blocking, and only as a regular file: a FIFO with no writer
+ * blocks an ordinary open for ever, and these reads were synchronous, so a
+ * named pipe in the workspace stopped the whole harness (C074). The limit is
+ * enforced while reading; `overLimit` says the file holds more.
+ */
+function readWorkspaceText(
+  tool: string,
+  file: string,
+  maxBytes: number,
+): { text: string; size: number; overLimit: boolean } {
+  const read = openForReadSync(workspaceRoot(), file, { maxBytes });
+  if (!read.ok) throw new Error(`${tool}: ${read.reason}`);
+  return {
+    // Decoded only when asked for: a caller refuses a file over the limit unread.
+    get text(): string {
+      return KEEP_BOM.decode(read.bytes);
+    },
+    size: read.size,
+    overLimit: read.truncated,
+  };
+}
+
 /** Read a delimited file into a header and rows of strings. */
 function readTable(
   tool: string,
@@ -53,11 +86,12 @@ function readTable(
   options: { delimiter?: string; noHeader?: boolean },
 ): { headers: string[]; rows: string[][]; rel: string; bytes: number } {
   const at = resolveSafe(tool, file);
-  const bytes = statSync(at.real).size;
-  if (bytes > LIMITS.fileBytes) {
+  const read = readWorkspaceText(tool, file, LIMITS.fileBytes);
+  const bytes = read.size;
+  if (read.overLimit) {
     throw new Error(`${at.rel} is ${bytes} bytes, over the ${LIMITS.fileBytes}-byte limit`);
   }
-  const text = readFileSync(at.real, "utf-8");
+  const text = read.text;
   // `parseCsv` returns every row including the header; splitting it here
   // keeps one reader for the whole repository rather than two that disagree
   // about quoting on the same file.
@@ -194,13 +228,18 @@ export const tableProfile: RegisteredTool = buildTool({
  */
 function loadReferenceProfile(file: string): { profile: TableProfile; rel: string } | string {
   const at = resolveSafe("DataDriftCheck", file);
-  const bytes = statSync(at.real).size;
-  if (bytes > LIMITS.profileBytes) {
-    return `${at.rel} is ${bytes} bytes, far larger than any profile — this is probably not a stored TableProfile`;
+  let read: ReturnType<typeof readWorkspaceText>;
+  try {
+    read = readWorkspaceText("DataDriftCheck", file, LIMITS.profileBytes);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  if (read.overLimit) {
+    return `${at.rel} is ${read.size} bytes, far larger than any profile — this is probably not a stored TableProfile`;
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(at.real, "utf-8"));
+    parsed = JSON.parse(read.text);
   } catch (err) {
     return `${at.rel} is not JSON: ${(err as Error).message}. referenceProfile takes a stored TableProfile result; for raw data use referenceFile`;
   }
@@ -753,17 +792,13 @@ export const fixedWidthParse: RegisteredTool = buildTool({
   concurrencySafe: true,
   execute: async (input) => {
     const at = resolveSafe("FixedWidthParse", input.file);
-    const bytes = statSync(at.real).size;
-    if (bytes > LIMITS.fileBytes) {
-      throw new Error(`${at.rel} is ${bytes} bytes, over the ${LIMITS.fileBytes}-byte limit`);
+    const read = readWorkspaceText("FixedWidthParse", input.file, LIMITS.fileBytes);
+    if (read.overLimit) {
+      throw new Error(`${at.rel} is ${read.size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
     }
-    const result = parseFixedWidth(
-      readFileSync(at.real, "utf-8"),
-      input.fields as ReadonlyArray<FixedField>,
-      {
-        skipLines: input.skipLines,
-      },
-    );
+    const result = parseFixedWidth(read.text, input.fields as ReadonlyArray<FixedField>, {
+      skipLines: input.skipLines,
+    });
     const limit = input.limit ?? 500;
     return json({
       file: at.rel,

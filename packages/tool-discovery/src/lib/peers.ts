@@ -161,6 +161,13 @@ export function classifyPeer(input: ClassifyInput): PeerVerdict {
           reason: `answered HTTP ${attempt.status} for its .well-known/crewhaus.json`,
         };
       }
+      if (attempt.unreadable !== undefined) {
+        return {
+          outcome: "unhealthy",
+          code: "unhealthy:unreadable-body",
+          reason: `answered HTTP 200 but ${attempt.unreadable}, so its .well-known/crewhaus.json was not parsed`,
+        };
+      }
       if (attempt.truncated) {
         return {
           outcome: "unhealthy",
