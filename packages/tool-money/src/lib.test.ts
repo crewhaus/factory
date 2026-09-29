@@ -7,6 +7,7 @@ import { describe, expect, test } from "bun:test";
  * always sum to the whole — are properties this is the right level to pin.
  */
 import { createHmac } from "node:crypto";
+import { RegexAnswers, askCheckPatterns } from "@crewhaus/tool-schema";
 import { allocateProportional, computeRefund } from "./lib/allocate";
 import { codeLines } from "./lib/coding";
 import { checkSpendLimit, refundAbuseSignals } from "./lib/controls";
@@ -1023,6 +1024,42 @@ describe("GL coding", () => {
       account: "9999",
       needsReview: true,
       reason: "no rule matched",
+    });
+  });
+
+  test("a pattern the worker could not answer leaves the line uncoded, with the reason", async () => {
+    // A deadline of 0 settles every question as undetermined, deterministically.
+    const regex = new RegexAnswers();
+    const line = { id: "l1", vendor: "AWS capex" };
+    const ordered = [
+      {
+        id: "capex",
+        priority: 10,
+        when: [{ path: "vendor", op: "matches" as const, expected: "capex" }],
+        account: "1500",
+      },
+      {
+        id: "opex",
+        when: [{ path: "vendor", op: "contains" as const, expected: "AWS" }],
+        account: "6500",
+      },
+    ];
+    for (const rule of ordered) askCheckPatterns(line, rule.when, regex);
+    await regex.resolve({}, { deadlineMs: 0 });
+    const result = codeLines([line], ordered, { regex });
+    expect(result.lines[0]).toMatchObject({
+      account: null,
+      needsReview: true,
+      undetermined: ["capex"],
+    });
+    expect(result.lines[0]?.reason).toContain("ran out");
+    // Answered, the same rules code the line.
+    const answered = new RegexAnswers();
+    for (const rule of ordered) askCheckPatterns(line, rule.when, answered);
+    await answered.resolve({});
+    expect(codeLines([line], ordered, { regex: answered }).lines[0]).toMatchObject({
+      account: "1500",
+      needsReview: false,
     });
   });
 

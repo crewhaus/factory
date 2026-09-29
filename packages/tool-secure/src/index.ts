@@ -63,7 +63,12 @@ import {
   canonicalPiiValue,
   scanPii,
 } from "./lib/pii";
-import { MAX_POLICY_RULES, POLICY_RULE_KINDS, evaluatePolicy } from "./lib/policy";
+import {
+  MAX_POLICY_RULES,
+  POLICY_RULE_KINDS,
+  type PolicyRunContext,
+  evaluatePolicy,
+} from "./lib/policy";
 import {
   MAX_MAPPING_ENTRIES,
   TOKEN_SHAPE,
@@ -901,6 +906,15 @@ export const allowlistCheck: RegisteredTool = buildTool({
   },
 });
 
+/** The ctx fields a tool's `execute` receives that a pattern run uses. */
+function policyRunContext(ctx: unknown): PolicyRunContext {
+  const c = ctx as { signal?: AbortSignal; runContext?: { sessionId?: string } } | undefined;
+  return {
+    ...(c?.signal === undefined ? {} : { signal: c.signal }),
+    ...(typeof c?.runContext?.sessionId === "string" ? { runawayKey: c.runContext.sessionId } : {}),
+  };
+}
+
 export const contentPolicyCheck: RegisteredTool = buildTool({
   name: "ContentPolicyCheck",
   description:
@@ -925,15 +939,15 @@ export const contentPolicyCheck: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) => {
+  execute: async (input, ctx) => {
     try {
       assertTextSize(input.text, "text");
-      const result = evaluatePolicy(input.text, input.rules);
+      const result = await evaluatePolicy(input.text, input.rules, policyRunContext(ctx));
       return json({
         pass: result.pass,
         counts: result.counts,
         outcomes: result.outcomes,
-        note: "Mechanical only. A required phrase can be present and still wrong, and a forbidden claim can be made in other words — review_pattern rules exist for exactly that, and a review outcome does not fail the check. A rule whose pattern does not compile is reported as error and DOES fail the check, because an unevaluated rule is not a passed one. Matching is case-insensitive unless caseSensitive is set.",
+        note: "Mechanical only. A required phrase can be present and still wrong, and a forbidden claim can be made in other words — review_pattern rules exist for exactly that, and a review outcome does not fail the check. A rule whose pattern does not compile, is refused as one that could run away, or could not be run to the end of the text is reported as error and DOES fail the check, because an unevaluated rule is not a passed one. Matching is case-insensitive unless caseSensitive is set.",
       });
     } catch (err) {
       return `ContentPolicyCheck could not run: ${asMessage(err)}`;

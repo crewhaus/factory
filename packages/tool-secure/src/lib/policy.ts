@@ -17,18 +17,27 @@
  * alternatives — refusing the whole evaluation, or silently treating the rule
  * as no-match — either block work over a typo or quietly turn a policy off.
  *
- * ## The regex is the operator's, and it runs untimed
+ * ## Patterns run in the regex worker, and an unanswered one is an error
  *
- * `*_pattern` rules compile caller-supplied regex sources and run them over
- * text up to the package's 2,000,000-character cap. JavaScript's engine
- * backtracks, so a pattern like `(a+)+$` can take time exponential in the
- * length of the text it fails on. There is no timeout here, because there is
- * no way to interrupt a regex mid-match in this runtime. The rules are
- * operator-written, not attacker-written, which is what makes this
- * acceptable — but an operator who pastes a pattern from untrusted content
- * has handed that content a stall. Write anchored patterns with no nested
- * unbounded quantifier.
+ * The rules arrive in the tool's input, so a model (or text it read) writes
+ * them. 0.7.0 compiled each `*_pattern` and ran it on this thread over text
+ * of up to 2,000,000 characters: `(a+)+!$|guaranteed returns` held the
+ * process 0.75 s and then answered "forbidden text is absent" — JavaScriptCore
+ * gives up on a runaway match and reports it as no match — so a gate passed
+ * text it had not checked (C073). Patterns now run in
+ * `@crewhaus/tool-safety`'s regex worker under a deadline. A pattern the
+ * screen refuses (a shape that backtracks exponentially) is an `error`, like
+ * one that does not compile. A run that cannot finish is an `error` too,
+ * "not evaluated", unless the matches it found before stopping already
+ * decide the rule (a forbidden pattern that matched has failed); a count
+ * from a run that stopped early is a lower bound, and says so.
  */
+import {
+  type RegexOutcome,
+  type RegexSession,
+  describeRegexOutcome,
+  openRegexSession,
+} from "@crewhaus/tool-safety/regex";
 import { compareStrings, matchAll } from "./text";
 import { lineStarts, locate } from "./text";
 
@@ -64,6 +73,11 @@ export type PolicyOutcome = {
   readonly message: string;
   readonly matches: ReadonlyArray<PolicyMatch>;
   readonly matchCount: number;
+  /**
+   * Set when the pattern could not be run to the end of the text, or more
+   * matches exist than were counted: `matchCount` is then "at least".
+   */
+  readonly matchCountIsLowerBound?: true;
 };
 
 export type PolicyResult = {
@@ -91,8 +105,85 @@ function escapeRegex(literal: string): string {
   return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Evaluate every rule against the text. One pass per rule, no early exit. */
-export function evaluatePolicy(text: string, rules: ReadonlyArray<PolicyRule>): PolicyResult {
+/** Wall-clock budget for all of one check's patterns, shared in rule order. */
+export const POLICY_PATTERN_DEADLINE_MS = 10_000;
+/** The pattern screen's limits for a rule. */
+const PATTERN_LIMITS = { maxPatternChars: 10_000 } as const;
+/** Matches counted per pattern rule; past it the count is a lower bound. */
+const MAX_COUNTED_MATCHES = 10_000;
+
+/** Where a check's patterns run: the call's abort signal, and whose runaway workers they count as. */
+export type PolicyRunContext = { readonly signal?: AbortSignal; readonly runawayKey?: string };
+
+type Found = {
+  /** The first {@link MAX_MATCHES_PER_RULE} matches, for their locations. */
+  readonly matches: ReadonlyArray<{ readonly index: number; readonly match: string }>;
+  /** Every match found (exact unless `lowerBound`). */
+  readonly count: number;
+  /** Why the scan stopped before the end of the text, if it did. */
+  readonly stopped?: string;
+  /** More matches may exist than were found (a cap, or an early stop). */
+  readonly lowerBound: boolean;
+};
+
+/**
+ * Every match of a `*_pattern` rule's source, run in the regex worker: the
+ * matches, or why the pattern could not be run at all (`refused`).
+ */
+async function findPattern(
+  session: RegexSession,
+  text: string,
+  source: string,
+  flags: string,
+  deadlineMs: number,
+  ctx: PolicyRunContext,
+): Promise<Found | { readonly refused: string }> {
+  const outcome = await session.run({
+    op: "matchAll",
+    pattern: source,
+    flags,
+    input: text,
+    maxMatches: MAX_COUNTED_MATCHES,
+    deadlineMs,
+    maxInputChars: Math.max(1, text.length),
+    limits: PATTERN_LIMITS,
+    ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
+    ...(ctx.runawayKey === undefined ? {} : { runawayKey: ctx.runawayKey }),
+  });
+  if (outcome.status === "rejected") return { refused: describeRegexOutcome(outcome) };
+  if (outcome.status === "ok") {
+    const all = outcome.result.matches;
+    return {
+      matches: all.slice(0, MAX_MATCHES_PER_RULE),
+      count: all.length,
+      lowerBound: outcome.result.truncated,
+    };
+  }
+  const partial =
+    outcome.status === "gave-up" || outcome.status === "timeout"
+      ? (outcome.partial?.matches ?? [])
+      : [];
+  return {
+    matches: partial.slice(0, MAX_MATCHES_PER_RULE),
+    count: partial.length,
+    stopped: describeRegexOutcome(outcome as RegexOutcome<unknown>),
+    lowerBound: true,
+  };
+}
+
+/**
+ * Evaluate every rule against the text. One pass per rule, no early exit.
+ *
+ * Phrase rules are literals, matched on this thread (a literal search is
+ * linear). Pattern rules run in the regex worker, one after another in one
+ * session, sharing {@link POLICY_PATTERN_DEADLINE_MS}.
+ */
+export async function evaluatePolicy(
+  text: string,
+  rules: ReadonlyArray<PolicyRule>,
+  ctx: PolicyRunContext = {},
+  options: { readonly deadlineMs?: number } = {},
+): Promise<PolicyResult> {
   if (rules.length > MAX_POLICY_RULES) {
     throw new PolicyError(`${rules.length} rules, over the ${MAX_POLICY_RULES} limit`);
   }
@@ -106,78 +197,132 @@ export function evaluatePolicy(text: string, rules: ReadonlyArray<PolicyRule>): 
 
   const starts = lineStarts(text);
   const outcomes: PolicyOutcome[] = [];
+  const deadlineMs = options.deadlineMs ?? POLICY_PATTERN_DEADLINE_MS;
+  const started = performance.now();
+  let session: RegexSession | undefined;
 
-  for (const rule of rules) {
-    const flags = rule.caseSensitive === true ? "g" : "gi";
-    const isPattern = rule.kind.endsWith("_pattern");
-    let re: RegExp;
-    try {
-      re = new RegExp(isPattern ? rule.value : escapeRegex(rule.value), flags);
-    } catch (err) {
-      outcomes.push({
-        id: rule.id,
-        kind: rule.kind,
-        status: "error",
-        message: `rule not evaluated: invalid regular expression /${rule.value}/ — ${(err as Error).message}`,
-        matches: [],
-        matchCount: 0,
-      });
-      continue;
-    }
-
-    const matches: PolicyMatch[] = [];
-    let matchCount = 0;
-    for (const { index, match } of matchAll(text, re)) {
-      matchCount += 1;
-      if (matches.length < MAX_MATCHES_PER_RULE) {
-        const { line, column } = locate(starts, index);
-        matches.push({ line, column, excerpt: match[0].slice(0, EXCERPT_CHARS) });
+  try {
+    for (const rule of rules) {
+      const isPattern = rule.kind.endsWith("_pattern");
+      let found: Found;
+      if (isPattern) {
+        const left = Math.floor(deadlineMs - (performance.now() - started));
+        session ??= openRegexSession();
+        const run =
+          left < 1
+            ? {
+                matches: [],
+                count: 0,
+                stopped: `the check's ${deadlineMs} ms for running patterns ran out before this rule`,
+                lowerBound: true,
+              }
+            : await findPattern(
+                session,
+                text,
+                rule.value,
+                rule.caseSensitive === true ? "" : "i",
+                left,
+                ctx,
+              );
+        if ("refused" in run) {
+          outcomes.push({
+            id: rule.id,
+            kind: rule.kind,
+            status: "error",
+            message: `rule not evaluated: invalid regular expression /${rule.value}/ — ${run.refused}`,
+            matches: [],
+            matchCount: 0,
+          });
+          continue;
+        }
+        found = run;
+      } else {
+        // A literal: linear to search, so it runs here, counted in full and
+        // located for the first few.
+        const re = new RegExp(escapeRegex(rule.value), rule.caseSensitive === true ? "g" : "gi");
+        const first: { index: number; match: string }[] = [];
+        let count = 0;
+        for (const { index, match } of matchAll(text, re)) {
+          count += 1;
+          if (first.length < MAX_MATCHES_PER_RULE) first.push({ index, match: match[0] });
+        }
+        found = { matches: first, count, lowerBound: false };
       }
+      outcomes.push(judge(rule, found, starts));
     }
-
-    const present = matchCount > 0;
-    const describe = rule.description === undefined ? "" : ` (${rule.description})`;
-    if (rule.kind === "required_phrase" || rule.kind === "required_pattern") {
-      outcomes.push({
-        id: rule.id,
-        kind: rule.kind,
-        status: present ? "pass" : "fail",
-        message: present
-          ? `required text found ${matchCount} time(s)${describe}`
-          : `required text is absent${describe}`,
-        // A required rule that passed needs no locations; one that failed has none.
-        matches: [],
-        matchCount,
-      });
-      continue;
-    }
-    if (rule.kind === "review_pattern") {
-      outcomes.push({
-        id: rule.id,
-        kind: rule.kind,
-        status: present ? "review" : "pass",
-        message: present
-          ? `${matchCount} passage(s) need a human decision${describe}`
-          : `nothing matched${describe}`,
-        matches,
-        matchCount,
-      });
-      continue;
-    }
-    outcomes.push({
-      id: rule.id,
-      kind: rule.kind,
-      status: present ? "fail" : "pass",
-      message: present
-        ? `forbidden text found ${matchCount} time(s)${describe}`
-        : `forbidden text is absent${describe}`,
-      matches,
-      matchCount,
-    });
+  } finally {
+    session?.close();
   }
 
   const counts: Record<PolicyOutcome["status"], number> = { pass: 0, fail: 0, review: 0, error: 0 };
   for (const outcome of outcomes) counts[outcome.status] += 1;
   outcomes.sort((a, b) => compareStrings(a.id, b.id));
   return { pass: counts.fail === 0 && counts.error === 0, outcomes, counts };
+}
+
+/**
+ * One rule's outcome from what its scan found. A scan that stopped early is
+ * a verdict only when what it found already decides the rule; otherwise the
+ * rule was not evaluated, and says why.
+ */
+function judge(rule: PolicyRule, found: Found, starts: ReadonlyArray<number>): PolicyOutcome {
+  const matches: PolicyMatch[] = [];
+  for (const { index, match } of found.matches) {
+    const { line, column } = locate(starts, index);
+    matches.push({ line, column, excerpt: match.slice(0, EXCERPT_CHARS) });
+  }
+  const matchCount = found.count;
+  const present = matchCount > 0;
+  const atLeast = found.lowerBound ? { matchCountIsLowerBound: true as const } : {};
+  const describe = rule.description === undefined ? "" : ` (${rule.description})`;
+  if (!present && found.stopped !== undefined) {
+    return {
+      id: rule.id,
+      kind: rule.kind,
+      status: "error",
+      message: `rule not evaluated: ${found.stopped} — nothing had matched before it stopped, which is not the same as nothing matching${describe}`,
+      matches: [],
+      matchCount: 0,
+      ...atLeast,
+    };
+  }
+  const count = found.lowerBound ? `at least ${matchCount}` : `${matchCount}`;
+  if (rule.kind === "required_phrase" || rule.kind === "required_pattern") {
+    return {
+      id: rule.id,
+      kind: rule.kind,
+      status: present ? "pass" : "fail",
+      message: present
+        ? `required text found ${count} time(s)${describe}`
+        : `required text is absent${describe}`,
+      // A required rule that passed needs no locations; one that failed has none.
+      matches: [],
+      matchCount,
+      ...atLeast,
+    };
+  }
+  if (rule.kind === "review_pattern") {
+    return {
+      id: rule.id,
+      kind: rule.kind,
+      status: present ? "review" : "pass",
+      message: present
+        ? `${count} passage(s) need a human decision${describe}`
+        : `nothing matched${describe}`,
+      matches,
+      matchCount,
+      ...atLeast,
+    };
+  }
+  return {
+    id: rule.id,
+    kind: rule.kind,
+    status: present ? "fail" : "pass",
+    message: present
+      ? `forbidden text found ${count} time(s)${describe}`
+      : `forbidden text is absent${describe}`,
+    matches,
+    matchCount,
+    ...atLeast,
+  };
 }

@@ -33,6 +33,7 @@ import {
   verifyPayload,
 } from "./index";
 import { computeLink } from "./lib/evidence";
+import { evaluatePolicy } from "./lib/policy";
 
 /** Tools return compact JSON; parse it so assertions read as data. */
 // biome-ignore lint/suspicious/noExplicitAny: assertions read the parsed JSON shape directly.
@@ -706,6 +707,83 @@ describe("ContentPolicyCheck", () => {
     });
     expect(out.outcomes[0].status).toBe("error");
     expect(out.pass).toBe(false);
+  });
+
+  // C073: patterns ran on this thread, and JavaScriptCore's give-up on a
+  // runaway match reads as "no match", so the gate passed text it had not
+  // checked: pass:true, "forbidden text is absent".
+  test("a pattern that could run away is an error that fails the check, never 'absent'", async () => {
+    const text = `${"a".repeat(30)}! guaranteed returns`;
+    const rules = Array.from({ length: 10 }, (_, i) => ({
+      id: `g${i}`,
+      kind: "forbidden_pattern" as const,
+      value: `(a+)+!$|guaranteed returns${i === 0 ? "" : `|x{${i}}`}`,
+    }));
+    const started = performance.now();
+    const out = await run(contentPolicyCheck, { text, rules });
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(out.pass).toBe(false);
+    expect(out.counts).toMatchObject({ error: 10, pass: 0 });
+    expect(out.outcomes[0].message).toContain("nested-quantifier");
+    // The same rule without the runaway branch finds the forbidden text.
+    const plain = await run(contentPolicyCheck, {
+      text,
+      rules: [{ id: "g", kind: "forbidden_pattern", value: "guaranteed returns" }],
+    });
+    expect(plain.outcomes[0]).toMatchObject({ status: "fail", matchCount: 1 });
+  });
+
+  test("a pattern that was not run to the end is an error, with the reason", async () => {
+    const out = await evaluatePolicy(
+      "guaranteed",
+      [
+        { id: "f", kind: "forbidden_pattern", value: "absent-thing" },
+        { id: "r", kind: "required_pattern", value: "absent-thing" },
+        { id: "p", kind: "forbidden_phrase", value: "absent-thing" },
+      ],
+      {},
+      { deadlineMs: 0 },
+    );
+    expect(out.pass).toBe(false);
+    const byId = Object.fromEntries(out.outcomes.map((o) => [o.id, o]));
+    expect(byId.f).toMatchObject({ status: "error", matchCountIsLowerBound: true });
+    expect(byId.r).toMatchObject({ status: "error" });
+    expect(byId.f?.message).toContain("ran out");
+    expect(byId.f?.message).toContain("not the same as nothing matching");
+    // A literal runs on this thread, whatever the pattern budget.
+    expect(byId.p).toMatchObject({ status: "pass" });
+  });
+
+  test("a count past the cap is reported as a lower bound", async () => {
+    const out = await run(contentPolicyCheck, {
+      text: "a".repeat(20_000),
+      rules: [
+        { id: "pat", kind: "forbidden_pattern", value: "a" },
+        { id: "lit", kind: "forbidden_phrase", value: "a" },
+      ],
+    });
+    const byId = Object.fromEntries(
+      (out.outcomes as Array<{ id: string }>).map((o) => [o.id, o]),
+    ) as Record<
+      string,
+      {
+        status: string;
+        matchCount: number;
+        message: string;
+        matchCountIsLowerBound?: boolean;
+        matches: unknown[];
+      }
+    >;
+    expect(byId.pat).toMatchObject({
+      status: "fail",
+      matchCount: 10_000,
+      matchCountIsLowerBound: true,
+    });
+    expect(byId.pat?.message).toContain("at least 10000");
+    expect(byId.pat?.matches.length).toBe(20);
+    // Literals are counted in full.
+    expect(byId.lit).toMatchObject({ status: "fail", matchCount: 20_000 });
+    expect(byId.lit?.matchCountIsLowerBound).toBeUndefined();
   });
 
   test("a duplicate rule id is refused with a readable message", async () => {

@@ -10,7 +10,7 @@
  * Conditions are `@crewhaus/tool-schema`'s check grammar, the same one
  * `Assert` and `Branch` use.
  */
-import { type Check, runChecks } from "@crewhaus/tool-schema";
+import { type Check, type RegexAnswers, runChecks, testPatternSync } from "@crewhaus/tool-schema";
 
 export type CodingRule = {
   readonly id: string;
@@ -33,6 +33,13 @@ export type CodedLine = {
   readonly ambiguous: boolean;
   readonly needsReview: boolean;
   readonly reason: string;
+  /**
+   * Rules whose conditions could not be evaluated on this line (a pattern
+   * that could not be run to an answer, or one refused as invalid), when
+   * any could have decided it. The line then goes to review uncoded: a
+   * rule that might have matched is not a rule that did not.
+   */
+  readonly undetermined?: ReadonlyArray<string>;
 };
 
 export type CodingResult = {
@@ -43,10 +50,49 @@ export type CodingResult = {
   readonly byAccount: ReadonlyArray<{ readonly account: string; readonly lines: number }>;
 };
 
+type RuleVerdict =
+  | { readonly verdict: "pass" | "fail" }
+  | { readonly verdict: "undetermined"; readonly reason: string };
+
+/**
+ * Whether `rule` holds for `line`, three ways. A condition whose pattern
+ * could not be run to an answer is undetermined, and so is one whose
+ * pattern the screen refused: the rule is malformed, and reading it as "did
+ * not match" let a lower-priority rule code the line (C073). A condition
+ * that definitely failed still decides the rule.
+ */
+function ruleVerdict(
+  line: Record<string, unknown>,
+  rule: CodingRule,
+  regex: RegexAnswers | undefined,
+  refused: (check: Check) => string | undefined,
+): RuleVerdict {
+  const report = runChecks(line, rule.when as Check[], regex === undefined ? {} : { regex });
+  if (report.ok) return { verdict: "pass" };
+  const open: string[] = [];
+  for (const failure of report.failures) {
+    const check = rule.when[failure.index] as Check;
+    const refusal = refused(check);
+    if (refusal !== undefined) open.push(refusal);
+    else if (failure.undetermined === true) open.push(failure.reason);
+    else return { verdict: "fail" };
+  }
+  return { verdict: "undetermined", reason: open.join("; ") };
+}
+
 export function codeLines(
   lines: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
   rules: ReadonlyArray<CodingRule>,
-  options: { readonly version?: string; readonly defaultAccount?: string } = {},
+  options: {
+    readonly version?: string;
+    readonly defaultAccount?: string;
+    /**
+     * The rules' `matches` patterns, answered in the regex worker (see
+     * tool-schema's `askCheckPatterns`). Without it they run bounded on this
+     * thread.
+     */
+    readonly regex?: RegexAnswers;
+  } = {},
 ): CodingResult {
   const seen = new Set<string>();
   for (const rule of rules) {
@@ -57,11 +103,62 @@ export function codeLines(
     seen.add(rule.id);
   }
 
+  // A refused pattern is refused whatever it is run on, so it is screened
+  // once per pattern, on the empty string.
+  const refusals = new Map<string, string | undefined>();
+  const refused = (check: Check): string | undefined => {
+    if (check.op !== "matches" && check.op !== "notMatches") return undefined;
+    if (typeof check.expected !== "string") return undefined;
+    const flags = check.flags ?? "";
+    const key = `${flags}\u0000${check.expected}`;
+    if (!refusals.has(key)) {
+      const answer = testPatternSync(check.expected, flags, "");
+      refusals.set(
+        key,
+        typeof answer === "object" && "refused" in answer
+          ? `invalid regex /${check.expected}/${flags}: ${answer.refused}`
+          : undefined,
+      );
+    }
+    return refusals.get(key);
+  };
+
   const results: CodedLine[] = [];
   for (const line of lines) {
-    const matches = rules
-      .filter((rule) => runChecks(line, rule.when as Check[]).ok)
+    const verdicts = rules.map((rule) => ({
+      rule,
+      ...ruleVerdict(line, rule, options.regex, refused),
+    }));
+    const matches = verdicts
+      .filter((v) => v.verdict === "pass")
+      .map((v) => v.rule)
       .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+    // A rule that could not be evaluated decides nothing, but it could have:
+    // when it would outrank (or tie) whatever did match, or when nothing
+    // did, the line is not coded.
+    const bar = matches.length === 0 ? Number.NEGATIVE_INFINITY : (matches[0]?.priority ?? 0);
+    const blocking = verdicts.filter(
+      (v): v is typeof v & { verdict: "undetermined"; reason: string } =>
+        v.verdict === "undetermined" && (v.rule.priority ?? 0) >= bar,
+    );
+    if (blocking.length > 0) {
+      const named = blocking.map((v) => `"${v.rule.id}" (${v.reason})`).join(", ");
+      results.push({
+        lineId: line.id,
+        account: null,
+        costCenter: null,
+        taxCode: null,
+        matched: matches.map((r) => r.id),
+        ambiguous: false,
+        needsReview: true,
+        reason:
+          matches.length === 0
+            ? `no rule definitely matched, and these could not be evaluated: ${named}`
+            : `rule "${(matches[0] as CodingRule).id}" matched, but these could not be evaluated and would outrank or tie it: ${named}`,
+        undetermined: blocking.map((v) => v.rule.id),
+      });
+      continue;
+    }
 
     if (matches.length === 0) {
       results.push({

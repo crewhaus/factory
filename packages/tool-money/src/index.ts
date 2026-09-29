@@ -17,7 +17,13 @@
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { openForRead } from "@crewhaus/tool-safety/fs";
-import { ASSERT_OPS } from "@crewhaus/tool-schema";
+import {
+  ASSERT_OPS,
+  type Check,
+  RegexAnswers,
+  askCheckPatterns,
+  regexRunContext,
+} from "@crewhaus/tool-schema";
 import { z } from "zod";
 import {
   type OrderLine,
@@ -558,13 +564,24 @@ export const glCodeSuggest: RegisteredTool = buildTool({
   }),
   readOnly: true,
   concurrencySafe: true,
-  execute: async (input) =>
-    json(
-      codeLines(input.lines, input.rules as ReadonlyArray<CodingRule>, {
+  execute: async (input, ctx) => {
+    const rules = input.rules as ReadonlyArray<CodingRule>;
+    // `matches` patterns run in the regex worker, before the rules are read:
+    // a pattern that cannot be run to an answer is undetermined, and the
+    // line goes to review rather than to a lower-priority rule.
+    const regex = new RegexAnswers();
+    for (const line of input.lines) {
+      for (const rule of rules) askCheckPatterns(line, rule.when as Check[], regex);
+    }
+    await regex.resolve(regexRunContext(ctx));
+    return json(
+      codeLines(input.lines, rules, {
         version: input.version,
         defaultAccount: input.defaultAccount,
+        regex,
       }),
-    ),
+    );
+  },
 });
 
 /**
