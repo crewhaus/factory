@@ -36,6 +36,8 @@ import {
   appendMetricsSnapshot,
   readMetricsHistory,
 } from "./alert-watchdog";
+import { IDENTITY_FILENAME, loadOrCreateAgentIdentity } from "./identity";
+import { attachIncidentCollector } from "./incident-collector";
 import { attachAlertWatchdog, attachWatchmeCapture } from "./observability";
 
 const ROOTS: string[] = [];
@@ -211,5 +213,87 @@ describe("alert-watchdog metrics history (0.7.1)", () => {
     await expect(wd?.finalize() ?? Promise.resolve()).rejects.toThrow(/code is-symlink/);
     expect(alerts.length).toBeGreaterThan(0);
     expect(readFileSync(victim, "utf8")).toBe(VICTIM_TEXT);
+  });
+});
+
+describe("incident capture (0.7.1)", () => {
+  test("a directory link planted at .crewhaus/incidents is refused: the capture lands nowhere outside", () => {
+    const { crewhaus, outside } = layout();
+    symlinkSync(outside, join(crewhaus, "incidents"));
+    const bus = new TraceEventBus({ runId: "run_1", sessionId: SID });
+    const errors: string[] = [];
+    const ctx = createRunContext();
+    const logger = ctx.logger;
+    const spy = {
+      ...ctx,
+      logger: {
+        ...logger,
+        error: (m: string, f?: unknown) => errors.push(`${m} ${JSON.stringify(f)}`),
+      },
+    };
+    const collector = attachIncidentCollector(
+      bus,
+      spy as never,
+      { CREWHAUS_INCIDENTS: "1" },
+      {
+        incidentsDir: join(crewhaus, "incidents"),
+      },
+    );
+    bus.publish({
+      ...bus.envelope(),
+      kind: "circuit_state_changed",
+      adapter: "anthropic",
+      fromState: "closed",
+      toState: "open",
+      reason: "$(touch /tmp/pwned)",
+    } as TraceEvent);
+    collector?.unsubscribe();
+    expect(readdirSync(outside)).toEqual(["victim"]);
+    expect(errors.join("\n")).toContain("code escapes-root");
+  });
+
+  test("control: an ordinary capture still lands under .crewhaus/incidents", () => {
+    const { crewhaus } = layout();
+    const bus = new TraceEventBus({ runId: "run_1", sessionId: SID });
+    const collector = attachIncidentCollector(
+      bus,
+      createRunContext(),
+      { CREWHAUS_INCIDENTS: "1" },
+      {
+        incidentsDir: join(crewhaus, "incidents"),
+      },
+    );
+    bus.publish({
+      ...bus.envelope(),
+      kind: "circuit_state_changed",
+      adapter: "anthropic",
+      fromState: "closed",
+      toState: "open",
+      reason: "5 consecutive 429s",
+    } as TraceEvent);
+    collector?.unsubscribe();
+    const [dir] = readdirSync(join(crewhaus, "incidents"));
+    expect(readdirSync(join(crewhaus, "incidents", dir ?? "")).sort()).toEqual([
+      "events.jsonl",
+      "incident.json",
+    ]);
+  });
+});
+
+describe("agent identity (0.7.1)", () => {
+  test("a link planted at identity.json is refused: the new keypair is never written through it", () => {
+    const { crewhaus, victim } = layout();
+    symlinkSync(victim, join(crewhaus, IDENTITY_FILENAME));
+    expect(() => loadOrCreateAgentIdentity(crewhaus)).toThrow(
+      /identity\.json: .*\(code is-symlink\)/,
+    );
+    expect(readFileSync(victim, "utf8")).toBe(VICTIM_TEXT);
+  });
+
+  test("control: first boot mints, a later boot reads the same identity", () => {
+    const { crewhaus } = layout();
+    const first = loadOrCreateAgentIdentity(crewhaus);
+    expect(loadOrCreateAgentIdentity(crewhaus).agentId).toBe(first.agentId);
+    expect(lstatSync(join(crewhaus, IDENTITY_FILENAME)).isFile()).toBe(true);
   });
 });
