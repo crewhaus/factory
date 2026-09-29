@@ -126,6 +126,14 @@ import {
 } from "./lib/result";
 import { workspaceRoot } from "./paths";
 
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which changed the
+ * spec SpecPin registers, so a spec pinned on 0.7.0 no longer content-matched
+ * its own version (bounds review).
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
+
 // ---------------------------------------------------------------------------
 // shared plumbing
 // ---------------------------------------------------------------------------
@@ -467,7 +475,7 @@ export const specPin: RegisteredTool = buildTool({
         `"${render(input.specFile)}" is over the ${MAX_SPEC_BYTES}-byte limit for a spec, so it was not read`,
       );
     }
-    const yaml = read.text;
+    const yaml = KEEP_BOM.decode(read.bytes);
 
     // Contain the root and the leaves. The version files are not known yet, so
     // this first pass contains what does not depend on them; the manifest read

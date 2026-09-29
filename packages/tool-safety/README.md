@@ -171,6 +171,8 @@ The helper reads at most `maxBytes` plus one byte (to tell whether more exists),
 
 The open descriptor is checked again with `fstat`, and it must be the same file (`dev`/`ino`) as the one checked. The open uses `O_NONBLOCK`, so a path swapped for a FIFO between the two checks cannot block. `followSymlinks: false` refuses a symlink and opens with `O_NOFOLLOW`.
 
+The result's `bytes` is a view of the buffer the file was read into, not a copy, and `text` is decoded from it on first use. A caller that needs only the bytes (a size, a hash, a binary format) never pays for a string of the whole file. The decode drops a leading byte-order mark, as `TextDecoder` does; a caller that must keep the file's bytes as they are (0.7.0's `readFileSync(path, "utf8")` kept it) decodes `bytes` itself with `new TextDecoder("utf-8", { ignoreBOM: true })`.
+
 `openRegularFile(path)` (and `openRegularFileAsync`) makes the same checks and returns the open descriptor with its `stats`, for a reader that streams: `ReadLines` up to line N, `TailFile` from `size − n`, `SplitFile`'s source. `readOpenedFileSync(opened, { maxBytes, position })` reads from it. The caller closes it.
 
 ## `./fs`: the leaf, not just the directory

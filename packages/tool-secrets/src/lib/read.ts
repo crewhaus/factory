@@ -1,6 +1,14 @@
 import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { workspaceRoot } from "../paths";
 
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which changed a
+ * file: secret's value and fingerprint, and dropped the mark from a .env
+ * that EnvFileUpsert rewrote (bounds review).
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
+
 /** The most a secret file, a .env, the journal or the lock is read to. */
 export const MAX_READ_BYTES = 16 * 1024 * 1024;
 
@@ -19,8 +27,9 @@ const ERRNO: Readonly<Record<string, string>> = {
 };
 
 /**
- * A workspace file's whole text, as `readFileSync(path, "utf8")` gave it, or
- * a throw carrying an errno-style `code` (`ENOENT` for a missing file).
+ * A workspace file's whole text, as `readFileSync(path, "utf8")` gave it (a
+ * leading byte-order mark kept), or a throw carrying an errno-style `code`
+ * (`ENOENT` for a missing file).
  *
  * Opened without blocking, and only as a regular file. A FIFO with no writer
  * blocks an ordinary open for ever, and every read in this package is
@@ -44,5 +53,5 @@ export function readWorkspaceText(path: string, maxBytes = MAX_READ_BYTES): stri
     err.code = "EFBIG";
     throw err;
   }
-  return read.text;
+  return KEEP_BOM.decode(read.bytes);
 }

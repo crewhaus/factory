@@ -35,6 +35,14 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { fetchRaw, readFileBoundedSync, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import { z } from "zod";
 
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which changed a
+ * file:// page's body, and the sha256 its citation records, for a file that
+ * starts with one (bounds review).
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_REDIRECTS = 5;
 const DEFAULT_MAX_BODY_BYTES = 5 * 1024 * 1024;
@@ -606,7 +614,7 @@ export function createCrawler(opts: {
     if (read.truncated) {
       throw new CrawlerError(`file ${abs} exceeds ${maxBodyBytes} bytes`);
     }
-    return read.text;
+    return KEEP_BOM.decode(read.bytes);
   }
 
   return {

@@ -33,6 +33,14 @@ import {
 import { type FixedField, parseFixedWidth, shardRows, toLong, toWide } from "./lib/reshape";
 import { resolveSafe, workspaceRoot } from "./paths";
 
+/**
+ * A file's text as 0.7.0's `readFileSync(path, "utf8")` gave it: a leading
+ * byte-order mark kept. tool-safety's `text` drops one, which moved
+ * FixedWidthParse's columns by one on a file that starts with one (bounds
+ * review). A CSV's header is unaffected: parseCsv drops the mark itself.
+ */
+const KEEP_BOM = new TextDecoder("utf-8", { ignoreBOM: true });
+
 const json = (value: unknown): string => JSON.stringify(value);
 
 const LIMITS = {
@@ -61,7 +69,14 @@ function readWorkspaceText(
 ): { text: string; size: number; overLimit: boolean } {
   const read = openForReadSync(workspaceRoot(), file, { maxBytes });
   if (!read.ok) throw new Error(`${tool}: ${read.reason}`);
-  return { text: read.text, size: read.size, overLimit: read.truncated };
+  return {
+    // Decoded only when asked for: a caller refuses a file over the limit unread.
+    get text(): string {
+      return KEEP_BOM.decode(read.bytes);
+    },
+    size: read.size,
+    overLimit: read.truncated,
+  };
 }
 
 /** Read a delimited file into a header and rows of strings. */
