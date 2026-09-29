@@ -1,20 +1,33 @@
 /**
  * The oldest Bun that CrewHaus supports, and the check `crewhaus doctor` runs.
  *
- * 0.7.1 raised this from 1.2.0 to 1.3.11. On Bun 1.2 the guarantees 0.7.1's
- * hardening rests on do not hold: a regex worker that timed out keeps running
- * (a batch's thread stayed live for 39 s after `terminate`, against about 1 s on
- * 1.3), burning a core and filling the runaway-worker budget so later regex
- * calls come back "busy". The test suite cannot run there either
- * (`beforeAll(fn, timeout)` is rejected), so a 1.2 floor was a claim nothing
- * checked. 1.3.11 is the Bun the CI suite and the release binaries use; no
- * older 1.3 has been run against this tree.
+ * 0.7.1 raised this from 1.2.0. The guarantee it was raised for is
+ * @crewhaus/tool-safety's regex worker: a caller-supplied regex runs in a
+ * worker that is terminated at its deadline, so a pattern that never finishes
+ * costs one abandoned thread for a moment, not a core for as long as it runs.
+ * - On 1.2 a timed-out batch's thread stayed live for 39 s after `terminate`
+ *   (about 1 s on 1.3), filling the runaway-worker budget so later regex calls
+ *   came back "busy"; the test suite cannot run there at all
+ *   (`beforeAll(fn, timeout)` is rejected).
+ * - On 1.3.11, Linux x64 (CI run 36615945808), tool-safety's own tests fail:
+ *   a terminated batch kept its thread for the whole batch, and
+ *   String.prototype.replace split a surrogate pair against the spec. The
+ *   first 0.7.1 floor was 1.3.11, which promised the guarantee exactly where
+ *   CI refuted it.
+ * - On 1.3.13 and 1.3.14 both pass on Linux arm64, and on 1.3.14 on macOS,
+ *   where this whole tree is developed and tested.
+ *
+ * So the floor is 1.3.14, and CI's and the release jobs' Bun pins EQUAL it
+ * (scripts/bun-floor.test.ts): the gating ubuntu x64 `ci` job is what proves
+ * the floor on Linux x64, and release.yml's build waits on it, so no tag ships
+ * a floor that job has not run green. The standalone binaries embed the Bun
+ * that builds them, the same pin.
  *
  * The same floor is stated in the root package.json's `engines.bun` (which
  * release-prep stamps into every published package), the container images and
  * the install docs; `scripts/bun-floor.test.ts` fails when any of them drifts.
  */
-export const BUN_FLOOR = "1.3.11";
+export const BUN_FLOOR = "1.3.14";
 
 /** major.minor.patch of a Bun version string; a pre-release tag is ignored. */
 export function bunVersionParts(version: string): [number, number, number] | undefined {

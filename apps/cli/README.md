@@ -30,7 +30,7 @@ winget install CrewHaus.CLI                   # Windows (winget)
 # Debian / Ubuntu (apt): signed repo at https://crewhaus.github.io/apt
 ```
 
-Or install this package from npm — it runs on [Bun](https://bun.sh) ≥ 1.3.11:
+Or install this package from npm — it runs on [Bun](https://bun.sh) ≥ 1.3.14:
 
 ```bash
 npm install -g crewhaus        # global

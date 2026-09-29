@@ -25,10 +25,10 @@ chvm use latest
 
 The first `chvm use` puts a `crewhaus` shim onto your PATH and installs the newest published release. chvm itself runs on Node; [Bun](https://bun.sh) is what runs `crewhaus`. What it buys over a package-manager install: pinned side-by-side versions (`chvm use 0.5.4`, partial versions resolve), an instant switch in every open shell, and `chvm use local [path]` to run a factory checkout from source.
 
-The CLI also ships through **five package channels**, all supported and all current. Take one of these when you want a self-contained binary — the Homebrew, Scoop, winget, and apt builds need no Bun or Node runtime; only the npm/Bun package requires Bun (>= 1.3.11).
+The CLI also ships through **five package channels**, all supported and all current. Take one of these when you want a self-contained binary — the Homebrew, Scoop, winget, and apt builds need no Bun or Node runtime; only the npm/Bun package requires Bun (>= 1.3.14).
 
 ```bash
-# npm / Bun (requires Bun >= 1.3.11)
+# npm / Bun (requires Bun >= 1.3.14)
 npm install -g crewhaus        # or: bun add -d crewhaus
 
 # Homebrew (macOS / Linux)

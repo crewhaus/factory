@@ -86,21 +86,28 @@ describe("the Bun floor is stated once and held everywhere", () => {
     expect(froms).toBe(24);
   });
 
-  test("every Bun that CI and the release jobs install is at or above the floor", () => {
+  test("every Bun that CI and the release jobs install IS the floor, so CI proves it before a tag", () => {
+    // Equal, not merely at or above: the first 0.7.1 floor (1.3.11) was
+    // "at or above" a pin nobody had seen green on Linux x64, and CI there
+    // refuted it. A pinned job runs exactly the floor; a floating one
+    // (pricing-drift) floats from exactly the floor.
     const workflows = trackedFiles(".github/workflows/*.yml");
     const bad: string[] = [];
     let pins = 0;
+    let exact = 0;
     for (const file of workflows) {
       const text = readFileSync(join(ROOT, file), "utf8");
       for (const m of text.matchAll(/bun-version:\s*"?([^"\s]+)"?/g)) {
         pins += 1;
         const spec = m[1] ?? "";
-        const version = spec.startsWith(">=") ? spec.slice(2) : spec;
-        if (!meetsFloor(version)) bad.push(`${file}: bun-version ${spec}`);
+        if (spec === BUN_FLOOR) exact += 1;
+        else if (spec !== `>=${BUN_FLOOR}`) bad.push(`${file}: bun-version ${spec}`);
       }
     }
     expect(bad).toEqual([]);
     expect(pins).toBe(9);
+    // ci (3 jobs), release (3), smoke-runtime (1) pin it exactly.
+    expect(exact).toBe(7);
   });
 
   test("every install doc that names a minimum Bun names the floor", () => {

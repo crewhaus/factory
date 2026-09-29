@@ -60,7 +60,7 @@ echo "deb [signed-by=/usr/share/keyrings/crewhaus.gpg] https://crewhaus.github.i
 sudo apt update && sudo apt install crewhaus
 ```
 
-Prefer npm? The `crewhaus` package runs on [Bun](https://bun.sh) ≥ 1.3.11:
+Prefer npm? The `crewhaus` package runs on [Bun](https://bun.sh) ≥ 1.3.14:
 
 ```bash
 npm install -g crewhaus        # global
@@ -119,7 +119,7 @@ Full architecture: [`AI-Harness-Systems.md`](https://github.com/crewhaus/docs/bl
 
 ## Quickstart
 
-Install `crewhaus` (see [Install](#install)) — the binary needs no runtime; the npm package needs [Bun](https://bun.sh) ≥ 1.3.11.
+Install `crewhaus` (see [Install](#install)) — the binary needs no runtime; the npm package needs [Bun](https://bun.sh) ≥ 1.3.14.
 
 ```bash
 # Create a new agent project — writes a minimal `crewhaus.yaml`
