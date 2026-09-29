@@ -102,6 +102,10 @@ the way the engine scores it — a broken `alwaysDeny` or `alwaysAsk` fails
 closed and gates every call, a broken `alwaysAllow` is dropped — and under
 `mode: plan` the decisions follow plan mode: allow rules are ignored, a deny or
 ask rule denies, and anything else is allowed only if the tool is read-only.
+A rule that compiles but can never fire as written — a spec key where the tool
+name belongs (`removePath(src/**)` for `RemovePath(src/**)`), or an argument
+pattern the tool's operative field cannot match — is listed under
+`ruleProblems` with its fix and counted as covering nothing.
 Builtins are reported with their own flags from the builtin manifest, rules
 are matched against the name the engine sees (`JavaScript`, not a guess from
 the key `javascript`), and an `all-<category>` selector is audited as the
@@ -112,7 +116,16 @@ server, and checks builtin keys against this release's builtins unless you pass
 returns `anchorChecked`, because a chain that verifies without an anchor has
 not ruled out a dropped tail. `EvalBaselineCompare` fails a comparison that never happened — two runs that share
 no sample id, or that name different datasets (unless `allowDatasetMismatch`) —
-rather than passing a candidate measured on something else; and it reads a results document
+rather than passing a candidate measured on something else, and
+`minSharedFraction` can require the candidate to cover more of the baseline.
+Another version or split of the same registry dataset (`golden@v3` against
+`golden@v4` or `golden@v3#dev`), or the same dataset with a regression suite
+unioned in (`golden@v3+regressions@v1`), is the same dataset: it is noted, not
+failed. A sample present on only one side is reported and never counted as a
+regression; a sample with no `sampleId` is never matched by position — it
+counts in its own run's pass rate and is named in a note; and a candidate
+sample whose judge abstained or whose invoker errored is listed as
+inconclusive, so judge noise is not mistaken for a real fall. It also reads a results document
 without believing it: a declared `passRate` outside 0..1 is discarded in
 favour of the samples, one the samples contradict is reported as a note, and a
 repeated `sampleId` is named, because samples are matched by id and a repeat

@@ -27,6 +27,7 @@ import {
 } from "@crewhaus/tool-categories";
 import { isPrivateIp } from "@crewhaus/tool-fetch";
 import { TOOL_REGISTRY, projectRegistryEntry } from "@crewhaus/tool-registry-manifest";
+import { loadAllBuiltinTools } from "./builtin-tools-for-tests";
 import { TOOL_PACKAGE_LOADERS, loadBuiltinTools } from "./tool-packages";
 import {
   CLI_RUNTIME_TOOL_KEYS,
@@ -810,6 +811,30 @@ describe("the generated tool manifest matches the tools it describes", () => {
     expect(manifestKeys.length).toBeGreaterThanOrEqual(500);
     expect(manifestKeys.filter((k) => k.startsWith("mcp__"))).toEqual([]);
   });
+});
+
+/**
+ * OpenAI and Azure OpenAI refuse the WHOLE request when any tool's
+ * `function.description` is longer than 1024 characters, so one over-long
+ * builtin breaks every turn of a spec that grants it (C014).
+ * `@crewhaus/tool-registry-manifest`'s own test holds the limit over the
+ * manifest; this holds it over the live tools, which includes the builtins the
+ * manifest cannot carry — the chain readers and signers other shapes emit,
+ * `SendMessage` and the pipeline's `Retrieve`. `.length` counts UTF-16 units,
+ * never fewer than the code points a provider might count.
+ */
+describe("every builtin description fits every provider", () => {
+  test("no live builtin's description is longer than 1024 characters", async () => {
+    const { tools, fromMap } = await loadAllBuiltinTools();
+    const over = tools
+      .filter((tool) => tool.description.length > 1024)
+      .map((tool) => `${tool.name}: ${tool.description.length}`);
+    // The sweep's hit count: the emitter map and the package scan both ran,
+    // and the scan found the builtins the map leaves out.
+    expect(fromMap).toBeGreaterThanOrEqual(500);
+    expect(tools.length).toBeGreaterThan(fromMap);
+    expect(over).toEqual([]);
+  }, 60_000);
 });
 
 /**
