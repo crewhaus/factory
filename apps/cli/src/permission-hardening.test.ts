@@ -164,6 +164,15 @@ async function gate(
   ruleSet: RuleSet,
   mode: PermissionMode = "default",
 ): Promise<string | undefined> {
+  // The tools resolve a relative path against process.cwd(). A test that
+  // outlives its timeout keeps running after afterEach has put the cwd back
+  // (to apps/cli) and removed the workspace, so its next call would write
+  // `src/new.ts` or `build/link/app.ts` into the checkout itself. Refuse.
+  if (process.cwd() !== ws || !existsSync(ws)) {
+    throw new Error(
+      `gate(${name}) outlived its test's workspace; refusing to run tools against ${process.cwd()}`,
+    );
+  }
   const runContext = createRunContext();
   const events: TraceEvent[] = [];
   runContext.eventBus.subscribe((e) => events.push(e));
@@ -190,6 +199,20 @@ async function gate(
  * show it was the rule: an input the tool's schema rejects never reaches one.
  */
 let lastReason: string | undefined;
+
+describe("a gate call that outlives its test never runs a tool in the checkout", () => {
+  test("after teardown has restored the cwd, gate() refuses instead of resolving against it", async () => {
+    // What afterEach does to a test that timed out while its body runs on.
+    process.chdir(cwd);
+    let refused: unknown;
+    try {
+      await gate("Read", { path: "package.json" }, rules(["alwaysAllow", "Read"]));
+    } catch (err) {
+      refused = err;
+    }
+    expect(String(refused)).toContain("outlived its test's workspace");
+  });
+});
 
 describe("p1 — a scoped deny/ask with a bare allow behind it (permission-integration#0)", () => {
   const rs = rules(
