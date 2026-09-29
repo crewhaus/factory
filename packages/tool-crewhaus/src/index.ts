@@ -62,6 +62,7 @@ import {
   builtinKeyForName,
   checkBuiltinTool,
 } from "@crewhaus/tool-categories";
+import { specPermissionRuleLists } from "@crewhaus/tool-permission-matcher";
 import {
   NON_CLI_TOOL_FLAGS,
   RUNTIME_TOOL_NAMES,
@@ -682,6 +683,10 @@ export const permissionAudit: RegisteredTool = buildTool({
     ];
     const result = auditPermissions({
       tools: view.tools,
+      // A `thredz:` block registers its tools under their bare names
+      // (`goal_list`, `message_send`, …) with no `tools:` entry, so they are
+      // granted too, and a rule naming one covers it.
+      runtimeTools: thredzToolNamesOfSpec(parsed.value),
       mode: view.permissions.mode,
       askMode: view.permissions.askMode,
       rules: view.permissions.rules,
@@ -705,6 +710,11 @@ export const permissionAudit: RegisteredTool = buildTool({
         ...thredzToolNamesOfSpec(parsed.value).map((name) => ({ name })),
       ],
       mcpServers: view.mcpServers.map((s) => s.name),
+      // The model profiles', pool candidates' and sub-agents' lists, checked
+      // for rules that never fire, as lint and compile check them (C146).
+      otherRuleLists: specPermissionRuleLists(expanded).filter(
+        (list) => list.path !== "permissions.rules",
+      ),
       ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });
     return json({

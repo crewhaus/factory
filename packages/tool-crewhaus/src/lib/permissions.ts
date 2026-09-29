@@ -30,8 +30,10 @@
 import { isOutwardName } from "@crewhaus/tool-builder";
 import { legacyMcpToolName } from "@crewhaus/tool-catalog";
 import {
+  type PermissionRuleList,
   type PermissionRuleProblem,
   type RuleToolDescriptor,
+  mcpServersReachedBy,
   permissionRuleProblems,
 } from "@crewhaus/tool-permission-matcher";
 import { compareStrings } from "./spec-view";
@@ -53,6 +55,9 @@ export type ToolFlagsLike = {
 
 /** A rule as a spec declares it. */
 export type RuleLike = { readonly type: string; readonly pattern: string };
+
+/** A rule that can never do what it says, and the list that holds it. */
+export type LocatedRuleProblem = PermissionRuleProblem & { readonly list: string };
 
 /** How thoroughly a rule's pattern covers a tool name. */
 export type Coverage = "full" | "conditional" | "none";
@@ -98,8 +103,18 @@ export type PermissionAuditResult = {
   /** What an unmatched call resolves to under `mode`, before tool flags. */
   readonly fallback: string;
   readonly tools: readonly ToolPermission[];
-  /** Declared rules that match none of the granted tools — likely dead. */
+  /**
+   * Declared rules that match none of the granted tools and can match no
+   * tool of a declared MCP server — likely dead.
+   */
   readonly unusedRules: readonly RuleLike[];
+  /**
+   * Declared rules that match none of the granted tools but can match a tool
+   * of an MCP server the spec declares (`broker__*`, `mcp__gh__create_*`).
+   * The server lists its tools when it starts, so this report cannot say
+   * which they cover — only that they are not dead.
+   */
+  readonly mcpServerRules: ReadonlyArray<RuleLike & { readonly servers: readonly string[] }>;
   /**
    * Rules the runtime matcher would REFUSE to compile. The engine fails
    * closed on these: an uncompilable `alwaysDeny`/`alwaysAsk` gates every
@@ -120,9 +135,12 @@ export type PermissionAuditResult = {
    * Rules that can never do what they say: a spec key where the tool's name
    * belongs, an argument pattern the tool's operative field cannot match, an
    * MCP server the spec does not declare. The same check `crewhaus lint`
-   * runs. Such a rule is not counted as covering any tool.
+   * runs, over every rule list the spec carries: `list` names it
+   * (`permissions.rules`, `models.fast.permissions.deny`,
+   * `agent.sub_agents.helper.permissions.allow`, …). Such a rule is not
+   * counted as covering any tool.
    */
-  readonly ruleProblems: readonly PermissionRuleProblem[];
+  readonly ruleProblems: readonly LocatedRuleProblem[];
   readonly findings: readonly PermissionFinding[];
 };
 
@@ -280,6 +298,12 @@ export function fallbackDecision(mode: string): string {
 
 export type AuditPermissionsInput = {
   readonly tools: readonly string[];
+  /**
+   * Tools the runtime registers under exactly these names with no `tools:`
+   * entry — a `thredz:` block's `goal_list`, `message_send`, … They are
+   * granted like `tools`, and no registered name is guessed for them.
+   */
+  readonly runtimeTools?: readonly string[];
   readonly mode: string;
   readonly askMode: string;
   readonly rules: readonly RuleLike[];
@@ -299,6 +323,14 @@ export type AuditPermissionsInput = {
   readonly knownTools?: readonly RuleToolDescriptor[];
   /** The MCP servers the spec declares. */
   readonly mcpServers?: readonly string[];
+  /**
+   * The spec's other rule lists — model profiles' and pool candidates'
+   * deny/ask, sub-agents' allow/deny (`specPermissionRuleLists`, without
+   * `permissions.rules`). They narrow or replace `rules` for what they
+   * serve, so they are checked for rules that can never fire, not audited
+   * for cover.
+   */
+  readonly otherRuleLists?: readonly PermissionRuleList[];
   /** The spec's `security.justification.judge`, when it sets one. */
   readonly justificationJudge?: string;
 };
@@ -325,30 +357,42 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   const tools: ToolPermission[] = [];
   const findings: PermissionFinding[] = [];
   const flagsOf = input.flagsOf ?? (() => undefined);
-  const grantedTools = [...new Set(input.tools)].sort(compareStrings);
+  const runtimeTools = new Set(input.runtimeTools ?? []);
+  const grantedTools = [...new Set([...input.tools, ...runtimeTools])].sort(compareStrings);
+  // The name the engine matches rules against: a builtin's comes from its
+  // flags, a runtime tool's is its own, anything else's is a guess.
+  const registeredNameOf = (tool: string, flags: ToolFlagsLike | undefined): string =>
+    flags?.name ?? (runtimeTools.has(tool) ? tool : toRegisteredName(tool));
 
   // Rules that can never fire as written cover nothing; the ones whose
   // argument is merely unscoped still match (on the call's text), a
   // `builtin-not-reached` glob still matches a declared MCP server's tools,
   // and a `tool-not-known` name may be a plugin's.
-  const ruleProblems = permissionRuleProblems({
-    rules: input.rules,
-    granted: grantedTools.flatMap((tool) => {
-      const flags = flagsOf(tool);
-      return flags !== undefined
-        ? [
-            {
-              name: flags.name,
-              ...(flags.operativeArgs ? { operativeArgs: flags.operativeArgs } : {}),
-            },
-          ]
-        : [{ name: toRegisteredName(tool) }];
-    }),
-    known: input.knownTools ?? [],
-    mcpServers: input.mcpServers ?? [],
+  const granted = grantedTools.flatMap((tool) => {
+    const flags = flagsOf(tool);
+    return flags !== undefined
+      ? [
+          {
+            name: flags.name,
+            ...(flags.operativeArgs ? { operativeArgs: flags.operativeArgs } : {}),
+          },
+        ]
+      : [{ name: registeredNameOf(tool, undefined) }];
   });
+  const problemsIn = (list: PermissionRuleList): LocatedRuleProblem[] =>
+    permissionRuleProblems({
+      rules: list.rules,
+      granted,
+      known: input.knownTools ?? [],
+      mcpServers: input.mcpServers ?? [],
+    }).map((p) => ({ ...p, list: list.path }));
+  const topProblems = problemsIn({ path: "permissions.rules", rules: input.rules });
+  const ruleProblems = [
+    ...topProblems,
+    ...(input.otherRuleLists ?? []).flatMap((list) => problemsIn(list)),
+  ];
   const deadRules = new Set(
-    ruleProblems
+    topProblems
       .filter(
         (p) =>
           p.code !== "argument-not-scoped" &&
@@ -363,7 +407,7 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     // The name the engine matches rules against. A builtin's comes from its
     // flags: `toRegisteredName` gets `javascript` → "Javascript" wrong, and a
     // live `alwaysDeny JavaScript` was then reported as unused (C032).
-    const registered = flags?.name ?? toRegisteredName(tool);
+    const registered = registeredNameOf(tool, flags);
     let matched: { rule: RuleLike; coverage: Coverage } | undefined;
     for (const rule of input.rules) {
       if (modeOverridesRules && rule.type === "alwaysAllow") continue;
@@ -385,15 +429,20 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
       // reported as the tool's decision. A tool the manifest does not
       // describe keeps both spellings, since its registered name is a guess.
       const coverage =
-        flags !== undefined
+        flags !== undefined || runtimeTools.has(tool)
           ? patternCoverage(rule.pattern, registered)
           : patternCoverage(rule.pattern, tool) !== "none"
             ? patternCoverage(rule.pattern, tool)
             : patternCoverage(rule.pattern, registered);
       if (coverage !== "none") {
-        matched = { rule, coverage };
+        // The first rule that speaks to the tool is its decision; one that
+        // speaks only to some calls (`Edit(curriculum.md)`) leaves the rules
+        // after it reachable for the others (`Edit(eval/**)`), so they are
+        // not reported as matching nothing. A rule that covers every call
+        // shadows the rest.
+        matched ??= { rule, coverage };
         usedRules.add(`${rule.type} ${rule.pattern}`);
-        break;
+        if (coverage === "full") break;
       }
     }
     const external = isExternalTool(tool, flags);
@@ -465,10 +514,23 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   }
 
   // A rule naming a tool the spec does not grant cannot fire. Worth saying:
-  // it is usually a rename or a tool that was dropped and the guard left.
-  const unusedRules = input.rules
-    .filter((rule) => !usedRules.has(`${rule.type} ${rule.pattern}`))
-    .sort((a, b) => compareStrings(a.pattern, b.pattern) || compareStrings(a.type, b.type));
+  // it is usually a rename or a tool that was dropped and the guard left —
+  // unless it can match a declared MCP server's tools, which only the server
+  // can list.
+  const byPattern = (a: RuleLike, b: RuleLike) =>
+    compareStrings(a.pattern, b.pattern) || compareStrings(a.type, b.type);
+  const unmatched = input.rules.filter((rule) => !usedRules.has(`${rule.type} ${rule.pattern}`));
+  const unusedRules: RuleLike[] = [];
+  const mcpServerRules: Array<RuleLike & { servers: string[] }> = [];
+  for (const rule of unmatched) {
+    const servers = deadRules.has(`${rule.type} ${rule.pattern}`)
+      ? []
+      : mcpServersReachedBy(rule.pattern, input.mcpServers ?? []);
+    if (servers.length > 0) mcpServerRules.push({ ...rule, servers });
+    else unusedRules.push(rule);
+  }
+  unusedRules.sort(byPattern);
+  mcpServerRules.sort(byPattern);
 
   if (blanketGate !== undefined) {
     findings.push({
@@ -491,6 +553,7 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     fallback,
     tools,
     unusedRules,
+    mcpServerRules,
     malformedRules,
     modeOverridesRules,
     ruleProblems,
