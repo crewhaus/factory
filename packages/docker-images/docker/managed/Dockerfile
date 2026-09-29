@@ -1,6 +1,6 @@
 # Section 32 — docker-images: managed target shape (multi-tenant gateway daemon).
 # Section 20 daemon listens on $PORT (default 8080) for tenant API traffic.
-FROM oven/bun:1.2-alpine AS deps
+FROM oven/bun:1.3-alpine AS deps
 WORKDIR /app
 COPY bun.lock package.json ./
 COPY packages packages
@@ -13,7 +13,7 @@ COPY tsconfig.base.json tsconfig.json ./
 RUN bun run typecheck
 RUN bun build apps/cli/src/index.ts --target=bun --outfile=/app/dist/crewhaus.js
 
-FROM oven/bun:1.2-alpine AS runtime
+FROM oven/bun:1.3-alpine AS runtime
 RUN apk add --no-cache curl ca-certificates && \
     addgroup -S crewhaus && adduser -S crewhaus -G crewhaus -u 10001 && \
     mkdir -p /app/.crewhaus/audit && chown -R crewhaus:crewhaus /app/.crewhaus
