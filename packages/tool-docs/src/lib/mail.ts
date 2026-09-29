@@ -296,13 +296,34 @@ const OBSOLETE_ZONES: Readonly<Record<string, number>> = {
 };
 
 /**
+ * `value` with each `(…)` comment replaced by a space: exactly
+ * `value.replace(/\([^)]*\)/g, " ")`, in linear time. That regex re-read the
+ * rest of the header from every `(` with no `)` after it, so a Date of
+ * 80 000 `(` took 3.6 s (C090's tool-docs sibling, bounds review).
+ */
+export function replaceComments(value: string): string {
+  let out = "";
+  let at = 0;
+  for (;;) {
+    const open = value.indexOf("(", at);
+    if (open === -1) break;
+    const close = value.indexOf(")", open + 1);
+    // No `)` after this `(`, so none after any later one: nothing more matches.
+    if (close === -1) break;
+    out += `${value.slice(at, open)} `;
+    at = close + 1;
+  }
+  return out + value.slice(at);
+}
+
+/**
  * Parse an RFC 5322 `Date:` to ISO-8601, by hand. The host's `Date` parser
  * accepts and silently reinterprets all sorts of malformed input; a mail
  * date is data, and data gets a real parser.
  */
 export function parseMailDate(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
-  const cleaned = value.replace(/\([^)]*\)/g, " ").trim();
+  const cleaned = replaceComments(value).trim();
   const match =
     /^(?:[A-Za-z]{3},\s*)?(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([+-]\d{4}|[A-Za-z]{1,3})?/.exec(
       cleaned,

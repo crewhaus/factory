@@ -18,7 +18,7 @@
 import { describe, expect, test } from "bun:test";
 import { emlParse } from "./index";
 import { tidyLines } from "./lib/lines";
-import { parseAddressList, stripHtml } from "./lib/mail";
+import { parseAddressList, parseMailDate, replaceComments, stripHtml } from "./lib/mail";
 import { parseToUnicodeCMap } from "./lib/pdf-text";
 
 /** 0.7.0's stripHtml, verbatim. Small inputs only. */
@@ -210,6 +210,34 @@ describe("parseAddressList", () => {
     // 0.7.0: 40 000 '<' took 0.9 s (quadratic); this is 10x that.
     const started = performance.now();
     parseAddressList("<".repeat(400_000), new Set());
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
+});
+
+describe("parseMailDate's comment strip (bounds review)", () => {
+  test("is the regex it replaces", () => {
+    const next = rng(11);
+    const atoms = ["(", ")", "a", " ", "((", "))", "(x)", "Mon"];
+    for (let i = 0; i < 5_000; i++) {
+      let text = "";
+      const length = Math.floor(next() * 20);
+      for (let j = 0; j < length; j++) text += atoms[Math.floor(next() * atoms.length)];
+      expect({ text, out: replaceComments(text) }).toEqual({
+        text,
+        out: text.replace(/\([^)]*\)/g, " "),
+      });
+    }
+    expect(parseMailDate("Tue, 1 Jul 2003 10:52:37 +0200 (CEST)")).toBe("2003-07-01T08:52:37.000Z");
+  });
+
+  test("is linear on a Date of many '(' and no ')'", async () => {
+    // 0.7.0 and 0.7.1's first cut: 80 000 '(' took 3.6 s, four times as
+    // long per doubling. This is ten times that.
+    const started = performance.now();
+    expect(parseMailDate("(".repeat(800_000))).toBeUndefined();
+    const message = `From: a@x.test\r\nDate: ${"(".repeat(400_000)}\r\n\r\nbody\r\n`;
+    const out = JSON.parse(String(await emlParse.execute({ content: message }, {} as never)));
+    expect(out.date).toBeUndefined();
     expect(performance.now() - started).toBeLessThan(5_000);
   });
 });
