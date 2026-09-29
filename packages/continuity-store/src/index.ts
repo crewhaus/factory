@@ -525,6 +525,18 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
   const lockPath = join(storeDir, ".lock");
   const retentionPath = join(crewhausDir, "retention.json");
   const sessionRootDir = resolve(opts.sessionRootDir ?? join(crewhausDir, "sessions"));
+
+  /**
+   * The root `retention.json` is contained within. Without a tenant it is the
+   * harness root (the parent of `.crewhaus`), so an operator may keep the
+   * retention policy in a sibling `config/` and link `.crewhaus/retention.json`
+   * to it; a link OUT of the workspace is still refused. Under a tenant it is
+   * the tenant's own root, so pins never reach outside the tenant.
+   */
+  function retentionRoot(): string {
+    const tenant = opts.tenant ?? currentTenantContext()?.tenant;
+    return tenant !== undefined ? tenantRootOf(tenant) : resolve(crewhausDir, "..");
+  }
   // Fail closed at construction, not just on first I/O.
   fence(storeDir);
 
@@ -534,15 +546,17 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
   }
 
   /**
-   * Write `content` at `absPath` without writing THROUGH anything planted in
-   * the store (C070). The bytes go to an `O_EXCL|O_NOFOLLOW` temp under a
-   * random name in the file's physical directory, which must be inside the
-   * store, and the temp is renamed into place. The fixed temp name
+   * Write `content` at `absPath` without writing THROUGH anything planted
+   * OUTSIDE the store (C070). The bytes go to an `O_EXCL|O_NOFOLLOW` temp
+   * under a random name in the file's physical directory, which must be
+   * inside the store, and the temp is renamed into place. The fixed temp name
    * (`focus.md.tmp`, `goals.yaml.tmp`) used to be opened with link
    * following, so a symlink planted there, dangling or not, created or
    * overwrote a file anywhere the process could write, with the model's
-   * focus or goal text. A symlinked leaf, a `plans/` directory leading out,
-   * or a FIFO at the leaf is refused, naming the store path.
+   * focus or goal text. A `plans/` directory or a leaf link leading OUT of
+   * the store is refused, naming the store path; a link that stays inside the
+   * store is followed (`focus.md -> focus-kept.md` in the store edits the
+   * target), and a FIFO at the leaf is refused rather than blocked on.
    */
   async function writeAtomic(path: string, content: string): Promise<void> {
     fence(path);
@@ -554,6 +568,7 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
       overwrite: true,
       createParents: true,
       mode: 0o600,
+      leafSymlink: "follow-contained",
     });
     if (!written.ok) {
       throw new ContinuityStoreError(
@@ -566,15 +581,16 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
 
   /**
    * At most {@link STATE_FILE_MAX_BYTES} of a regular file inside the store,
-   * never through a symlink (a planted `focus.md -> ~/.ssh/...` is not
-   * read), or `null` when nothing is there. A FIFO is refused, not waited on.
+   * never through a symlink leading OUT of it (a planted
+   * `focus.md -> ~/.ssh/...` is not read), or `null` when nothing is there. A
+   * link that stays inside the store is followed; a FIFO is refused, not
+   * waited on.
    */
   async function readText(path: string): Promise<string | null> {
     fence(path);
     const rel = storeRel(path);
     const read = await openForRead(storeDir, rel, {
       maxBytes: STATE_FILE_MAX_BYTES,
-      followLeafSymlink: false,
     });
     if (!read.ok) {
       if (read.code === "not-found") return null;
@@ -985,13 +1001,18 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
           status: "proven",
           proofs: mergeProofs(current.proofs, proofs),
         }));
-        await writePlan(next);
-        // Proof lifetime (§2.4): pin every cited session so TTL eviction
-        // cannot orphan a live proven record.
+        // Proof lifetime (§2.4): pin every cited session BEFORE the proven
+        // status lands, so a retention file that cannot be written (a link
+        // out of the workspace, malformed JSON) fails the whole transition
+        // rather than leaving a proven record whose evidence TTL eviction can
+        // then orphan. Over-pinning if the status write later fails is a
+        // harmless GC hint; a proven-but-unpinned record is not.
         await appendRetentionPins(
           proofs.map((p) => p.sessionId),
           fence(retentionPath),
+          retentionRoot(),
         );
+        await writePlan(next);
         return next;
       });
     },
@@ -1060,15 +1081,19 @@ export function createContinuityStore(opts: ContinuityStoreOptions): ContinuityS
           ...(mergedProofs !== undefined ? { proofs: mergedProofs } : {}),
           updatedAt: now().toISOString(),
         };
-        const nextGoals = [...goals];
-        nextGoals[idx] = next;
-        await writeGoals(nextGoals);
+        // Pin the cited sessions BEFORE the proven goal lands, so a retention
+        // file that cannot be written fails the transition instead of leaving
+        // a proven goal whose evidence can be TTL-evicted (see proveStep).
         if (proofs.length > 0) {
           await appendRetentionPins(
             proofs.map((p) => p.sessionId),
             fence(retentionPath),
+            retentionRoot(),
           );
         }
+        const nextGoals = [...goals];
+        nextGoals[idx] = next;
+        await writeGoals(nextGoals);
         return next;
       });
     },

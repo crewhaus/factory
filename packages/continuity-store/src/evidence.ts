@@ -19,7 +19,7 @@
  */
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
-import { basename, dirname } from "node:path";
+import { dirname, relative } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import { openEventLog } from "@crewhaus/event-log";
 import { openForRead, writeFileSafe } from "@crewhaus/tool-safety/fs";
@@ -274,29 +274,34 @@ export async function verifyEvidence(
  * write preserves every other key in the file verbatim; the write is
  * tmp+rename atomic. Absent file → created with `{version: 1, pins: […]}`.
  *
- * The file is read and written inside its own directory (C070): a symlink
- * at `retention.json` is refused rather than read or replaced, and the temp
- * is an `O_EXCL|O_NOFOLLOW` file under a random name, so a link planted at
- * the old fixed `retention.json.tmp` is never written through.
+ * The file is contained inside `containmentRoot` (C070): the temp is an
+ * `O_EXCL|O_NOFOLLOW` file under a random name, so a link planted at the old
+ * fixed `retention.json.tmp` is never written through. `retention.json`
+ * itself is treated as the operator config it is — a link to it that stays
+ * inside the root is followed (an operator who keeps their policy in
+ * `config/retention.json` and links `.crewhaus/retention.json` to it keeps
+ * working); only a link that leaves the root is refused. The caller passes
+ * the workspace (or, under a tenant, the tenant root) as `containmentRoot`.
  */
 export async function appendRetentionPins(
   sessionIds: readonly string[],
   retentionPath: string,
+  containmentRoot: string,
 ): Promise<{ readonly added: readonly string[] }> {
   const valid = [...new Set(sessionIds.filter((id) => SESSION_ID_REGEX.test(id)))];
   if (valid.length === 0) return { added: [] };
 
-  const dir = dirname(retentionPath);
-  const name = basename(retentionPath);
+  const given = relative(containmentRoot, retentionPath);
   let config: Record<string, unknown> = { version: 1 };
-  const read = await openForRead(dir, name, {
+  const read = await openForRead(containmentRoot, given, {
     maxBytes: RETENTION_FILE_MAX_BYTES,
-    followLeafSymlink: false,
   });
   if (!read.ok && read.code !== "not-found") {
     throw new CrewhausError(
       "config",
-      `continuity-store: cannot read ${retentionPath}: ${read.reason}`,
+      read.code === "escapes-root"
+        ? `continuity-store: ${retentionPath} links outside the workspace, so proof sessions cannot be pinned. Point it inside the workspace, or replace the link with the file itself.`
+        : `continuity-store: cannot read ${retentionPath}: ${read.reason}`,
     );
   }
   if (read.ok) {
@@ -332,15 +337,19 @@ export async function appendRetentionPins(
   if (added.length === 0) return { added: [] };
 
   config["pins"] = [...existing, ...added];
-  await mkdir(dir, { recursive: true });
-  const written = writeFileSafe(dir, name, `${JSON.stringify(config, null, 2)}\n`, {
+  await mkdir(dirname(retentionPath), { recursive: true });
+  const written = writeFileSafe(containmentRoot, given, `${JSON.stringify(config, null, 2)}\n`, {
     overwrite: true,
+    createParents: true,
     mode: 0o600,
+    leafSymlink: "follow-contained",
   });
   if (!written.ok) {
     throw new CrewhausError(
       "config",
-      `continuity-store: cannot write ${retentionPath}: ${written.reason}`,
+      written.code === "escapes-root"
+        ? `continuity-store: ${retentionPath} links outside the workspace, so proof sessions cannot be pinned. Point it inside the workspace, or replace the link with the file itself.`
+        : `continuity-store: cannot write ${retentionPath}: ${written.reason}`,
     );
   }
   return { added };

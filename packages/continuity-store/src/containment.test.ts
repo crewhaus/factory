@@ -94,15 +94,33 @@ describe("writes never follow a link planted at the old fixed temp name", () => 
   });
 });
 
-describe("a link AT a store file is refused, naming the store path and the reason", () => {
+describe("a link AT a store file leading OUT is refused, naming the store path and the reason", () => {
   test("focus.md linked to an outside file carrying the marker: neither read nor replaced", async () => {
     const secret = join(outside, "secret.md");
     const text = `${FOCUS_MARKER}\n# Focus\n\nOUTSIDE-SECRET\n`;
     writeFileSync(secret, text);
     symlinkSync(secret, join(store.dir(), "focus.md"));
-    await expect(store.readFocus()).rejects.toThrow(/focus\.md.*symbolic link/);
-    await expect(store.writeFocus("overwrite")).rejects.toThrow(/focus\.md.*symbolic link/);
+    await expect(store.readFocus()).rejects.toThrow(
+      /focus\.md.*resolves outside the continuity store/,
+    );
+    await expect(store.writeFocus("overwrite")).rejects.toThrow(
+      /focus\.md.*resolves outside the continuity store/,
+    );
     expect(readFileSync(secret, "utf8")).toBe(text);
+  });
+
+  test("a leaf link that STAYS inside the store is followed for read and write", async () => {
+    // An operator-created in-store link is the store's own business, not an
+    // escape: 0.7.0 read and wrote through it, and it must keep working.
+    const kept = join(store.dir(), "focus-kept.md");
+    writeFileSync(kept, `${FOCUS_MARKER}\n# Focus\n\nKEPT\n`);
+    symlinkSync(kept, join(store.dir(), "focus.md"));
+    const focus = await store.readFocus();
+    expect(focus?.body).toContain("KEPT");
+    await store.writeFocus("rewritten through the link");
+    // The write lands in the link's target, and the link is still a link.
+    expect(lstatSync(join(store.dir(), "focus.md")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(kept, "utf8")).toContain("rewritten through the link");
   });
 
   test("plans/ linked to an outside directory: a new plan is refused as outside the store", async () => {
@@ -144,26 +162,76 @@ describe("a link AT a store file is refused, naming the store path and the reaso
   );
 });
 
-describe("retention.json pins stay inside .crewhaus", () => {
+describe("retention.json pins are contained within the workspace", () => {
+  // The harness root (containment root) is the parent of .crewhaus.
+  const wsRoot = (): string => join(tmp, "ws");
+
   test("retention.json.tmp leading to an outside file: it is not overwritten", async () => {
     const dir = join(tmp, "ws", ".crewhaus");
     const victim = join(outside, "victim.json");
     writeFileSync(victim, "ORIGINAL\n");
     symlinkSync(victim, join(dir, "retention.json.tmp"));
-    const { added } = await appendRetentionPins([SESS], join(dir, "retention.json"));
+    const { added } = await appendRetentionPins([SESS], join(dir, "retention.json"), wsRoot());
     expect(added).toEqual([SESS]);
     expect(readFileSync(victim, "utf8")).toBe("ORIGINAL\n");
     expect(isRegularFile(join(dir, "retention.json"))).toBe(true);
   });
 
-  test("retention.json itself linked out: refused, the outside file untouched", async () => {
+  test("retention.json linked to a sibling config/ inside the workspace: the pin lands in the target", async () => {
+    // An operator who keeps the retention policy under config/ and links
+    // .crewhaus/retention.json to it must keep working (0.7.0 behaviour): the
+    // link stays inside the workspace, so it is followed, not refused.
+    const dir = join(tmp, "ws", ".crewhaus");
+    const config = join(tmp, "ws", "config");
+    mkdirSync(config, { recursive: true });
+    const target = join(config, "retention.json");
+    writeFileSync(target, '{"version":1,"pins":["sess_00000000000000aa"]}\n');
+    symlinkSync(target, join(dir, "retention.json"));
+    const { added } = await appendRetentionPins([SESS], join(dir, "retention.json"), wsRoot());
+    expect(added).toEqual([SESS]);
+    // The pin was appended to the linked file, and the link is still a link.
+    expect(lstatSync(join(dir, "retention.json")).isSymbolicLink()).toBe(true);
+    const written = JSON.parse(readFileSync(target, "utf8")) as { pins: string[] };
+    expect(written.pins).toEqual(["sess_00000000000000aa", SESS]);
+  });
+
+  test("retention.json linked OUT of the workspace: refused, the outside file untouched", async () => {
     const dir = join(tmp, "ws", ".crewhaus");
     const victim = join(outside, "retention.json");
     writeFileSync(victim, '{"version":1}\n');
     symlinkSync(victim, join(dir, "retention.json"));
-    await expect(appendRetentionPins([SESS], join(dir, "retention.json"))).rejects.toThrow(
-      /retention\.json.*symbolic link/,
-    );
+    await expect(
+      appendRetentionPins([SESS], join(dir, "retention.json"), wsRoot()),
+    ).rejects.toThrow(/retention\.json links outside the workspace/);
     expect(readFileSync(victim, "utf8")).toBe('{"version":1}\n');
+  });
+
+  test("an escaping retention link fails the proven transition BEFORE the status is saved", async () => {
+    // Pin-before-write: the proof session is pinned before the proven status
+    // lands, so a retention file that cannot be written fails the whole
+    // transition instead of leaving a proven step the pin never covered — TTL
+    // eviction could then orphan its evidence. (The store reads sessions and
+    // retention.json under .crewhaus.)
+    await store.createPlan({ title: "Ship", steps: ["run tests"] });
+    const sessDir = join(tmp, "ws", ".crewhaus", "sessions");
+    mkdirSync(sessDir, { recursive: true });
+    writeFileSync(
+      join(sessDir, `${SESS}.jsonl`),
+      `${JSON.stringify({ ts: 1, version: 1, kind: "tool_use", payload: { id: "tu_x", name: "Bash", input: {} } })}\n${JSON.stringify(
+        {
+          ts: 2,
+          version: 1,
+          kind: "tool_result",
+          payload: { toolUseId: "tu_x", content: "42 pass", isError: false },
+        },
+      )}\n`,
+    );
+    symlinkSync(join(outside, "retention.json"), join(tmp, "ws", ".crewhaus", "retention.json"));
+    await expect(
+      store.proveStep("plan-0001", 1, [{ toolUseId: "tu_x", sessionId: SESS }]),
+    ).rejects.toThrow(/retention\.json links outside the workspace/);
+    // The step is still unproven on disk: the status write never ran.
+    const plan = await store.getPlan("plan-0001");
+    expect(plan?.steps[0]?.status).not.toBe("proven");
   });
 });
