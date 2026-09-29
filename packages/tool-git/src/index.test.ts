@@ -481,6 +481,11 @@ describe("containment of the repository git discovers", () => {
 
     const shown = String(await gitShow.execute({ cwd: "c", ref: victimHead, path: "creds.txt" }));
     expect(shown).toContain("borrows from a repository outside the workspace");
+    // The refusal names the file that actually holds the outward entry —
+    // mid/info/alternates — not the repository's own objects/info/alternates,
+    // which in this layout names only the in-workspace `mid`.
+    expect(shown).toContain("mid/info/alternates");
+    expect(shown).not.toContain("(objects/info/alternates)");
     expect(shown).not.toContain("victim-secret");
     expect(shown).not.toContain(victim);
   });
@@ -541,6 +546,93 @@ describe("containment of the repository git discovers", () => {
     const packShown = String(await gitShow.execute({ cwd: "pack-repo", ref: victimHead }));
     expect(packShown).toContain("objects/pack/");
     expect(packShown).not.toContain("victim-secret");
+  });
+
+  test("a loose-object leaf link is refused: objects/<fanout>/<rest> leading out (C071)", async () => {
+    // C071 residual: the deep scan walked objects/pack and objects/info but
+    // left the loose fan-out at depth one, so a symlink planted at a real
+    // fan-out dir's leaf — objects/ab/cdef… -> the victim's loose object —
+    // was never seen, and git read the borrowed object by hash. A fresh,
+    // un-gc'd repository keeps every object loose, so this is the common case.
+    const victim = victimRepo("loose");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const fanout = victimHead.slice(0, 2);
+    const rest = victimHead.slice(2);
+    // The victim's commit object is loose (no gc): confirm the fixture.
+    expect(existsSync(join(victim, ".git", "objects", fanout, rest))).toBe(true);
+
+    const looseRepo = join(workspace, "loose-repo");
+    mkdirSync(looseRepo);
+    git(["init", "-q", "-b", "main"], looseRepo);
+    const dir = join(looseRepo, ".git", "objects", fanout);
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(join(victim, ".git", "objects", fanout, rest), join(dir, rest));
+
+    const shown = String(await gitShow.execute({ cwd: "loose-repo", ref: victimHead }));
+    expect(shown).toContain(`holds a link (objects/${fanout}/${rest})`);
+    expect(shown).toContain("outside the workspace");
+    expect(shown).not.toContain("victim-secret");
+  });
+
+  test("a link at objects/info/<file> leading out is refused (objects/info stays covered)", async () => {
+    // Kills a mutant that drops objects/info from the deep scan: git reads
+    // objects/info/{packs,commit-graph,…} by name, so a link there leaks the
+    // file it names just as objects/pack does.
+    const out = outsideDir("info-target");
+    writeFileSync(join(out, "borrowed"), "x\n");
+    const infoRepo = join(workspace, "info-repo");
+    mkdirSync(infoRepo);
+    git(["init", "-q", "-b", "main"], infoRepo);
+    mkdirSync(join(infoRepo, ".git", "objects", "info"), { recursive: true });
+    symlinkSync(join(out, "borrowed"), join(infoRepo, ".git", "objects", "info", "commit-graph"));
+
+    const shown = String(await gitLog.execute({ cwd: "info-repo" }));
+    expect(shown).toContain("holds a link (objects/info/commit-graph)");
+    expect(shown).toContain("outside the workspace");
+  });
+
+  test("an inside-staying refs/ directory link whose child leads out is refused (C071)", async () => {
+    // C071 residual: deepLinkLeadingOut `continue`d on any link staying inside
+    // the workspace, so it never looked beneath an in-workspace directory
+    // link. refs/remotes -> ws/stage (inside) with ws/stage/v -> the victim's
+    // heads (outside) let git resolve refs/remotes/v/main to the victim's ref
+    // file, and bootstrapped the victim tip SHA from GitBranchList's error.
+    const victim = victimRepo("refs-double");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const stage = join(workspace, "stage");
+    mkdirSync(stage);
+    const double = join(workspace, "double");
+    mkdirSync(double);
+    git(["init", "-q", "-b", "main"], double);
+    symlinkSync(stage, join(double, ".git", "refs", "remotes"));
+    symlinkSync(join(victim, ".git", "refs", "heads"), join(stage, "v"));
+    // Plain git resolves the victim's ref through the two links.
+    expect(git(["rev-parse", "refs/remotes/v/main"], double).stdout.trim()).toBe(victimHead);
+
+    const byRef = String(
+      await gitShow.execute({ cwd: "double", ref: "refs/remotes/v/main", path: "creds.txt" }),
+    );
+    expect(byRef).toContain("holds a link (refs/remotes/v)");
+    expect(byRef).toContain("outside the workspace");
+    expect(byRef).not.toContain("victim-secret");
+    // The branch listing must not disclose the victim tip SHA in its error.
+    const branches = String(await gitBranchList.execute({ cwd: "double", remote: true }));
+    expect(branches).toContain("outside the workspace");
+    expect(branches).not.toContain(victimHead);
+  });
+
+  test("an inside-staying refs/ link that points at an ancestor does not loop the scan", async () => {
+    // The descent into inside-staying directory links is realpath-guarded, so
+    // a link pointing back up (refs/loop -> the git dir) terminates instead of
+    // recursing forever; a normal repository still opens.
+    const loopRepo = join(workspace, "loop-repo");
+    mkdirSync(loopRepo);
+    git(["init", "-q", "-b", "main"], loopRepo);
+    writeFileSync(join(loopRepo, "f.txt"), "in-workspace\n");
+    commitAll(loopRepo, "loop commit", D3);
+    symlinkSync(join(loopRepo, ".git"), join(loopRepo, ".git", "refs", "loop"));
+    const out = JSON.parse(String(await gitLog.execute({ cwd: "loop-repo" })));
+    expect(out.commits[0].subject).toBe("loop commit");
   });
 
   test("a .git/hooks, .git/lfs or info/exclude linked outside is not history: the repository still works", async () => {
@@ -1437,6 +1529,35 @@ describe("GitApplyPatch", () => {
       expect(out.applied).toBe(true);
       expect(lstatSync(join(repo, "good")).isSymbolicLink()).toBe(true);
       expect(readlinkSync(join(repo, "good"))).toBe("README.md");
+    });
+
+    test("a link into a sibling directory of the repo applies: target inside the workspace, outside the repo", async () => {
+      // The workspace holds sibling directories (here `repo` and `plain`); a
+      // link from one into another points INSIDE the workspace and is
+      // legitimate — a vendored dependency, a shared asset. It was wrongly
+      // refused, and mislabelled "outside the workspace", when the bound was
+      // the repository's top level instead of the workspace root.
+      expect(existsSync(join(workspace, "plain"))).toBe(true);
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("sib", "../plain") });
+      expect(out.applied).toBe(true);
+      expect(lstatSync(join(repo, "sib")).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(repo, "sib"))).toBe("../plain");
+    });
+
+    test("the escaping-link check honours strip, not a fixed -p1", async () => {
+      // Kills a mutant that always passes strip 1: the patch header carries an
+      // extra component, so only strip 2 gives the real link path `deep/link`
+      // and resolves `../../../outside` out of the workspace. Read with strip
+      // 1 the path and its `..` climb land back inside, and the escape is
+      // missed while git (run with -p2) still creates it.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("x/deep/link", "../../../outside"),
+        strip: 2,
+      });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (deep/link)");
+      expect(existsSync(join(repo, "deep", "link"))).toBe(false);
     });
   });
 

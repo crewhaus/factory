@@ -1121,20 +1121,28 @@ function unreverseRename(shown: string): string {
 
 /**
  * The first symbolic link a patch would create whose target leaves the
- * workspace, as the link's own path, or undefined. git applies paths relative
+ * WORKSPACE, as the link's own path, or undefined. git applies paths relative
  * to the directory it runs in (`repo.cwd`), so the link lands at
  * `cwd/<path>`; a relative target resolves against the link's own directory,
  * an absolute one stands as written. The parent directory is realpath'd (it
  * is inside the tree), the target joined onto it and normalised, and the
  * result must be inside the workspace root. A target that cannot be resolved
  * is treated as leading out — git would still create the link.
+ *
+ * The bound is the workspace root (the directory the harness runs from), NOT
+ * `repo.root`: the workspace may hold sibling repositories, so a link from
+ * one into another (`app/vendor-lib -> ../lib`) points inside the workspace
+ * and is fine — matching every other containment check in these tools, which
+ * measure against the workspace, not the repository. Checking against
+ * `repo.root` refused that legitimate link and, worse, said it "points
+ * outside the workspace" when it did not.
  */
 function escapingSymlink(
   patchText: string,
-  repo: { readonly cwd: string; readonly root: string },
+  repo: { readonly cwd: string },
   strip: number,
 ): string | undefined {
-  const rootReal = realOrUndefined(repo.root);
+  const rootReal = realOrUndefined(process.cwd());
   if (rootReal === undefined) return undefined;
   for (const link of symlinksCreatedByPatch(patchText, strip)) {
     if (link.target === "") continue; // a rename with no hunk keeps the target

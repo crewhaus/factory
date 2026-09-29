@@ -719,9 +719,10 @@ export async function locateRepository(
         return outside(`its .git directory holds a link (${link}) leading outside the workspace`);
       }
     }
-    if (alternateLeadingOut(commonDir, rootReal) !== undefined) {
+    const alternate = alternateLeadingOut(commonDir, rootReal);
+    if (alternate !== undefined) {
       return outside(
-        "its object store borrows from a repository outside the workspace (objects/info/alternates)",
+        `its object store borrows from a repository outside the workspace (${alternate})`,
       );
     }
     return { ok: true, value: { root: top, gitDir, commonDir } };
