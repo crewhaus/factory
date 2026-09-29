@@ -50,7 +50,12 @@ type Exemption = {
   readonly pendingElsewhere?: true;
 };
 
-const HOME = "writes under ~/.crewhaus, which no model tool can write to";
+// Checked, not assumed (watchme-store was listed here while the CLI opened it
+// in the workspace): each HOME entry's root defaults to the home directory
+// (CREWHAUS_HANGAR_ROOT / CREWHAUS_REGISTRY_ROOT move it; nothing moves it on
+// a model's say).
+const HOME =
+  "writes under ~/.crewhaus by default (only an operator's environment variable moves it), where no model tool can write";
 const WORKSPACE_FOLLOW_UP =
   "FOLLOW-UP: writes inside the workspace, so a planted link reaches it; move to writeFileSafe";
 
