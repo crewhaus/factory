@@ -49,7 +49,7 @@ import {
   searchBlockAtTimestamp,
 } from "./lib/blocks";
 import { nowMs, sleep } from "./lib/clock";
-import { getRpcEndpointPolicy } from "./lib/endpoint";
+import { callOrigins, getRpcEndpointPolicy } from "./lib/endpoint";
 import { type AssetUnits, type SentProof, UNKNOWN_UNITS, collectHistory } from "./lib/history";
 import { type LogFilter, projectLog, scanLogs } from "./lib/logs";
 import {
@@ -160,9 +160,11 @@ async function client(
   input: { readonly rpcUrl: string; readonly timeoutMs?: number },
   ctx: ToolExecuteContext | undefined,
 ): Promise<RpcClient> {
+  const narrowTo = callOrigins(ctx?.toolConfig);
   return openRpc(input.rpcUrl, {
     ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
     ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    ...(narrowTo !== undefined ? { allowedOrigins: narrowTo } : {}),
   });
 }
 
@@ -450,7 +452,7 @@ export const evmRpcHealth: RegisteredTool = buildTool({
         archiveUnknownIf:
           "the probe block is within 128 blocks of the head, or the error was not a pruning error",
       },
-      policy: describePolicy(),
+      policy: describePolicy(ctx),
     });
   },
 });
@@ -493,9 +495,11 @@ async function probeEndpoint(
   const errors: string[] = [];
   let rpc: RpcClient;
   try {
+    const narrowTo = callOrigins(ctx?.toolConfig);
     rpc = await openRpc(url, {
       ...(ctx?.signal !== undefined ? { signal: ctx.signal } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(narrowTo !== undefined ? { allowedOrigins: narrowTo } : {}),
     });
   } catch (err) {
     return {
@@ -639,11 +643,19 @@ function safeOrigin(url: string): string {
   }
 }
 
-function describePolicy(): Record<string, unknown> {
+function describePolicy(ctx: ToolExecuteContext | undefined): Record<string, unknown> {
   const policy = getRpcEndpointPolicy();
+  let narrowedTo: ReadonlyArray<string> | null = null;
+  try {
+    narrowedTo = callOrigins(ctx?.toolConfig) ?? null;
+  } catch {
+    // Already reported on each endpoint by the probe that tried to use it.
+  }
   return {
     allowPrivateHosts: policy.allowPrivateHosts === true,
     allowedOrigins: policy.allowedOrigins ?? null,
+    // This model's own tool_config block, which narrows the list above.
+    modelAllowedOrigins: narrowedTo,
   };
 }
 

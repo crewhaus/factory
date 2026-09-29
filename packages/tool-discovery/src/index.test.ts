@@ -705,10 +705,12 @@ test("every null a tool returns is explained", async () => {
     const unexplained: string[] = [];
     const walk = (value: unknown, dotted: string): void => {
       if (value === null) {
-        // `filters.*` and `posture.allowList` are "the caller did not ask" and
-        // "the operator configured none" — absence of an input, not a fact
-        // this tool failed to establish.
-        if (!dotted.startsWith("filters.") && dotted !== "posture.allowList") {
+        // `filters.*`, `posture.allowList` and `posture.modelAllowList` are
+        // "the caller did not ask", "the operator configured none" and "no
+        // model-pool candidate narrowed this call" — absence of an input, not
+        // a fact this tool failed to establish.
+        const configured = dotted === "posture.allowList" || dotted === "posture.modelAllowList";
+        if (!dotted.startsWith("filters.") && !configured) {
           if (!explained.has(dotted)) unexplained.push(dotted);
         }
         return;

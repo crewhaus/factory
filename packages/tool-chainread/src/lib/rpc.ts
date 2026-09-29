@@ -113,6 +113,8 @@ export type RpcClientOptions = {
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
   readonly maxBytes?: number;
+  /** A per-call allow-list that narrows the boot one (see `callOrigins`). */
+  readonly allowedOrigins?: ReadonlyArray<string>;
 };
 
 export type RpcClient = {
@@ -132,7 +134,7 @@ export type RpcClient = {
  * mid-scan, which is precisely the rebinding the pin defends against.
  */
 export async function openRpc(rawUrl: string, options: RpcClientOptions = {}): Promise<RpcClient> {
-  const endpoint = await vetEndpoint(rawUrl);
+  const endpoint = await vetEndpoint(rawUrl, options.allowedOrigins);
   return clientFor(endpoint, options);
 }
 

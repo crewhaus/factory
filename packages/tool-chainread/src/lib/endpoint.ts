@@ -73,6 +73,33 @@ export type ChainreadConfigInput = {
  * box — so a block that tries is refused rather than ignored.
  */
 export function registerChainreadConfig(input: ChainreadConfigInput): void {
+  const origins = originsOf(input);
+  if (origins === undefined) return;
+  setRpcEndpointPolicy({ ...policy, allowedOrigins: origins });
+}
+
+/**
+ * The RPC origins a model-pool candidate's own `tool_config` block narrows
+ * THIS call to (`ToolExecuteContext.toolConfig`), or `undefined` when it sets
+ * none. It narrows only: an origin must be in this list AND in the list bound
+ * at boot, when there is one. A candidate that lists an origin the agent's
+ * block does not is refused there, not widened — the boot list is the
+ * operator's ceiling for every model in the pool. Before 0.7.1 this block was
+ * accepted by `compile --strict` and never read, so a spec that set the list
+ * only on a candidate dialled any public origin (C029).
+ */
+export function callOrigins(toolConfig: unknown): ReadonlyArray<string> | undefined {
+  if (toolConfig === undefined || toolConfig === null) return undefined;
+  if (typeof toolConfig !== "object" || Array.isArray(toolConfig)) {
+    throw new RpcEndpointError(
+      "this model's tool_config block for the chain readers is not a mapping; write allowed_origins under it.",
+    );
+  }
+  return originsOf(toolConfig as ChainreadConfigInput);
+}
+
+/** A block's allowed_origins, checked and reduced to origins; `undefined` when it sets none. */
+function originsOf(input: ChainreadConfigInput): string[] | undefined {
   const block = (input ?? {}) as Record<string, unknown>;
   for (const key of ["allow_private_hosts", "allowPrivateHosts"]) {
     if (Object.hasOwn(block, key)) {
@@ -87,7 +114,7 @@ export function registerChainreadConfig(input: ChainreadConfigInput): void {
     );
   }
   const raw = block["allowed_origins"] ?? block["allowedOrigins"];
-  if (raw === undefined) return;
+  if (raw === undefined) return undefined;
   if (!Array.isArray(raw) || raw.some((o) => typeof o !== "string")) {
     throw new RpcEndpointError(
       'tool_config.chainread.allowed_origins must be a list of origins, for example ["https://mainnet.base.org"].',
@@ -116,7 +143,7 @@ export function registerChainreadConfig(input: ChainreadConfigInput): void {
     }
     return url.origin;
   });
-  setRpcEndpointPolicy({ ...policy, allowedOrigins: origins });
+  return origins;
 }
 
 /** Read the policy back — for `EvmRpcHealth`, which reports the posture it is operating under. */
@@ -331,7 +358,10 @@ export type VettedEndpoint = {
  * the reason in the message, because every one of these is a refusal a model
  * should read and act on rather than retry.
  */
-export async function vetEndpoint(rawUrl: string): Promise<VettedEndpoint> {
+export async function vetEndpoint(
+  rawUrl: string,
+  narrowTo?: ReadonlyArray<string>,
+): Promise<VettedEndpoint> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -365,6 +395,11 @@ export async function vetEndpoint(rawUrl: string): Promise<VettedEndpoint> {
   if (allowed !== undefined && !allowed.includes(url.origin)) {
     throw new RpcEndpointError(
       `refusing "${url.origin}" — the operator's rpc allow-list is ${allowed.length === 0 ? "empty" : allowed.join(", ")}`,
+    );
+  }
+  if (narrowTo !== undefined && !narrowTo.includes(url.origin)) {
+    throw new RpcEndpointError(
+      `refusing "${url.origin}" — this model's rpc allow-list (its own tool_config block) is ${narrowTo.length === 0 ? "empty" : narrowTo.join(", ")}`,
     );
   }
 

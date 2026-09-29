@@ -649,6 +649,8 @@ describe("EvmRpcHealth", () => {
     expect(result.policy).toEqual({
       allowPrivateHosts: false,
       allowedOrigins: ["https://rpc.example.com"],
+      // No model-pool candidate block narrowed this call (C029).
+      modelAllowedOrigins: null,
     });
   });
 });

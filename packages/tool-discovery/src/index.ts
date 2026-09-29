@@ -78,6 +78,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   MAX_TIMEOUT_MS,
   type Vetted,
+  callOrigins,
   fetchOnce,
   getPeerPolicy,
   vetPeerUrl,
@@ -438,6 +439,8 @@ let attempts: Attempt[] = [];
 /** The deadline and cancellation the current sweep is running under. */
 let sweepTimeoutMs = DEFAULT_TIMEOUT_MS;
 let sweepSignal: AbortSignal | undefined;
+/** The current call's own allow-list, from its model's tool_config block (C029). */
+let sweepAllowed: ReadonlyArray<string> | undefined;
 
 let discovery: Discovery | undefined;
 
@@ -450,6 +453,7 @@ function peerDiscovery(): Discovery {
       const { attempt, body } = await fetchOnce(url, {
         timeoutMs: sweepTimeoutMs,
         ...(sweepSignal !== undefined ? { signal: sweepSignal } : {}),
+        ...(sweepAllowed !== undefined ? { allowedOrigins: sweepAllowed } : {}),
       });
       attempts.push(attempt);
       if (attempt.kind !== "answered") throw new Error(attempt.reason);
@@ -562,6 +566,14 @@ export const federationDiscover: RegisteredTool = buildTool({
 
     sweepTimeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     sweepSignal = ctx?.signal;
+    // A model-pool candidate's own block narrows what this sweep may dial.
+    // A block this cannot read refuses the sweep rather than dialling
+    // everything: a list someone wrote and this ignored is not a list.
+    try {
+      sweepAllowed = callOrigins(ctx?.toolConfig);
+    } catch (err) {
+      return refusal("FederationDiscover", "refused", errText(err));
+    }
 
     // OWN ENTRIES ONLY, in a Map with no prototype behind it. `input.pins` is
     // an ordinary object, so `pins[peer]` walks `Object.prototype`: the
@@ -641,7 +653,7 @@ export const federationDiscover: RegisteredTool = buildTool({
       // the peer id went through, because nothing else is going to.
       let endpointVet: Vetted | undefined;
       if (record !== undefined) {
-        endpointVet = await vetPeerUrl(record.endpoint);
+        endpointVet = await vetPeerUrl(record.endpoint, sweepAllowed);
         // Two verdicts on the advertised endpoint are NOT findings about the
         // peer — see UNHEALTHY_ENDPOINT_CODES. They are recorded as what they
         // are: facts this process could not establish.
@@ -765,6 +777,8 @@ export const federationDiscover: RegisteredTool = buildTool({
           policy.allowedOrigins === undefined
             ? null
             : [...policy.allowedOrigins].sort(compareStrings),
+        // This model's own tool_config block, which narrows the list above.
+        modelAllowList: sweepAllowed === undefined ? null : [...sweepAllowed].sort(compareStrings),
         followsRedirects: false,
         makesFederationCall: false,
       },
