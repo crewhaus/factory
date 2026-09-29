@@ -351,7 +351,7 @@ describe("url, command and id values", () => {
     expect(match("Run(rm)", "restrict", rm)).toBe(true);
     expect(match("Run(rm -rf *)", "restrict", rm)).toBe(true);
     // As written, then each word that may name a file as that file from the
-    // root, alone and in the command line, and the directory itself.
+    // root, alone and in the command line.
     expect(values(rm)).toEqual([
       {
         kind: "command",
@@ -361,12 +361,10 @@ describe("url, command and id values", () => {
           "rm",
           "-rf",
           "x",
-          "src",
           "src/rm",
           "src/x",
           "src/rm -rf src/x",
           "rm -rf src/x",
-          "./src",
           "./src/rm",
           "./src/x",
           "./src/rm -rf ./src/x",
@@ -469,6 +467,11 @@ describe("url, command and id values", () => {
     expect(fires(run, release, { argv: ["sh", "release.sh"], cwd: "other" })).toBe(false);
     // A flag or a URL is not a file in the directory.
     expect(fires(run, "Run(scripts/-v)", { argv: ["sh", "-v"], cwd: "scripts" })).toBe(false);
+    // A deny on the directory's files fires on any command run there; one on
+    // a program name does not fire because the directory's name starts alike.
+    expect(fires(run, "Run(scripts/**)", { argv: ["ls"], cwd: "scripts" })).toBe(true);
+    expect(fires(run, "Run(rm*)", { argv: ["ls"], cwd: "rmtemp" })).toBe(false);
+    expect(fires(run, "Run(rm*)", { argv: ["rm", "x"], cwd: "rmtemp" })).toBe(true);
     // A directory the runtime resolves through a symlink is read where it
     // leads, too.
     const linked: PathCanonicalizer = (raw) =>

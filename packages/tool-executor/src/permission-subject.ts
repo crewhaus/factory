@@ -342,12 +342,14 @@ function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): Oper
 /**
  * The spellings a deny or ask reads for a command run in `runsIn`, a
  * directory other than the workspace root: the command as written and each
- * of its words, the directory in each of its spellings, and each word that
- * could name a file written as that file from the workspace root — with `..`
+ * of its words, and each word that could name a file written as that file
+ * from the workspace root, for every spelling of the directory — with `..`
  * collapsed, and as joined — alone and within the whole command line (with
  * and without the program itself joined, which PATH may resolve instead).
- * Every spelling only widens what a deny or ask catches; none is canonical,
- * so no allow reads them.
+ * So `scripts/**` fires on any command run in `scripts/`. The directory on
+ * its own is not a spelling: `alwaysDeny RunCommand(rm*)` must not fire on
+ * `ls` run in `rmtemp/`. Every spelling only widens what a deny or ask
+ * catches; none is canonical, so no allow reads them.
  */
 function commandSpellingsIn(
   raw: string,
@@ -361,7 +363,6 @@ function commandSpellingsIn(
   for (const v of dirValues) for (const d of [...v.canonical, ...(v.spellings ?? [])]) dirs.add(d);
   dirs.delete("");
   for (const d of dirs) {
-    out.add(d);
     for (const join of [
       (w: string) => `${d.replace(/\/+$/, "")}/${w}`,
       (w: string) => normalizePathLexically(`${d}/${w}`).path,
