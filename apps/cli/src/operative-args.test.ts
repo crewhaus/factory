@@ -210,7 +210,6 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
     "the built-in first-party gallery is searched; nothing on disk is read",
   "OraclePriceRead.address": "the feed is a pinned one named by feed, which is declared",
   "OraclePriceRead.feed": "the feed is named by chainId and address, which are declared",
-  "PackageManifestVerify.manifests.text": "the manifests are read from paths instead",
   "PackageManifestVerify.paths": "the manifests are passed inline, as manifests.text",
   "PaymentFileBuild.outFile": "the file comes back inline; nothing is written",
   "PortfolioValuation.wallet": "the amounts are passed inline; no balance is read",

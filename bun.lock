@@ -2589,6 +2589,7 @@
       "name": "@crewhaus/tool-distribution",
       "version": "0.7.0",
       "dependencies": {
+        "@crewhaus/egress-classifier": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/single-binary-cli": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
