@@ -645,9 +645,124 @@ tools: [read]
     expect(fixed.text).toBe(yaml.replace("Raed]", "Read]"));
   });
 
-  test("a document that is not YAML is left alone", () => {
+  // wave III review: it was left alone, and the CLI then printed "no
+  // mechanical fixes applicable" — a definite answer about a file it could
+  // not read. It now says it skipped, and why.
+  test("a document that is not YAML is left alone, and says it was skipped", () => {
     const broken = "name: t\ntarget: cli\ntools: [raed\n";
-    expect(applyLintFixes(broken, readOnly)).toEqual({ text: broken, applied: [], suggested: [] });
+    const result = applyLintFixes(broken, readOnly);
+    expect({ ...result, skipped: undefined }).toEqual({
+      text: broken,
+      applied: [],
+      suggested: [],
+      skipped: undefined,
+    });
+    expect(result.skipped).toMatch(/^the file is not valid YAML \(.+\)$/);
+    const unsafeName = "name: my agent: v2\ntarget: cli\ntools: [raed]\n";
+    expect(applyLintFixes(unsafeName, readOnly).skipped).toMatch(/not valid YAML/);
+    // A valid document says nothing about skipping.
+    expect(applyLintFixes(`${validCli}tools: [read]\n`, readOnly).skipped).toBeUndefined();
+  });
+
+  // wave III review: on a shape whose runtime carries no tools, compile
+  // accepts a tools: list and ignores it, and lint says clean — while --fix
+  // rewrote `raed` to `read` from the cli set, the C025 lint/--fix
+  // disagreement at a new site.
+  test("a tools: list on a shape with no tool runtime is left alone, as lint leaves it", () => {
+    const voice = `name: hello-voice
+target: voice
+agent:
+  model: gpt-4o-realtime-preview
+  instructions: answer briefly
+voice:
+  provider: openai
+  voiceId: alloy
+  vad: server
+tools: [raed, gitStaus]
+`;
+    expect(runLint(voice, noTools).findings.filter((f) => f.path.includes("tools"))).toEqual([]);
+    expect(applyLintFixes(voice, readOnly)).toEqual({ text: voice, applied: [], suggested: [] });
+    for (const target of ["onchain", "onchain-game"]) {
+      const yaml = voice.replace("target: voice", `target: ${target}`);
+      expect({ target, fixed: applyLintFixes(yaml, readOnly).applied }).toEqual({
+        target,
+        fixed: [],
+      });
+    }
+  });
+
+  // wave III review: `tools: &shared [raed, gitStaus]` with an MCP server's
+  // `args: *shared` — --fix rewrote the anchored list, the bundle then
+  // carried `"args":["read","gitStatus"]`, and the report said only that
+  // two tools were fixed.
+  test("a tools: list that an alias reads somewhere else is suggested, not rewritten", () => {
+    const anchored = `name: demo
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: go
+tools: &shared [raed, gitStaus]
+mcp_servers:
+  gh:
+    transport: stdio
+    command: gh-mcp
+    args: *shared
+`;
+    const result = applyLintFixes(anchored, readOnly);
+    expect(result.text).toBe(anchored);
+    expect(result.applied).toEqual([]);
+    expect(result.suggested).toEqual([
+      'tool "raed" — did you mean "read"? (not auto-fixed — tools is also read through an alias at mcp_servers.gh.args, which the edit would change too)',
+      'tool "gitStaus" — did you mean "gitStatus"? (not auto-fixed — tools is also read through an alias at mcp_servers.gh.args, which the edit would change too)',
+    ]);
+    // An anchor on an item, or on a map holding the list, reaches the same way.
+    const onItem = anchored
+      .replace("tools: &shared [raed, gitStaus]", "tools: [&t raed, gitStaus]")
+      .replace("args: *shared", "args: [*t]");
+    expect(applyLintFixes(onItem, readOnly).applied).toEqual([
+      'tool "gitStaus" → "gitStatus" (nearest match)',
+    ]);
+    const onMap = `name: demo
+target: cli
+agent: &a
+  model: claude-sonnet-4-6
+  instructions: go
+  sub_agents:
+    helper:
+      description: d
+      instructions: h
+      tools: [Raed]
+tool_config:
+  copy: *a
+`;
+    expect(applyLintFixes(onMap, readOnly).applied).toEqual([]);
+    // An alias that is itself a tools: list of the same kind reads the fix
+    // it needs, so the fix is applied.
+    const shared = `name: demo
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: go
+  sub_agents:
+    a:
+      description: d
+      instructions: i
+      tools: &t [gitStaus, Raed]
+    b:
+      description: d
+      instructions: i
+      tools: *t
+tools: [read, gitStatus]
+`;
+    expect(applyLintFixes(shared, readOnly).applied).toEqual([
+      'tool "gitStaus" → "gitStatus" (nearest match)',
+      'tool "Raed" → "Read" (nearest match)',
+    ]);
+    // lint's narrowing-list warning says the same.
+    const warned = runLint(onMap, noTools).findings.filter((f) => f.rule === "tool-list-typo");
+    expect(warned.map((f) => f.message)).toEqual([
+      'tools: "Raed" is no tool, so this list never grants it — did you mean "Read"? (not auto-fixed: the list is also read through an alias at tool_config.copy)',
+    ]);
   });
 
   test("lint reports the narrowing-list typos --fix rewrites", () => {

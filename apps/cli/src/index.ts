@@ -2434,14 +2434,16 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
   const { resolve: resolveTool } = await buildToolResolver();
 
   if (args.flags["fix"] === true) {
-    const { text: fixedYaml, applied, suggested } = applyLintFixes(yamlText, resolveTool);
+    const { text: fixedYaml, applied, suggested, skipped } = applyLintFixes(yamlText, resolveTool);
     if (applied.length > 0) {
       writeFileSync(absSpec, fixedYaml);
       for (const line of applied) process.stdout.write(`fixed: ${line}\n`);
       yamlText = fixedYaml;
     }
     for (const line of suggested) process.stdout.write(`suggestion: ${line}\n`);
-    if (applied.length === 0 && suggested.length === 0) {
+    if (skipped !== undefined) {
+      process.stdout.write(`lint --fix: skipped — ${skipped}.\n`);
+    } else if (applied.length === 0 && suggested.length === 0) {
       process.stdout.write("lint --fix: no mechanical fixes applicable.\n");
     }
   }

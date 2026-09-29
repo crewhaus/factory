@@ -1640,6 +1640,21 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(compiled.exitCode).toBe(0);
   }, 30_000);
 
+  // wave III review: a file --fix could not parse got "no mechanical fixes
+  // applicable", a definite answer about a file it never read.
+  test("lint --fix says it skipped a file that is not valid YAML", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const broken =
+      "name: my agent: v2\ntarget: cli\nagent:\n  model: m\n  instructions: hi\ntools: [raed]\n";
+    writeFileSync(specPath, broken);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toMatch(/lint --fix: skipped — the file is not valid YAML \(.+\)\./);
+    expect(result.stdout).not.toContain("no mechanical fixes applicable");
+    expect(readFileSync(specPath, "utf-8")).toBe(broken);
+  }, 30_000);
+
   test("lint reports a tool the spec's shape cannot compile, in compile's words", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(

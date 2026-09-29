@@ -31,7 +31,7 @@ import {
   TOOL_FLAGS,
   TOOL_FLAGS_BY_NAME,
 } from "@crewhaus/tool-registry-manifest/flags";
-import { type Document, type Scalar, isMap, isScalar, isSeq, parseDocument } from "yaml";
+import { type Document, type Scalar, isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
 import { auditModelPlan } from "./model-plan-lint";
 import { auditSpecToolNames, collectToolNames, nonCliBuiltinFlags } from "./scope-audit";
 
@@ -536,6 +536,11 @@ export type LintFixResult = {
   readonly applied: string[];
   /** One line per typo it will not pick a fix for. */
   readonly suggested: string[];
+  /**
+   * Why nothing was looked at, when the file could not be walked (it is not
+   * valid YAML) — so "no fixes" is never said of a file nobody read.
+   */
+  readonly skipped?: string;
 };
 
 /** A path through a YAML document: a mapping key, or `[]` for a sequence item. */
@@ -660,12 +665,51 @@ type ToolListFix = {
   readonly node: Scalar;
   readonly to?: string;
   readonly candidates?: readonly string[];
+  /**
+   * Where the same item is read again through a YAML alias of it (or of a
+   * node holding it) that is not a `tools:` list of the same kind — an MCP
+   * server's `args: *shared`. Editing the item edits those too, so the fix
+   * is suggested, not applied.
+   */
+  readonly aliasedAt?: readonly string[];
 };
+
+/** Every YAML alias in the document, by the anchor it names, with where it sits. */
+function aliasesByAnchor(doc: Document): Map<string, DocPath[]> {
+  const out = new Map<string, DocPath[]>();
+  const visit = (node: unknown, path: string[], depth: number): void => {
+    if (depth > 64) return;
+    if (isAlias(node)) {
+      const at = out.get(node.source) ?? [];
+      at.push(path);
+      out.set(node.source, at);
+    } else if (isMap(node)) {
+      for (const pair of node.items) {
+        const k = isScalar(pair.key) ? pair.key.value : pair.key;
+        visit(pair.value, [...path, String(k)], depth + 1);
+      }
+    } else if (isSeq(node)) {
+      for (const item of node.items) visit(item, [...path, SEQ_ITEM], depth + 1);
+    }
+  };
+  visit(doc.contents, [], 0);
+  return out;
+}
+
+/** A node's anchor, when it carries one. */
+function anchorOf(node: unknown): string | undefined {
+  const anchor = (node as { readonly anchor?: unknown } | null)?.anchor;
+  return typeof anchor === "string" && anchor !== "" ? anchor : undefined;
+}
 
 /**
  * Every item of every `tools:` list in the document that names no tool the
  * list takes and is a typo of one: the nearest legal name, or, when the
  * nearest names differ in what they may do, the tied names to choose from.
+ *
+ * On a shape whose runtime carries no tools (voice, onchain), compile
+ * accepts a `tools:` list and ignores it, and lint says nothing about it, so
+ * there is nothing to fix.
  */
 function toolListFixes(
   doc: Document,
@@ -678,11 +722,41 @@ function toolListFixes(
   // it to the registered name). A narrowing list also takes the registered
   // name (`Read`, as 0.7.0 documented), so a typo there is fixed in the
   // spelling it was written in.
-  const shapeKeys = builtinToolsFor(shape);
-  const keys = shapeKeys.length > 0 ? shapeKeys : builtinToolsFor("cli");
+  const keys = builtinToolsFor(shape);
+  if (keys.length === 0) return [];
   const names = keys.map((k) => BUILTIN_TOOLS[k]?.name ?? k);
+  const aliases = aliasesByAnchor(doc);
+  const isToolList = (path: DocPath, narrowing: boolean): boolean =>
+    path[path.length - 1] === "tools" &&
+    patterns.some((p) => pathMatches(p, path)) &&
+    isNarrowingList(path) === narrowing;
+  // Where an item at `itemPath` is also read through an alias of a node on
+  // the way to it (`anchored`, each with its path), when that is not an item
+  // of a tools: list of the same kind.
+  const aliasedOutside = (
+    itemPath: DocPath,
+    anchored: ReadonlyArray<{ readonly anchor: string; readonly path: DocPath }>,
+    narrowing: boolean,
+  ): string[] => {
+    const out: string[] = [];
+    for (const { anchor, path } of anchored) {
+      for (const aliasPath of aliases.get(anchor) ?? []) {
+        const effective = [...aliasPath, ...itemPath.slice(path.length)];
+        const list = effective.slice(0, -1);
+        if (effective[effective.length - 1] === SEQ_ITEM && isToolList(list, narrowing)) continue;
+        out.push(aliasPath.join("."));
+      }
+    }
+    return out;
+  };
   const out: ToolListFix[] = [];
-  const visit = (node: unknown, path: string[]): void => {
+  const visit = (
+    node: unknown,
+    path: string[],
+    anchored: ReadonlyArray<{ readonly anchor: string; readonly path: DocPath }>,
+  ): void => {
+    const own = anchorOf(node);
+    const here = own !== undefined ? [...anchored, { anchor: own, path }] : anchored;
     if (isMap(node)) {
       for (const pair of node.items) {
         const k = isScalar(pair.key) ? pair.key.value : pair.key;
@@ -691,6 +765,9 @@ function toolListFixes(
         const at = [...path, key];
         if (key === "tools" && isSeq(pair.value) && patterns.some((p) => pathMatches(p, at))) {
           const narrowing = isNarrowingList(at);
+          const seqAnchor = anchorOf(pair.value);
+          const listAnchored =
+            seqAnchor !== undefined ? [...here, { anchor: seqAnchor, path: at }] : here;
           for (const item of pair.value.items) {
             if (!isScalar(item) || typeof item.value !== "string") continue;
             const token = item.value;
@@ -699,20 +776,37 @@ function toolListFixes(
             const candidates = narrowing && /^[A-Z]/.test(token) ? names : keys;
             const nearest = nearestToolName(token, candidates, undefined, getReadOnly);
             const list = at.join(".");
+            const itemPath = [...at, SEQ_ITEM];
+            const itemAnchor = anchorOf(item);
+            const aliasedAt = aliasedOutside(
+              itemPath,
+              itemAnchor !== undefined
+                ? [...listAnchored, { anchor: itemAnchor, path: itemPath }]
+                : listAnchored,
+              narrowing,
+            );
+            const aliased = aliasedAt.length > 0 ? { aliasedAt } : {};
             if (nearest?.kind === "match") {
-              out.push({ list, narrowing, token, node: item, to: nearest.name });
+              out.push({ list, narrowing, token, node: item, to: nearest.name, ...aliased });
             } else if (nearest?.kind === "ambiguous") {
-              out.push({ list, narrowing, token, node: item, candidates: nearest.candidates });
+              out.push({
+                list,
+                narrowing,
+                token,
+                node: item,
+                candidates: nearest.candidates,
+                ...aliased,
+              });
             }
           }
         }
-        visit(pair.value, at);
+        visit(pair.value, at, here);
       }
     } else if (isSeq(node)) {
-      for (const item of node.items) visit(item, [...path, SEQ_ITEM]);
+      for (const item of node.items) visit(item, [...path, SEQ_ITEM], here);
     }
   };
-  visit(doc.contents, []);
+  visit(doc.contents, [], []);
   return out;
 }
 
@@ -758,7 +852,7 @@ function narrowingListFindings(
     .map((f) => ({
       message:
         f.to !== undefined
-          ? `tools: "${f.token}" is no tool, so this list never grants it — did you mean "${f.to}"? (lint --fix writes it.)`
+          ? `tools: "${f.token}" is no tool, so this list never grants it — did you mean "${f.to}"? ${f.aliasedAt !== undefined ? `(not auto-fixed: the list is also read through an alias at ${f.aliasedAt.join(", ")})` : "(lint --fix writes it.)"}`
           : `tools: "${f.token}" is no tool, so this list never grants it — did you mean ${(f.candidates ?? []).map((c) => `"${c}"`).join(" or ")}? (not auto-fixed: they differ in what they may do)`,
       path: f.list,
       severity: "warning" as const,
@@ -818,7 +912,10 @@ function credentialScalar(doc: Document, label: string, raw: string): Scalar | u
  *   `$UPPER_SNAKE_CASE`. Only what compile rejects: `model: $fast` is a
  *   profile reference, and is never touched.
  *
- * A document that is not valid YAML is left alone: there is nothing to walk.
+ * A document that is not valid YAML is left alone — there is nothing to walk
+ * — and `skipped` says so. A typo in a list that is also read through a YAML
+ * alias somewhere that is not a `tools:` list (`args: *shared`) is only
+ * suggested: the edit would change that place too.
  */
 export function applyLintFixes(
   yamlText: string,
@@ -827,11 +924,27 @@ export function applyLintFixes(
   const applied: string[] = [];
   const suggested: string[] = [];
   const doc = parseDocument(yamlText);
-  if (doc.errors.length > 0) return { text: yamlText, applied, suggested };
+  if (doc.errors.length > 0) {
+    const first = (doc.errors[0]?.message ?? "").split("\n")[0] ?? "";
+    return {
+      text: yamlText,
+      applied,
+      suggested,
+      skipped: `the file is not valid YAML${first !== "" ? ` (${first})` : ""}`,
+    };
+  }
 
   const edits: ScalarEdit[] = [];
   for (const fix of toolListFixes(doc, (name) => resolveTool(name)?.readOnly)) {
-    if (fix.to !== undefined) {
+    if (fix.aliasedAt !== undefined) {
+      const options =
+        fix.to !== undefined
+          ? `"${fix.to}"`
+          : (fix.candidates ?? []).map((c) => `"${c}"`).join(" or ");
+      suggested.push(
+        `tool "${fix.token}" — did you mean ${options}? (not auto-fixed — ${fix.list} is also read through an alias at ${fix.aliasedAt.join(", ")}, which the edit would change too)`,
+      );
+    } else if (fix.to !== undefined) {
       const edit = scalarEdit(yamlText, fix.node, fix.to);
       if (edit === undefined) continue;
       edits.push(edit);
