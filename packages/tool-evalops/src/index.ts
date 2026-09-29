@@ -607,7 +607,8 @@ const evalBaselinePinSchema = z.object({
 export const evalBaselinePin: RegisteredTool = buildTool({
   name: "EvalBaselinePin",
   operativeArgs: [
-    { field: "evalsDir", kind: "path" },
+    // DEFAULT_EVALS_DIR, spelled with "/" so a rule reads it the same on every OS.
+    { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
     { field: "dataset", kind: "id", within: "spec" },
   ],
   description:

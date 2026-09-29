@@ -671,9 +671,14 @@ const LEDGER_ACTIONS = ["list", "tally", "assign", "record"] as const;
 
 export const experimentLedger: RegisteredTool = buildTool({
   name: "ExperimentLedger",
+  // The ledger lives in `experimentsDir`, which defaults to
+  // `<dir>/.crewhaus/experiments`. A declared default cannot follow `dir`
+  // (and `within: "dir"` would misread an explicit experimentsDir, which is
+  // relative to the working directory), so a call that sets `dir` alone is
+  // read as `dir` plus the root default: a deny or ask on either fires.
   operativeArgs: [
-    { field: "dir", kind: "path" },
-    { field: "experimentsDir", kind: "path" },
+    { field: "dir", kind: "path", default: ".", relocates: true },
+    { field: "experimentsDir", kind: "path", default: ".crewhaus/experiments", relocates: true },
     { field: "name", kind: "id" },
   ],
   description:

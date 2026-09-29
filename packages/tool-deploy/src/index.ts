@@ -391,7 +391,7 @@ function decidePin(current: CurrentPin, target: string, repin: boolean): PinDeci
 export const specPin: RegisteredTool = buildTool({
   name: "SpecPin",
   operativeArgs: [
-    { field: "registryDir", kind: "path" },
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
     { field: "specFile", kind: "path" },
     { field: "env", kind: "id", within: "name" },
   ],
@@ -883,7 +883,7 @@ async function planRollback(
 export const deployRollback: RegisteredTool = buildTool({
   name: "DeployRollback",
   operativeArgs: [
-    { field: "registryDir", kind: "path" },
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
     { field: "env", kind: "id", within: "name" },
   ],
   description:

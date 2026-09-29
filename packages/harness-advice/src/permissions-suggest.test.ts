@@ -152,6 +152,14 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
       { source: z.string(), destination: z.string() },
     ),
     clipboardWrite: declared("ClipboardWrite", [], { text: z.string() }),
+    kvSet: declared(
+      "KvSet",
+      [
+        { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+        { field: "key", kind: "id", within: "namespace" },
+      ],
+      { namespace: z.string(), key: z.string(), stateDir: z.string().optional() },
+    ),
     emailSend: declared(
       "EmailSend",
       [{ field: "to", kind: "recipient" }],
@@ -176,6 +184,17 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
     expect(blanketGrantNote(rm)).toBeUndefined();
     const http = aggFor("HttpRequest", { url: "HTTPS://API.example.com", method: "DELETE" });
     expect(patternFor(http)).toBe("HttpRequest(https://api.example.com/)");
+  });
+
+  it("a store the calls left out does not turn a key-scoped proposal into a blanket one (C004)", () => {
+    // The store's default is read by a deny or ask only; an allow — what this
+    // proposes — is about the key, which is where these calls all acted.
+    const kv = aggFor("KvSet", { namespace: "scratch", key: "a" });
+    expect(patternFor(kv)).toBe("KvSet(scratch/a)");
+    expect(blanketGrantNote(kv)).toBeUndefined();
+    // A call that names the store is two places, as before.
+    const moved = aggFor("KvSet", { namespace: "scratch", key: "a", stateDir: "elsewhere" });
+    expect(blanketGrantNote(moved)).toContain("more than one place");
   });
 
   it("strips the justification the runtime strips before parsing", () => {

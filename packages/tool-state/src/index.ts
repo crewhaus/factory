@@ -369,7 +369,7 @@ function readLog(toolName: string, root: SafePath, dir: string, name: string): L
 export const kvSet: RegisteredTool = stateTool({
   name: "KvSet",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "key", kind: "id", within: "namespace" },
   ],
   description:
@@ -523,7 +523,7 @@ export const kvGet: RegisteredTool = stateTool({
 export const kvDelete: RegisteredTool = stateTool({
   name: "KvDelete",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "key", kind: "id", within: "namespace" },
   ],
   description:
@@ -670,7 +670,7 @@ function isCounter(value: unknown): value is CounterRecord {
 export const counterIncrement: RegisteredTool = stateTool({
   name: "CounterIncrement",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "name", kind: "id" },
   ],
   description:
@@ -836,7 +836,7 @@ function versionFileName(version: number): string {
 export const checkpointSave: RegisteredTool = stateTool({
   name: "CheckpointSave",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "name", kind: "id" },
   ],
   description:
@@ -1038,7 +1038,7 @@ export const checkpointList: RegisteredTool = stateTool({
 export const journalAppend: RegisteredTool = stateTool({
   name: "JournalAppend",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "stream", kind: "id" },
   ],
   description:
@@ -1153,7 +1153,7 @@ export const journalRead: RegisteredTool = stateTool({
 export const blackboardPost: RegisteredTool = stateTool({
   name: "BlackboardPost",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "topic", kind: "id" },
   ],
   description:
@@ -1302,7 +1302,7 @@ function isNote(value: unknown): value is NoteRecord {
 export const noteWrite: RegisteredTool = stateTool({
   name: "NoteWrite",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "id", kind: "id" },
   ],
   description:
@@ -1476,7 +1476,7 @@ export const noteSearch: RegisteredTool = stateTool({
 export const indexBuild: RegisteredTool = stateTool({
   name: "IndexBuild",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "name", kind: "id" },
   ],
   description:
@@ -1878,7 +1878,7 @@ export const stateImport: RegisteredTool = stateTool({
 export const dedupeMark: RegisteredTool = stateTool({
   name: "DedupeMark",
   operativeArgs: [
-    { field: "stateDir", kind: "path" },
+    { field: "stateDir", kind: "path", default: DEFAULT_STATE_DIR, relocates: true },
     { field: "scope", kind: "id" },
   ],
   description:

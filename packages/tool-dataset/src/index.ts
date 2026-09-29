@@ -103,6 +103,7 @@ import {
   classifyCandidate,
 } from "./lib/dedupe";
 import {
+  DEFAULT_REGISTRY_REL,
   type RegistryRoot,
   allSamplesOf,
   assignmentOf,
@@ -394,8 +395,12 @@ const putSchema = z.object({
 
 export const datasetPut: RegisteredTool = buildTool({
   name: "DatasetPut",
+  // The default is the one this package documents. An operator who moves the
+  // registry with CREWHAUS_DATASETS_DIR writes a rule about that directory,
+  // and a call that leaves registryDir out is still read as this one: the
+  // permission subject is computed without the process environment.
   operativeArgs: [
-    { field: "registryDir", kind: "path" },
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_REL, relocates: true },
     { field: "name", kind: "id" },
   ],
   description:

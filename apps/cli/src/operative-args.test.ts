@@ -131,3 +131,121 @@ describe("every non-read-only or external builtin declares operativeArgs", () =>
     expect(offenders).toEqual([]);
   });
 });
+
+/**
+ * C004 — a field the call may leave out, whose value the tool then fills in
+ * `execute`, has to say so with a `default`. Otherwise a deny on the place
+ * the tool uses by default — `alwaysDeny KvDelete(.crewhaus/state/**)` — is
+ * dodged by leaving the field out, while the tool acts there anyway.
+ *
+ * Every optional operative field either declares its `default` or is listed
+ * here with what an omitted value means, and why no default applies. The
+ * test fails for a new optional field until it is one or the other.
+ */
+const OMITTED_MEANS: Readonly<Record<string, string>> = {
+  "BarcodeEncode.path": "only a PNG is written; an SVG comes back inline and nothing is written",
+  "ChartRender.path": "the SVG comes back inline; nothing is written",
+  "ChatPost.channel":
+    "required in API mode; an incoming webhook posts to the channel the operator bound it to",
+  "ChatUpdate.channel":
+    "required in API mode; an incoming webhook posts to the channel the operator bound it to",
+  "CliVersionPin.dirs":
+    "the harnesses in this machine's registry, which the operator keeps; it writes nothing",
+  "CronDelete.fingerprint": "a guard on the entry id or match names, never a target of its own",
+  "CronDelete.id": "the schema requires id or match; whichever is given is read",
+  "CronDelete.match": "the schema requires id or match; whichever is given is read",
+  "DiagramRender.path": "the SVG comes back inline; nothing is written",
+  "EInvoiceBuild.outFile": "the document comes back inline; nothing is written",
+  "EmailSend.bcc.address": "no Bcc recipients; nothing is sent without one recipient somewhere",
+  "EmailSend.cc.address": "no Cc recipients; nothing is sent without one recipient somewhere",
+  "EmailSend.to.address": "no To recipients; nothing is sent without one recipient somewhere",
+  "EmitTraceEvent.sessionId":
+    "the session this call runs in, from the run context; its directory declares a default",
+  "Erc721TokenInfo.ipfsGateway": "ipfs URIs are skipped; nothing is fetched through a gateway",
+  "EvmRpcHealth.compareWith": "nothing to compare with; only the main endpoint is probed",
+  "ExperimentLedger.name":
+    "only `list` omits it, and it names every experiment; the directories declare defaults",
+  "FeedParse.url": "the feed is passed inline; nothing is fetched",
+  "Format.command":
+    "the formatter the project declares, detected at run time; the paths it formats declare a default",
+  "HarnessRegister.dir":
+    "register and relocate refuse without it; the registry file is fixed, never a caller's path",
+  "HarnessRegister.from": "the entry is named by id instead; list names none",
+  "HarnessRegister.id": "the entry is named by from instead; list names none",
+  "HooksManage.command": "only `set` carries a command, and refuses without one",
+  "ImportJson.file": "the records are passed inline; nothing is read from disk",
+  "InvoiceRender.outDir": "the rendered text comes back inline; nothing is written",
+  "PackageManifestVerify.paths": "the manifests are passed inline, as manifests.text",
+  "PaymentFileBuild.outFile": "the file comes back inline; nothing is written",
+  "PortfolioValuation.wallet": "the amounts are passed inline; no balance is read",
+  "QrEncode.path": "only a PNG is written; an SVG comes back inline and nothing is written",
+  "RunBuild.command":
+    "the build the project declares, detected at run time; its directory declares a default",
+  "RunTests.command":
+    "the test command the project declares, detected at run time; its directory declares a default",
+  "SitemapParse.url": "the sitemap is passed inline; nothing is fetched",
+  "SpecPatchApply.path":
+    "the spec is passed inline and patched text comes back; nothing is written",
+  "SpecPin.env": "the version is registered and no pin moves",
+  "StatusPagePost.incidentId": "a new incident on the operator's configured status page",
+  "SubtitleWrite.path": "the document comes back inline; nothing is written",
+  "TlsInspect.servername": "the host, which is declared, is the name sent",
+  "WebhookPost.url":
+    "the URL is read from an operator-listed environment variable named in urlEnv; a deny on every call still reads the call's strings",
+};
+
+describe("an optional operative field says what leaving it out means (C004)", () => {
+  /** `Tool.field` for every declared field the schema lets a call leave out, with no default. */
+  function optionalWithoutDefault(): string[] {
+    const out: string[] = [];
+    for (const tool of builtins) {
+      const shape = (tool.inputSchema as { shape?: Record<string, { isOptional?: () => boolean }> })
+        .shape;
+      if (shape === undefined) continue;
+      for (const arg of tool.operativeArgs ?? []) {
+        if (arg.default !== undefined) continue;
+        const top = shape[arg.field.split(".")[0] as string];
+        if (top?.isOptional?.() === true) out.push(`${tool.name}.${arg.field}`);
+      }
+    }
+    return out.sort();
+  }
+
+  test("every one declares a default or is a reviewed omission", () => {
+    const found = optionalWithoutDefault();
+    // The sweep's hit count: a scan that could not read the schemas finds nothing.
+    expect(found.length).toBeGreaterThanOrEqual(30);
+    expect(found).toEqual(Object.keys(OMITTED_MEANS).sort());
+  });
+
+  test("the store directories a tool fills in declare where", () => {
+    const declared = new Map<string, string | undefined>();
+    for (const tool of builtins) {
+      for (const arg of tool.operativeArgs ?? []) {
+        if (arg.relocates === true) declared.set(`${tool.name}.${arg.field}`, arg.default);
+      }
+    }
+    // The audit's list, each with the place its execute falls back to.
+    for (const [field, place] of [
+      ["KvSet.stateDir", ".crewhaus/state"],
+      ["KvDelete.stateDir", ".crewhaus/state"],
+      ["NoteWrite.stateDir", ".crewhaus/state"],
+      ["CounterIncrement.stateDir", ".crewhaus/state"],
+      ["BlackboardPost.stateDir", ".crewhaus/state"],
+      ["JournalAppend.stateDir", ".crewhaus/state"],
+      ["CheckpointSave.stateDir", ".crewhaus/state"],
+      ["DedupeMark.stateDir", ".crewhaus/state"],
+      ["IndexBuild.stateDir", ".crewhaus/state"],
+      ["EmitTraceEvent.dir", ".crewhaus/sessions"],
+      ["DeployRollback.registryDir", ".crewhaus/specs"],
+      ["SpecPin.registryDir", ".crewhaus/specs"],
+      ["DatasetPut.registryDir", ".crewhaus/datasets"],
+      ["EvalBaselinePin.evalsDir", ".crewhaus/evals"],
+      ["ExperimentLedger.experimentsDir", ".crewhaus/experiments"],
+      ["GitBranchDelete.cwd", "."],
+    ] as const) {
+      expect({ field, place: declared.get(field) }).toEqual({ field, place });
+    }
+    expect(declared.size).toBeGreaterThanOrEqual(20);
+  });
+});

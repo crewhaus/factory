@@ -189,6 +189,14 @@ describe("the flags table is the manifest without its prose", () => {
     expect(TOOL_REGISTRY["issueCreate"]?.operativeArgs).toEqual([
       { field: "repo", kind: "recipient", within: "owner" },
     ]);
+    // A relocating store directory, so an offline reader matches it the way
+    // the runtime does: its default is read by a deny or ask only (C004).
+    expect(TOOL_REGISTRY["kvDelete"]?.operativeArgs?.[0]).toEqual({
+      field: "stateDir",
+      kind: "path",
+      default: ".crewhaus/state",
+      relocates: true,
+    });
   });
 });
 

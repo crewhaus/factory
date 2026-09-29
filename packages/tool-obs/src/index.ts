@@ -916,7 +916,7 @@ function endsWithoutNewline(real: string, size: number, shown: string): Loaded<b
 export const emitTraceEvent: RegisteredTool = buildTool({
   name: "EmitTraceEvent",
   operativeArgs: [
-    { field: "dir", kind: "path" },
+    { field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
     { field: "sessionId", kind: "id" },
   ],
   description:

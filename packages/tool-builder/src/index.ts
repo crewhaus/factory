@@ -296,6 +296,16 @@ function checkOperativeArgs(
     if (arg.default !== undefined && typeof arg.default !== "string") {
       fail(`${at}.default must be a string (the value the tool uses when "${field}" is omitted)`);
     }
+    const { relocates } = arg;
+    if (relocates !== undefined) {
+      if (relocates !== true) fail(`${at}.relocates is either true or left out`);
+      if (kind !== "path") fail(`${at}.relocates: only a "path" field can relocate a tool`);
+      if (arg.default === undefined) {
+        fail(
+          `${at}.relocates needs a default: the place the tool uses when "${field}" is omitted, which a deny or ask rule must see`,
+        );
+      }
+    }
     if (seen.has(field)) fail(`names "${field}" twice; list each field once`);
     seen.add(field);
     const shape = resolveFieldShape(inputSchema, segments, 0);
@@ -325,6 +335,7 @@ function checkOperativeArgs(
         kind,
         ...(arg.default !== undefined ? { default: arg.default } : {}),
         ...(within !== undefined ? { within } : {}),
+        ...(relocates === true ? { relocates } : {}),
       }),
     );
   }

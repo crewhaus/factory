@@ -467,6 +467,13 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   among all the others, and `EvmGetLogs(137/…)` does not. An allow rule
  *   still matches only `canonical` — naming one contract does not grant a
  *   read of all of them.
+ * - `restrictOnly` — the declared default of a field that only relocates
+ *   the tool (a store directory, the repository a branch operation runs
+ *   in), standing in for a field the call left out while it carries another
+ *   operative value. A deny or ask rule reads it like any value, so
+ *   `alwaysDeny KvDelete(.crewhaus/state/**)` fires on a call that omits
+ *   `stateDir`; an allow rule skips it, because the grant is about the
+ *   record the call names (`alwaysAllow KvSet(scratch/*)`).
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
@@ -493,6 +500,7 @@ export type OperativeValue = {
   readonly outsideWorkspace?: boolean;
   readonly caseInsensitive?: boolean;
   readonly standsForAny?: ReadonlyArray<string>;
+  readonly restrictOnly?: boolean;
 };
 
 export type MatchOptions = {
@@ -504,7 +512,11 @@ export type MatchOptions = {
    * where it acts), and the matcher falls back to the
    * {@link OPERATIVE_ARG_FIELDS} name table, then to every string in `input`.
    * Present but empty ⇒ the tool declares operative fields and this call
-   * carries none of them, so no argument-scoped rule can match it.
+   * carries none of them (and no default stands in): no argument-scoped
+   * allow can match it, and a deny or ask is matched against the call's
+   * string values, as for a tool that declares nothing — `alwaysDeny
+   * WebhookPost(**)` still fires on a call that names its URL through
+   * `urlEnv`.
    */
   readonly operativeValues?: ReadonlyArray<OperativeValue>;
 };
@@ -950,8 +962,12 @@ function valueMatches(
  *   enough. A deny that needed every value to match would be dodged by
  *   adding one more argument.
  *
- * A call with no operative value matches no argument-scoped rule of either
- * polarity.
+ * An allow skips a `restrictOnly` value (a relocating field's default). A
+ * call with no operative value an allow can read matches no
+ * argument-scoped allow. A deny or ask on a call that carries none of its
+ * tool's declared operative fields is matched against the call's string
+ * values instead, the way 0.7.0 matched every tool — otherwise leaving every
+ * optional operative field out would dodge `alwaysDeny Tool(**)`.
  */
 export function matchesPattern(
   compiled: CompiledPattern,
@@ -963,12 +979,19 @@ export function matchesPattern(
   const argRe = compiled._argRe;
   if (argRe === null) return true;
   const polarity = options.polarity ?? "allow";
-  const values = options.operativeValues ?? fallbackValues(toolName, input);
-  if (values.length === 0) return false;
   const absoluteGlob = globIsAbsolute(compiled.argGlob ?? "");
-  return polarity === "allow"
-    ? values.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity))
-    : values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
+  let values = options.operativeValues ?? fallbackValues(toolName, input);
+  if (polarity === "allow") {
+    const granted = values.filter((v) => v.restrictOnly !== true);
+    if (granted.length === 0) return false;
+    return granted.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
+  }
+  // The tool declares where it acts and this call names none of it: read
+  // what the call does carry, rather than let a deny or ask miss outright.
+  if (values.length === 0 && options.operativeValues !== undefined) {
+    values = stringValues(input).map(undeclaredValue);
+  }
+  return values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
 }
 
 export {

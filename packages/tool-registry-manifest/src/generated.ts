@@ -374,7 +374,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "topic", kind: "id" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -619,7 +619,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -1137,7 +1137,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -1398,7 +1398,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "registryDir", kind: "path" },
+      { field: "registryDir", kind: "path", default: ".crewhaus/datasets", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["dataset", "operations"],
@@ -1570,7 +1570,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "scope", kind: "id" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -1680,7 +1680,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "cwd", kind: "path", default: "." },
-      { field: "endpoint", kind: "url" },
+      { field: "endpoint", kind: "url", default: "https://api.osv.dev" },
     ],
     categories: ["supplychain", "code", "network"],
     package: "@crewhaus/tool-supplychain",
@@ -1746,7 +1746,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "registryDir", kind: "path" },
+      { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "env", kind: "id", within: "name" },
     ],
     categories: ["deploy", "operations"],
@@ -2129,7 +2129,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "dir", kind: "path" },
+      { field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true },
       { field: "sessionId", kind: "id" },
     ],
     categories: ["obs", "operations"],
@@ -2326,7 +2326,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "evalsDir", kind: "path" },
+      { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
       { field: "dataset", kind: "id", within: "spec" },
     ],
     categories: ["evalops", "operations"],
@@ -2593,8 +2593,8 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "dir", kind: "path" },
-      { field: "experimentsDir", kind: "path" },
+      { field: "dir", kind: "path", default: ".", relocates: true },
+      { field: "experimentsDir", kind: "path", default: ".crewhaus/experiments", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["routing", "operations"],
@@ -3041,7 +3041,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["git", "code"],
@@ -3060,7 +3060,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["git", "code"],
@@ -3335,7 +3335,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "branch", kind: "id" },
     ],
     categories: ["git", "code"],
@@ -3354,7 +3354,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["git", "code"],
@@ -4119,7 +4119,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -4340,7 +4340,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "stream", kind: "id" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -4548,7 +4548,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requireJustification: true,
     operativeArgs: [
       { field: "dir", kind: "path", default: "." },
-      { field: "sharedDir", kind: "path" },
+      { field: "sharedDir", kind: "path", default: ".crewhaus-shared" },
     ],
     categories: ["lifecycle", "operations"],
     package: "@crewhaus/tool-lifecycle",
@@ -4570,7 +4570,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "key", kind: "id", within: "namespace" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -4616,7 +4616,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "key", kind: "id", within: "namespace" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -5125,7 +5125,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "id", kind: "id" },
     ],
     categories: ["state", "data-stores", "memory"],
@@ -6301,7 +6301,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "manifest", kind: "path" }],
+    operativeArgs: [{ field: "manifest", kind: "path", default: "." }],
     categories: ["registry", "code", "network"],
     package: "@crewhaus/tool-registry",
     keywords: ["outdated dependencies", "newest version", "upgrade available", "registry outdated"],
@@ -7049,7 +7049,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "registryDir", kind: "path" },
+      { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "specFile", kind: "path" },
       { field: "env", kind: "id", within: "name" },
     ],

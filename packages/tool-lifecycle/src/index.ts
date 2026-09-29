@@ -1126,7 +1126,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
   name: "KnowledgeSync",
   operativeArgs: [
     { field: "dir", kind: "path", default: "." },
-    { field: "sharedDir", kind: "path" },
+    { field: "sharedDir", kind: "path", default: SHARED_DIR_DEFAULT },
   ],
   description:
     "Push a harness's memories, grader and prompt fragments into a shared knowledge store, or pull the store's into the harness. Deduped by content hash and redacted by @crewhaus/harness-lifecycle, which drops any artifact still carrying a credential-shaped token after masking. A push requires the harness to have opted in (a .crewhaus/knowledge.json marker) and requires allowWithoutPiiRedaction, because @crewhaus/pii-redactor is not a dependency here: credential masking runs, but names, emails and phone numbers are NOT removed. Shared records that failed validation — a forged content hash, an oversized body — are COUNTED and reported rather than silently skipped, because a poisoned shared store is untrusted input, and a sync that moves more than maxArtifacts is refused. The text of artifacts dropped for still looking secret is never echoed back. dryRun defaults to true.",

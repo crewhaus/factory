@@ -238,7 +238,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "topic", kind: "id" },
     ],
   },
@@ -397,7 +397,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -731,7 +731,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -900,7 +900,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "registryDir", kind: "path" },
+      { field: "registryDir", kind: "path", default: ".crewhaus/datasets", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -1012,7 +1012,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "scope", kind: "id" },
     ],
   },
@@ -1087,7 +1087,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "cwd", kind: "path", default: "." },
-      { field: "endpoint", kind: "url" },
+      { field: "endpoint", kind: "url", default: "https://api.osv.dev" },
     ],
   },
   dependencyList: {
@@ -1126,7 +1126,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "registryDir", kind: "path" },
+      { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "env", kind: "id", within: "name" },
     ],
   },
@@ -1374,7 +1374,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "dir", kind: "path" },
+      { field: "dir", kind: "path", default: ".crewhaus/sessions", relocates: true },
       { field: "sessionId", kind: "id" },
     ],
   },
@@ -1506,7 +1506,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "evalsDir", kind: "path" },
+      { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
       { field: "dataset", kind: "id", within: "spec" },
     ],
   },
@@ -1688,8 +1688,8 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "dir", kind: "path" },
-      { field: "experimentsDir", kind: "path" },
+      { field: "dir", kind: "path", default: ".", relocates: true },
+      { field: "experimentsDir", kind: "path", default: ".crewhaus/experiments", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -1985,7 +1985,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -1999,7 +1999,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -2189,7 +2189,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "branch", kind: "id" },
     ],
   },
@@ -2203,7 +2203,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path" },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -2718,7 +2718,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "name", kind: "id" },
     ],
   },
@@ -2863,7 +2863,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "stream", kind: "id" },
     ],
   },
@@ -2995,7 +2995,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: true,
     operativeArgs: [
       { field: "dir", kind: "path", default: "." },
-      { field: "sharedDir", kind: "path" },
+      { field: "sharedDir", kind: "path", default: ".crewhaus-shared" },
     ],
   },
   kvDelete: {
@@ -3007,7 +3007,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "key", kind: "id", within: "namespace" },
     ],
   },
@@ -3038,7 +3038,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "key", kind: "id", within: "namespace" },
     ],
   },
@@ -3362,7 +3362,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "stateDir", kind: "path" },
+      { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
       { field: "id", kind: "id" },
     ],
   },
@@ -4111,7 +4111,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "manifest", kind: "path" }],
+    operativeArgs: [{ field: "manifest", kind: "path", default: "." }],
   },
   registryPackageInfo: {
     key: "registryPackageInfo",
@@ -4601,7 +4601,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: true,
     operativeArgs: [
-      { field: "registryDir", kind: "path" },
+      { field: "registryDir", kind: "path", default: ".crewhaus/specs", relocates: true },
       { field: "specFile", kind: "path" },
       { field: "env", kind: "id", within: "name" },
     ],

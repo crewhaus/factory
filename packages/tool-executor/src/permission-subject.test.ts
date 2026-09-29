@@ -421,6 +421,92 @@ describe("url, command and id values", () => {
   });
 });
 
+describe("a relocating field's default (C004)", () => {
+  // The tool-state shape: a store directory the tool defaults in execute, and
+  // the record inside it that the call names.
+  const kvLike = () =>
+    buildTool({
+      name: "KvLike",
+      description: "store a value",
+      inputSchema: z.object({
+        namespace: z.string().optional(),
+        key: z.string().optional(),
+        stateDir: z.string().optional(),
+      }),
+      destructive: true,
+      operativeArgs: [
+        { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+        { field: "key", kind: "id", within: "namespace" },
+      ],
+      execute: async () => "ok",
+    });
+
+  test("left out beside a record, it is read by a deny or ask only", () => {
+    const values = operativeValuesFor(kvLike(), { namespace: "ns", key: "k" }) ?? [];
+    expect(values.map((v) => [v.kind, v.canonical[0], v.restrictOnly === true])).toEqual([
+      ["id", "ns/k", false],
+      ["path", ".crewhaus/state", true],
+    ]);
+    const deny = compilePattern("KvLike(.crewhaus/state/**)");
+    const allowKey = compilePattern("KvLike(ns/*)");
+    expect(
+      matchesPattern(deny, "KvLike", {}, { polarity: "restrict", operativeValues: values }),
+    ).toBe(true);
+    expect(
+      matchesPattern(allowKey, "KvLike", {}, { polarity: "allow", operativeValues: values }),
+    ).toBe(true);
+  });
+
+  test("named by the call, it is a value like any other: an allow must cover it too", () => {
+    const values =
+      operativeValuesFor(kvLike(), { namespace: "ns", key: "k", stateDir: ".crewhaus/state" }) ??
+      [];
+    expect(values.some((v) => v.restrictOnly === true)).toBe(false);
+    const allowKey = compilePattern("KvLike(ns/*)");
+    expect(
+      matchesPattern(allowKey, "KvLike", {}, { polarity: "allow", operativeValues: values }),
+    ).toBe(false);
+  });
+
+  test("with nothing else to read, the default is the call's place, for every rule", () => {
+    const values = operativeValuesFor(kvLike(), {}) ?? [];
+    expect(values.map((v) => [v.canonical[0], v.restrictOnly === true])).toEqual([
+      [".crewhaus/state", false],
+    ]);
+    const allowStore = compilePattern("KvLike(.crewhaus/state)");
+    expect(
+      matchesPattern(allowStore, "KvLike", {}, { polarity: "allow", operativeValues: values }),
+    ).toBe(true);
+  });
+
+  test("a default without relocates is one more value every rule reads", () => {
+    const plain = buildTool({
+      name: "PlainLike",
+      description: "store a value",
+      inputSchema: z.object({ key: z.string(), dir: z.string().optional() }),
+      destructive: true,
+      operativeArgs: [
+        { field: "dir", kind: "path", default: "." },
+        { field: "key", kind: "id" },
+      ],
+      execute: async () => "ok",
+    });
+    const values = operativeValuesFor(plain, { key: "k" }) ?? [];
+    expect(values.some((v) => v.restrictOnly === true)).toBe(false);
+    expect(
+      matchesPattern(
+        compilePattern("PlainLike(k)"),
+        "PlainLike",
+        {},
+        {
+          polarity: "allow",
+          operativeValues: values,
+        },
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("executeTool allowedPatterns match the parsed, canonical call (security-1#0)", () => {
   test("a decoy key the schema strips does not satisfy an allow", async () => {
     const r = await executeTool(

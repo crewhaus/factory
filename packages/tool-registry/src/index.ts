@@ -343,7 +343,7 @@ const NOT_A_PACKAGE = new Set(["python"]);
 
 export const registryOutdated: RegisteredTool = buildTool({
   name: "RegistryOutdated",
-  operativeArgs: [{ field: "manifest", kind: "path" }],
+  operativeArgs: [{ field: "manifest", kind: "path", default: "." }],
   description:
     "Read a project's manifest, ask the registry what is newest for each dependency, and report the drift: the declared range, the highest version that range still allows, the latest published version, how far apart they are, and whether the package is deprecated or yanked. Use it to decide what to upgrade. It contacts npm, PyPI or crates.io anonymously — which is what separates it from DependencyOutdated in @crewhaus/tool-code, which compares a manifest against its own lockfile and never leaves the machine. A range it cannot evaluate exactly (a git or workspace spec, a PEP 440 '!=', a version that does not order as semver) is listed as unchecked with the reason, never counted as up to date.",
   inputSchema: z

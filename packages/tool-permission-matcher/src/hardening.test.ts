@@ -369,13 +369,15 @@ describe("declared operative values", () => {
     ).toBe(false);
   });
 
-  test("an empty list means no operative value: no arg glob matches, either way", () => {
+  test("an empty list: no arg glob allows it, and a deny reads the call's strings instead", () => {
     const p = compilePattern("Grep(**)");
     expect(matchesPattern(p, "Grep", { pattern: "x" }, { ...allow, operativeValues: [] })).toBe(
       false,
     );
+    // It used to match no deny either, so leaving every optional operative
+    // field out dodged `alwaysDeny Tool(**)`, which 0.7.0 enforced (C004).
     expect(matchesPattern(p, "Grep", { pattern: "x" }, { ...restrict, operativeValues: [] })).toBe(
-      false,
+      true,
     );
   });
 
@@ -808,5 +810,101 @@ describe("MCP tool names", () => {
   test("matchesPattern applies the same name rule", () => {
     const p = compilePattern("github__create_issue");
     expect(matchesPattern(p, "mcp__github__create_issue", { title: "x" }, restrict)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C004 — a relocating field's default, and a call with no operative value
+// ---------------------------------------------------------------------------
+
+describe("a relocating field's default is read by a deny or ask, and skipped by an allow", () => {
+  // KvDelete {namespace: "ns", key: "k"} with stateDir left out: the key it
+  // names, and the store it lives in standing in with its default.
+  const key: OperativeValue = { kind: "id", canonical: ["ns/k"], spellings: ["k", "ns"] };
+  const store: OperativeValue = {
+    kind: "path",
+    canonical: [".crewhaus/state", "./.crewhaus/state"],
+    spellings: [".crewhaus/state"],
+    restrictOnly: true,
+  };
+  const call = (pattern: string, polarity: typeof allow | typeof restrict) =>
+    matchesPattern(
+      compilePattern(pattern),
+      "KvDelete",
+      {},
+      {
+        ...polarity,
+        operativeValues: [key, store],
+      },
+    );
+
+  test("a deny on the default store fires, so leaving stateDir out does not dodge it", () => {
+    expect(call("KvDelete(.crewhaus/state/**)", restrict)).toBe(true);
+    expect(call("KvDelete(.crewhaus/state)", restrict)).toBe(true);
+    // Not a value that is not there.
+    expect(call("KvDelete(other/**)", restrict)).toBe(false);
+  });
+
+  test("an allow is about the key: the store's default does not have to match it too", () => {
+    expect(call("KvDelete(ns/*)", allow)).toBe(true);
+    expect(call("KvDelete(other/*)", allow)).toBe(false);
+    // And the default alone grants nothing: the key must still be covered.
+    expect(call("KvDelete(.crewhaus/state/**)", allow)).toBe(false);
+  });
+
+  test("an allow with nothing but restrict-only values matches nothing", () => {
+    const only = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "KvDelete",
+        {},
+        {
+          ...allow,
+          operativeValues: [store],
+        },
+      );
+    expect(only("KvDelete(**)")).toBe(false);
+    expect(only("KvDelete(.crewhaus/state)")).toBe(false);
+  });
+});
+
+describe("a deny or ask on a call that carries none of its declared operative fields", () => {
+  // WebhookPost {urlEnv, payload}: the destination is named through an
+  // operator-listed environment variable, so the declared `url` is absent.
+  const input = { urlEnv: "HOOK_URL", payload: { note: "hello" } };
+  const fires = (pattern: string) =>
+    matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+      ...restrict,
+      operativeValues: [],
+    });
+  const grants = (pattern: string) =>
+    matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+      ...allow,
+      operativeValues: [],
+    });
+
+  test("is matched against the call's string values, as for a tool that declares nothing", () => {
+    expect(fires("WebhookPost(**)")).toBe(true);
+    expect(fires("WebhookPost(HOOK_URL)")).toBe(true);
+    // A deny about a place the call does not name still does not fire.
+    expect(fires("WebhookPost(https://evil.example/**)")).toBe(false);
+  });
+
+  test("no argument-scoped allow can match it", () => {
+    expect(grants("WebhookPost(**)")).toBe(false);
+    expect(grants("WebhookPost(HOOK_URL)")).toBe(false);
+  });
+
+  test("a call with no string at all still matches no argument-scoped deny", () => {
+    const empty = matchesPattern(
+      compilePattern("Tool(**)"),
+      "Tool",
+      { n: 1 },
+      {
+        ...restrict,
+        operativeValues: [],
+      },
+    );
+    expect(empty).toBe(false);
   });
 });

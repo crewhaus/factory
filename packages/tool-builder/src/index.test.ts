@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import type { RegisteredTool, ToolDefinition, ToolIoCapability } from "@crewhaus/tool-catalog";
+import type {
+  OperativeArg,
+  RegisteredTool,
+  ToolDefinition,
+  ToolIoCapability,
+} from "@crewhaus/tool-catalog";
 import { z } from "zod";
 import { OUTWARD_TOOL_NAMES, auditToolScopes, buildTool, isOutwardName } from "./index";
 
@@ -341,6 +346,39 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
 
   test("omitted on the definition ⇒ omitted on the tool", () => {
     expect("operativeArgs" in buildTool(echoDef)).toBe(false);
+  });
+
+  test("relocates is carried on a path with a default, and refused anywhere else (C004)", () => {
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Nested",
+        description: "d",
+        inputSchema: nested,
+        execute: exec,
+        operativeArgs: [arg as unknown as OperativeArg],
+      });
+    const tool = build({
+      field: "path",
+      kind: "path",
+      default: ".crewhaus/state",
+      relocates: true,
+    })();
+    expect(tool.operativeArgs?.[0]).toEqual({
+      field: "path",
+      kind: "path",
+      default: ".crewhaus/state",
+      relocates: true,
+    });
+    // A relocating field without a default would leave a deny nothing to read.
+    expect(build({ field: "path", kind: "path", relocates: true })).toThrow(
+      /relocates needs a default/,
+    );
+    expect(build({ field: "mode", kind: "text", default: "fast", relocates: true })).toThrow(
+      /only a "path" field can relocate/,
+    );
+    expect(build({ field: "path", kind: "path", default: ".", relocates: "yes" })).toThrow(
+      /relocates is either true or left out/,
+    );
   });
 
   test("a field the schema does not have throws at build time, naming what is there", () => {
