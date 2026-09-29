@@ -31,13 +31,11 @@
  * families are not.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, statSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { xmlParse } from "@crewhaus/tool-data";
 import { paymentIdentifierValidate } from "@crewhaus/tool-money";
-import { openForReadSync } from "@crewhaus/tool-safety/fs";
+import { openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { AmountError, formatMinor, minorUnitExponent } from "./lib/amounts";
 import { CalendarError } from "./lib/calendar";
@@ -286,23 +284,34 @@ function describeRules(report: RuleReport): Record<string, unknown> {
   };
 }
 
-/** Write to a contained path, refusing to clobber unless told to. */
+/**
+ * Write to a contained path, refusing to clobber unless told to.
+ *
+ * Through tool-safety's writer: the bytes go to an exclusively created temp
+ * beside the destination and are renamed into place, so a destination that
+ * is a FIFO, socket, device or directory is refused by name instead of
+ * opened. 0.7.0 (and 0.7.1's first cut) `statSync`ed and then
+ * `writeFileSync`ed it; with `overwrite` a FIFO with no reader blocked that
+ * synchronous open for ever, and the whole runtime with it (C074's sibling,
+ * bounds review). A replaced file keeps its permission bits.
+ */
 function writeContained(toolName: string, rel: string, text: string, overwrite: boolean): string {
+  // This package's own containment first, so an escape is worded as before.
   const at = resolveSafe(toolName, rel);
-  if (!overwrite) {
-    try {
-      statSync(at.real);
-      throw new PaymentFileError(`"${rel}" already exists; pass overwrite to replace it`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
+  // Parents are created, each one contained: the destination was already
+  // proved to be inside the workspace, and `resolveSafe` allows a missing
+  // leaf precisely so a tool can validate a destination before making it.
+  const written = writeFileSafe(workspaceRoot(), rel, text, {
+    overwrite,
+    createParents: true,
+    leafSymlink: "follow-contained",
+  });
+  if (written.ok) return at.rel;
+  if (written.code === "exists") {
+    throw new PaymentFileError(`"${rel}" already exists; pass overwrite to replace it`);
   }
-  // The parent is created because the destination was already proved to be
-  // inside the workspace — `resolveSafe` allows a missing leaf precisely so a
-  // tool can validate a destination before making it.
-  mkdirSync(dirname(at.real), { recursive: true });
-  writeFileSync(at.real, text, "utf8");
-  return at.rel;
+  if (written.code === "escapes-root") throw new ToolPermissionError(toolName, rel);
+  throw new PaymentFileError(`${toolName}: ${written.reason}`);
 }
 
 /**
