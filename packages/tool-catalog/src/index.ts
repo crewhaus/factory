@@ -250,8 +250,9 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * kind: "command", within: "cwd" }`), because the same words are another
  * program elsewhere: `./build.sh` in `src/` runs `src/build.sh`. A command
  * that runs in the workspace root — the field left out, or naming the root —
- * is matched as usual. One that runs anywhere else is not covered by any
- * scoped allow (`RunCommand(./build.sh)` asks), while a deny or ask reads
+ * is matched as usual. One that runs anywhere else is not covered by a
+ * scoped allow (`RunCommand(./build.sh)` asks) unless it names every command
+ * (`RunCommand(**)`), while a deny or ask reads
  * the command as written and each word that may name a file as that file
  * from the workspace root, so `alwaysDeny RunCommand(*src/build.sh*)` fires
  * on `./build.sh` run in `src/`. A bare program name (`git`) is not joined:
@@ -267,8 +268,9 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * }`). The environment can run another program than the command's words
  * say — PATH decides what a bare program name is, and BASH_ENV,
  * NODE_OPTIONS, LD_PRELOAD and the like load code of their own — so a call
- * that sets any variable is not covered by a scoped allow (it asks, as a
- * command run outside the root does), and a deny or ask also reads a bare
+ * that sets any variable is not covered by a scoped allow that names a
+ * command (it asks, as a command run outside the root does; `RunCommand(**)`
+ * still covers it), and a deny or ask also reads a bare
  * program as it is found on each PATH entry the call sets, and every value
  * the call sets, each word that may name a file also as that file:
  * `alwaysDeny RunCommand(*scripts/release.sh*)` fires on `[release.sh]`

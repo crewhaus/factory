@@ -35,10 +35,11 @@
  *      except a `command`, whose `within` names the directory it runs in:
  *      the program `./build.sh` names is another program in `src/`. A
  *      command run anywhere but the workspace root loses its canonical
- *      value, so no scoped allow covers it (the call asks). A deny or ask
- *      reads it as written, and each word that may name a file also as
- *      that file from the root, so `alwaysDeny RunCommand(*scripts/release.sh*)`
- *      fires on `[sh, release.sh]` run in `scripts/`. Only the directory's
+ *      value, so no scoped allow covers it (the call asks) except one that
+ *      names every command (`RunCommand(**)`). A deny or ask reads it as
+ *      written, and each word that may name a file also as that file from
+ *      the root, so `alwaysDeny RunCommand(*scripts/release.sh*)` fires on
+ *      `[sh, release.sh]` run in `scripts/`. Only the directory's
  *      workspace-relative spellings (and the one the call wrote) are joined:
  *      the workspace's own absolute path is not something the call named,
  *      so `RunCommand(**prod**)` does not fire because the workspace lives
@@ -46,25 +47,26 @@
  *      finds it, not the directory. A command inside an array of objects
  *      (`steps.argv`) runs in its element's own directory field when it has
  *      one, else the top-level one.
- *    - a `command` declared with an `env` field — the variables the call
- *      sets in the child's environment — can run another program than its
- *      words say: PATH decides what a bare program name is, and BASH_ENV,
- *      NODE_OPTIONS, LD_PRELOAD and the like load code of their own. So a
- *      call that sets any variable loses its canonical value (no scoped
- *      allow covers it), and a deny or ask also reads a bare program as it
- *      is found on each PATH entry the call sets, and every value it sets —
- *      each word that may name a file also joined to where it resolves. An
- *      environment too large to read that way (more than
- *      {@link MAX_ENV_VARS} variables, {@link MAX_ENV_WORDS} words in a
- *      value, or a value longer than {@link MAX_ENV_VALUE_CHARS} characters)
- *      is flagged `outsideWorkspace`: which program runs could not be worked
- *      out, so every deny or ask fires.
  *      Unless it is a path or a command, the value alone and the qualifier
  *      alone are kept as other spellings, so a deny or ask rule written
  *      without the qualifier — `alwaysDeny EvmCall(0xdAC17F…)`,
  *      `EvmCall(*)`, the way 0.7.0 matched every string in the call — still
  *      fires. An allow must name the qualified value, so it cannot be
  *      widened by leaving the qualifier out.
+ *    - a `command` declared with an `env` field — the variables the call
+ *      sets in the child's environment — can run another program than its
+ *      words say: PATH decides what a bare program name is, and BASH_ENV,
+ *      NODE_OPTIONS, LD_PRELOAD and the like load code of their own. So a
+ *      call that sets any variable loses its canonical value (only an
+ *      allow naming every command covers it), and a deny or ask also reads
+ *      a bare program as it is found on each PATH entry the call sets, and
+ *      every value it sets — each word that may name a file also joined to
+ *      where it resolves. An
+ *      environment too large to read that way (more than
+ *      {@link MAX_ENV_VARS} variables, {@link MAX_ENV_WORDS} words in a
+ *      value, or a value longer than {@link MAX_ENV_VALUE_CHARS} characters)
+ *      is flagged `outsideWorkspace`: which program runs could not be worked
+ *      out, so every deny or ask fires.
  *    - a field left out whose declared default is `*` stands for every
  *      value (`standsForAny`), whatever its kind: a deny or ask naming any
  *      one value there fires on it, and an allow grants it only when it
