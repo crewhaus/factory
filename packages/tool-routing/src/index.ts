@@ -1064,6 +1064,10 @@ export const experimentLedger: RegisteredTool = buildTool({
 
 export const flywheelStatus: RegisteredTool = buildTool({
   name: "FlywheelStatus",
+  operativeArgs: [
+    { field: "dir", kind: "path", default: ".", relocates: true },
+    { field: "specDir", kind: "path" },
+  ],
   description:
     "Report what a harness's self-improvement loop has left on disk: the scaffolded CI workflows, the per-run artifact directories under .crewhaus/flywheel, and which dataset rungs the loop would resolve if it ran with no --dataset. It deliberately does NOT name 'the source the last run used': the top precedence rung is the --dataset FLAG, which is an argument and not a file, so no reader of a directory can know whether it was passed. It reports the rungs that are observable, flags the case where a conventional eval/dataset.jsonl would shadow distilled user ratings, and names apps/cli's resolveFlywheelData as the owner of the rule rather than carrying a second copy of it. Three facts it cannot obtain are reported as unknown with the package that holds them: whether a ratings dataset is registered, whether the optimizer's write-back landed in the spec, and the acceptance verdict inside a run's eval artifacts. Read-only.",
   inputSchema: z.object({
@@ -1181,6 +1185,7 @@ export const flywheelStatus: RegisteredTool = buildTool({
 
 export const watchmeReport: RegisteredTool = buildTool({
   name: "WatchmeReport",
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
   description:
     "Read a harness's observational-learning ledger: whether it is watching, the per-window report outcomes, the per-spec/target quality and cost roll-up, the judge verdicts, and how much of that quality has actually reached the routing scoreboard's observe-only `q:` lane. Report-window outcomes are kept apart — `model_refused_unpriced` is a configuration error that consumed its window, `model_failed` is transient and retries, and collapsing them into one failure state hides the first as the second. A state.json that exists but cannot be parsed is reported as unreadable, never as a harness that has never watched: the store falls back to its default there, which reads as the opposite of the truth. The routing half degrades explicitly — an absent or unreadable scoreboard is reported as such, never as 'no quality signal'. Every rate carries a Wilson interval. Read-only: it never runs the phase-2 judge, never synthesizes, and never feeds routing.",
   inputSchema: z.object({

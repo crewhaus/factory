@@ -910,6 +910,7 @@ export const bundleFreshness: RegisteredTool = buildTool({
 
 export const auditVerify: RegisteredTool = buildTool({
   name: "AuditVerify",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_AUDIT_DIR, relocates: true }],
   description:
     "Re-walk a harness's audit log hash chain and report whether it is intact, plus the file and line of the first break. Use to check that the tamper-evident record has not been edited or truncated. Read the two caveats it returns: `anchorChecked: false` means tail truncation could not be ruled out, and even a matching on-host anchor is rewritable by anything running as the same user — only an off-host anchor store settles that, and this tool does not have one. The walk cannot be interrupted once it starts, so a chain larger than `maxBytes` is refused before it begins rather than run without a deadline.",
   inputSchema: z.object({
@@ -1156,6 +1157,7 @@ const sessionSourceFields = {
 
 export const sessionSummarize: RegisteredTool = buildTool({
   name: "SessionSummarize",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Summarize a harness's session transcripts: event counts by kind, a per-tool call and error tally, MCP call health and the errors that were recorded. Use to see what a harness has actually been doing without reading a JSONL file into context. Malformed lines are counted rather than thrown on, because a transcript truncated by a killed process is the normal case; a tool call is counted from its `tool_use` record, with the `tool_stats` mirror supplying durations and errors so nothing is counted twice.",
   inputSchema: z.object(sessionSourceFields),
@@ -1181,6 +1183,7 @@ export const sessionSummarize: RegisteredTool = buildTool({
 
 export const traceQuery: RegisteredTool = buildTool({
   name: "TraceQuery",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Return a filtered slice of a harness's session events — by kind, by timestamp range, by a substring of the payload — in log order. Use to pull the few events that matter out of a long transcript: the permission decisions, the model failovers, the calls to one tool. Payloads are truncated to keep a result readable, so treat this as a window onto the log rather than a copy of it.",
   inputSchema: z.object({
@@ -1257,6 +1260,7 @@ export const traceQuery: RegisteredTool = buildTool({
 
 export const costSummarize: RegisteredTool = buildTool({
   name: "CostSummarize",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Total the cost and token accruals in a harness's session logs, broken down by model, by provider and by UTC day. Use to see where a fleet's spend went without a billing API. Figures come from the `cost_accrual` records the runtime writes when cost tracking is on, so a harness that ran without it reports zero accruals rather than an estimate; costs stay in integer USD micros, the unit the records carry, and an accrual for a model with no pricing row is counted under `unpriced` with its real token counts and no cost.",
   inputSchema: z.object(sessionSourceFields),

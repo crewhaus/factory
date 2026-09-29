@@ -337,6 +337,55 @@ describe("C004 — a store the call leaves out, and a call that names no operati
   });
 });
 
+describe("C004 — the readers beside the store writers read their default store too", () => {
+  test("KvGet and EventQuery without a directory meet a deny on the default one", async () => {
+    await builtin("KvSet").execute({ namespace: "ns", key: "k", value: "SECRET-IN-STATE" });
+    const cases: Array<[string, string, unknown]> = [
+      ["KvGet", "*(.crewhaus/state/**)", { namespace: "ns", key: "k" }],
+      ["KvGet", "KvGet(.crewhaus/state/**)", { namespace: "ns", key: "k" }],
+      ["KvList", "*(.crewhaus/state/**)", { namespace: "ns", includeValues: true }],
+      ["StateExport", "*(.crewhaus/state/**)", {}],
+      ["EventQuery", "*(.crewhaus/sessions/**)", {}],
+      ["TraceQuery", "*(.crewhaus/sessions/**)", {}],
+      ["AuditVerify", "*(.crewhaus/audit/**)", {}],
+    ];
+    for (const [name, deny, input] of cases) {
+      for (const mode of ["auto", "plan"] as const) {
+        const got = await gate(name, input, rules(["alwaysDeny", deny]), mode);
+        expect({ name, deny, mode, got }).toEqual({ name, deny, mode, got: "deny" });
+      }
+      // In default mode an allow behind the deny does not carry the call past it.
+      const withAllow = rules(["alwaysDeny", deny], ["alwaysAllow", name]);
+      const got = await gate(name, input, withAllow, "default");
+      expect({ name, deny, got }).toEqual({ name, deny, got: "deny" });
+    }
+  });
+
+  test("an allow on the record still covers the ordinary read, and a listing stands for every record", async () => {
+    expect(
+      await gate(
+        "KvGet",
+        { namespace: "scratch", key: "a" },
+        rules(["alwaysAllow", "KvGet(scratch/*)"]),
+      ),
+    ).toBe("allow");
+    expect(
+      await gate(
+        "KvGet",
+        { namespace: "prod", key: "a" },
+        rules(["alwaysAllow", "KvGet(scratch/*)"]),
+      ),
+    ).toBe("ask");
+    // A listing with no prefix reads every key of the namespace.
+    const denyKey = rules(
+      ["alwaysDeny", "KvList(prod/api-credentials)"],
+      ["alwaysAllow", "KvList"],
+    );
+    expect(await gate("KvList", { namespace: "prod", includeValues: true }, denyKey)).toBe("deny");
+    expect(await gate("KvList", { namespace: "scratch" }, denyKey)).toBe("allow");
+  });
+});
+
 describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
   test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
     // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as

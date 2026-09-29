@@ -257,6 +257,7 @@ const evalHistorySchema = z.object({
 
 export const evalHistory: RegisteredTool = buildTool({
   name: "EvalHistory",
+  operativeArgs: [{ field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true }],
   description:
     "Read the recorded eval runs and return each lineage's trend, CUT wherever the measuring instrument changed. Use before quoting an eval trend or deciding a suite is improving: runs record the dataset, graders and judge they were measured with, and a first-to-last delta drawn across a graders rewrite compares numbers that were never comparable. Every segment reports its own delta in percentage points, every cut says which hash changed, and a join whose comparability could not be verified is marked instead of assumed. Reads only; runs nothing.",
   inputSchema: evalHistorySchema,
@@ -463,6 +464,10 @@ const evalAggregateSchema = z.object({
 
 export const evalAggregate: RegisteredTool = buildTool({
   name: "EvalAggregate",
+  operativeArgs: [
+    { field: "run", kind: "path" },
+    { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
+  ],
   description:
     "Recompute an eval run's aggregates from its own samples — pass rate, mean score, latency percentiles, pass@k and pass^k — and add the interval a small sample deserves. Use to check a run's published numbers against its samples, or to get the figures for one slice of it (by sample id or metadata). The fold is the eval runner's own, so the answer matches what a re-run would report; pass@k and pass^k carry Wilson intervals because 3 of 5 is not 60%. Any sample the fold could not use is named, never dropped.",
   inputSchema: evalAggregateSchema,
@@ -742,6 +747,11 @@ const evalCoverageSchema = z.object({
 
 export const evalCoverage: RegisteredTool = buildTool({
   name: "EvalCoverage",
+  operativeArgs: [
+    { field: "dataset", kind: "path" },
+    { field: "sessionsDir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+    { field: "evalsDir", kind: "path", default: ".crewhaus/evals", relocates: true },
+  ],
   description:
     "Compare what production actually does against what the eval dataset exercises, and rank what is missing. Use before trusting a green eval: it builds tool-call, tool-sequence and compaction frequencies from the harness's session logs, intersects them with the dataset's expected_tools (plus the tools the last recorded run really called), and returns the gaps ranked by how much of production they cover — each with a confidence interval, because a gap seen in 3 of 5 sessions is not a 60% gap. Reading zero sessions is reported as a refusal, never as 'no gaps'.",
   inputSchema: evalCoverageSchema,

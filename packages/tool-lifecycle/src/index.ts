@@ -239,6 +239,7 @@ export const harnessRetire: RegisteredTool = buildTool({
   operativeArgs: [
     { field: "dir", kind: "path", default: "." },
     { field: "archiveDir", kind: "path" },
+    { field: "registryDir", kind: "path" },
   ],
   description:
     "Decommission a harness: fingerprint its durable state, archive it, and remove the live copy, writing a retirement log into the archive that records every step and its outcome. Use it when a harness is finished for good; the orchestration, ordering and active-pin refusal are @crewhaus/harness-lifecycle's own. It REFUSES while the spec still has an environment pinned to a registered version, when the registry manifest cannot be read (never treated as 'no pins'), when the archive directory already holds an archived state (it would be replaced), and when the archive directory overlaps the state directory. It does NOT verify the audit chain (run AuditVerify first) or collect a compliance-evidence bundle, and reports both as not performed, so a real run needs acceptUnverified:true. dryRun defaults to true and touches nothing; the preview fingerprints the state so it can warn in advance about files it will not be able to read.",

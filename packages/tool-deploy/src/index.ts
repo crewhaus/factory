@@ -1065,6 +1065,10 @@ export const deployRollback: RegisteredTool = buildTool({
 
 export const deployInspect: RegisteredTool = buildTool({
   name: "DeployInspect",
+  operativeArgs: [
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_RELDIR, relocates: true },
+    { field: "env", kind: "id", within: "name", default: "*" },
+  ],
   description:
     "Read-only: what is pinned where in the local spec registry. Use it before a pin or a rollback. Reports each spec's registered versions, its environment pins, and whether the version each pin points at can actually be fetched (a manifest can list a version whose file is gone). With a tenant, reports the tenant's effective version per environment and whether an overlay file exists; the environments listed are the spec's global pins, so one pinned only for that tenant appears only when env names it. Every path is contained before it is read. An environment name outside the registry's grammar is refused, not reported as unpinned; a spec the registry's listing hides (a leading \"_\") is named under hiddenByRegistry; an absent registry is reported absent and an unreadable one unread, never as empty. It cannot show deployment history (only the audit log's deployment_action chain has it) or a field-level diff (use SpecDiff).",
   inputSchema: z.object({
