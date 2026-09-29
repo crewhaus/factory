@@ -29,12 +29,10 @@
  * `_setClock`, so a test can fix `postedAt` — which is inside the hash chain,
  * so a wall-clock read would make the same posting hash differently twice.
  */
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { type Transaction, parseStatement } from "@crewhaus/tool-money";
-import { openForReadSync } from "@crewhaus/tool-safety/fs";
+import { joinRel, openForReadSync, writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   LedgerError,
@@ -1012,21 +1010,32 @@ export const invoiceRender: RegisteredTool = buildTool({
     const files: string[] = [];
     if (outDir !== null) {
       const dir = outDir;
-      mkdirSync(dir.real, { recursive: true });
       for (const [format, text] of Object.entries(rendered).sort()) {
         const name = `${allocation.number}.${format === "markdown" ? "md" : format}`;
-        // Belt and braces over the check above: the composed path goes back
-        // through the workspace resolver, so containment is enforced by the
-        // resolver every other path in this package uses and not only by the
-        // character rule that produced this name.
-        const target = resolveSafe("InvoiceRender", `${dir.rel}/${name}`).abs;
-        // Written to a temporary name and renamed: a rename within one
-        // directory is atomic, so a reader never sees half an invoice, and a
-        // crash mid-write leaves the previous file rather than a truncated one.
-        const temp = `${target}.${payloadHash.slice(0, 8)}.tmp`;
-        mkdirSync(dirname(temp), { recursive: true });
-        writeFileSync(temp, text, "utf-8");
-        renameSync(temp, target);
+        const rel = joinRel(dir.rel, name);
+        // Belt and braces over the check above: the composed path is contained
+        // again where it is written, by the physical location of its directory
+        // and its leaf, not only by the character rule that produced the name.
+        // writeFileSafe writes a temp under a RANDOM name, created
+        // O_EXCL|O_NOFOLLOW beside the target, and renames it into place: a
+        // reader never sees half an invoice, a crash leaves the previous file,
+        // and nothing is written through a link. The old temp name
+        // (`<target>.<hash8>.tmp`) was predictable from the caller's own input,
+        // so a link planted there wrote the invoice outside the workspace and
+        // left the target linked out. Missing directories under outDir are
+        // created one at a time, each checked; a link or FIFO at the target is
+        // refused.
+        const written = writeFileSafe(workspaceRoot(), rel, text, {
+          overwrite: true,
+          createParents: true,
+        });
+        if (!written.ok) {
+          // The number is already allocated and recorded with this payload, so
+          // it is not lost: a replay under the same key re-renders these bytes.
+          throw new LedgerError(
+            `InvoiceRender: ${allocation.number} is allocated and recorded, but ${written.reason}. Nothing was written through it. Fix the destination (move the link or special file aside, or choose another outDir) and repeat the call with the same idempotencyKey to write the same files.`,
+          );
+        }
         files.push(`${dir.rel}/${name}`);
       }
     }
