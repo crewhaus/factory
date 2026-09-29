@@ -175,6 +175,7 @@ const OMITTED_MEANS: Readonly<Record<string, string>> = {
   "HooksManage.command": "only `set` carries a command, and refuses without one",
   "ImportJson.file": "the records are passed inline; nothing is read from disk",
   "InvoiceRender.outDir": "the rendered text comes back inline; nothing is written",
+  "PackageManifestVerify.manifests.text": "the manifests are read from paths instead",
   "PackageManifestVerify.paths": "the manifests are passed inline, as manifests.text",
   "PaymentFileBuild.outFile": "the file comes back inline; nothing is written",
   "PortfolioValuation.wallet": "the amounts are passed inline; no balance is read",

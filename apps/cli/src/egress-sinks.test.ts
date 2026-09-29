@@ -14,6 +14,7 @@ import type { EgressMatcher } from "@crewhaus/egress-classifier";
 import { type TrustOrigin, createRunContext } from "@crewhaus/run-context";
 import { defaultSinkScope, runChatLoop } from "@crewhaus/runtime-core";
 import { type RegisteredTool, hasModelChosenDestination } from "@crewhaus/tool-catalog";
+import { _setFetch as _setDistributionFetch } from "@crewhaus/tool-distribution";
 import type { TraceEvent } from "@crewhaus/trace-event-bus";
 import { loadAllBuiltinTools } from "./builtin-tools-for-tests";
 
@@ -50,6 +51,8 @@ describe("which builtins are dynamic sinks", () => {
       "OpenExternal",
       "HttpPaginate",
       "EvmGetBlock",
+      // The URLs it downloads are written inside the manifest text (C049).
+      "PackageManifestVerify",
     ]) {
       expect({ name, scope: scopeOf(name) }).toEqual({ name, scope: "external-dynamic" });
     }
@@ -127,10 +130,96 @@ describe("which builtins are dynamic sinks", () => {
     expect([...exemptionsUsed].sort()).toEqual(Object.keys(OPERATOR_FIXED).sort());
     expect(undeclared).toEqual([]);
   });
+
+  /**
+   * The field-name guard above cannot see a destination carried INSIDE a
+   * value: PackageManifestVerify dials every URL written in a manifest's
+   * text, and no field of it is named like a URL (C049). So every external
+   * tool that reaches the network is held here too: it is a dynamic sink
+   * (it declares a `url` or `recipient`), or it is listed with where its
+   * destination comes from instead. A new network tool fails until it is one
+   * or the other, which is the review that would have caught
+   * PackageManifestVerify.
+   */
+  const CODE_HOST =
+    "the configured code host, at an allow-listed origin; the call names a repository there";
+  const CHAIN_RPC =
+    "the RPC endpoint the operator configured for the chain; the call names what to read there";
+  const CONFIGURED_DESTINATION: Readonly<Record<string, string>> = {
+    AlertAck: "the operator's configured alerting backend",
+    AlertList: "the operator's configured alerting backend",
+    ChatDelete: "a message already posted, in the configured chat workspace; it sends no text",
+    ChatReact: "a message already posted, in the configured chat workspace; it sends an emoji name",
+    CheckRuns: CODE_HOST,
+    CompareRefs: CODE_HOST,
+    ContractInspect: CHAIN_RPC,
+    DefiPositionRead: CHAIN_RPC,
+    DeliveryCheck: "the configured notification provider's delivery status",
+    EntityRegistryLookup: "fixed public company registries",
+    Erc20Balance: CHAIN_RPC,
+    EvmBlockNumber: CHAIN_RPC,
+    EvmCall: CHAIN_RPC,
+    EvmGetBalance: CHAIN_RPC,
+    EvmGetLogs: CHAIN_RPC,
+    EvmGetTransaction: CHAIN_RPC,
+    EvmGetTransactionReceipt: CHAIN_RPC,
+    EvmMulticall: CHAIN_RPC,
+    EvmSimulate: CHAIN_RPC,
+    EvmSimulateBundle: CHAIN_RPC,
+    GasMarketRead: CHAIN_RPC,
+    ImageGenerate: "the configured image provider",
+    IssueGet: CODE_HOST,
+    IssueList: CODE_HOST,
+    LogsQuery: "the operator's configured log backend",
+    MetricsQuery: "the operator's configured metrics backend",
+    OraclePriceRead: CHAIN_RPC,
+    PortfolioValuation: `${CHAIN_RPC}, and fixed public price providers`,
+    PrComments: CODE_HOST,
+    PrFiles: CODE_HOST,
+    PrGet: CODE_HOST,
+    PrList: CODE_HOST,
+    PrReviews: CODE_HOST,
+    PreflightRun: "binds local ports to see whether they are free; sends nothing anywhere",
+    PriceQuote: "fixed public price providers (the ECB, Coinbase)",
+    RateLimitStatus: CODE_HOST,
+    RegistryOutdated: "fixed public package registries (npm, PyPI, crates.io)",
+    RegistryPackageInfo: "fixed public package registries (npm, PyPI, crates.io)",
+    RegistrySearch: "fixed public package registries (npm, PyPI, crates.io)",
+    ReleaseGet: CODE_HOST,
+    ReleaseList: CODE_HOST,
+    RepoGet: CODE_HOST,
+    Retrieve: "the configured embedder and vector store",
+    SearchCode: CODE_HOST,
+    SearchIssues: CODE_HOST,
+    SendMessage: "the operator's configured channel adapter",
+    StatusPagePost: "the operator's configured status page",
+    TokenResolve: CHAIN_RPC,
+    VatIdValidate: "the fixed VIES service",
+    VectorDelete: "the configured vector store",
+    WebSearch: "the configured search provider",
+    WorkflowRunLogs: CODE_HOST,
+    WorkflowRunRerun: CODE_HOST,
+    WorkflowRuns: CODE_HOST,
+  };
+
+  test("a network tool is a dynamic sink, or says where its destination comes from", () => {
+    const network = external.filter(({ tool }) => tool.ioCapability === "network");
+    const configured = network
+      .filter(({ tool }) => !hasModelChosenDestination(tool))
+      .map(({ tool }) => tool.name)
+      .sort();
+    // The sweep's hit count: both halves are populated.
+    expect(network.length).toBeGreaterThanOrEqual(100);
+    expect(network.length - configured.length).toBeGreaterThanOrEqual(45);
+    expect(configured).toEqual(Object.keys(CONFIGURED_DESTINATION).sort());
+    for (const name of configured) {
+      expect({ name, scope: scopeOf(name) }).toEqual({ name, scope: "external-configured" });
+    }
+  });
 });
 
 describe("end to end: a tool result reaching HttpRequest is blocked", () => {
-  function adapter(input: unknown): ProviderAdapter {
+  function adapter(input: unknown, name = "HttpRequest"): ProviderAdapter {
     let i = 0;
     return {
       providerId: "anthropic",
@@ -150,7 +239,7 @@ describe("end to end: a tool result reaching HttpRequest is blocked", () => {
             kind: "content_block_start",
             index: 0,
             block: first
-              ? { type: "tool_use", id: "tu_1", name: "HttpRequest", input: {} }
+              ? { type: "tool_use", id: "tu_1", name, input: {} }
               : { type: "text", text: "" },
           } as const;
           yield {
@@ -214,5 +303,55 @@ describe("end to end: a tool result reaching HttpRequest is blocked", () => {
     );
     expect(egress?.outcome).toBe("egress-blocked");
     expect(executed).toBe(false);
+  });
+
+  test("PackageManifestVerify does not download a URL carrying a tool result's text (C049)", async () => {
+    const pmv = external.find((e) => e.tool.name === "PackageManifestVerify")
+      ?.tool as RegisteredTool;
+    const wire: string[] = [];
+    _setDistributionFetch(async (req) => {
+      wire.push(req.url);
+      return new Response("x", { status: 200 });
+    });
+    const secret = "internal-doc-7f3a9c Q3 acquisition target";
+    const manifest = (query: string) =>
+      `class Foo < Formula\n  desc "x"\n  homepage "https://example.com"\n  version "1.0.0"\n  url "https://example.com/foo-1.0.0.tar.gz${query}"\n  sha256 "${"a".repeat(64)}"\nend\n`;
+    const run = async (mode: "plan" | "auto", text: string, download?: boolean) => {
+      const runContext = createRunContext();
+      runContext.dataLineage = new Map<string, TrustOrigin>([[secret, "tool"]]);
+      const events: TraceEvent[] = [];
+      runContext.eventBus.subscribe((e) => events.push(e));
+      await runChatLoop({
+        model: "test-model",
+        instructions: "verify the release manifest",
+        runContext,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        permissionMode: mode,
+        tools: [pmv],
+        _adapter: adapter(
+          { manifests: [{ text }], ...(download !== undefined ? { download } : {}) },
+          "PackageManifestVerify",
+        ),
+      });
+      return events
+        .filter((e) => e.kind === "permission_decision")
+        .map((e) => (e.kind === "permission_decision" ? (e.outcome ?? e.decision) : ""));
+    };
+    try {
+      for (const mode of ["plan", "auto"] as const) {
+        const tagged = manifest(`?d=${encodeURIComponent(secret)}`);
+        expect({ mode, outcomes: await run(mode, tagged) }).toMatchObject({
+          mode,
+          outcomes: expect.arrayContaining(["egress-blocked"]),
+        });
+      }
+      expect(wire).toEqual([]);
+      // Control: a manifest carrying nothing a tool returned is not blocked.
+      const clean = await run("auto", manifest(""), false);
+      expect(clean).not.toContain("egress-blocked");
+    } finally {
+      _setDistributionFetch(undefined);
+    }
   });
 });

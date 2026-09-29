@@ -3515,7 +3515,10 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path" }],
+    operativeArgs: [
+      { field: "paths", kind: "path" },
+      { field: "manifests.text", kind: "url" },
+    ],
   },
   packagePublishPreflight: {
     key: "packagePublishPreflight",

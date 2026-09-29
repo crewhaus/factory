@@ -5379,7 +5379,10 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     ioCapability: "network",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "paths", kind: "path" }],
+    operativeArgs: [
+      { field: "paths", kind: "path" },
+      { field: "manifests.text", kind: "url" },
+    ],
     categories: ["distribution", "code"],
     package: "@crewhaus/tool-distribution",
     keywords: [
