@@ -18,6 +18,7 @@
     "@crewhaus/prompt-optimizer": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "@crewhaus/trace-event-bus": "workspace:*"
   },
   "license": "Apache-2.0",

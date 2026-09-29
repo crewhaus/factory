@@ -412,6 +412,12 @@ export async function spawnSubAgent(
       //     parent's spec asked for.
       ...(parent.askMode !== undefined ? { askMode: parent.askMode } : {}),
       ...(parent.approvals !== undefined ? { approvals: parent.approvals } : {}),
+      //   - sandboxAvailable: 0.7.1. The child runs in this process, against
+      //     the backend the parent was told is wired, so a child granted a
+      //     code-execution tool passes the sandbox floor exactly when the
+      //     parent does. Only the fact is inherited: the child's tools and
+      //     rules are still the narrowed ones above.
+      ...(parent.sandboxAvailable === true ? { sandboxAvailable: true } : {}),
       ...(opts._client !== undefined ? { _adapter: opts._client as ProviderAdapter } : {}),
     });
   } catch (err) {

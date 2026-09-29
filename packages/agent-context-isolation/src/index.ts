@@ -312,6 +312,16 @@ export type ParentRunHandle = {
     readonly notify?: (approval: PendingApproval) => Promise<void>;
     readonly surface?: string;
   };
+  /**
+   * 0.7.1 — the parent loop was told a sandbox backend is wired
+   * (`runChatLoop({ sandboxAvailable: true })`). It is a fact about the
+   * process, not a grant: a child runs in the same process against the same
+   * backend, so it inherits the fact. Without it a sub-agent granted Python or
+   * Shell was denied every call by the sandbox floor, with advice to set
+   * CREWHAUS_SANDBOX that the operator had already followed. Present only when
+   * true, so a handle from a sandbox-less parent keeps its key set.
+   */
+  readonly sandboxAvailable?: true;
 };
 
 /**
@@ -344,7 +354,9 @@ export type ParentServedArm = {
  *   - unchanged from 0.5.x: the (narrowed) permission rule set, the (filtered)
  *     tool catalog, `maxTokens` when the child declares none, the recall-only
  *     memory seam, skills, the failure taxonomy, the read-only continuity seam,
- *     `askMode` and the approval store, and `sessionRootDir`.
+ *     `askMode` and the approval store, and `sessionRootDir`;
+ *   - 0.7.1: whether a sandbox backend is wired (`sandboxAvailable`), since
+ *     the child runs in the parent's process against the same backend.
  *
  * What a child NEVER inherits: the parent's `model_pool` / `model_tiers` /
  * `model_fallbacks` / `circuit_breaker` (a child routes only through the
@@ -503,6 +515,7 @@ export function projectParentHandle(bridge: RuntimeBridge): ParentRunHandle {
     ...(bridge.continuity !== undefined ? { continuity: bridge.continuity } : {}),
     ...(bridge.askMode !== undefined ? { askMode: bridge.askMode } : {}),
     ...(bridge.approvals !== undefined ? { approvals: bridge.approvals } : {}),
+    ...(bridge.sandboxAvailable === true ? { sandboxAvailable: true as const } : {}),
   };
 }
 

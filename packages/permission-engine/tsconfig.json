@@ -4,6 +4,10 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../errors" }, { "path": "../tool-permission-matcher" }],
+  "references": [
+    { "path": "../errors" },
+    { "path": "../tool-permission-matcher" },
+    { "path": "../tool-safety" }
+  ],
   "include": ["src/**/*"]
 }

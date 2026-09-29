@@ -1,5 +1,5 @@
 # Section 32 — docker-images: eval target shape (deployable eval bundle).
-FROM oven/bun:1.2-alpine AS deps
+FROM oven/bun:1.3-alpine AS deps
 WORKDIR /app
 COPY bun.lock package.json ./
 COPY packages packages
@@ -12,7 +12,7 @@ COPY tsconfig.base.json tsconfig.json ./
 RUN bun run typecheck
 RUN bun build apps/cli/src/index.ts --target=bun --outfile=/app/dist/crewhaus.js
 
-FROM oven/bun:1.2-alpine AS runtime
+FROM oven/bun:1.3-alpine AS runtime
 RUN addgroup -S crewhaus && adduser -S crewhaus -G crewhaus -u 10001 && \
     mkdir -p /app/.crewhaus/evals && chown -R crewhaus:crewhaus /app/.crewhaus
 WORKDIR /app

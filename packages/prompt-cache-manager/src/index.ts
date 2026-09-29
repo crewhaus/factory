@@ -25,14 +25,15 @@
  * rotation triggers, the no-op skip, the marker-stripping invariants, and the
  * store's read/write round-trip.
  */
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import type {
   CanonicalCacheControl,
   CanonicalTextBlockParam,
   ProviderFeatures,
 } from "@crewhaus/adapter-anthropic";
 import { CrewhausError } from "@crewhaus/errors";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 
 /** Default rotation period: 7 days. Anthropic's hard TTL is 30 days. */
 export const DEFAULT_ROTATE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
@@ -286,10 +287,31 @@ export function createPromptCacheRotationStore(
         specName: opts.specName,
         lastRotatedAt: rotatedAt,
       };
-      await mkdir(rootDir, { recursive: true });
-      const tmpPath = `${filePath}.tmp`;
-      await writeFile(tmpPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-      await rename(tmpPath, filePath);
+      // 0.7.1 — a random O_EXCL|O_NOFOLLOW temp, never the fixed
+      // `<spec>.json.tmp`, which was opened through any link planted there; a
+      // link at the record itself is refused too. The write is rooted at the
+      // record directory's PARENT (`.crewhaus` by default), so the lazily
+      // created `prompt-cache/` directory is contained as well: rooted at
+      // itself, a link planted there was followed as the root and the record
+      // landed wherever it pointed. The parent is the operator's.
+      const dir = resolve(rootDir);
+      const parent = dirname(dir);
+      await mkdir(parent, { recursive: true });
+      const written = writeFileSafe(
+        parent,
+        `${basename(dir)}/${opts.specName}.json`,
+        `${JSON.stringify(record)}\n`,
+        {
+          overwrite: true,
+          mode: 0o600,
+          createParents: true,
+        },
+      );
+      if (!written.ok) {
+        throw new PromptCacheStoreError(
+          `write(): refusing to write ${filePath}: ${written.reason} (code ${written.code})`,
+        );
+      }
     },
 
     path(): string {

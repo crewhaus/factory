@@ -1249,3 +1249,130 @@ describe("spawnSubAgent — G57 child usage aggregation", () => {
     }
   });
 });
+
+/**
+ * 0.7.1 (C024 sibling) — a sub-agent runs in the parent's process, against the
+ * sandbox backend the parent was told is wired. Before, the child loop was
+ * never told, so a child granted a code-execution tool was denied every call
+ * by the sandbox floor, with advice to set CREWHAUS_SANDBOX that the operator
+ * had already followed.
+ */
+describe("spawnSubAgent — the sandbox floor sees the parent's backend (0.7.1)", () => {
+  const SANDBOXED = "Sandboxed";
+  const makeSandboxedTool = (ran: string[]): RegisteredTool =>
+    buildTool({
+      name: SANDBOXED,
+      description: "stands in for Python: runs only where a sandbox is wired",
+      inputSchema: z.object({ code: z.string() }),
+      requiresSandbox: true,
+      execute: async (input) => {
+        ran.push(input.code);
+        return "ran in the sandbox";
+      },
+    });
+  // The floor needs an explicit allow as well as a backend.
+  const allowSandboxed: RuleSet = {
+    ...emptyRuleSet,
+    yaml: [{ type: "alwaysAllow", pattern: SANDBOXED, source: "yaml" }],
+  };
+  const childScript = (): ProviderAdapter =>
+    makeScriptedClient([
+      [
+        {
+          type: "tool_use",
+          id: "tu_code",
+          name: SANDBOXED,
+          input: { code: "print(1)" },
+        } as Anthropic.ToolUseBlock,
+      ],
+      [{ type: "text", text: "child done", citations: null } as Anthropic.TextBlock],
+    ]);
+  const resultTextOf = (result: { transcript: ReadonlyArray<{ content: unknown }> }): string =>
+    JSON.stringify(result.transcript[2]?.content ?? "");
+
+  test("a child granted a sandboxed tool runs it when the parent has a sandbox, and is refused when it has none", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      const outcomes: Array<{ sandbox: boolean; ran: string[]; toolResult: string }> = [];
+      for (const sandbox of [true, false]) {
+        const ran: string[] = [];
+        const result = await spawnSubAgent(
+          sandbox ? { ...parent, sandboxAvailable: true } : parent,
+          {
+            def: { ...DEF_NO_TOOLS, tools: [SANDBOXED] },
+            prompt: "run it",
+            permissionMode: "auto",
+            permissionRules: allowSandboxed,
+            childTools: [makeSandboxedTool(ran)],
+            sessionRootDir: root,
+            _client: childScript(),
+          },
+        );
+        outcomes.push({ sandbox, ran, toolResult: resultTextOf(result) });
+      }
+      const [withSandbox, without] = outcomes;
+      expect(withSandbox?.ran).toEqual(["print(1)"]);
+      expect(withSandbox?.toolResult).toContain("ran in the sandbox");
+      // The floor still holds for a parent that has no sandbox: the fact is
+      // inherited, never invented.
+      expect(without?.ran).toEqual([]);
+      expect(without?.toolResult).toContain(`tool \\"${SANDBOXED}\\" requires a sandbox`);
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("end to end: a parent loop with sandboxAvailable hands it through the Task tool to the child", async () => {
+    const root = newTempRoot();
+    try {
+      const ran: string[] = [];
+      const coder: SubAgentDefinition = {
+        name: "coder",
+        description: "runs code",
+        instructions: "Run the code.",
+        tools: [SANDBOXED],
+      };
+      const subAgents = new Map([[coder.name, coder]]);
+      let childToolResult = "";
+      await runChatLoop({
+        model: "test-model",
+        instructions: "delegate to the coder",
+        _adapter: makeScriptedClient([
+          [
+            {
+              type: "tool_use",
+              id: "tu_task",
+              name: "Task",
+              input: { description: "c", prompt: "run it", subagent_type: "coder" },
+            } as Anthropic.ToolUseBlock,
+          ],
+          [{ type: "text", text: "parent done", citations: null } as Anthropic.TextBlock],
+        ]),
+        sessionRootDir: root,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        tools: [makeSandboxedTool(ran), createTaskTool({ subAgents })],
+        permissionMode: "auto",
+        permissionRules: {
+          ...allowSandboxed,
+          yaml: [...allowSandboxed.yaml, { type: "alwaysAllow", pattern: "Task", source: "yaml" }],
+        },
+        sandboxAvailable: true,
+        installSigintHandler: false,
+        subAgents,
+        spawnSubAgent: async (parent, opts: SpawnSubAgentOptions) => {
+          const result = await spawnSubAgent(parent, { ...opts, _client: childScript() });
+          childToolResult = resultTextOf(result);
+          return result;
+        },
+      });
+      expect(childToolResult).toContain("ran in the sandbox");
+      expect(childToolResult).not.toContain("requires a sandbox");
+      expect(ran).toEqual(["print(1)"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

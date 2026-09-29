@@ -47,16 +47,10 @@
  * load; `compact()` (an explicit single-writer maintenance op, e.g. from
  * `crewhaus route`) rewrites the file to aggregate lines.
  */
-import {
-  appendFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { RouteObservation } from "./reward.js";
+import { appendStoreFile, writeStoreFile } from "./store-io.js";
 
 /** Rolled-up statistics for one `(routeKey, model)` arm. */
 export type ArmStats = {
@@ -315,12 +309,15 @@ function applyLine(
   foldQuality(arm, rec["q"]);
 }
 
+/** The scoreboard file, relative to the store's root. */
+export const ARMS_REL = join("routing", "arms.jsonl");
+
 /**
  * Open (or create) the scoreboard rooted at `rootDir`. The backing file is
  * `<rootDir>/routing/arms.jsonl`; a missing file is treated as an empty store.
  */
 export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): Scoreboard {
-  const path = join(rootDir, "routing", "arms.jsonl");
+  const path = join(rootDir, ARMS_REL);
   const now = opts.now ?? Date.now;
   const arms = new Map<string, Arm>();
   const lineage = opts.lineage;
@@ -410,7 +407,7 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
       if (obs.harness !== undefined) line["h"] = obs.harness;
       if (pf !== undefined) line["pf"] = pf;
       ensureDir();
-      appendFileSync(path, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+      appendStoreFile(rootDir, ARMS_REL, `${JSON.stringify(line)}\n`);
     },
     ungraded(routeKey: string, model: string): void {
       const key = armKey(routeKey, model);
@@ -434,7 +431,7 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
         ...(pf !== undefined ? { pf } : {}),
       };
       ensureDir();
-      appendFileSync(path, `${JSON.stringify(line)}\n`, { mode: 0o600 });
+      appendStoreFile(rootDir, ARMS_REL, `${JSON.stringify(line)}\n`);
     },
     snapshot(): ArmStats[] {
       return [...arms.values()]
@@ -469,9 +466,7 @@ export function openScoreboard(rootDir: string, opts: ScoreboardOptions = {}): S
         );
       // Write-then-rename for an atomic swap: a concurrent reader sees either
       // the old or the new file, never a half-written one.
-      const tmp = `${path}.tmp`;
-      writeFileSync(tmp, lines.length > 0 ? `${lines.join("\n")}\n` : "", { mode: 0o600 });
-      renameSync(tmp, path);
+      writeStoreFile(rootDir, ARMS_REL, lines.length > 0 ? `${lines.join("\n")}\n` : "");
     },
   };
 }

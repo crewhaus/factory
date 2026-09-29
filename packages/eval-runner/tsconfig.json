@@ -91,6 +91,9 @@
       "path": "../tool-mcp"
     },
     {
+      "path": "../tool-safety"
+    },
+    {
       "path": "../tool-task"
     },
     {

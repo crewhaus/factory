@@ -642,6 +642,9 @@ import {
 // argv switch on import). The block's exit-rating half lives in the RUNTIME
 // (@crewhaus/runtime-core's exit-rating module) so compiled bundles get it too.
 import { DISTILL_STATE_RELPATH, maybeAutoDistill } from "./autodistill";
+// 0.7.1 — the oldest supported Bun and doctor's check of it, in a module the
+// floor guard (scripts/bun-floor.test.ts) can import.
+import { checkBunVersion } from "./bun-floor";
 // Local-bundle dependency manifest: `compile` writes the same synthesized
 // pin-to-CLI-version package.json that `--check` installs against, so the
 // documented standalone flow (`bun install` + `bun agent.ts` in the out-dir)
@@ -5154,17 +5157,6 @@ function emitEvent(event: Record<string, unknown>): void {
 }
 
 type DoctorCheck = { label: string; pass: boolean; reason?: string; warn?: boolean };
-
-function checkBunVersion(version: string): { pass: boolean; reason?: string } {
-  const parts = version.split(".");
-  const major = Number.parseInt(parts[0] ?? "", 10);
-  const minor = Number.parseInt(parts[1] ?? "", 10);
-  if (Number.isNaN(major) || Number.isNaN(minor)) {
-    return { pass: false, reason: `unparseable version "${version}"` };
-  }
-  const ok = major > 1 || (major === 1 && minor >= 2);
-  return ok ? { pass: true } : { pass: false, reason: `bun ${version} is below minimum 1.2.0` };
-}
 
 function runContext(args: ParsedArgs): void {
   if (args.flags["help"]) {

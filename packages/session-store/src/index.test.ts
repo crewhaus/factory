@@ -274,7 +274,9 @@ describe("session-store — list and TTL eviction", () => {
       // The malformed file is logged-and-skipped; the good session survives.
       expect(listed.map((s) => s.id)).toEqual([good.id]);
       expect(errSpy).toHaveBeenCalledTimes(1);
-      expect(errSpy.mock.calls[0]?.[0]).toContain(`skipping malformed session "${badId}"`);
+      expect(errSpy.mock.calls[0]?.[0]).toContain(`skipping session "${badId}"`);
+      // 0.7.1: the line says why, instead of calling every skip "malformed".
+      expect(errSpy.mock.calls[0]?.[0]).toContain("malformed JSON");
     } finally {
       errSpy.mockRestore();
     }

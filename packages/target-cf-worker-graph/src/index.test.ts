@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { IrGraphNode, IrGraphV0 } from "@crewhaus/ir";
 import { TargetEmitError, emitCfWorkerGraph, resolveGraphTools } from "./index";
@@ -414,6 +414,20 @@ describe("emitCfWorkerGraph — package.json + gates", () => {
     expect(parsed.dependencies["@crewhaus/worker-runtime"]).toBeDefined();
   });
 
+  test("every @crewhaus dependency is pinned to the version this workspace publishes (0.7.1)", () => {
+    const ir: IrGraphV0 = {
+      ...baseIr,
+      entry: "only",
+      nodes: [node("only", "i", { tools: ["webFetch", "todoWrite"] })],
+      edges: [],
+    };
+    const { checked, stale } = stalePins(
+      emitCfWorkerGraph(ir).files.find((f) => f.path === "package.json")?.content ?? "",
+    );
+    expect(stale).toEqual([]);
+    expect(checked).toBe(3);
+  });
+
   test("edge-safe tool packages are declared in package.json", () => {
     const ir: IrGraphV0 = {
       ...baseIr,
@@ -622,3 +636,42 @@ describe("emitCfWorkerGraph — /chat SSE through the shared runtime", () => {
     expect(workerCode(withObs("json"))).toContain("trace: true");
   });
 });
+
+/**
+ * 0.7.1 — the version each workspace package would publish at, by name. The
+ * release train stamps them all in lockstep, so a pin that differs from these
+ * is a pin to some other release.
+ */
+function workspaceVersions(): Map<string, string> {
+  const root = join(import.meta.dir, "..", "..", "..");
+  const out = new Map<string, string>();
+  for (const entry of readdirSync(join(root, "packages"), { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    let manifest: { name?: unknown; version?: unknown };
+    try {
+      manifest = JSON.parse(
+        readFileSync(join(root, "packages", entry.name, "package.json"), "utf8"),
+      );
+    } catch {
+      continue;
+    }
+    if (typeof manifest.name === "string" && typeof manifest.version === "string") {
+      out.set(manifest.name, manifest.version);
+    }
+  }
+  return out;
+}
+
+/** Deps of an emitted package.json whose pin is not the workspace's version. */
+function stalePins(pkgJson: string): { checked: number; stale: string[] } {
+  const deps = (JSON.parse(pkgJson) as { dependencies: Record<string, string> }).dependencies;
+  const versions = workspaceVersions();
+  const stale: string[] = [];
+  let checked = 0;
+  for (const [name, pin] of Object.entries(deps)) {
+    if (!name.startsWith("@crewhaus/")) continue;
+    checked += 1;
+    if (pin !== versions.get(name)) stale.push(`${name}@${pin} (workspace: ${versions.get(name)})`);
+  }
+  return { checked, stale };
+}

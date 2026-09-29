@@ -6536,6 +6536,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // `"pause"` default — identical resolution, no double-defaulting.
       ...(opts.askMode !== undefined ? { askMode: opts.askMode } : {}),
       ...(opts.approvals !== undefined ? { approvals: opts.approvals } : {}),
+      // 0.7.1 — a Task child runs against this process's sandbox backend, so
+      // it passes the sandbox floor exactly when this loop does.
+      ...(opts.sandboxAvailable === true ? { sandboxAvailable: true as const } : {}),
       specModels: bridgeSpecModels,
     };
     // Spin "running <tool>…" for exactly the execution window — started after

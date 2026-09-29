@@ -317,6 +317,7 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/secrets-manager": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/audit-log": {
@@ -742,6 +743,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
       },
     },
@@ -860,6 +862,7 @@
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
@@ -918,6 +921,7 @@
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
@@ -932,6 +936,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/exporter-datadog": {
@@ -1406,6 +1411,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -1504,6 +1510,7 @@
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/prompt-injection-detector": {
@@ -1591,6 +1598,9 @@
     "packages/routing-store": {
       "name": "@crewhaus/routing-store",
       "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/tool-safety": "workspace:*",
+      },
     },
     "packages/rules-engine": {
       "name": "@crewhaus/rules-engine",
@@ -1651,6 +1661,7 @@
         "@crewhaus/tool-loop-detection": "workspace:*",
         "@crewhaus/tool-orchestrator": "workspace:*",
         "@crewhaus/tool-result-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/turn-state-machine": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
@@ -1767,6 +1778,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/single-binary-cli": {
@@ -3596,6 +3608,9 @@
     "packages/watchme-store": {
       "name": "@crewhaus/watchme-store",
       "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/tool-safety": "workspace:*",
+      },
     },
     "packages/wiki-store": {
       "name": "@crewhaus/wiki-store",

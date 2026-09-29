@@ -4,6 +4,6 @@
     "rootDir": "src",
     "outDir": "dist"
   },
-  "references": [{ "path": "../adapter-anthropic" }],
+  "references": [{ "path": "../adapter-anthropic" }, { "path": "../tool-safety" }],
   "include": ["src/**/*"]
 }

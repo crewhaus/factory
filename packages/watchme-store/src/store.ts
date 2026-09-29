@@ -21,19 +21,37 @@
  * lines; `compact()` and `setState()` are single-writer maintenance ops run
  * under `acquireLock()` and land write-then-rename so a reader never
  * observes a torn file.
+ *
+ * 0.7.1: the store lives in the WORKSPACE (`crewhaus watchme` opens it at
+ * `./.crewhaus`), so a model with GitApplyPatch could plant a link in it.
+ * 0.7.0 wrote the fixed `state.json.tmp` / `observations.jsonl.tmp` through
+ * any link planted there and renamed the link into place (`watchme stop`
+ * clobbered the file it named), and appended observations and judgments
+ * through a link at either log. Every write now goes through
+ * @crewhaus/tool-safety rooted at `rootDir`: `writeFileSafe` (a random
+ * O_EXCL|O_NOFOLLOW temp, a leaf check, the rename) and `appendContained`,
+ * with `watchme/` itself created contained. A link, FIFO or directory at a
+ * store file, or a `watchme/` link leading out of `rootDir`, is refused with a
+ * {@link WatchmeStoreError} naming the file and the reason.
  */
 import {
-  appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
   statSync,
   unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import {
+  type SafeFsFailure,
+  appendContained,
+  ensureDirContained,
+  openForReadFd,
+  writeFileSafe,
+} from "@crewhaus/tool-safety/fs";
 import type {
   WatchmeAggregate,
   WatchmeJudgment,
@@ -253,10 +271,10 @@ function toAggregate(fold: Fold): WatchmeAggregate {
 }
 
 /** Parse a JSONL file into records, skipping blank/torn/malformed lines. */
-function readJsonl(path: string): Record<string, unknown>[] {
-  if (!existsSync(path)) return [];
+function readJsonl(text: string | undefined): Record<string, unknown>[] {
+  if (text === undefined) return [];
   const records: Record<string, unknown>[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
+  for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (trimmed.length === 0) continue;
     try {
@@ -285,17 +303,65 @@ const isJudgment = (rec: Record<string, unknown>): boolean =>
   typeof rec["turnNumber"] === "number" &&
   typeof rec["score"] === "number";
 
+const OBSERVATIONS_FILE = "observations.jsonl";
+const JUDGMENTS_FILE = "judgments.jsonl";
+const STATE_FILE = "state.json";
+
+/** A store file the store refused to write, naming the file and the reason. */
+export class WatchmeStoreError extends Error {
+  override readonly name = "WatchmeStoreError";
+}
+
 /** Open (or create) the watch-me store rooted at the harness `.crewhaus` dir. */
 export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}): WatchmeStore {
   const dir = join(rootDir, "watchme");
-  const observationsPath = join(dir, "observations.jsonl");
-  const judgmentsPath = join(dir, "judgments.jsonl");
-  const statePath = join(dir, "state.json");
   const lockPath = join(dir, "run.lock");
   const specToken = opts.specName ?? basename(dirname(resolve(rootDir)));
 
+  const refused = (op: string, file: string, failure: SafeFsFailure): WatchmeStoreError =>
+    new WatchmeStoreError(
+      `watchme-store: refusing to ${op} ${join(dir, file)}: ${failure.reason} (code ${failure.code})`,
+    );
+
   const ensureDir = (): void => {
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // `rootDir` (the harness `.crewhaus`) is the operator's, and may be a
+    // link; `watchme/` under it is created, or checked, one contained step.
+    if (!existsSync(rootDir)) mkdirSync(rootDir, { recursive: true, mode: 0o700 });
+    const made = ensureDirContained(rootDir, "watchme", { mode: 0o700 });
+    if (!made.ok) throw refused("use", "", made);
+  };
+
+  /**
+   * A store file's text, or undefined when it does not exist. Read without
+   * following a link at its name (a digest a model planted would reach the
+   * judge and the report); a link, FIFO or directory there is refused.
+   */
+  const readText = (file: string): string | undefined => {
+    if (!existsSync(dir)) return undefined;
+    const opened = openForReadFd(rootDir, `watchme/${file}`, { followLeafSymlink: false });
+    if (!opened.ok) {
+      if (opened.code === "not-found") return undefined;
+      throw refused("read", file, opened);
+    }
+    try {
+      return readFileSync(opened.fd, "utf8");
+    } finally {
+      closeSync(opened.fd);
+    }
+  };
+
+  const append = (file: string, line: string): void => {
+    ensureDir();
+    const appended = appendContained(rootDir, `watchme/${file}`, line, { mode: 0o600 });
+    if (!appended.ok) throw refused("append to", file, appended);
+  };
+
+  const replace = (file: string, data: string): void => {
+    const written = writeFileSafe(rootDir, `watchme/${file}`, data, {
+      overwrite: true,
+      mode: 0o600,
+    });
+    if (!written.ok) throw refused("write", file, written);
   };
 
   const readObservations = (): WatchmeObservation[] => {
@@ -305,7 +371,7 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
     // double-count). `n` therefore reflects DISTINCT sessions. The Map keeps
     // each session at its first-seen position while carrying the last value,
     // so append order over distinct sessions is preserved.
-    const all = readJsonl(observationsPath).filter(
+    const all = readJsonl(readText(OBSERVATIONS_FILE)).filter(
       isObservation,
     ) as unknown as WatchmeObservation[];
     const byId = new Map<string, WatchmeObservation>();
@@ -314,12 +380,13 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
   };
 
   const readAggregates = (): WatchmeAggregate[] =>
-    readJsonl(observationsPath).filter(isAggregate) as unknown as WatchmeAggregate[];
+    readJsonl(readText(OBSERVATIONS_FILE)).filter(isAggregate) as unknown as WatchmeAggregate[];
 
   const state = (): WatchmeState => {
-    if (!existsSync(statePath)) return DEFAULT_STATE;
+    const text = readText(STATE_FILE);
+    if (text === undefined) return DEFAULT_STATE;
     try {
-      const parsed = JSON.parse(readFileSync(statePath, "utf8")) as unknown;
+      const parsed = JSON.parse(text) as unknown;
       if (
         typeof parsed === "object" &&
         parsed !== null &&
@@ -337,17 +404,15 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
   return {
     dir,
     appendObservation(obs: WatchmeObservation): void {
-      ensureDir();
-      appendFileSync(observationsPath, `${JSON.stringify(obs)}\n`, { mode: 0o600 });
+      append(OBSERVATIONS_FILE, `${JSON.stringify(obs)}\n`);
     },
     readObservations,
     readAggregates,
     appendJudgment(j: WatchmeJudgment): void {
-      ensureDir();
-      appendFileSync(judgmentsPath, `${JSON.stringify(j)}\n`, { mode: 0o600 });
+      append(JUDGMENTS_FILE, `${JSON.stringify(j)}\n`);
     },
     readJudgments(): WatchmeJudgment[] {
-      return readJsonl(judgmentsPath).filter(isJudgment) as unknown as WatchmeJudgment[];
+      return readJsonl(readText(JUDGMENTS_FILE)).filter(isJudgment) as unknown as WatchmeJudgment[];
     },
     compact(): void {
       ensureDir();
@@ -376,17 +441,13 @@ export function openWatchmeStore(rootDir: string, opts: WatchmeStoreOptions = {}
         .map((f) => JSON.stringify(toAggregate(f)));
       // Write-then-rename for an atomic swap: a concurrent reader sees either
       // the old or the new file, never a half-written one.
-      const tmp = `${observationsPath}.tmp`;
-      writeFileSync(tmp, lines.length > 0 ? `${lines.join("\n")}\n` : "", { mode: 0o600 });
-      renameSync(tmp, observationsPath);
+      replace(OBSERVATIONS_FILE, lines.length > 0 ? `${lines.join("\n")}\n` : "");
     },
     state,
     setState(patch: Partial<WatchmeState>): void {
       ensureDir();
       const next: WatchmeState = { ...state(), ...patch, schemaVersion: 1 };
-      const tmp = `${statePath}.tmp`;
-      writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-      renameSync(tmp, statePath);
+      replace(STATE_FILE, `${JSON.stringify(next, null, 2)}\n`);
     },
     windowKey(nowMs: number, everyMs: number): string {
       return `watchme:${specToken}:${Math.floor(nowMs / everyMs)}`;

@@ -30,8 +30,8 @@
  * References: claude-code/utils/permissions/ (24 files); AI-Harness-Systems
  * §Policy engine.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   type CompiledPattern,
@@ -40,6 +40,7 @@ import {
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 
 export type PermissionMode = "default" | "plan" | "auto" | "bypass";
@@ -661,6 +662,14 @@ export function tagRules(
 /** The settings file's path relative to a harness root. */
 export const SETTINGS_RELATIVE_PATH = join(".crewhaus", "settings.json");
 
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 /** Absolute settings path for a harness root. */
 export function settingsFilePath(dir: string): string {
   return join(dir, SETTINGS_RELATIVE_PATH);
@@ -749,9 +758,29 @@ export function appendSettingsRule(
       ],
     },
   };
-  mkdirSync(dirname(path), { recursive: true });
-  const tmpPath = `${path}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(next, null, 2)}\n`);
-  renameSync(tmpPath, path);
+  // 0.7.1 — a random O_EXCL|O_NOFOLLOW temp beside the file, never the fixed
+  // `settings.json.tmp`, which was opened through any link a model had
+  // planted there. A settings.json that links elsewhere in the workspace is
+  // written where it leads; one that leads out of it is refused.
+  //
+  // `.crewhaus` itself may be a link an operator made to keep a harness's
+  // state elsewhere; rules are read through it, so they are written through
+  // it too: it is then the root, as it is for the session and routing stores.
+  mkdirSync(dir, { recursive: true });
+  const crewhausDir = join(dir, ".crewhaus");
+  const linkedStateDir = isSymlink(crewhausDir);
+  const written = writeFileSafe(
+    linkedStateDir ? crewhausDir : dir,
+    linkedStateDir ? "settings.json" : SETTINGS_RELATIVE_PATH,
+    `${JSON.stringify(next, null, 2)}\n`,
+    {
+      overwrite: true,
+      createParents: true,
+      leafSymlink: "follow-contained",
+    },
+  );
+  if (!written.ok) {
+    throw new PermissionConfigError(`cannot write settings file ${path}: ${written.reason}`);
+  }
   return { added: true, path };
 }

@@ -350,3 +350,62 @@ describe("emitEval — bridge mode (cluster S)", () => {
     expect(code).toContain("const __invoker = createBridgeInvoker(BRIDGE, __entry);");
   });
 });
+
+describe("emitEval — a bridge's tool_config and permission rules (C002)", () => {
+  const policy = {
+    toolConfigs: { http: { allowed_origins: ["https://api.example.com"] } },
+    permissions: { rules: [{ type: "alwaysDeny" as const, pattern: "GitStatus" }] },
+  };
+  const researchBridge = {
+    sourceTarget: "research",
+    kind: "single-turn-chat-loop",
+    chatCapable: false,
+  } as const;
+
+  test("an entry-less bridge hands both to the runner, and the emission stays valid TypeScript", () => {
+    const code =
+      emitEval(
+        { ...makeIr({ agent: { ...makeIr().agent, tools: ["gitStatus"] } }), ...policy },
+        {
+          bridge: researchBridge,
+        },
+      ).files[0]?.content ?? "";
+    expect(code).toContain(
+      'const TOOL_CONFIGS = {"http":{"allowed_origins":["https://api.example.com"]}};',
+    );
+    expect(code).toContain(
+      'const PERMISSION_RULES = [{"type":"alwaysDeny","pattern":"GitStatus"}] as const;',
+    );
+    expect(code).toContain("    toolConfigs: TOOL_CONFIGS,\n");
+    expect(code).toContain("    permissions: { rules: PERMISSION_RULES },\n");
+    expect(() => new Bun.Transpiler({ loader: "ts" }).transformSync(code)).not.toThrow();
+  });
+
+  test("a spec without either keeps 0.7.0's literal bytes", () => {
+    const code = emitEval(makeIr(), { bridge: researchBridge }).files[0]?.content ?? "";
+    expect(code).toContain(
+      "    toolConfigs: {},\n    mcp_servers: {},\n    permissions: { rules: [] },\n",
+    );
+    expect(code).not.toContain("TOOL_CONFIGS");
+    expect(code).not.toContain("PERMISSION_RULES");
+  });
+
+  test("an entry-driven bridge runs its entry's own config and rules, so it takes neither", () => {
+    const code =
+      emitEval(
+        { ...makeIr(), ...policy },
+        {
+          bridge: {
+            sourceTarget: "managed",
+            kind: "gateway-request",
+            chatCapable: true,
+            entryImport: "../agent.ts",
+          },
+        },
+      ).files[0]?.content ?? "";
+    expect(code).not.toContain("TOOL_CONFIGS");
+    expect(code).not.toContain("PERMISSION_RULES");
+    expect(code).toContain("    toolConfigs: {},\n");
+    expect(code).toContain("    permissions: { rules: [] },\n");
+  });
+});

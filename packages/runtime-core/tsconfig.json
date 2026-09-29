@@ -35,6 +35,7 @@
     { "path": "../tool-plan" },
     { "path": "../tool-loop-detection" },
     { "path": "../tool-result-store" },
+    { "path": "../tool-safety" },
     { "path": "../streaming-tool-executor" },
     { "path": "../sub-agent-permission-inheritance" },
     { "path": "../turn-state-machine" },

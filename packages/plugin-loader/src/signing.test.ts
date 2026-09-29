@@ -20,13 +20,23 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import {
   type PluginManifest,
   entrypointDigest,
   manifestPayloadForSigning,
 } from "@crewhaus/plugin-sdk";
 import { PluginLoaderError, createPluginLoader, defaultVerifiedCodeDir } from "./index";
+
+/**
+ * Is `path` inside directory `dir`? Compared physically and by path segment:
+ * a string prefix got this wrong on Linux, where tmpdir() is not a symlink, so
+ * `<root>-verified/...` starts with `<root>` and a sibling read as inside.
+ */
+function isInside(dir: string, path: string): boolean {
+  const rel = relative(realpathSync(dir), path);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
 
 let root: string;
 let dir: string;
@@ -195,7 +205,7 @@ describe("only the verified bytes of a signed plugin run (C108)", () => {
     });
     try {
       await l.load(path);
-      expect(importedFrom.startsWith(root)).toBe(false);
+      expect(isInside(root, importedFrom)).toBe(false);
       expect(dirname(dirname(importedFrom))).toBe(realpathSync(staging));
       expect(basename(importedFrom)).toBe("index.mjs");
       expect(modeWhileImporting).toBe(0o700);
@@ -344,7 +354,7 @@ describe("where a signed plugin's code is staged (C108)", () => {
     expect(dirname(dirname(importedFrom))).toBe(
       realpathSync(join(homedir(), ".crewhaus", "verified-code")),
     );
-    expect(importedFrom.startsWith(realpathSync(tmpdir()))).toBe(false);
+    expect(isInside(tmpdir(), importedFrom)).toBe(false);
   });
 
   test("a staging directory that is a link, or that others can write, is refused before anything is staged", async () => {
