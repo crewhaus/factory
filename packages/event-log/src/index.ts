@@ -34,7 +34,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { RuntimeError } from "@crewhaus/errors";
 import { assertSamePath, currentTenantContext, requireTenant } from "@crewhaus/tenancy";
-import { appendContained } from "@crewhaus/tool-safety/fs";
+import { appendContained, openForReadFd } from "@crewhaus/tool-safety/fs";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/sessions";
 const ID_REGEX = /^sess_[0-9a-f]{16}$/;
@@ -384,7 +384,19 @@ async function* readEvents(
   opts: { since?: number; until?: number },
 ): AsyncIterable<Event> {
   if (!existsSync(fullPath)) return;
-  const stream = createReadStream(fullPath, { encoding: "utf8" });
+  // 0.7.1: opened without following a link at the name, as the append is, so
+  // `--resume` never replays another file's lines as this session's history
+  // (and a FIFO there cannot block it).
+  const opened = openForReadFd(dirname(fullPath), basename(fullPath), {
+    followLeafSymlink: false,
+  });
+  if (!opened.ok) {
+    if (opened.code === "not-found") return;
+    throw new RuntimeError(
+      `event-log: refusing to read ${fullPath}: ${opened.reason} (code ${opened.code})`,
+    );
+  }
+  const stream = createReadStream(fullPath, { fd: opened.fd, encoding: "utf8" });
   const rl = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
   let lineNumber = 0;
   try {

@@ -17,6 +17,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -144,5 +145,50 @@ describe("the session summary index (0.7.1)", () => {
     symlinkSync(victim, join(indexDir, `${id}.json`));
     expect(() => summarizeSessionIntoIndex(id, log, indexDir)).toThrow(/\(code is-symlink\)/);
     expect(readFileSync(victim, "utf8")).toBe(VICTIM_TEXT);
+  });
+
+  test("a directory link planted at .crewhaus/sessions-index is refused: nothing lands outside", () => {
+    const { sessions, outside } = layout();
+    const id = "sess_0123456789abcdef";
+    const log = join(sessions, `${id}.jsonl`);
+    writeFileSync(
+      log,
+      `${JSON.stringify({ ts: 1, version: 1, kind: "user_message", payload: { text: "hi" } })}\n`,
+    );
+    // `sessions summarize` creates the index directory lazily, so a model can
+    // plant it first; 0.7.0 and the first 0.7.1 fix both followed it as the root.
+    const indexDir = join(sessions, "..", "sessions-index");
+    symlinkSync(outside, indexDir);
+    expect(() => summarizeSessionIntoIndex(id, log, indexDir)).toThrow(/\(code escapes-root\)/);
+    expect(readdirSync(outside)).toEqual(["victim"]);
+  });
+
+  test("a link planted at the session log is refused, never summarized into recall", () => {
+    const { sessions, outside } = layout();
+    const id = "sess_0123456789abcdef";
+    const secret = join(outside, "secret.jsonl");
+    writeFileSync(
+      secret,
+      `${JSON.stringify({ ts: 1, version: 1, kind: "user_message", payload: { text: "SECRET-TOKEN" } })}\n`,
+    );
+    symlinkSync(secret, join(sessions, `${id}.jsonl`));
+    const indexDir = join(sessions, "..", "sessions-index");
+    expect(() => summarizeSessionIntoIndex(id, join(sessions, `${id}.jsonl`), indexDir)).toThrow(
+      /the session log .*\(code is-symlink\)/,
+    );
+    expect(existsSync(join(indexDir, `${id}.json`))).toBe(false);
+  });
+
+  test("an ordinary summary still lands in .crewhaus/sessions-index", () => {
+    const { sessions } = layout();
+    const id = "sess_0123456789abcdef";
+    const log = join(sessions, `${id}.jsonl`);
+    writeFileSync(
+      log,
+      `${JSON.stringify({ ts: 1, version: 1, kind: "user_message", payload: { text: "hi" } })}\n`,
+    );
+    const indexDir = join(sessions, "..", "sessions-index");
+    expect(summarizeSessionIntoIndex(id, log, indexDir)?.sessionId).toBe(id);
+    expect(lstatSync(join(indexDir, `${id}.json`)).isFile()).toBe(true);
   });
 });

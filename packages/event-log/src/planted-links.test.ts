@@ -57,6 +57,23 @@ describe("event-log appends (0.7.1)", () => {
     },
   );
 
+  test("a link at <id>.jsonl is never replayed by read(), so --resume cannot load another file as history", async () => {
+    const { sessions, outside } = layout();
+    const planted = join(outside, "history.jsonl");
+    writeFileSync(
+      planted,
+      `${JSON.stringify({ ts: 1, version: 1, kind: "user_message", payload: { text: "INJECTED" } })}\n`,
+    );
+    symlinkSync(planted, join(sessions, `${ID}.jsonl`));
+    const log = await openEventLog(ID, { rootDir: sessions });
+    const seen: unknown[] = [];
+    const drain = async (): Promise<void> => {
+      for await (const ev of log.read()) seen.push(ev);
+    };
+    await expect(drain()).rejects.toThrow(/refusing to read .*\(code is-symlink\)/);
+    expect(seen).toEqual([]);
+  });
+
   test("control: a plain log still appends and reads back", async () => {
     const { sessions } = layout();
     const log = await openEventLog(ID, { rootDir: sessions });
