@@ -10,7 +10,17 @@
  * Conditions are `@crewhaus/tool-schema`'s check grammar, the same one
  * `Assert` and `Branch` use.
  */
-import { type Check, type RegexAnswers, runChecks, testPatternSync } from "@crewhaus/tool-schema";
+import {
+  CALLER_PATTERN_DEADLINE_MS,
+  type Check,
+  MAX_PATTERN_QUESTIONS,
+  type RegexAnswer,
+  RegexAnswers,
+  type RegexRunContext,
+  askCheckPatterns,
+  runChecks,
+  testPatternSync,
+} from "@crewhaus/tool-schema";
 
 export type CodingRule = {
   readonly id: string;
@@ -80,20 +90,15 @@ function ruleVerdict(
   return { verdict: "undetermined", reason: open.join("; ") };
 }
 
-export function codeLines(
-  lines: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
-  rules: ReadonlyArray<CodingRule>,
-  options: {
-    readonly version?: string;
-    readonly defaultAccount?: string;
-    /**
-     * The rules' `matches` patterns, answered in the regex worker (see
-     * tool-schema's `askCheckPatterns`). Without it they run bounded on this
-     * thread.
-     */
-    readonly regex?: RegexAnswers;
-  } = {},
-): CodingResult {
+/** Blocking rules a review reason names with their reasons; the rest are counted. */
+const NAMED_IN_REASON = 3;
+
+/**
+ * Validate the rules once, and return the screen's verdict per pattern: a
+ * refused pattern is refused whatever it is run on, so each is screened
+ * once, on the empty string.
+ */
+function prepareRules(rules: ReadonlyArray<CodingRule>): (check: Check) => string | undefined {
   const seen = new Set<string>();
   for (const rule of rules) {
     if (rule.when.length === 0) {
@@ -102,11 +107,8 @@ export function codeLines(
     if (seen.has(rule.id)) throw new Error(`two rules share the id "${rule.id}"`);
     seen.add(rule.id);
   }
-
-  // A refused pattern is refused whatever it is run on, so it is screened
-  // once per pattern, on the empty string.
   const refusals = new Map<string, string | undefined>();
-  const refused = (check: Check): string | undefined => {
+  return (check: Check): string | undefined => {
     if (check.op !== "matches" && check.op !== "notMatches") return undefined;
     if (typeof check.expected !== "string") return undefined;
     const flags = check.flags ?? "";
@@ -122,83 +124,214 @@ export function codeLines(
     }
     return refusals.get(key);
   };
+}
 
-  const results: CodedLine[] = [];
-  for (const line of lines) {
-    const verdicts = rules.map((rule) => ({
-      rule,
-      ...ruleVerdict(line, rule, options.regex, refused),
-    }));
-    const matches = verdicts
-      .filter((v) => v.verdict === "pass")
-      .map((v) => v.rule)
-      .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
-    // A rule that could not be evaluated decides nothing, but it could have:
-    // when it would outrank (or tie) whatever did match, or when nothing
-    // did, the line is not coded.
-    const bar = matches.length === 0 ? Number.NEGATIVE_INFINITY : (matches[0]?.priority ?? 0);
-    const blocking = verdicts.filter(
-      (v): v is typeof v & { verdict: "undetermined"; reason: string } =>
-        v.verdict === "undetermined" && (v.rule.priority ?? 0) >= bar,
-    );
-    if (blocking.length > 0) {
-      const named = blocking.map((v) => `"${v.rule.id}" (${v.reason})`).join(", ");
-      results.push({
-        lineId: line.id,
-        account: null,
-        costCenter: null,
-        taxCode: null,
-        matched: matches.map((r) => r.id),
-        ambiguous: false,
-        needsReview: true,
-        reason:
-          matches.length === 0
-            ? `no rule definitely matched, and these could not be evaluated: ${named}`
-            : `rule "${(matches[0] as CodingRule).id}" matched, but these could not be evaluated and would outrank or tie it: ${named}`,
-        undetermined: blocking.map((v) => v.rule.id),
-      });
-      continue;
-    }
+type CodeOptions = {
+  readonly version?: string;
+  readonly defaultAccount?: string;
+};
 
-    if (matches.length === 0) {
-      results.push({
-        lineId: line.id,
-        account: options.defaultAccount ?? null,
-        costCenter: null,
-        taxCode: null,
-        matched: [],
-        ambiguous: false,
-        // A default account is a place to put it, not a coding decision, so
-        // the line still goes to review rather than quietly landing in a
-        // suspense account nobody looks at.
-        needsReview: true,
-        reason: "no rule matched",
-      });
-      continue;
-    }
+export function codeLines(
+  lines: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
+  rules: ReadonlyArray<CodingRule>,
+  options: CodeOptions & {
+    /**
+     * The rules' `matches` patterns, answered in the regex worker (see
+     * tool-schema's `askCheckPatterns`). Without it they run bounded on this
+     * thread. {@link codeLinesAnsweringPatterns} asks and answers them.
+     */
+    readonly regex?: RegexAnswers;
+  } = {},
+): CodingResult {
+  const refused = prepareRules(rules);
+  return summarize(
+    lines.map((line) => codeLine(line, rules, options.regex, refused, options.defaultAccount)),
+    options.version,
+  );
+}
 
-    const top = matches[0] as CodingRule;
-    const topPriority = top.priority ?? 0;
-    const tied = matches.filter((r) => (r.priority ?? 0) === topPriority);
-    // Two rules at the same priority disagreeing is a rule-set bug. Picking
-    // one would hide it, and the wrong account is found in an audit, not in
-    // a test.
-    const conflicting = tied.some((r) => r.account !== top.account);
-
-    results.push({
-      lineId: line.id,
-      account: conflicting ? null : top.account,
-      costCenter: conflicting ? null : (top.costCenter ?? null),
-      taxCode: conflicting ? null : (top.taxCode ?? null),
-      matched: matches.map((r) => r.id),
-      ambiguous: conflicting,
-      needsReview: conflicting,
-      reason: conflicting
-        ? `rules ${tied.map((r) => `"${r.id}"`).join(", ")} match at the same priority and disagree on the account`
-        : "",
-    });
+/** Answers every question as undetermined, for lines reached after the pattern budget ran out. */
+class Unanswered extends RegexAnswers {
+  constructor(private readonly why: string) {
+    super();
   }
 
+  override lookup(): RegexAnswer {
+    return { undetermined: this.why };
+  }
+}
+
+/**
+ * Chunks whose patterns get tool-schema's per-call budget each, at most: a
+ * batch of benign patterns is answered in full up to the schema's limits,
+ * and a runaway pattern costs a worker thirty seconds at worst (0.7.0 ran
+ * the same batch on the caller's thread with no bound at all).
+ */
+const MAX_BUDGETED_CHUNKS = 6;
+
+/**
+ * {@link codeLines} with the rules' patterns answered in the regex worker, a
+ * chunk of lines at a time.
+ *
+ * One `RegexAnswers` takes at most tool-schema's `MAX_PATTERN_QUESTIONS`
+ * distinct pattern questions and answers any past that as undetermined. A
+ * line asks one per pattern condition, so 5 000 lines under 201 one-pattern
+ * rules — well inside the schema's 5 000 lines and 1 000 rules — asked more,
+ * and every line past the cap went to review uncoded where 0.7.0 coded it
+ * (bounds review). So the lines are cut into chunks that cannot ask more
+ * than the cap (`maxQuestions`, for tests), each asked, answered and coded
+ * in turn.
+ *
+ * The patterns share one budget, counted only while they run: tool-schema's
+ * `CALLER_PATTERN_DEADLINE_MS` per chunk, for at most
+ * {@link MAX_BUDGETED_CHUNKS} chunks (`deadlineMs` overrides it). Lines
+ * reached after it ran out, or after the call was cancelled, are not asked
+ * about: their pattern conditions are undetermined, and they go to review.
+ */
+export async function codeLinesAnsweringPatterns(
+  lines: ReadonlyArray<{ readonly id: string } & Record<string, unknown>>,
+  rules: ReadonlyArray<CodingRule>,
+  options: CodeOptions & {
+    readonly run?: RegexRunContext;
+    readonly deadlineMs?: number;
+    readonly maxQuestions?: number;
+  } = {},
+): Promise<CodingResult> {
+  const refused = prepareRules(rules);
+  let perLine = 0;
+  for (const rule of rules) {
+    for (const check of rule.when) {
+      if (
+        (check.op === "matches" || check.op === "notMatches") &&
+        typeof check.expected === "string"
+      ) {
+        perLine += 1;
+      }
+    }
+  }
+  const cap = Math.max(1, options.maxQuestions ?? MAX_PATTERN_QUESTIONS);
+  const perChunk = perLine === 0 ? lines.length : Math.max(1, Math.floor(cap / perLine));
+  const chunks = Math.max(1, Math.ceil(lines.length / Math.max(1, perChunk)));
+  const size = Math.max(1, Math.ceil(lines.length / chunks));
+  const budgetMs =
+    options.deadlineMs ?? CALLER_PATTERN_DEADLINE_MS * Math.min(chunks, MAX_BUDGETED_CHUNKS);
+  const run = options.run ?? {};
+  let spent = 0;
+  const coded: CodedLine[] = [];
+  for (let from = 0; from < lines.length; from += size) {
+    const chunk = lines.slice(from, from + size);
+    const left = Math.floor(budgetMs - spent);
+    let regex: RegexAnswers;
+    if (perLine > 0 && run.signal?.aborted === true) {
+      regex = new Unanswered("the call was cancelled before this line's patterns could run");
+    } else if (perLine > 0 && left < 1) {
+      regex = new Unanswered(
+        `the call's ${budgetMs} ms for running patterns ran out before this line's could run`,
+      );
+    } else {
+      regex = new RegexAnswers();
+      if (perLine > 0) {
+        for (const line of chunk) {
+          for (const rule of rules) askCheckPatterns(line, rule.when as Check[], regex);
+        }
+        const began = performance.now();
+        await regex.resolve(run, { deadlineMs: left });
+        spent += performance.now() - began;
+      }
+    }
+    for (const line of chunk) {
+      coded.push(codeLine(line, rules, regex, refused, options.defaultAccount));
+    }
+  }
+  return summarize(coded, options.version);
+}
+
+function codeLine(
+  line: { readonly id: string } & Record<string, unknown>,
+  rules: ReadonlyArray<CodingRule>,
+  regex: RegexAnswers | undefined,
+  refused: (check: Check) => string | undefined,
+  defaultAccount: string | undefined,
+): CodedLine {
+  const verdicts = rules.map((rule) => ({
+    rule,
+    ...ruleVerdict(line, rule, regex, refused),
+  }));
+  const matches = verdicts
+    .filter((v) => v.verdict === "pass")
+    .map((v) => v.rule)
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+  // A rule that could not be evaluated decides nothing, but it could have:
+  // when it would outrank (or tie) whatever did match, or when nothing
+  // did, the line is not coded.
+  const bar = matches.length === 0 ? Number.NEGATIVE_INFINITY : (matches[0]?.priority ?? 0);
+  const blocking = verdicts.filter(
+    (v): v is typeof v & { verdict: "undetermined"; reason: string } =>
+      v.verdict === "undetermined" && (v.rule.priority ?? 0) >= bar,
+  );
+  if (blocking.length > 0) {
+    // A few named with their reasons; every one is in `undetermined`. A
+    // batch whose patterns all went unanswered would otherwise repeat a
+    // reason per rule on every line.
+    const shown = blocking.slice(0, NAMED_IN_REASON).map((v) => `"${v.rule.id}" (${v.reason})`);
+    const more = blocking.length - shown.length;
+    const named =
+      more > 0 ? `${shown.join(", ")} and ${more} more (see undetermined)` : shown.join(", ");
+    return {
+      lineId: line.id,
+      account: null,
+      costCenter: null,
+      taxCode: null,
+      matched: matches.map((r) => r.id),
+      ambiguous: false,
+      needsReview: true,
+      reason:
+        matches.length === 0
+          ? `no rule definitely matched, and these could not be evaluated: ${named}`
+          : `rule "${(matches[0] as CodingRule).id}" matched, but these could not be evaluated and would outrank or tie it: ${named}`,
+      undetermined: blocking.map((v) => v.rule.id),
+    };
+  }
+
+  if (matches.length === 0) {
+    return {
+      lineId: line.id,
+      account: defaultAccount ?? null,
+      costCenter: null,
+      taxCode: null,
+      matched: [],
+      ambiguous: false,
+      // A default account is a place to put it, not a coding decision, so
+      // the line still goes to review rather than quietly landing in a
+      // suspense account nobody looks at.
+      needsReview: true,
+      reason: "no rule matched",
+    };
+  }
+
+  const top = matches[0] as CodingRule;
+  const topPriority = top.priority ?? 0;
+  const tied = matches.filter((r) => (r.priority ?? 0) === topPriority);
+  // Two rules at the same priority disagreeing is a rule-set bug. Picking
+  // one would hide it, and the wrong account is found in an audit, not in
+  // a test.
+  const conflicting = tied.some((r) => r.account !== top.account);
+
+  return {
+    lineId: line.id,
+    account: conflicting ? null : top.account,
+    costCenter: conflicting ? null : (top.costCenter ?? null),
+    taxCode: conflicting ? null : (top.taxCode ?? null),
+    matched: matches.map((r) => r.id),
+    ambiguous: conflicting,
+    needsReview: conflicting,
+    reason: conflicting
+      ? `rules ${tied.map((r) => `"${r.id}"`).join(", ")} match at the same priority and disagree on the account`
+      : "",
+  };
+}
+
+function summarize(results: ReadonlyArray<CodedLine>, version: string | undefined): CodingResult {
   const tally = new Map<string, number>();
   for (const line of results) {
     if (line.account === null || line.needsReview) continue;
@@ -209,7 +342,7 @@ export function codeLines(
     lines: results,
     coded: results.filter((l) => !l.needsReview).length,
     needsReview: results.filter((l) => l.needsReview).length,
-    version: options.version ?? null,
+    version: version ?? null,
     byAccount: [...tally.entries()]
       .map(([account, count]) => ({ account, lines: count }))
       .sort((a, b) => b.lines - a.lines || (a.account < b.account ? -1 : 1)),
