@@ -749,6 +749,9 @@ export const permissionAudit: RegisteredTool = buildTool({
         ...thredzToolNamesOfSpec(parsed.value).map((name) => ({ name })),
       ],
       mcpServers: view.mcpServers.map((s) => s.name),
+      // `alwaysAllow run_exam` on a spec with `learning.exam`, or `alwaysAllow
+      // Skill`, names a tool the runtime adds when it is wired: not dead.
+      mayRegisterTools: RUNTIME_TOOL_NAMES,
       // The model profiles', pool candidates' and sub-agents' lists, checked
       // for rules that never fire, as lint and compile check them (C146).
       otherRuleLists: specPermissionRuleLists(expanded).filter(

@@ -116,6 +116,14 @@ export type PermissionAuditResult = {
    */
   readonly mcpServerRules: ReadonlyArray<RuleLike & { readonly servers: readonly string[] }>;
   /**
+   * Declared rules that match none of the granted tools but name a tool the
+   * runtime can add on its own (`Skill`, `Task`, `run_exam`, …), depending
+   * on wiring this report does not model — skills on disk, sub-agents, a
+   * `learning.exam`. Whether this spec's runtime adds it is not known here,
+   * so they are not called dead; `tools` says which such tools they name.
+   */
+  readonly runtimeToolRules: ReadonlyArray<RuleLike & { readonly tools: readonly string[] }>;
+  /**
    * Rules the runtime matcher would REFUSE to compile. The engine fails
    * closed on these: an uncompilable `alwaysDeny`/`alwaysAsk` gates every
    * call as if it had matched, while an uncompilable `alwaysAllow` is simply
@@ -324,6 +332,12 @@ export type AuditPermissionsInput = {
   /** The MCP servers the spec declares. */
   readonly mcpServers?: readonly string[];
   /**
+   * Tools the runtime may register on its own, under exactly these names,
+   * depending on wiring the audit does not model (`RUNTIME_TOOL_NAMES`). A
+   * rule naming one is reported under `runtimeToolRules`, not as unused.
+   */
+  readonly mayRegisterTools?: readonly string[];
+  /**
    * The spec's other rule lists — model profiles' and pool candidates'
    * deny/ask, sub-agents' allow/deny (`specPermissionRuleLists`, without
    * `permissions.rules`). They narrow or replace `rules` for what they
@@ -516,21 +530,36 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   // A rule naming a tool the spec does not grant cannot fire. Worth saying:
   // it is usually a rename or a tool that was dropped and the guard left —
   // unless it can match a declared MCP server's tools, which only the server
-  // can list.
+  // can list, or a tool the runtime may add on its own.
   const byPattern = (a: RuleLike, b: RuleLike) =>
     compareStrings(a.pattern, b.pattern) || compareStrings(a.type, b.type);
   const unmatched = input.rules.filter((rule) => !usedRules.has(`${rule.type} ${rule.pattern}`));
   const unusedRules: RuleLike[] = [];
   const mcpServerRules: Array<RuleLike & { servers: string[] }> = [];
+  const runtimeToolRules: Array<RuleLike & { tools: string[] }> = [];
+  const mayRegister = [...new Set(input.mayRegisterTools ?? [])].sort(compareStrings);
   for (const rule of unmatched) {
-    const servers = deadRules.has(`${rule.type} ${rule.pattern}`)
-      ? []
-      : mcpServersReachedBy(rule.pattern, input.mcpServers ?? []);
-    if (servers.length > 0) mcpServerRules.push({ ...rule, servers });
+    // A rule the checker says can never fire, or an allow plan mode ignores,
+    // matches nothing whatever tools the runtime adds.
+    if (
+      deadRules.has(`${rule.type} ${rule.pattern}`) ||
+      (modeOverridesRules && rule.type === "alwaysAllow")
+    ) {
+      unusedRules.push(rule);
+      continue;
+    }
+    const servers = mcpServersReachedBy(rule.pattern, input.mcpServers ?? []);
+    if (servers.length > 0) {
+      mcpServerRules.push({ ...rule, servers });
+      continue;
+    }
+    const named = mayRegister.filter((tool) => patternCoverage(rule.pattern, tool) !== "none");
+    if (named.length > 0) runtimeToolRules.push({ ...rule, tools: named });
     else unusedRules.push(rule);
   }
   unusedRules.sort(byPattern);
   mcpServerRules.sort(byPattern);
+  runtimeToolRules.sort(byPattern);
 
   if (blanketGate !== undefined) {
     findings.push({
@@ -554,6 +583,7 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
     tools,
     unusedRules,
     mcpServerRules,
+    runtimeToolRules,
     malformedRules,
     modeOverridesRules,
     ruleProblems,

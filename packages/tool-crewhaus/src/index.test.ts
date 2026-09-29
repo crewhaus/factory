@@ -840,6 +840,76 @@ describe("PermissionAudit", () => {
     expect(await unused("Edit")).toEqual(["Edit(eval/**)"]);
   });
 
+  // wave III fix-up: with `learning.exam` the cli runtime registers
+  // `run_exam` (the trader starter's bundle wires createExamRunner), yet its
+  // `alwaysAllow run_exam` was listed under unusedRules, "the rules that
+  // match nothing" — as was `alwaysAllow Skill`, which the same audit had
+  // just said names a real tool. Whether the runtime adds such a tool
+  // depends on wiring the audit does not model, so it says that instead.
+  test("a rule naming a tool the runtime may add is reported as such, not as matching nothing", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "learning:",
+      "  domain: trading",
+      "  exam: { dataset: eval/dataset.jsonl, graders: eval/graders.yaml }",
+      "tools: [read]",
+      "permissions:",
+      "  rules:",
+      "    - { type: alwaysAllow, pattern: run_exam }",
+      "    - { type: alwaysAllow, pattern: Skill }",
+      "    - { type: alwaysAsk, pattern: 'Evm*' }",
+      "    - { type: alwaysAllow, pattern: Nonexistent }",
+      "    - { type: alwaysAllow, pattern: skill }",
+    ].join("\n");
+    const result = await callJson<{
+      unusedRules: Array<{ pattern: string }>;
+      runtimeToolRules: Array<{ type: string; pattern: string; tools: string[] }>;
+      tools: Array<{ tool: string }>;
+    }>(permissionAudit, { spec });
+    expect(result.runtimeToolRules.map((r) => [r.pattern, r.tools.length])).toEqual([
+      ["Evm*", 8],
+      ["Skill", 1],
+      ["run_exam", 1],
+    ]);
+    expect(result.runtimeToolRules.find((r) => r.pattern === "run_exam")?.tools).toEqual([
+      "run_exam",
+    ]);
+    // A name no tool has is still unused, and so is a near miss the rule
+    // checker calls dead (`skill` is not `Skill`: the engine matches case).
+    expect(result.unusedRules.map((r) => r.pattern)).toEqual(["Nonexistent", "skill"]);
+    // Nothing is granted on the audit's say-so: no row for a tool it cannot
+    // confirm the runtime adds.
+    expect(result.tools.map((t) => t.tool)).toEqual(["read"]);
+    // Plan mode ignores every allow, so those match nothing whatever the
+    // runtime adds — nor does an allow on a declared server's tools; an ask
+    // still names the tools it would gate.
+    const plan = await callJson<{
+      unusedRules: Array<{ pattern: string }>;
+      runtimeToolRules: Array<{ pattern: string }>;
+      mcpServerRules: Array<{ pattern: string }>;
+    }>(permissionAudit, {
+      spec: spec
+        .replace(
+          "permissions:",
+          "mcp_servers:\n  broker: { transport: stdio, command: bunx }\npermissions:\n  mode: plan",
+        )
+        .concat("\n    - { type: alwaysAllow, pattern: broker__quote }"),
+    });
+    expect(plan.runtimeToolRules.map((r) => r.pattern)).toEqual(["Evm*"]);
+    expect(plan.mcpServerRules).toEqual([]);
+    expect(plan.unusedRules.map((r) => r.pattern)).toEqual([
+      "Nonexistent",
+      "Skill",
+      "broker__quote",
+      "run_exam",
+      "skill",
+    ]);
+  });
+
   test("a rule that names nothing granted is reported as unused", async () => {
     const spec = CLI_SPEC.replace("pattern: Read", "pattern: Nonexistent");
     const result = await callJson<{ unusedRules: Array<{ pattern: string }> }>(permissionAudit, {
