@@ -33,7 +33,6 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
-import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import {
   type CompiledPattern,
   type OperativeValue,
@@ -41,6 +40,7 @@ import {
   compilePattern,
   matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 
 export type PermissionMode = "default" | "plan" | "auto" | "bypass";
