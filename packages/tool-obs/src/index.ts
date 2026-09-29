@@ -345,6 +345,7 @@ function filterFrom(input: {
 
 export const eventQuery: RegisteredTool = buildTool({
   name: "EventQuery",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Page through a harness's own JSONL event logs, filtered by kind, time range, run id, session id and one field predicate, returning a bounded page and a cursor to continue from. Use it to pull the handful of lines that matter out of a transcript with tens of thousands, instead of reading whole files into context. Ordering is by session id then line number, which is the order the lines were written and is total, so the cursor is exact rather than approximate: a log that grew between pages appends after the cursor and nothing is skipped or repeated. The ordering ops on the predicate are numeric only, because comparing dates as text is the kind of answer that looks right and is wrong; use sinceTs and untilTs for time.",
   inputSchema: z.object({
@@ -398,6 +399,7 @@ export const eventQuery: RegisteredTool = buildTool({
 
 export const eventCounts: RegisteredTool = buildTool({
   name: "EventCounts",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Tally a harness's own event logs by kind, by tool and by outcome, so one call answers what this harness actually did. Use it before EventQuery to find out which kinds and which tools are worth paging through, rather than reading every line to find out. A call is counted from tool_use lines and its duration and error from the tool_stats mirror, so the two are never double-counted; when a log carries neither, errors are recovered by joining a tool_result's isError back to its tool_use id. MCP tools are tallied separately as server/tool, because an MCP server's Read and the built-in Read are different tools that share a name.",
   inputSchema: z.object({
@@ -424,6 +426,7 @@ export const eventCounts: RegisteredTool = buildTool({
 
 export const toolCallStats: RegisteredTool = buildTool({
   name: "ToolCallStats",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Per-tool call counts, failure counts, mean, p50, p95 and max duration from a harness's own logs, ordered most-failing first. Use it to find which tool is failing or slow without eyeballing a transcript. Percentiles are NEAREST-RANK — the value at index ceil(p/100 × n) − 1 of the ascending sample — so every figure returned is a duration that was actually measured, never an interpolated one that was not; with a single sample every percentile is that sample. Durations come only from the runtime's tool_stats and mcp_stats mirrors, so a harness that ran with advisor events disabled reports counts with latencyUnavailable set rather than an estimate.",
   inputSchema: z.object({
@@ -449,6 +452,7 @@ export const toolCallStats: RegisteredTool = buildTool({
 
 export const errorCluster: RegisteredTool = buildTool({
   name: "ErrorCluster",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Group a harness's errors by a normalised fingerprint — URLs, uuids, timestamps, paths, prefixed ids, hex blobs, quoted strings and numbers all masked — most frequent first, with one verbatim example each. Use it to turn a thousand error lines into the six distinct problems they actually are. Masking is by SHAPE, never by vocabulary, so it needs no knowledge of which platform wrote the message; the example is the first occurrence in log order, which is the only choice that does not change as the log grows. It does not cluster by meaning: two messages that differ only in a number land together even when they are different problems, which is exactly why the example is carried on every group.",
   inputSchema: z.object({
@@ -481,6 +485,7 @@ export const errorCluster: RegisteredTool = buildTool({
 
 export const runTimeline: RegisteredTool = buildTool({
   name: "RunTimeline",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "One run's events in order with the gap before each and the runtime's own measured duration where it recorded one, so a caller can see where the time went. Use it after EventCounts points at a slow or failed run, to find the step that actually cost the time. A gap is the distance from the previous timestamped line and is attributed to the line that ends it, which is not the same as how long that step took — where the runtime measured the step itself, durationMs carries the measured figure and is the one to trust. An event with no timestamp keeps its place in order and carries no gap, because a made-up timestamp reads exactly like a real one.",
   inputSchema: z.object({
@@ -552,6 +557,7 @@ const rateSchema = z
 
 export const costReport: RegisteredTool = buildTool({
   name: "CostReport",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Token and cost totals from a harness's own logs, broken down by model, by UTC day and by run, with the rate table supplied by the caller rather than assumed. Use it to see where a fleet's spend went without a billing API, and to re-price historical tokens at current rates. Both figures come back side by side: recordedUsdMicros is what the runtime computed from whatever price table that process held, computedUsdMicros is what your rates say those tokens cost. Figures are integer micro-USD so the arithmetic is exact; a model with no row in your table is counted under modelsWithoutRate with real tokens and zero computed cost, never silently at zero, and an accrual the runtime itself could not price is counted under unpricedAccruals.",
   inputSchema: z.object({
@@ -706,7 +712,10 @@ function specNameOf(events: readonly ObsEvent[]): string | undefined {
 
 export const incidentBundle: RegisteredTool = buildTool({
   name: "IncidentBundle",
-  operativeArgs: [{ field: "out", kind: "path" }],
+  operativeArgs: [
+    { field: "out", kind: "path" },
+    { field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+  ],
   description:
     "Assemble one failed run's events, clustered errors, tool statistics and spec name into a single contained JSON file a human can be handed. Use it at the end of a triage pass so the findings leave the context window as a durable artefact instead of being re-derived by the next reader. The output path goes through workspace containment like every other path here, and the write refuses an existing file unless overwrite is set, so a second bundle never silently replaces the first. It records no timestamp of its own: pass nowMs if the bundle should say when it was made, because a tool that read the clock would produce a different file from the same log every time.",
   inputSchema: z.object({
@@ -916,7 +925,7 @@ function endsWithoutNewline(real: string, size: number, shown: string): Loaded<b
 export const emitTraceEvent: RegisteredTool = buildTool({
   name: "EmitTraceEvent",
   operativeArgs: [
-    { field: "dir", kind: "path" },
+    { field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
     { field: "sessionId", kind: "id" },
   ],
   description:
@@ -1734,7 +1743,7 @@ export const healthProbe: RegisteredTool = buildTool({
   name: "HealthProbe",
   operativeArgs: [{ field: "urls", kind: "url" }],
   description:
-    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline is required rather than defaulted and bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; each probe is additionally bounded by whatever is left of it, and a probe that never got a turn comes back as skipped rather than as a failure it did not have; one the allow-list or the SSRF check refused was never sent and comes back as refused, not unhealthy (both with ok null). The configured token is sent only to the origins the spec declared as obs surfaces, because the allow-list is a reachability list and a probe of somebody else's service must not hand them the credential — authenticated on each probe says whether it carried one. latencyMs is a wall-clock measurement and is the one field in this package that differs run to run — everything else about the result is determined by the endpoints' answers.",
+    "Check a list of allow-listed endpoints with a concurrency cap and a required deadline, returning each one's status and latency. Use it to answer whether a fleet is up in a single call, instead of one model turn per endpoint. The deadline bounds the WHOLE sweep, so a hung endpoint cannot hold the others up; a probe that never got a turn comes back as skipped, and one the allow-list or the SSRF check refused was never sent and comes back as refused, not unhealthy (both with ok null). The configured token is sent only to the origins the spec declared as obs surfaces, never to somebody else's service, and authenticated says whether a probe carried it. latencyMs is wall-clock and the one field that differs run to run.",
   inputSchema: z.object({
     urls: z
       .array(z.string().min(1))

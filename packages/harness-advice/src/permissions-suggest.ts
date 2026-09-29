@@ -166,6 +166,9 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
   } else {
     values = operativeValuesOf(declared, input) ?? [];
   }
+  // A relocating field's default is read by a deny or ask only; an allow —
+  // what this proposes — is about the record the call named.
+  values = values.filter((v) => v.restrictOnly !== true);
   if (values.length === 0) return unscoped("no-value");
   if (values.length > 1) return unscoped("several-places");
   const only = values[0] as OperativeValue;

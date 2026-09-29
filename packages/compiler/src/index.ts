@@ -138,6 +138,7 @@ import {
   BUILTIN_TOOLS,
   SHAPE_TOOL_PROFILES,
   type ShapeToolProfile,
+  TOOL_BOOT_REGISTRARS,
   ToolCategoryError,
   type ToolShape,
   builtinKeyForName,
@@ -148,6 +149,7 @@ import {
   expandToolSelectors,
   malformedToolConfigRefs,
   registeredToolName,
+  toolConfigBlockFor,
   toolConfigProblems,
 } from "@crewhaus/tool-categories";
 // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
@@ -1095,6 +1097,7 @@ function checkToolConfigDelivery(ir: IrNode): {
         warnings.push({ code: "tool-config-partial-cap", path: p.path, message: p.message });
       }
       for (const bad of malformedToolConfigRefs(blocks, candidate.path)) errors.push(bad);
+      errors.push(...narrowingCandidateProblems(site.tools, blocks, candidate.path));
       // Informational: a candidate's block replaces the agent's, so a wider
       // allow-list there is legal but worth saying (see the module).
       for (const w of toolConfigWidenings(
@@ -1104,7 +1107,11 @@ function checkToolConfigDelivery(ir: IrNode): {
         blocks,
         candidate.path,
       )) {
-        warnings.push({ code: "model-plan-tool-config-widens", path: w.path, message: w.message });
+        warnings.push({
+          code: w.code ?? "model-plan-tool-config-widens",
+          path: w.path,
+          message: w.message,
+        });
       }
     }
   }
@@ -1130,6 +1137,44 @@ function checkToolConfigDelivery(ir: IrNode): {
     }
   }
   return { errors, warnings };
+}
+
+/**
+ * A model_pool candidate's block for a family that reads it per call with
+ * its boot registrar's own parser (`candidateNarrows`: the chain readers,
+ * FederationDiscover) is checked as the agent-level block is. An
+ * `allowed_origins` entry that is not an origin is a compile error at agent
+ * level; on a candidate it used to compile clean under --strict and throw on
+ * every call that candidate made.
+ */
+function narrowingCandidateProblems(
+  tools: ReadonlyArray<string>,
+  blocks: Readonly<Record<string, unknown>>,
+  path: string,
+): Array<{ path: string; message: string }> {
+  const out: Array<{ path: string; message: string }> = [];
+  const checked = new Set<unknown>();
+  for (const key of tools) {
+    const entry = BUILTIN_TOOLS[key];
+    const initSymbol = entry?.initSymbol;
+    if (initSymbol === undefined) continue;
+    const registrar = TOOL_BOOT_REGISTRARS[initSymbol];
+    if (registrar?.candidateNarrows !== true) continue;
+    const block = toolConfigBlockFor(blocks, key);
+    if (block === undefined || checked.has(block)) continue;
+    checked.add(block);
+    const blockKey = Object.entries(blocks).find(([, v]) => v === block)?.[0] ?? key;
+    out.push(
+      ...toolConfigProblems({
+        key: blockKey,
+        package: registrar.package,
+        initSymbol,
+        config: block,
+        where: `${path}.${blockKey}`,
+      }),
+    );
+  }
+  return out;
 }
 
 /** What a spec writes to give a chain tool its chain. Mirrors `@crewhaus/chain-adapter-base`. */

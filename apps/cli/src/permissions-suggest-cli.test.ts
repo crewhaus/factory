@@ -156,6 +156,22 @@ describe("crewhaus permissions suggest — an allow that would override the spec
     ]);
   }, 30_000);
 
+  test("a key-scoped allow names the spec's guard on the store the key lives in", async () => {
+    writeFileSync(
+      join(cwd, "crewhaus.yaml"),
+      'name: t\ntarget: cli\nagent:\n  model: m\n  instructions: tidy up\ntools: [kvDelete]\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "KvDelete(.crewhaus/state/**)" }\n',
+    );
+    seed([{ name: "KvDelete", input: { namespace: "prod", key: "a" } }]);
+    const out = JSON.parse((await suggest(true)).stdout) as Json;
+    const allow = out.suggestions.find((s) => s.rule.pattern.startsWith("KvDelete"));
+    // Scoped on the key: the store it lives in is not asked of the allow…
+    expect(allow?.rule).toMatchObject({ type: "alwaysAllow", pattern: "KvDelete(prod/a)" });
+    // …but the calls it covers delete under .crewhaus/state all the same.
+    expect(allow?.evidence.filter((e) => e.startsWith("OVERRIDES"))).toEqual([
+      "OVERRIDES alwaysDeny KvDelete(.crewhaus/state/**) (crewhaus.yaml): settings rules are read first, so the calls this allows would no longer reach that rule",
+    ]);
+  }, 30_000);
+
   test("the builtin floor's asks count, and the text output shows the line", async () => {
     seed([
       { name: "Bash", input: { command: "ls build" } },

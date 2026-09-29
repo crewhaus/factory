@@ -103,6 +103,7 @@ import {
   classifyCandidate,
 } from "./lib/dedupe";
 import {
+  DEFAULT_REGISTRY_REL,
   type RegistryRoot,
   allSamplesOf,
   assignmentOf,
@@ -394,8 +395,12 @@ const putSchema = z.object({
 
 export const datasetPut: RegisteredTool = buildTool({
   name: "DatasetPut",
+  // The default is the one this package documents. An operator who moves the
+  // registry with CREWHAUS_DATASETS_DIR writes a rule about that directory,
+  // and a call that leaves registryDir out is still read as this one: the
+  // permission subject is computed without the process environment.
   operativeArgs: [
-    { field: "registryDir", kind: "path" },
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_REL, relocates: true },
     { field: "name", kind: "id" },
   ],
   description:
@@ -658,6 +663,10 @@ const inspectSchema = z.object({
 
 export const datasetInspect: RegisteredTool = buildTool({
   name: "DatasetInspect",
+  operativeArgs: [
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_REL, relocates: true },
+    { field: "dataset", kind: "id", default: "*" },
+  ],
   description:
     "Report what a dataset registry holds and whether it is intact: versions, split sizes, gold coverage, provenance, releases, the stored-vs-recomputed sample hashes, and PII/secret hit counts. Use it before trusting a dataset — a version whose stored hashes no longer match its samples has had its eval identity silently diverge from its content, and this is what says so. A version that cannot be read is reported as unreadable, never as absent, and per-sample detail for the locked test split is withheld unless you ask for it, because inspection is how a holdout quietly gets burned.",
   inputSchema: inspectSchema,
@@ -911,6 +920,12 @@ const lintSchema = z.object({
 
 export const datasetLint: RegisteredTool = buildTool({
   name: "DatasetLint",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "leakScanPaths", kind: "path" },
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_REL, relocates: true },
+    { field: "dataset", kind: "id" },
+  ],
   description:
     "Run the offline eval-dataset hygiene gate over a registry dataset or a local file: duplicate ids, empty golds, near-duplicate inputs, ids reused across versions with different content, graders that need a gold the samples do not carry, expected_tools a tool-less spec can never satisfy, off-taxonomy provenance, and canary phrases leaked into prompt-side text. Use it before an eval run rather than after paying for one. Every rule the call could not evaluate — no graders passed, no other versions, nothing to scan for a leak, a dataset too large for the all-pairs near-duplicate scan — is listed as not evaluated, so a short finding list is never mistaken for a clean dataset.",
   inputSchema: lintSchema,
@@ -1190,6 +1205,12 @@ const mineSchema = z.object({
 
 export const datasetMine: RegisteredTool = buildTool({
   name: "DatasetMine",
+  operativeArgs: [
+    { field: "sessionsDir", kind: "path", default: SESSIONS_REL, relocates: true },
+    { field: "auditDir", kind: "path", default: AUDIT_REL, relocates: true },
+    { field: "registryDir", kind: "path", default: DEFAULT_REGISTRY_REL, relocates: true },
+    { field: "dedupeAgainst", kind: "id" },
+  ],
   description:
     "Mine recorded sessions for the turns a harness visibly struggled on — uncaught errors, tool-error spikes, loop nudges, a user re-asking the same question, and the in-loop judge's own failures — and return them as quarantine samples ready to version. Use it to grow an eval dataset from production without waiting for anyone to rate anything. It writes nothing: candidates come back for review and DatasetPut is the only writer. Candidates already in the registry are dropped by id, by content and (with a blocking index, so the parameters rather than the threshold set the recall) by near-duplicate input. A signal whose evidence is missing — no trace sidecar, no audit log — is reported as unavailable rather than as a signal that did not fire.",
   inputSchema: mineSchema,

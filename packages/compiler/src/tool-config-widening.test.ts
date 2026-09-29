@@ -273,3 +273,85 @@ describe("model-plan-tool-config-widens: credential and destination lists (net a
     expect(checked).toBe(cases.length);
   });
 });
+
+describe("a family whose candidate list narrows the agent's (C029)", () => {
+  // The chain readers and FederationDiscover read a candidate's
+  // allowed_origins per call and intersect it with the agent-level list, so
+  // "REPLACES … does not narrow it" would state the opposite of the runtime.
+  const notices = (yaml: string) =>
+    compile(yaml).warnings.filter((w) => w.code.startsWith("model-plan-tool-config"));
+
+  test("a candidate list that keeps no agent-level origin reaches nothing, and --strict fails on it", () => {
+    const found = notices(
+      spec({
+        tools: "evmGetBlock",
+        agent: "  evmGetBlock: { allowed_origins: [https://mainnet.base.org] }",
+        candidate: "{ evmGetBlock: { allowed_origins: [https://base.llamarpc.com] } }",
+      }),
+    );
+    expect(found).toEqual([
+      {
+        code: "model-plan-tool-config-unreachable",
+        path: "agent.model_pool.candidates[0].tool_config.evmGetBlock.allowed_origins",
+        message:
+          "this candidate's EvmGetBlock lists \"https://base.llamarpc.com\", none of which tool_config.evmGetBlock.allowed_origins allows. For EvmGetBlock a candidate's list NARROWS the agent-level one — a call reaches only origins on both — so this candidate reaches no origin and every call it makes is refused. List origins the agent-level block allows.",
+      },
+    ]);
+  });
+
+  test("an extra origin beside a kept one is named as never reached, informationally", () => {
+    const found = notices(
+      spec({
+        tools: "federationDiscover",
+        agent: "  federationDiscover: { allowed_origins: [https://peer.example] }",
+        candidate:
+          "{ federationDiscover: { allowed_origins: [https://peer.example, https://other.example] } }",
+      }),
+    );
+    expect(found.map((w) => [w.code, w.path])).toEqual([
+      [
+        "model-plan-tool-config-narrowed",
+        "agent.model_pool.candidates[0].tool_config.federationDiscover.allowed_origins",
+      ],
+    ]);
+    expect(found[0]?.message).toContain('"https://other.example"');
+    expect(found[0]?.message).toContain("never reached");
+    expect(found[0]?.message).not.toContain("REPLACES");
+  });
+
+  test("a subset of the agent-level list is said nothing about", () => {
+    expect(
+      notices(
+        spec({
+          tools: "evmGetBlock",
+          agent:
+            "  chainread: { allowed_origins: [https://mainnet.base.org, https://base.llamarpc.com] }",
+          candidate: "{ chainread: { allowed_origins: [https://base.llamarpc.com] } }",
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("a candidate entry that is not an origin is a compile error, as it is at agent level", () => {
+    const candidate = () =>
+      compile(
+        spec({
+          tools: "evmGetBlock",
+          agent: "  chainread: { allowed_origins: [https://mainnet.base.org] }",
+          candidate: "{ chainread: { allowed_origins: [mainnet.base.org] } }",
+        }),
+      );
+    expect(candidate).toThrow(
+      /agent\.model_pool\.candidates\[0\]\.tool_config\.chainread\.allowed_origins\[0\]/,
+    );
+    const agent = () =>
+      compile(
+        spec({
+          tools: "evmGetBlock",
+          agent: "  chainread: { allowed_origins: [mainnet.base.org] }",
+          candidate: "{ chainread: { allowed_origins: [https://mainnet.base.org] } }",
+        }),
+      );
+    expect(agent).toThrow(/tool_config\.chainread\.allowed_origins\[0\]/);
+  });
+});

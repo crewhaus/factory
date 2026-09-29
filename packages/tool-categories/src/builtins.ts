@@ -102,6 +102,14 @@ export type BootRegistrar = {
    * tools of the registration are listed without it.
    */
   readonly capKeys?: ReadonlyArray<string>;
+  /**
+   * A model_pool candidate's `allowed_origins` NARROWS the agent-level one
+   * for these tools instead of replacing it: each call reaches only origins
+   * on both lists (tool-chainread's and tool-discovery's `callOrigins`). So
+   * compile says a candidate origin the agent does not list is never
+   * reached, and a candidate whose list keeps none reaches nothing.
+   */
+  readonly candidateNarrows?: true;
 };
 
 /** The data-only half of a registrar's validation. See {@link BootRegistrar.checks}. */
@@ -202,6 +210,7 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     keys: ["chainread"],
     binds: ["setRpcEndpointPolicy"],
     checks: NO_PRIVATE_HOSTS("public RPC origins"),
+    candidateNarrows: true,
   },
   registerDiscoveryConfig: {
     package: "@crewhaus/tool-discovery",
@@ -210,6 +219,7 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     keys: ["federationDiscover"],
     binds: ["setPeerPolicy"],
     checks: NO_PRIVATE_HOSTS("peer origins"),
+    candidateNarrows: true,
   },
   registerObjectStoreConfig: {
     package: "@crewhaus/tool-objectstore",

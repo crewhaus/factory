@@ -130,6 +130,19 @@ A tool that overstates its coverage is worse than one that is narrow and says so
 - **Code search.** GitHub's covers the default branch of indexed repositories and wants a
   qualifier in the query. GitLab's blob search here is project-scoped, because a group- or
   instance-wide one needs Advanced Search; it says so when you ask without a project.
+- **A search's scope is `owner` and `repo`, on both hosts.** A permission rule reads those two
+  fields (`alwaysDeny SearchCode(acme/secret)`), but GitHub takes its scope from qualifiers in
+  the query text and ignores the fields. So on GitHub the two are held together: `owner` and
+  `repo` given alone are added to the query as `repo:owner/repo`; a `repo:`, `org:` or `user:`
+  qualifier already in the query must be covered by the fields — the same repository, or the
+  whole owner with no `repo` — or the search is refused with the fields to set; and an `owner`
+  alone needs `org:` or `user:` in the query, because the two are different qualifiers. A
+  qualifier behind `NOT` or inside parentheses still counts; only a leading `-`, which narrows,
+  and text inside a double-quoted phrase, which GitHub searches for as written, are left alone.
+  A rule reads an owner in any letter case, as GitHub does. A search that names no owner covers
+  every repository the token can read, so a deny naming any repository fires on it.
+  GitLab's issue search is per project or instance-wide, so an `owner` without a `repo` is
+  refused there rather than silently searching the whole instance.
 - **Rate limits.** GitHub has a real endpoint. GitLab does not, so the tool makes one cheap
   request and reads the `RateLimit-*` headers off it — and an instance with rate limiting disabled
   honestly reports nothing.

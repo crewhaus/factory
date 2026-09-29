@@ -65,3 +65,53 @@ test("compile --strict prints the widening notice and still writes the bundle", 
   expect(exitCode).toBe(0);
   expect(existsSync(join(outDir, "agent.ts"))).toBe(true);
 }, 30_000);
+
+test("compile --strict fails on a candidate whose narrowing list keeps no origin (C029)", async () => {
+  // The chain readers intersect a candidate's allowed_origins with the
+  // agent-level list per call, so this candidate can read nothing: every
+  // call it makes is refused. Before, compile said it "reaches" the RPC.
+  const specPath = join(tmp, "crewhaus.yaml");
+  writeFileSync(
+    specPath,
+    [
+      "name: pooled",
+      "target: cli",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: read the chain",
+      "  model_pool:",
+      "    candidates:",
+      "      - model: claude-haiku-4-5",
+      "        tool_config: { evmGetBlock: { allowed_origins: [https://base.llamarpc.com] } }",
+      "      - model: claude-opus-4-8",
+      "tools: [evmGetBlock]",
+      'chains: [{ id: "8453", kind: evm, rpcUrls: [https://mainnet.base.org], finality: { kind: finalized } }]',
+      "tool_config:",
+      "  evmGetBlock: { allowed_origins: [https://mainnet.base.org] }",
+      "",
+    ].join("\n"),
+  );
+  const outDir = join(tmp, "out");
+  const proc = Bun.spawn(
+    [process.execPath, CLI_PATH, "compile", specPath, "--strict", "--no-register", "-o", outDir],
+    {
+      cwd: tmp,
+      env: {
+        PATH: process.env["PATH"] ?? "",
+        CREWHAUS_REGISTRY_ROOT: join(tmp, "registry"),
+        CREWHAUS_WATCHME_ROOT: join(tmp, "watchme"),
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+  expect(stderr).toContain(
+    "crewhaus: warning[model-plan-tool-config-unreachable] agent.model_pool.candidates[0].tool_config.evmGetBlock.allowed_origins:",
+  );
+  expect(stderr).not.toContain("REPLACES");
+  expect(stderr).toContain("escalated to errors");
+  expect(exitCode).toBe(1);
+  expect(existsSync(join(outDir, "agent.ts"))).toBe(false);
+}, 30_000);

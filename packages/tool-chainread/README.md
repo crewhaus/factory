@@ -342,6 +342,12 @@ tool_config:
     allowed_origins: [https://mainnet.base.org]   # the ONLY origins these tools dial
 ```
 
+A `model_pool` candidate may carry the same block under its own `tool_config`. It
+narrows the calls that model makes and never widens them: an origin must be on the
+candidate's list AND on the agent's list, when there is one. A spec that sets the
+list only on a candidate is held to it on that candidate's calls. `EvmRpcHealth`
+reports it as `modelAllowedOrigins`.
+
 A spec cannot open loopback or the private ranges: `allow_private_hosts` in the block
 is refused, because a spec can come from a template or a pull request. A local anvil
 or hardhat node is the casualty; a host that runs one opens it in code:

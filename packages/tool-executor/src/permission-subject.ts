@@ -45,7 +45,14 @@
  *      widened by leaving the qualifier out.
  *    - a field left out whose declared default is `*` stands for every
  *      value (`standsForAny`): a deny or ask naming any one value there
- *      fires on it.
+ *      fires on it. When the field is declared `within` another that the
+ *      call leaves out as well, it stands for every `<qualifier>/<value>`
+ *      (`anyQualifier`): a code search naming no owner reaches every
+ *      repository.
+ *    - a `relocates` field left out stands in with its default, which a
+ *      deny or ask reads; when the call carries another operative value an
+ *      allow skips it (`restrictOnly`), because the grant is about the
+ *      record the call names, not the store it lives in.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
  *      hash — `0x` or `0X`, both of which a node accepts) is marked
  *      `caseInsensitive`: its letter case is at most an EIP-55 checksum, so
@@ -142,11 +149,25 @@ export function operativeValuesOf(
   if (operativeArgs === undefined || operativeArgs.length === 0) return undefined;
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
+  // The defaults of relocating fields the call left out. Whether an allow
+  // reads them depends on what else the call carries, so they are placed
+  // last (see `relocates` on OperativeArg).
+  const relocated: OperativeValue[] = [];
   for (const arg of operativeArgs) {
-    for (const { value: raw, words, runsIn, unqualified, anyAfter } of readField(
-      parsedInput,
-      arg,
-    )) {
+    for (const {
+      value: raw,
+      words,
+      runsIn,
+      unqualified,
+      anyAfter,
+      defaulted,
+      anyQualifier,
+    } of readField(parsedInput, arg)) {
+      if (arg.relocates === true && defaulted === true) {
+        if (arg.kind === "url") relocated.push(canonicalUrl(raw));
+        else relocated.push(...canonicalizePath(raw));
+        continue;
+      }
       switch (arg.kind) {
         case "path":
           values.push(...canonicalizePath(raw));
@@ -177,10 +198,20 @@ export function operativeValuesOf(
             ...(spellings.length > 0 ? { spellings } : {}),
             ...(HEX_ID.test(raw) ? { caseInsensitive: true } : {}),
             ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
+            ...(anyQualifier === true ? { anyQualifier: true } : {}),
           });
         }
       }
     }
+  }
+  // A relocating field's default is a place the call did not name. When the
+  // call names a record there, an allow is about the record and skips the
+  // default; a deny or ask still reads it. With nothing else to read, the
+  // default is the call's only place, and every rule reads it.
+  if (values.length > 0) {
+    for (const v of relocated) values.push({ ...v, restrictOnly: true });
+  } else {
+    values.push(...relocated);
   }
   return values;
 }
@@ -201,6 +232,10 @@ type FieldReading = {
   readonly runsIn?: string;
   readonly unqualified?: ReadonlyArray<string>;
   readonly anyAfter?: ReadonlyArray<string>;
+  /** The declared default, standing in for a field the call left out. */
+  readonly defaulted?: true;
+  /** With `anyAfter`: the `within` qualifier was left out too. */
+  readonly anyQualifier?: true;
 };
 
 /** Do these canonical values name the workspace root itself, and nothing else? */
@@ -263,14 +298,21 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
   // reads every contract's logs.
   const every = out.length === 0 && arg.default === ANY_VALUE;
   if (out.length === 0 && arg.default !== undefined) {
-    out.push({ value: arg.default, ...runsInOf(input) });
+    out.push({ value: arg.default, ...runsInOf(input), defaulted: true });
   }
   const anyValue = (rs: FieldReading[]): FieldReading[] =>
     every ? rs.map((r) => ({ ...r, anyAfter: [""] })) : rs;
   // A command's `within` is where it runs, carried as `runsIn` above.
   if (arg.kind === "command") return anyValue(out);
   const qualifier = topQualifier;
-  if (qualifier === undefined) return anyValue(out);
+  if (qualifier === undefined) {
+    // The qualifier is left out as well: a code search with no owner reaches
+    // every repository, so the value stands for every `<owner>/<repo>` too.
+    const read = anyValue(out);
+    return every && arg.within !== undefined
+      ? read.map((r) => ({ ...r, anyQualifier: true as const }))
+      : read;
+  }
   return out.map((r) => {
     // A path relative to a directory field; an absolute one ignores it.
     if (arg.kind === "path") {

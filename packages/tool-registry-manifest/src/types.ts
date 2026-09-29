@@ -19,6 +19,8 @@ export type RegistryOperativeArg = {
   readonly kind: string;
   readonly default?: string;
   readonly within?: string;
+  /** The field only moves the tool; its default is read by a deny or ask. */
+  readonly relocates?: true;
 };
 
 export type RegistryEntry = {
@@ -111,6 +113,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     kind: arg.kind,
     ...(arg.default !== undefined ? { default: arg.default } : {}),
     ...(arg.within !== undefined ? { within: arg.within } : {}),
+    ...(arg.relocates === true ? { relocates: true as const } : {}),
   };
 }
 

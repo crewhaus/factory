@@ -458,6 +458,39 @@ describe("toRow", () => {
     expect(operativeOf("EnvFileUpsert", { entries: {} })).toEqual({ field: "path", value: ".env" });
   });
 
+  test("a store or repository the call leaves out does not stand in for the record it acts on", () => {
+    // The approver deciding on these needs the branch, the key, the pin —
+    // not the directory each lives in (a relocating field's default).
+    expect(operativeOf("GitBranchDelete", { name: "main", force: true })).toEqual({
+      field: "name",
+      value: "main",
+    });
+    expect(operativeOf("KvDelete", { namespace: "prod", key: "api-credentials" })).toEqual({
+      field: "key",
+      value: "prod/api-credentials",
+    });
+    expect(
+      operativeOf("DeployRollback", { name: "billing", env: "production", toVersion: 3 }),
+    ).toMatchObject({ value: "billing/production" });
+    expect(operativeOf("EvalBaselinePin", { spec: "billing", dataset: "golden" })).toMatchObject({
+      value: "billing/golden",
+    });
+    // Named by the call, the place is shown like any value…
+    expect(operativeOf("KvDelete", { stateDir: "elsewhere", namespace: "p", key: "k" })).toEqual({
+      field: "stateDir",
+      value: "elsewhere",
+    });
+    // …and with nothing else to show, the default is where the call acts.
+    expect(operativeOf("EmitTraceEvent", { name: "deploy_started" })).toEqual({
+      field: "dir",
+      value: ".crewhaus/sessions",
+    });
+    const row = toRow(
+      approval({ toolName: "GitBranchDelete", input: { name: "main", force: true } }) as never,
+    );
+    expect([row.operativeField, row.operativeValue]).toEqual(["name", "main"]);
+  });
+
   test("a builtin with no scoping argument shows none, even when a table name would match", () => {
     expect(operativeOf("ClipboardWrite", { text: "x" })).toEqual({ field: null, value: null });
   });

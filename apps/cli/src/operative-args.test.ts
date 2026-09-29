@@ -38,6 +38,27 @@ function inScope(): RegisteredTool[] {
   return builtins.filter((t) => !t.readOnly || t.scope === "external");
 }
 
+type FieldSchema = { isOptional?: () => boolean };
+
+/**
+ * The object shape of a tool's input schema, looking through the wrappers a
+ * schema is built with (`.refine`/`.superRefine`/`.transform`, `.pipe`,
+ * `.default`, `.optional`). `undefined` only for a schema that is not an
+ * object underneath; the sweeps below assert no tool is skipped that way.
+ */
+function shapeOf(schema: unknown): Record<string, FieldSchema> | undefined {
+  let current = schema as { shape?: unknown; _def?: Record<string, unknown> } | undefined;
+  for (let depth = 0; depth < 16 && current !== undefined; depth++) {
+    if (current.shape !== undefined && typeof current.shape === "object") {
+      return current.shape as Record<string, FieldSchema>;
+    }
+    const def = current._def;
+    const inner = def?.["schema"] ?? def?.["innerType"] ?? def?.["in"];
+    current = inner as typeof current;
+  }
+  return undefined;
+}
+
 /**
  * The builtins that declare `[]`, each with the reason no argument scopes
  * it. Adding a tool here is the review step; the test below fails until
@@ -120,14 +141,230 @@ describe("every non-read-only or external builtin declares operativeArgs", () =>
     for (const tool of inScope()) {
       if (!tool.destructive || tool.scope === "external") continue;
       const declared = tool.operativeArgs ?? [];
-      const fields = Object.keys(
-        ((tool.inputSchema as { shape?: Record<string, unknown> }).shape ?? {}) as object,
-      );
+      const fields = Object.keys(shapeOf(tool.inputSchema) ?? {});
       if (!fields.some((f) => pathish.test(f))) continue;
       checked++;
       if (!declared.some((a) => a.kind === "path")) offenders.push(tool.name);
     }
     expect(checked).toBeGreaterThanOrEqual(40);
     expect(offenders).toEqual([]);
+  });
+});
+
+/**
+ * C004 — a field the call may leave out, whose value the tool then fills in
+ * `execute`, has to say so with a `default`. Otherwise a deny on the place
+ * the tool uses by default — `alwaysDeny KvDelete(.crewhaus/state/**)` — is
+ * dodged by leaving the field out, while the tool acts there anyway.
+ *
+ * Every optional operative field either declares its `default` or is listed
+ * here with what an omitted value means, and why no default applies. The
+ * test fails for a new optional field until it is one or the other.
+ */
+const OMITTED_MEANS: Readonly<Record<string, string>> = {
+  "BarcodeEncode.path": "only a PNG is written; an SVG comes back inline and nothing is written",
+  "ChartRender.path": "the SVG comes back inline; nothing is written",
+  "ChatPost.channel":
+    "required in API mode; an incoming webhook posts to the channel the operator bound it to",
+  "ChatUpdate.channel":
+    "required in API mode; an incoming webhook posts to the channel the operator bound it to",
+  "CliVersionPin.dirs":
+    "the harnesses in this machine's registry, which the operator keeps; it writes nothing",
+  "CronDelete.fingerprint": "a guard on the entry id or match names, never a target of its own",
+  "CronDelete.id": "the schema requires id or match; whichever is given is read",
+  "CronDelete.match": "the schema requires id or match; whichever is given is read",
+  "DatasetLint.dataset":
+    "the samples are read from path or passed inline; no registry dataset is read",
+  "DatasetLint.leakScanPaths":
+    "no file is scanned for canary phrases, and the result says the check did not run",
+  "DatasetLint.path": "the samples come from the registry (dataset) or inline; no file is read",
+  "DatasetMine.dedupeAgainst": "no dedupe and no registry dataset is read, and the result says so",
+  "DiagramRender.path": "the SVG comes back inline; nothing is written",
+  "EInvoiceBuild.outFile": "the document comes back inline; nothing is written",
+  "EmailSend.bcc.address": "no Bcc recipients; nothing is sent without one recipient somewhere",
+  "EmailSend.cc.address": "no Cc recipients; nothing is sent without one recipient somewhere",
+  "EmailSend.to.address": "no To recipients; nothing is sent without one recipient somewhere",
+  "EmitTraceEvent.sessionId":
+    "the session this call runs in, from the run context; its directory declares a default",
+  "Erc721TokenInfo.ipfsGateway": "ipfs URIs are skipped; nothing is fetched through a gateway",
+  "EvalAggregate.run":
+    "the run is looked up by runId in the index under evalsDir, which declares a default",
+  "EvmRpcHealth.compareWith": "nothing to compare with; only the main endpoint is probed",
+  "ExperimentLedger.name":
+    "only `list` omits it, and it names every experiment; the directories declare defaults",
+  "FeedParse.url": "the feed is passed inline; nothing is fetched",
+  "FlywheelStatus.specDir": "the spec directory is the harness dir, which declares a default",
+  "Format.command":
+    "the formatter the project declares, detected at run time; the paths it formats declare a default",
+  "HarnessJobStatus.dir":
+    "every harness's jobs in the manager's ledger, whose location the operator sets; the directory only filters it",
+  "HarnessRegister.dir":
+    "register and relocate refuse without it; the registry file is fixed, never a caller's path",
+  "HarnessRegister.from": "the entry is named by id instead; list names none",
+  "HarnessRegister.id": "the entry is named by from instead; list names none",
+  "HarnessRetire.registryDir": "the registry under the harness dir, which declares a default",
+  "HooksManage.command": "only `set` carries a command, and refuses without one",
+  "ImportJson.file": "the records are passed inline; nothing is read from disk",
+  "InvoiceRender.outDir": "the rendered text comes back inline; nothing is written",
+  "MarketplaceSearch.registryDir":
+    "the built-in first-party gallery is searched; nothing on disk is read",
+  "OraclePriceRead.address": "the feed is a pinned one named by feed, which is declared",
+  "OraclePriceRead.feed": "the feed is named by chainId and address, which are declared",
+  "PackageManifestVerify.paths": "the manifests are passed inline, as manifests.text",
+  "PaymentFileBuild.outFile": "the file comes back inline; nothing is written",
+  "PortfolioValuation.wallet": "the amounts are passed inline; no balance is read",
+  "QrEncode.path": "only a PNG is written; an SVG comes back inline and nothing is written",
+  "RunBuild.command":
+    "the build the project declares, detected at run time; its directory declares a default",
+  "RunTests.command":
+    "the test command the project declares, detected at run time; its directory declares a default",
+  "SitemapParse.url": "the sitemap is passed inline; nothing is fetched",
+  "SpecAdvise.path":
+    "the spec is passed inline, or not at all; the log directories declare defaults",
+  "SpecPatchApply.path":
+    "the spec is passed inline and patched text comes back; nothing is written",
+  "SpecPin.env": "the version is registered and no pin moves",
+  "SplitFile.outputDir":
+    "the parts are written beside the source, in the directory of path, which is declared",
+  "StatusPagePost.incidentId": "a new incident on the operator's configured status page",
+  "SubtitleWrite.path": "the document comes back inline; nothing is written",
+  "TlsInspect.servername": "the host, which is declared, is the name sent",
+  "WebhookPost.url":
+    "the URL is read from an operator-listed environment variable named in urlEnv; a deny on every call still reads the call's strings",
+};
+
+describe("an optional operative field says what leaving it out means (C004)", () => {
+  /** `Tool.field` for every declared field the schema lets a call leave out, with no default. */
+  function optionalWithoutDefault(): string[] {
+    const out: string[] = [];
+    for (const tool of builtins) {
+      const shape = shapeOf(tool.inputSchema);
+      if (shape === undefined) continue;
+      for (const arg of tool.operativeArgs ?? []) {
+        if (arg.default !== undefined) continue;
+        const top = shape[arg.field.split(".")[0] as string];
+        if (top?.isOptional?.() === true) out.push(`${tool.name}.${arg.field}`);
+      }
+    }
+    return out.sort();
+  }
+
+  test("every one declares a default or is a reviewed omission", () => {
+    const found = optionalWithoutDefault();
+    // The sweep's hit count: a scan that could not read the schemas finds nothing.
+    expect(found.length).toBeGreaterThanOrEqual(50);
+    expect(found).toEqual(Object.keys(OMITTED_MEANS).sort());
+  });
+
+  test("no tool that declares operativeArgs is skipped for a schema the sweep cannot read", () => {
+    // A `.superRefine` or `.pipe` around the object used to hide its fields,
+    // so an optional operative field there was never checked.
+    const unread = builtins
+      .filter((t) => t.operativeArgs !== undefined && shapeOf(t.inputSchema) === undefined)
+      .map((t) => t.name);
+    expect(unread).toEqual([]);
+    const wrapped = builtins.filter(
+      (t) =>
+        t.operativeArgs !== undefined &&
+        (t.inputSchema as { shape?: unknown }).shape === undefined &&
+        shapeOf(t.inputSchema) !== undefined,
+    );
+    // The wrapped schemas are really in the sweep: SplitFile's is a
+    // `.refine`, OraclePriceRead's a `.superRefine`.
+    const names = wrapped.map((t) => t.name);
+    expect(names).toContain("OraclePriceRead");
+    expect(names).toContain("SplitFile");
+  });
+
+  test("every optional store or harness directory a tool reads or writes is declared", () => {
+    // C004 — a reader that fills its store in `execute` without declaring it
+    // let `alwaysDeny *(.crewhaus/state/**)` be dodged by leaving `stateDir`
+    // out: KvGet returned the key the deny was meant to keep. Read from the
+    // schemas, never a list of tools: any optional field named like a store
+    // directory, on any builtin — read-only and internal ones included.
+    const STORE =
+      /^(dir|stateDir|registryDir|evalsDir|sessionsDir|auditDir|specDir|experimentsDir)$/;
+    const undeclared: string[] = [];
+    let checked = 0;
+    for (const tool of builtins) {
+      const shape = shapeOf(tool.inputSchema);
+      if (shape === undefined) continue;
+      const declared = new Set((tool.operativeArgs ?? []).map((a) => a.field.split(".")[0]));
+      for (const [field, schema] of Object.entries(shape)) {
+        if (!STORE.test(field) || schema.isOptional?.() !== true) continue;
+        checked++;
+        if (!declared.has(field)) undeclared.push(`${tool.name}.${field}`);
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(60);
+    expect(undeclared.sort()).toEqual([]);
+  });
+
+  test("the store directories a tool fills in declare where", () => {
+    const declared = new Map<string, string | undefined>();
+    for (const tool of builtins) {
+      for (const arg of tool.operativeArgs ?? []) {
+        if (arg.relocates === true) declared.set(`${tool.name}.${arg.field}`, arg.default);
+      }
+    }
+    // The audit's list, each with the place its execute falls back to.
+    for (const [field, place] of [
+      ["KvSet.stateDir", ".crewhaus/state"],
+      ["KvDelete.stateDir", ".crewhaus/state"],
+      ["NoteWrite.stateDir", ".crewhaus/state"],
+      ["CounterIncrement.stateDir", ".crewhaus/state"],
+      ["BlackboardPost.stateDir", ".crewhaus/state"],
+      ["JournalAppend.stateDir", ".crewhaus/state"],
+      ["CheckpointSave.stateDir", ".crewhaus/state"],
+      ["DedupeMark.stateDir", ".crewhaus/state"],
+      ["IndexBuild.stateDir", ".crewhaus/state"],
+      ["EmitTraceEvent.dir", ".crewhaus/sessions"],
+      ["DeployRollback.registryDir", ".crewhaus/specs"],
+      ["SpecPin.registryDir", ".crewhaus/specs"],
+      ["DatasetPut.registryDir", ".crewhaus/datasets"],
+      ["EvalBaselinePin.evalsDir", ".crewhaus/evals"],
+      ["ExperimentLedger.experimentsDir", ".crewhaus/experiments"],
+      ["GitBranchDelete.cwd", "."],
+      ["DependencyAudit.endpoint", "https://api.osv.dev"],
+      // The readers beside them (the reviewers' re-attack).
+      ["KvGet.stateDir", ".crewhaus/state"],
+      ["StateExport.stateDir", ".crewhaus/state"],
+      ["EventQuery.dir", ".crewhaus/sessions"],
+      ["TraceQuery.dir", ".crewhaus/sessions"],
+      ["IncidentBundle.dir", ".crewhaus/sessions"],
+      ["AuditVerify.dir", ".crewhaus/audit"],
+      ["SpecAdvise.auditDir", ".crewhaus/audit"],
+      ["EvalHistory.evalsDir", ".crewhaus/evals"],
+      ["DeployInspect.registryDir", ".crewhaus/specs"],
+      ["DatasetInspect.registryDir", ".crewhaus/datasets"],
+      // The directory a build or test run starts in (0.7.0's
+      // `alwaysAllow RunBuild(npm run build)` covers the ordinary call).
+      ["RunBuild.cwd", "."],
+      ["RunTests.cwd", "."],
+    ] as const) {
+      expect({ field, place: declared.get(field) }).toEqual({ field, place });
+    }
+    expect(declared.size).toBeGreaterThanOrEqual(50);
+  });
+
+  test("a process tool's working directory only moves the run, so an allow on the command covers the ordinary call", () => {
+    // A command's directory is either folded into the command (`within`, as
+    // RunCommand declares it) or declared beside it as a relocating field.
+    // As a plain default it is one more value every allow must match, and
+    // `alwaysAllow RunBuild(npm run build)` never fires on a call that
+    // leaves it out. Read from the declarations, never a list of tools.
+    const plain: string[] = [];
+    let checked = 0;
+    for (const tool of builtins) {
+      const args = tool.operativeArgs ?? [];
+      if (!args.some((a) => a.kind === "command")) continue;
+      for (const arg of args) {
+        if (arg.field !== "cwd" || arg.default === undefined) continue;
+        checked++;
+        if (arg.relocates !== true) plain.push(`${tool.name}.${arg.field}`);
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(2);
+    expect(plain.sort()).toEqual([]);
   });
 });

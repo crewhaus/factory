@@ -594,7 +594,7 @@ function mcpServerOf(tool: string, servers: ReadonlySet<string>): string {
 export const permissionAudit: RegisteredTool = buildTool({
   name: "PermissionAudit",
   description:
-    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use as the \"what can this harness really do\" review before deploying it. It sees the spec's own rules only — CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time — and it matches the tool-name half of a pattern, reporting an argument-scoped rule like `Bash(git *)` as conditional cover rather than pretending to evaluate future arguments. A rule the matcher cannot compile is listed under `malformedRules` and treated the way the engine treats it (a broken deny or ask gates everything; a broken allow is dropped); a rule that can never fire as written (a spec key where the tool name belongs, an argument pattern the tool's field cannot match) is listed under `ruleProblems` with its fix and covers nothing. Builtins are reported with their own flags, so an unruled call's decision is the one the engine would make for that tool. Under `mode: plan` the decisions follow plan mode: allow rules are ignored, a deny or ask rule denies, and anything else is allowed only if the tool is read-only.",
+    "Report what a spec's permission rules actually cover: the effective mode, the rule that speaks to each granted tool, the rules that match nothing, and the tools that reach outside the process with no rule naming them. Use it as the \"what can this harness really do\" review before deploying. It sees the spec's own rules only: CLI flags, `.crewhaus/settings.json` rules and the builtin floor also apply at run time. An argument-scoped rule like `Bash(git *)` is reported as conditional cover, not evaluated. A rule that cannot compile is listed under `malformedRules` and treated as the engine treats it (a broken deny or ask gates everything; a broken allow is dropped); a rule that can never fire as written is listed under `ruleProblems` with its fix and covers nothing. Builtins are judged by their own flags, so an unruled call gets the engine's decision. Under `mode: plan`, allow rules are ignored, a deny or ask rule denies, and anything else is allowed only if the tool is read-only.",
   inputSchema: z.object({
     ...specSourceFields,
     destructiveTools: z
@@ -910,6 +910,7 @@ export const bundleFreshness: RegisteredTool = buildTool({
 
 export const auditVerify: RegisteredTool = buildTool({
   name: "AuditVerify",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_AUDIT_DIR, relocates: true }],
   description:
     "Re-walk a harness's audit log hash chain and report whether it is intact, plus the file and line of the first break. Use to check that the tamper-evident record has not been edited or truncated. Read the two caveats it returns: `anchorChecked: false` means tail truncation could not be ruled out, and even a matching on-host anchor is rewritable by anything running as the same user — only an off-host anchor store settles that, and this tool does not have one. The walk cannot be interrupted once it starts, so a chain larger than `maxBytes` is refused before it begins rather than run without a deadline.",
   inputSchema: z.object({
@@ -1055,7 +1056,7 @@ function loadEvalDoc(
 export const evalBaselineCompare: RegisteredTool = buildTool({
   name: "EvalBaselineCompare",
   description:
-    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail, the ones that recovered, and whether the declared thresholds hold. Use as the release gate after an eval — the verdict is a pure function of the two result documents, so it needs no eval runner and no model. Samples are matched by id; one present on only one side is reported but never counted as a regression, and a candidate sample whose judge abstained or whose invoker errored is listed as inconclusive so judge noise is not mistaken for a real fall. A comparison that never happened fails: runs that share no sample ids, or that name different datasets (unless allowDatasetMismatch), fail the gate, and minSharedFraction can require the candidate to cover more of the baseline. Another version or split of the same registry dataset (golden@v3 against golden@v4 or golden@v3#dev), or the same dataset with a regression suite unioned in (golden@v3+regressions@v1), is the same dataset: it is noted, not failed. A sample with no sampleId is never matched by position: it counts in its run's pass rate and is named in a note. A repeated sample id, and a declared pass rate its own samples do not support, are both reported as notes; a declared rate outside 0..1 is refused outright and recomputed.",
+    "Gate a candidate eval run against its baseline: pass-rate delta, the samples that went pass to fail or recovered, and whether the declared thresholds hold. Use it as the release gate after an eval; the verdict is a pure function of the two result documents, needing no runner or model. Samples are matched by id, never by position: one on only one side is reported, never counted as a regression; one with no sampleId counts in its run's pass rate and is named in a note; a candidate sample whose judge abstained or invoker errored is inconclusive. A comparison that never happened fails: runs sharing no sample ids, or naming different datasets (unless allowDatasetMismatch); minSharedFraction can demand more overlap. Another version or split of one registry dataset, or it with a regression suite unioned in, is the same dataset and only noted. A repeated sample id and a declared pass rate its samples do not support are noted; a declared rate outside 0..1 is refused and recomputed.",
   inputSchema: z.object({
     baseline: evalDocSchema.optional().describe("the baseline run's results document"),
     baselinePath: z.string().optional().describe("path to the baseline results.json instead"),
@@ -1156,6 +1157,7 @@ const sessionSourceFields = {
 
 export const sessionSummarize: RegisteredTool = buildTool({
   name: "SessionSummarize",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Summarize a harness's session transcripts: event counts by kind, a per-tool call and error tally, MCP call health and the errors that were recorded. Use to see what a harness has actually been doing without reading a JSONL file into context. Malformed lines are counted rather than thrown on, because a transcript truncated by a killed process is the normal case; a tool call is counted from its `tool_use` record, with the `tool_stats` mirror supplying durations and errors so nothing is counted twice.",
   inputSchema: z.object(sessionSourceFields),
@@ -1181,6 +1183,7 @@ export const sessionSummarize: RegisteredTool = buildTool({
 
 export const traceQuery: RegisteredTool = buildTool({
   name: "TraceQuery",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Return a filtered slice of a harness's session events — by kind, by timestamp range, by a substring of the payload — in log order. Use to pull the few events that matter out of a long transcript: the permission decisions, the model failovers, the calls to one tool. Payloads are truncated to keep a result readable, so treat this as a window onto the log rather than a copy of it.",
   inputSchema: z.object({
@@ -1257,6 +1260,7 @@ export const traceQuery: RegisteredTool = buildTool({
 
 export const costSummarize: RegisteredTool = buildTool({
   name: "CostSummarize",
+  operativeArgs: [{ field: "dir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true }],
   description:
     "Total the cost and token accruals in a harness's session logs, broken down by model, by provider and by UTC day. Use to see where a fleet's spend went without a billing API. Figures come from the `cost_accrual` records the runtime writes when cost tracking is on, so a harness that ran without it reports zero accruals rather than an estimate; costs stay in integer USD micros, the unit the records carry, and an accrual for a model with no pricing row is counted under `unpriced` with its real token counts and no cost.",
   inputSchema: z.object(sessionSourceFields),

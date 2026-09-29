@@ -120,6 +120,10 @@ tool_config:
 ```
 
 An empty `allowed_origins` list means *nothing* may be dialled, not *anything*.
+A `model_pool` candidate may carry the same block under its own `tool_config`; it
+narrows that model's sweeps and never widens them (a peer must be on both lists),
+and the result reports it as `posture.modelAllowList`. A candidate block the tool
+cannot read refuses the sweep rather than dialling everything.
 A spec cannot open loopback or the private ranges — `allow_private_hosts` in the
 block is refused. A host that needs a local federation fixture, or wants to
 check manifest signatures, sets the gates in code:

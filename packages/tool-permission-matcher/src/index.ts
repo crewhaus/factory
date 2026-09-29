@@ -171,9 +171,11 @@ export type GlobMatcher = {
   /**
    * Whether the glob matches `prefix` followed by SOME run of characters
    * without a `/` (possibly none): for a value that stands for every value
-   * in its last segment (see `OperativeValue.standsForAny`).
+   * in its last segment (see `OperativeValue.standsForAny`). With `segments`
+   * above 1, that many such runs joined by `/` — a value that stands for
+   * every `<qualifier>/<value>` (see `OperativeValue.anyQualifier`).
    */
-  readonly matchesSegmentAfter: (prefix: string) => boolean;
+  readonly matchesSegmentAfter: (prefix: string, segments?: number) => boolean;
 };
 
 function compileGlob(glob: string): GlobMatcher {
@@ -188,8 +190,9 @@ function compileGlob(glob: string): GlobMatcher {
         if (work !== undefined) work.steps += value.length;
         return value === literal;
       },
-      matchesSegmentAfter: (prefix: string) =>
-        literal.startsWith(prefix) && !literal.slice(prefix.length).includes("/"),
+      matchesSegmentAfter: (prefix: string, segments = 1) =>
+        literal.startsWith(prefix) &&
+        literal.slice(prefix.length).split("/").length === Math.max(1, segments),
     };
   }
 
@@ -285,9 +288,10 @@ function compileGlob(glob: string): GlobMatcher {
       }
       return done(current.includes(0));
     },
-    matchesSegmentAfter(prefix: string): boolean {
+    matchesSegmentAfter(prefix: string, segments = 1): boolean {
       // Run the prefix like `test` does, then ask whether the accepting
-      // state can be reached reading only characters that are not `/`.
+      // state can be reached reading characters that are not `/`, with
+      // exactly `segments - 1` slashes between them.
       let current = [start];
       for (let i = 0; i < prefix.length; i++) {
         const c = prefix.charCodeAt(i);
@@ -311,18 +315,33 @@ function compileGlob(glob: string): GlobMatcher {
         if (following.length === 0) return false;
         current = following;
       }
-      const seen = new Uint8Array(count);
-      const stack = [...current];
-      while (stack.length > 0) {
-        const s = stack.pop() as number;
-        if (seen[s] === 1) continue;
-        seen[s] = 1;
-        const st = states[s] as GlobState;
-        if (st.t === "accept") return true;
-        if (st.t === "split") stack.push(st.b, st.a);
-        else if ((st.t === "lit" && st.c !== SLASH) || st.t === "notSlash" || st.t === "anyChar") {
-          stack.push(st.out);
+      const slashes = Math.max(1, segments) - 1;
+      for (let level = 0; level <= slashes; level++) {
+        // The states reachable at this level reading no `/`; a transition
+        // that can read one leads to the next level.
+        const seen = new Uint8Array(count);
+        const stack = [...current];
+        const next: number[] = [];
+        while (stack.length > 0) {
+          const s = stack.pop() as number;
+          if (seen[s] === 1) continue;
+          seen[s] = 1;
+          const st = states[s] as GlobState;
+          if (st.t === "accept") {
+            if (level === slashes) return true;
+            continue;
+          }
+          if (st.t === "split") {
+            stack.push(st.b, st.a);
+            continue;
+          }
+          if ((st.t === "lit" && st.c !== SLASH) || st.t === "notSlash" || st.t === "anyChar") {
+            stack.push(st.out);
+          }
+          if ((st.t === "lit" && st.c === SLASH) || st.t === "anyChar") next.push(st.out);
         }
+        if (next.length === 0) return false;
+        current = next;
       }
       return false;
     },
@@ -467,6 +486,22 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   among all the others, and `EvmGetLogs(137/…)` does not. An allow rule
  *   still matches only `canonical` — naming one contract does not grant a
  *   read of all of them.
+ *   A value that names the same thing in any letter case (an `id`, a
+ *   `command`, a `recipient`, or a `0x` hex value) is compared ignoring case
+ *   here too, so an owner-wide code search written `ACME/*` still meets
+ *   `alwaysDeny SearchCode(acme/secret)`.
+ * - `anyQualifier` — with `standsForAny`: the field is declared `within`
+ *   another that the call left out as well, so the value also stands for
+ *   every `<qualifier>/<value>`. A code search that names no owner reaches
+ *   every repository the token can read, and `alwaysDeny
+ *   SearchCode(acme/secret)` fires on it.
+ * - `restrictOnly` — the declared default of a field that only relocates
+ *   the tool (a store directory, the repository a branch operation runs
+ *   in), standing in for a field the call left out while it carries another
+ *   operative value. A deny or ask rule reads it like any value, so
+ *   `alwaysDeny KvDelete(.crewhaus/state/**)` fires on a call that omits
+ *   `stateDir`; an allow rule skips it, because the grant is about the
+ *   record the call names (`alwaysAllow KvSet(scratch/*)`).
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
@@ -493,6 +528,8 @@ export type OperativeValue = {
   readonly outsideWorkspace?: boolean;
   readonly caseInsensitive?: boolean;
   readonly standsForAny?: ReadonlyArray<string>;
+  readonly anyQualifier?: boolean;
+  readonly restrictOnly?: boolean;
 };
 
 export type MatchOptions = {
@@ -504,7 +541,12 @@ export type MatchOptions = {
    * where it acts), and the matcher falls back to the
    * {@link OPERATIVE_ARG_FIELDS} name table, then to every string in `input`.
    * Present but empty ⇒ the tool declares operative fields and this call
-   * carries none of them, so no argument-scoped rule can match it.
+   * carries none of them (and no default stands in): no argument-scoped
+   * allow can match it, and a deny or ask fires when EVERY string value of
+   * the call matches (0.7.0's reading of a tool it knew no field of) —
+   * `alwaysDeny WebhookPost(**)` still fires on a call that names its URL
+   * through `urlEnv`, and `WebhookPost(http://**)` is not set off by a link
+   * in its payload.
    */
   readonly operativeValues?: ReadonlyArray<OperativeValue>;
 };
@@ -892,10 +934,24 @@ function valueMatches(
   }
   if (polarity !== "restrict") return false;
   // A field the call left out whose default is `*` stands for every value, so
-  // a deny or ask naming any one value there fires on it.
+  // a deny or ask naming any one value there fires on it — in any letter
+  // case the value itself is compared in, and, when its qualifier was left
+  // out too, under any qualifier.
   if (value.standsForAny !== undefined) {
+    const caseFolds =
+      value.caseInsensitive === true ||
+      value.kind === "id" ||
+      value.kind === "command" ||
+      value.kind === "recipient";
+    const lower = caseFolds ? foldedArgMatcher(compiled, "lower") : undefined;
+    const widths = value.anyQualifier === true ? [1, 2] : [1];
     for (const prefix of value.standsForAny) {
-      if (argRe.matchesSegmentAfter(prefix)) return true;
+      for (const width of widths) {
+        if (argRe.matchesSegmentAfter(prefix, width)) return true;
+        if (lower?.matchesSegmentAfter(prefix.normalize("NFC").toLowerCase(), width) === true) {
+          return true;
+        }
+      }
     }
   }
   // A deny or ask on a path is not dodged by spelling the name another way
@@ -950,8 +1006,16 @@ function valueMatches(
  *   enough. A deny that needed every value to match would be dodged by
  *   adding one more argument.
  *
- * A call with no operative value matches no argument-scoped rule of either
- * polarity.
+ * An allow skips a `restrictOnly` value (a relocating field's default). A
+ * call with no operative value an allow can read matches no
+ * argument-scoped allow. A deny or ask on a call that carries none of its
+ * tool's declared operative fields is matched against the call's string
+ * values instead, the way 0.7.0 matched a tool it knew no field of: EVERY
+ * string must match, and a call with none matches nothing. So leaving
+ * every optional operative field out does not dodge `alwaysDeny Tool(**)`,
+ * while a deny about a destination (`WebhookPost(http://**)`) is not set
+ * off by a link inside the payload of a call that names its destination
+ * through `urlEnv`.
  */
 export function matchesPattern(
   compiled: CompiledPattern,
@@ -963,12 +1027,23 @@ export function matchesPattern(
   const argRe = compiled._argRe;
   if (argRe === null) return true;
   const polarity = options.polarity ?? "allow";
-  const values = options.operativeValues ?? fallbackValues(toolName, input);
-  if (values.length === 0) return false;
   const absoluteGlob = globIsAbsolute(compiled.argGlob ?? "");
-  return polarity === "allow"
-    ? values.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity))
-    : values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
+  const values = options.operativeValues ?? fallbackValues(toolName, input);
+  if (polarity === "allow") {
+    const granted = values.filter((v) => v.restrictOnly !== true);
+    if (granted.length === 0) return false;
+    return granted.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
+  }
+  // The tool declares where it acts and this call names none of it: read
+  // what the call does carry, as 0.7.0 did — every string, not any one.
+  if (values.length === 0 && options.operativeValues !== undefined) {
+    const strings = stringValues(input).map(undeclaredValue);
+    return (
+      strings.length > 0 &&
+      strings.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity))
+    );
+  }
+  return values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
 }
 
 export {

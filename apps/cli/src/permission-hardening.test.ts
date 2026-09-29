@@ -237,6 +237,218 @@ describe("p14 — leaving out a field the tool fills with a default (permission-
   });
 });
 
+describe("C004 — a store the call leaves out, and a call that names no operative field", () => {
+  test("KvDelete without stateDir meets alwaysDeny KvDelete(.crewhaus/state/**); the key survives", async () => {
+    const kvSet = builtin("KvSet");
+    await kvSet.execute({ namespace: "ns", key: "k", value: "v" });
+    const rs = rules(["alwaysDeny", "KvDelete(.crewhaus/state/**)"], ["alwaysAllow", "KvDelete"]);
+    for (const mode of ["default", "auto", "plan"] as const) {
+      expect({
+        mode,
+        got: await gate("KvDelete", { namespace: "ns", key: "k" }, rs, mode),
+      }).toEqual({ mode, got: "deny" });
+    }
+    const after = String(await builtin("KvGet").execute({ namespace: "ns", key: "k" }));
+    expect(after).toContain('"found":true');
+  });
+
+  test("every tool-state writer's default store is read by a deny", async () => {
+    const calls: Array<[string, unknown]> = [
+      ["KvSet", { namespace: "ns", key: "k", value: 1 }],
+      ["NoteWrite", { id: "n1", text: "x" }],
+      ["CounterIncrement", { name: "c" }],
+      ["BlackboardPost", { topic: "t", author: "a", text: "x" }],
+      ["JournalAppend", { stream: "s", entry: {} }],
+      ["CheckpointSave", { name: "cp", data: {} }],
+      ["DedupeMark", { scope: "s", id: "i" }],
+      ["IndexBuild", { name: "ix", paths: ["src/app.ts"] }],
+    ];
+    for (const [name, input] of calls) {
+      const rs = rules(["alwaysDeny", `${name}(.crewhaus/state/**)`], ["alwaysAllow", name]);
+      expect({ name, got: await gate(name, input, rs) }).toEqual({ name, got: "deny" });
+    }
+    expect(existsSync(join(ws, ".crewhaus", "state"))).toBe(false);
+  });
+
+  test("an allow on the record still covers the ordinary call, and only that call", async () => {
+    const allow = rules(["alwaysAllow", "KvSet(scratch/*)"]);
+    // The store is left out: the grant is about the key, and it holds.
+    expect(await gate("KvSet", { namespace: "scratch", key: "a", value: 1 }, allow)).toBe("allow");
+    // Another namespace, or a store the call points somewhere else, asks.
+    expect(await gate("KvSet", { namespace: "prod", key: "a", value: 1 }, allow)).toBe("ask");
+    expect(
+      await gate(
+        "KvSet",
+        { namespace: "scratch", key: "a", value: 1, stateDir: "elsewhere" },
+        allow,
+      ),
+    ).toBe("ask");
+    // A deny on the key is unaffected by the default beside it.
+    const deny = rules(["alwaysDeny", "KvSet(scratch/*)"], ["alwaysAllow", "KvSet"]);
+    expect(await gate("KvSet", { namespace: "scratch", key: "a", value: 1 }, deny)).toBe("deny");
+  });
+
+  test("a registry, sessions or evals directory left out is read by a deny", async () => {
+    const cases: Array<[string, string, unknown]> = [
+      ["DeployRollback", ".crewhaus/specs/**", { name: "s", env: "prod", toVersion: "v1" }],
+      ["SpecPin", ".crewhaus/specs/**", { name: "s", specFile: "crewhaus.yaml", env: "prod" }],
+      ["DatasetPut", ".crewhaus/datasets/**", { name: "golden", samples: [] }],
+      ["EvalBaselinePin", ".crewhaus/evals/**", { action: "show", spec: "s", dataset: "d" }],
+      ["EmitTraceEvent", ".crewhaus/sessions/**", { name: "deploy_started", sessionId: "s1" }],
+      ["ExperimentLedger", ".crewhaus/experiments/**", { action: "tally", name: "e" }],
+      ["KnowledgeSync", ".crewhaus-shared/**", { direction: "push" }],
+    ];
+    for (const [name, glob, input] of cases) {
+      const rs = rules(["alwaysDeny", `${name}(${glob})`], ["alwaysAllow", name]);
+      const got = await gate(name, input, rs);
+      expect({ name, got, reason: lastReason }).toMatchObject({ name, got: "deny" });
+    }
+  });
+
+  test("a deny on every call is not dodged by leaving every operative field out", async () => {
+    const cases: Array<[string, unknown]> = [
+      // dir and sessionId omitted: the session log under the default directory
+      ["EmitTraceEvent", { name: "deploy_started" }],
+      // the destination named through an operator-listed environment variable
+      ["WebhookPost", { urlEnv: "HOOK_URL", payload: { a: 1 } }],
+      // a listing names no directory, id or source
+      ["HarnessRegister", { action: "list" }],
+    ];
+    for (const [name, input] of cases) {
+      const rs = rules(["alwaysDeny", `${name}(**)`], ["alwaysAllow", name]);
+      expect({ name, got: await gate(name, input, rs) }).toEqual({ name, got: "deny" });
+    }
+    // A scoped deny that names a place the call does not reach still does not fire.
+    const narrow = rules(
+      ["alwaysDeny", "WebhookPost(https://evil.example/**)"],
+      ["alwaysAllow", "WebhookPost"],
+    );
+    expect(await gate("WebhookPost", { urlEnv: "HOOK_URL", payload: { a: 1 } }, narrow)).toBe(
+      "allow",
+    );
+    // Nor is a destination deny set off by a link in the payload: every
+    // string must match, as in 0.7.0, not any one.
+    const http = rules(["alwaysDeny", "WebhookPost(http://**)"], ["alwaysAllow", "WebhookPost"]);
+    const alert = {
+      urlEnv: "HOOK_URL",
+      payload: { text: "Deploy failed", link: "http://status.internal/incident/42" },
+    };
+    expect(await gate("WebhookPost", alert, http)).toBe("allow");
+  });
+});
+
+describe("C004 — the readers beside the store writers read their default store too", () => {
+  test("KvGet and EventQuery without a directory meet a deny on the default one", async () => {
+    await builtin("KvSet").execute({ namespace: "ns", key: "k", value: "SECRET-IN-STATE" });
+    const cases: Array<[string, string, unknown]> = [
+      ["KvGet", "*(.crewhaus/state/**)", { namespace: "ns", key: "k" }],
+      ["KvGet", "KvGet(.crewhaus/state/**)", { namespace: "ns", key: "k" }],
+      ["KvList", "*(.crewhaus/state/**)", { namespace: "ns", includeValues: true }],
+      ["StateExport", "*(.crewhaus/state/**)", {}],
+      ["EventQuery", "*(.crewhaus/sessions/**)", {}],
+      ["TraceQuery", "*(.crewhaus/sessions/**)", {}],
+      ["AuditVerify", "*(.crewhaus/audit/**)", {}],
+    ];
+    for (const [name, deny, input] of cases) {
+      for (const mode of ["auto", "plan"] as const) {
+        const got = await gate(name, input, rules(["alwaysDeny", deny]), mode);
+        expect({ name, deny, mode, got }).toEqual({ name, deny, mode, got: "deny" });
+      }
+      // In default mode an allow behind the deny does not carry the call past it.
+      const withAllow = rules(["alwaysDeny", deny], ["alwaysAllow", name]);
+      const got = await gate(name, input, withAllow, "default");
+      expect({ name, deny, got }).toEqual({ name, deny, got: "deny" });
+    }
+  });
+
+  test("an allow on the record still covers the ordinary read, and a listing stands for every record", async () => {
+    expect(
+      await gate(
+        "KvGet",
+        { namespace: "scratch", key: "a" },
+        rules(["alwaysAllow", "KvGet(scratch/*)"]),
+      ),
+    ).toBe("allow");
+    expect(
+      await gate(
+        "KvGet",
+        { namespace: "prod", key: "a" },
+        rules(["alwaysAllow", "KvGet(scratch/*)"]),
+      ),
+    ).toBe("ask");
+    // A listing with no prefix reads every key of the namespace.
+    const denyKey = rules(
+      ["alwaysDeny", "KvList(prod/api-credentials)"],
+      ["alwaysAllow", "KvList"],
+    );
+    expect(await gate("KvList", { namespace: "prod", includeValues: true }, denyKey)).toBe("deny");
+    expect(await gate("KvList", { namespace: "scratch" }, denyKey)).toBe("allow");
+  });
+});
+
+describe("C004 — a fixed service the call leaves out is read by a deny, not asked of an allow", () => {
+  test("DependencyAudit: an allow on the project still covers the ordinary call", async () => {
+    // 0.7.0 and the 0.7.1 base allowed these; declaring the OSV endpoint as
+    // a plain default made every allow also have to match https://api.osv.dev.
+    for (const pattern of ["DependencyAudit(.)", "DependencyAudit(./**)", "DependencyAudit(*)"]) {
+      const rs = rules(["alwaysAllow", pattern]);
+      for (const input of [{ cwd: "." }, { cwd: ".", ecosystems: ["npm"] }]) {
+        const got = await gate("DependencyAudit", input, rs);
+        expect({ pattern, input, got }).toEqual({ pattern, input, got: "allow" });
+      }
+    }
+    // An endpoint the call names must still be covered by the allow.
+    const named = { cwd: ".", endpoint: "https://osv.internal.example" };
+    expect(await gate("DependencyAudit", named, rules(["alwaysAllow", "DependencyAudit(.)"]))).toBe(
+      "ask",
+    );
+    // A deny on the public database still fires when the call leaves it out.
+    const deny = rules(
+      ["alwaysDeny", "DependencyAudit(https://api.osv.dev/**)"],
+      ["alwaysAllow", "DependencyAudit"],
+    );
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const got = await gate("DependencyAudit", { cwd: "." }, deny, mode);
+      expect({ mode, got }).toEqual({ mode, got: "deny" });
+    }
+  });
+});
+
+describe("C004 — a search that reaches a denied repository", () => {
+  test("a search that reaches a denied repository meets the deny (SearchCode, SearchIssues)", async () => {
+    for (const name of ["SearchCode", "SearchIssues"]) {
+      const rs = rules(["alwaysDeny", `${name}(acme/secret)`], ["alwaysAllow", name]);
+      // The repository named outright, and the whole owner it belongs to.
+      const named = { owner: "acme", repo: "secret", query: "password" };
+      const ownerWide = { owner: "acme", query: "password org:acme" };
+      expect({ name, got: await gate(name, named, rs) }).toEqual({ name, got: "deny" });
+      expect({ name, got: await gate(name, ownerWide, rs) }).toEqual({ name, got: "deny" });
+      // Another owner's search is not this rule's business.
+      const other = { owner: "other", query: "password org:other" };
+      expect({ name, got: await gate(name, other, rs) }).toEqual({ name, got: "allow" });
+    }
+  });
+
+  test("the owner written in another letter case, or left out, still meets the deny", async () => {
+    // GitHub logins are case-insensitive, so org:ACME searches acme/secret;
+    // and a search that names no owner covers every repository the token
+    // can read, acme/secret among them.
+    for (const name of ["SearchCode", "SearchIssues"]) {
+      const rs = rules(["alwaysDeny", `${name}(acme/secret)`], ["alwaysAllow", name]);
+      for (const [mode, input] of [
+        ["default", { owner: "ACME", query: "password org:ACME" }],
+        ["default", { owner: "Acme", query: "password user:Acme" }],
+        ["default", { query: "password" }],
+        ["auto", { query: "password" }],
+        ["plan", { owner: "ACME", query: "password org:ACME" }],
+      ] as const) {
+        const got = await gate(name, input, rs, mode);
+        expect({ name, mode, input, got }).toEqual({ name, mode, input, got: "deny" });
+      }
+    }
+  });
+});
+
 describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (permission-integration#1, #2)", () => {
   test("Write(src/**) does not reach .crewhaus/settings.json by a decoy or by `..`", async () => {
     const rs = rules(["alwaysAllow", "Write(src/**)"]);
@@ -562,6 +774,40 @@ describe("C033 — a scoped allow on a multi-field builtin is usable", () => {
     const deny = rules(["alwaysDeny", "RunCommand(rm*)"], ["alwaysAllow", "RunCommand"]);
     expect(await gate("RunCommand", { argv: ["rm", "-rf", "x"], cwd: "src" }, deny)).toBe("deny");
     expect(await gate("RunCommand", { argv: ["ls"], cwd: "src" }, deny)).toBe("allow");
+  }, 30_000);
+
+  // RunBuild and RunTests declare `cwd` beside the command. As a plain
+  // default, the root "." was one more value every allow had to match, so
+  // `alwaysAllow RunBuild(npm run build)` — which 0.7.0 honoured — no longer
+  // fired on the ordinary call, and a headless run stopped at an approval.
+  // `cwd` only moves the run, as it does for RunCommand: an allow scoped to
+  // the command covers the workspace root, a call in another directory must
+  // be covered there too, and a deny on a directory still reads the root
+  // when the call leaves `cwd` out.
+  test("RunBuild and RunTests: an allow on the command covers the ordinary call, not another directory", async () => {
+    for (const [tool, script] of [
+      ["RunBuild", "./build.sh"],
+      ["RunTests", "./test.sh"],
+    ] as const) {
+      const command = [script];
+      const allow = rules(["alwaysAllow", `${tool}(${script})`]);
+      expect({
+        tool,
+        root: await gate(tool, { command }, allow),
+        src: await gate(tool, { command, cwd: "src" }, allow),
+      }).toEqual({ tool, root: "allow", src: "ask" });
+      const denySrc = rules(["alwaysDeny", `${tool}(src)`], ["alwaysAllow", tool]);
+      expect({
+        tool,
+        src: await gate(tool, { command, cwd: "src" }, denySrc),
+        root: await gate(tool, { command }, denySrc),
+      }).toEqual({ tool, src: "deny", root: "allow" });
+      const denyRoot = rules(["alwaysDeny", `${tool}(.)`], ["alwaysAllow", tool]);
+      expect({ tool, root: await gate(tool, { command }, denyRoot) }).toEqual({
+        tool,
+        root: "deny",
+      });
+    }
   }, 30_000);
 
   test("a boolean switch is not part of what a rule sees (documented; 0.8)", async () => {

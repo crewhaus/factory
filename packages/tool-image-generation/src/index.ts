@@ -263,7 +263,7 @@ export const imageGenerate: RegisteredTool = buildTool({
   name: "ImageGenerate",
   operativeArgs: [],
   description:
-    "Generate an image from a text prompt via a remote API. Returns a URL or base64 data URI. Use for: visual concepts, mockups, illustrations, social posts. Don't use for: 'edit this existing photo' (different tool needed).",
+    "Generate an image from a text prompt via a remote API. Returns a URL or base64 data URI. With the OpenAI provider every call is a billed generation on the operator's account, so generate only what the task needs. Use for: visual concepts, mockups, illustrations, social posts. Don't use for: 'edit this existing photo' (different tool needed).",
   inputSchema,
   destructive: false,
   readOnly: false, // not idempotent — each call mints a new image

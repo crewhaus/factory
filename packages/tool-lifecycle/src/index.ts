@@ -239,9 +239,10 @@ export const harnessRetire: RegisteredTool = buildTool({
   operativeArgs: [
     { field: "dir", kind: "path", default: "." },
     { field: "archiveDir", kind: "path" },
+    { field: "registryDir", kind: "path" },
   ],
   description:
-    "Decommission a harness: fingerprint its durable state, archive it, and remove the live copy, with a retirement log written into the archive recording every step and its outcome. The orchestration, the ordering and the refusal on an active deployment pin are @crewhaus/harness-lifecycle's own. It REFUSES when the spec still has an environment pinned to a registered version, when the registry manifest cannot be read (an unreadable manifest is never treated as 'no pins'), when the archive directory already holds an archived state (the library replaces it, which would destroy the earlier harness's archive), and when the archive directory overlaps the state directory it is archiving. Two steps the CLI performs are NOT performed here and are reported as not performed: verifying the audit chain (run the AuditVerify tool first) and collecting a compliance-evidence bundle. Because of that a real run needs acceptUnverified:true. dryRun defaults to true and touches nothing; the preview fingerprints the state so it can tell you in advance about files it will not be able to read.",
+    "Decommission a harness: fingerprint its durable state, archive it, and remove the live copy, writing a retirement log into the archive that records every step and its outcome. Use it when a harness is finished for good; the orchestration, ordering and active-pin refusal are @crewhaus/harness-lifecycle's own. It REFUSES while the spec still has an environment pinned to a registered version, when the registry manifest cannot be read (never treated as 'no pins'), when the archive directory already holds an archived state (it would be replaced), and when the archive directory overlaps the state directory. It does NOT verify the audit chain (run AuditVerify first) or collect a compliance-evidence bundle, and reports both as not performed, so a real run needs acceptUnverified:true. dryRun defaults to true and touches nothing; the preview fingerprints the state so it can warn in advance about files it will not be able to read.",
   inputSchema: z.object({
     spec: z
       .string()
@@ -1126,7 +1127,7 @@ export const knowledgeSync: RegisteredTool = buildTool({
   name: "KnowledgeSync",
   operativeArgs: [
     { field: "dir", kind: "path", default: "." },
-    { field: "sharedDir", kind: "path" },
+    { field: "sharedDir", kind: "path", default: SHARED_DIR_DEFAULT },
   ],
   description:
     "Push a harness's memories, grader and prompt fragments into a shared knowledge store, or pull the store's into the harness. Deduped by content hash and redacted by @crewhaus/harness-lifecycle, which drops any artifact still carrying a credential-shaped token after masking. A push requires the harness to have opted in (a .crewhaus/knowledge.json marker) and requires allowWithoutPiiRedaction, because @crewhaus/pii-redactor is not a dependency here: credential masking runs, but names, emails and phone numbers are NOT removed. Shared records that failed validation — a forged content hash, an oversized body — are COUNTED and reported rather than silently skipped, because a poisoned shared store is untrusted input, and a sync that moves more than maxArtifacts is refused. The text of artifacts dropped for still looking secret is never echoed back. dryRun defaults to true.",

@@ -9,6 +9,9 @@
       "path": "../errors"
     },
     {
+      "path": "../egress-classifier"
+    },
+    {
       "path": "../tool-builder"
     },
     {

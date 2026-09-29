@@ -242,6 +242,22 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * directory declares it this way; without it, the directory is invisible to
  * every rule.
  *
+ * `relocates: true` marks a `path` field that only moves the tool off its
+ * usual place: the store its other operative fields name a record in
+ * (`stateDir`, `registryDir`, `evalsDir`), or the repository a branch
+ * operation runs in (`cwd`) — or a `url` field that only moves it off the
+ * fixed service it is built to use (DependencyAudit's `endpoint`, the
+ * public OSV database). It needs a `default`. A deny or ask rule sees
+ * that default when the call leaves the field out, so
+ * `alwaysDeny KvDelete(.crewhaus/state/**)` fires on the ordinary call. An
+ * allow rule is about the record: when the call leaves the field out AND
+ * carries another operative value, the default does not have to match as
+ * well, so `alwaysAllow KvSet(scratch/*)` still covers the ordinary call.
+ * A call that names the field is matched like any other: an allow must cover
+ * the place it names too. Without `relocates`, a default is one more value
+ * every rule reads — right for a field that IS where the tool acts
+ * (`EnvFileUpsert`'s `.env`, a harness directory it deletes).
+ *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
@@ -253,6 +269,7 @@ export type OperativeArg = {
   readonly kind: OperativeArgKind;
   readonly default?: string;
   readonly within?: string;
+  readonly relocates?: true;
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

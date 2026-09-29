@@ -869,7 +869,7 @@ export const gitCommit: RegisteredTool = buildTool({
 export const gitSwitch: RegisteredTool = buildTool({
   name: "GitSwitch",
   operativeArgs: [
-    { field: "cwd", kind: "path" },
+    { field: "cwd", kind: "path", default: ".", relocates: true },
     { field: "branch", kind: "id" },
   ],
   description:
@@ -915,7 +915,7 @@ export const gitSwitch: RegisteredTool = buildTool({
 export const gitBranchCreate: RegisteredTool = buildTool({
   name: "GitBranchCreate",
   operativeArgs: [
-    { field: "cwd", kind: "path" },
+    { field: "cwd", kind: "path", default: ".", relocates: true },
     { field: "name", kind: "id" },
   ],
   description:
@@ -953,7 +953,7 @@ export const gitBranchCreate: RegisteredTool = buildTool({
 export const gitBranchDelete: RegisteredTool = buildTool({
   name: "GitBranchDelete",
   operativeArgs: [
-    { field: "cwd", kind: "path" },
+    { field: "cwd", kind: "path", default: ".", relocates: true },
     { field: "name", kind: "id" },
   ],
   description:
@@ -1072,7 +1072,7 @@ export const gitStashPop: RegisteredTool = buildTool({
 export const gitTagCreate: RegisteredTool = buildTool({
   name: "GitTagCreate",
   operativeArgs: [
-    { field: "cwd", kind: "path" },
+    { field: "cwd", kind: "path", default: ".", relocates: true },
     { field: "name", kind: "id" },
   ],
   description:

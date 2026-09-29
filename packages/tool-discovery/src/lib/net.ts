@@ -101,6 +101,32 @@ export type DiscoveryConfigInput = {
  * is refused, because a spec may come from a template or a pull request.
  */
 export function registerDiscoveryConfig(input: DiscoveryConfigInput): void {
+  const origins = originsOf(input);
+  if (origins === undefined) return;
+  setPeerPolicy({ ...policy, allowedOrigins: origins });
+}
+
+/**
+ * The peer origins a model-pool candidate's own `tool_config` block narrows
+ * THIS call to (`ToolExecuteContext.toolConfig`), or `undefined` when it sets
+ * none. It narrows only: a peer's origin must be in this list AND in the one
+ * bound at boot, when there is one — the boot list is the operator's ceiling
+ * for every model in the pool. Before 0.7.1 this block was accepted by
+ * `compile --strict` and never read, so a spec that set the list only on a
+ * candidate dialled any public peer (C029).
+ */
+export function callOrigins(toolConfig: unknown): ReadonlyArray<string> | undefined {
+  if (toolConfig === undefined || toolConfig === null) return undefined;
+  if (typeof toolConfig !== "object" || Array.isArray(toolConfig)) {
+    throw new PeerEndpointError(
+      "this model's tool_config block for FederationDiscover is not a mapping; write allowed_origins under it.",
+    );
+  }
+  return originsOf(toolConfig as DiscoveryConfigInput);
+}
+
+/** A block's allowed_origins, checked and reduced to origins; `undefined` when it sets none. */
+function originsOf(input: DiscoveryConfigInput): string[] | undefined {
   const block = (input ?? {}) as Record<string, unknown>;
   for (const key of ["allow_private_hosts", "allowPrivateHosts"]) {
     if (Object.hasOwn(block, key)) {
@@ -115,7 +141,7 @@ export function registerDiscoveryConfig(input: DiscoveryConfigInput): void {
     );
   }
   const raw = block["allowed_origins"] ?? block["allowedOrigins"];
-  if (raw === undefined) return;
+  if (raw === undefined) return undefined;
   if (!Array.isArray(raw) || raw.some((o) => typeof o !== "string")) {
     throw new PeerEndpointError(
       'tool_config.federationDiscover.allowed_origins must be a list of origins, for example ["https://peer.example"].',
@@ -137,7 +163,7 @@ export function registerDiscoveryConfig(input: DiscoveryConfigInput): void {
     }
     return url.origin;
   });
-  setPeerPolicy({ ...policy, allowedOrigins: origins });
+  return origins;
 }
 
 /** Read it back — `FederationDiscover` reports the posture it ran under. */
@@ -398,7 +424,10 @@ function deniedPrivate(host: string, what: string): string {
  * errors of the same kind: a private address is a refusal to ask, and a name
  * that does not resolve is an unanswered question.
  */
-export async function vetPeerUrl(rawUrl: string): Promise<Vetted> {
+export async function vetPeerUrl(
+  rawUrl: string,
+  narrowTo?: ReadonlyArray<string>,
+): Promise<Vetted> {
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -428,6 +457,13 @@ export async function vetPeerUrl(rawUrl: string): Promise<Vetted> {
       ok: false,
       code: "not-allow-listed",
       reason: `refusing "${url.origin}" — the operator's federation allow-list is ${allowed.length === 0 ? "empty, so nothing may be dialled" : allowed.join(", ")}`,
+    };
+  }
+  if (narrowTo !== undefined && !narrowTo.includes(url.origin)) {
+    return {
+      ok: false,
+      code: "not-allow-listed",
+      reason: `refusing "${url.origin}" — this model's federation allow-list (its own tool_config block) is ${narrowTo.length === 0 ? "empty, so nothing may be dialled" : narrowTo.join(", ")}`,
     };
   }
 
@@ -578,6 +614,8 @@ export type Attempt =
 export type FetchOptions = {
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  /** A per-call allow-list that narrows the boot one (see `callOrigins`). */
+  readonly allowedOrigins?: ReadonlyArray<string>;
 };
 
 /** Read a body with a hard cap, aborting the stream once it is exceeded. */
@@ -637,7 +675,7 @@ export async function fetchOnce(
   rawUrl: string,
   opts: FetchOptions,
 ): Promise<{ attempt: Attempt; body?: string }> {
-  const vet = await vetPeerUrl(rawUrl);
+  const vet = await vetPeerUrl(rawUrl, opts.allowedOrigins);
   if (!vet.ok) {
     return vet.code === "unresolvable"
       ? { attempt: { kind: "no-answer", url: rawUrl, code: "unresolvable", reason: vet.reason } }

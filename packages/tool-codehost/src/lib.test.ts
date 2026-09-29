@@ -32,6 +32,7 @@ import {
   gitlabProjectPath,
   joinCommaList,
 } from "./lib/refs";
+import { githubSearchQuery, queryScopes } from "./lib/search-scope";
 import {
   apiErrorMessage,
   clip,
@@ -1072,5 +1073,125 @@ describe("baseUrlProblem", () => {
 
   test("something that is not a URL at all says so", () => {
     expect(baseUrlProblem("api.github.com")).toContain("absolute URL");
+  });
+});
+
+describe("queryScopes: the repositories a GitHub query reaches (C004)", () => {
+  test("repo:, org: and user: are scopes, in any letter case", () => {
+    expect(queryScopes("password REPO:acme/secret Org:acme user:zoe is:open")).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+      { qualifier: "org", owner: "acme" },
+      { qualifier: "user", owner: "zoe" },
+    ]);
+  });
+
+  test("a scope inside a group or behind NOT still counts; a leading - does not", () => {
+    expect(queryScopes("(repo:a/b OR repo:c/d) NOT org:e -repo:f/g")).toEqual([
+      { qualifier: "repo", owner: "a", repo: "b" },
+      { qualifier: "repo", owner: "c", repo: "d" },
+      { qualifier: "org", owner: "e" },
+    ]);
+  });
+
+  test("a quoted value is read without its quotes; a repo with no owner part keeps it empty", () => {
+    expect(queryScopes('repo:"acme/widget" repo:solo')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "widget" },
+      { qualifier: "repo", owner: "solo", repo: "" },
+    ]);
+  });
+
+  test("a qualifier inside a quoted phrase is text GitHub searches for, not a scope", () => {
+    expect(queryScopes('"curl -u user:$TOKEN" repo:acme/app')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "app" },
+    ]);
+    expect(queryScopes('"see repo:foo/bar for details"')).toEqual([]);
+    expect(queryScopes('label:"good first issue" org:acme')).toEqual([
+      { qualifier: "org", owner: "acme" },
+    ]);
+    // A phrase ends the term it interrupts: what follows it is still read.
+    expect(queryScopes('"x"repo:acme/secret')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+    ]);
+  });
+
+  test("quotes that do not pair up cannot hide a qualifier", () => {
+    expect(queryScopes('"password repo:acme/secret')).toEqual([
+      { qualifier: "repo", owner: "acme", repo: "secret" },
+    ]);
+  });
+});
+
+describe("githubSearchQuery: the fields and the query agree, or nothing is searched", () => {
+  const q = (query: string, owner?: string, repo?: string) =>
+    githubSearchQuery("SearchCode", query, owner, repo);
+
+  test("no scope anywhere is sent as written", () => {
+    expect(q("assignee:@me is:open")).toEqual({ ok: true, q: "assignee:@me is:open" });
+  });
+
+  test("fields with no qualifier are written into the query", () => {
+    expect(q("password", "acme", "widget")).toEqual({ ok: true, q: "password repo:acme/widget" });
+  });
+
+  test("a qualifier the fields cover is kept; the owner covers every one of its repositories", () => {
+    expect(q("x repo:Acme/Widget", "acme", "widget")).toEqual({
+      ok: true,
+      q: "x repo:Acme/Widget",
+    });
+    expect(q("x repo:acme/a repo:acme/b", "acme")).toEqual({
+      ok: true,
+      q: "x repo:acme/a repo:acme/b",
+    });
+    expect(q("x org:acme", "acme")).toEqual({ ok: true, q: "x org:acme" });
+  });
+
+  test("a qualifier the fields do not cover is refused, naming the fields to set", () => {
+    for (const [query, owner, repo, want] of [
+      ["password repo:acme/secret", undefined, undefined, 'owner "acme" and repo "secret"'],
+      ["x repo:acme/secret", "acme", "widget", 'owner "acme" and repo "secret"'],
+      ["x org:acme", "acme", "widget", 'owner "acme" and no repo'],
+      ["x repo:acme/a repo:other/b", "acme", undefined, 'owner "other" and repo "b"'],
+    ] as const) {
+      const r = q(query, owner, repo);
+      expect({ query, ok: r.ok }).toEqual({ query, ok: false });
+      if (!r.ok) expect(r.message).toContain(want);
+    }
+  });
+
+  test("an owner alone must say org: or user:, and a repo needs its owner", () => {
+    const bare = q("x", "acme");
+    expect(bare.ok).toBe(false);
+    if (!bare.ok) expect(bare.message).toContain("add org:acme or user:acme");
+    const orphan = q("x", undefined, "widget");
+    expect(orphan.ok).toBe(false);
+    if (!orphan.ok) expect(orphan.message).toContain("repo needs owner");
+  });
+
+  test("a quoted phrase holding a qualifier is searched as written", () => {
+    // 0.7.0 sent these; reading the phrase as a scope refused them with
+    // advice no call could follow.
+    expect(q('"curl -u user:$TOKEN" repo:acme/app', "acme", "app")).toEqual({
+      ok: true,
+      q: '"curl -u user:$TOKEN" repo:acme/app',
+    });
+    expect(q('"see repo:foo/bar for details"', "acme", "app")).toEqual({
+      ok: true,
+      q: '"see repo:foo/bar for details" repo:acme/app',
+    });
+  });
+
+  test("a qualifier that names no GitHub account is refused without suggesting it", () => {
+    const r = q("x user:$TOKEN", "acme");
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain("does not name a GitHub account");
+      expect(r.message).not.toContain("name the same scope there");
+    }
+  });
+
+  test("a name that would add a qualifier of its own is refused before it is written", () => {
+    const r = q("x", "acme", "widget org:evil");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.message).toContain("is not a GitHub name");
   });
 });

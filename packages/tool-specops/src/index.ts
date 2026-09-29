@@ -939,6 +939,11 @@ export const specUpgrade: RegisteredTool = buildTool({
 
 export const specAdvise: RegisteredTool = buildTool({
   name: "SpecAdvise",
+  operativeArgs: [
+    { field: "path", kind: "path" },
+    { field: "sessionsDir", kind: "path", default: DEFAULT_SESSIONS_DIR, relocates: true },
+    { field: "auditDir", kind: "path", default: DEFAULT_AUDIT_DIR, relocates: true },
+  ],
   description:
     "Mine a harness's own session logs with the shipped advice rules and return ranked findings, each with the counts it fired on and either an applyable spec patch or advice text. Use to answer 'what should this spec change' from evidence rather than opinion: every finding carries its thresholds and evidence, and every emitted patch is pre-validated against the same allow-list SpecPatchApply enforces, so a patch here is one that applies. It reports what it could NOT read - unreadable logs, a missing directory, a spec that would not parse - because a clean bill of health from an empty read is the one answer worth nothing. The model_pool reward-scoreboard rules cannot fire here: that store is not a dependency of this package, and the result says so rather than reporting no routing findings.",
   inputSchema: z.object({

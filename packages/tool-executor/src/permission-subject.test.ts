@@ -283,6 +283,25 @@ describe("url, command and id values", () => {
     expect(operativeValuesFor(tool, { chainId: "1", address: "0xab" })?.[0]?.standsForAny).toBe(
       undefined,
     );
+    // Its qualifier left out as well, it stands for every <qualifier>/<value>
+    // — a code search naming no owner reaches every repository (C004).
+    const search = buildTool({
+      name: "Search",
+      description: "d",
+      inputSchema: z.object({ owner: z.string().optional(), repo: z.string().optional() }),
+      operativeArgs: [{ field: "repo", kind: "id", within: "owner", default: "*" }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    const unscoped = operativeValuesFor(search, {});
+    expect(unscoped).toEqual([
+      { kind: "id", canonical: ["*"], standsForAny: [""], anyQualifier: true },
+    ]);
+    expect(operativeValuesFor(search, { owner: "acme" })?.[0]?.anyQualifier).toBe(undefined);
+    const deny = compilePattern("Search(acme/secret)");
+    expect(
+      matchesPattern(deny, "Search", {}, { polarity: "restrict", operativeValues: unscoped }),
+    ).toBe(true);
     // Any other default is a value, not "every value".
     const dot = buildTool({
       name: "Dot",
@@ -418,6 +437,122 @@ describe("url, command and id values", () => {
     const arg = { field: "path", kind: "path", default: ".env" } as const;
     expect(readOperativeField({ entries: [] }, arg)).toEqual([".env"]);
     expect(readOperativeField({ path: "config/.env" }, arg)).toEqual(["config/.env"]);
+  });
+});
+
+describe("a relocating field's default (C004)", () => {
+  // The tool-state shape: a store directory the tool defaults in execute, and
+  // the record inside it that the call names.
+  const kvLike = () =>
+    buildTool({
+      name: "KvLike",
+      description: "store a value",
+      inputSchema: z.object({
+        namespace: z.string().optional(),
+        key: z.string().optional(),
+        stateDir: z.string().optional(),
+      }),
+      destructive: true,
+      operativeArgs: [
+        { field: "stateDir", kind: "path", default: ".crewhaus/state", relocates: true },
+        { field: "key", kind: "id", within: "namespace" },
+      ],
+      execute: async () => "ok",
+    });
+
+  test("left out beside a record, it is read by a deny or ask only", () => {
+    const values = operativeValuesFor(kvLike(), { namespace: "ns", key: "k" }) ?? [];
+    expect(values.map((v) => [v.kind, v.canonical[0], v.restrictOnly === true])).toEqual([
+      ["id", "ns/k", false],
+      ["path", ".crewhaus/state", true],
+    ]);
+    const deny = compilePattern("KvLike(.crewhaus/state/**)");
+    const allowKey = compilePattern("KvLike(ns/*)");
+    expect(
+      matchesPattern(deny, "KvLike", {}, { polarity: "restrict", operativeValues: values }),
+    ).toBe(true);
+    expect(
+      matchesPattern(allowKey, "KvLike", {}, { polarity: "allow", operativeValues: values }),
+    ).toBe(true);
+  });
+
+  test("named by the call, it is a value like any other: an allow must cover it too", () => {
+    const values =
+      operativeValuesFor(kvLike(), { namespace: "ns", key: "k", stateDir: ".crewhaus/state" }) ??
+      [];
+    expect(values.some((v) => v.restrictOnly === true)).toBe(false);
+    const allowKey = compilePattern("KvLike(ns/*)");
+    expect(
+      matchesPattern(allowKey, "KvLike", {}, { polarity: "allow", operativeValues: values }),
+    ).toBe(false);
+  });
+
+  test("with nothing else to read, the default is the call's place, for every rule", () => {
+    const values = operativeValuesFor(kvLike(), {}) ?? [];
+    expect(values.map((v) => [v.canonical[0], v.restrictOnly === true])).toEqual([
+      [".crewhaus/state", false],
+    ]);
+    const allowStore = compilePattern("KvLike(.crewhaus/state)");
+    expect(
+      matchesPattern(allowStore, "KvLike", {}, { polarity: "allow", operativeValues: values }),
+    ).toBe(true);
+  });
+
+  test("a url default that only moves the tool off its fixed service reads as a url", () => {
+    // DependencyAudit: the lockfile's versions go to the public OSV
+    // database unless the call names another endpoint.
+    const audit = buildTool({
+      name: "AuditLike",
+      description: "audit",
+      inputSchema: z.object({ cwd: z.string().optional(), endpoint: z.string().optional() }),
+      readOnly: true,
+      operativeArgs: [
+        { field: "cwd", kind: "path", default: "." },
+        { field: "endpoint", kind: "url", default: "https://api.osv.dev", relocates: true },
+      ],
+      execute: async () => "ok",
+    });
+    const values = operativeValuesFor(audit, { cwd: "." }) ?? [];
+    expect(values.map((v) => [v.kind, v.canonical, v.restrictOnly === true])).toEqual([
+      ["path", ["."], false],
+      ["url", ["https://api.osv.dev/", "https://api.osv.dev"], true],
+    ]);
+    const on = (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(
+        compilePattern(pattern),
+        "AuditLike",
+        {},
+        { polarity, operativeValues: values },
+      );
+    expect(on("AuditLike(.)", "allow")).toBe(true);
+    expect(on("AuditLike(https://api.osv.dev/**)", "restrict")).toBe(true);
+  });
+
+  test("a default without relocates is one more value every rule reads", () => {
+    const plain = buildTool({
+      name: "PlainLike",
+      description: "store a value",
+      inputSchema: z.object({ key: z.string(), dir: z.string().optional() }),
+      destructive: true,
+      operativeArgs: [
+        { field: "dir", kind: "path", default: "." },
+        { field: "key", kind: "id" },
+      ],
+      execute: async () => "ok",
+    });
+    const values = operativeValuesFor(plain, { key: "k" }) ?? [];
+    expect(values.some((v) => v.restrictOnly === true)).toBe(false);
+    expect(
+      matchesPattern(
+        compilePattern("PlainLike(k)"),
+        "PlainLike",
+        {},
+        {
+          polarity: "allow",
+          operativeValues: values,
+        },
+      ),
+    ).toBe(false);
   });
 });
 

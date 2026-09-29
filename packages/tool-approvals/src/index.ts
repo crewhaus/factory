@@ -339,6 +339,7 @@ function noteStoreHealth(unknowns: Unknowns, store: StoreRead, probe: string): v
 
 export const approvalStatus: RegisteredTool = buildTool({
   name: "ApprovalStatus",
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
   description:
     "Read one harness's tool-approval ledger: what is parked waiting for a human right now, what was decided, when and by whom. Use to answer 'is this harness blocked on me?' before assuming a quiet run is a finished one — a run under `permissions.ask_mode: pause` stops silently and waits. Pass `approvalId` for one record in full. This is a pure read: it never grants, denies, expires or compacts anything, so polling it is free of side effects. An approvals log that cannot be read is reported as UNKNOWN, never as an empty inbox.",
   inputSchema: z.object({
@@ -855,6 +856,7 @@ function rowAsRecord(row: InboxRow): ApprovalRecord & { readonly harness: string
 
 export const permissionsSuggest: RegisteredTool = buildTool({
   name: "PermissionsSuggest",
+  operativeArgs: [{ field: "dir", kind: "path", default: ".", relocates: true }],
   description:
     "Mine a harness's own ask/deny history into permission rules that would stop the re-asking, each verified to match ONLY the call it was derived from. Recurring asks a human always approved become an `alwaysAllow` proposal; recurring DENIED asks become an `alwaysAsk` tightening, never a blanket deny. This tool PROPOSES and writes nothing — applying a rule is `crewhaus permissions suggest --apply`, which is always an interactive human confirm, because an agent must never widen its own permissions. Rules built from observed values are glob-escaped and then checked against the real permission matcher; any rule that would also match a value the human never approved is refused and reported in `rejected`, not suggested.",
   inputSchema: z.object({

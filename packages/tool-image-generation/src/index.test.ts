@@ -24,6 +24,13 @@ describe("imageGenerate — schema + flags", () => {
     expect(imageGenerate.destructive).toBe(false);
   });
 
+  test("says it spends money, because nothing else about the call does (C039)", () => {
+    // Not destructive and not justification-gated — auto mode runs it with no
+    // rule (a reviewed decision in apps/cli flag-rules, gating is 0.8 work) —
+    // so the model reading the description is the one place the cost shows.
+    expect(imageGenerate.description).toContain("billed generation on the operator's account");
+  });
+
   test("name is 'ImageGenerate'", () => {
     expect(imageGenerate.name).toBe("ImageGenerate");
   });

@@ -355,9 +355,19 @@ export function operativeOf(
 ): { readonly field: string | null; readonly value: string | null } {
   const declared = TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs;
   if (declared !== undefined) {
-    for (const arg of declared) {
-      const value = readOperativeField(input, arg as OperativeArg).find((v) => v.length > 0);
-      if (value !== undefined) return { field: arg.field, value };
+    // A relocating field the call left out (a store directory, the
+    // repository a branch operation runs in) is where the record lives, not
+    // the record: an approver deciding on GitBranchDelete needs the branch,
+    // not ".". Its default is shown only when the call names nothing else.
+    for (const pass of ["named", "any"] as const) {
+      for (const arg of declared) {
+        const read =
+          pass === "named" && arg.relocates === true
+            ? { field: arg.field, kind: arg.kind as OperativeArg["kind"] }
+            : (arg as OperativeArg);
+        const value = readOperativeField(input, read).find((v) => v.length > 0);
+        if (value !== undefined) return { field: arg.field, value };
+      }
     }
     return { field: null, value: null };
   }

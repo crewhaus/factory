@@ -168,6 +168,56 @@ describe("matchesSegmentAfter: a glob against a prefix and ANY one segment", () 
     expect(matched).toBeGreaterThan(300);
     expect(compared - matched).toBeGreaterThan(300);
   });
+
+  test("with two segments, agrees with trying every short <segment>/<segment>", () => {
+    // A value that stands for every `<owner>/<repo>` (a code search that
+    // names neither). For a glob of at most three tokens, a match needs at
+    // most three characters besides the one slash between the segments, so
+    // pairs of at most three characters in all are a complete oracle.
+    const rand = prng(0x5ea);
+    const globAlphabet = ["a", "b", "/", "*", "**", "?", "\\*"];
+    const prefixes = ["", "a", "a/", "b/", "a/b/", "/"];
+    const short = [""];
+    for (let len = 1; len <= 3; len++) {
+      for (const base of short.filter((x) => x.length === len - 1)) {
+        for (const c of ["a", "b", "c", "*"]) short.push(base + c);
+      }
+    }
+    const pairs: string[] = [];
+    for (const one of short) {
+      for (const two of short) if (one.length + two.length <= 3) pairs.push(`${one}/${two}`);
+    }
+    let compared = 0;
+    let matched = 0;
+    for (let g = 0; g < 400; g++) {
+      let glob = "";
+      const glen = 1 + Math.floor(rand() * 3);
+      for (let i = 0; i < glen; i++) {
+        glob += globAlphabet[Math.floor(rand() * globAlphabet.length)];
+      }
+      const oracle = oracleGlobToRegex(glob);
+      const argRe = compilePattern(`T(${glob})`)._argRe;
+      if (argRe === null) throw new Error("expected an arg glob");
+      for (const prefix of prefixes) {
+        const want = pairs.some((pair) => oracle.test(prefix + pair));
+        if (argRe.matchesSegmentAfter(prefix, 2) !== want) {
+          throw new Error(
+            `glob ${JSON.stringify(glob)} after ${JSON.stringify(prefix)} (2 segments): oracle=${want} new=${!want}`,
+          );
+        }
+        compared++;
+        if (want) matched++;
+      }
+    }
+    expect(compared).toBe(400 * 6);
+    expect(matched).toBeGreaterThan(200);
+    expect(compared - matched).toBeGreaterThan(200);
+    // The literal fast path reads the same way.
+    const literal = compilePattern("T(acme/secret)")._argRe;
+    expect(literal?.matchesSegmentAfter("", 2)).toBe(true);
+    expect(literal?.matchesSegmentAfter("", 1)).toBe(false);
+    expect(literal?.matchesSegmentAfter("acme/", 2)).toBe(false);
+  });
 });
 
 // C037 — the cases a plain two-pointer "back up to the last star" matcher
@@ -369,13 +419,15 @@ describe("declared operative values", () => {
     ).toBe(false);
   });
 
-  test("an empty list means no operative value: no arg glob matches, either way", () => {
+  test("an empty list: no arg glob allows it, and a deny reads the call's strings instead", () => {
     const p = compilePattern("Grep(**)");
     expect(matchesPattern(p, "Grep", { pattern: "x" }, { ...allow, operativeValues: [] })).toBe(
       false,
     );
+    // It used to match no deny either, so leaving every optional operative
+    // field out dodged `alwaysDeny Tool(**)`, which 0.7.0 enforced (C004).
     expect(matchesPattern(p, "Grep", { pattern: "x" }, { ...restrict, operativeValues: [] })).toBe(
-      false,
+      true,
     );
   });
 
@@ -576,6 +628,87 @@ describe("declared operative values", () => {
         },
       ),
     ).toBe(false);
+  });
+
+  test("a value standing for every repository of an owner meets a deny in any letter case", () => {
+    // SearchCode {owner: "ACME", query: "password org:ACME"}: GitHub logins
+    // are case-insensitive, so this searches acme/secret, and the deny,
+    // written in lower case, must fire (C004).
+    const ownerWide: OperativeValue = {
+      kind: "id",
+      canonical: ["ACME/*"],
+      spellings: ["*", "ACME"],
+      standsForAny: ["ACME/", ""],
+    };
+    const fires = (pattern: string, value: OperativeValue = ownerWide) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "SearchCode",
+        {},
+        {
+          ...restrict,
+          operativeValues: [value],
+        },
+      );
+    expect(
+      ["SearchCode(acme/secret)", "SearchCode(Acme/*)", "SearchCode(acme/s*)"].filter((p) =>
+        fires(p),
+      ),
+    ).toHaveLength(3);
+    // Another owner is not this search's business.
+    expect(fires("SearchCode(other/secret)")).toBe(false);
+    // A path is folded only where its filesystem ignores case, and a URL by
+    // its own rules: the prefix fold is for values compared ignoring case.
+    const pathValue: OperativeValue = { ...ownerWide, kind: "path" };
+    expect(fires("SearchCode(acme/secret)", pathValue)).toBe(false);
+  });
+
+  test("a value whose qualifier was left out too stands for every <qualifier>/<value>", () => {
+    // SearchIssues {query: "password"}: no owner and no repo, so every
+    // repository the token can read is searched.
+    const everything: OperativeValue = {
+      kind: "id",
+      canonical: ["*"],
+      standsForAny: [""],
+      anyQualifier: true,
+    };
+    const fires = (pattern: string, value: OperativeValue = everything) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "SearchIssues",
+        {},
+        {
+          ...restrict,
+          operativeValues: [value],
+        },
+      );
+    const grants = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "SearchIssues",
+        {},
+        {
+          ...allow,
+          operativeValues: [everything],
+        },
+      );
+    const denies = [
+      "SearchIssues(acme/secret)",
+      "SearchIssues(ACME/Secret)",
+      "SearchIssues(acme/*)",
+      "SearchIssues(*/secret)",
+      "SearchIssues(acme/**)",
+      "SearchIssues(secret)",
+    ];
+    expect(denies.filter((p) => fires(p))).toEqual(denies);
+    // Deeper than owner/repo names no repository.
+    expect(fires("SearchIssues(acme/secret/issues)")).toBe(false);
+    // Without the mark, only one segment stands for any value.
+    const oneSegment: OperativeValue = { kind: "id", canonical: ["*"], standsForAny: [""] };
+    expect(fires("SearchIssues(acme/secret)", oneSegment)).toBe(false);
+    // An allow still reads only the canonical value.
+    expect(grants("SearchIssues(acme/secret)")).toBe(false);
+    expect(grants("SearchIssues(*)")).toBe(true);
   });
 
   test("non-path values are not filtered by absoluteness", () => {
@@ -808,5 +941,120 @@ describe("MCP tool names", () => {
   test("matchesPattern applies the same name rule", () => {
     const p = compilePattern("github__create_issue");
     expect(matchesPattern(p, "mcp__github__create_issue", { title: "x" }, restrict)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C004 — a relocating field's default, and a call with no operative value
+// ---------------------------------------------------------------------------
+
+describe("a relocating field's default is read by a deny or ask, and skipped by an allow", () => {
+  // KvDelete {namespace: "ns", key: "k"} with stateDir left out: the key it
+  // names, and the store it lives in standing in with its default.
+  const key: OperativeValue = { kind: "id", canonical: ["ns/k"], spellings: ["k", "ns"] };
+  const store: OperativeValue = {
+    kind: "path",
+    canonical: [".crewhaus/state", "./.crewhaus/state"],
+    spellings: [".crewhaus/state"],
+    restrictOnly: true,
+  };
+  const call = (pattern: string, polarity: typeof allow | typeof restrict) =>
+    matchesPattern(
+      compilePattern(pattern),
+      "KvDelete",
+      {},
+      {
+        ...polarity,
+        operativeValues: [key, store],
+      },
+    );
+
+  test("a deny on the default store fires, so leaving stateDir out does not dodge it", () => {
+    expect(call("KvDelete(.crewhaus/state/**)", restrict)).toBe(true);
+    expect(call("KvDelete(.crewhaus/state)", restrict)).toBe(true);
+    // Not a value that is not there.
+    expect(call("KvDelete(other/**)", restrict)).toBe(false);
+  });
+
+  test("an allow is about the key: the store's default does not have to match it too", () => {
+    expect(call("KvDelete(ns/*)", allow)).toBe(true);
+    expect(call("KvDelete(other/*)", allow)).toBe(false);
+    // And the default alone grants nothing: the key must still be covered.
+    expect(call("KvDelete(.crewhaus/state/**)", allow)).toBe(false);
+  });
+
+  test("an allow with nothing but restrict-only values matches nothing", () => {
+    const only = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "KvDelete",
+        {},
+        {
+          ...allow,
+          operativeValues: [store],
+        },
+      );
+    expect(only("KvDelete(**)")).toBe(false);
+    expect(only("KvDelete(.crewhaus/state)")).toBe(false);
+  });
+});
+
+describe("a deny or ask on a call that carries none of its declared operative fields", () => {
+  // WebhookPost {urlEnv, payload}: the destination is named through an
+  // operator-listed environment variable, so the declared `url` is absent.
+  const input = { urlEnv: "HOOK_URL", payload: { note: "hello" } };
+  const fires = (pattern: string) =>
+    matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+      ...restrict,
+      operativeValues: [],
+    });
+  const grants = (pattern: string) =>
+    matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+      ...allow,
+      operativeValues: [],
+    });
+
+  test("fires when every string value of the call matches, as 0.7.0 read such a call", () => {
+    expect(fires("WebhookPost(**)")).toBe(true);
+    // One string matching is not enough: 0.7.0 needed every one, and a
+    // deny about one value would otherwise fire on unrelated payload text.
+    expect(fires("WebhookPost(HOOK_URL)")).toBe(false);
+    // A deny about a place the call does not name still does not fire.
+    expect(fires("WebhookPost(https://evil.example/**)")).toBe(false);
+  });
+
+  test("a destination deny is not set off by a link inside the payload", () => {
+    // An ordinary alert whose destination is named through urlEnv, with a
+    // link in its text: `WebhookPost(http://**)` is about where the post
+    // goes, which this call does not say, and 0.7.0 allowed it.
+    const alert = {
+      urlEnv: "ALERT_WEBHOOK_URL",
+      payload: { text: "Deploy failed", link: "http://status.internal/incident/42" },
+    };
+    const deny = (pattern: string, input: unknown) =>
+      matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+        ...restrict,
+        operativeValues: [],
+      });
+    expect(deny("WebhookPost(http://**)", alert)).toBe(false);
+    expect(deny("WebhookPost(**)", alert)).toBe(true);
+  });
+
+  test("no argument-scoped allow can match it", () => {
+    expect(grants("WebhookPost(**)")).toBe(false);
+    expect(grants("WebhookPost(HOOK_URL)")).toBe(false);
+  });
+
+  test("a call with no string at all still matches no argument-scoped deny", () => {
+    const empty = matchesPattern(
+      compilePattern("Tool(**)"),
+      "Tool",
+      { n: 1 },
+      {
+        ...restrict,
+        operativeValues: [],
+      },
+    );
+    expect(empty).toBe(false);
   });
 });

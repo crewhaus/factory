@@ -803,6 +803,7 @@ export const JOB_STATES_COVER_JOBSTATE: Exclude<JobState, (typeof JOB_STATES)[nu
 
 export const harnessJobStatus: RegisteredTool = buildTool({
   name: "HarnessJobStatus",
+  operativeArgs: [{ field: "dir", kind: "path" }],
   description:
     "Read the manager's durable job ledger (<hangarRoot>/jobs.jsonl, from CREWHAUS_HANGAR_ROOT or <registryRoot>/hangar): what was enqueued, what ran, what it exited with, and what is still open. Read-only — the store has no cancel route. The fold is @crewhaus/harness-supervisor's own, which skips a torn trailing line while the manager is appending to it. A ledger that exists but could not be opened is reported as unreadable, never as 'no jobs': the store answers both with an empty list, and that is how an operator concludes a queue is idle while it is running. `interrupted` is a FINAL state — a manager that died mid-job reopens the row as interrupted and never re-runs it — so a job sitting there is waiting for a person, not for the queue.",
   inputSchema: z.object({

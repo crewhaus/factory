@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/egress-classifier": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/single-binary-cli": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",

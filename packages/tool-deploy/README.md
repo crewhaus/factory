@@ -101,7 +101,11 @@ shared with every other unmappable name. So is a name the registry's own
 directory itself), when the call would write: its pins would exist on disk and
 be missing from every enumeration. `DeployInspect` can still read such a spec by
 name, and its registry-wide listing names any it finds under `hiddenByRegistry`
-instead of leaving them silently absent.
+instead of leaving them silently absent. For the same reason `SpecPin` and
+`DeployRollback` refuse a `registryDir` that sits inside a directory another
+registry reserves (its `_tenants`, or any other `_` name): the second
+registry's files would be invisible to the first one's listing and could be
+mistaken for its own.
 
 **Destructive means dry run by default, through the same selection code.**
 `DeployRollback` takes an explicit `dryRun: false` to act, and the preview is
