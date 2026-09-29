@@ -127,10 +127,44 @@ describe("rules that name no tool", () => {
     );
   });
 
-  test("a near miss of a tool name, and nothing for a name it has never heard of", () => {
+  test("a near miss of a tool name, and only a note for a name it has never heard of", () => {
     expect(problems(["Tre"])[0]).toMatchObject({ code: "unknown-tool", suggestion: "Tree" });
-    // `Task`, `Consult` and a sub-agent's own tools are added at run time.
-    expect(problems(["Task", "Consult", "SomeCustomTool(x)"])).toEqual([]);
+    // C146 — `alwaysAllow NoSuchTool(**)` passed as clean. A name known to
+    // nothing and close to nothing is noted, with no fix: a plugin or a
+    // custom tool may still register it, so it is not called dead.
+    const notes = problems(["NoSuchTool(**)", "SomeCustomTool(x)", "undeclared__tool"]);
+    expect(notes.map((p) => [p.pattern, p.code, p.suggestion])).toEqual([
+      ["NoSuchTool(**)", "tool-not-known", undefined],
+      ["SomeCustomTool(x)", "tool-not-known", undefined],
+      ["undeclared__tool", "tool-not-known", undefined],
+    ]);
+    expect(notes[0]?.message).toBe(
+      'rule "NoSuchTool(**)" names NoSuchTool, which is no builtin and no tool the runtime adds, so it never fires unless a plugin, a custom tool or an MCP server\'s "<server>__<tool>" spelling registers a tool by that name. Check the name, or remove the rule.',
+    );
+    // A tie between two near names is noted, not guessed.
+    const tie = permissionRuleProblems({
+      rules: [{ type: "alwaysDeny", pattern: "Wrote" }],
+      granted: [],
+      known: [tool("Write"), tool("Wrate")],
+      mcpServers: [],
+    });
+    expect(tie.map((p) => p.code)).toEqual(["tool-not-known"]);
+    expect(tie[0]?.message).toContain("equally close to Wrate and Write");
+    // A name the caller knows (`Task`, `Consult`, a thredz alias, when it
+    // passes them) gets nothing; a glob gets nothing; an MCP rule for a
+    // declared server gets nothing.
+    const withRuntime = [...known, { name: "Task" }, { name: "Consult" }, { name: "goal_list" }];
+    expect(
+      permissionRuleProblems({
+        rules: ["Task", "Consult", "goal_list", "Nothing*", "web__fetch"].map((pattern) => ({
+          type: "alwaysAllow",
+          pattern,
+        })),
+        granted,
+        known: withRuntime,
+        mcpServers: ["web"],
+      }),
+    ).toEqual([]);
   });
 
   test("a correction never turns an allow into a grant of a tool that can do more", () => {

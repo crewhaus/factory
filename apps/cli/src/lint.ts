@@ -11,6 +11,7 @@ import {
 } from "@crewhaus/tool-permission-matcher";
 import {
   RUNTIME_TOOL_NAMES,
+  THREDZ_TOOL_NAMES,
   TOOL_FLAGS,
   TOOL_FLAGS_BY_NAME,
 } from "@crewhaus/tool-registry-manifest/flags";
@@ -191,7 +192,7 @@ export function runLint(
   for (const p of permissionRuleProblemsOf(ir, resolveTool)) {
     findings.push({
       message: p.message,
-      path: `permissions.rules[${p.type} ${p.pattern}]`,
+      path: p.path,
       severity: "warning",
       rule: `permission-rule:${p.code}`,
     });
@@ -214,21 +215,122 @@ export const KNOWN_TOOLS: ReadonlyArray<RuleToolDescriptor> = [
 ];
 
 /**
+ * The tools a spec's `thredz:` block registers under their bare names
+ * (`goal_list`, `task_complete`, …; the messaging set too when a block says
+ * `messaging: true`), or none when the spec has no block. A crew carries a
+ * block per role as well as the crew-wide one.
+ */
+export function thredzToolNamesOf(ir: IrNode): string[] {
+  const blocks: Array<{ readonly messaging?: unknown }> = [];
+  const top = (ir as { readonly thredz?: { readonly messaging?: unknown } }).thredz;
+  if (top !== undefined) blocks.push(top);
+  const roles = (ir as { readonly roles?: unknown }).roles;
+  if (Array.isArray(roles)) {
+    for (const role of roles) {
+      const block = (role as { readonly thredz?: { readonly messaging?: unknown } } | null)?.thredz;
+      if (block !== undefined) blocks.push(block);
+    }
+  }
+  if (blocks.length === 0) return [];
+  return [
+    ...THREDZ_TOOL_NAMES.memory,
+    ...(blocks.some((b) => b.messaging === true) ? THREDZ_TOOL_NAMES.messaging : []),
+  ];
+}
+
+/** One list of permission patterns a spec carries, and how the engine reads it. */
+type RuleList = {
+  /** Where it sits in the spec, for the finding's path. */
+  readonly path: string;
+  readonly rules: ReadonlyArray<{ readonly type: string; readonly pattern: string }>;
+};
+
+/**
+ * Every list of permission patterns in a lowered spec, each rule typed the
+ * way the engine applies it: the shape's `permissions.rules`, each model
+ * profile's `permissions.deny` / `ask` (they narrow whatever the profile
+ * serves), and each sub-agent's `permissions.allow` / `deny` (they replace or
+ * narrow the parent's for the sub-agent). All of them are matched against a
+ * tool's registered name, so a spec key or a misspelling is as dead in one as
+ * in another (C146).
+ */
+function permissionRuleListsOf(ir: IrNode): RuleList[] {
+  const lists: RuleList[] = [];
+  const node = ir as {
+    readonly permissions?: { readonly rules?: ReadonlyArray<{ type: string; pattern: string }> };
+    readonly models?: Readonly<Record<string, unknown>>;
+    readonly subAgents?: unknown;
+    readonly roles?: unknown;
+  };
+  const top = node.permissions?.rules ?? [];
+  if (top.length > 0) lists.push({ path: "permissions.rules", rules: top });
+  const typed = (type: string, patterns: unknown) =>
+    Array.isArray(patterns)
+      ? patterns
+          .filter((p): p is string => typeof p === "string")
+          .map((pattern) => ({ type, pattern }))
+      : [];
+  for (const [name, profile] of Object.entries(node.models ?? {})) {
+    const perms = (profile as { readonly permissions?: { deny?: unknown; ask?: unknown } } | null)
+      ?.permissions;
+    if (perms === undefined) continue;
+    for (const [field, type] of [
+      ["deny", "alwaysDeny"],
+      ["ask", "alwaysAsk"],
+    ] as const) {
+      const rules = typed(type, perms[field]);
+      if (rules.length > 0) lists.push({ path: `models.${name}.permissions.${field}`, rules });
+    }
+  }
+  const subAgents = (owner: unknown, at: string): void => {
+    const defs = (owner as { readonly subAgents?: unknown } | null)?.subAgents;
+    if (!Array.isArray(defs)) return;
+    for (const def of defs as ReadonlyArray<{ name?: unknown; permissions?: unknown }>) {
+      const perms = def?.permissions;
+      if (typeof def?.name !== "string" || perms === null || typeof perms !== "object") continue;
+      for (const [field, type] of [
+        ["allow", "alwaysAllow"],
+        ["deny", "alwaysDeny"],
+      ] as const) {
+        const rules = typed(type, (perms as Record<string, unknown>)[field]);
+        if (rules.length > 0) {
+          lists.push({ path: `${at}.sub_agents.${def.name}.permissions.${field}`, rules });
+        }
+      }
+    }
+  };
+  subAgents(node, "agent");
+  if (Array.isArray(node.roles)) {
+    for (const role of node.roles as ReadonlyArray<{ name?: unknown } | null>) {
+      if (typeof role?.name === "string") subAgents(role, `roles.${role.name}`);
+    }
+  }
+  return lists;
+}
+
+/** A rule that can never do what it says, and where the spec holds it. */
+export type LocatedRuleProblem = PermissionRuleProblem & {
+  /** The list that holds the rule, e.g. `models.fast.permissions.deny`. */
+  readonly list: string;
+  /** `<list>[<type> <pattern>]`, e.g. `models.fast.permissions.deny[alwaysDeny fetch]`. */
+  readonly path: string;
+};
+
+/**
  * The permission rules of a lowered spec that can never do what they say
- * (see `permissionRuleProblems`). A granted tool is described by the live
- * tool `resolveTool` returns, falling back to the builtin manifest, so the
- * check sees the same declarations the runtime will.
+ * (see `permissionRuleProblems`), in every list a spec carries (see
+ * `permissionRuleListsOf`). A granted tool is described by the live tool
+ * `resolveTool` returns, falling back to the builtin manifest, so the check
+ * sees the same declarations the runtime will; the tools a `thredz:` block
+ * registers are known in a spec that has one.
  */
 export function permissionRuleProblemsOf(
   ir: IrNode,
   resolveTool: (name: string) => RegisteredTool | undefined,
-): PermissionRuleProblem[] {
-  const node = ir as {
-    readonly permissions?: { readonly rules?: ReadonlyArray<{ type: string; pattern: string }> };
-    readonly mcp_servers?: Readonly<Record<string, unknown>>;
-  };
-  const rules = node.permissions?.rules ?? [];
-  if (rules.length === 0) return [];
+): LocatedRuleProblem[] {
+  const lists = permissionRuleListsOf(ir);
+  if (lists.length === 0) return [];
+  const node = ir as { readonly mcp_servers?: Readonly<Record<string, unknown>> };
   const granted: RuleToolDescriptor[] = [];
   for (const name of collectToolNames(ir)) {
     const live = resolveTool(name);
@@ -240,12 +342,17 @@ export function permissionRuleProblemsOf(
       ...(described.operativeArgs !== undefined ? { operativeArgs: described.operativeArgs } : {}),
     });
   }
-  return permissionRuleProblems({
-    rules,
-    granted,
-    known: KNOWN_TOOLS,
-    mcpServers: Object.keys(node.mcp_servers ?? {}),
-  });
+  const thredz = thredzToolNamesOf(ir);
+  const known =
+    thredz.length === 0 ? KNOWN_TOOLS : [...KNOWN_TOOLS, ...thredz.map((name) => ({ name }))];
+  const mcpServers = Object.keys(node.mcp_servers ?? {});
+  const out: LocatedRuleProblem[] = [];
+  for (const list of lists) {
+    for (const p of permissionRuleProblems({ rules: list.rules, granted, known, mcpServers })) {
+      out.push({ ...p, list: list.path, path: `${list.path}[${p.type} ${p.pattern}]` });
+    }
+  }
+  return out;
 }
 
 /** Re-exported for the CLI wrapper's philosophy-alignment parity note. */

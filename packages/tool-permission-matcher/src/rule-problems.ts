@@ -8,12 +8,13 @@
  * fallback. `crewhaus lint`, `compile` and `PermissionAudit` use this to say
  * so while the spec is being written (permission-integration#12).
  *
- * Only what can be shown is reported. A rule naming a tool this module has
- * never heard of is NOT reported as dead — the runtime adds tools a spec does
- * not list (`Task`, `Consult`, a sub-agent's tools from disk) — unless the
- * name is one or two letters away from a tool it does know. The caller's
- * `known` list must therefore carry the tools the runtime registers on its
- * own (`Skill`, the browser shape's `Type`), not only the builtins, or a real
+ * Only what can be shown is reported as dead. A rule naming a tool this
+ * module has never heard of is not — a plugin or a custom tool may register
+ * it — unless the name is one or two letters away from a tool it does know;
+ * otherwise it gets an informational `tool-not-known` note, which `compile
+ * --strict` does not escalate. The caller's `known` list must therefore carry
+ * the tools the runtime registers on its own (`Skill`, the browser shape's
+ * `Type`, a `thredz:` block's `goal_list`), not only the builtins, or a real
  * tool name reads as a typo of a builtin.
  *
  * A correction never widens an allow: when the nearest name belongs to a tool
@@ -67,7 +68,14 @@ export type PermissionRuleProblemCode =
    * MCP server, and reaches no granted builtin whose key or spelling it
    * resembles. It still fires on the MCP tools; the note names the builtins.
    */
-  | "builtin-not-reached";
+  | "builtin-not-reached"
+  /**
+   * INFORMATIONAL: a literal name that is no tool the caller knows and is
+   * close to none. It never fires unless something the checker cannot see
+   * offline — a plugin, a custom tool, an MCP server's pre-0.7.1
+   * `<server>__<tool>` spelling — registers a tool by that name.
+   */
+  | "tool-not-known";
 
 export type PermissionRuleProblem = {
   readonly type: string;
@@ -444,7 +452,19 @@ export function permissionRuleProblems(
           .filter((c) => c.d <= 2)
           .sort((a, b) => a.d - b.d || (a.name < b.name ? -1 : 1));
         const best = near[0];
-        if (best !== undefined && near.filter((c) => c.d === best.d).length === 1) {
+        const tied = best === undefined ? [] : near.filter((c) => c.d === best.d);
+        if (best === undefined || tied.length > 1) {
+          // Known to nothing, and close to no one tool (or to several alike):
+          // say so, without a fix, and without calling it dead outright.
+          report(
+            "tool-not-known",
+            `rule "${rule.pattern}" names ${toolGlob}, which is no builtin and no tool the runtime adds${
+              tied.length > 1
+                ? ` (it is equally close to ${listNames(tied.map((c) => c.name))})`
+                : ""
+            }, so it never fires unless a plugin, a custom tool or an MCP server's "<server>__<tool>" spelling registers a tool by that name. Check the name, or remove the rule.`,
+          );
+        } else {
           const fixed = withTool(rule.pattern, best.name);
           const widens =
             rule.type === "alwaysAllow" &&

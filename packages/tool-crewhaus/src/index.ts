@@ -58,6 +58,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
   RUNTIME_TOOL_NAMES,
+  THREDZ_TOOL_NAMES,
   TOOL_FLAGS,
   TOOL_FLAGS_BY_NAME,
 } from "@crewhaus/tool-registry-manifest/flags";
@@ -575,6 +576,25 @@ export const toolInventory: RegisteredTool = buildTool({
 });
 
 /**
+ * The bare tool names a spec's `thredz:` block registers (the goal, task,
+ * wiki and space tools; the messaging tools too when the block, or one of a
+ * crew's per-role blocks, says `messaging: true`), or none without a block.
+ */
+function thredzToolNamesOfSpec(spec: unknown): readonly string[] {
+  const block = asRecord(spec)?.["thredz"];
+  if (block === undefined || block === false || block === null) return [];
+  const record = asRecord(block);
+  const messaging =
+    record?.["messaging"] === true ||
+    Object.values(asRecord(record?.["roles"]) ?? {}).some(
+      (role) => asRecord(role)?.["messaging"] === true,
+    );
+  return messaging
+    ? [...THREDZ_TOOL_NAMES.memory, ...THREDZ_TOOL_NAMES.messaging]
+    : THREDZ_TOOL_NAMES.memory;
+}
+
+/**
  * The server an `mcp__<server>__<tool>` name belongs to: the longest declared
  * `mcp_servers` key it starts with, because a key may itself contain `__`
  * (0.7.0 ran such keys). With no declared key, the text up to the first
@@ -653,8 +673,13 @@ export const permissionAudit: RegisteredTool = buildTool({
       // nothing.
       flagsOf: (tool) => TOOL_FLAGS[tool] ?? TOOL_FLAGS_BY_NAME.get(tool),
       // The builtins, and the tools the runtime registers without a spec
-      // listing them — `alwaysAllow Skill` names a real tool.
-      knownTools: [...Object.values(TOOL_FLAGS), ...RUNTIME_TOOL_NAMES.map((name) => ({ name }))],
+      // listing them — `alwaysAllow Skill` names a real tool, and so does
+      // `alwaysAllow goal_list` in a spec with a `thredz:` block.
+      knownTools: [
+        ...Object.values(TOOL_FLAGS),
+        ...RUNTIME_TOOL_NAMES.map((name) => ({ name })),
+        ...thredzToolNamesOfSpec(parsed.value).map((name) => ({ name })),
+      ],
       mcpServers: view.mcpServers.map((s) => s.name),
       ...(typeof judge === "string" ? { justificationJudge: judge } : {}),
     });

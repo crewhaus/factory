@@ -521,6 +521,44 @@ describe("PermissionAudit", () => {
     expect(result.tools[0]?.destructive).toBe(true);
   });
 
+  // back-compat (wave III): the trader starter's `alwaysAllow goal_list`
+  // is live with a `thredz:` block (the runtime registers goal_list under
+  // that name), and was reported as a near miss of GoalList.
+  test("a thredz: block's tool names are known; without the block they are near misses", async () => {
+    const spec = (thredz: string) =>
+      [
+        "name: demo",
+        "target: cli",
+        ...(thredz === "" ? [] : [thredz]),
+        "agent:",
+        "  model: claude-sonnet-4-6",
+        "  instructions: go",
+        "tools: [read]",
+        "permissions:",
+        "  mode: default",
+        "  rules:",
+        "    - { type: alwaysAllow, pattern: goal_list }",
+        "    - { type: alwaysAllow, pattern: goal_write }",
+        "    - { type: alwaysAllow, pattern: agent_list }",
+      ].join("\n");
+    const problems = async (thredz: string) =>
+      (
+        await callJson<{ ruleProblems: Array<{ pattern: string; code: string }> }>(
+          permissionAudit,
+          { spec: spec(thredz) },
+        )
+      ).ruleProblems.map((p) => [p.pattern, p.code]);
+    expect(await problems("thredz: { api_key: $THREDZ_API_KEY, goals: true }")).toEqual([
+      ["agent_list", "tool-not-known"],
+    ]);
+    expect(await problems("thredz: { api_key: $THREDZ_API_KEY, messaging: true }")).toEqual([]);
+    expect(await problems("")).toEqual([
+      ["goal_list", "unknown-tool"],
+      ["goal_write", "unknown-tool"],
+      ["agent_list", "tool-not-known"],
+    ]);
+  });
+
   test("a rule that names nothing granted is reported as unused", async () => {
     const spec = CLI_SPEC.replace("pattern: Read", "pattern: Nonexistent");
     const result = await callJson<{ unusedRules: Array<{ pattern: string }> }>(permissionAudit, {

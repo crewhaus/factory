@@ -5594,3 +5594,51 @@ export const RUNTIME_TOOL_NAMES: ReadonlyArray<string> = [
   "wiki_stats",
   "wiki_write",
 ];
+
+/**
+ * The bare names a `thredz:` block registers from the Thredz MCP server
+ * (`goal_list`, `task_complete`, `wiki_space_create`, …): `memory` always,
+ * `messaging` too when the block says `messaging: true`. A permission rule
+ * naming one of them is a real rule in a spec with that block, and a near
+ * miss of a builtin (`goal_list` of GoalList) in a spec without one.
+ *
+ * Copied from `@crewhaus/memory-service` (`THREDZ_ALIAS_TOOL_NAMES`,
+ * `THREDZ_MESSAGING_TOOL_NAMES`) so a bundle that checks rules need not
+ * import it; `apps/cli/src/runtime-tool-names.test.ts` fails when it is stale.
+ */
+export const THREDZ_TOOL_NAMES: {
+  readonly memory: ReadonlyArray<string>;
+  readonly messaging: ReadonlyArray<string>;
+} = {
+  memory: [
+    "wiki_recall",
+    "wiki_semantic_search",
+    "wiki_search",
+    "wiki_get",
+    "wiki_write",
+    "wiki_list",
+    "wiki_related",
+    "wiki_set_signals",
+    "wiki_stats",
+    "log_knowledge_gap",
+    "goal_list",
+    "goal_get",
+    "goal_write",
+    "goal_update",
+    "task_list",
+    "task_complete",
+    "wiki_space_list",
+    "wiki_space_create",
+  ],
+  messaging: [
+    "agent_register",
+    "agent_update",
+    "agent_list",
+    "message_send",
+    "inbox_poll",
+    "message_ack",
+    "thread_get",
+    "agent_block",
+    "agent_unblock",
+  ],
+};

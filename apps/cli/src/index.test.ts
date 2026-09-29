@@ -626,6 +626,45 @@ describe("crewhaus compile", () => {
     expect(noted.exitCode).toBe(0);
   }, 60_000);
 
+  // C146 / back-compat (wave III): a model profile's deny and a sub-agent's
+  // deny are checked like the shape's rules, so --strict refuses a dead one;
+  // the trader starter's `alwaysAllow goal_list` is live with a thredz:
+  // block and passes --strict as it did on 0.7.0; a name nothing knows is a
+  // note --strict does not escalate.
+  test("compile --strict reads every rule list, and knows a thredz: block's tools", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const head = "agent:\n  model: claude-sonnet-4-6\n  instructions: tidy up\n";
+    writeFileSync(
+      specPath,
+      `name: lists\ntarget: cli\nmodels:\n  fast: { model: claude-haiku-4-5, permissions: { deny: [fetch] } }\n${head}  model_pool:\n    candidates:\n      - { model: $fast, tags: [cheap] }\n      - { model: claude-opus-4-8, tags: [strong] }\n  sub_agents:\n    helper:\n      description: d\n      instructions: help\n      tools: [RemovePath]\n      permissions: { allow: [], deny: ["removePath(src/**)"] }\ntools: [removePath, fetch]\n`,
+    );
+    const dead = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "a")],
+      { cwd: tmp },
+    );
+    expect(dead.exitCode).toBe(1);
+    expect(dead.stderr).toContain(
+      'warning[permission-rule] models.fast.permissions.deny: rule "fetch"',
+    );
+    expect(dead.stderr).toContain(
+      'warning[permission-rule] agent.sub_agents.helper.permissions.deny: rule "removePath(src/**)"',
+    );
+    writeFileSync(
+      specPath,
+      `name: goals\ntarget: cli\nthredz: { api_key: $THREDZ_API_KEY, goals: true }\n${head}tools: [read]\npermissions:\n  rules:\n    - { type: alwaysAllow, pattern: goal_list }\n    - { type: alwaysAllow, pattern: goal_write }\n    - { type: alwaysAllow, pattern: goal_update }\n    - { type: alwaysAllow, pattern: "NoSuchTool(**)" }\n`,
+    );
+    const live = await runCli(
+      ["compile", specPath, "--strict", "--no-register", "-o", join(tmp, "b")],
+      { cwd: tmp },
+    );
+    expect(live.stderr).not.toContain("goal_");
+    expect(live.stderr).toContain(
+      'warning[permission-rule-note] permissions.rules: rule "NoSuchTool(**)" names NoSuchTool',
+    );
+    expect(live.stderr).not.toContain("escalated to errors");
+    expect(live.exitCode).toBe(0);
+  }, 60_000);
+
   // provider-limits#0 — 0.7.0 compiled `tools: [all-code]` on a 128-tool
   // provider (even under --strict) and every call then failed with the
   // provider's 400. A site no model can serve is now refused. The warnings

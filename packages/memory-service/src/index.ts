@@ -141,6 +141,7 @@ import {
   type ThredzConnection,
   classifyThredzFailure,
   parseThredzRecallLines,
+  thredzAliasToolNames,
   withThredzGoalMirror,
 } from "./thredz.js";
 
@@ -173,12 +174,14 @@ export {
   THREDZ_SERVER_NAME,
   THREDZ_GOAL_TOOL_NAMES,
   THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_MESSAGING_TOOL_NAMES,
   THREDZ_ALIAS_TOOL_FLAGS,
   THREDZ_GOAL_MAP_FILE,
   classifyThredzFailure,
   connectThredz,
   extractThredzGoalId,
   parseThredzRecallLines,
+  thredzAliasToolNames,
   withThredzGoalMirror,
   type ConnectThredzOptions,
   type ThredzCallResult,

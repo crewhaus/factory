@@ -328,8 +328,9 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   const grantedTools = [...new Set(input.tools)].sort(compareStrings);
 
   // Rules that can never fire as written cover nothing; the ones whose
-  // argument is merely unscoped still match (on the call's text), and a
-  // `builtin-not-reached` glob still matches a declared MCP server's tools.
+  // argument is merely unscoped still match (on the call's text), a
+  // `builtin-not-reached` glob still matches a declared MCP server's tools,
+  // and a `tool-not-known` name may be a plugin's.
   const ruleProblems = permissionRuleProblems({
     rules: input.rules,
     granted: grantedTools.flatMap((tool) => {
@@ -348,7 +349,12 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
   });
   const deadRules = new Set(
     ruleProblems
-      .filter((p) => p.code !== "argument-not-scoped" && p.code !== "builtin-not-reached")
+      .filter(
+        (p) =>
+          p.code !== "argument-not-scoped" &&
+          p.code !== "builtin-not-reached" &&
+          p.code !== "tool-not-known",
+      )
       .map((p) => `${p.type} ${p.pattern}`),
   );
 

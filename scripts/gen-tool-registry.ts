@@ -35,6 +35,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runtimeToolNames } from "../apps/cli/src/runtime-tool-names";
+import {
+  THREDZ_ALIAS_TOOL_NAMES,
+  THREDZ_MESSAGING_TOOL_NAMES,
+} from "../packages/memory-service/src/thredz";
 import { TOOL_KEYWORDS } from "../apps/cli/src/tools-cli";
 import {
   BUILTIN_TOOLS,
@@ -188,6 +192,22 @@ export const TOOL_FLAGS_BY_NAME: ReadonlyMap<string, ToolFlags> = new Map(
  * out; \`apps/cli/src/tool-registry.test.ts\` fails when it is stale.
  */
 export const RUNTIME_TOOL_NAMES: ReadonlyArray<string> = ${JSON.stringify(runtimeToolNames(REPO_ROOT, builtinNames))};
+
+/**
+ * The bare names a \`thredz:\` block registers from the Thredz MCP server
+ * (\`goal_list\`, \`task_complete\`, \`wiki_space_create\`, …): \`memory\` always,
+ * \`messaging\` too when the block says \`messaging: true\`. A permission rule
+ * naming one of them is a real rule in a spec with that block, and a near
+ * miss of a builtin (\`goal_list\` of GoalList) in a spec without one.
+ *
+ * Copied from \`@crewhaus/memory-service\` (\`THREDZ_ALIAS_TOOL_NAMES\`,
+ * \`THREDZ_MESSAGING_TOOL_NAMES\`) so a bundle that checks rules need not
+ * import it; \`apps/cli/src/runtime-tool-names.test.ts\` fails when it is stale.
+ */
+export const THREDZ_TOOL_NAMES: {
+  readonly memory: ReadonlyArray<string>;
+  readonly messaging: ReadonlyArray<string>;
+} = ${JSON.stringify({ memory: [...THREDZ_ALIAS_TOOL_NAMES], messaging: [...THREDZ_MESSAGING_TOOL_NAMES] })};
 `,
 );
 

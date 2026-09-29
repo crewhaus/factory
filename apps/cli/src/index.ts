@@ -2739,10 +2739,18 @@ async function autoRegisterSpec(
   }
 }
 
+/** Rule findings that inform without saying the rule is dead: never escalated by --strict. */
+const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
+  "builtin-not-reached",
+  "tool-not-known",
+]);
+
 /**
  * The permission rules in a spec that can never do what they say, as compile
- * warnings (code `permission-rule`). A spec that does not parse or lower has
- * none here — the compile itself reports why.
+ * warnings (code `permission-rule`), in every list a spec carries — the
+ * shape's rules, each model profile's deny/ask, each sub-agent's allow/deny.
+ * A spec that does not parse or lower has none here — the compile itself
+ * reports why.
  */
 async function permissionRuleWarnings(
   yamlText: string,
@@ -2753,17 +2761,16 @@ async function permissionRuleWarnings(
   } catch {
     return [];
   }
-  const rules = (ir as { permissions?: { rules?: readonly unknown[] } }).permissions?.rules;
-  if (rules === undefined || rules.length === 0) return [];
   const toolMap = await loadToolMap();
   const byRegisteredName: Record<string, RegisteredTool> = {};
   for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
   // A `builtin-not-reached` note is about a rule that still fires (on a
-  // declared MCP server's tools), so --strict does not escalate it.
+  // declared MCP server's tools), and a `tool-not-known` one about a name a
+  // plugin or custom tool may still supply, so --strict escalates neither.
   return permissionRuleProblemsOf(ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
     (p) => ({
-      code: p.code === "builtin-not-reached" ? "permission-rule-note" : "permission-rule",
-      path: "permissions.rules",
+      code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
+      path: p.list,
       message: p.message,
     }),
   );

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import type { IrNode } from "@crewhaus/compiler";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
 import {
   formatLintJson,
   formatLintText,
@@ -8,6 +10,7 @@ import {
   runLint,
   suggestSafeName,
   suggestSecretFix,
+  thredzToolNamesOf,
 } from "./lint";
 
 /** A resolver that knows the built-in outward tools resolve to external scope,
@@ -302,6 +305,137 @@ permissions:
     expect(
       runLint(mcp, noTools).findings.filter((f) => f.rule.startsWith("permission-rule:")),
     ).toEqual([]);
+  });
+
+  // C146 (wave III): only the shape's `permissions.rules` were checked. A
+  // model profile's deny/ask and a sub-agent's allow/deny are matched the
+  // same way, and `removePath(src/**)`, `REMOVEPATH` or `fetch` there passed
+  // lint and compile --strict while never firing.
+  test("a model profile's and a sub-agent's rules are checked like the shape's", () => {
+    const yaml = `name: demo
+target: cli
+models:
+  fast: { model: claude-haiku-4-5, permissions: { deny: ['removePath(src/**)', 'REMOVEPATH', 'fetch'], ask: ['Fetch'] } }
+agent:
+  model: claude-sonnet-4-6
+  instructions: go
+  model_pool:
+    candidates:
+      - { model: $fast, tags: [cheap] }
+      - { model: claude-opus-4-8, tags: [strong] }
+  sub_agents:
+    helper:
+      description: d
+      instructions: help
+      tools: [RemovePath, Fetch]
+      permissions:
+        allow: ['Fetch', 'fetch(https://ok.example/**)']
+        deny: ['removePath(src/**)', 'fetch(https://evil.example/**)', 'RemovePath(build/**)']
+tools: [removePath, fetch]
+permissions:
+  mode: auto
+`;
+    const found = runLint(yaml, noTools).findings.filter((f) =>
+      f.rule.startsWith("permission-rule:"),
+    );
+    expect(found.map((f) => [f.rule, f.path, f.message.match(/Write "([^"]+)"/)?.[1]])).toEqual([
+      [
+        "permission-rule:tool-key-not-name",
+        "models.fast.permissions.deny[alwaysDeny removePath(src/**)]",
+        "RemovePath(src/**)",
+      ],
+      [
+        "permission-rule:unknown-tool",
+        "models.fast.permissions.deny[alwaysDeny REMOVEPATH]",
+        "RemovePath",
+      ],
+      [
+        "permission-rule:tool-key-not-name",
+        "models.fast.permissions.deny[alwaysDeny fetch]",
+        "Fetch",
+      ],
+      [
+        "permission-rule:tool-key-not-name",
+        "agent.sub_agents.helper.permissions.allow[alwaysAllow fetch(https://ok.example/**)]",
+        "Fetch(https://ok.example/**)",
+      ],
+      [
+        "permission-rule:tool-key-not-name",
+        "agent.sub_agents.helper.permissions.deny[alwaysDeny removePath(src/**)]",
+        "RemovePath(src/**)",
+      ],
+      [
+        "permission-rule:tool-key-not-name",
+        "agent.sub_agents.helper.permissions.deny[alwaysDeny fetch(https://evil.example/**)]",
+        "Fetch(https://evil.example/**)",
+      ],
+    ]);
+  });
+
+  // back-compat (wave III): with `thredz: {goals: true}` the runtime
+  // registers goal_list / goal_write / goal_update under those bare names, so
+  // the trader starter's allows are live. They were reported as near misses
+  // of GoalList, GoalWrite and GoalUpdate, and `compile --strict` failed.
+  test("a thredz: block's tools are real tools; without the block they are near misses", () => {
+    const rules = ["goal_list", "goal_write", "goal_update", "task_complete"]
+      .map((pattern) => `    - { type: alwaysAllow, pattern: ${pattern} }`)
+      .join("\n");
+    const base = `${validCli}tools: [read]
+permissions:
+  rules:
+${rules}
+    - { type: alwaysAllow, pattern: message_send }
+`;
+    const permissionRules = (yaml: string) =>
+      runLint(yaml, noTools)
+        .findings.filter((f) => f.rule.startsWith("permission-rule:"))
+        .map((f) => [f.rule, f.path]);
+    expect(permissionRules(`${base}thredz: { api_key: $THREDZ_API_KEY, goals: true }\n`)).toEqual([
+      // Messaging is opt-in: without `messaging: true` it is not registered.
+      ["permission-rule:tool-not-known", "permissions.rules[alwaysAllow message_send]"],
+    ]);
+    expect(
+      permissionRules(`${base}thredz: { api_key: $THREDZ_API_KEY, messaging: true }\n`),
+    ).toEqual([]);
+    expect(permissionRules(base)).toEqual([
+      ["permission-rule:unknown-tool", "permissions.rules[alwaysAllow goal_list]"],
+      ["permission-rule:unknown-tool", "permissions.rules[alwaysAllow goal_write]"],
+      ["permission-rule:unknown-tool", "permissions.rules[alwaysAllow goal_update]"],
+      ["permission-rule:tool-not-known", "permissions.rules[alwaysAllow task_complete]"],
+      ["permission-rule:tool-not-known", "permissions.rules[alwaysAllow message_send]"],
+    ]);
+  });
+
+  test("a crew role's own thredz: block registers the same tools", () => {
+    const ir = (roles: unknown[], top?: unknown) =>
+      ({
+        target: "crew",
+        roles,
+        ...(top !== undefined ? { thredz: top } : {}),
+      }) as unknown as IrNode;
+    const memory = [...THREDZ_TOOL_NAMES.memory];
+    const all = [...memory, ...THREDZ_TOOL_NAMES.messaging];
+    expect(thredzToolNamesOf(ir([{ name: "a" }]))).toEqual([]);
+    expect(thredzToolNamesOf(ir([{ name: "a", thredz: {} }]))).toEqual(memory);
+    expect(
+      thredzToolNamesOf(ir([{ name: "a" }, { name: "b", thredz: { messaging: true } }])),
+    ).toEqual(all);
+    expect(thredzToolNamesOf(ir([], { messaging: true }))).toEqual(all);
+  });
+
+  test("a rule naming a tool nothing knows gets a note, not a fix", () => {
+    const yaml = `${validCli}tools: [read]
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: "NoSuchTool(**)" }
+`;
+    const result = runLint(yaml, noTools);
+    const found = result.findings.filter((f) => f.rule.startsWith("permission-rule:"));
+    expect(found.map((f) => [f.rule, f.severity])).toEqual([
+      ["permission-rule:tool-not-known", "warning"],
+    ]);
+    expect(found[0]?.message).not.toContain("Write ");
+    expect(result.ok).toBe(true);
   });
 
   test("the live tool's declaration is what is checked", () => {
