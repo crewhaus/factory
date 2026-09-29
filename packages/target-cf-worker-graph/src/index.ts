@@ -10,6 +10,7 @@ import {
 import { parseModelString } from "@crewhaus/model-router";
 import { readmeToolFacts, resolveBuiltinTools } from "@crewhaus/tool-categories";
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
+import pkg from "../package.json" with { type: "json" };
 
 export type EmitOptions = {
   /**
@@ -503,12 +504,22 @@ enabled = true
 `;
 }
 
-const RUNTIME_DEP_RANGE = "^0.3.0";
+/**
+ * The version every @crewhaus package the generated worker imports is pinned
+ * to: this emitter's own. The release train stamps every @crewhaus package with
+ * one version (release-prep, lockstep), so it is exactly the runtime and tool
+ * packages this emitter was released with, as the other shapes' manifests pin
+ * the CLI's version. It was a literal "^0.3.0" until 0.7.1: npm has no
+ * @crewhaus/worker-runtime in that range, so `npm install` in an emitted worker
+ * failed, and the tool packages resolved to 0.3.x without any later edge fix.
+ * A static import, so a compiled binary carries the version it was built from.
+ */
+const RUNTIME_DEP_VERSION: string = pkg.version;
 
 function renderPackageJson(ir: IrGraphV0, wiring: EdgeToolWiring): string {
   const safeName = ir.name.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
-  const deps: Record<string, string> = { "@crewhaus/worker-runtime": RUNTIME_DEP_RANGE };
-  for (const pkg of wiring.packages) deps[pkg] = RUNTIME_DEP_RANGE;
+  const deps: Record<string, string> = { "@crewhaus/worker-runtime": RUNTIME_DEP_VERSION };
+  for (const pkg of wiring.packages) deps[pkg] = RUNTIME_DEP_VERSION;
   return `${JSON.stringify(
     {
       name: safeName,
