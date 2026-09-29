@@ -326,6 +326,14 @@ describe("C004 — a store the call leaves out, and a call that names no operati
     expect(await gate("WebhookPost", { urlEnv: "HOOK_URL", payload: { a: 1 } }, narrow)).toBe(
       "allow",
     );
+    // Nor is a destination deny set off by a link in the payload: every
+    // string must match, as in 0.7.0, not any one.
+    const http = rules(["alwaysDeny", "WebhookPost(http://**)"], ["alwaysAllow", "WebhookPost"]);
+    const alert = {
+      urlEnv: "HOOK_URL",
+      payload: { text: "Deploy failed", link: "http://status.internal/incident/42" },
+    };
+    expect(await gate("WebhookPost", alert, http)).toBe("allow");
   });
 });
 

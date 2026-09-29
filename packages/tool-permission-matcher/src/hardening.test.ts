@@ -1014,11 +1014,30 @@ describe("a deny or ask on a call that carries none of its declared operative fi
       operativeValues: [],
     });
 
-  test("is matched against the call's string values, as for a tool that declares nothing", () => {
+  test("fires when every string value of the call matches, as 0.7.0 read such a call", () => {
     expect(fires("WebhookPost(**)")).toBe(true);
-    expect(fires("WebhookPost(HOOK_URL)")).toBe(true);
+    // One string matching is not enough: 0.7.0 needed every one, and a
+    // deny about one value would otherwise fire on unrelated payload text.
+    expect(fires("WebhookPost(HOOK_URL)")).toBe(false);
     // A deny about a place the call does not name still does not fire.
     expect(fires("WebhookPost(https://evil.example/**)")).toBe(false);
+  });
+
+  test("a destination deny is not set off by a link inside the payload", () => {
+    // An ordinary alert whose destination is named through urlEnv, with a
+    // link in its text: `WebhookPost(http://**)` is about where the post
+    // goes, which this call does not say, and 0.7.0 allowed it.
+    const alert = {
+      urlEnv: "ALERT_WEBHOOK_URL",
+      payload: { text: "Deploy failed", link: "http://status.internal/incident/42" },
+    };
+    const deny = (pattern: string, input: unknown) =>
+      matchesPattern(compilePattern(pattern), "WebhookPost", input, {
+        ...restrict,
+        operativeValues: [],
+      });
+    expect(deny("WebhookPost(http://**)", alert)).toBe(false);
+    expect(deny("WebhookPost(**)", alert)).toBe(true);
   });
 
   test("no argument-scoped allow can match it", () => {

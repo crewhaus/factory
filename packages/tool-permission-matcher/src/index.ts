@@ -542,10 +542,11 @@ export type MatchOptions = {
    * {@link OPERATIVE_ARG_FIELDS} name table, then to every string in `input`.
    * Present but empty ⇒ the tool declares operative fields and this call
    * carries none of them (and no default stands in): no argument-scoped
-   * allow can match it, and a deny or ask is matched against the call's
-   * string values, as for a tool that declares nothing — `alwaysDeny
-   * WebhookPost(**)` still fires on a call that names its URL through
-   * `urlEnv`.
+   * allow can match it, and a deny or ask fires when EVERY string value of
+   * the call matches (0.7.0's reading of a tool it knew no field of) —
+   * `alwaysDeny WebhookPost(**)` still fires on a call that names its URL
+   * through `urlEnv`, and `WebhookPost(http://**)` is not set off by a link
+   * in its payload.
    */
   readonly operativeValues?: ReadonlyArray<OperativeValue>;
 };
@@ -1009,8 +1010,12 @@ function valueMatches(
  * call with no operative value an allow can read matches no
  * argument-scoped allow. A deny or ask on a call that carries none of its
  * tool's declared operative fields is matched against the call's string
- * values instead, the way 0.7.0 matched every tool — otherwise leaving every
- * optional operative field out would dodge `alwaysDeny Tool(**)`.
+ * values instead, the way 0.7.0 matched a tool it knew no field of: EVERY
+ * string must match, and a call with none matches nothing. So leaving
+ * every optional operative field out does not dodge `alwaysDeny Tool(**)`,
+ * while a deny about a destination (`WebhookPost(http://**)`) is not set
+ * off by a link inside the payload of a call that names its destination
+ * through `urlEnv`.
  */
 export function matchesPattern(
   compiled: CompiledPattern,
@@ -1023,16 +1028,20 @@ export function matchesPattern(
   if (argRe === null) return true;
   const polarity = options.polarity ?? "allow";
   const absoluteGlob = globIsAbsolute(compiled.argGlob ?? "");
-  let values = options.operativeValues ?? fallbackValues(toolName, input);
+  const values = options.operativeValues ?? fallbackValues(toolName, input);
   if (polarity === "allow") {
     const granted = values.filter((v) => v.restrictOnly !== true);
     if (granted.length === 0) return false;
     return granted.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
   }
   // The tool declares where it acts and this call names none of it: read
-  // what the call does carry, rather than let a deny or ask miss outright.
+  // what the call does carry, as 0.7.0 did — every string, not any one.
   if (values.length === 0 && options.operativeValues !== undefined) {
-    values = stringValues(input).map(undeclaredValue);
+    const strings = stringValues(input).map(undeclaredValue);
+    return (
+      strings.length > 0 &&
+      strings.every((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity))
+    );
   }
   return values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
 }
