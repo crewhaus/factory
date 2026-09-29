@@ -1050,10 +1050,39 @@ function valueMatches(
         folded.test(f.text),
     );
   }
-  const folds = restrictFoldsOf(value);
+  // A glob that folding leaves as it is compiles to the same matcher, so a
+  // fold that is already one of the value's own spellings was tested above;
+  // a command's words are mostly lower case already, and a long argv run in
+  // a subdirectory would otherwise be matched twice over.
+  const folds = globFoldsToItself(compiled) ? restrictNewFoldsOf(value) : restrictFoldsOf(value);
   if (folds === undefined) return false;
   const folded = foldedArgMatcher(compiled, "lower");
   return folds.some((candidate) => folded.test(candidate));
+}
+
+const globFoldCache = new WeakMap<CompiledPattern, boolean>();
+
+/** Does folding (NFC, lower case) leave this pattern's argument glob as it is? */
+function globFoldsToItself(compiled: CompiledPattern): boolean {
+  let same = globFoldCache.get(compiled);
+  if (same === undefined) {
+    const glob = compiled.argGlob ?? "";
+    same = foldPath(glob, true) === glob;
+    globFoldCache.set(compiled, same);
+  }
+  return same;
+}
+
+const restrictNewFoldCache = new WeakMap<OperativeValue, string[] | undefined>();
+
+/** The value's folds that are not already among its own canonical spellings and spellings. */
+function restrictNewFoldsOf(value: OperativeValue): string[] | undefined {
+  if (restrictNewFoldCache.has(value)) return restrictNewFoldCache.get(value);
+  const folds = restrictFoldsOf(value);
+  const own = new Set([...value.canonical, ...(value.spellings ?? [])]);
+  const fresh = folds?.filter((f) => !own.has(f));
+  restrictNewFoldCache.set(value, fresh);
+  return fresh;
 }
 
 /** The declared default that stands for every value of its field. */
