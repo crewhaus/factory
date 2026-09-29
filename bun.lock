@@ -3604,6 +3604,9 @@
     "packages/watchme-store": {
       "name": "@crewhaus/watchme-store",
       "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/tool-safety": "workspace:*",
+      },
     },
     "packages/wiki-store": {
       "name": "@crewhaus/wiki-store",
