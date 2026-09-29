@@ -31,12 +31,13 @@
  * families are not.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { xmlParse } from "@crewhaus/tool-data";
 import { paymentIdentifierValidate } from "@crewhaus/tool-money";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import { AmountError, formatMinor, minorUnitExponent } from "./lib/amounts";
 import { CalendarError } from "./lib/calendar";
@@ -55,7 +56,7 @@ import {
   localName,
   serialize,
 } from "./lib/xml";
-import { ToolPermissionError, resolveSafe } from "./paths";
+import { ToolPermissionError, resolveSafe, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -482,13 +483,20 @@ export const eInvoiceParse: RegisteredTool = buildTool({
     let source: string;
     if (input.file !== undefined) {
       const at = resolveSafe("EInvoiceParse", input.file);
-      const size = statSync(at.real).size;
-      if (size > LIMITS.documentBytes) {
+      // Opened without blocking, and only as a regular file: a FIFO with no
+      // writer blocks an ordinary open for ever, and this read was
+      // synchronous, so a named pipe in the workspace stopped the whole
+      // harness (C074). The limit is enforced while reading.
+      const read = openForReadSync(workspaceRoot(), input.file, {
+        maxBytes: LIMITS.documentBytes,
+      });
+      if (!read.ok) throw new ToolInputError(`EInvoiceParse: ${read.reason}`);
+      if (read.truncated) {
         throw new ToolInputError(
-          `${at.rel} is ${size} bytes, over the ${LIMITS.documentBytes}-byte limit for this tool`,
+          `${at.rel} is ${read.size} bytes, over the ${LIMITS.documentBytes}-byte limit for this tool`,
         );
       }
-      text = readFileSync(at.real, "utf8");
+      text = read.text;
       source = at.rel;
     } else {
       text = input.xml as string;

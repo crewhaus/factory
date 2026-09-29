@@ -21,12 +21,13 @@
  * wins". That is reported as `shadowedBy`/`alsoDefinedIn` with fingerprints,
  * which says the values differ without saying what either of them is.
  */
-import { readFileSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { ENV_FILENAMES } from "@crewhaus/harness-supervisor";
 import { resolveSafe } from "../paths";
 import { type BackendOutcome, classify } from "./backends";
 import { decodeAssignment, liveAssignments, parseEnvDoc } from "./envfile";
+import { readWorkspaceText } from "./read";
 import { type SecretRef, formatRef, readArgv } from "./refs";
 import { type CommandOptions, runCommand } from "./run";
 
@@ -96,7 +97,7 @@ function readFileValue(toolName: string, path: string): Resolution {
     };
   }
   try {
-    return { status: "resolved", value: readFileSync(real, "utf8"), source: path };
+    return { status: "resolved", value: readWorkspaceText(path), source: path };
   } catch (err) {
     return {
       status: "error",

@@ -28,9 +28,9 @@
  * leave the process are a VAT id or a company identifier going to a public
  * register. `index.test.ts` asserts both over every schema in the package.
  */
-import { readFileSync, statSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   type EntityRecord,
@@ -70,7 +70,7 @@ import {
   mapViesResponse,
   parseVatId,
 } from "./lib/vat";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 export { _setKycFetch, type KycFetch, ORIGINS } from "./lib/net";
 
@@ -929,21 +929,25 @@ export const sanctionsScreen: RegisteredTool = buildTool({
 
     for (const file of input.listFiles ?? []) {
       const at = resolveSafe("SanctionsScreen", file);
-      let size: number;
-      try {
-        size = statSync(at.real).size;
-      } catch {
+      // Opened without blocking, and only as a regular file: a FIFO with no
+      // writer blocks an ordinary open for ever, and this read was
+      // synchronous, so a named pipe named as a list stopped the whole
+      // harness (C074). The limit is enforced while reading.
+      const read = openForReadSync(workspaceRoot(), file, { maxBytes: LIMITS.snapshotBytes });
+      if (!read.ok) {
         // A refusal in the package's own words, with the path as the caller
         // wrote it. The raw ENOENT carries an absolute path from this machine,
         // which is both unreadable and more than the caller asked for.
-        return `SanctionsScreen refused ${at.rel}: there is no such file in the workspace`;
+        return read.code === "not-found"
+          ? `SanctionsScreen refused ${at.rel}: there is no such file in the workspace`
+          : `SanctionsScreen refused ${at.rel}: ${read.reason}`;
       }
-      if (size > LIMITS.snapshotBytes) {
-        return `SanctionsScreen refused ${at.rel}: it is ${size} bytes, over the ${LIMITS.snapshotBytes}-byte limit`;
+      if (read.truncated) {
+        return `SanctionsScreen refused ${at.rel}: it is ${read.size} bytes, over the ${LIMITS.snapshotBytes}-byte limit`;
       }
       let document: unknown;
       try {
-        document = JSON.parse(readFileSync(at.real, "utf-8"));
+        document = JSON.parse(read.text);
       } catch (err) {
         return `SanctionsScreen refused ${at.rel}: it is not JSON (${(err as Error).message})`;
       }

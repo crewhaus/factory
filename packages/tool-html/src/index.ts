@@ -12,9 +12,9 @@
  * the browser, the markup will not contain the content, and the tools will
  * correctly report that it does not.
  */
-import { readFileSync, statSync } from "node:fs";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   type TextBudget,
@@ -30,7 +30,7 @@ import {
 } from "./lib/extract";
 import { type Element, attrOf, parseHtml } from "./lib/parse";
 import { createMatchContext, queryAll } from "./lib/select";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -85,11 +85,17 @@ function loadSource(
   }
   if (input.file !== undefined) {
     const at = resolveSafe(tool, input.file);
-    const size = statSync(at.real).size;
-    if (size > LIMITS.fileBytes) {
-      throw new Error(`${at.rel} is ${size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
+    // Opened without blocking, and only as a regular file: a FIFO with no
+    // writer blocks an ordinary open for ever, and this read was synchronous,
+    // so a named pipe in the workspace stopped the whole harness (C074). The
+    // byte limit is enforced while reading, not by a size read before the
+    // open.
+    const read = openForReadSync(workspaceRoot(), input.file, { maxBytes: LIMITS.fileBytes });
+    if (!read.ok) throw new Error(`${tool}: ${read.reason}`);
+    if (read.truncated) {
+      throw new Error(`${at.rel} is ${read.size} bytes, over the ${LIMITS.fileBytes}-byte limit`);
     }
-    const text = readFileSync(at.real, "utf-8");
+    const text = read.text;
     return { root: parseHtml(text), from: at.rel, chars: text.length };
   }
   const text = input.html as string;

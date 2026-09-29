@@ -23,10 +23,11 @@
  * package drives it, and nothing in the suite resolves a name or opens a
  * socket.
  */
-import { chmodSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import { openForReadSync } from "@crewhaus/tool-safety/fs";
 import { z } from "zod";
 import {
   type DependencySite,
@@ -65,7 +66,7 @@ import {
   fetchPackage,
   searchRegistry,
 } from "./lib/registries";
-import { resolveSafe } from "./paths";
+import { resolveSafe, workspaceRoot } from "./paths";
 
 export { _setRegistryFetch, type RegistryFetch } from "./lib/net";
 
@@ -320,13 +321,19 @@ function loadManifest(tool: string, given: string): LoadedManifest {
       message: `${tool} does not read "${basename(at.real)}" — it reads package.json, Cargo.toml and pyproject.toml. A go.mod, a requirements.txt or a Gemfile is a different grammar, and guessing at one is how a manifest gets corrupted.`,
     };
   }
-  if (stat.size > MAX_MANIFEST_BYTES) {
+  // Opened without blocking, and only as a regular file: `statSync` does not
+  // block on a FIFO, but the read after it did, for ever, and it was
+  // synchronous, so a named pipe called package.json stopped the whole
+  // harness (C074). The byte limit is enforced while reading.
+  const read = openForReadSync(workspaceRoot(), given, { maxBytes: MAX_MANIFEST_BYTES });
+  if (!read.ok) return { ok: false, message: `${tool}: ${read.reason}` };
+  if (read.truncated) {
     return {
       ok: false,
-      message: `${tool}: "${at.rel}" is ${stat.size} bytes, which is not a manifest`,
+      message: `${tool}: "${at.rel}" is ${read.size} bytes, which is not a manifest`,
     };
   }
-  const bytes = readFileSync(at.real);
+  const bytes = Buffer.from(read.bytes);
   const text = bytes.toString("utf-8");
   return {
     ok: true,
