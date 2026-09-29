@@ -920,6 +920,7 @@
         "@crewhaus/tool-fs": "workspace:*",
         "@crewhaus/tool-image": "workspace:*",
         "@crewhaus/tool-mcp": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/tool-task": "workspace:*",
         "@crewhaus/tool-todo": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
