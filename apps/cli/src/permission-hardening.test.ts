@@ -564,6 +564,50 @@ describe("C033 — a scoped allow on a multi-field builtin is usable", () => {
     expect(await gate("RunCommand", { argv: ["ls"], cwd: "src" }, deny)).toBe("allow");
   }, 30_000);
 
+  // merge-seams (wave III): the deny that refused `[sh, scripts/release.sh]`
+  // allowed `[sh, release.sh]` with `cwd: scripts`, and the script ran.
+  test("a deny naming a script by its workspace path holds when the call runs it from its directory", async () => {
+    mkdirSync(join(ws, "scripts"));
+    writeFileSync(join(ws, "scripts", "release.sh"), 'echo released > "$PWD/../RELEASED"\n');
+    mkdirSync(join(ws, "node_modules", ".bin"), { recursive: true });
+    writeFileSync(join(ws, "node_modules", ".bin", "eslint"), "#!/bin/sh\necho linted > RAN\n", {
+      mode: 0o755,
+    });
+    const retry = { maxAttempts: 1, backoff: { kind: "fixed", delayMs: 0 } };
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["RunCommand", { argv: ["sh", "release.sh"], cwd: "scripts" }],
+      ["RunCommand", { argv: ["sh", "./release.sh"], cwd: "./scripts/" }],
+      ["ProcessStart", { argv: ["sh", "release.sh"], cwd: "scripts" }],
+      ["Retry", { argv: ["sh", "release.sh"], cwd: "scripts", ...retry }],
+      ["RunPipeline", { steps: [{ argv: ["sh", "release.sh"], cwd: "scripts" }] }],
+      ["RunPipeline", { cwd: "scripts", steps: [{ argv: ["sh", "release.sh"] }] }],
+    ];
+    const decisions: string[] = [];
+    for (const [tool, input] of calls) {
+      const rs = rules(["alwaysDeny", `${tool}(*scripts/release.sh*)`], ["alwaysAllow", tool]);
+      decisions.push(`${tool} ${JSON.stringify(input)}: ${await gate(tool, input, rs)}`);
+    }
+    expect(decisions.filter((d) => !d.endsWith(": deny"))).toEqual([]);
+    expect(existsSync(join(ws, "RELEASED"))).toBe(false);
+    // A deny on a directory of programs, and the binary run from inside it.
+    const bin = rules(
+      ["alwaysDeny", "RunCommand(**node_modules/.bin/**)"],
+      ["alwaysAllow", "RunCommand"],
+    );
+    expect(await gate("RunCommand", { argv: ["./eslint"], cwd: "node_modules/.bin" }, bin)).toBe(
+      "deny",
+    );
+    expect(existsSync(join(ws, "node_modules", ".bin", "RAN"))).toBe(false);
+    // The same words in another directory are another program, and run.
+    expect(
+      await gate(
+        "RunCommand",
+        { argv: ["sh", "-c", "true"], cwd: "src" },
+        rules(["alwaysDeny", "RunCommand(*scripts/release.sh*)"], ["alwaysAllow", "RunCommand"]),
+      ),
+    ).toBe("allow");
+  }, 30_000);
+
   test("a boolean switch is not part of what a rule sees (documented; 0.8)", async () => {
     const rs = rules(["alwaysAllow", "RemovePath(build/**)"]);
     const call = { path: "build/nothing-here", recursive: true, dryRun: false };

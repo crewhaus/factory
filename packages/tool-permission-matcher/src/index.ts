@@ -174,7 +174,36 @@ export type GlobMatcher = {
    * in its last segment (see `OperativeValue.standsForAny`).
    */
   readonly matchesSegmentAfter: (prefix: string) => boolean;
+  /**
+   * Whether the glob matches `prefix` followed by SOME continuation (possibly
+   * none): a run without a `/` when `tail` is `"segment"`, any run at all
+   * when it is `"run"`.
+   */
+  readonly matchesSomeAfter: (prefix: string, tail: AnyValueTail) => boolean;
+  /**
+   * Whether the glob matches `prefix` followed by EVERY continuation of the
+   * `tail` kind — what an allow must satisfy to grant a value that stands for
+   * every value. `false` when working that out would take more than a
+   * bounded amount of work: an allow that cannot be shown to cover every
+   * value grants nothing.
+   */
+  readonly matchesEveryAfter: (prefix: string, tail: AnyValueTail) => boolean;
 };
+
+/**
+ * What follows the prefix of a value that stands for every value: one path
+ * segment (an address after `<chainId>/`), or any run of characters (a path,
+ * a URL or a command, which may hold `/`).
+ */
+export type AnyValueTail = "segment" | "run";
+
+/**
+ * How many sets of automaton states {@link GlobMatcher.matchesEveryAfter}
+ * explores before it gives up and answers `false`. A glob a person writes
+ * reaches a handful; the bound keeps a pathological one from stalling the
+ * permission gate.
+ */
+const EVERY_AFTER_STATE_SETS = 4096;
 
 function compileGlob(glob: string): GlobMatcher {
   const tokens = tokenizeGlob(glob);
@@ -183,13 +212,17 @@ function compileGlob(glob: string): GlobMatcher {
   if (tokens.every((t) => t.k === "lit")) {
     let literal = "";
     for (const t of tokens) literal += String.fromCharCode((t as { c: number }).c);
+    const someAfter = (prefix: string, tail: AnyValueTail): boolean =>
+      literal.startsWith(prefix) && (tail === "run" || !literal.slice(prefix.length).includes("/"));
     return {
       test: (value: string, work?: { steps: number }) => {
         if (work !== undefined) work.steps += value.length;
         return value === literal;
       },
-      matchesSegmentAfter: (prefix: string) =>
-        literal.startsWith(prefix) && !literal.slice(prefix.length).includes("/"),
+      matchesSegmentAfter: (prefix: string) => someAfter(prefix, "segment"),
+      matchesSomeAfter: someAfter,
+      // One string: never both the prefix alone and the prefix plus more.
+      matchesEveryAfter: () => false,
     };
   }
 
@@ -239,6 +272,69 @@ function compileGlob(glob: string): GlobMatcher {
   const start = next;
   const count = states.length;
 
+  /** The non-split states reachable from `from` without reading, sorted. */
+  function closureOf(from: ReadonlyArray<number>): number[] {
+    const seen = new Uint8Array(count);
+    const out: number[] = [];
+    const stack = [...from];
+    while (stack.length > 0) {
+      const s = stack.pop() as number;
+      if (seen[s] === 1) continue;
+      seen[s] = 1;
+      const st = states[s] as GlobState;
+      if (st.t === "split") stack.push(st.b, st.a);
+      else out.push(s);
+    }
+    return out.sort((a, b) => a - b);
+  }
+
+  /** The states after reading `c` from the (closed) set `set`, closed again. */
+  function stepOn(set: ReadonlyArray<number>, c: number): number[] {
+    const next: number[] = [];
+    for (const s of set) {
+      const st = states[s] as GlobState;
+      if (
+        (st.t === "lit" && st.c === c) ||
+        (st.t === "notSlash" && c !== SLASH) ||
+        st.t === "anyChar"
+      ) {
+        next.push(st.out);
+      }
+    }
+    return next.length === 0 ? next : closureOf(next);
+  }
+
+  /** The states after reading `prefix` from the start, like `test` does. */
+  function afterPrefix(prefix: string): number[] {
+    let current = closureOf([start]);
+    for (let i = 0; i < prefix.length && current.length > 0; i++) {
+      current = stepOn(current, prefix.charCodeAt(i));
+    }
+    return current;
+  }
+
+  /** Whether the accepting state is reachable after the prefix, reading `tail` characters. */
+  function someAfter(prefix: string, tail: AnyValueTail): boolean {
+    const seen = new Uint8Array(count);
+    const stack = afterPrefix(prefix);
+    while (stack.length > 0) {
+      const s = stack.pop() as number;
+      if (seen[s] === 1) continue;
+      seen[s] = 1;
+      const st = states[s] as GlobState;
+      if (st.t === "accept") return true;
+      if (st.t === "split") stack.push(st.b, st.a);
+      else if (
+        (st.t === "lit" && (tail === "run" || st.c !== SLASH)) ||
+        st.t === "notSlash" ||
+        st.t === "anyChar"
+      ) {
+        stack.push(st.out);
+      }
+    }
+    return false;
+  }
+
   return {
     test(value: string, work?: { steps: number }): boolean {
       // `seen[s] === step` ⇔ state s is already in the set for this step.
@@ -286,45 +382,41 @@ function compileGlob(glob: string): GlobMatcher {
       return done(current.includes(0));
     },
     matchesSegmentAfter(prefix: string): boolean {
-      // Run the prefix like `test` does, then ask whether the accepting
-      // state can be reached reading only characters that are not `/`.
-      let current = [start];
-      for (let i = 0; i < prefix.length; i++) {
-        const c = prefix.charCodeAt(i);
-        const following: number[] = [];
-        const seen = new Uint8Array(count);
-        const stack = [...current];
-        while (stack.length > 0) {
-          const s = stack.pop() as number;
-          if (seen[s] === 1) continue;
-          seen[s] = 1;
-          const st = states[s] as GlobState;
-          if (st.t === "split") stack.push(st.b, st.a);
-          else if (
-            (st.t === "lit" && st.c === c) ||
-            (st.t === "notSlash" && c !== SLASH) ||
-            st.t === "anyChar"
-          ) {
-            following.push(st.out);
-          }
-        }
-        if (following.length === 0) return false;
-        current = following;
+      return someAfter(prefix, "segment");
+    },
+    matchesSomeAfter: someAfter,
+    matchesEveryAfter(prefix: string, tail: AnyValueTail): boolean {
+      // The sets of states the automaton can be in after the prefix and any
+      // continuation, built one character class at a time (the subset
+      // construction). Every continuation is accepted exactly when every such
+      // set holds the accepting state. Characters the glob never names act
+      // alike, so one stands for all of them.
+      const first = afterPrefix(prefix);
+      if (first.length === 0) return false;
+      const alphabet = new Set<number>();
+      for (const st of states) {
+        if (st.t === "lit" && (tail === "run" || st.c !== SLASH)) alphabet.add(st.c);
       }
-      const seen = new Uint8Array(count);
-      const stack = [...current];
-      while (stack.length > 0) {
-        const s = stack.pop() as number;
-        if (seen[s] === 1) continue;
-        seen[s] = 1;
-        const st = states[s] as GlobState;
-        if (st.t === "accept") return true;
-        if (st.t === "split") stack.push(st.b, st.a);
-        else if ((st.t === "lit" && st.c !== SLASH) || st.t === "notSlash" || st.t === "anyChar") {
-          stack.push(st.out);
+      if (tail === "run") alphabet.add(SLASH);
+      let other = 0x61;
+      while (alphabet.has(other) || other === SLASH) other++;
+      alphabet.add(other);
+      const seenSets = new Set<string>([first.join(",")]);
+      const queue: number[][] = [first];
+      while (queue.length > 0) {
+        const set = queue.pop() as number[];
+        if (!set.includes(0)) return false;
+        for (const c of alphabet) {
+          const next = stepOn(set, c);
+          if (next.length === 0) return false;
+          const key = next.join(",");
+          if (seenSets.has(key)) continue;
+          if (seenSets.size >= EVERY_AFTER_STATE_SETS) return false;
+          seenSets.add(key);
+          queue.push(next);
         }
       }
-      return false;
+      return true;
     },
   };
 }
@@ -461,12 +553,17 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * - `standsForAny` — the value stands for EVERY value after each of these
  *   prefixes: a field left out whose declared default is `*` (an EvmGetLogs
  *   call with no `address` reads every contract's logs, and is matched as
- *   `<chainId>/*`). A deny or ask rule fires when its glob matches one of
- *   the prefixes followed by any one segment, so `alwaysDeny
- *   EvmGetLogs(1/0xdAC17F…)` catches the query that reads that contract
- *   among all the others, and `EvmGetLogs(137/…)` does not. An allow rule
- *   still matches only `canonical` — naming one contract does not grant a
- *   read of all of them.
+ *   `<chainId>/*`). What follows a prefix is one segment for an id, a
+ *   recipient or a text value, and any run of characters for a path, a URL
+ *   or a command. A deny or ask rule fires when its glob matches one of the
+ *   prefixes followed by some such continuation, in any form the kind is
+ *   folded in (so `alwaysDeny EvmGetLogs(Base/0xdAC17F…)` catches the query
+ *   on `base` that reads that contract among all the others, and
+ *   `EvmGetLogs(137/…)` does not). Each `canonical` spelling is then
+ *   `<prefix>*`, and an allow rule grants it only when its glob matches the
+ *   prefix followed by EVERY continuation: `EvmGetLogs(1/*)` grants the
+ *   every-contract read, while naming one contract, `EvmGetLogs(1/0x*)` or
+ *   `EvmGetLogs(1/?)` does not.
  *
  * For a `path` value, a glob that starts with `/` is compared with the
  * absolute spellings and any other glob with the relative ones, so
@@ -880,6 +977,19 @@ function valueMatches(
   polarity: RulePolarity,
 ): boolean {
   if (value.outsideWorkspace === true) return polarity === "restrict";
+  // A value that stands for every value (a field left out whose default is
+  // `*`) is granted only by a glob that matches every value there: its
+  // canonical spelling `<prefix>*` is not a literal `*`, so `EvmGetLogs(1/?)`
+  // cannot stand in for `EvmGetLogs(1/*)`.
+  if (polarity === "allow" && value.standsForAny !== undefined) {
+    const tail = anyValueTail(value.kind);
+    return value.canonical.some((candidate) => {
+      if (value.kind === "path" && isAbsoluteSpelling(candidate) !== absoluteGlob) return false;
+      return candidate.endsWith(ANY_VALUE)
+        ? argRe.matchesEveryAfter(candidate.slice(0, -ANY_VALUE.length), tail)
+        : argRe.test(candidate);
+    });
+  }
   const candidates =
     polarity === "allow"
       ? value.kind === "url"
@@ -892,11 +1002,11 @@ function valueMatches(
   }
   if (polarity !== "restrict") return false;
   // A field the call left out whose default is `*` stands for every value, so
-  // a deny or ask naming any one value there fires on it.
-  if (value.standsForAny !== undefined) {
-    for (const prefix of value.standsForAny) {
-      if (argRe.matchesSegmentAfter(prefix)) return true;
-    }
+  // a deny or ask naming any one value there fires on it — in whatever form
+  // the kind is folded in below, so a deny naming the chain `Base` catches
+  // the every-contract query on `base` as it catches the one-contract one.
+  if (value.standsForAny !== undefined && standsForAnyFires(value, compiled, argRe, absoluteGlob)) {
+    return true;
   }
   // A deny or ask on a path is not dodged by spelling the name another way
   // the filesystem treats as the same: another Unicode normal form always,
@@ -933,6 +1043,52 @@ function valueMatches(
   if (folds === undefined) return false;
   const folded = foldedArgMatcher(compiled, "lower");
   return folds.some((candidate) => folded.test(candidate));
+}
+
+/** The declared default that stands for every value of its field. */
+const ANY_VALUE = "*";
+
+/**
+ * What follows a prefix in a value that stands for every value. An id, a
+ * recipient or a text value is one segment after its qualifier (the address
+ * after `<chainId>/`), so `EvmGetLogs(137/…)` does not fire on chain 1's
+ * every-contract query; a path, a URL or a command may hold `/` anywhere.
+ */
+function anyValueTail(kind: OperativeValueKind): AnyValueTail {
+  return kind === "path" || kind === "url" || kind === "command" ? "run" : "segment";
+}
+
+/**
+ * Does a deny or ask glob name some value of a value that stands for every
+ * value — directly, or folded the way a value of its kind is folded?
+ */
+function standsForAnyFires(
+  value: OperativeValue,
+  compiled: CompiledPattern,
+  argRe: GlobMatcher,
+  absoluteGlob: boolean,
+): boolean {
+  const tail = anyValueTail(value.kind);
+  const prefixes = (value.standsForAny ?? []).filter(
+    (prefix) => value.kind !== "path" || isAbsoluteSpelling(prefix) === absoluteGlob,
+  );
+  if (prefixes.some((prefix) => argRe.matchesSomeAfter(prefix, tail))) return true;
+  if (value.kind === "path") {
+    const ignoreCase = value.caseInsensitive === true;
+    const folded = foldedArgMatcher(compiled, ignoreCase ? "lower" : "nfc");
+    return prefixes.some((prefix) => folded.matchesSomeAfter(foldPath(prefix, ignoreCase), tail));
+  }
+  const foldsCase =
+    value.caseInsensitive === true ||
+    value.kind === "url" ||
+    value.kind === "id" ||
+    value.kind === "recipient" ||
+    value.kind === "command";
+  if (!foldsCase) return false;
+  const folded = foldedArgMatcher(compiled, "lower");
+  return prefixes.some((prefix) =>
+    folded.matchesSomeAfter(prefix.normalize("NFC").toLowerCase(), tail),
+  );
 }
 
 /**

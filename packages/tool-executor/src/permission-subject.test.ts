@@ -350,8 +350,29 @@ describe("url, command and id values", () => {
     const rm = { argv: ["rm", "-rf", "x"], cwd: "src" };
     expect(match("Run(rm)", "restrict", rm)).toBe(true);
     expect(match("Run(rm -rf *)", "restrict", rm)).toBe(true);
+    // As written, then each word that may name a file as that file from the
+    // root, alone and in the command line, and the directory itself.
     expect(values(rm)).toEqual([
-      { kind: "command", canonical: [], spellings: ["rm -rf x", "rm", "-rf", "x"] },
+      {
+        kind: "command",
+        canonical: [],
+        spellings: [
+          "rm -rf x",
+          "rm",
+          "-rf",
+          "x",
+          "src",
+          "src/rm",
+          "src/x",
+          "src/rm -rf src/x",
+          "rm -rf src/x",
+          "./src",
+          "./src/rm",
+          "./src/x",
+          "./src/rm -rf ./src/x",
+          "rm -rf ./src/x",
+        ],
+      },
     ]);
     // The command is not written with its directory in front.
     expect(readOperativeField(rm, { field: "argv", kind: "command", within: "cwd" })).toEqual([
@@ -379,6 +400,193 @@ describe("url, command and id values", () => {
     expect(
       grantable({ cwd: "sub", steps: [{ argv: ["make"] }, { argv: ["make"], cwd: "." }] }),
     ).toEqual([false, true]);
+  });
+
+  // merge-seams (wave III): `alwaysDeny RunCommand(*scripts/release.sh*)`
+  // refused `[sh, scripts/release.sh]` and allowed `[sh, release.sh]` with
+  // `cwd: scripts` — the same script. Nothing a deny read joined the working
+  // directory with the words.
+  test("a deny naming a program by its workspace path fires when the call runs it from its directory", () => {
+    const run = buildTool({
+      name: "Run",
+      description: "d",
+      inputSchema: z.object({ argv: z.array(z.string()), cwd: z.string().optional() }),
+      operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+      execute: async () => "ok",
+    });
+    const pipe = buildTool({
+      name: "Pipe",
+      description: "d",
+      inputSchema: z.object({
+        steps: z.array(z.object({ argv: z.array(z.string()), cwd: z.string().optional() })),
+        cwd: z.string().optional(),
+      }),
+      operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd" }],
+      execute: async () => "ok",
+    });
+    const on =
+      (polarity: "allow" | "restrict", canonicalizePath?: PathCanonicalizer) =>
+      (tool: typeof run, pattern: string, input: unknown) =>
+        matchesPattern(compilePattern(pattern), tool.name, input, {
+          polarity,
+          operativeValues:
+            operativeValuesFor(
+              tool,
+              input,
+              canonicalizePath !== undefined ? { canonicalizePath } : {},
+            ) ?? [],
+        });
+    const fires = on("restrict");
+    const release = "Run(*scripts/release.sh*)";
+    const cases: Array<[typeof run, string, unknown]> = [
+      [run, release, { argv: ["sh", "release.sh"], cwd: "scripts" }],
+      [run, release, { argv: ["sh", "./release.sh"], cwd: "scripts/" }],
+      [run, release, { argv: ["sh", "release.sh"], cwd: "./scripts" }],
+      [run, release, { argv: ["sh", "release.sh"], cwd: "other/../scripts" }],
+      [run, "Run(scripts/release.sh)", { argv: ["sh", "release.sh"], cwd: "scripts" }],
+      [run, "Run(sh scripts/release.sh)", { argv: ["sh", "release.sh"], cwd: "scripts" }],
+      [run, "Run(**node_modules/.bin/**)", { argv: ["./eslint", "src"], cwd: "node_modules/.bin" }],
+      [run, "Run(**/node_modules/.bin/eslint)", { argv: ["eslint"], cwd: "node_modules/.bin" }],
+      [
+        pipe,
+        "Pipe(*scripts/release.sh*)",
+        { steps: [{ argv: ["sh", "release.sh"], cwd: "scripts" }] },
+      ],
+      [
+        pipe,
+        "Pipe(*scripts/release.sh*)",
+        { cwd: "scripts", steps: [{ argv: ["sh", "release.sh"] }] },
+      ],
+    ];
+    expect(
+      cases
+        .filter(([tool, p, input]) => !fires(tool, p, input))
+        .map(([, p, input]) => `${p} ${JSON.stringify(input)}`),
+    ).toEqual([]);
+    // The same words run from the root, or from another directory, are not
+    // that script.
+    expect(fires(run, release, { argv: ["sh", "release.sh"] })).toBe(false);
+    expect(fires(run, release, { argv: ["sh", "release.sh"], cwd: "other" })).toBe(false);
+    // A flag or a URL is not a file in the directory.
+    expect(fires(run, "Run(scripts/-v)", { argv: ["sh", "-v"], cwd: "scripts" })).toBe(false);
+    // A directory the runtime resolves through a symlink is read where it
+    // leads, too.
+    const linked: PathCanonicalizer = (raw) =>
+      raw === "bin"
+        ? [{ kind: "path", canonical: ["tools/bin", "./tools/bin"], spellings: ["bin"] }]
+        : lexicalPathValues(raw);
+    expect(
+      on("restrict", linked)(run, "Run(tools/bin/deploy*)", { argv: ["./deploy"], cwd: "bin" }),
+    ).toBe(true);
+    // And an allow still does not follow the call into the directory.
+    expect(
+      on("allow")(run, "Run(sh scripts/release.sh)", {
+        argv: ["sh", "release.sh"],
+        cwd: "scripts",
+      }),
+    ).toBe(false);
+  });
+
+  // merge-seams (wave III): the documented `default: "*"` — "a deny or ask
+  // naming any one value there fires" — held for ids only. A path, a URL, or
+  // a command run outside the root came back as the literal `*`, which no
+  // deny naming a real place matched.
+  test("a left-out path, URL or command whose default is * stands for every value", () => {
+    const probe = (operativeArgs: Parameters<typeof buildTool>[0]["operativeArgs"]) =>
+      buildTool({
+        name: "Probe",
+        description: "d",
+        inputSchema: z.object({
+          path: z.string().optional(),
+          url: z.string().optional(),
+          argv: z.array(z.string()).optional(),
+          cwd: z.string().optional(),
+        }),
+        operativeArgs,
+        execute: async () => "ok",
+      });
+    const on =
+      (polarity: "allow" | "restrict") =>
+      (tool: ReturnType<typeof probe>, input: unknown, canonicalizePath?: PathCanonicalizer) =>
+      (pattern: string) =>
+        matchesPattern(compilePattern(pattern), "Probe", input, {
+          polarity,
+          operativeValues:
+            operativeValuesFor(
+              tool,
+              input,
+              canonicalizePath !== undefined ? { canonicalizePath } : {},
+            ) ?? [],
+        });
+    const fires = on("restrict");
+    const grants = on("allow");
+
+    const path = probe([{ field: "path", kind: "path", default: "*" }]);
+    expect(["Probe(secret/**)", "Probe(**/.env)"].filter(fires(path, {}))).toHaveLength(2);
+    expect(fires(path, {})("Probe(/etc/**)")).toBe(false);
+    expect(grants(path, {})("Probe(**)")).toBe(true);
+    expect(["Probe(*)", "Probe(?)", "Probe(src/**)"].filter(grants(path, {}))).toEqual([]);
+    // With the runtime's absolute spelling of the root, an absolute deny too.
+    const rooted: PathCanonicalizer = (raw) =>
+      raw === "." ? [{ kind: "path", canonical: [".", "/ws"] }] : lexicalPathValues(raw);
+    expect(fires(path, {}, rooted)("Probe(/ws/secret/**)")).toBe(true);
+    expect(fires(path, {}, rooted)("Probe(/etc/**)")).toBe(false);
+
+    const scoped = probe([{ field: "path", kind: "path", within: "cwd", default: "*" }]);
+    expect(fires(scoped, { cwd: "pkg" })("Probe(pkg/secret/**)")).toBe(true);
+    expect(fires(scoped, { cwd: "pkg" })("Probe(other/**)")).toBe(false);
+    expect(grants(scoped, { cwd: "pkg" })("Probe(pkg/**)")).toBe(true);
+    expect(grants(scoped, { cwd: "pkg" })("Probe(pkg/*)")).toBe(false);
+    // A directory outside the workspace: every deny fires, no allow grants.
+    expect(fires(scoped, { cwd: "../x" })("Probe(nothing-like-it)")).toBe(true);
+    expect(grants(scoped, { cwd: "../x" })("Probe(**)")).toBe(false);
+
+    const url = probe([{ field: "url", kind: "url", default: "*" }]);
+    expect(fires(url, {})("Probe(https://evil.example/**)")).toBe(true);
+    expect(grants(url, {})("Probe(**)")).toBe(true);
+    expect(grants(url, {})("Probe(https://**)")).toBe(false);
+
+    const cmd = probe([{ field: "argv", kind: "command", within: "cwd", default: "*" }]);
+    for (const input of [{}, { cwd: "." }, { cwd: "sub" }]) {
+      expect({ input, fires: fires(cmd, input)("Probe(rm*)") }).toEqual({ input, fires: true });
+      expect({ input, fires: fires(cmd, input)("Probe(*/deploy.sh)") }).toEqual({
+        input,
+        fires: true,
+      });
+    }
+    expect(grants(cmd, {})("Probe(**)")).toBe(true);
+    expect(grants(cmd, {})("Probe(*)")).toBe(false);
+    expect(grants(cmd, { cwd: "sub" })("Probe(**)")).toBe(false);
+  });
+
+  test("an EvmGetLogs-shaped every-contract query: a deny in another case fires, `?` grants nothing", () => {
+    const logs = buildTool({
+      name: "Logs",
+      description: "d",
+      inputSchema: z.object({ chainId: z.string(), address: z.string().optional() }),
+      operativeArgs: [{ field: "address", kind: "id", within: "chainId", default: "*" }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    const USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+    const at = (polarity: "allow" | "restrict", pattern: string, input: unknown) =>
+      matchesPattern(compilePattern(pattern), "Logs", input, {
+        polarity,
+        operativeValues: operativeValuesFor(logs, input) ?? [],
+      });
+    const every = { chainId: "base" };
+    const one = { chainId: "base", address: USDT };
+    // The narrower query and the broader one are caught alike.
+    for (const deny of [`Logs(Base/${USDT})`, `Logs(BASE/${USDT.toLowerCase()})`]) {
+      expect({ deny, one: at("restrict", deny, one), every: at("restrict", deny, every) }).toEqual({
+        deny,
+        one: true,
+        every: true,
+      });
+    }
+    expect(at("restrict", `Logs(137/${USDT})`, every)).toBe(false);
+    expect(at("allow", "Logs(base/?)", every)).toBe(false);
+    expect(at("allow", "Logs(base/*)", every)).toBe(true);
   });
 
   test("an empty declaration is matched like no declaration: on the string values", () => {

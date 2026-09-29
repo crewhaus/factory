@@ -180,19 +180,32 @@ export const TOOL_CONTRACT_VERSION = "1.1.0";
  *   that lands outside the workspace never satisfies an allow rule and always
  *   satisfies a deny or ask rule. (The edge worker has no filesystem to ask:
  *   there `..` is collapsed as text and a path that climbs above its start
- *   counts as outside.)
+ *   counts as outside.) A deny or ask rule also compares it in Unicode
+ *   normal form C, and ignoring letter case where the filesystem does.
  * - `"url"` — a URL, compared in its parsed (WHATWG `href`) form, so
- *   `HTTP://Example.COM` and `http://example.com/` are one value.
+ *   `HTTP://Example.COM` and `http://example.com/` are one value. A deny or
+ *   ask rule also compares it as the request really made — without
+ *   userinfo, a root dot, a fragment or percent-escapes, in lower case — and,
+ *   when the rule names a host, on any port and over http and https.
  * - `"command"` — a command line. An array (an argv) is joined with single
  *   spaces, so `Tool(git status)` matches `["git", "status"]`.
  *   An allow rule must match the whole command; a deny or ask rule also fires
  *   on any single word of an argv, so `RunCommand(rm)` catches
- *   `["rm", "-rf", "src"]`.
+ *   `["rm", "-rf", "src"]`, and compares it ignoring letter case (a program
+ *   named `RM` runs `rm` on a filesystem that ignores case).
  * - `"recipient"` — who or where the tool delivers to, when that is not
  *   written as a URL: an email address, a phone number, a host name, a
- *   repository. Compared as written.
- * - `"text"` and `"id"` — compared as written. An `"id"` field may also hold a
- *   number, which is compared as its decimal string.
+ *   repository. An allow rule compares it as written. A deny or ask rule
+ *   also compares it in lower case, without a root dot on a host or domain,
+ *   without a `+tag` on an address, without a display name around one, and
+ *   as a phone number's digits alone.
+ * - `"id"` — an identifier: an owner, a chain, an address, a hash. An allow
+ *   rule compares it as written; a deny or ask rule also ignores letter case.
+ *   An `"id"` field may also hold a number, which is compared as its decimal
+ *   string.
+ * - `"text"` — compared as written, except that a `0x` hex value (in any
+ *   kind but a path or URL) is compared by a deny or ask rule ignoring
+ *   letter case, which is at most an EIP-55 checksum.
  *
  * `"url"` and `"recipient"` are the destination kinds: an external tool that
  * declares one sends to a place the model chooses (see
@@ -213,8 +226,11 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * a call that leaves the field out would carry no value for a deny rule to
  * catch, while the tool still acts on the default. A default of `*` means
  * "every value" (EvmGetLogs without an `address` reads every contract's
- * logs): an allow must match the `*` itself, and a deny or ask naming any
- * one value there fires.
+ * logs), whatever the kind: a deny or ask naming any one value there fires,
+ * and an allow grants it only when its pattern matches EVERY value there
+ * (`EvmGetLogs(1/*)` does; `EvmGetLogs(1/0x…)` and `EvmGetLogs(1/?)` do not).
+ * A path left out this way is every path under its `within` directory, or
+ * under the workspace root; a URL or a command is any at all.
  *
  * `within` names a second, top-level field that qualifies this one. Its value
  * is written in front, with a `/` between: `{ field: "repo", kind:
@@ -235,8 +251,10 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * program elsewhere: `./build.sh` in `src/` runs `src/build.sh`. A command
  * that runs in the workspace root — the field left out, or naming the root —
  * is matched as usual. One that runs anywhere else is not covered by any
- * scoped allow (`RunCommand(./build.sh)` asks), while a deny or ask still
- * reads the command as written. A command inside an array of objects
+ * scoped allow (`RunCommand(./build.sh)` asks), while a deny or ask reads
+ * the command as written and each word that may name a file as that file
+ * from the workspace root, so `alwaysDeny RunCommand(*src/build.sh*)` fires
+ * on `./build.sh` run in `src/`. A command inside an array of objects
  * (`steps.argv`) runs in its own object's field of that name when it has
  * one, else the top-level one. A command tool whose input has a working
  * directory declares it this way; without it, the directory is invisible to

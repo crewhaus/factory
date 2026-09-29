@@ -32,11 +32,13 @@
  *    - a field declared `within` another is written `<qualifier>/<value>` —
  *      except a `command`, whose `within` names the directory it runs in:
  *      the program `./build.sh` names is another program in `src/`. A
- *      command run anywhere but the workspace root keeps its spellings for a
- *      deny or ask, and loses its canonical value, so no scoped allow
- *      covers it (the call asks). A command inside an array of objects
- *      (`steps.argv`) runs in its element's own directory field when it has
- *      one, else the top-level one.
+ *      command run anywhere but the workspace root loses its canonical
+ *      value, so no scoped allow covers it (the call asks). A deny or ask
+ *      reads it as written, and each word that may name a file also as
+ *      that file from the root, so `alwaysDeny RunCommand(*scripts/release.sh*)`
+ *      fires on `[sh, release.sh]` run in `scripts/`. A command inside an
+ *      array of objects (`steps.argv`) runs in its element's own directory
+ *      field when it has one, else the top-level one.
  *      Unless it is a path or a command, the value alone and the qualifier
  *      alone are kept as other spellings, so a deny or ask rule written
  *      without the qualifier — `alwaysDeny EvmCall(0xdAC17F…)`,
@@ -44,8 +46,11 @@
  *      fires. An allow must name the qualified value, so it cannot be
  *      widened by leaving the qualifier out.
  *    - a field left out whose declared default is `*` stands for every
- *      value (`standsForAny`): a deny or ask naming any one value there
- *      fires on it.
+ *      value (`standsForAny`), whatever its kind: a deny or ask naming any
+ *      one value there fires on it, and an allow grants it only when it
+ *      covers every value there. A path stands for every path under its
+ *      directory (the workspace root when it has none); a URL, or a
+ *      command, for any at all.
  *    - an `id`, `recipient` or `text` value that is `0x` hex (an address, a
  *      hash — `0x` or `0X`, both of which a node accepts) is marked
  *      `caseInsensitive`: its letter case is at most an EIP-55 checksum, so
@@ -143,23 +148,39 @@ export function operativeValuesOf(
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
   for (const arg of operativeArgs) {
-    for (const { value: raw, words, runsIn, unqualified, anyAfter } of readField(
+    for (const { value: raw, words, runsIn, dir, unqualified, every, anyAfter } of readField(
       parsedInput,
       arg,
     )) {
       switch (arg.kind) {
         case "path":
-          values.push(...canonicalizePath(raw));
+          values.push(
+            ...(every === true
+              ? everyPathValues(dir ?? ".", canonicalizePath)
+              : canonicalizePath(raw)),
+          );
           break;
         case "url":
-          values.push(canonicalUrl(raw));
+          values.push(
+            every === true
+              ? { kind: "url", canonical: [ANY_VALUE], standsForAny: [""] }
+              : canonicalUrl(raw),
+          );
           break;
-        case "command":
-          if (runsIn !== undefined && !namesWorkspaceRoot(canonicalizePath(runsIn))) {
+        case "command": {
+          const dirValues = runsIn !== undefined ? canonicalizePath(runsIn) : undefined;
+          if (runsIn !== undefined && dirValues !== undefined && !namesWorkspaceRoot(dirValues)) {
             // Run in another directory, the same words may be another
-            // program: nothing canonical for an allow to grant; a deny or ask
-            // still reads what was written.
-            values.push({ kind: "command", canonical: [], spellings: [raw, ...(words ?? [])] });
+            // program: nothing canonical for an allow to grant. A deny or ask
+            // reads what was written, and each word also as the file it
+            // names there — `release.sh` run in `scripts/` is
+            // `scripts/release.sh`, which a deny may name.
+            values.push({
+              kind: "command",
+              canonical: [],
+              spellings: commandSpellingsIn(raw, words, runsIn, dirValues),
+              ...(every === true ? { standsForAny: [""] } : {}),
+            });
             break;
           }
           values.push({
@@ -169,6 +190,7 @@ export function operativeValuesOf(
             ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
           });
           break;
+        }
         default: {
           const spellings = [...(words ?? []), ...(unqualified ?? [])];
           values.push({
@@ -190,16 +212,23 @@ const HEX_ID = /(?:^|\/)0[xX][0-9a-fA-F]+$/;
 
 /**
  * One value of a declared field. `words` is the argv it was joined from;
- * `runsIn` the directory a `command` declared `within` one runs in;
+ * `runsIn` the directory a `command` declared `within` one runs in; `dir`
+ * the directory a `path` declared `within` one is relative to;
  * `unqualified` the value and its qualifier apart, for any other `within`
- * field; `anyAfter` the prefixes after which a `*` default stands for any
- * value.
+ * field; `every` that a left-out field's `*` default stands for every value,
+ * and `anyAfter` the prefixes after which it does for an id, a recipient, a
+ * text value or a command run at the root (a path, a URL and a command run
+ * elsewhere build their own).
  */
 type FieldReading = {
   readonly value: string;
   readonly words?: ReadonlyArray<string>;
   readonly runsIn?: string;
+  /** The directory a `path` declared `within` one is relative to. */
+  readonly dir?: string;
   readonly unqualified?: ReadonlyArray<string>;
+  /** The field was left out and its default `*` stands for every value. */
+  readonly every?: true;
   readonly anyAfter?: ReadonlyArray<string>;
 };
 
@@ -266,7 +295,7 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     out.push({ value: arg.default, ...runsInOf(input) });
   }
   const anyValue = (rs: FieldReading[]): FieldReading[] =>
-    every ? rs.map((r) => ({ ...r, anyAfter: [""] })) : rs;
+    every ? rs.map((r) => ({ ...r, every: true, anyAfter: [""] })) : rs;
   // A command's `within` is where it runs, carried as `runsIn` above.
   if (arg.kind === "command") return anyValue(out);
   const qualifier = topQualifier;
@@ -274,19 +303,90 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
   return out.map((r) => {
     // A path relative to a directory field; an absolute one ignores it.
     if (arg.kind === "path") {
+      if (every) return { ...r, value: `${qualifier}/${r.value}`, dir: qualifier, every: true };
       return isAbsolutePath(r.value) ? r : { ...r, value: `${qualifier}/${r.value}` };
     }
     return {
       ...r,
       value: `${qualifier}/${r.value}`,
       unqualified: [r.value, qualifier],
-      ...(every ? { anyAfter: [`${qualifier}/`, ""] } : {}),
+      ...(every ? { every: true, anyAfter: [`${qualifier}/`, ""] } : {}),
     };
   });
 }
 
 /** The declared default that stands for every value of its field. */
 const ANY_VALUE = "*";
+
+/**
+ * Every path under `dir` — a path field left out whose default is `*` — as
+ * the values a rule reads: for each place `dir` resolves to, its spellings
+ * as prefixes (`sub/`, `/abs/ws/sub/`; the workspace root is the empty
+ * prefix) and `<prefix>*` as the canonical spelling an allow must cover
+ * whole. A directory outside the workspace stays outside: every deny or ask
+ * fires on it, and no allow does.
+ */
+function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): OperativeValue[] {
+  const under = (p: string): string => (p === "." ? "" : p.endsWith("/") ? p : `${p}/`);
+  return canonicalizePath(dir).map((v): OperativeValue => {
+    if (v.outsideWorkspace === true) return v;
+    return {
+      kind: "path",
+      canonical: v.canonical.map((c) => `${under(c)}${ANY_VALUE}`),
+      standsForAny: [...new Set([...v.canonical, ...(v.spellings ?? [])].map(under))],
+      ...(v.caseInsensitive === true ? { caseInsensitive: true } : {}),
+    };
+  });
+}
+
+/**
+ * The spellings a deny or ask reads for a command run in `runsIn`, a
+ * directory other than the workspace root: the command as written and each
+ * of its words, the directory in each of its spellings, and each word that
+ * could name a file written as that file from the workspace root — with `..`
+ * collapsed, and as joined — alone and within the whole command line (with
+ * and without the program itself joined, which PATH may resolve instead).
+ * Every spelling only widens what a deny or ask catches; none is canonical,
+ * so no allow reads them.
+ */
+function commandSpellingsIn(
+  raw: string,
+  words: ReadonlyArray<string> | undefined,
+  runsIn: string,
+  dirValues: ReadonlyArray<OperativeValue>,
+): string[] {
+  const argv = words ?? raw.split(/\s+/).filter((w) => w !== "");
+  const out = new Set<string>([raw, ...(words ?? [])]);
+  const dirs = new Set<string>([runsIn]);
+  for (const v of dirValues) for (const d of [...v.canonical, ...(v.spellings ?? [])]) dirs.add(d);
+  dirs.delete("");
+  for (const d of dirs) {
+    out.add(d);
+    for (const join of [
+      (w: string) => `${d.replace(/\/+$/, "")}/${w}`,
+      (w: string) => normalizePathLexically(`${d}/${w}`).path,
+    ]) {
+      const line = argv.map((w) => (namesAFile(w) ? join(w) : w));
+      argv.forEach((w, i) => {
+        if (namesAFile(w)) out.add(line[i] as string);
+      });
+      out.add(line.join(" "));
+      // A bare program name (`sh`) is looked up on PATH, not in the
+      // directory, so the line is also read with only its arguments joined.
+      out.add([argv[0] ?? "", ...line.slice(1)].join(" "));
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Could this argv word name a file relative to the working directory? Not a
+ * flag, not an absolute path, not a URL; anything else might be a program
+ * or a script (`release.sh`, `./eslint`, `bin/tool`).
+ */
+function namesAFile(word: string): boolean {
+  return word !== "" && !word.startsWith("-") && !isAbsolutePath(word) && !word.includes("://");
+}
 
 function isAbsolutePath(value: string): boolean {
   return value.startsWith("/") || value.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(value);
