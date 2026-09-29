@@ -14909,11 +14909,19 @@ async function runPermissions(action: string, args: ParsedArgs): Promise<void> {
       suggestions.push(suggestion);
       continue;
     }
+    const relocatingDefaults = (
+      Object.values(toolMap).find((t) => t.name === suggestion.toolName)?.operativeArgs ?? []
+    ).flatMap((arg) =>
+      arg.relocates === true && arg.default !== undefined
+        ? [{ kind: arg.kind, value: arg.default }]
+        : [],
+    );
     const overridden = guardsOverridden(
       {
         toolName: suggestion.toolName,
         ...(scoped && agg.argSamples[0] !== undefined ? { scopedValue: agg.argSamples[0] } : {}),
         ...(scoped && agg.argKind !== undefined ? { valueKind: agg.argKind } : {}),
+        ...(relocatingDefaults.length > 0 ? { relocatingDefaults } : {}),
       },
       overrideCheck.rules,
       process.cwd(),
