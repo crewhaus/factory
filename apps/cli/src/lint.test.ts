@@ -3,6 +3,7 @@ import type { IrNode } from "@crewhaus/compiler";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
 import {
+  applyLintFixes,
   formatLintJson,
   formatLintText,
   levenshtein,
@@ -11,6 +12,7 @@ import {
   suggestSafeName,
   suggestSecretFix,
   thredzToolNamesOf,
+  toolListPaths,
 } from "./lint";
 
 /** A resolver that knows the built-in outward tools resolve to external scope,
@@ -447,5 +449,204 @@ permissions:
     expect(result.findings.some((f) => f.rule === "permission-rule:argument-not-scoped")).toBe(
       false,
     );
+  });
+});
+
+// C025 (wave III) — `lint --fix` was a per-line scanner. It rewrote tool
+// names inside `instructions: |` text, turned `model: $fast` (a profile
+// reference) into `$FAST` so the shipped hybrid-support starter stopped
+// compiling, and rewrote sub-agent typos plain `lint` called clean. It is now
+// a walk over the YAML document.
+describe("applyLintFixes — a walk over the document, not its lines", () => {
+  const readOnly = (name: string): RegisteredTool | undefined =>
+    ({ name, readOnly: /^(read|glob|grep|Read)$/.test(name) }) as RegisteredTool;
+
+  test("text inside a block scalar is never a tools: list; the real list is", () => {
+    const yaml = `name: t5
+target: cli
+agent:
+  model: claude-sonnet-5
+  instructions: |
+    You write crewhaus specs. Always emit this block exactly:
+    tools:
+      - files
+      - reports
+    and this one line exactly:
+    tools: [logs, draft]
+tool_config:
+  http: { tools: [raed] }
+tools:
+  - raed # the reader
+  - "webfetch"
+`;
+    const fixed = applyLintFixes(yaml, readOnly);
+    expect(fixed.applied).toEqual([
+      'tool "raed" → "read" (nearest match)',
+      'tool "webfetch" → "webFetch" (nearest match)',
+    ]);
+    // Only the two items changed, keeping the comment and the quotes; a
+    // `tools` key inside a tool's own config block is not a tools: list.
+    expect(fixed.text).toBe(
+      yaml
+        .replace("  - raed # the reader", "  - read # the reader")
+        .replace('"webfetch"', '"webFetch"'),
+    );
+  });
+
+  test("a profile reference is not a credential; a credential compile rejects is fixed", () => {
+    const yaml = `name: hybrid
+target: channel
+models:
+  fast: { model: claude-haiku-4-5 }
+  checker: { model: claude-sonnet-4-6 }
+agent:
+  model: $fast
+  instructions: help
+  model_pool:
+    candidates:
+      - { model: $fast, tags: [cheap] }
+      - { model: $checker, tags: [strong] }
+channels:
+  slack:
+    botToken: $slack_bot_token
+    signingSecret: "\${SLACK_SIGNING_SECRET}"
+routing:
+  sessionKey: thread
+mcp_servers:
+  kb:
+    transport: stdio
+    command: npx
+    env:
+      API_KEY: $kb_api_key
+      MODE: $fast
+`;
+    const fixed = applyLintFixes(yaml, readOnly);
+    // In the order compile meets them.
+    expect(fixed.applied).toEqual([
+      'secret "$kb_api_key" → "$KB_API_KEY" ($UPPER_SNAKE_CASE)',
+      'secret "$slack_bot_token" → "$SLACK_BOT_TOKEN" ($UPPER_SNAKE_CASE)',
+      'secret "${SLACK_SIGNING_SECRET}" → "$SLACK_SIGNING_SECRET" ($UPPER_SNAKE_CASE)',
+    ]);
+    expect(fixed.text).toBe(
+      yaml
+        .replace("$slack_bot_token", "$SLACK_BOT_TOKEN")
+        .replace('"${SLACK_SIGNING_SECRET}"', '"$SLACK_SIGNING_SECRET"')
+        .replace("$kb_api_key", "$KB_API_KEY"),
+    );
+    // `$fast` stays a profile reference everywhere, including an env value
+    // that is not a credential (compile keeps it a literal).
+    expect(fixed.text.match(/\$fast/g)?.length).toBe(3);
+    expect(fixed.text).toContain("$checker");
+  });
+
+  test("a thredz: key, in the shorthand or under a crew role", () => {
+    const short =
+      "name: t\ntarget: cli\nthredz: $thredz_key\nagent:\n  model: m\n  instructions: hi\n";
+    expect(applyLintFixes(short, readOnly).text).toBe(short.replace("$thredz_key", "$THREDZ_KEY"));
+    // compile names it `thredz.api_key` whichever role's key it is.
+    const crew = `name: rd
+target: crew
+model: claude-sonnet-4-6
+entry: researcher
+roles:
+  researcher: { instructions: gather }
+  editor: { instructions: write }
+memory: { enabled: true }
+thredz:
+  api_key: $THREDZ_SHARED
+  roles:
+    editor: { space: $k_researcher, api_key: $K_EDITOR }
+    researcher: { api_key: $k_researcher }
+`;
+    const fixed = applyLintFixes(crew, readOnly);
+    expect(fixed.applied).toEqual(['secret "$k_researcher" → "$K_RESEARCHER" ($UPPER_SNAKE_CASE)']);
+    // The key, not the editor's space that happens to hold the same text.
+    expect(fixed.text).toBe(crew.replace("api_key: $k_researcher", "api_key: $K_RESEARCHER"));
+  });
+
+  test("an unsafe name the spec rejects is sanitised; a name elsewhere is not", () => {
+    const yaml = `name: "my/agent"
+target: cli
+agent:
+  model: m
+  instructions: |
+    name: keep/this
+permissions:
+  mode: "de/fault"
+tools: [read]
+`;
+    const fixed = applyLintFixes(yaml, readOnly);
+    expect(fixed.applied).toEqual(['name "my/agent" → "my-agent" (unsafe characters)']);
+    expect(fixed.text).toBe(yaml.replace('"my/agent"', '"my-agent"'));
+  });
+
+  test("a narrowing list keeps real tool names that are not builtins", () => {
+    const yaml = `name: t
+target: cli
+thredz: { api_key: $THREDZ_API_KEY }
+agent:
+  model: m
+  instructions: hi
+  sub_agents:
+    helper:
+      description: d
+      instructions: h
+      tools: [goal_list, Skill, mcp__kb__search, Raed]
+tools: [read]
+`;
+    const fixed = applyLintFixes(yaml, readOnly);
+    expect(fixed.applied).toEqual(['tool "Raed" → "Read" (nearest match)']);
+    expect(fixed.text).toBe(yaml.replace("Raed]", "Read]"));
+  });
+
+  test("a document that is not YAML is left alone", () => {
+    const broken = "name: t\ntarget: cli\ntools: [raed\n";
+    expect(applyLintFixes(broken, readOnly)).toEqual({ text: broken, applied: [], suggested: [] });
+  });
+
+  test("lint reports the narrowing-list typos --fix rewrites", () => {
+    const yaml = `name: t3
+target: cli
+agent:
+  model: claude-sonnet-5
+  instructions: Answer.
+  sub_agents:
+    helper:
+      description: helper
+      instructions: help
+      tools: [raed, Read]
+tools: [read, grep]
+`;
+    const findings = runLint(yaml, noTools).findings.filter((f) => f.rule === "tool-list-typo");
+    expect(findings.map((f) => [f.path, f.severity])).toEqual([
+      ["agent.sub_agents.helper.tools", "warning"],
+    ]);
+    expect(findings[0]?.message).toContain('"raed" is no tool');
+    expect(findings[0]?.message).toContain('did you mean "read"?');
+    expect(applyLintFixes(yaml, noTools).applied).toEqual(['tool "raed" → "read" (nearest match)']);
+    // A model profile's list is validated at parse time; --fix still fixes
+    // it in the spelling it was written in.
+    const profile = `${yaml}models:\n  fast: { model: claude-haiku-4-5, tools: [Grpe] }\n`;
+    expect(runLint(profile, noTools).findings.map((f) => f.rule)).toEqual(["parse"]);
+    expect(applyLintFixes(profile, noTools).applied).toEqual([
+      'tool "raed" → "read" (nearest match)',
+      'tool "Grpe" → "Grep" (nearest match)',
+    ]);
+  });
+});
+
+describe("toolListPaths — where a spec holds a tools: list, from the spec's schema", () => {
+  test("every site and every narrowing list, and nothing else", () => {
+    const cli = toolListPaths("cli").map((p) => p.join("."));
+    expect(cli).toContain("tools");
+    expect(cli).toContain("agent.sub_agents.*.tools");
+    expect(cli).toContain("models.*.tools");
+    expect(cli).toContain("agent.model_pool.candidates.[].tools");
+    expect(cli.some((p) => p.startsWith("mcp_servers") || p.startsWith("tool_config"))).toBe(false);
+    expect(toolListPaths("graph").map((p) => p.join("."))).toContain("nodes.*.tools");
+    expect(toolListPaths("workflow").map((p) => p.join("."))).toContain("steps.[].tools");
+    expect(toolListPaths("crew").map((p) => p.join("."))).toContain("roles.*.sub_agents.*.tools");
+    // `expose.mcp.tools` is a mode word, not a list of tools.
+    expect(cli.some((p) => p.startsWith("expose"))).toBe(false);
   });
 });

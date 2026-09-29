@@ -479,11 +479,9 @@ import {
   BUILTIN_TOOLS,
   CATEGORIES,
   LOOP_TOOL_NAMES,
-  SHAPE_TOOL_PROFILES,
   type SpecChainBlocks,
   ToolCategoryError,
   type ToolShape,
-  builtinKeyForName,
   builtinToolsFor,
   categoriesForTool,
   registerToolConfigs,
@@ -1081,13 +1079,11 @@ import {
 // modules so this entry file stays testable.
 import {
   type LintResult,
+  applyLintFixes,
   formatLintJson,
   formatLintText,
-  nearestToolName,
   permissionRuleProblemsOf,
   runLint,
-  suggestSafeName,
-  suggestSecretFix,
 } from "./lint";
 // Item 68 — `crewhaus loadtest`: concurrency benchmark + deploy gate for daemon
 // shapes. The runner drives an injected LoadDriver; side-effect-free (this entry
@@ -2396,9 +2392,9 @@ async function buildToolResolver(): Promise<{
  * pipeline (`runLint`: parse + ir-passes collect-all + scope audit) over the
  * cwd (or a named) spec WITHOUT emitting, so the §47 chain / graph-crew
  * well-formedness checks that the CLI compile path skips surface for authors.
- * `--fix` applies mechanical corrections (unknown tool → nearest match, `$SECRET`
- * typo → `$UPPER_SNAKE_CASE`, unsafe name → sanitised) then re-lints. Exit 1 on
- * any error finding.
+ * `--fix` applies mechanical corrections (`applyLintFixes`: a tools: list typo
+ * → nearest match, a credential compile rejects → `$UPPER_SNAKE_CASE`, an
+ * unsafe name → sanitised) then re-lints. Exit 1 on any error finding.
  */
 async function runLintCommand(args: ParsedArgs): Promise<void> {
   if (args.flags["help"]) {
@@ -2410,8 +2406,10 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
         "  --format json   structured {message,path,severity,rule} findings for editors/CI.\n" +
         "                  IR passes are fail-fast per pass; json mode runs each pass\n" +
         "                  independently (collect-all) so one violation doesn't hide others.\n" +
-        "  --fix           apply mechanical fixes: unknown tool name → nearest match,\n" +
-        "                  $secret typo → $UPPER_SNAKE_CASE, unsafe name → sanitised.\n" +
+        "  --fix           apply mechanical fixes: a tools: list typo → nearest match,\n" +
+        "                  a credential compile rejects ($slack_token) → $UPPER_SNAKE_CASE,\n" +
+        "                  an unsafe name → sanitised. Only those fields change; text\n" +
+        "                  such as instructions and a $profile reference stay as written.\n" +
         "                  A typo equidistant from tools of DIFFERENT capability (e.g.\n" +
         "                  read-only vs mutating) is printed as a suggestion instead of\n" +
         "                  auto-applied.\n",
@@ -2451,162 +2449,6 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
   const result = runLint(yamlText, resolveTool);
   process.stdout.write(format === "json" ? formatLintJson(result) : formatLintText(result));
   process.exit(result.ok ? 0 : 1);
-}
-
-/**
- * Item 41 — apply `lint --fix`'s mechanical corrections to a spec's YAML by
- * scanning the raw text for the three fixable classes and rewriting the token
- * in place. Text-level (not spec-patch) because two of the three classes —
- * an unsafe `name:` and a mistyped tool in a `tools:` list — must be fixed
- * BEFORE the spec can parse, and spec-patch requires a parseable document.
- * Returns the rewritten text + a description of each applied fix.
- *
- * `resolveTool` (same resolver `buildToolResolver` returns) supplies the
- * read-only/mutating capability signal `nearestToolName` uses to detect a
- * cross-capability typo — e.g. `Reit` is Levenshtein-2 from BOTH `Read`
- * (read-only) and `Edit` (mutating). Such a typo is NOT auto-applied (the
- * line is left untouched); it is instead returned in `suggested` as a
- * printed "did you mean X or Y?" line so the author picks, rather than the
- * fixer silently rewriting to whichever tie-break happened to win.
- */
-function applyLintFixes(
-  yamlText: string,
-  resolveTool: (name: string) => RegisteredTool | undefined,
-): { text: string; applied: string[]; suggested: string[] } {
-  const applied: string[] = [];
-  const suggested: string[] = [];
-  const getReadOnly = (candidateName: string): boolean | undefined =>
-    resolveTool(candidateName)?.readOnly;
-  // shape-reach#6 — a typo is fixed to a spelling `compile` accepts on THIS
-  // spec's shape: the camelCase spec key, which every tools: list takes (a
-  // sub-agent list maps it to the registered name). Rewriting to the
-  // PascalCase name produced a spec compile then rejected. Read `target:`
-  // off the text, because the spec may not parse yet.
-  const target = /^target:\s*["']?([\w-]+)/m.exec(yamlText)?.[1];
-  const shape: ToolShape =
-    target !== undefined && Object.hasOwn(SHAPE_TOOL_PROFILES, target)
-      ? (target as ToolShape)
-      : "cli";
-  const shapeKeys = builtinToolsFor(shape);
-  const toolCandidates = shapeKeys.length > 0 ? shapeKeys : builtinToolsFor("cli");
-  // A sub-agent's or a `models:` profile's list narrows tools the site
-  // already registers, and takes a builtin under either spelling: `Read` is
-  // correct there (0.7.0 documented it), so it is left alone. A typo there is
-  // fixed in the spelling it was written in, as 0.7.0's lint --fix did.
-  const registeredCandidates = toolCandidates.map((k) => BUILTIN_TOOLS[k]?.name ?? k);
-  const fixToken = (token: string, narrowing: boolean): { to?: string; suggestion?: string } => {
-    if (narrowing && builtinKeyForName(token) !== undefined) return {};
-    const pascal = narrowing && /^[A-Z]/.test(token);
-    // The resolver takes either spelling, so both candidate lists work with it.
-    const candidates = pascal ? registeredCandidates : toolCandidates;
-    const nearest = nearestToolName(token, candidates, undefined, getReadOnly);
-    if (nearest?.kind === "match") return { to: nearest.name };
-    if (nearest?.kind === "ambiguous") {
-      const options = nearest.candidates.map((c) => `"${c}"`).join(" or ");
-      return {
-        suggestion: `tool "${token}" — did you mean ${options}? (not auto-fixed — ambiguous across tool capabilities)`,
-      };
-    }
-    return {};
-  };
-  const lines = yamlText.split("\n");
-  // The block key the current list items belong to — only items of a
-  // `tools:` list are tool names; a bare word in any other list is not.
-  let listKey: { key: string; indent: number } | undefined;
-  // The mapping keys enclosing the current line, by indent: a `tools:` list
-  // under `sub_agents:` or `models:` narrows a site rather than being one.
-  const ancestors: Array<{ key: string; indent: number }> = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line === undefined) continue;
-    const indent = line.length - line.trimStart().length;
-    const trimmed = line.trim();
-    const mappingKey = /^(\s*)(-\s+)?([A-Za-z_][\w-]*):(\s|$)/.exec(line);
-    if (mappingKey?.[3] !== undefined) {
-      const keyIndent = (mappingKey[1]?.length ?? 0) + (mappingKey[2]?.length ?? 0);
-      while ((ancestors[ancestors.length - 1]?.indent ?? -1) >= keyIndent) ancestors.pop();
-      ancestors.push({ key: mappingKey[3], indent: keyIndent });
-    }
-    const narrowing = ancestors.some((a) => a.key === "sub_agents" || a.key === "models");
-
-    const blockKey = /^(\s*)([A-Za-z_][\w-]*):\s*(#.*)?$/.exec(line);
-    if (blockKey?.[2] !== undefined) {
-      listKey = { key: blockKey[2], indent };
-      continue;
-    }
-    const isItem = trimmed.startsWith("- ") || trimmed === "-";
-    if (trimmed !== "" && !trimmed.startsWith("#") && listKey !== undefined) {
-      // A list item belongs to the key above it at the same or a deeper
-      // indent; any other content at or left of the key closes the block.
-      if (!(isItem && indent >= listKey.indent) && indent <= listKey.indent) listKey = undefined;
-    }
-
-    // Unsafe `name:` value → sanitised.
-    const nameMatch = /^(\s*name:\s*)(.+?)(\s*)$/.exec(line);
-    if (nameMatch?.[2] !== undefined) {
-      const raw = stripQuotes(nameMatch[2]);
-      const safe = suggestSafeName(raw);
-      if (safe !== undefined) {
-        lines[i] = `${nameMatch[1]}${safe}`;
-        applied.push(`name "${raw}" → "${safe}" (unsafe characters)`);
-        continue;
-      }
-    }
-
-    // A `- toolName` item of a `tools:` block list that is a typo.
-    const toolMatch = /^(\s*-\s*)([A-Za-z]\w*)(\s*)$/.exec(line);
-    if (toolMatch?.[2] !== undefined && listKey?.key === "tools") {
-      const fix = fixToken(toolMatch[2], narrowing);
-      if (fix.to !== undefined) {
-        lines[i] = `${toolMatch[1]}${fix.to}`;
-        applied.push(`tool "${toolMatch[2]}" → "${fix.to}" (nearest match)`);
-        continue;
-      }
-      if (fix.suggestion !== undefined) {
-        suggested.push(fix.suggestion);
-        continue;
-      }
-    }
-
-    // A flow-style `tools: [a, b]` list: fix each bare token in place.
-    const flow = /^(\s*(?:-\s*)?tools:\s*\[)([^\]]*)(\].*)$/.exec(line);
-    if (flow?.[2] !== undefined) {
-      const tokens = flow[2].split(",");
-      let changed = false;
-      const fixed = tokens.map((raw) => {
-        const token = raw.trim();
-        if (!/^[A-Za-z]\w*$/.test(token)) return raw;
-        const fix = fixToken(token, narrowing);
-        if (fix.suggestion !== undefined) suggested.push(fix.suggestion);
-        if (fix.to === undefined) return raw;
-        changed = true;
-        applied.push(`tool "${token}" → "${fix.to}" (nearest match)`);
-        return raw.replace(token, fix.to);
-      });
-      if (changed) lines[i] = `${flow[1]}${fixed.join(",")}${flow[3]}`;
-      continue;
-    }
-
-    // A credential value that looks like a malformed env ref → $UPPER_SNAKE_CASE.
-    const secretMatch = /^(\s*\w+:\s*)(\$\S+)(\s*)$/.exec(line);
-    if (secretMatch?.[2] !== undefined) {
-      const fixed = suggestSecretFix(stripQuotes(secretMatch[2]));
-      if (fixed !== undefined) {
-        lines[i] = `${secretMatch[1]}${fixed}`;
-        applied.push(`secret "${secretMatch[2]}" → "${fixed}" ($UPPER_SNAKE_CASE)`);
-      }
-    }
-  }
-  return { text: lines.join("\n"), applied, suggested };
-}
-
-/** Strip a single pair of surrounding single/double quotes from a scalar. */
-function stripQuotes(s: string): string {
-  const t = s.trim();
-  if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
-    return t.slice(1, -1);
-  }
-  return t;
 }
 
 /**

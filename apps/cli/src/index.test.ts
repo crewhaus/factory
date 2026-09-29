@@ -1606,6 +1606,40 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(readFileSync(specPath, "utf-8")).toBe(spec("read, webFetch"));
   });
 
+  // C025 (wave III): the per-line fixer rewrote a `tools:` example inside
+  // `instructions: |` and turned the profile reference `$fast` into `$FAST`,
+  // after which the spec no longer compiled.
+  test("lint --fix leaves prompt text and a profile reference alone", async () => {
+    const specPath = join(tmp, "crewhaus.yaml");
+    const original = [
+      "name: t",
+      "target: cli",
+      "models:",
+      "  fast: { model: claude-haiku-4-5 }",
+      "agent:",
+      "  model: $fast",
+      "  instructions: |",
+      "    Always emit this block exactly:",
+      "    tools:",
+      "      - files",
+      "      - reports",
+      "    tools: [logs, draft]",
+      "tools: [read]",
+      "",
+    ].join("\n");
+    writeFileSync(specPath, original);
+    const result = await runCli(["lint", specPath, "--fix"], {
+      env: { ANTHROPIC_API_KEY: "test" },
+    });
+    expect(result.stdout).toContain("lint --fix: no mechanical fixes applicable.");
+    expect(readFileSync(specPath, "utf-8")).toBe(original);
+    const compiled = await runCli(
+      ["compile", specPath, "--no-register", "-o", join(tmp, "profile-out")],
+      { env: { ANTHROPIC_API_KEY: "test" } },
+    );
+    expect(compiled.exitCode).toBe(0);
+  }, 30_000);
+
   test("lint reports a tool the spec's shape cannot compile, in compile's words", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
     writeFileSync(
