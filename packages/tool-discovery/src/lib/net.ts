@@ -42,6 +42,7 @@
  * distinction is the whole reason this returns a verdict instead of throwing.
  */
 import { CrewhausError } from "@crewhaus/errors";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 
 export class PeerEndpointError extends CrewhausError {
   override readonly name = "PeerEndpointError";
@@ -508,7 +509,12 @@ const pinnedFetch: PeerFetch = async (req, pinnedIp) => {
   const original = new URL(req.url);
   const host = original.hostname;
   const unbracketed = host.replace(/^\[/, "").replace(/\]$/, "");
-  if (pinnedIp === "" || unbracketed === pinnedIp) return globalThis.fetch(req);
+  // Both branches keep the body RAW (`fetchRaw`, Bun's `decompress: false`):
+  // otherwise Bun inflates a gzip, deflate, br or zstd body in native code
+  // before any reader sees a byte, and a 421-byte brotli reply cost 843 MB
+  // however small MAX_WELLKNOWN_BYTES was (C093). `readCapped` decodes it,
+  // under the cap. Peers are model-chosen public hosts by default.
+  if (pinnedIp === "" || unbracketed === pinnedIp) return fetchRaw(req);
 
   const pinnedUrl = new URL(original.toString());
   pinnedUrl.hostname = pinnedIp.includes(":") ? `[${pinnedIp}]` : pinnedIp;
@@ -521,7 +527,7 @@ const pinnedFetch: PeerFetch = async (req, pinnedIp) => {
     redirect: "manual",
     tls: { serverName: host },
   };
-  return globalThis.fetch(pinnedUrl.toString(), init);
+  return fetchRaw(pinnedUrl.toString(), init);
 };
 
 let peerFetch: PeerFetch = pinnedFetch;
@@ -571,6 +577,12 @@ export type Attempt =
       readonly bytes: number;
       /** Set when the body hit {@link MAX_WELLKNOWN_BYTES} and was cut. */
       readonly truncated: boolean;
+      /**
+       * Set when the body could not be read as the bytes it claims to be (a
+       * corrupt or unsupported content-encoding): the peer is up, and its
+       * answer is unusable. The reason quotes nothing the peer sent.
+       */
+      readonly unreadable?: string;
       /** A 3xx `Location`, recorded and NOT followed. */
       readonly location?: string;
     };
@@ -580,46 +592,32 @@ export type FetchOptions = {
   readonly signal?: AbortSignal;
 };
 
-/** Read a body with a hard cap, aborting the stream once it is exceeded. */
-async function readCapped(res: Response): Promise<{ text: string; bytes: number; cut: boolean }> {
-  if (res.body === null) return { text: "", bytes: 0, cut: false };
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  let cut = false;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      chunks.push(value);
-      if (total > MAX_WELLKNOWN_BYTES) {
-        cut = true;
-        try {
-          await reader.cancel();
-        } catch {
-          // already aborting
-        }
-        break;
-      }
-    }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {
-      // ignore
-    }
-  }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+/**
+ * Read a body with a hard cap on its DECODED size: the body arrives raw (see
+ * `pinnedFetch`), a gzip, deflate, br or zstd body is decoded here in small
+ * steps, and the decoder stops once {@link MAX_WELLKNOWN_BYTES} exist. An
+ * aborted read throws, so `fetchOnce` classifies the deadline or the
+ * cancellation as it does for the request itself.
+ */
+async function readCapped(
+  res: Response,
+  signal: AbortSignal,
+): Promise<{ text: string; bytes: number; cut: boolean; unreadable?: string }> {
+  const read = await readResponseBounded(res, { maxBytes: MAX_WELLKNOWN_BYTES, signal });
+  if (read.ok) return { text: read.text, bytes: read.decodedBytes, cut: read.truncated };
+  if (read.code === "aborted" || read.code === "stalled") {
+    throw new Error("the read was aborted before the body ended");
   }
   return {
-    text: new TextDecoder("utf-8", { fatal: false }).decode(merged.slice(0, MAX_WELLKNOWN_BYTES)),
-    bytes: total,
-    cut,
+    text: "",
+    bytes: 0,
+    cut: false,
+    unreadable:
+      read.code === "unsupported-encoding"
+        ? "its body uses a stack of content-encodings this tool cannot decode within its cap"
+        : read.code === "read-error"
+          ? "its body could not be read to the end"
+          : "its body is labelled as compressed but could not be decoded",
   };
 }
 
@@ -672,7 +670,7 @@ export async function fetchOnce(
       res.status >= 300 && res.status < 400
         ? (res.headers.get("location") ?? undefined)
         : undefined;
-    const { text, bytes, cut } = await readCapped(res);
+    const { text, bytes, cut, unreadable } = await readCapped(res, ctrl.signal);
     return {
       attempt: {
         kind: "answered",
@@ -680,6 +678,7 @@ export async function fetchOnce(
         status: res.status,
         bytes,
         truncated: cut,
+        ...(unreadable !== undefined ? { unreadable } : {}),
         ...(location !== undefined ? { location } : {}),
       },
       body: text,

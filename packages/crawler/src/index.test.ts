@@ -509,10 +509,12 @@ describe("createCrawler — per-domain rate limiting", () => {
     const nowSpy = spyOn(Date, "now");
     const timeoutSpy = spyOn(globalThis, "setTimeout");
     const waits: number[] = [];
-    // Run scheduled callbacks synchronously so the test never touches the clock.
+    // Run the rate-limit sleeps synchronously so the test never touches the
+    // clock. The request's own deadline (30 s) is recorded but not fired:
+    // the body read honours it, so firing it at once would abandon the read.
     timeoutSpy.mockImplementation(((fn: () => void, ms?: number) => {
       waits.push(ms ?? 0);
-      fn();
+      if ((ms ?? 0) <= 1_000) fn();
       return 0 as unknown as ReturnType<typeof setTimeout>;
     }) as typeof setTimeout);
     try {
@@ -547,9 +549,10 @@ describe("createCrawler — per-domain rate limiting", () => {
     const nowSpy = spyOn(Date, "now");
     const timeoutSpy = spyOn(globalThis, "setTimeout");
     const waits: number[] = [];
+    // As above: the rate-limit sleep runs at once, the request deadline never.
     timeoutSpy.mockImplementation(((fn: () => void, ms?: number) => {
       waits.push(ms ?? 0);
-      fn();
+      if ((ms ?? 0) <= 1_000) fn();
       return 0 as unknown as ReturnType<typeof setTimeout>;
     }) as typeof setTimeout);
     try {

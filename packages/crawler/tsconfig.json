@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../tool-safety" },
     { "path": "../citation-tracker" },
     { "path": "../errors" },
     { "path": "../tool-builder" },

@@ -23,6 +23,7 @@ import {
   canonicalizeOrigin,
   getFetchConfig,
 } from "@crewhaus/tool-fetch";
+import { fetchRaw, readResponseBounded } from "@crewhaus/tool-safety/streams";
 import {
   type BatchHit,
   type Coordinate,
@@ -74,7 +75,14 @@ export class OsvUnavailableError extends CrewhausError {
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
-const defaultFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
+/**
+ * The body is kept RAW (`fetchRaw`, Bun's `decompress: false`): otherwise Bun
+ * inflates a gzip, deflate, br or zstd reply in native code before any
+ * reader sees a byte, so an allow-listed mirror's 260 KB gzip of zeros cost
+ * about 1 GB of RSS before the cap fired (C093). `readCapped` decodes it,
+ * under the cap.
+ */
+const defaultFetch: FetchLike = (input, init) => fetchRaw(input, init);
 let fetchFn: FetchLike = defaultFetch;
 
 /** Test seam: replace the fetch used for every OSV call, or restore it. */
@@ -141,42 +149,34 @@ export type RequestBudget = {
 };
 
 /**
- * Read a response body with a hard ceiling.
+ * Read a response body with a hard ceiling on its DECODED size.
  *
  * `res.text()` buffers whatever arrives, and "whatever arrives" from a
- * self-hosted mirror is not a number this process chose. Streaming with a
- * counter is the only version of this that has a limit.
+ * self-hosted mirror is not a number this process chose. The body arrives
+ * raw, a compressed one is decoded here in small steps, and the decoder
+ * stops at the ceiling, so the ceiling bounds memory rather than what is
+ * kept after buffering. A body past it is abandoned, never parsed from a
+ * prefix; one that cannot be decoded is refused without quoting it.
  */
-async function readCapped(res: Response, url: string): Promise<string> {
-  const body = res.body;
-  if (body === null || body === undefined) return await res.text();
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      total += value.byteLength;
-      if (total > MAX_RESPONSE_BYTES) {
-        await reader.cancel();
-        throw new OsvUnavailableError(
-          `${url} returned more than ${MAX_RESPONSE_BYTES} bytes; the response was abandoned rather than buffered`,
-        );
-      }
-      chunks.push(value);
-    }
-  } finally {
-    reader.releaseLock();
+async function readCapped(res: Response, url: string, signal: AbortSignal): Promise<string> {
+  const read = await readResponseBounded(res, { maxBytes: MAX_RESPONSE_BYTES, signal });
+  if (read.ok) {
+    if (!read.truncated) return read.text;
+    throw new OsvUnavailableError(
+      `${url} returned more than ${MAX_RESPONSE_BYTES} bytes; the response was abandoned rather than buffered`,
+    );
   }
-  const joined = new Uint8Array(total);
-  let at = 0;
-  for (const part of chunks) {
-    joined.set(part, at);
-    at += part.byteLength;
+  if (read.code === "aborted" || read.code === "stalled") {
+    // The catch in `request` reads the abort reason (timeout or cancel).
+    throw new Error("the read was aborted before the body ended");
   }
-  return new TextDecoder().decode(joined);
+  throw new OsvUnavailableError(
+    read.code === "unsupported-encoding"
+      ? `${url} sent a body in a stack of content-encodings this tool cannot decode within its ${MAX_RESPONSE_BYTES}-byte cap; nothing was audited`
+      : read.code === "read-error"
+        ? `${url} closed the connection before its body ended; nothing was audited`
+        : `${url} sent a body labelled as compressed that could not be decoded; nothing was audited`,
+  );
 }
 
 /** One request, with the timeout and the caller's cancellation both wired in. */
@@ -210,7 +210,7 @@ async function request(
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: controller.signal,
     });
-    return { status: res.status, text: await readCapped(res, url) };
+    return { status: res.status, text: await readCapped(res, url, controller.signal) };
   } catch (err) {
     if (err instanceof OsvUnavailableError) throw err;
     if (controller.signal.aborted) {

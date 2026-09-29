@@ -18,6 +18,7 @@
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-encode": "workspace:*",
     "@crewhaus/tool-fetch": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
     "zod": "^3.23.8"
   },
   "devDependencies": {

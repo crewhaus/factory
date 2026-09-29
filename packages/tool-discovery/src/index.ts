@@ -453,6 +453,9 @@ function peerDiscovery(): Discovery {
       });
       attempts.push(attempt);
       if (attempt.kind !== "answered") throw new Error(attempt.reason);
+      if (attempt.unreadable !== undefined) {
+        throw new Error(`the .well-known body could not be read: ${attempt.unreadable}`);
+      }
       if (attempt.truncated) {
         // A CUT body is a DIFFERENT document, and the prefix can still be
         // valid JSON — pad a well-formed record with whitespace past the cap
@@ -732,6 +735,7 @@ export const federationDiscover: RegisteredTool = buildTool({
                 status: attempt.status,
                 bytes: attempt.bytes,
                 truncated: attempt.truncated,
+                ...(attempt.unreadable !== undefined ? { unreadable: attempt.unreadable } : {}),
                 ...(attempt.location !== undefined
                   ? { location: quoteUntrusted(attempt.location, CAPS.url).text }
                   : {}),
