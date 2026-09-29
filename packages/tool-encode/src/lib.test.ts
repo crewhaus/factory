@@ -1068,6 +1068,19 @@ describe("slugify", () => {
     expect(slugify("Hello World", { separator: "_" }).slug).toBe("hello_world");
   });
 
+  test("a separator or replacement is text, never a replacement pattern", () => {
+    // As String.replace replacement strings, `$&` put the punctuation back
+    // ("hello, world!") and `$'`/`` $` `` spliced in the rest of the input.
+    expect(slugify("Hello, World!", { separator: "$&" }).slug).toBe("hello$&world");
+    expect(slugify("Hello, World!", { separator: "$'" }).slug).toBe("hello$'world");
+    expect(slugify("a/../b", { separator: "$&" }).slug).toBe("a$&b");
+    // The replacement goes through the ordinary pipeline as the text it is
+    // ("$" folds to "usd"); expanded, `$\`` had made "tom-tom-jerry".
+    expect(slugify("Tom & Jerry", { replacements: { "&": "$`" } }).slug).toBe("tom-usd-jerry");
+    expect(slugify("Tom & Jerry", { replacements: { "&": "$'" } }).slug).toBe("tom-usd-jerry");
+    expect(slugify("Tom & Jerry", { replacements: { "&": "$$" } }).slug).toBe("tom-usdusd-jerry");
+  });
+
   test("keeps case when asked to", () => {
     expect(slugify("Hello World", { lowercase: false }).slug).toBe("Hello-World");
   });

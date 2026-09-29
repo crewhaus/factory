@@ -343,7 +343,10 @@ export function applyMutation(prompt: string, m: Mutation): string {
       // Falls back to append when the old sample isn't textually present.
       const search = `Input: ${m.oldSample.input}`;
       const replace = `Input: ${m.newSample.input}\nExpected output: ${m.newSample.expected_output ?? ""}`;
-      if (prompt.includes(search)) return prompt.replace(search, replace);
+      // A function replacer: the sample text is data, and as a replacement
+      // string its `$&`, `$'` and `$$` would expand (a dataset input of
+      // "price is $&" wrote the OLD example back into the prompt).
+      if (prompt.includes(search)) return prompt.replace(search, () => replace);
       return `${prompt}\n\nExample:\nInput: ${m.newSample.input}\nExpected output: ${m.newSample.expected_output ?? ""}`;
     }
     case "add-COT-prefix": {
