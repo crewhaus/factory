@@ -31,9 +31,9 @@
  *   directory follows as its root.
  * The runtime's own `.crewhaus` stores are held to both by behavioural tests
  * that plant each link: session-store, event-log, runtime-core (watch-me
- * sidecar, alert history), dream-engine, prompt-cache-manager, watchme-store,
- * routing-store, permission-engine and eval-runner, each in its
- * `planted-*.test.ts` or `tool-record.test.ts`.
+ * sidecar, alert history, incident capture, agent identity), dream-engine,
+ * prompt-cache-manager, watchme-store, routing-store, permission-engine and
+ * eval-runner, each in its `planted-*.test.ts` or `tool-record.test.ts`.
  */
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
