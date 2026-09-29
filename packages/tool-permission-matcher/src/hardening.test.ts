@@ -228,7 +228,11 @@ describe("matchesSomeAfter / matchesEveryAfter: a glob against a prefix and some
     expect(tally.compared - tally.some).toBeGreaterThan(500);
     expect(tally.every).toBeGreaterThan(100);
     expect(tally.some - tally.every).toBeGreaterThan(500);
-  });
+    // 400 globs × 12 questions, each against up to 3,906 continuations: about
+    // 0.3 s alone, but 9.4 s was measured under the full suite's load (and CI
+    // runners are slower still), so it declares a budget rather than racing
+    // bun's 5 s default.
+  }, 60_000);
 
   test("matchesSegmentAfter is matchesSomeAfter with a segment tail", () => {
     for (const glob of ["1/*", "1/**", "**x", "1/a/b", "?", "1/?"]) {
