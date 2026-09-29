@@ -28,9 +28,11 @@ describe("a key-scoped allow and a guard on the store the key lives in", () => {
     expect(guardsOverridden(keyAllow, [storeDeny, otherDeny], "/ws")).toEqual([storeDeny]);
   });
 
-  test("without the relocating default the override is invisible", () => {
+  test("a builtin's relocating defaults are read from the manifest when the caller passes none", () => {
     const { relocatingDefaults: _, ...bare } = keyAllow;
-    expect(guardsOverridden(bare, [storeDeny], "/ws")).toEqual([]);
+    expect(guardsOverridden(bare, [storeDeny], "/ws")).toEqual([storeDeny]);
+    // An explicit empty list says the tool relocates nothing: no override.
+    expect(guardsOverridden({ ...bare, relocatingDefaults: [] }, [storeDeny], "/ws")).toEqual([]);
   });
 
   test("a guard written against the absolute store is read too", () => {

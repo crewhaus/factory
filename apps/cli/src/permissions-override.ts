@@ -19,6 +19,7 @@ import {
   matchesPattern,
   matchesToolName,
 } from "@crewhaus/tool-permission-matcher";
+import { TOOL_FLAGS_BY_NAME } from "@crewhaus/tool-registry-manifest/flags";
 
 /** A proposed allow: the tool, and the one value it is scoped to, if any. */
 export type ProposedAllow = {
@@ -33,13 +34,25 @@ export type ProposedAllow = {
    * those fields out, and such a call acts at the default — so a guard on
    * the default is overridden as well: settings `alwaysAllow KvDelete(prod/*)`
    * decides `{namespace: "prod", key}` before the spec's
-   * `alwaysDeny KvDelete(.crewhaus/state/**)` is read.
+   * `alwaysDeny KvDelete(.crewhaus/state/**)` is read. Left out, a builtin's
+   * are read from the builtin manifest.
    */
   readonly relocatingDefaults?: ReadonlyArray<{
     readonly kind: OperativeValueKind;
     readonly value: string;
   }>;
 };
+
+/** A builtin's relocating defaults, from the manifest every bundle ships. */
+function builtinRelocatingDefaults(
+  toolName: string,
+): ReadonlyArray<{ readonly kind: OperativeValueKind; readonly value: string }> {
+  return (TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs ?? []).flatMap((arg) =>
+    arg.relocates === true && arg.default !== undefined
+      ? [{ kind: arg.kind as OperativeValueKind, value: arg.default }]
+      : [],
+  );
+}
 
 /** One value as a guard compares it, a relative path also resolved against `cwd`. */
 function valueAt(kind: OperativeValueKind, value: string, cwd: string): OperativeValue {
@@ -85,7 +98,9 @@ export function guardsOverridden(
         ? undefined
         : [
             valueAt(allow.valueKind, value, cwd),
-            ...(allow.relocatingDefaults ?? []).map((d) => valueAt(d.kind, d.value, cwd)),
+            ...(allow.relocatingDefaults ?? builtinRelocatingDefaults(allow.toolName)).map((d) =>
+              valueAt(d.kind, d.value, cwd),
+            ),
           ];
     const fires = matchesPattern(
       compiled,
