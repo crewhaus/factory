@@ -8,7 +8,9 @@ import {
   compilePattern,
   matchesPattern,
   matchesToolName,
+  mcpServersReachedBy,
   permissionRuleProblems,
+  specPermissionRuleLists,
 } from "./index";
 
 const tool = (
@@ -435,5 +437,100 @@ describe("argument patterns that cannot scope", () => {
     for (const bad of ["GET https://x", "/v1/**", "api.example.com/**", "://x", "1http://x"]) {
       expect({ bad, can: argGlobCanMatchUrl(bad) }).toEqual({ bad, can: false });
     }
+  });
+});
+
+// C146 / wave III review: lint read its lists from the lowered spec and
+// PermissionAudit read `permissions.rules` alone, so the two disagreed about
+// which lists exist; a pool candidate's inline deny/ask was read by neither.
+describe("specPermissionRuleLists — every rule list a spec document carries", () => {
+  test("the shape's rules, profiles' and pool candidates' deny/ask, sub-agents' allow/deny", () => {
+    const spec = {
+      name: "demo",
+      target: "cli",
+      models: {
+        fast: { model: "m", permissions: { deny: ["Fetch"], ask: ["Write"] } },
+        slow: { model: "m" },
+      },
+      agent: {
+        model_pool: {
+          candidates: [
+            { model: "$fast" },
+            { model: "x", permissions: { ask: ["Bash"], deny: [] } },
+          ],
+        },
+        sub_agents: {
+          helper: { permissions: { allow: ["Read"], deny: ["Fetch(https://evil/**)"] } },
+          inheritor: { permissions: "inherit" },
+        },
+      },
+      roles: {
+        researcher: {
+          sub_agents: { digger: { permissions: { allow: [], deny: ["RemovePath"] } } },
+        },
+      },
+      // Not rule lists: a tool's own config and a server's, and a
+      // `permissions` key anywhere else.
+      tool_config: {
+        x: {
+          permissions: { deny: ["Nope"] },
+          sub_agents: { y: { permissions: { deny: ["Nope"] } } },
+        },
+      },
+      mcp_servers: { s: { sub_agents: { y: { permissions: { allow: ["Nope"] } } } } },
+      steps: [{ permissions: { deny: ["Nope"] } }],
+      permissions: {
+        mode: "auto",
+        rules: [{ type: "alwaysAllow", pattern: "Read" }, { type: "alwaysDeny" }, "Bash"],
+      },
+    };
+    expect(specPermissionRuleLists(spec)).toEqual([
+      { path: "permissions.rules", rules: [{ type: "alwaysAllow", pattern: "Read" }] },
+      { path: "models.fast.permissions.deny", rules: [{ type: "alwaysDeny", pattern: "Fetch" }] },
+      { path: "models.fast.permissions.ask", rules: [{ type: "alwaysAsk", pattern: "Write" }] },
+      {
+        path: "agent.model_pool.candidates[1].permissions.ask",
+        rules: [{ type: "alwaysAsk", pattern: "Bash" }],
+      },
+      {
+        path: "agent.sub_agents.helper.permissions.allow",
+        rules: [{ type: "alwaysAllow", pattern: "Read" }],
+      },
+      {
+        path: "agent.sub_agents.helper.permissions.deny",
+        rules: [{ type: "alwaysDeny", pattern: "Fetch(https://evil/**)" }],
+      },
+      {
+        path: "roles.researcher.sub_agents.digger.permissions.deny",
+        rules: [{ type: "alwaysDeny", pattern: "RemovePath" }],
+      },
+    ]);
+    expect(specPermissionRuleLists(undefined)).toEqual([]);
+    expect(specPermissionRuleLists({ permissions: { mode: "auto" } })).toEqual([]);
+  });
+
+  test("the MCP servers a rule can reach, in either spelling", () => {
+    const servers = ["broker", "gh"];
+    expect({
+      legacy: mcpServersReachedBy("broker__paper_buy", servers),
+      exact: mcpServersReachedBy("mcp__broker__quote", servers),
+      glob: mcpServersReachedBy("mcp__gh__*", servers),
+      scoped: mcpServersReachedBy("broker__quote(AAPL)", servers),
+      wide: mcpServersReachedBy("*", servers),
+      builtin: mcpServersReachedBy("Read", servers),
+      undeclared: mcpServersReachedBy("mcp__other__x", servers),
+      bareServer: mcpServersReachedBy("mcp__broker__", servers),
+      malformed: mcpServersReachedBy("broker__x(", servers),
+    }).toEqual({
+      legacy: ["broker"],
+      exact: ["broker"],
+      glob: ["gh"],
+      scoped: ["broker"],
+      wide: ["broker", "gh"],
+      builtin: [],
+      undeclared: [],
+      bareServer: [],
+      malformed: [],
+    });
   });
 });

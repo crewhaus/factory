@@ -22,6 +22,7 @@ import {
   type PermissionRuleProblem,
   type RuleToolDescriptor,
   permissionRuleProblems,
+  specPermissionRuleLists,
 } from "@crewhaus/tool-permission-matcher";
 import {
   NON_CLI_TOOL_FLAGS,
@@ -209,7 +210,7 @@ export function runLint(
   // near-miss tool name, an MCP server the spec does not declare, an
   // argument pattern that cannot match the field the tool declares. Shared
   // with `compile` (which fails on them under --strict) and PermissionAudit.
-  for (const p of permissionRuleProblemsOf(ir, resolveTool)) {
+  for (const p of permissionRuleProblemsOf(spec, ir, resolveTool)) {
     findings.push({
       message: p.message,
       path: p.path,
@@ -259,76 +260,6 @@ export function thredzToolNamesOf(ir: IrNode): string[] {
   ];
 }
 
-/** One list of permission patterns a spec carries, and how the engine reads it. */
-type RuleList = {
-  /** Where it sits in the spec, for the finding's path. */
-  readonly path: string;
-  readonly rules: ReadonlyArray<{ readonly type: string; readonly pattern: string }>;
-};
-
-/**
- * Every list of permission patterns in a lowered spec, each rule typed the
- * way the engine applies it: the shape's `permissions.rules`, each model
- * profile's `permissions.deny` / `ask` (they narrow whatever the profile
- * serves), and each sub-agent's `permissions.allow` / `deny` (they replace or
- * narrow the parent's for the sub-agent). All of them are matched against a
- * tool's registered name, so a spec key or a misspelling is as dead in one as
- * in another (C146).
- */
-function permissionRuleListsOf(ir: IrNode): RuleList[] {
-  const lists: RuleList[] = [];
-  const node = ir as {
-    readonly permissions?: { readonly rules?: ReadonlyArray<{ type: string; pattern: string }> };
-    readonly models?: Readonly<Record<string, unknown>>;
-    readonly subAgents?: unknown;
-    readonly roles?: unknown;
-  };
-  const top = node.permissions?.rules ?? [];
-  if (top.length > 0) lists.push({ path: "permissions.rules", rules: top });
-  const typed = (type: string, patterns: unknown) =>
-    Array.isArray(patterns)
-      ? patterns
-          .filter((p): p is string => typeof p === "string")
-          .map((pattern) => ({ type, pattern }))
-      : [];
-  for (const [name, profile] of Object.entries(node.models ?? {})) {
-    const perms = (profile as { readonly permissions?: { deny?: unknown; ask?: unknown } } | null)
-      ?.permissions;
-    if (perms === undefined) continue;
-    for (const [field, type] of [
-      ["deny", "alwaysDeny"],
-      ["ask", "alwaysAsk"],
-    ] as const) {
-      const rules = typed(type, perms[field]);
-      if (rules.length > 0) lists.push({ path: `models.${name}.permissions.${field}`, rules });
-    }
-  }
-  const subAgents = (owner: unknown, at: string): void => {
-    const defs = (owner as { readonly subAgents?: unknown } | null)?.subAgents;
-    if (!Array.isArray(defs)) return;
-    for (const def of defs as ReadonlyArray<{ name?: unknown; permissions?: unknown }>) {
-      const perms = def?.permissions;
-      if (typeof def?.name !== "string" || perms === null || typeof perms !== "object") continue;
-      for (const [field, type] of [
-        ["allow", "alwaysAllow"],
-        ["deny", "alwaysDeny"],
-      ] as const) {
-        const rules = typed(type, (perms as Record<string, unknown>)[field]);
-        if (rules.length > 0) {
-          lists.push({ path: `${at}.sub_agents.${def.name}.permissions.${field}`, rules });
-        }
-      }
-    }
-  };
-  subAgents(node, "agent");
-  if (Array.isArray(node.roles)) {
-    for (const role of node.roles as ReadonlyArray<{ name?: unknown } | null>) {
-      if (typeof role?.name === "string") subAgents(role, `roles.${role.name}`);
-    }
-  }
-  return lists;
-}
-
 /** A rule that can never do what it says, and where the spec holds it. */
 export type LocatedRuleProblem = PermissionRuleProblem & {
   /** The list that holds the rule, e.g. `models.fast.permissions.deny`. */
@@ -338,18 +269,21 @@ export type LocatedRuleProblem = PermissionRuleProblem & {
 };
 
 /**
- * The permission rules of a lowered spec that can never do what they say
- * (see `permissionRuleProblems`), in every list a spec carries (see
- * `permissionRuleListsOf`). A granted tool is described by the live tool
- * `resolveTool` returns, falling back to the builtin manifest, so the check
- * sees the same declarations the runtime will; the tools a `thredz:` block
- * registers are known in a spec that has one.
+ * The permission rules of a spec that can never do what they say (see
+ * `permissionRuleProblems`), in every list the spec carries (see
+ * `specPermissionRuleLists`: the shape's rules, each model profile's and
+ * pool candidate's deny/ask, each sub-agent's allow/deny). A granted tool is
+ * one the lowered spec lists, described by the live tool `resolveTool`
+ * returns, falling back to the builtin manifest, so the check sees the same
+ * declarations the runtime will; the tools a `thredz:` block registers are
+ * known in a spec that has one.
  */
 export function permissionRuleProblemsOf(
+  spec: unknown,
   ir: IrNode,
   resolveTool: (name: string) => RegisteredTool | undefined,
 ): LocatedRuleProblem[] {
-  const lists = permissionRuleListsOf(ir);
+  const lists = specPermissionRuleLists(spec);
   if (lists.length === 0) return [];
   const node = ir as { readonly mcp_servers?: Readonly<Record<string, unknown>> };
   const granted: RuleToolDescriptor[] = [];
@@ -375,6 +309,50 @@ export function permissionRuleProblemsOf(
     }
   }
   return out;
+}
+
+/** Rule findings that inform without saying the rule is dead: never escalated by --strict. */
+const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
+  "builtin-not-reached",
+  "tool-not-known",
+]);
+
+/**
+ * The permission rules in a spec that can never do what they say, as compile
+ * warnings (code `permission-rule`, or `permission-rule-note` for a note
+ * --strict does not escalate), in every list the spec carries. A spec that
+ * does not parse or lower has none here — the compile itself reports why.
+ *
+ * `loadTools` imports every builtin package the CLI carries (about half a
+ * second), so it is called only when the spec has a rule to check: a
+ * rule-less compile does not pay for it.
+ */
+export async function permissionRuleWarnings(
+  yamlText: string,
+  loadTools: () => Promise<Readonly<Record<string, RegisteredTool>>>,
+): Promise<Array<{ code: string; path: string; message: string }>> {
+  let spec: Spec;
+  let ir: IrNode;
+  try {
+    spec = parseSpec(yamlText);
+    ir = lower(spec);
+  } catch {
+    return [];
+  }
+  if (specPermissionRuleLists(spec).length === 0) return [];
+  const toolMap = await loadTools();
+  const byRegisteredName: Record<string, RegisteredTool> = {};
+  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
+  // A `builtin-not-reached` note is about a rule that still fires (on a
+  // declared MCP server's tools), and a `tool-not-known` one about a name a
+  // plugin or custom tool may still supply, so --strict escalates neither.
+  return permissionRuleProblemsOf(spec, ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
+    (p) => ({
+      code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
+      path: p.list,
+      message: p.message,
+    }),
+  );
 }
 
 /** Re-exported for the CLI wrapper's philosophy-alignment parity note. */

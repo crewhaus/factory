@@ -8,6 +8,7 @@ import {
   formatLintText,
   levenshtein,
   nearestToolName,
+  permissionRuleWarnings,
   runLint,
   suggestSafeName,
   suggestSecretFix,
@@ -371,6 +372,51 @@ permissions:
         "agent.sub_agents.helper.permissions.deny[alwaysDeny fetch(https://evil.example/**)]",
         "Fetch(https://evil.example/**)",
       ],
+    ]);
+  });
+
+  // wave III review: a pool candidate carries its own deny/ask inline, read
+  // the same way as a profile's, and neither lint nor PermissionAudit read
+  // it. The lists now come from one reader both use.
+  test("a pool candidate's own deny/ask is checked, and the lists match PermissionAudit's", () => {
+    const yaml = `name: demo
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: go
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap], permissions: { deny: ['removePath'], ask: ['Fetch'] } }
+      - { model: claude-opus-4-8, tags: [strong] }
+tools: [removePath, fetch]
+`;
+    const found = runLint(yaml, noTools).findings.filter((f) =>
+      f.rule.startsWith("permission-rule:"),
+    );
+    expect(found.map((f) => [f.rule, f.path])).toEqual([
+      [
+        "permission-rule:tool-key-not-name",
+        "agent.model_pool.candidates[0].permissions.deny[alwaysDeny removePath]",
+      ],
+    ]);
+  });
+
+  // wave III review: compile loaded every builtin package (about half a
+  // second) before finding a rule-less spec had no rule to check.
+  test("compile's rule check loads the tools only when the spec has a rule to check", async () => {
+    let loads = 0;
+    const loadTools = async () => {
+      loads++;
+      return {} as Record<string, RegisteredTool>;
+    };
+    expect(await permissionRuleWarnings(`${validCli}tools: [read]\n`, loadTools)).toEqual([]);
+    expect(await permissionRuleWarnings("not: [valid", loadTools)).toEqual([]);
+    expect(loads).toBe(0);
+    const profileOnly = `${validCli.replace("agent:", "models:\n  fast: { model: claude-haiku-4-5, permissions: { deny: [fetch] } }\nagent:")}tools: [fetch]\n`;
+    const warnings = await permissionRuleWarnings(profileOnly, loadTools);
+    expect(loads).toBe(1);
+    expect(warnings.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule", "models.fast.permissions.deny"],
     ]);
   });
 

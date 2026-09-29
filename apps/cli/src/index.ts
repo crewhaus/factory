@@ -1082,7 +1082,7 @@ import {
   applyLintFixes,
   formatLintJson,
   formatLintText,
-  permissionRuleProblemsOf,
+  permissionRuleWarnings,
   runLint,
 } from "./lint";
 // Item 68 — `crewhaus loadtest`: concurrency benchmark + deploy gate for daemon
@@ -2148,7 +2148,7 @@ async function runCompile(args: ParsedArgs): Promise<void> {
   // 0.7.1 (permission-integration#12) — permission rules that can never do
   // what they say, the same check `crewhaus lint` runs. Remediable, so
   // --strict fails on them like any other compile warning.
-  const warnings = [...bundle.warnings, ...(await permissionRuleWarnings(yamlText))];
+  const warnings = [...bundle.warnings, ...(await permissionRuleWarnings(yamlText, loadToolMap))];
   for (const warning of warnings) {
     process.stderr.write(`crewhaus: ${formatCompileWarning(warning)}\n`);
   }
@@ -2579,43 +2579,6 @@ async function autoRegisterSpec(
   } catch (err) {
     process.stderr.write(`[register] skipped: ${(err as Error).message}\n`);
   }
-}
-
-/** Rule findings that inform without saying the rule is dead: never escalated by --strict. */
-const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
-  "builtin-not-reached",
-  "tool-not-known",
-]);
-
-/**
- * The permission rules in a spec that can never do what they say, as compile
- * warnings (code `permission-rule`), in every list a spec carries — the
- * shape's rules, each model profile's deny/ask, each sub-agent's allow/deny.
- * A spec that does not parse or lower has none here — the compile itself
- * reports why.
- */
-async function permissionRuleWarnings(
-  yamlText: string,
-): Promise<Array<{ code: string; path: string; message: string }>> {
-  let ir: ReturnType<typeof lower>;
-  try {
-    ir = lower(parseSpec(yamlText));
-  } catch {
-    return [];
-  }
-  const toolMap = await loadToolMap();
-  const byRegisteredName: Record<string, RegisteredTool> = {};
-  for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
-  // A `builtin-not-reached` note is about a rule that still fires (on a
-  // declared MCP server's tools), and a `tool-not-known` one about a name a
-  // plugin or custom tool may still supply, so --strict escalates neither.
-  return permissionRuleProblemsOf(ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
-    (p) => ({
-      code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
-      path: p.list,
-      message: p.message,
-    }),
-  );
 }
 
 /**

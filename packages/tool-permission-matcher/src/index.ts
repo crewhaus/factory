@@ -1139,10 +1139,13 @@ export function matchesPattern(
 }
 
 export {
+  type PermissionRuleList,
   type PermissionRuleProblem,
   type PermissionRuleProblemCode,
   type PermissionRuleProblemsInput,
   type RuleToolDescriptor,
   argGlobCanMatchUrl,
+  mcpServersReachedBy,
   permissionRuleProblems,
+  specPermissionRuleLists,
 } from "./rule-problems";
