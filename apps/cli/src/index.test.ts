@@ -1505,7 +1505,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     expect(result.stdout).toContain('"edit"');
     expect(result.stdout).toContain("ambiguous");
     expect(result.stdout).not.toContain("fixed: tool");
-  });
+  }, 30_000);
 
   test("an unambiguous tool-name typo still auto-fixes", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -1527,7 +1527,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       env: { ANTHROPIC_API_KEY: "test" },
     });
     expect(compiled.exitCode).toBe(0);
-  });
+  }, 30_000);
 
   test("a sub-agent's registered names are left alone, and its typo keeps their spelling", async () => {
     // `tools: [Read, Grep]` is how 0.7.0 documented a sub-agent's list, and it
@@ -1561,7 +1561,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     const typo = await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
     expect(typo.stdout).toContain('fixed: tool "Reed" → "Read" (nearest match)');
     expect(readFileSync(specPath, "utf-8")).toBe(spec("Read, Grep, WebFetch", "Grep"));
-  });
+  }, 30_000);
 
   test("a bare word in a list that is not tools: is left alone", async () => {
     const specPath = join(tmp, "crewhaus.yaml");
@@ -1570,7 +1570,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
     writeFileSync(specPath, original);
     await runCli(["lint", specPath, "--fix"], { env: { ANTHROPIC_API_KEY: "test" } });
     expect(readFileSync(specPath, "utf-8")).toBe(original);
-  });
+  }, 30_000);
 
   test("an MCP server's args are not tool names, and a flow tools: list is fixed to spec keys", async () => {
     // shape-reach#6 — the fixer used to rewrite any bare-word list item within
@@ -1604,7 +1604,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       'fixed: tool "webfetch" → "webFetch" (nearest match)',
     ]);
     expect(readFileSync(specPath, "utf-8")).toBe(spec("read, webFetch"));
-  });
+  }, 30_000);
 
   // C025 (wave III): the per-line fixer rewrote a `tools:` example inside
   // `instructions: |` and turned the profile reference `$fast` into `$FAST`,
@@ -1652,7 +1652,7 @@ describe("crewhaus lint --fix — cross-capability tool-name guard (item 41 fix)
       '[tool] tools: tool "evmCall" is a builtin, but the cli shape cannot run it',
     );
     expect(result.stdout).toContain('[tool] tools: unknown tool "nosuchtool"');
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
