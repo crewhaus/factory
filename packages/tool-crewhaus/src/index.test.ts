@@ -459,6 +459,70 @@ describe("ToolInventory", () => {
     expect(result.unknown).toEqual(["NoSuchThing"]);
   });
 
+  // wave III review: cf09645e accepted any registered name, runtime name or
+  // thredz name anywhere, so a site list compile rejects (`tools: [Read,
+  // Skill, goal_list]`) came back with nothing unknown.
+  test("a site list takes spec keys, as compile reads it; a narrowing list also takes the rest", async () => {
+    const spec = [
+      "name: demo",
+      "target: cli",
+      "thredz: true",
+      "models:",
+      "  fast: { model: claude-haiku-4-5, tools: [Read, Skill] }",
+      "agent:",
+      "  model: claude-sonnet-4-6",
+      "  instructions: go",
+      "  model_pool:",
+      "    candidates:",
+      "      - { model: $fast, tags: [cheap] }",
+      "      - { model: claude-opus-4-8, tags: [strong], tools: [Read, goal_list] }",
+      "  sub_agents:",
+      "    helper:",
+      "      description: d",
+      "      instructions: h",
+      "      tools: [Read, Skill, goal_list, EvmGetLogs]",
+      "tools: [Read, goal_list, Skill, evmCall, WebFetch, read]",
+    ].join("\n");
+    const result = await callJson<{
+      unknown: string[];
+      unknownAt: Array<{ tool: string; site: string; reason?: string }>;
+      notOnShape: Array<{ tool: string; site: string }>;
+    }>(toolInventory, { spec });
+    expect(result.unknown).toEqual(["Read", "Skill", "WebFetch", "goal_list"]);
+    expect(result.unknownAt.map((u) => `${u.site}: ${u.tool}`)).toEqual([
+      "<root>: Read",
+      "<root>: goal_list",
+      "<root>: Skill",
+      "<root>: WebFetch",
+    ]);
+    // With compile's own words.
+    expect(result.unknownAt[0]?.reason).toContain('write "read"');
+    expect(result.notOnShape.map((n) => `${n.site}: ${n.tool}`)).toEqual([
+      "<root>: evmCall",
+      "agent.sub_agents.helper: EvmGetLogs",
+    ]);
+    // A graph node's list is a site list too.
+    const graph = [
+      "name: g",
+      "target: graph",
+      "model: claude-sonnet-5",
+      "entry: plan",
+      "nodes:",
+      "  plan:",
+      "    instructions: plan",
+      "    tools: [evmCall, EvmGetLogs, sendMessage]",
+      "edges: []",
+    ].join("\n");
+    const onGraph = await callJson<{ unknown: string[]; notOnShape: Array<{ tool: string }> }>(
+      toolInventory,
+      { spec: graph },
+    );
+    expect([onGraph.unknown, onGraph.notOnShape.map((n) => n.tool)]).toEqual([
+      ["EvmGetLogs"],
+      ["sendMessage"],
+    ]);
+  });
+
   test("a spec of real tools reports nothing unknown", async () => {
     const result = await callJson<{ unknown: string[] }>(toolInventory, { spec: CLI_SPEC });
     expect(result.unknown).toEqual([]);

@@ -555,28 +555,53 @@ export const toolInventory: RegisteredTool = buildTool({
 
     const builtin: string[] = [];
     const mcp: Array<{ tool: string; server: string; declared: boolean }> = [];
-    const unknown: string[] = [];
-    const notOnShape: Array<{ tool: string; reason: string }> = [];
+    const unknown = new Set<string>();
+    const unknownAt: Array<{ tool: string; site: string; reason?: string }> = [];
+    const notOnShape: Array<{ tool: string; site: string; reason: string }> = [];
     for (const tool of resolved.tools) {
       if (tool.startsWith("mcp__")) {
         const server = mcpServerOf(tool, servers);
         mcp.push({ tool, server, declared: servers.has(server) });
-        continue;
+      } else {
+        builtin.push(tool);
       }
-      builtin.push(tool);
-      if (usedCallerList) {
-        if (!callerKnown.has(tool) && !callerKnown.has(toRegisteredName(tool))) {
-          unknown.push(tool);
+    }
+    // Each name is judged where it is listed, as compile judges it: a site's
+    // list registers tools and takes the spec key (`read`), so a registered
+    // name (`Read`), a tool the runtime adds itself (`Skill`) or a thredz
+    // name there is refused; a list that narrows one (a sub-agent's, a model
+    // profile's, a pool candidate's) also takes the registered name, and a
+    // tool the runtime or a thredz: block adds is real there.
+    for (const site of resolved.toolSites) {
+      const narrowing = isNarrowingToolSite(site.path);
+      for (const tool of new Set(site.tools)) {
+        if (tool.startsWith("mcp__")) continue;
+        const miss = (reason?: string) => {
+          unknown.add(tool);
+          unknownAt.push({ tool, site: site.path, ...(reason !== undefined ? { reason } : {}) });
+        };
+        if (usedCallerList) {
+          if (!callerKnown.has(tool) && !callerKnown.has(toRegisteredName(tool))) miss();
+          continue;
         }
-        continue;
+        if (!narrowing) {
+          const verdict = checkBuiltinTool(tool, shape);
+          if (verdict.kind === "unknown") miss(verdict.message);
+          else if (verdict.kind === "refused") {
+            notOnShape.push({ tool, site: site.path, reason: verdict.message });
+          }
+          continue;
+        }
+        const key = Object.hasOwn(BUILTIN_TOOLS, tool) ? tool : builtinKeyForName(tool);
+        if (key === undefined) {
+          if (!runtimeKnown.has(tool)) miss();
+          continue;
+        }
+        const verdict = checkBuiltinTool(key, shape);
+        if (verdict.kind === "refused") {
+          notOnShape.push({ tool, site: site.path, reason: verdict.message });
+        }
       }
-      const key = Object.hasOwn(BUILTIN_TOOLS, tool) ? tool : builtinKeyForName(tool);
-      if (key === undefined) {
-        if (!runtimeKnown.has(tool)) unknown.push(tool);
-        continue;
-      }
-      const verdict = checkBuiltinTool(key, shape);
-      if (verdict.kind === "refused") notOnShape.push({ tool, reason: verdict.message });
     }
 
     return json({
@@ -586,7 +611,8 @@ export const toolInventory: RegisteredTool = buildTool({
       builtin,
       mcp,
       dangling: mcp.filter((m) => !m.declared).map((m) => m.tool),
-      unknown,
+      unknown: [...unknown].sort(compareStrings),
+      unknownAt,
       ...(usedCallerList ? {} : { shape, notOnShape }),
       checkedAgainst: usedCallerList ? "the knownTools you passed" : "this release's builtins",
       sites: resolved.toolSites,
@@ -594,6 +620,19 @@ export const toolInventory: RegisteredTool = buildTool({
     });
   },
 });
+
+/**
+ * Does the `tools:` list at this site (a `collectToolSites` path) narrow
+ * what a site registers — a sub-agent's, a model profile's or a pool
+ * candidate's — rather than register tools itself?
+ */
+function isNarrowingToolSite(sitePath: string): boolean {
+  return (
+    sitePath.startsWith("models.") ||
+    /(^|\.)sub_agents\./.test(sitePath) ||
+    /(^|\.)model_pool(\.|$)/.test(sitePath)
+  );
+}
 
 /**
  * The bare tool names a spec's `thredz:` block registers (the goal, task,
