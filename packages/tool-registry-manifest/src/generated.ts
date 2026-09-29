@@ -6639,7 +6639,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path", default: "." },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "command", kind: "command" },
     ],
     categories: ["toolchain", "code"],
@@ -6690,7 +6690,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path", default: "." },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "command", kind: "command" },
     ],
     categories: ["toolchain", "code"],

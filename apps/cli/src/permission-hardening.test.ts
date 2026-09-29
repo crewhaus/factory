@@ -776,6 +776,40 @@ describe("C033 — a scoped allow on a multi-field builtin is usable", () => {
     expect(await gate("RunCommand", { argv: ["ls"], cwd: "src" }, deny)).toBe("allow");
   }, 30_000);
 
+  // RunBuild and RunTests declare `cwd` beside the command. As a plain
+  // default, the root "." was one more value every allow had to match, so
+  // `alwaysAllow RunBuild(npm run build)` — which 0.7.0 honoured — no longer
+  // fired on the ordinary call, and a headless run stopped at an approval.
+  // `cwd` only moves the run, as it does for RunCommand: an allow scoped to
+  // the command covers the workspace root, a call in another directory must
+  // be covered there too, and a deny on a directory still reads the root
+  // when the call leaves `cwd` out.
+  test("RunBuild and RunTests: an allow on the command covers the ordinary call, not another directory", async () => {
+    for (const [tool, script] of [
+      ["RunBuild", "./build.sh"],
+      ["RunTests", "./test.sh"],
+    ] as const) {
+      const command = [script];
+      const allow = rules(["alwaysAllow", `${tool}(${script})`]);
+      expect({
+        tool,
+        root: await gate(tool, { command }, allow),
+        src: await gate(tool, { command, cwd: "src" }, allow),
+      }).toEqual({ tool, root: "allow", src: "ask" });
+      const denySrc = rules(["alwaysDeny", `${tool}(src)`], ["alwaysAllow", tool]);
+      expect({
+        tool,
+        src: await gate(tool, { command, cwd: "src" }, denySrc),
+        root: await gate(tool, { command }, denySrc),
+      }).toEqual({ tool, src: "deny", root: "allow" });
+      const denyRoot = rules(["alwaysDeny", `${tool}(.)`], ["alwaysAllow", tool]);
+      expect({ tool, root: await gate(tool, { command }, denyRoot) }).toEqual({
+        tool,
+        root: "deny",
+      });
+    }
+  }, 30_000);
+
   test("a boolean switch is not part of what a rule sees (documented; 0.8)", async () => {
     const rs = rules(["alwaysAllow", "RemovePath(build/**)"]);
     const call = { path: "build/nothing-here", recursive: true, dryRun: false };

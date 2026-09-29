@@ -425,8 +425,11 @@ function workspaceRoots(): string[] {
 
 export const runTests: RegisteredTool = buildTool({
   name: "RunTests",
+  // `cwd` only moves the run inside the workspace, as for RunCommand: a deny
+  // or ask on a directory reads the root when the call leaves it out, and
+  // `alwaysAllow RunTests(bun test)` is not also asked to match ".".
   operativeArgs: [
-    { field: "cwd", kind: "path", default: "." },
+    { field: "cwd", kind: "path", default: ".", relocates: true },
     { field: "command", kind: "command" },
   ],
   description:
@@ -672,8 +675,9 @@ function diagnosticsBody(diagnostics: readonly Diagnostic[]): Record<string, unk
 
 export const runBuild: RegisteredTool = buildTool({
   name: "RunBuild",
+  // `cwd` relocates the run, as on RunTests above.
   operativeArgs: [
-    { field: "cwd", kind: "path", default: "." },
+    { field: "cwd", kind: "path", default: ".", relocates: true },
     { field: "command", kind: "command" },
   ],
   description:

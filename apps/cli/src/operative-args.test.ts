@@ -337,9 +337,34 @@ describe("an optional operative field says what leaving it out means (C004)", ()
       ["EvalHistory.evalsDir", ".crewhaus/evals"],
       ["DeployInspect.registryDir", ".crewhaus/specs"],
       ["DatasetInspect.registryDir", ".crewhaus/datasets"],
+      // The directory a build or test run starts in (0.7.0's
+      // `alwaysAllow RunBuild(npm run build)` covers the ordinary call).
+      ["RunBuild.cwd", "."],
+      ["RunTests.cwd", "."],
     ] as const) {
       expect({ field, place: declared.get(field) }).toEqual({ field, place });
     }
     expect(declared.size).toBeGreaterThanOrEqual(50);
+  });
+
+  test("a process tool's working directory only moves the run, so an allow on the command covers the ordinary call", () => {
+    // A command's directory is either folded into the command (`within`, as
+    // RunCommand declares it) or declared beside it as a relocating field.
+    // As a plain default it is one more value every allow must match, and
+    // `alwaysAllow RunBuild(npm run build)` never fires on a call that
+    // leaves it out. Read from the declarations, never a list of tools.
+    const plain: string[] = [];
+    let checked = 0;
+    for (const tool of builtins) {
+      const args = tool.operativeArgs ?? [];
+      if (!args.some((a) => a.kind === "command")) continue;
+      for (const arg of args) {
+        if (arg.field !== "cwd" || arg.default === undefined) continue;
+        checked++;
+        if (arg.relocates !== true) plain.push(`${tool.name}.${arg.field}`);
+      }
+    }
+    expect(checked).toBeGreaterThanOrEqual(2);
+    expect(plain.sort()).toEqual([]);
   });
 });

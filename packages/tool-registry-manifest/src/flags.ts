@@ -4362,7 +4362,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path", default: "." },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "command", kind: "command" },
     ],
   },
@@ -4398,7 +4398,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requiresSandbox: false,
     requireJustification: false,
     operativeArgs: [
-      { field: "cwd", kind: "path", default: "." },
+      { field: "cwd", kind: "path", default: ".", relocates: true },
       { field: "command", kind: "command" },
     ],
   },
