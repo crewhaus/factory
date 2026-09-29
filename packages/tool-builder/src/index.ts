@@ -273,6 +273,24 @@ function scalarFieldShape(inputSchema: unknown, name: string): string | undefine
 }
 
 /**
+ * Why `name` cannot hold a command's environment, or `undefined` when it can:
+ * it must be a top-level field holding a map of names to string values.
+ */
+function mapFieldShape(inputSchema: unknown, name: string): string | undefined {
+  const s = unwrapZod(inputSchema);
+  if (zodTypeName(s) !== "ZodObject") return "is not an object";
+  const shape = (zodDef(s)["shape"] as () => Record<string, unknown>)();
+  if (!Object.hasOwn(shape, name)) return `has no top-level field "${name}"`;
+  const field = unwrapZod(shape[name]);
+  if (zodTypeName(field) !== "ZodRecord") {
+    return `field "${name}" is not a map of variable names to values`;
+  }
+  return leafShape(zodDef(field)["valueType"]) === "string"
+    ? undefined
+    : `field "${name}" does not map names to string values`;
+}
+
+/**
  * Check a tool's `operativeArgs` against its input schema. A declaration that
  * names a field the schema does not have would make every scoped rule for the
  * tool silently miss, so it is refused when the tool is built, not discovered
@@ -329,12 +347,25 @@ function checkOperativeArgs(
       const qualifier = scalarFieldShape(inputSchema, within);
       if (qualifier !== undefined) fail(`${at}.within: the input schema ${qualifier}`);
     }
+    const { env } = arg;
+    if (env !== undefined) {
+      if (kind !== "command") {
+        fail(`${at}.env: only a "command" runs in an environment; a "${kind}" value has none`);
+      }
+      if (typeof env !== "string" || !/^[A-Za-z_$][\w$]*$/.test(env)) {
+        fail(`${at}.env must name one top-level input field, e.g. "envSet"`);
+      }
+      if (env === field || env === within) fail(`${at}.env names "${env}", which is already used`);
+      const environment = mapFieldShape(inputSchema, env);
+      if (environment !== undefined) fail(`${at}.env: the input schema ${environment}`);
+    }
     out.push(
       Object.freeze({
         field,
         kind,
         ...(arg.default !== undefined ? { default: arg.default } : {}),
         ...(within !== undefined ? { within } : {}),
+        ...(env !== undefined ? { env } : {}),
       }),
     );
   }

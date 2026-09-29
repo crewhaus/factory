@@ -1853,7 +1853,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "paths", kind: "path", default: ".", within: "cwd" },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "cwd" },
     ],
   },
   formatCheck: {
@@ -2471,7 +2471,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "dir", kind: "path", default: "." },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "dir" },
     ],
   },
   htmlForms: {
@@ -3893,7 +3893,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   processStatus: {
     key: "processStatus",
@@ -4217,7 +4217,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   robotsCheck: {
     key: "robotsCheck",
@@ -4278,7 +4278,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "cwd", kind: "path", default: "." },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "cwd" },
     ],
   },
   runCommand: {
@@ -4290,7 +4290,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   runPipeline: {
     key: "runPipeline",
@@ -4301,7 +4301,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd" }],
+    operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd", env: "envSet" }],
   },
   runTests: {
     key: "runTests",
@@ -4314,7 +4314,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     requireJustification: false,
     operativeArgs: [
       { field: "cwd", kind: "path", default: "." },
-      { field: "command", kind: "command" },
+      { field: "command", kind: "command", within: "cwd" },
     ],
   },
   runTimeline: {

@@ -769,13 +769,52 @@ describe("declared operative values", () => {
     ).toHaveLength(2);
     expect(url.grants("U(**)")).toBe(true);
     expect(["U(https://**)", "U(*)"].filter(url.grants)).toEqual([]);
-    // Every command.
+    // Every command, run where no allow can name it: only one that names
+    // every command grants it.
     const cmd = check(
       { kind: "command", canonical: [], spellings: ["*"], standsForAny: [""] },
       "C",
     );
     expect(["C(*scripts/release.sh*)", "C(RM*)", "C(rm -rf /)"].filter(cmd.fires)).toHaveLength(3);
-    expect(["C(**)", "C(*)"].filter(cmd.grants)).toEqual([]);
+    expect(["C(**)", "C(*)"].filter(cmd.grants)).toEqual(["C(**)"]);
+  });
+
+  // wave III: a command with no canonical spelling (run in another
+  // directory, or with an environment the call set) asked under every
+  // scoped allow, `RunCommand(**)` included — which 0.7.0 honoured for any
+  // call, since every string matched it.
+  test("a command no allow can name is granted only by one that names every command", () => {
+    const elsewhere: OperativeValue = {
+      kind: "command",
+      canonical: [],
+      spellings: ["sh release.sh", "sh", "release.sh", "scripts/release.sh"],
+    };
+    const grants = (pattern: string) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "C",
+        {},
+        {
+          polarity: "allow",
+          operativeValues: [elsewhere],
+        },
+      );
+    expect(["C(**)", "C(***)"].filter(grants)).toEqual(["C(**)", "C(***)"]);
+    expect(
+      ["C(*)", "C(sh *)", "C(sh release.sh)", "C(**release.sh)", "C(?**)"].filter(grants),
+    ).toEqual([]);
+    // Unreadable (outsideWorkspace) is granted by nothing.
+    expect(
+      matchesPattern(
+        compilePattern("C(**)"),
+        "C",
+        {},
+        {
+          polarity: "allow",
+          operativeValues: [{ ...elsewhere, outsideWorkspace: true }],
+        },
+      ),
+    ).toBe(false);
   });
 
   test("non-path values are not filtered by absoluteness", () => {

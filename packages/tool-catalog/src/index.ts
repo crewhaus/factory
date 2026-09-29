@@ -254,11 +254,29 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * scoped allow (`RunCommand(./build.sh)` asks), while a deny or ask reads
  * the command as written and each word that may name a file as that file
  * from the workspace root, so `alwaysDeny RunCommand(*src/build.sh*)` fires
- * on `./build.sh` run in `src/`. A command inside an array of objects
+ * on `./build.sh` run in `src/`. A bare program name (`git`) is not joined:
+ * PATH finds it, not the directory. A command inside an array of objects
  * (`steps.argv`) runs in its own object's field of that name when it has
  * one, else the top-level one. A command tool whose input has a working
  * directory declares it this way; without it, the directory is invisible to
  * every rule.
+ *
+ * `env`, for a `command` only, names a top-level field holding the
+ * variables the call sets in the child's environment, a map of names to
+ * values (`{ field: "argv", kind: "command", within: "cwd", env: "envSet"
+ * }`). The environment can run another program than the command's words
+ * say — PATH decides what a bare program name is, and BASH_ENV,
+ * NODE_OPTIONS, LD_PRELOAD and the like load code of their own — so a call
+ * that sets any variable is not covered by a scoped allow (it asks, as a
+ * command run outside the root does), and a deny or ask also reads a bare
+ * program as it is found on each PATH entry the call sets, and every value
+ * the call sets, each word that may name a file also as that file:
+ * `alwaysDeny RunCommand(*scripts/release.sh*)` fires on `[release.sh]`
+ * with `PATH: scripts`, and on `[bash, -c, true]` with `BASH_ENV:
+ * scripts/release.sh`. A command inside an array of objects reads its own
+ * object's field of that name when it has one, else the top-level one. A
+ * command tool that lets the call set its child's environment declares it
+ * this way; without it, the environment is invisible to every rule.
  *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
@@ -271,6 +289,7 @@ export type OperativeArg = {
   readonly kind: OperativeArgKind;
   readonly default?: string;
   readonly within?: string;
+  readonly env?: string;
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

@@ -19,6 +19,8 @@ export type RegistryOperativeArg = {
   readonly kind: string;
   readonly default?: string;
   readonly within?: string;
+  /** For a `command`: the field holding the environment its call sets. */
+  readonly env?: string;
 };
 
 export type RegistryEntry = {
@@ -111,6 +113,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     kind: arg.kind,
     ...(arg.default !== undefined ? { default: arg.default } : {}),
     ...(arg.within !== undefined ? { within: arg.within } : {}),
+    ...(arg.env !== undefined ? { env: arg.env } : {}),
   };
 }
 

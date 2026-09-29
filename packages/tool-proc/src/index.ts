@@ -196,7 +196,7 @@ function outcomeJson(outcome: Awaited<ReturnType<typeof runOnce>>): Record<strin
 
 export const runCommand: RegisteredTool = buildTool({
   name: "RunCommand",
-  operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+  operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   description:
     "Run a program from an argv array — the program and each argument as separate strings, with no shell anywhere, so an argument containing a space, a quote or $(...) stays an argument. Use it whenever a harness needs a program's exit code and output without the injection surface of a shell command line. The child inherits no environment except the names you forward, always has a timeout, and runs in a session of its own with no terminal: a program that prompts (sudo, ssh, gpg) fails instead of waiting for input.",
   inputSchema: z.object({
@@ -233,7 +233,7 @@ export const runCommand: RegisteredTool = buildTool({
 
 export const runPipeline: RegisteredTool = buildTool({
   name: "RunPipeline",
-  operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd" }],
+  operativeArgs: [{ field: "steps.argv", kind: "command", within: "cwd", env: "envSet" }],
   description:
     "Run several argv commands in order, stopping at the first non-zero exit, and return every step's result. Use it for a short ordered chain — install, then build, then test — without spending a model turn between the steps. Steps run in sequence and do not pipe into each other; each gets its own stdin and its own timeout, and runs with no terminal, so a step that prompts fails instead of waiting.",
   inputSchema: z.object({
@@ -336,7 +336,7 @@ const backoffSchema = z
 
 export const retry: RegisteredTool = buildTool({
   name: "Retry",
-  operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+  operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   description:
     "Re-run an argv command until it succeeds or a bounded attempt count runs out, waiting a caller-declared backoff between attempts. Use it for a flaky step — a service still starting, a lock still held — instead of asking a model to decide when to try again. The backoff is fixed or exponential with an explicit base and carries no jitter, and every attempt is reported. Each attempt runs with no terminal, so one that prompts fails instead of waiting.",
   inputSchema: z.object({
@@ -462,7 +462,7 @@ function noSuchProc(toolName: string, id: string): string {
 
 export const processStart: RegisteredTool = buildTool({
   name: "ProcessStart",
-  operativeArgs: [{ field: "argv", kind: "command", within: "cwd" }],
+  operativeArgs: [{ field: "argv", kind: "command", within: "cwd", env: "envSet" }],
   description:
     "Start a program in the background from an argv array and return an id immediately, without waiting for it to finish. Use it for something that must outlive one tool call — a dev server, a watcher, a tail — then poll it with ProcessStatus and ProcessOutput and end it with ProcessStop. The process is killed if the harness exits, so a session never leaks children.",
   inputSchema: z.object({

@@ -427,7 +427,7 @@ export const runTests: RegisteredTool = buildTool({
   name: "RunTests",
   operativeArgs: [
     { field: "cwd", kind: "path", default: "." },
-    { field: "command", kind: "command" },
+    { field: "command", kind: "command", within: "cwd" },
   ],
   description:
     "Run the project's test suite and return only what failed, as structured JSON: the test name, the failing assertion, its file and line, and a trimmed stack. Use it instead of running a test command and reading the output, because a green run comes back as three counts rather than thousands of lines. The runner is detected from the project (bun, vitest, jest, pytest, go, cargo) or given explicitly, and each one is asked for its machine-readable form. Running tests executes the project's own code, so it is not a read-only operation.",
@@ -674,7 +674,7 @@ export const runBuild: RegisteredTool = buildTool({
   name: "RunBuild",
   operativeArgs: [
     { field: "cwd", kind: "path", default: "." },
-    { field: "command", kind: "command" },
+    { field: "command", kind: "command", within: "cwd" },
   ],
   description:
     "Build the project and return structured diagnostics instead of the build log: file, line, column, severity, rule and message. Use it to find out whether a change compiles and, when it does not, exactly where — without a model reading a compiler's output. The command comes from the project (a build script, cargo, go, tsc) or is given explicitly. A build writes its own output, so this is not a read-only operation.",
@@ -824,7 +824,7 @@ export const format: RegisteredTool = buildTool({
   name: "Format",
   operativeArgs: [
     { field: "paths", kind: "path", within: "cwd", default: "." },
-    { field: "command", kind: "command" },
+    { field: "command", kind: "command", within: "cwd" },
   ],
   description:
     "Rewrite files with the project's own formatter and report what it did. Use it after generating or editing code so the result matches the project's style without a model reproducing that style by hand. This tool WRITES: it is the only one here that changes source files, and FormatCheck is the counterpart that only reports.",

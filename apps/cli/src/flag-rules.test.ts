@@ -263,3 +263,77 @@ describe("what auto mode runs without asking (permission-integration#13)", () =>
     expect(decide(buildTool({ ...def, destructive: true }), "auto")).toBe("ask");
   });
 });
+
+describe("what a command rule reads (wave III review)", () => {
+  /**
+   * THE RULE: a command runs in its working directory and with the
+   * environment its call sets, and both decide which program runs —
+   * `./build.sh` in `src/` is `src/build.sh`, and `[release.sh]` with
+   * `PATH: scripts` is `scripts/release.sh`. A command operative argument
+   * that does not declare them (`within`, `env`) leaves both invisible to
+   * every rule, so a deny naming the script is dodged by moving it into the
+   * directory or onto the PATH.
+   */
+  type ZodLike = { readonly _def?: Record<string, unknown> };
+  const unwrap = (schema: unknown): ZodLike | undefined => {
+    let at = schema as ZodLike | undefined;
+    for (let i = 0; i < 16 && at?._def !== undefined; i++) {
+      const def = at._def;
+      const inner = def["innerType"] ?? def["schema"];
+      if (inner === undefined) break;
+      at = inner as ZodLike;
+    }
+    return at;
+  };
+  const topFields = (tool: RegisteredTool): Record<string, unknown> => {
+    const shape = unwrap(tool.inputSchema)?._def?.["shape"];
+    return typeof shape === "function" ? (shape as () => Record<string, unknown>)() : {};
+  };
+  const commandArgs = (tool: RegisteredTool) =>
+    (tool.operativeArgs ?? []).filter((a) => a.kind === "command");
+  /** The field names a working directory goes by among the builtins. */
+  const DIRECTORY_FIELDS = ["cwd", "dir"];
+
+  test("a command tool whose input has a working directory declares the command within it", () => {
+    const inScope = builtins.filter(
+      (t) =>
+        commandArgs(t).length > 0 && DIRECTORY_FIELDS.some((f) => Object.hasOwn(topFields(t), f)),
+    );
+    // The hit count: the four tool-proc runners, RunBuild, RunTests, Format
+    // and HooksManage (whose hook the supervisor runs from its `dir`).
+    expect(names(inScope)).toEqual([
+      "Format",
+      "HooksManage",
+      "ProcessStart",
+      "Retry",
+      "RunBuild",
+      "RunCommand",
+      "RunPipeline",
+      "RunTests",
+    ]);
+    const undeclared = inScope.flatMap((t) =>
+      commandArgs(t)
+        .filter((a) => a.within === undefined || !DIRECTORY_FIELDS.includes(a.within))
+        .map((a) => `${t.name}.${a.field}`),
+    );
+    expect(undeclared).toEqual([]);
+  });
+
+  test("a command tool whose call sets its child's environment declares it", () => {
+    const envFieldOf = (t: RegisteredTool): string[] =>
+      Object.entries(topFields(t))
+        .filter(
+          ([name, schema]) =>
+            /env/i.test(name) && unwrap(schema)?._def?.["typeName"] === "ZodRecord",
+        )
+        .map(([name]) => name);
+    const inScope = builtins.filter((t) => commandArgs(t).length > 0 && envFieldOf(t).length > 0);
+    expect(names(inScope)).toEqual(["ProcessStart", "Retry", "RunCommand", "RunPipeline"]);
+    const undeclared = inScope.flatMap((t) =>
+      commandArgs(t)
+        .filter((a) => a.env === undefined || !envFieldOf(t).includes(a.env))
+        .map((a) => `${t.name}.${a.field}`),
+    );
+    expect(undeclared).toEqual([]);
+  });
+});

@@ -535,7 +535,10 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * - `canonical` — the spelling(s) of what the tool will act on: for a path,
  *   the workspace-relative location with `..` collapsed and symlinks
  *   followed, plus the same location as an absolute path. An allow rule must
- *   match one of these.
+ *   match one of these. A `command` with none — run in another directory, or
+ *   with an environment the call set, where its words may name another
+ *   program — is granted only by a glob that matches every command
+ *   (`RunCommand(**)`).
  * - `spellings` — other ways of writing the same value (what the model sent,
  *   the path before symlinks were followed). A deny or ask rule also fires on
  *   these, so a rule written against either form is not dodged.
@@ -977,6 +980,14 @@ function valueMatches(
   polarity: RulePolarity,
 ): boolean {
   if (value.outsideWorkspace === true) return polarity === "restrict";
+  // A command with no canonical spelling runs where its words may name
+  // another program — another directory, or an environment the call set
+  // (PATH, BASH_ENV) — so no allow that names a command covers it. One that
+  // names EVERY command (`RunCommand(**)`) still does: whichever program it
+  // turns out to be is one it names.
+  if (polarity === "allow" && value.kind === "command" && value.canonical.length === 0) {
+    return argRe.matchesEveryAfter("", anyValueTail(value.kind));
+  }
   // A value that stands for every value (a field left out whose default is
   // `*`) is granted only by a glob that matches every value there: its
   // canonical spelling `<prefix>*` is not a literal `*`, so `EvmGetLogs(1/?)`

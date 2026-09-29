@@ -28,7 +28,9 @@
  *    - a `url` is parsed (WHATWG) and matched as its `href`.
  *    - a `command` held as an array (an argv) is joined with spaces; each
  *      word is kept as another spelling, so a deny or ask rule naming one
- *      word (`RunCommand(rm)`) still fires on the whole argv.
+ *      word (`RunCommand(rm)`) still fires on the whole argv. A word that
+ *      names a file through `.`, `..` or a doubled `/` is also read with
+ *      them collapsed, so `scripts//release.sh` is `scripts/release.sh`.
  *    - a field declared `within` another is written `<qualifier>/<value>` —
  *      except a `command`, whose `within` names the directory it runs in:
  *      the program `./build.sh` names is another program in `src/`. A
@@ -36,9 +38,27 @@
  *      value, so no scoped allow covers it (the call asks). A deny or ask
  *      reads it as written, and each word that may name a file also as
  *      that file from the root, so `alwaysDeny RunCommand(*scripts/release.sh*)`
- *      fires on `[sh, release.sh]` run in `scripts/`. A command inside an
- *      array of objects (`steps.argv`) runs in its element's own directory
- *      field when it has one, else the top-level one.
+ *      fires on `[sh, release.sh]` run in `scripts/`. Only the directory's
+ *      workspace-relative spellings (and the one the call wrote) are joined:
+ *      the workspace's own absolute path is not something the call named,
+ *      so `RunCommand(**prod**)` does not fire because the workspace lives
+ *      in `prod-agent/`. A bare program name (`git`) is not joined — PATH
+ *      finds it, not the directory. A command inside an array of objects
+ *      (`steps.argv`) runs in its element's own directory field when it has
+ *      one, else the top-level one.
+ *    - a `command` declared with an `env` field — the variables the call
+ *      sets in the child's environment — can run another program than its
+ *      words say: PATH decides what a bare program name is, and BASH_ENV,
+ *      NODE_OPTIONS, LD_PRELOAD and the like load code of their own. So a
+ *      call that sets any variable loses its canonical value (no scoped
+ *      allow covers it), and a deny or ask also reads a bare program as it
+ *      is found on each PATH entry the call sets, and every value it sets —
+ *      each word that may name a file also joined to where it resolves. An
+ *      environment too large to read that way (more than
+ *      {@link MAX_ENV_VARS} variables, {@link MAX_ENV_WORDS} words in a
+ *      value, or a value longer than {@link MAX_ENV_VALUE_CHARS} characters)
+ *      is flagged `outsideWorkspace`: which program runs could not be worked
+ *      out, so every deny or ask fires.
  *      Unless it is a path or a command, the value alone and the qualifier
  *      alone are kept as other spellings, so a deny or ask rule written
  *      without the qualifier — `alwaysDeny EvmCall(0xdAC17F…)`,
@@ -148,7 +168,7 @@ export function operativeValuesOf(
   const canonicalizePath = opts.canonicalizePath ?? lexicalPathValues;
   const values: OperativeValue[] = [];
   for (const arg of operativeArgs) {
-    for (const { value: raw, words, runsIn, dir, unqualified, every, anyAfter } of readField(
+    for (const { value: raw, words, runsIn, env, dir, unqualified, every, anyAfter } of readField(
       parsedInput,
       arg,
     )) {
@@ -169,24 +189,36 @@ export function operativeValuesOf(
           break;
         case "command": {
           const dirValues = runsIn !== undefined ? canonicalizePath(runsIn) : undefined;
-          if (runsIn !== undefined && dirValues !== undefined && !namesWorkspaceRoot(dirValues)) {
-            // Run in another directory, the same words may be another
-            // program: nothing canonical for an allow to grant. A deny or ask
-            // reads what was written, and each word also as the file it
-            // names there — `release.sh` run in `scripts/` is
-            // `scripts/release.sh`, which a deny may name.
+          const elsewhere =
+            runsIn !== undefined && dirValues !== undefined && !namesWorkspaceRoot(dirValues);
+          const setsEnv = env !== undefined && Object.keys(env).length > 0;
+          const argv = words ?? raw.split(/\s+/).filter((w) => w !== "");
+          const read = commandSpellings(
+            argv,
+            elsewhere ? runDirSpellings(runsIn as string, dirValues as OperativeValue[]) : [],
+            setsEnv ? env : undefined,
+            canonicalizePath,
+          );
+          if (elsewhere || setsEnv) {
+            // Run in another directory, or with an environment the call set,
+            // the same words may be another program: nothing canonical for an
+            // allow to grant. A deny or ask reads what was written, and each
+            // word also as the file it names there — `release.sh` run in
+            // `scripts/` is `scripts/release.sh`, which a deny may name.
             values.push({
               kind: "command",
               canonical: [],
-              spellings: commandSpellingsIn(raw, words, runsIn, dirValues),
+              spellings: [...new Set([raw, ...(words ?? []), ...read.spellings])],
+              ...(read.unreadable ? { outsideWorkspace: true } : {}),
               ...(every === true ? { standsForAny: [""] } : {}),
             });
             break;
           }
+          const spellings = [...new Set([...(words ?? []), ...read.spellings])];
           values.push({
             kind: "command",
             canonical: [raw],
-            ...(words !== undefined ? { spellings: words } : {}),
+            ...(spellings.length > 0 ? { spellings } : {}),
             ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
           });
           break;
@@ -218,12 +250,14 @@ const HEX_ID = /(?:^|\/)0[xX][0-9a-fA-F]+$/;
  * field; `every` that a left-out field's `*` default stands for every value,
  * and `anyAfter` the prefixes after which it does for an id, a recipient, a
  * text value or a command run at the root (a path, a URL and a command run
- * elsewhere build their own).
+ * elsewhere build their own). `env` is the environment a `command` declared
+ * with an `env` field sets for its child.
  */
 type FieldReading = {
   readonly value: string;
   readonly words?: ReadonlyArray<string>;
   readonly runsIn?: string;
+  readonly env?: Readonly<Record<string, string>>;
   /** The directory a `path` declared `within` one is relative to. */
   readonly dir?: string;
   readonly unqualified?: ReadonlyArray<string>;
@@ -260,6 +294,14 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
     const dir = qualifierOf(owner, arg.within) ?? topQualifier;
     return dir !== undefined ? { runsIn: dir } : {};
   };
+  // And with its own object's environment field, else the top-level one.
+  const topEnv = arg.env !== undefined ? envMapOf(input, arg.env) : undefined;
+  const envOf = (owner: unknown): { env?: Readonly<Record<string, string>> } => {
+    if (arg.kind !== "command" || arg.env === undefined) return {};
+    const env = envMapOf(owner, arg.env) ?? topEnv;
+    return env !== undefined ? { env } : {};
+  };
+  const placed = (owner: unknown) => ({ ...runsInOf(owner), ...envOf(owner) });
   const walk = (value: unknown, i: number, depth: number, owner: unknown): void => {
     if (depth > 64) return;
     if (Array.isArray(value)) {
@@ -269,14 +311,14 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
         value.length > 0 &&
         value.every((v) => typeof v === "string")
       ) {
-        out.push({ value: value.join(" "), words: value as string[], ...runsInOf(owner) });
+        out.push({ value: value.join(" "), words: value as string[], ...placed(owner) });
         return;
       }
       for (const element of value) walk(element, i, depth + 1, owner);
       return;
     }
     if (i === segments.length) {
-      if (typeof value === "string") out.push({ value, ...runsInOf(owner) });
+      if (typeof value === "string") out.push({ value, ...placed(owner) });
       else if (arg.kind === "id" && typeof value === "number" && Number.isFinite(value)) {
         out.push({ value: String(value) });
       }
@@ -292,7 +334,7 @@ function readField(input: unknown, arg: OperativeArg): FieldReading[] {
   // reads every contract's logs.
   const every = out.length === 0 && arg.default === ANY_VALUE;
   if (out.length === 0 && arg.default !== undefined) {
-    out.push({ value: arg.default, ...runsInOf(input) });
+    out.push({ value: arg.default, ...placed(input) });
   }
   const anyValue = (rs: FieldReading[]): FieldReading[] =>
     every ? rs.map((r) => ({ ...r, every: true, anyAfter: [""] })) : rs;
@@ -340,44 +382,183 @@ function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): Oper
 }
 
 /**
- * The spellings a deny or ask reads for a command run in `runsIn`, a
- * directory other than the workspace root: the command as written and each
- * of its words, and each word that could name a file written as that file
- * from the workspace root, for every spelling of the directory — with `..`
- * collapsed, and as joined — alone and within the whole command line (with
- * and without the program itself joined, which PATH may resolve instead).
- * So `scripts/**` fires on any command run in `scripts/`. The directory on
- * its own is not a spelling: `alwaysDeny RunCommand(rm*)` must not fire on
- * `ls` run in `rmtemp/`. Every spelling only widens what a deny or ask
- * catches; none is canonical, so no allow reads them.
+ * The most variables, words in one value, and characters in one value, of an
+ * environment a command's call sets that a deny or ask reads one by one. A
+ * call past any of them is flagged `outsideWorkspace` instead: which program
+ * it runs could not be worked out, so every deny or ask fires on it.
  */
-function commandSpellingsIn(
-  raw: string,
-  words: ReadonlyArray<string> | undefined,
-  runsIn: string,
-  dirValues: ReadonlyArray<OperativeValue>,
-): string[] {
-  const argv = words ?? raw.split(/\s+/).filter((w) => w !== "");
-  const out = new Set<string>([raw, ...(words ?? [])]);
-  const dirs = new Set<string>([runsIn]);
-  for (const v of dirValues) for (const d of [...v.canonical, ...(v.spellings ?? [])]) dirs.add(d);
-  dirs.delete("");
-  for (const d of dirs) {
-    for (const join of [
-      (w: string) => `${d.replace(/\/+$/, "")}/${w}`,
-      (w: string) => normalizePathLexically(`${d}/${w}`).path,
-    ]) {
-      const line = argv.map((w) => (namesAFile(w) ? join(w) : w));
-      argv.forEach((w, i) => {
-        if (namesAFile(w)) out.add(line[i] as string);
-      });
-      out.add(line.join(" "));
-      // A bare program name (`sh`) is looked up on PATH, not in the
-      // directory, so the line is also read with only its arguments joined.
-      out.add([argv[0] ?? "", ...line.slice(1)].join(" "));
+export const MAX_ENV_VARS = 64;
+export const MAX_ENV_WORDS = 64;
+export const MAX_ENV_VALUE_CHARS = 8192;
+
+/** What a deny or ask also reads for one command, beyond what the call wrote. */
+type CommandReading = {
+  readonly spellings: ReadonlyArray<string>;
+  /** The call's environment was too large to read; see {@link MAX_ENV_VARS}. */
+  readonly unreadable: boolean;
+};
+
+/**
+ * The workspace-relative spellings of the directory a command runs in, and
+ * the one the call wrote, without trailing slashes: `scripts/` and
+ * `./scripts` as written, `scripts` as canonicalised, `lnk` for a symlink
+ * the canonicaliser followed to `scripts`. The canonicaliser's absolute
+ * spellings of the workspace root are left out — the call named none of
+ * them, and joining them put every word the workspace's own path holds
+ * (`prod-agent/…`, `/private/var/…`) in front of every command run in a
+ * subdirectory. Its `./sub` spellings are left out too: a word the call did
+ * not write with `./` is not read with one, so `RunCommand(./**)` does not
+ * fire on `git status` run in `sub/`.
+ */
+function runDirSpellings(runsIn: string, dirValues: ReadonlyArray<OperativeValue>): string[] {
+  const out = new Set<string>();
+  const add = (d: string): void => {
+    const trimmed = d.replace(/[\\/]+$/, "");
+    if (trimmed !== "" && trimmed !== ".") out.add(trimmed);
+  };
+  add(runsIn);
+  for (const v of dirValues) {
+    for (const d of [...v.canonical, ...(v.spellings ?? [])]) {
+      if (isAbsolutePath(d) || d.startsWith("./") || d === ".") continue;
+      add(d);
     }
   }
   return [...out];
+}
+
+/**
+ * `dir/word`, as written and with `.`, `..` and doubled `/` collapsed. A join
+ * that climbs out of the directory it starts in is kept only as written: its
+ * collapsed form would drop the climb.
+ */
+function joinedSpellings(dir: string, word: string): string[] {
+  const written = `${dir}/${word}`;
+  const lexical = normalizePathLexically(written);
+  return lexical.escapes || lexical.path === written ? [written] : [written, lexical.path];
+}
+
+/** A word with separators, collapsed the way {@link joinedSpellings} does, when that changes it. */
+function collapsedWord(word: string): string | undefined {
+  if (!/[\\/]/.test(word)) return undefined;
+  const lexical = normalizePathLexically(word);
+  return lexical.escapes || lexical.path === word || lexical.path === "."
+    ? undefined
+    : lexical.path;
+}
+
+/**
+ * The spellings a deny or ask reads for one command beyond the words as
+ * written. Every spelling only widens what a deny or ask catches; none is
+ * canonical, so no allow reads them.
+ *
+ * - Each word that names a file through `.`, `..` or a doubled `/`, with
+ *   them collapsed, and the command line with those words collapsed.
+ * - For a command run in a directory other than the root (`dirs`, its
+ *   relative spellings): each word that may name a file joined to the
+ *   directory — except a bare program name, which PATH finds, not the
+ *   directory — and the command line with those words joined, once per
+ *   directory. So `scripts/**` fires on `sh x` run in `scripts/`. The
+ *   directory on its own is not a spelling: `alwaysDeny RunCommand(rm*)` must
+ *   not fire on `ls` run in `rmtemp/`.
+ * - For a call that sets its child's environment (`env`): a bare program as
+ *   PATH finds it on each entry the call sets — a relative entry is looked
+ *   up from the workspace root and run from the child's directory (Bun's
+ *   spawn does both), so both are read, and an absolute entry inside the
+ *   workspace is read from the root — and every value the call sets, each of
+ *   its words that may name a file (split at spaces, `:`, `=` and `;`, so
+ *   `--require=./hook.js` and `a:b` are read) as written, collapsed, and
+ *   joined to the child's directory.
+ */
+function commandSpellings(
+  argv: ReadonlyArray<string>,
+  dirs: ReadonlyArray<string>,
+  env: Readonly<Record<string, string>> | undefined,
+  canonicalizePath: PathCanonicalizer,
+): CommandReading {
+  const out = new Set<string>();
+  const program = argv[0] ?? "";
+  const bareProgram = program !== "" && !/[\\/]/.test(program);
+  // Words collapsed where the call wrote a separator.
+  let collapsedAny = false;
+  const collapsedLine = argv.map((w) => {
+    const c = namesAFile(w) ? collapsedWord(w) : undefined;
+    if (c === undefined) return w;
+    out.add(c);
+    collapsedAny = true;
+    return c;
+  });
+  if (collapsedAny) out.add(collapsedLine.join(" "));
+  // Words joined to the directory the command runs in.
+  for (const d of dirs) {
+    const line = argv.map((w, i) => {
+      if ((i === 0 && bareProgram) || !namesAFile(w)) return w;
+      const joined = joinedSpellings(d, w);
+      for (const j of joined) out.add(j);
+      return joined[joined.length - 1] as string;
+    });
+    out.add(line.join(" "));
+  }
+  if (env === undefined) return { spellings: [...out], unreadable: false };
+  const entries = Object.entries(env);
+  let unreadable = entries.length > MAX_ENV_VARS;
+  // Where a relative path in a value resolves: the child's directory.
+  const places = dirs.length > 0 ? dirs : ["."];
+  for (const [name, value] of entries.slice(0, MAX_ENV_VARS)) {
+    if (value.length > MAX_ENV_VALUE_CHARS) {
+      unreadable = true;
+      continue;
+    }
+    if (value !== "") out.add(value);
+    const words = value.split(/[\s:=;]+/).filter((w) => w !== "");
+    if (words.length > MAX_ENV_WORDS) unreadable = true;
+    for (const w of words.slice(0, MAX_ENV_WORDS)) {
+      if (!namesAFile(w)) continue;
+      out.add(w);
+      const c = collapsedWord(w);
+      if (c !== undefined) out.add(c);
+      for (const d of dirs) for (const j of joinedSpellings(d, w)) out.add(j);
+    }
+    if (name.toUpperCase() !== "PATH" || !bareProgram) continue;
+    const pathEntries = value.split(":");
+    if (pathEntries.length > MAX_ENV_WORDS) unreadable = true;
+    for (const raw of pathEntries.slice(0, MAX_ENV_WORDS)) {
+      const entry = raw === "" ? "." : raw.replace(/[\\/]+$/, "") || "/";
+      const found = new Set<string>();
+      if (isAbsolutePath(entry)) {
+        found.add(`${entry === "/" ? "" : entry}/${program}`);
+        for (const v of canonicalizePath(entry)) {
+          if (v.outsideWorkspace === true) continue;
+          for (const c of [...v.canonical, ...(v.spellings ?? [])]) {
+            if (isAbsolutePath(c) || c.startsWith("./")) continue;
+            found.add(c === "." ? program : `${c}/${program}`);
+          }
+        }
+      } else {
+        for (const j of joinedSpellings(entry, program)) found.add(j);
+        for (const d of places) {
+          for (const j of joinedSpellings(d === "." ? entry : `${d}/${entry}`, program))
+            found.add(j);
+        }
+      }
+      for (const f of found) {
+        out.add(f);
+        out.add([f, ...argv.slice(1)].join(" "));
+      }
+    }
+  }
+  return { spellings: [...out], unreadable };
+}
+
+/** The string-valued entries of the object at `field`, when the call carries one. */
+function envMapOf(input: unknown, field: string): Readonly<Record<string, string>> | undefined {
+  if (input === null || typeof input !== "object" || !Object.hasOwn(input, field)) {
+    return undefined;
+  }
+  const value = (input as Record<string, unknown>)[field];
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [name, v] of Object.entries(value)) if (typeof v === "string") out[name] = v;
+  return out;
 }
 
 /**
