@@ -30,7 +30,7 @@
  * References: claude-code/utils/permissions/ (24 files); AI-Harness-Systems
  * §Policy engine.
  */
-import { mkdirSync, readFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
 import {
@@ -662,6 +662,14 @@ export function tagRules(
 /** The settings file's path relative to a harness root. */
 export const SETTINGS_RELATIVE_PATH = join(".crewhaus", "settings.json");
 
+function isSymlink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 /** Absolute settings path for a harness root. */
 export function settingsFilePath(dir: string): string {
   return join(dir, SETTINGS_RELATIVE_PATH);
@@ -754,12 +762,23 @@ export function appendSettingsRule(
   // `settings.json.tmp`, which was opened through any link a model had
   // planted there. A settings.json that links elsewhere in the workspace is
   // written where it leads; one that leads out of it is refused.
+  //
+  // `.crewhaus` itself may be a link an operator made to keep a harness's
+  // state elsewhere; rules are read through it, so they are written through
+  // it too: it is then the root, as it is for the session and routing stores.
   mkdirSync(dir, { recursive: true });
-  const written = writeFileSafe(dir, SETTINGS_RELATIVE_PATH, `${JSON.stringify(next, null, 2)}\n`, {
-    overwrite: true,
-    createParents: true,
-    leafSymlink: "follow-contained",
-  });
+  const crewhausDir = join(dir, ".crewhaus");
+  const linkedStateDir = isSymlink(crewhausDir);
+  const written = writeFileSafe(
+    linkedStateDir ? crewhausDir : dir,
+    linkedStateDir ? "settings.json" : SETTINGS_RELATIVE_PATH,
+    `${JSON.stringify(next, null, 2)}\n`,
+    {
+      overwrite: true,
+      createParents: true,
+      leafSymlink: "follow-contained",
+    },
+  );
   if (!written.ok) {
     throw new PermissionConfigError(`cannot write settings file ${path}: ${written.reason}`);
   }

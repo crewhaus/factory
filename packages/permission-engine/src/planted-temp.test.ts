@@ -16,7 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendSettingsRule } from "./index";
+import { appendSettingsRule, loadSettingsRules } from "./index";
 
 const ROOTS: string[] = [];
 afterAll(() => {
@@ -65,5 +65,41 @@ describe("appendSettingsRule never writes through a planted link (0.7.1)", () =>
     appendSettingsRule(inside.ws, { type: "alwaysAllow", pattern: "Skill" });
     expect(lstatSync(join(inside.ws, ".crewhaus", "settings.json")).isSymbolicLink()).toBe(true);
     expect(JSON.parse(readFileSync(shared, "utf8")).permissions.rules.length).toBe(1);
+  });
+
+  test("a .crewhaus that is itself a link (state kept elsewhere) still takes the rule, as 0.7.0 did", () => {
+    const base = mkdtempSync(join(tmpdir(), "settings-statedir-"));
+    ROOTS.push(base);
+    const harness = join(base, "harness");
+    const state = join(base, "state", "crewhaus");
+    mkdirSync(harness, { recursive: true });
+    mkdirSync(state, { recursive: true });
+    writeFileSync(
+      join(state, "settings.json"),
+      `${JSON.stringify({ permissions: { rules: [{ type: "alwaysAllow", pattern: "Read" }] } })}\n`,
+    );
+    symlinkSync(state, join(harness, ".crewhaus"), "dir");
+    expect(appendSettingsRule(harness, { type: "alwaysAllow", pattern: "Write" }).added).toBe(true);
+    // Read back through the same link, as a boot reads it.
+    expect(loadSettingsRules(harness).map((r) => r.pattern)).toEqual(["Read", "Write"]);
+    expect(lstatSync(join(harness, ".crewhaus")).isSymbolicLink()).toBe(true);
+    expect(lstatSync(join(state, "settings.json")).isFile()).toBe(true);
+  });
+
+  test("under a linked .crewhaus, a settings.json linking out of it is still refused", () => {
+    const base = mkdtempSync(join(tmpdir(), "settings-statedir-"));
+    ROOTS.push(base);
+    const harness = join(base, "harness");
+    const state = join(base, "state");
+    mkdirSync(harness, { recursive: true });
+    mkdirSync(state, { recursive: true });
+    const victim = join(base, "victim.json");
+    writeFileSync(victim, "{}\n");
+    symlinkSync(victim, join(state, "settings.json"));
+    symlinkSync(state, join(harness, ".crewhaus"), "dir");
+    expect(() => appendSettingsRule(harness, { type: "alwaysAllow", pattern: "Write" })).toThrow(
+      /cannot write settings file .*settings\.json: /,
+    );
+    expect(readFileSync(victim, "utf8")).toBe("{}\n");
   });
 });
