@@ -18,6 +18,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -26,7 +28,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { MAX_OUTPUT_CHARS, failure, runGit, skippedPatchPaths, unquoteGitPath } from "./git-run";
+import {
+  MAX_OUTPUT_CHARS,
+  failure,
+  runGit,
+  skippedPatchPaths,
+  symlinksCreatedByPatch,
+  unquoteGitPath,
+} from "./git-run";
 import {
   GIT_TOOLS,
   gitAdd,
@@ -452,6 +461,86 @@ describe("containment of the repository git discovers", () => {
         leaked: false,
       });
     }
+  });
+
+  test("chained alternates are followed: an in-workspace alternate whose own alternates name the victim is refused", async () => {
+    // C071 bypass: the first `info/alternates` names an in-workspace object
+    // dir (which passes a first-level check), and THAT dir's own alternates
+    // name the victim's store. git follows the chain; the check must too.
+    const victim = victimRepo("chain");
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+    const mid = join(workspace, "mid");
+    mkdirSync(join(mid, "info"), { recursive: true });
+    writeFileSync(join(mid, "info", "alternates"), `${join(victim, ".git", "objects")}\n`);
+    const c = join(workspace, "c");
+    mkdirSync(c);
+    git(["init", "-q", "-b", "main"], c);
+    writeFileSync(join(c, ".git", "objects", "info", "alternates"), `${mid}\n`);
+    // Plain git reads the victim's committed file through the chain.
+    expect(git(["show", `${victimHead}:creds.txt`], c).stdout).toContain("victim-secret");
+
+    const shown = String(await gitShow.execute({ cwd: "c", ref: victimHead, path: "creds.txt" }));
+    expect(shown).toContain("borrows from a repository outside the workspace");
+    expect(shown).not.toContain("victim-secret");
+    expect(shown).not.toContain(victim);
+  });
+
+  test("a chain of in-workspace alternates that never leaves the workspace still opens", async () => {
+    // The recursion refuses only a store that leads OUT: a legitimate chain
+    // of in-workspace alternates (a shared object cache linked twice) opens.
+    const cache = join(workspace, "cache");
+    mkdirSync(cache);
+    git(["init", "-q", "-b", "main", "--bare"], cache);
+    const mid = join(workspace, "mid2");
+    mkdirSync(join(mid, "info"), { recursive: true });
+    writeFileSync(join(mid, "info", "alternates"), `${join(cache, "objects")}\n`);
+    const c = join(workspace, "c2");
+    mkdirSync(c);
+    git(["init", "-q", "-b", "main"], c);
+    writeFileSync(join(c, ".git", "objects", "info", "alternates"), `${mid}\n`);
+    writeFileSync(join(c, "f.txt"), "in-workspace\n");
+    commitAll(c, "c commit", D3);
+    const out = JSON.parse(String(await gitLog.execute({ cwd: "c2" })));
+    expect(out.commits[0].subject).toBe("c commit");
+  });
+
+  test("a link deep under refs/ or objects/pack/ is refused, not only one at depth one", async () => {
+    // C071 bypass: linkLeadingOut scanned <gitdir>/<sub>/<name> only, so a
+    // link at refs/remotes/v (depth 3) or objects/pack/<file> (depth 3) went
+    // unseen while git read the victim's refs and packs through it.
+    const victim = victimRepo("deep");
+    git(["gc", "-q"], victim);
+    const victimHead = git(["rev-parse", "HEAD"], victim).stdout.trim();
+
+    // (a) a directory link deep under refs/: refs/remotes/v -> victim heads.
+    const refsRepo = join(workspace, "refs-repo");
+    mkdirSync(refsRepo);
+    git(["init", "-q", "-b", "main"], refsRepo);
+    mkdirSync(join(refsRepo, ".git", "refs", "remotes"), { recursive: true });
+    symlinkSync(
+      join(victim, ".git", "refs", "heads"),
+      join(refsRepo, ".git", "refs", "remotes", "v"),
+    );
+    const bySha = String(await gitShow.execute({ cwd: "refs-repo", ref: victimHead }));
+    expect(bySha).toContain("holds a link (refs/remotes/v)");
+    expect(bySha).not.toContain("victim-secret");
+    const byRef = String(
+      await gitShow.execute({ cwd: "refs-repo", ref: "refs/remotes/v/main", path: "creds.txt" }),
+    );
+    expect(byRef).toContain("holds a link (refs/remotes/v)");
+    expect(byRef).not.toContain("victim-secret");
+
+    // (b) a file link deep under objects/pack/: the victim's pack files.
+    const packRepo = join(workspace, "pack-repo");
+    mkdirSync(packRepo);
+    git(["init", "-q", "-b", "main"], packRepo);
+    const victimPack = join(victim, ".git", "objects", "pack");
+    for (const f of readdirSync(victimPack)) {
+      symlinkSync(join(victimPack, f), join(packRepo, ".git", "objects", "pack", f));
+    }
+    const packShown = String(await gitShow.execute({ cwd: "pack-repo", ref: victimHead }));
+    expect(packShown).toContain("objects/pack/");
+    expect(packShown).not.toContain("victim-secret");
   });
 
   test("a .git/hooks, .git/lfs or info/exclude linked outside is not history: the repository still works", async () => {
@@ -1241,6 +1330,16 @@ describe("GitTagCreate", () => {
 });
 
 describe("GitApplyPatch", () => {
+  const linkOutsideDirs: string[] = [];
+  const outsideForLinks = (): string => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-tool-git-link-")));
+    linkOutsideDirs.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    for (const dir of linkOutsideDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
   test("checks a patch without changing anything, then applies it", async () => {
     writeFileSync(join(repo, "README.md"), "hello\nworld\npatched\n");
     const diff = await call(gitDiff, { mode: "patch" });
@@ -1286,6 +1385,91 @@ describe("GitApplyPatch", () => {
     // The refusal is only worth anything if the file really is not there.
     expect(existsSync(join(workspace, "escape.txt"))).toBe(false);
     expect(existsSync(join(repo, "escape.txt"))).toBe(false);
+  });
+
+  describe("a patch creating a symbolic link out of the workspace is refused (C070 enabler)", () => {
+    const linkPatch = (path: string, target: string): string =>
+      [
+        `diff --git a/${path} b/${path}`,
+        "new file mode 120000",
+        "index 0000000..1111111",
+        "--- /dev/null",
+        `+++ b/${path}`,
+        "@@ -0,0 +1 @@",
+        `+${target}`,
+        "\\ No newline at end of file",
+        "",
+      ].join("\n");
+
+    test("an absolute target outside the workspace is refused, nothing planted", async () => {
+      const outside = join(outsideForLinks(), "planted.rc");
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("evil", outside) });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (evil)");
+      expect(out.reason).toContain("outside the workspace");
+      expect(existsSync(join(repo, "evil"))).toBe(false);
+      expect(existsSync(outside)).toBe(false);
+    });
+
+    test("a ../ target that climbs out of the workspace is refused", async () => {
+      // repo is one level under the workspace root, so `../../x` leaves it.
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("up", "../../outside.rc"),
+      });
+      expect(out).toMatchObject({ applied: false, wouldApply: false });
+      expect(out.reason).toContain("symbolic link (up)");
+      expect(existsSync(join(repo, "up"))).toBe(false);
+    });
+
+    test("check mode refuses too, so it never reports 'would apply' for an escaping link", async () => {
+      const out = await call(gitApplyPatch, {
+        cwd: "repo",
+        patch: linkPatch("evil2", "/etc/passwd"),
+        check: true,
+      });
+      expect(out).toMatchObject({ applied: false, checkedOnly: true, wouldApply: false });
+      expect(existsSync(join(repo, "evil2"))).toBe(false);
+    });
+
+    test("a link that stays inside the workspace still applies", async () => {
+      const out = await call(gitApplyPatch, { cwd: "repo", patch: linkPatch("good", "README.md") });
+      expect(out.applied).toBe(true);
+      expect(lstatSync(join(repo, "good")).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(repo, "good"))).toBe("README.md");
+    });
+  });
+
+  test("symlinksCreatedByPatch reads targets and honours -p; a deletion contributes none", () => {
+    const patch = [
+      "diff --git a/dir/link b/dir/link",
+      "new file mode 120000",
+      "index 0000000..1111111",
+      "--- /dev/null",
+      "+++ b/dir/link",
+      "@@ -0,0 +1 @@",
+      "+/etc/passwd",
+      "\\ No newline at end of file",
+      "diff --git a/gone b/gone",
+      "deleted file mode 120000",
+      "index 1111111..0000000",
+      "--- a/gone",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-/was/here",
+      "diff --git a/plain.txt b/plain.txt",
+      "new file mode 100644",
+      "index 0000000..2222222",
+      "--- /dev/null",
+      "+++ b/plain.txt",
+      "@@ -0,0 +1 @@",
+      "+not a link",
+      "",
+    ].join("\n");
+    // -p1 (git's default) drops the a/ or b/ prefix.
+    expect(symlinksCreatedByPatch(patch, 1)).toEqual([{ path: "dir/link", target: "/etc/passwd" }]);
+    // -p2 drops one more component.
+    expect(symlinksCreatedByPatch(patch, 2)).toEqual([{ path: "link", target: "/etc/passwd" }]);
   });
 
   test("git's quoted path names are read back to the file they name", () => {

@@ -61,6 +61,27 @@ const SCANNED_SUBDIRS = ["refs", "objects", "info", "logs", "worktrees", "module
 const MAX_SCANNED_ENTRIES = 4096;
 
 /**
+ * git reads every ref by name, at any depth (`refs/remotes/<remote>/<branch>`),
+ * and every pack and info file under `objects/`. A link at depth one is caught
+ * by the {@link SCANNED_SUBDIRS} scan, but one deeper is not: `refs/remotes/v`
+ * as a directory link, or `objects/pack/<name>.{idx,pack}` as a file link,
+ * hands git another repository's refs or packs while the git dir stays inside
+ * the workspace. These trees are walked deeper for a link leading out; git
+ * writes no symlink into any of them, so a legitimate repository has none.
+ * The walk is bounded — the leaves are refs, pack and info files, never the
+ * loose-object fan-out, which stays a depth-one scan.
+ */
+const DEEP_SCAN: ReadonlyArray<{ readonly sub: string; readonly recursive: boolean }> = [
+  { sub: "refs", recursive: true },
+  { sub: "objects/pack", recursive: false },
+  { sub: "objects/info", recursive: false },
+];
+/** Total entries a deep scan lstats before it stops (a link past it is not sought). */
+const MAX_DEEP_SCAN_ENTRIES = 50_000;
+/** Deepest a deep scan descends (a ref namespace is shallow in practice). */
+const MAX_DEEP_SCAN_DEPTH = 64;
+
+/**
  * Entries of a git dir that may lead outside the workspace, because none of
  * them holds or redirects the repository's history, config, index or logs:
  *
@@ -94,8 +115,11 @@ const MAY_LEAD_OUT: ReadonlySet<string> = new Set([
  * repository's history while the git dir itself sits inside the workspace.
  * The entries in {@link MAY_LEAD_OUT} (hooks, lfs …) hold no history and
  * are allowed to.
- * Only the git dir's own entries and those of the directories git reads by
- * name are checked: a bounded scan, not a walk of every loose object.
+ * The git dir's own entries and those of the directories git reads by name
+ * are checked at depth one; `refs/`, `objects/pack/` and `objects/info/` are
+ * walked deeper (a link at `refs/remotes/v` or `objects/pack/*.pack` leaks
+ * the same way a top-level one does). It stays a bounded scan, never a walk
+ * of every loose object.
  */
 export function linkLeadingOut(gitDir: string, root: string): string | undefined {
   const check = (abs: string, rel: string): string | undefined => {
@@ -128,7 +152,61 @@ export function linkLeadingOut(gitDir: string, root: string): string | undefined
       if (hit !== undefined) return hit;
     }
   }
+  for (const { sub, recursive } of DEEP_SCAN) {
+    const hit = deepLinkLeadingOut(path.join(gitDir, sub), sub, root, recursive);
+    if (hit !== undefined) return hit;
+  }
   return undefined;
+}
+
+/**
+ * The first link leading out (or nowhere) under `dir`, as a path relative to
+ * the git dir, or undefined. A symlink entry is a hit whatever it is (a link
+ * is never followed to descend); a real subdirectory is descended into when
+ * `recursive`. Bounded by {@link MAX_DEEP_SCAN_ENTRIES} lstats and
+ * {@link MAX_DEEP_SCAN_DEPTH}: a link hidden past the budget is not sought,
+ * as a walk of every loose object is not.
+ */
+function deepLinkLeadingOut(
+  dir: string,
+  relPrefix: string,
+  root: string,
+  recursive: boolean,
+): string | undefined {
+  let budget = MAX_DEEP_SCAN_ENTRIES;
+  const walk = (abs: string, rel: string, depth: number): string | undefined => {
+    let names: string[];
+    try {
+      names = readdirSync(abs);
+    } catch {
+      return undefined;
+    }
+    for (const name of names) {
+      if (budget-- <= 0) return undefined;
+      const childAbs = path.join(abs, name);
+      const childRel = `${rel}/${name}`;
+      let isLink = false;
+      let isDir = false;
+      try {
+        const st = lstatSync(childAbs);
+        isLink = st.isSymbolicLink();
+        isDir = st.isDirectory();
+      } catch {
+        continue;
+      }
+      if (isLink) {
+        const real = realOrUndefined(childAbs);
+        if (real === undefined || !isInside(root, real)) return childRel;
+        continue; // a link staying inside the workspace is not descended into
+      }
+      if (isDir && recursive && depth + 1 < MAX_DEEP_SCAN_DEPTH) {
+        const hit = walk(childAbs, childRel, depth + 1);
+        if (hit !== undefined) return hit;
+      }
+    }
+    return undefined;
+  };
+  return walk(dir, relPrefix, 0);
 }
 
 /** Largest bookkeeping file (gitdir, alternates) this module reads. */
@@ -146,35 +224,72 @@ function readSmallRegularFile(abs: string): string | undefined {
 }
 
 /**
- * The first object directory `objects/info/alternates` borrows from outside
- * the root, or undefined. git reads objects from every directory listed there
- * (a `clone --shared` or `--reference`), so a line naming another
- * repository's object store makes its whole history readable by hash. A line
- * git would read but this cannot resolve is treated as leading out.
+ * git follows alternates transitively: the objects dir listed in one
+ * `info/alternates` is itself an object store whose own `info/alternates` git
+ * then reads, up to a depth of {@link MAX_ALTERNATE_DEPTH}. An in-workspace
+ * alternate whose own alternates name another repository's object store makes
+ * that store's whole history readable by hash, so every object directory in
+ * the chain must be inside the root — not only the first level a
+ * `clone --shared`/`--reference` writes.
  */
-export function alternateLeadingOut(commonDir: string, root: string): string | undefined {
-  const objects = path.join(commonDir, "objects");
-  const file = path.join(objects, "info", "alternates");
-  let isEntry = false;
+const MAX_ALTERNATE_DEPTH = 5;
+
+/**
+ * The object directories `<objectsDir>/info/alternates` names, resolved
+ * against `objectsDir` as git resolves them, or `"unreadable"` when git would
+ * read the file but this cannot (present but not a small regular file, or a
+ * C-quoted line): that is treated as leading out.
+ */
+function listAlternates(objectsDir: string): string[] | "unreadable" {
+  const file = path.join(objectsDir, "info", "alternates");
   try {
     lstatSync(file);
-    isEntry = true;
   } catch {
-    isEntry = false;
+    return [];
   }
-  if (!isEntry) return undefined;
   const text = readSmallRegularFile(file);
-  // Present but unreadable as a small regular file: git would still try it.
-  if (text === undefined) return "objects/info/alternates";
+  if (text === undefined) return "unreadable";
+  const dirs: string[] = [];
   for (const raw of text.split("\n")) {
     const line = raw.trim();
     if (line === "" || line.startsWith("#")) continue;
     // git C-quotes a path that needs it; a quoted line is not resolved here.
-    if (line.startsWith('"')) return "objects/info/alternates";
-    const real = realOrUndefined(path.resolve(objects, line));
-    if (real === undefined || !isInside(root, real)) return "objects/info/alternates";
+    if (line.startsWith('"')) return "unreadable";
+    dirs.push(path.resolve(objectsDir, line));
   }
-  return undefined;
+  return dirs;
+}
+
+/**
+ * The first object directory the repository's object store borrows from
+ * outside the root, following the alternates chain as git does (depth
+ * {@link MAX_ALTERNATE_DEPTH}), or undefined. `alternateLeadingOut` used to
+ * check only the first `info/alternates`, so an in-workspace alternate whose
+ * OWN alternates named the victim went unseen; git read the victim's objects
+ * all the same (C071 bypass).
+ */
+export function alternateLeadingOut(commonDir: string, root: string): string | undefined {
+  const start = path.join(commonDir, "objects");
+  const seen = new Set<string>();
+  const walk = (objectsDir: string, depth: number): string | undefined => {
+    const key = realOrUndefined(objectsDir) ?? objectsDir;
+    if (seen.has(key)) return undefined;
+    seen.add(key);
+    const alts = listAlternates(objectsDir);
+    if (alts === "unreadable") return "objects/info/alternates";
+    for (const alt of alts) {
+      const real = realOrUndefined(alt);
+      if (real === undefined || !isInside(root, real)) return "objects/info/alternates";
+      // git stops following past its depth limit, so a store reachable only
+      // beyond it is never read: there is nothing more to check there.
+      if (depth + 1 <= MAX_ALTERNATE_DEPTH) {
+        const hit = walk(real, depth + 1);
+        if (hit !== undefined) return hit;
+      }
+    }
+    return undefined;
+  };
+  return walk(start, 0);
 }
 
 /**
