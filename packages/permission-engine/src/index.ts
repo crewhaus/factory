@@ -30,9 +30,10 @@
  * References: claude-code/utils/permissions/ (24 files); AI-Harness-Systems
  * §Policy engine.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import {
   type CompiledPattern,
   type OperativeValue,
@@ -749,9 +750,18 @@ export function appendSettingsRule(
       ],
     },
   };
-  mkdirSync(dirname(path), { recursive: true });
-  const tmpPath = `${path}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(next, null, 2)}\n`);
-  renameSync(tmpPath, path);
+  // 0.7.1 — a random O_EXCL|O_NOFOLLOW temp beside the file, never the fixed
+  // `settings.json.tmp`, which was opened through any link a model had
+  // planted there. A settings.json that links elsewhere in the workspace is
+  // written where it leads; one that leads out of it is refused.
+  mkdirSync(dir, { recursive: true });
+  const written = writeFileSafe(dir, SETTINGS_RELATIVE_PATH, `${JSON.stringify(next, null, 2)}\n`, {
+    overwrite: true,
+    createParents: true,
+    leafSymlink: "follow-contained",
+  });
+  if (!written.ok) {
+    throw new PermissionConfigError(`cannot write settings file ${path}: ${written.reason}`);
+  }
   return { added: true, path };
 }

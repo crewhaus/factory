@@ -317,6 +317,7 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/secrets-manager": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/audit-log": {
@@ -741,6 +742,7 @@
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
       },
     },
@@ -859,6 +861,7 @@
         "@crewhaus/prompt-optimizer": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
       },
     },
@@ -1406,6 +1409,7 @@
       "dependencies": {
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-permission-matcher": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
       },
     },
@@ -1504,6 +1508,7 @@
       "dependencies": {
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/errors": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/prompt-injection-detector": {
@@ -1591,6 +1596,9 @@
     "packages/routing-store": {
       "name": "@crewhaus/routing-store",
       "version": "0.7.0",
+      "dependencies": {
+        "@crewhaus/tool-safety": "workspace:*",
+      },
     },
     "packages/rules-engine": {
       "name": "@crewhaus/rules-engine",

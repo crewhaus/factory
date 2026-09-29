@@ -18,11 +18,12 @@
  *      the store's read-modify-write holds the shared infra-utils lock).
  */
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, readFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import type { IdempotencyRecord, IdempotencyStore } from "@crewhaus/durable-execution";
 import { CrewhausError } from "@crewhaus/errors";
 import { withFileLock } from "@crewhaus/infra-utils";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import type { DreamPhase1Counts } from "./phase1";
 
 /** How a dream run ended. `deterministic`/`full` are the success outcomes
@@ -88,13 +89,29 @@ export async function readDreamState(dreamDir: string): Promise<DreamState | nul
   return parsed as DreamState;
 }
 
-/** tmp+rename atomic — a reader never observes a torn state.json. */
+/**
+ * Replace `absPath` atomically: a random O_EXCL|O_NOFOLLOW temp beside it,
+ * renamed into place (@crewhaus/tool-safety). 0.7.1 — the temp was the fixed
+ * `<file>.tmp`, opened through any link planted there, and a link at the file
+ * itself was written through; both are refused now, naming the file.
+ */
+function replaceFile(absPath: string, data: string): void {
+  const written = writeFileSafe(dirname(absPath), basename(absPath), data, {
+    overwrite: true,
+    mode: 0o600,
+  });
+  if (!written.ok) {
+    throw new DreamStateError(
+      `refusing to write ${absPath}: ${written.reason} (code ${written.code})`,
+    );
+  }
+}
+
+/** temp+rename atomic — a reader never observes a torn state.json. */
 export async function writeDreamState(dreamDir: string, state: DreamState): Promise<void> {
   const path = join(dreamDir, DREAM_STATE_FILENAME);
   await mkdir(dirname(path), { recursive: true });
-  const tmpPath = `${path}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  await rename(tmpPath, path);
+  replaceFile(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 type IdempotencyFileShape = {
@@ -108,7 +125,7 @@ const DEFAULT_MAX_IDEMPOTENCY_RECORDS = 24;
 /**
  * A small durable `IdempotencyStore` over one JSON file (next to
  * state.json), for durable-execution's `withIdempotency`. Writes hold the
- * §7.6 advisory lock from infra-utils and land tmp+rename atomic, so
+ * §7.6 advisory lock from infra-utils and land temp+rename atomic, so
  * parallel writers (fleet run, janitor + cron) never tear the file; reads
  * are lock-free (they only ever see a fully-renamed file).
  */
@@ -147,11 +164,7 @@ export function createFileIdempotencyStore(
           );
           const pruned = Object.fromEntries(entries.slice(0, maxRecords));
           await mkdir(dirname(path), { recursive: true });
-          const tmpPath = `${path}.tmp`;
-          await writeFile(tmpPath, `${JSON.stringify({ version: 1, records: pruned })}\n`, {
-            mode: 0o600,
-          });
-          await rename(tmpPath, path);
+          replaceFile(path, `${JSON.stringify({ version: 1, records: pruned })}\n`);
         },
         {
           label: "dream-engine",
