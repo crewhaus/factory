@@ -66,6 +66,9 @@ export type Table = {
  */
 export type TableBudget = { chars: number; work?: TextWork };
 
+/** What one returned row costs in the result before its cells: `[]` and a comma. */
+export const ROW_ENVELOPE_CHARS = 3;
+
 export type TableLimits = {
   /** Body rows to build; the rest are counted, never expanded. */
   readonly maxRows?: number;
@@ -159,6 +162,12 @@ export function extractTable(table: Element, limits: TableLimits = {}): Table {
       charsTruncated = true;
       return false;
     };
+    // The row itself costs its brackets and separator, whatever it holds.
+    // 0.7.0 charged cells only, so rows with none (`<tr></tr>`, or a `<tr>`
+    // holding a nested table directly) were free, and nested tables' rows,
+    // which every enclosing table lists again, cost nothing at any depth:
+    // 231 KB of markup came back as 9.5 M characters (C167).
+    if (!spend(ROW_ENVELOPE_CHARS)) break;
     const drainCarried = (): boolean => {
       while (carry.has(column)) {
         const held = carry.get(column) as { text: string; cost: number; remaining: number };

@@ -869,6 +869,56 @@ describe("HtmlTable builds a bounded grid", () => {
     expect(compared).toBe(500);
     expect(spanned).toBeGreaterThan(300);
   }, 20_000);
+
+  // C167's residual: rows with no cells and each table's own fields were
+  // never charged, and a nested table's rows are listed again by every table
+  // around it, so 0.7.0 (and the first 0.7.1 fix) returned 9.5 M characters
+  // for 231 KB of nested tables and 8.5 M for 100 000 empty ones.
+  const nested = (depth: number, emptyRows: number): string => {
+    let open = "";
+    let close = "";
+    for (let d = 0; d < depth; d++) {
+      open += `<table>${"<tr></tr>".repeat(emptyRows)}<tr>`;
+      close = `</tr></table>${close}`;
+    }
+    return open + close;
+  };
+
+  test("nested tables of empty rows stay within the call's character budget", async () => {
+    const raw = await tool({ html: nested(250, 100), maxRows: 100_000 });
+    expect(raw.length).toBeLessThanOrEqual(2_000_000 + 1_000);
+    const out = JSON.parse(raw);
+    expect(out.tablesOmitted).toBeGreaterThan(0);
+    expect(out.note).toContain("budget ran out");
+    const cut = (out.tables as Array<{ truncatedBy?: string[] }>).filter((t) =>
+      t.truncatedBy?.includes("chars"),
+    );
+    expect(cut).toHaveLength(1);
+  }, 20_000);
+
+  test("many empty tables stay within the call's character budget", async () => {
+    const raw = await tool({ html: "<table></table>".repeat(100_000) });
+    expect(raw.length).toBeLessThanOrEqual(2_000_000 + 1_000);
+    const out = JSON.parse(raw);
+    expect(out.tables.length + out.tablesOmitted).toBe(100_000);
+    expect(out.tablesOmitted).toBeGreaterThan(0);
+  }, 20_000);
+
+  test("a row with no cells is charged its brackets", () => {
+    const budget = { chars: 3 * 10 };
+    const lifted = lift(`<table>${"<tr></tr>".repeat(50)}</table>`, { budget });
+    expect(lifted.rows.length).toBe(10);
+    expect(lifted.truncatedBy).toEqual(["chars"]);
+    expect(budget.chars).toBeLessThan(0);
+  });
+
+  test("small documents return what they always did", async () => {
+    const raw = await tool({ html: nested(3, 2) });
+    const out = JSON.parse(raw);
+    expect(out.tables).toHaveLength(3);
+    expect(out.tablesOmitted).toBeUndefined();
+    expect(out.tables.map((t: { rowCount: number }) => t.rowCount)).toEqual([9, 6, 3]);
+  });
 });
 
 describe("element text is budgeted per call", () => {

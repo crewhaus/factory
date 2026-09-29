@@ -188,6 +188,12 @@ export const htmlQuery: RegisteredTool = buildTool({
   },
 });
 
+/**
+ * What one table costs in the result before its rows and caption: its keys,
+ * counts, flags and brackets (133 characters at their widest, rounded up).
+ */
+const TABLE_ENVELOPE_CHARS = 144;
+
 export const htmlTable: RegisteredTool = buildTool({
   name: "HtmlTable",
   description:
@@ -223,10 +229,16 @@ export const htmlTable: RegisteredTool = buildTool({
     const tables: Array<Record<string, unknown>> = [];
     let tablesOmitted = 0;
     for (const table of chosen) {
-      if (budget.chars <= 0) {
+      // Each table's own fields (rowCount, truncated, the brackets) are
+      // charged before it is read, so a call that matches many empty or
+      // nested tables stops at the budget like one large table does. 0.7.0
+      // charged only cell text, and 100 000 `<table></table>` came back as
+      // 8.5 M characters (C167).
+      if (budget.chars < TABLE_ENVELOPE_CHARS) {
         tablesOmitted += 1;
         continue;
       }
+      budget.chars -= TABLE_ENVELOPE_CHARS;
       const lifted = extractTable(table, {
         maxRows,
         maxColumns: LIMITS.tableColumns,
