@@ -22,6 +22,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CHANGESET_TOOLS, diffLint, docsSymbolCheck } from "./index";
 
+/**
+ * A test that needs a write or a listing to be REFUSED by a directory's mode
+ * cannot run as root, which the mode does not stop (a container's CI user,
+ * `docker run --user 0`). It is skipped there rather than failing.
+ */
+const canTestUnwritable = (process.getuid?.() ?? 0) !== 0;
+
 // biome-ignore lint/suspicious/noExplicitAny: the executor supplies this context, and neither tool reads anything but `signal` from it.
 const ctx = {} as any;
 
@@ -527,38 +534,41 @@ describe("DocsSymbolCheck", () => {
     }
   });
 
-  test("a directory the walk cannot list is refused, not counted as empty", async () => {
-    // The tool promises to refuse an incomplete scan because an incomplete
-    // index invents missing symbols. A directory that cannot be listed is the
-    // largest hole there is, and it used to be swallowed by a bare `catch`:
-    // every symbol living only inside it was reported as deleted.
-    project(
-      "export function renderReport() {}\n",
-      "`renderReport` and `onlyInTheLockedDir` are both real.\n",
-    );
-    mkdirSync(join(workspace, "src/private"), { recursive: true });
-    writeFileSync(
-      join(workspace, "src/private/hidden.ts"),
-      "export const onlyInTheLockedDir = 1;\n",
-    );
-    chmodSync(join(workspace, "src/private"), 0o000);
-    try {
-      const refused = await callRaw(docsSymbolCheck, { docs: ["docs"], source: "src" });
-      expect(refused).toContain("could not list");
-      expect(refused).toContain("private");
-      expect(refused).not.toContain("onlyInTheLockedDir");
+  test.if(canTestUnwritable)(
+    "a directory the walk cannot list is refused, not counted as empty",
+    async () => {
+      // The tool promises to refuse an incomplete scan because an incomplete
+      // index invents missing symbols. A directory that cannot be listed is the
+      // largest hole there is, and it used to be swallowed by a bare `catch`:
+      // every symbol living only inside it was reported as deleted.
+      project(
+        "export function renderReport() {}\n",
+        "`renderReport` and `onlyInTheLockedDir` are both real.\n",
+      );
+      mkdirSync(join(workspace, "src/private"), { recursive: true });
+      writeFileSync(
+        join(workspace, "src/private/hidden.ts"),
+        "export const onlyInTheLockedDir = 1;\n",
+      );
+      chmodSync(join(workspace, "src/private"), 0o000);
+      try {
+        const refused = await callRaw(docsSymbolCheck, { docs: ["docs"], source: "src" });
+        expect(refused).toContain("could not list");
+        expect(refused).toContain("private");
+        expect(refused).not.toContain("onlyInTheLockedDir");
 
-      // Accepting the gap explicitly is allowed, and then the gap is named.
-      const allowed = await call<DocsResponse>(docsSymbolCheck, {
-        docs: ["docs"],
-        source: "src",
-        allowUnreadableSources: true,
-      });
-      expect(allowed.warnings?.join(" ")).toContain("could not be listed");
-    } finally {
-      chmodSync(join(workspace, "src/private"), 0o755);
-    }
-  });
+        // Accepting the gap explicitly is allowed, and then the gap is named.
+        const allowed = await call<DocsResponse>(docsSymbolCheck, {
+          docs: ["docs"],
+          source: "src",
+          allowUnreadableSources: true,
+        });
+        expect(allowed.warnings?.join(" ")).toContain("could not be listed");
+      } finally {
+        chmodSync(join(workspace, "src/private"), 0o755);
+      }
+    },
+  );
 
   test("a tree with exactly maxFiles sources is complete, not refused", async () => {
     // The cap used to be checked once per directory ENTRY, so a tree holding
