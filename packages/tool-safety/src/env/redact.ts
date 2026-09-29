@@ -165,6 +165,282 @@ function partialAtStart(text: string, form: string, min: number): number {
   return 0;
 }
 
+// ─── Escaped spellings ──────────────────────────────────────────────────────
+//
+// The forms above are whole-string encodings. An echo is often escaped
+// character by character instead, and only where the encoder insists:
+// System.Text.Json writes `+` as `\u002B` and leaves the rest alone, a
+// server percent-encodes in lower case (`%2f`), an HTML page writes `/` as
+// `&#x2F;`. No list of whole-string forms covers the mixtures (C050's
+// residual: an AWS-style secret with `/` and `+` came back whole in all
+// three). So a text holding any escape is also read through a DECODED VIEW
+// — every `\uXXXX`, JSON escape, ASCII `%XX` and HTML character reference
+// decoded, with a map back to where each decoded character came from — and
+// each secret found there has its ORIGINAL span replaced.
+
+type Segment = {
+  /** Where the segment starts in the decoded view, and in the original text. */
+  readonly d: number;
+  readonly o: number;
+  /** Its length in each: equal for a plain run, different for an escape. */
+  readonly dl: number;
+  readonly ol: number;
+};
+
+type DecodedView = { readonly text: string; readonly segments: readonly Segment[] };
+
+const JSON_ESCAPES: Readonly<Record<string, string>> = {
+  '"': '"',
+  "\\": "\\",
+  "/": "/",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+};
+
+/** Named character references an echo of a token plausibly uses (HTML5 names). */
+const NAMED_REFERENCES: Readonly<Record<string, string>> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  sol: "/",
+  bsol: "\\",
+  plus: "+",
+  equals: "=",
+  lowbar: "_",
+  period: ".",
+  colon: ":",
+  semi: ";",
+  num: "#",
+  percnt: "%",
+  excl: "!",
+  quest: "?",
+  commat: "@",
+  dollar: "$",
+  ast: "*",
+  comma: ",",
+  tilde: "~",
+  verbar: "|",
+  lpar: "(",
+  rpar: ")",
+  lsqb: "[",
+  rsqb: "]",
+  lcub: "{",
+  rcub: "}",
+  grave: "`",
+  Hat: "^",
+};
+
+const HEX = /^[0-9A-Fa-f]+$/;
+
+/** The longest character reference decoded, `&` to `;`: `&#x10FFFF;`. */
+const MAX_REFERENCE_CHARS = 10;
+
+/** The escape starting at `i` (a `\`, `%` or `&`): what it decodes to and its length, or undefined. */
+function escapeAt(
+  text: string,
+  i: number,
+): { readonly ch: string; readonly len: number } | undefined {
+  const c = text[i];
+  if (c === "\\") {
+    const n = text[i + 1];
+    if (n === "u" || n === "U") {
+      const hex = text.slice(i + 2, i + 6);
+      if (hex.length === 4 && HEX.test(hex)) {
+        return { ch: String.fromCharCode(Number.parseInt(hex, 16)), len: 6 };
+      }
+      return undefined;
+    }
+    const simple = n === undefined ? undefined : JSON_ESCAPES[n];
+    return simple === undefined ? undefined : { ch: simple, len: 2 };
+  }
+  if (c === "%") {
+    const hex = text.slice(i + 1, i + 3);
+    if (hex.length !== 2 || !HEX.test(hex)) return undefined;
+    const code = Number.parseInt(hex, 16);
+    // ASCII only: a multi-byte UTF-8 sequence is the whole-string form's job.
+    return code < 0x80 ? { ch: String.fromCharCode(code), len: 3 } : undefined;
+  }
+  if (c === "&") {
+    // Looked for within the longest reference's reach only: an unbounded
+    // `indexOf(";")` from every `&` of a text with none is quadratic.
+    let semi = -1;
+    for (let j = i + 1; j < text.length && j <= i + MAX_REFERENCE_CHARS; j++) {
+      if (text.charCodeAt(j) === 0x3b) {
+        semi = j;
+        break;
+      }
+    }
+    if (semi === -1) return undefined;
+    const body = text.slice(i + 1, semi);
+    let code: number | undefined;
+    if (body.startsWith("#x") || body.startsWith("#X")) {
+      const hex = body.slice(2);
+      if (hex !== "" && HEX.test(hex)) code = Number.parseInt(hex, 16);
+    } else if (body.startsWith("#")) {
+      const dec = body.slice(1);
+      if (/^[0-9]+$/.test(dec)) code = Number.parseInt(dec, 10);
+    } else {
+      const named = NAMED_REFERENCES[body];
+      return named === undefined ? undefined : { ch: named, len: semi - i + 1 };
+    }
+    if (code === undefined || code > 0x10ffff) return undefined;
+    return { ch: String.fromCodePoint(code), len: semi - i + 1 };
+  }
+  return undefined;
+}
+
+/** `text` with every escape decoded, and where each piece came from; undefined when nothing decodes. */
+function decodedView(text: string): DecodedView | undefined {
+  const segments: Segment[] = [];
+  const parts: string[] = [];
+  let d = 0;
+  let runStart = 0;
+  let decodedAny = false;
+  for (let i = 0; i < text.length; ) {
+    const c = text.charCodeAt(i);
+    // `\`, `%`, `&`
+    const esc = c === 0x5c || c === 0x25 || c === 0x26 ? escapeAt(text, i) : undefined;
+    if (esc === undefined) {
+      i += 1;
+      continue;
+    }
+    decodedAny = true;
+    if (i > runStart) {
+      segments.push({ d, o: runStart, dl: i - runStart, ol: i - runStart });
+      parts.push(text.slice(runStart, i));
+      d += i - runStart;
+    }
+    segments.push({ d, o: i, dl: esc.ch.length, ol: esc.len });
+    parts.push(esc.ch);
+    d += esc.ch.length;
+    i += esc.len;
+    runStart = i;
+  }
+  if (!decodedAny) return undefined;
+  if (text.length > runStart) {
+    segments.push({ d, o: runStart, dl: text.length - runStart, ol: text.length - runStart });
+    parts.push(text.slice(runStart));
+  }
+  return { text: parts.join(""), segments };
+}
+
+/** The segment holding decoded index `p` (0 <= p < decoded length). */
+function segmentAt(view: DecodedView, p: number): Segment {
+  let lo = 0;
+  let hi = view.segments.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if ((view.segments[mid] as Segment).d <= p) lo = mid;
+    else hi = mid - 1;
+  }
+  return view.segments[lo] as Segment;
+}
+
+/** The original span a decoded span `[start, end)` came from: whole escapes, never half of one. */
+function originalSpan(view: DecodedView, start: number, end: number): [number, number] {
+  const first = segmentAt(view, start);
+  const last = segmentAt(view, end - 1);
+  const from = first.dl === first.ol ? first.o + (start - first.d) : first.o;
+  const to = last.dl === last.ol ? last.o + (end - 1 - last.d) + 1 : last.o + last.ol;
+  return [from, to];
+}
+
+/** The whole values to look for in a decoded view: each secret as sent, and trimmed. */
+function decodedNeedles(
+  values: Iterable<SecretValue | undefined>,
+  minLength: number,
+): { readonly needle: string; readonly publicLength: number }[] {
+  const out = new Map<string, number>();
+  for (const value of values) {
+    if (value === undefined) continue;
+    const prefix = typeof value === "string" ? "" : value.publicPrefix;
+    const secret = typeof value === "string" ? value : value.secret;
+    if (typeof secret !== "string" || secret.trim().length < minLength) continue;
+    for (const s of new Set([secret, secret.trim()])) out.set(prefix + s, prefix.length);
+  }
+  return [...out]
+    .map(([needle, publicLength]) => ({ needle, publicLength }))
+    .sort((a, b) => b.needle.length - a.needle.length);
+}
+
+/**
+ * The original spans of `text` that spell a needle once decoded — whole,
+ * or (at the text's edges) the part of one a cut left there — merged and
+ * in order.
+ */
+function escapedSpans(
+  text: string,
+  needles: readonly { readonly needle: string; readonly publicLength: number }[],
+  minLength: number,
+): [number, number][] {
+  if (needles.length === 0) return [];
+  const view = decodedView(text);
+  if (view === undefined) return [];
+  const spans: [number, number][] = [];
+  for (const { needle } of needles) {
+    for (let at = view.text.indexOf(needle); at !== -1; at = view.text.indexOf(needle, at + 1)) {
+      spans.push(originalSpan(view, at, at + needle.length));
+    }
+  }
+  let tail = 0;
+  let head = 0;
+  for (const { needle, publicLength } of needles) {
+    tail = Math.max(tail, partialAtEnd(view.text, needle, publicLength + minLength));
+    head = Math.max(head, partialAtStart(view.text, needle, minLength));
+  }
+  if (tail > 0) spans.push(originalSpan(view, view.text.length - tail, view.text.length));
+  if (head > 0) spans.push(originalSpan(view, 0, head));
+  spans.sort((a, b) => a[0] - b[0]);
+  const merged: [number, number][] = [];
+  for (const span of spans) {
+    const prev = merged[merged.length - 1];
+    if (prev !== undefined && span[0] <= prev[1]) prev[1] = Math.max(prev[1], span[1]);
+    else merged.push([span[0], span[1]]);
+  }
+  return merged;
+}
+
+/** `text` with each span replaced by `placeholder`. */
+function replaceSpans(
+  text: string,
+  spans: readonly [number, number][],
+  placeholder: string,
+): string {
+  let out = "";
+  let at = 0;
+  for (const [from, to] of spans) {
+    out += text.slice(at, from) + placeholder;
+    at = to;
+  }
+  return out + text.slice(at);
+}
+
+/**
+ * Whether `text` holds a known secret: any of its {@link secretForms}, or
+ * the secret itself under character escapes (`\u002B`, `%2f`, `&#x2F;`), at
+ * the length the redactor redacts (default six characters and up). For a
+ * check before text leaves in a form no redactor sees, such as a file
+ * written to the workspace.
+ */
+export function containsKnownSecret(
+  text: string,
+  values: Iterable<SecretValue | undefined>,
+  options: { readonly minLength?: number } = {},
+): boolean {
+  const minLength = options.minLength ?? DEFAULT_MIN_LENGTH;
+  const list = [...values];
+  for (const { form } of formsOf(list, minLength)) if (text.includes(form)) return true;
+  const needles = decodedNeedles(list, minLength);
+  if (needles.length === 0) return false;
+  const view = decodedView(text);
+  return view !== undefined && needles.some(({ needle }) => view.text.includes(needle));
+}
+
 /**
  * A function that replaces every known secret value, in each of its
  * {@link secretForms}, with the placeholder. Built once, applied to many
@@ -187,11 +463,16 @@ export function createSecretRedactor(
 ): (text: string) => string {
   const minLength = options.minLength ?? DEFAULT_MIN_LENGTH;
   const placeholder = options.placeholder ?? REDACTED;
-  const ordered = formsOf(values, minLength);
+  const list = [...values];
+  const ordered = formsOf(list, minLength);
   if (ordered.length === 0) return (text) => text;
+  const needles = decodedNeedles(list, minLength);
   return (text: string): string => {
     let out = text;
     for (const { form } of ordered) if (out.includes(form)) out = out.split(form).join(placeholder);
+    // A spelling escaped character by character, which no whole form is.
+    const escaped = escapedSpans(out, needles, minLength);
+    if (escaped.length > 0) out = replaceSpans(out, escaped, placeholder);
     let tail = 0;
     let head = 0;
     for (const { form, publicLength } of ordered) {

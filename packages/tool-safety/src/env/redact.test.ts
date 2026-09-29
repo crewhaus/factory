@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   REDACTED,
+  containsKnownSecret,
   createSecretRedactor,
   redactKnownSecrets,
   redactKnownSecretsDeep,
@@ -125,6 +126,63 @@ describe("the JSON spelling of '/' as '\\/' (net attacker review)", () => {
     const cut = echoed.slice(0, -4);
     expect(trimSecretTail(cut, [KEY])).toBe('{"key":"');
     expect(secretForms(KEY)).toContain(KEY.replaceAll("/", "\\/"));
+  });
+});
+
+describe("a secret escaped character by character (C050 residual)", () => {
+  // AWS-style: carries `/` and `+`, which encoders escape one at a time.
+  const KEY = ["wJalrXUtnFEMI", "K7MDENG+bPxRfiCY", "EXAMPLEKEY"].join("/");
+  const PIECES = ["wJalrXUtnFEMI", "K7MDENG", "bPxRfiCY", "EXAMPLEKEY"];
+  const shown = (text: string): string[] => PIECES.filter((p) => text.includes(p));
+  const spellings: Record<string, string> = {
+    // System.Text.Json's default escapes `+` (and only that, here).
+    stj: KEY.replaceAll("+", "\\u002B"),
+    stjLowerHex: KEY.replaceAll("+", "\\u002b").replaceAll("/", "\\u002f"),
+    lowerPercent: encodeURIComponent(KEY).replace(/%[0-9A-F]{2}/g, (x) => x.toLowerCase()),
+    mixedPercent: KEY.replaceAll("/", "%2f"),
+    htmlHex: KEY.replaceAll("/", "&#x2F;"),
+    htmlDecimal: KEY.replaceAll("/", "&#47;").replaceAll("+", "&#43;"),
+    htmlNamed: KEY.replaceAll("/", "&sol;").replaceAll("+", "&plus;"),
+    phpAndStj: KEY.replaceAll("/", "\\/").replaceAll("+", "\\u002B"),
+  };
+
+  for (const [name, spelled] of Object.entries(spellings)) {
+    test(`the ${name} spelling is redacted, and the text around it kept`, () => {
+      const text = `before ${spelled} after`;
+      expect(shown(text).length).toBeGreaterThan(0);
+      expect(redactKnownSecrets(text, [KEY])).toBe(`before ${REDACTED} after`);
+      expect(containsKnownSecret(text, [KEY])).toBe(true);
+    });
+  }
+
+  test("a cut through an escaped echo leaves none of it at either edge", () => {
+    const spelled = spellings.stj as string;
+    const tail = `got ${spelled.slice(0, -3)}`;
+    expect(shown(redactKnownSecrets(tail, [KEY]))).toEqual([]);
+    const head = `${spelled.slice(4)} rest`;
+    expect(shown(redactKnownSecrets(head, [KEY]))).toEqual([]);
+    expect(redactKnownSecrets(head, [KEY])).toBe(`${REDACTED} rest`);
+  });
+
+  test("escapes that spell no secret are left exactly as written", () => {
+    const text = "a%2fb \\u002B &#x2F; &amp; 100% & done; \\n";
+    expect(redactKnownSecrets(text, [KEY])).toBe(text);
+    expect(containsKnownSecret(text, [KEY])).toBe(false);
+  });
+
+  test("a composite's public prefix under escapes is not a secret on its own", () => {
+    const composite = { publicPrefix: "alice:", secret: "s3cr3t+Passw0rd/x" };
+    const echoed = "user=alice%3as3cr3t%2bPassw0rd%2fx";
+    expect(redactKnownSecrets(echoed, [composite])).toBe(`user=${REDACTED}`);
+    expect(redactKnownSecrets("user=alice%3a", [composite])).toBe("user=alice%3a");
+  });
+
+  test("the decoded view is linear: many '&', '%' and '\\' with nothing to decode", () => {
+    const hostile = `${"&".repeat(300_000)}${"%".repeat(300_000)}${"\\x".repeat(150_000)}`;
+    const started = performance.now();
+    expect(redactKnownSecrets(hostile, [KEY])).toBe(hostile);
+    expect(containsKnownSecret(hostile, [KEY])).toBe(false);
+    expect(performance.now() - started).toBeLessThan(5_000);
   });
 });
 

@@ -14,8 +14,11 @@
  * - {@link redactKnownSecrets} / {@link createSecretRedactor} /
  *   {@link redactKnownSecretsDeep}: known secret values out of text and
  *   results, in their encoded spellings too, and the part of one a cut
- *   left at a string's edge. {@link trimSecretTail}: for a caller that
+ *   left at a string's edge, and a secret escaped character by character
+ *   (`\u002B`, `%2f`, `&#x2F;`). {@link trimSecretTail}: for a caller that
  *   cut a text itself, the start of a secret removed from its end.
+ *   {@link containsKnownSecret}: whether text holds one, for text that
+ *   leaves where no redactor sees it (a file written to the workspace).
  * - {@link redactUrlCredentials} / {@link redactUrlCredentialsInText}:
  *   userinfo and credential-named parameters out of URLs.
  * - {@link withoutCredentials}: a child process's environment without the
@@ -47,6 +50,7 @@ export {
   type ComposedSecret,
   type RedactOptions,
   type SecretValue,
+  containsKnownSecret,
   createSecretRedactor,
   isCredentialParam,
   redactKnownSecrets,
