@@ -171,6 +171,11 @@ export type PathFacts = {
    * whole seconds, FAT two. So equal tokens prove nothing about a write made
    * within a tick of the last look, and WatchPath compares the content of a
    * recently written file instead (see `lib/watch-session.ts`).
+   *
+   * The mode is the third part ({@link changeStampOf}). Comparing content
+   * cannot see a chmod, and on a coarse clock a chmod within a tick of the
+   * last change moves neither time: on the Windows runner the same test saw
+   * the chmod in one run and missed it in the next.
    */
   readonly changeStamp: string;
   readonly sizeBytes: number;
@@ -182,6 +187,19 @@ export type PathFacts = {
    */
   readonly uid: number;
 };
+
+/**
+ * The change token {@link PathFacts.changeStamp} carries: modification time
+ * and inode-change time in nanoseconds, then the mode. Split on ":", the
+ * first two parts are the times (`stampsAreFine` reads them).
+ */
+export function changeStampOf(stats: {
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+  readonly mode: bigint | number;
+}): string {
+  return `${stats.mtimeNs}:${stats.ctimeNs}:${stats.mode}`;
+}
 
 export type PathProbe = (absolutePath: string) => PathFacts | undefined;
 
@@ -218,7 +236,7 @@ export function probePath(absolutePath: string): PathFacts | undefined {
     mode: Number(stats.mode),
     mtimeMs: Number(stats.mtimeMs),
     ctimeMs: Number(stats.ctimeMs),
-    changeStamp: `${stats.mtimeNs}:${stats.ctimeNs}`,
+    changeStamp: changeStampOf(stats),
     sizeBytes: Number(stats.size),
     uid: Number(stats.uid),
   };

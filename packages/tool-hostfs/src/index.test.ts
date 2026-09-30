@@ -47,7 +47,7 @@ import {
   PLOCATE_NO_DATABASE,
   PLOCATE_NO_MATCH,
 } from "./fixtures";
-import type { PathFacts } from "./host";
+import { type PathFacts, changeStampOf } from "./host";
 import {
   HOSTFS_TOOLS,
   _resetHostSeams,
@@ -701,7 +701,9 @@ describe("WatchPath: what it reports", () => {
           mode: Number(st.mode),
           mtimeMs: dir ? Number(st.mtimeMs) : stampMs,
           ctimeMs: dir ? Number(st.ctimeMs) : stampMs,
-          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${tick}:${tick}`,
+          changeStamp: changeStampOf(
+            dir ? st : { mtimeNs: BigInt(tick), ctimeNs: BigInt(tick), mode: st.mode },
+          ),
           sizeBytes: Number(st.size),
           uid: Number(st.uid),
         };
@@ -727,6 +729,30 @@ describe("WatchPath: what it reports", () => {
       expect(result["stoppedBy"]).toBe("eventCap");
       expect((result["events"] as Array<Record<string, unknown>>)[0]?.["kind"]).toBe("modified");
       expect(result["notes"]).toBeUndefined();
+    }, 20_000);
+
+    test("a chmod inside the snapshot's tick is still an event", async () => {
+      // Content comparison cannot see a permission change, and in one tick of
+      // a coarse clock a chmod moves neither time: only the mode shows it.
+      // 0400 is a real change on Windows too (the read-only attribute).
+      coarseTickProbe(Date.now());
+      writeFileSync(join(workspace, "perm.txt"), "x");
+      scriptedWatcher((emit) => {
+        chmodSync(join(workspace, "perm.txt"), 0o400);
+        emit("change", "perm.txt");
+      });
+      try {
+        const result = await callJson(watchPath, {
+          path: ".",
+          timeoutMs: 5_000,
+          maxEvents: 1,
+          settleMs: 20,
+        });
+        expect(result["eventCount"]).toBe(1);
+        expect((result["events"] as Array<Record<string, unknown>>)[0]?.["kind"]).toBe("modified");
+      } finally {
+        chmodSync(join(workspace, "perm.txt"), 0o644);
+      }
     }, 20_000);
 
     test("the same notification about content that did not change is still not an event", async () => {
@@ -823,7 +849,9 @@ describe("WatchPath: what it reports", () => {
           mode: Number(st.mode),
           mtimeMs: dir ? Number(st.mtimeMs) : stampMs,
           ctimeMs: dir ? Number(st.ctimeMs) : stampMs,
-          changeStamp: dir ? `${st.mtimeNs}:${st.ctimeNs}` : `${mtime}:${ctime}`,
+          changeStamp: changeStampOf(
+            dir ? st : { mtimeNs: BigInt(mtime), ctimeNs: BigInt(ctime), mode: st.mode },
+          ),
           sizeBytes: Number(st.size),
           uid: Number(st.uid),
         };
@@ -919,9 +947,8 @@ describe("WatchPath: what it reports", () => {
   test("a chmod is a change, even though it leaves mtime alone", async () => {
     // Which is why ctime is compared too: a permission change moves ctime
     // and nothing else, and a watcher that only looked at mtime would call
-    // it nothing.
-    // Read-only, so the change is a real one on Windows too, where a mode
-    // is only the read-only attribute and 0600 would change nothing at all.
+    // it nothing. Read-only, so the change is a real one on Windows too,
+    // where a mode is only the read-only attribute and 0600 changes nothing.
     writeFileSync(join(workspace, "perm.txt"), "x");
     scriptedWatcher((emit) => {
       chmodSync(join(workspace, "perm.txt"), 0o444);
@@ -1048,7 +1075,7 @@ function facts(path: string, device: number): PathFacts | undefined {
       isSymlink: stats.isSymbolicLink(),
       mode: Number(stats.mode),
       mtimeMs: Number(stats.mtimeMs),
-      changeStamp: `${stats.mtimeNs}:${stats.ctimeNs}`,
+      changeStamp: changeStampOf(stats),
       sizeBytes: Number(stats.size),
       uid: Number(stats.uid),
     };
