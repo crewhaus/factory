@@ -463,8 +463,10 @@ describe("security-8#2 — a glob cannot stall the event loop", () => {
       small: number;
       large: number;
     }>;
-    // The answers are what they always were; only the cost changed.
-    expect(rows.map((r) => r.answer)).toEqual([true, false, false, true]);
+    // The answers are what they always were, but for one: the first command
+    // line is two commands joined by `;`, and since 0.7.1 an allow must match
+    // each (the second, `git push git push …`, has no `--force`).
+    expect(rows.map((r) => r.answer)).toEqual([false, false, false, true]);
     for (const r of rows) {
       // The inputs really are the audit's sizes, 100–200 KB, and the work was
       // counted (a matcher that reports nothing proves nothing)…

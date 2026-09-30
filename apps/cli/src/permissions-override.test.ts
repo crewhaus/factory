@@ -65,3 +65,27 @@ describe("a path allow on a tool that walks directories (final review)", () => {
     ).toEqual(["Grep(src/secrets/**)"]);
   });
 });
+
+describe("an allow of a shell line (0.7.1)", () => {
+  test("overrides a guard that fires on any command in the line", () => {
+    // Settings `alwaysAllow Bash(git status && rm -rf build)` decides that
+    // line before the builtin floor's `alwaysAsk Bash(rm**)`, which reads the
+    // `rm` that comes second — so the proposal must say it overrides it.
+    const floor: PermissionRule = { type: "alwaysAsk", pattern: "Bash(rm**)", source: "builtin" };
+    const other = yaml("alwaysDeny", "Bash(curl**)");
+    const allow = {
+      toolName: "Bash",
+      scopedValue: "git status && rm -rf build",
+      valueKind: "command" as const,
+    };
+    expect(guardsOverridden(allow, [floor, other], "/ws")).toEqual([floor]);
+    // A command no shell reads is one command.
+    expect(
+      guardsOverridden(
+        { ...allow, toolName: "RunCommand", scopedValue: "git status && rm -rf build" },
+        [{ ...floor, pattern: "RunCommand(rm**)" }],
+        "/ws",
+      ),
+    ).toEqual([]);
+  });
+});

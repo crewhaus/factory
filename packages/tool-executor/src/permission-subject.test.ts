@@ -156,6 +156,71 @@ describe("url, command and id values", () => {
     expect(match("Run(rm -rf src)", "allow")).toBe(true);
   });
 
+  test("a command a shell parses is marked shell: an allow covers each command, a deny any", () => {
+    // The Bash tool's declaration (tool-bash): `sh -c` parses `command`.
+    const bashLike = buildTool({
+      name: "Bash",
+      description: "d",
+      inputSchema: z.object({ command: z.string(), timeout: z.number().optional() }),
+      destructive: true,
+      operativeArgs: [{ field: "command", kind: "command", shell: true }],
+      execute: async () => "ok",
+    });
+    const subject = preparePermissionSubject(bashLike, { command: "git status && rm -rf build" });
+    if (!subject.ok) throw new Error(subject.reason);
+    expect(subject.operativeValues).toEqual([
+      { kind: "command", canonical: ["git status && rm -rf build"], shell: true },
+    ]);
+    const match = (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(compilePattern(pattern), "Bash", subject.input, {
+        polarity,
+        operativeValues: subject.operativeValues ?? [],
+      });
+    expect(match("Bash(git *)", "allow")).toBe(false);
+    expect(match("Bash(rm -rf **)", "restrict")).toBe(true);
+    expect(match("Bash", "allow")).toBe(true);
+    // Without the declaration the same field is one command, as for any tool.
+    const plain = buildTool({
+      name: "Plain",
+      description: "d",
+      inputSchema: z.object({ command: z.string() }),
+      destructive: true,
+      operativeArgs: [{ field: "command", kind: "command" }],
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(plain, { command: "a && b" })).toEqual([
+      { kind: "command", canonical: ["a && b"] },
+    ]);
+  });
+
+  test("an argv that hands a line to a shell is read by a deny, never by an allow", () => {
+    const run = buildTool({
+      name: "Run",
+      description: "d",
+      inputSchema: z.object({ argv: z.array(z.string()) }),
+      destructive: true,
+      operativeArgs: [{ field: "argv", kind: "command" }],
+      execute: async () => "ok",
+    });
+    const argv = ["env", "A=1", "sh", "-c", "git status && rm -rf build"];
+    const values = operativeValuesFor(run, { argv }) ?? [];
+    expect(values[1]).toEqual({
+      kind: "command",
+      canonical: [],
+      spellings: ["git status && rm -rf build"],
+      shell: true,
+      restrictOnly: true,
+    });
+    const match = (pattern: string, polarity: "allow" | "restrict") =>
+      matchesPattern(compilePattern(pattern), "Run", {}, { polarity, operativeValues: values });
+    expect(match("Run(rm -rf **)", "restrict")).toBe(true);
+    // The argv is not split: an allow reads it as written, as before.
+    expect(match("Run(env A=1 sh -c *)", "allow")).toBe(true);
+    expect(match("Run(git *)", "allow")).toBe(false);
+    // An argv that runs no shell carries nothing more.
+    expect(operativeValuesFor(run, { argv: ["git", "status"] })).toHaveLength(1);
+  });
+
   test("a field declared within another is matched as qualifier/value", () => {
     const repo = { field: "repo", kind: "recipient", within: "owner" } as const;
     expect(readOperativeField({ owner: "crewhaus", repo: "factory" }, repo)).toEqual([

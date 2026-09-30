@@ -1,4 +1,5 @@
 import { CrewhausError } from "@crewhaus/errors";
+import { readShellLine, shellRestrictSpellings } from "./shell";
 
 export class PatternParseError extends CrewhausError {
   override readonly name = "PatternParseError";
@@ -219,6 +220,8 @@ export type GlobMatcher = {
    * cover every value grants nothing.
    */
   readonly matchesEveryAfter: (prefix: string, tail: AnyValueTail, segments?: number) => boolean;
+  /** The glob has no wildcard: it matches one string, written with escapes resolved. */
+  readonly isLiteral: boolean;
 };
 
 /**
@@ -520,6 +523,7 @@ function compileGlob(glob: string): GlobMatcher {
       matchesSomeAfter: someAfter,
       // One string: never both the prefix alone and the prefix plus more.
       matchesEveryAfter: () => false,
+      isLiteral: true,
     };
   }
 
@@ -677,6 +681,7 @@ function compileGlob(glob: string): GlobMatcher {
       return false;
     },
     matchesSomeAfter: someAfter,
+    isLiteral: false,
     matchesEveryAfter(prefix: string, tail: AnyValueTail, segments = 1): boolean {
       // The sets of states the automaton can be in after the prefix and any
       // continuation, built one character class at a time (the subset
@@ -914,6 +919,19 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   `src/**` + `/*.ts`; `Glob(src/*)` does not grant `src/**`). A bracket, a
  *   brace, a negation or an escape is read as everything under the
  *   pattern's literal directory part.
+ * - `shell` — a `command` a shell will parse (`sh -c`): the Bash tool's
+ *   `command`. It runs one program per simple command, and these are joined
+ *   by `&&`, `||`, `;`, `|`, `&`, newlines and parentheses. An allow must
+ *   match EVERY simple command (`Bash(git *)` does not grant `git status &&
+ *   rm -rf build`), or be the exact line itself (a glob with no wildcard);
+ *   a line whose commands cannot be read out of its text — a `$(…)`,
+ *   backticks, a here-document, an unterminated quote and the like (see
+ *   `readShellLine`) — is granted by no scoped allow. A glob that matches
+ *   every command without a `/` (`Bash(*)`, `Bash(**)`) still grants the
+ *   whole line as before. A deny or ask fires on the whole line and on any
+ *   simple command, also read from its program on, unquoted, through
+ *   wrappers (`env`, `sudo`, `xargs`, …) and inside an `eval`, a `sh -c` or
+ *   a substitution (see `shellRestrictSpellings`).
  * - `restrictOnly` — a value only a deny or ask reads. The declared default
  *   of a field that only relocates the tool (a store directory, the
  *   repository a branch operation runs in), standing in for a field the
@@ -955,6 +973,7 @@ export type OperativeValue = {
   readonly beneathSkipsHidden?: boolean;
   readonly notDirectory?: boolean;
   readonly globPattern?: boolean;
+  readonly shell?: boolean;
   readonly restrictOnly?: boolean;
 };
 
@@ -1047,7 +1066,12 @@ function fallbackValues(toolName: string, input: unknown): OperativeValue[] {
       const v = record[f];
       if (typeof v === "string") present.push(v);
     }
-    if (present.length > 0) return present.map(undeclaredValue);
+    if (present.length > 0) {
+      // A tool named Bash runs its command through a shell: read it as one.
+      return toolName === "Bash"
+        ? present.map((v) => ({ ...undeclaredValue(v), shell: true }))
+        : present.map(undeclaredValue);
+    }
     // operative field absent → every string in the input
   }
   return stringValues(input).map(undeclaredValue);
@@ -1357,6 +1381,15 @@ function valueMatches(
     return argRe.matchesEveryAfter("", anyValueTail(value));
   }
   if (value.outsideWorkspace === true) return polarity === "restrict";
+  if (value.shell === true) {
+    // A line a shell parses runs one program per simple command: an allow
+    // must cover each of them, a deny or ask fires on any (see `shell`).
+    if (polarity === "restrict")
+      return valueMatches(shellRestrictValue(value), compiled, argRe, absoluteGlob, polarity);
+    if (value.standsForAny === undefined) {
+      return value.canonical.some((line) => shellAllowMatches(line, argRe));
+    }
+  }
   if (value.globPattern === true)
     return globPatternMatches(value, compiled, absoluteGlob, polarity);
   // A value that stands for every value (a field left out whose default is
@@ -1440,6 +1473,61 @@ function valueMatches(
   if (folds === undefined) return false;
   const folded = foldedArgMatcher(compiled, "lower");
   return folds.some((candidate) => folded.test(candidate));
+}
+
+/** Whether an argument glob matches every command with no `/` in it, per glob. */
+const coversEveryCommandCache = new WeakMap<GlobMatcher, boolean>();
+
+function coversEveryCommand(argRe: GlobMatcher): boolean {
+  let covers = coversEveryCommandCache.get(argRe);
+  if (covers === undefined) {
+    covers = argRe.matchesEveryAfter("", "segment");
+    coversEveryCommandCache.set(argRe, covers);
+  }
+  return covers;
+}
+
+/**
+ * Does an allow's glob grant a shell line? A glob that matches every command
+ * without a `/` (`*`, `**`) is read against the whole line, as it always
+ * was: every simple command of a line it matches is one it matches too. A
+ * glob with no wildcard grants the exact line it spells. Otherwise the line
+ * is split into its simple commands and the glob must match each; a line
+ * that cannot be split honestly is granted by none.
+ */
+function shellAllowMatches(line: string, argRe: GlobMatcher): boolean {
+  if (coversEveryCommand(argRe)) return argRe.test(line);
+  if (argRe.isLiteral && argRe.test(line)) return true;
+  const reading = readShellLine(line);
+  if (reading.opaque !== undefined) return false;
+  // A line that runs nothing (blank, or a comment) is matched as written.
+  if (reading.commands.length === 0) return argRe.test(line);
+  return reading.commands.every((command) => argRe.test(command));
+}
+
+/** A shell value as a deny or ask reads it, worked out once per value. */
+const shellRestrictCache = new WeakMap<OperativeValue, OperativeValue>();
+
+/**
+ * A shell value with every spelling a deny or ask reads added to its
+ * spellings (see `shellRestrictSpellings`), and no longer marked `shell`:
+ * from here it is read like any value of its kind.
+ */
+function shellRestrictValue(value: OperativeValue): OperativeValue {
+  let read = shellRestrictCache.get(value);
+  if (read === undefined) {
+    const own = new Set([...value.canonical, ...(value.spellings ?? [])]);
+    const added = new Set<string>();
+    for (const line of own) {
+      for (const spelling of shellRestrictSpellings(line)) {
+        if (!own.has(spelling)) added.add(spelling);
+      }
+    }
+    const { shell: _shell, ...rest } = value;
+    read = { ...rest, spellings: [...(value.spellings ?? []), ...added] };
+    shellRestrictCache.set(value, read);
+  }
+  return read;
 }
 
 const globFoldCache = new WeakMap<CompiledPattern, boolean>();
@@ -1646,6 +1734,15 @@ export function matchesPattern(
   }
   return values.some((v) => valueMatches(v, compiled, argRe, absoluteGlob, polarity));
 }
+
+export {
+  MAX_SHELL_NESTING,
+  type ShellReading,
+  type ShellWork,
+  linesRunBy,
+  readShellLine,
+  shellRestrictSpellings,
+} from "./shell";
 
 export {
   type PermissionRuleList,

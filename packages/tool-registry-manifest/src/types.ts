@@ -31,6 +31,8 @@ export type RegistryOperativeArg = {
   readonly defaultAtRoot?: true;
   /** For a `path`: the value is a pattern that stands for every path it lists. */
   readonly glob?: true;
+  /** For a `command`: a shell parses it, so a rule reads each simple command in it. */
+  readonly shell?: true;
 };
 
 export type RegistryEntry = {
@@ -129,6 +131,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.beneath !== undefined ? { beneath: arg.beneath } : {}),
     ...(arg.defaultAtRoot === true ? { defaultAtRoot: true as const } : {}),
     ...(arg.glob === true ? { glob: true as const } : {}),
+    ...(arg.shell === true ? { shell: true as const } : {}),
   };
 }
 

@@ -404,6 +404,13 @@ function checkOperativeArgs(
         );
       }
     }
+    const { shell } = arg;
+    if (shell !== undefined) {
+      if (shell !== true) fail(`${at}.shell is either true or left out`);
+      if (kind !== "command") {
+        fail(`${at}.shell: only a "command" is a line a shell parses; a "${kind}" value is not`);
+      }
+    }
     const { env } = arg;
     if (env !== undefined) {
       if (kind !== "command") {
@@ -428,6 +435,7 @@ function checkOperativeArgs(
         ...(beneath !== undefined ? { beneath } : {}),
         ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
         ...(glob === true ? { glob } : {}),
+        ...(shell === true ? { shell } : {}),
       }),
     );
   }

@@ -35,7 +35,9 @@ import {
   OPERATIVE_ARG_FIELDS as MATCHER_OPERATIVE_ARG_FIELDS,
   type OperativeValue,
   type OperativeValueKind,
+  compilePattern,
   escapeGlobLiteral,
+  matchesPattern,
 } from "@crewhaus/tool-permission-matcher";
 import { type SessionEvents, payloadOf } from "./advise-rules";
 
@@ -53,7 +55,9 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  * - `several-places` — one call acted on more than one place (a source and a
  *   destination, several recipients), which one rule value cannot cover;
  * - `not-representable` — a value cannot be written as a rule value: a path
- *   outside the workspace, text that is not a URL, or a parenthesis;
+ *   outside the workspace, text that is not a URL, a parenthesis, or a value
+ *   the rule written for it would not match (the proposal is checked against
+ *   the call it came from, the way the engine reads it);
  * - `every-value` — a call acted on every value at once (a listing by prefix
  *   or by pattern, a query with no filter), which only a wildcard rule
  *   covers, and a proposal never writes one;
@@ -154,7 +158,9 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
     const record = input as Record<string, unknown>;
     for (const f of fields) {
       const v = record[f];
-      if (typeof v === "string" && v.length > 0) return representable(v);
+      if (typeof v === "string" && v.length > 0) {
+        return grantsItsCall(representable(v), toolName, (p) => matchesPattern(p, toolName, input));
+      }
     }
     return unscoped("no-value");
   }
@@ -185,7 +191,29 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
   if (only.standsForAny !== undefined || only.globPattern === true) {
     return unscoped("every-value");
   }
-  return representable(value, only.kind);
+  const allowOnly = values;
+  return grantsItsCall(representable(value, only.kind), toolName, (p) =>
+    matchesPattern(p, toolName, input, { operativeValues: allowOnly }),
+  );
+}
+
+/**
+ * The reading, when the rule it proposes grants the call it came from, the
+ * way the engine reads that call — else `not-representable`. A proposal that
+ * never fires would keep the human being asked with no idea why.
+ */
+function grantsItsCall(
+  reading: CallReading,
+  toolName: string,
+  grants: (pattern: ReturnType<typeof compilePattern>) => boolean,
+): CallReading {
+  if (reading.kind !== "value") return reading;
+  try {
+    const pattern = compilePattern(`${toolName}(${escapeGlobLiteral(reading.value)})`);
+    return grants(pattern) ? reading : unscoped("not-representable");
+  } catch {
+    return unscoped("not-representable");
+  }
 }
 
 /**
@@ -354,7 +382,7 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
     "no-scoping-argument": `${agg.toolName} has no argument that decides where it acts, so no rule can be narrower than the tool`,
     "not-parsed": "a recorded call no longer fits the tool's input, so what it acted on is unknown",
     "not-representable":
-      "an approved call acted on a place a rule cannot name (outside the workspace, not a URL, or containing a parenthesis)",
+      "an approved call acted on a place a rule cannot name (outside the workspace, not a URL, containing a parenthesis, or a value its own rule would not match)",
     "every-value":
       "an approved call acted on every value at once (a listing by prefix or by pattern, a query with no filter), which only a wildcard rule covers, and a proposal never widens what was approved",
     "several-places":

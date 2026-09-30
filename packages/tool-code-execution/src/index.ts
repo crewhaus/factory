@@ -439,7 +439,8 @@ export const javascript: RegisteredTool = buildTool({
 
 export const shell: RegisteredTool = buildTool({
   name: "Shell",
-  operativeArgs: [{ field: "code", kind: "command" }],
+  // `sh -c` parses the code: a rule reads each simple command in it.
+  operativeArgs: [{ field: "code", kind: "command", shell: true }],
   description:
     "Execute a POSIX shell command in a sandboxed container (network=none, read-only root, /tmp scratch). Equivalent to `sh -c <code>`.",
   inputSchema: codeSchema,

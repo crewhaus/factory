@@ -338,6 +338,21 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * on the whole repository wherever it runs: `GitDiff` with `cwd: "src"` and
  * no `paths` diffs secrets/ too, so its left-out paths are the root.
  *
+ * `shell: true`, for a `command` held as a string, says a shell parses it
+ * (`sh -c`, as the Bash tool runs its `command`). A shell line runs one
+ * program per simple command, joined by `&&`, `||`, `;`, `|`, `&`, newlines
+ * and parentheses, so an allow must match every simple command in it —
+ * `alwaysAllow Bash(git *)` does not grant `git status && rm -rf build` —
+ * or be the exact line (a pattern with no wildcard). A line whose commands
+ * cannot be read out of its text (a `$(…)`, backticks, a here-document, an
+ * unterminated quote, …) is granted by no scoped allow; `Bash(*)` and
+ * `Bash(**)` still grant what they did. A deny or ask fires on the whole line
+ * and on any simple command in it, also read without the variables it sets,
+ * unquoted, through wrappers such as `env`, `sudo` and `xargs`, and inside an
+ * `eval`, a `sh -c` or a substitution. A command held as an argv array runs
+ * without a shell and is never split; a deny or ask still reads the line an
+ * argv hands to a shell (`["sh", "-c", "a && b"]`).
+ *
  * A boolean switch (`dryRun`, `force`, `recursive`, …) cannot be operative:
  * a rule's argument pattern never sees one. So `RemovePath(build/**)` allows
  * a recursive, non-dry-run delete under build/ as well as a dry run. A tool
@@ -355,6 +370,7 @@ export type OperativeArg = {
   readonly beneath?: "all" | "visible";
   readonly defaultAtRoot?: true;
   readonly glob?: true;
+  readonly shell?: true;
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

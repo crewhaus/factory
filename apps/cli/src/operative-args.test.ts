@@ -553,3 +553,55 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     );
   });
 });
+
+/**
+ * Every builtin with a `command` operative argument, and whether a shell
+ * parses it. `shell: true` makes a scoped rule read each simple command of
+ * the line (an allow must match every one, a deny or ask fires on any), so
+ * `alwaysAllow Bash(git *)` does not grant `git status && rm -rf build`. A
+ * command held as an argv is handed to its program with no shell and is
+ * never split; a deny still reads the line an argv hands to `sh -c`. Adding
+ * a tool here is the review step: a new command tool fails until it is
+ * listed with the reason it is, or is not, a shell line.
+ */
+const COMMAND_TOOLS: Readonly<Record<string, string>> = {
+  Bash: "shell: `sh -c` runs `command`",
+  Shell: "shell: `sh -c` runs `code` in the sandbox",
+  Format: "an argv array, spawned with no shell",
+  HooksManage: "one program name or an argv array; the supervisor never runs a shell",
+  JavaScript: "JavaScript source for `node -e`, not a shell line",
+  ProcessStart: "an argv array, spawned with no shell",
+  Python: "Python source for `python3 -c`, not a shell line",
+  Retry: "an argv array, spawned with no shell",
+  RunBuild: "an argv array, spawned with no shell",
+  RunCommand: "an argv array, spawned with no shell",
+  RunPipeline: "each step an argv array, spawned with no shell",
+  RunTests: "an argv array, spawned with no shell",
+};
+
+describe("every command a shell parses is read as the commands it runs", () => {
+  const commandTools = (): RegisteredTool[] =>
+    builtins.filter((t) => (t.operativeArgs ?? []).some((a) => a.kind === "command"));
+
+  test("the builtins with a command argument are exactly the reviewed ones", () => {
+    const names = [...new Set(commandTools().map((t) => t.name))].sort();
+    expect(names).toEqual(Object.keys(COMMAND_TOOLS).sort());
+    expect(names.length).toBe(12);
+  });
+
+  test("the shell lines, and only they, are declared shell", () => {
+    const declared = [
+      ...new Set(
+        commandTools()
+          .filter((t) => (t.operativeArgs ?? []).some((a) => a.shell === true))
+          .map((t) => t.name),
+      ),
+    ].sort();
+    const reviewed = Object.entries(COMMAND_TOOLS)
+      .filter(([, why]) => why.startsWith("shell:"))
+      .map(([name]) => name)
+      .sort();
+    expect(declared).toEqual(reviewed);
+    expect(declared).toEqual(["Bash", "Shell"]);
+  });
+});
