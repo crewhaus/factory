@@ -15,6 +15,7 @@ import {
   compilePattern,
   linesRunBy,
   matchesPattern,
+  readShellChain,
   readShellLine,
   shellRestrictReading,
   shellRestrictSpellings,
@@ -84,6 +85,20 @@ describe("readShellLine: the simple commands a line runs", () => {
     ["(a", "an unclosed `(`"],
     ["a\u0000; b", "a NUL byte"],
   ];
+
+  test("readShellChain: the commands, and what joins them with the blanks beside operators dropped", () => {
+    expect(readShellChain("cd gen/foo  &&  bunx crewhaus compile x")).toEqual({
+      commands: ["cd gen/foo", "bunx crewhaus compile x"],
+      joins: ["", "&&", ""],
+    });
+    expect(readShellChain("if test -f x;  then make all ; fi")).toEqual({
+      commands: ["test -f x", "make all"],
+      joins: ["if", ";then", ";fi"],
+    });
+    expect(readShellChain("( a | b ) || c")?.joins).toEqual(["(", "|", ")||", ""]);
+    // A line it cannot split has no chain.
+    expect(readShellChain("echo $(date) && ls")).toBeUndefined();
+  });
 
   test("says why a line whose commands it cannot read out of its text is opaque", () => {
     for (const [line, why] of OPAQUE) {
@@ -231,15 +246,18 @@ describe("the reader costs the length of the line", () => {
     ["one variable used often", (k) => `x=${"a".repeat(k)}; ${"$x ".repeat(k)}`],
     ["a long brace list", (k) => `{${"a,".repeat(k)}`],
     ["many assignments", (k) => `${"x=$x$x; ".repeat(k)}$x`],
+    ["many joins", (k) => "a  &&  ;  ".repeat(k)],
   ];
 
-  test("readShellLine and shellRestrictSpellings are linear on crafted lines", () => {
+  test("readShellLine, readShellChain and shellRestrictSpellings are linear on crafted lines", () => {
     for (const [name, make] of CASES) {
       const small: ShellWork = { steps: 0 };
       const large: ShellWork = { steps: 0 };
       readShellLine(make(500), small);
+      readShellChain(make(500), small);
       shellRestrictSpellings(make(500), small);
       readShellLine(make(8000), large);
+      readShellChain(make(8000), large);
       shellRestrictSpellings(make(8000), large);
       expect(small.steps).toBeGreaterThan(0);
       expect({ name, linear: large.steps / small.steps < 17 }).toEqual({ name, linear: true });
