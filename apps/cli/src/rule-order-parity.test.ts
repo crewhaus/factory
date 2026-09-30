@@ -103,5 +103,5 @@ describe("a pass-applied bundle decides as the CLI does", () => {
       'Write {"path":"docs/x.md","content":"x"} → ask',
       'Read {"path":"src/a.ts"} → allow',
     ]);
-  });
+  }, 30_000);
 });

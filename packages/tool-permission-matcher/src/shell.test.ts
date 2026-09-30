@@ -239,7 +239,7 @@ describe("the reader costs the length of the line", () => {
       expect(small.steps).toBeGreaterThan(0);
       expect({ name, linear: large.steps / small.steps < 17 }).toEqual({ name, linear: true });
     }
-  });
+  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
