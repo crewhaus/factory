@@ -168,7 +168,14 @@ export function resolveInsideRoot(
 }
 
 /**
- * Validate the pathspecs a caller wants to limit a command to.
+ * The magic that makes git read one pathspec as a literal path: no `*`, `?`
+ * or `[...]` wildcards, no further magic. See {@link checkPathspecs}.
+ */
+export const LITERAL_PATHSPEC = ":(literal)";
+
+/**
+ * Validate the pathspecs a caller wants to limit a command to, and return
+ * them as git must be given them: each marked {@link LITERAL_PATHSPEC}.
  *
  * git resolves a pathspec relative to the directory it runs in, so an absolute
  * one or one containing `..` would reach outside the workspace even though it
@@ -176,6 +183,18 @@ export function resolveInsideRoot(
  * survivor is additionally resolved to prove it lands inside the root. A
  * leading `:` is refused too: that is git's pathspec-magic prefix (`:(exclude)`,
  * `:/`), and `:/` in particular means "from the top of the repository".
+ *
+ * A pathspec is otherwise a glob to git (fnmatch, where `*` crosses `/`), and
+ * a permission rule reads the same value as the literal path it spells. So
+ * `secret*` met no `alwaysDeny GitDiff(secrets/**)` while git diffed, staged
+ * or committed everything under `secrets/` (final review, 0.7.1). Every
+ * pathspec this returns is literal: it names a file, or a directory and
+ * everything under it, exactly as a rule reads it. A file whose name holds
+ * `*` or `[` (`app/[id]/page.tsx`) is still reached by writing its name.
+ * The runner also drops the inherited GIT_*_PATHSPECS variables, which would
+ * otherwise switch this off, or fold case, for every pathspec.
+ *
+ * Callers pass `value` to git, never the caller's own strings.
  */
 export function checkPathspecs(
   toolName: string,
@@ -192,7 +211,7 @@ export function checkPathspecs(
     const inside = resolveInsideRoot(toolName, path.join(cwdAbs, spec));
     if (!inside.ok) return inside;
   }
-  return { ok: true, value: [...paths] };
+  return { ok: true, value: paths.map((spec) => `${LITERAL_PATHSPEC}${spec}`) };
 }
 
 /** How much of an offending value an error message repeats back. */
@@ -393,11 +412,26 @@ export const REPOSITORY_LOCATOR_ENV: readonly string[] = Object.freeze([
   "GIT_GRAFT_FILE",
 ]);
 
+/**
+ * Environment variables that change how git reads EVERY pathspec: as
+ * literal text, as a glob, or ignoring case. Inherited, GIT_LITERAL_PATHSPECS
+ * turns the `:(literal)` a checked pathspec carries into part of its name,
+ * and GIT_ICASE_PATHSPECS makes `SECRETS` reach `secrets/` on a filesystem
+ * that tells them apart, where a permission rule does not. None is passed on.
+ */
+export const PATHSPEC_MODE_ENV: readonly string[] = Object.freeze([
+  "GIT_LITERAL_PATHSPECS",
+  "GIT_GLOB_PATHSPECS",
+  "GIT_NOGLOB_PATHSPECS",
+  "GIT_ICASE_PATHSPECS",
+]);
+
 function withoutRepositoryLocators(
   env: Readonly<Record<string, string | undefined>>,
 ): Record<string, string | undefined> {
   const out: Record<string, string | undefined> = { ...env };
   for (const name of REPOSITORY_LOCATOR_ENV) Reflect.deleteProperty(out, name);
+  for (const name of PATHSPEC_MODE_ENV) Reflect.deleteProperty(out, name);
   return out;
 }
 
@@ -817,12 +851,15 @@ export function firstLine(text: string): string {
  * from a stack trace.
  */
 export function failure(toolName: string, run: GitRun): string {
+  // A checked pathspec carries LITERAL_PATHSPEC for git; the caller wrote the
+  // path without it, and an error that repeats it back reads as the caller's.
+  const unmarked = (text: string): string => text.replaceAll(LITERAL_PATHSPEC, "");
   if (run.timedOut) {
     return redactUrlCredentialsInText(
-      `${toolName} timed out: \`git ${run.args.join(" ")}\` did not finish in time and was killed. Narrow the request or raise \`timeout\`.`,
+      `${toolName} timed out: \`git ${unmarked(run.args.join(" "))}\` did not finish in time and was killed. Narrow the request or raise \`timeout\`.`,
     );
   }
-  const detail = run.stderr.trim() === "" ? run.stdout.trim() : run.stderr.trim();
+  const detail = unmarked(run.stderr.trim() === "" ? run.stdout.trim() : run.stderr.trim());
   // git quotes a remote's URL in some errors, userinfo and all; a
   // credential never reaches a result, even inside an error (C051).
   return redactUrlCredentialsInText(

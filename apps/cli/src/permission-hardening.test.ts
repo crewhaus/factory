@@ -98,9 +98,12 @@ function adapterFor(name: string, input: unknown): ProviderAdapter {
       web_search: true,
     },
     estimateTokens: () => 0,
-    stream: () => {
+    stream: (req) => {
       const first = i === 0;
       i++;
+      // What the tool handed back to the model, for a test that checks what
+      // an allowed call revealed.
+      if (!first) lastResult = toolResultText(req.messages);
       return (async function* () {
         yield { kind: "message_start" } as const;
         yield {
@@ -179,6 +182,7 @@ async function gate(
   const runContext = createRunContext();
   const events: TraceEvent[] = [];
   runContext.eventBus.subscribe((e) => events.push(e));
+  lastResult = undefined;
   await runChatLoop({
     model: "test-model",
     instructions: "permission hardening",
@@ -194,6 +198,23 @@ async function gate(
   const first = events.find((e) => e.kind === "permission_decision");
   lastReason = first?.kind === "permission_decision" ? first.reason : undefined;
   return first?.kind === "permission_decision" ? first.decision : undefined;
+}
+
+/** The tool result the model was handed on the last {@link gate} call, if the call ran. */
+let lastResult: string | undefined;
+
+function toolResultText(
+  messages: ReadonlyArray<{ readonly content: unknown }>,
+): string | undefined {
+  let found: string | undefined;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const block of m.content as Array<{ type?: string; content?: unknown }>) {
+      if (block.type !== "tool_result") continue;
+      found = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+    }
+  }
+  return found;
 }
 
 /**
@@ -726,6 +747,56 @@ describe("F3b — every builtin's declaration is what a rule reads (permission-i
     expect(await gate("GitAdd", { paths: ["pkg/.env"] }, rs)).toBe("deny");
     expect(await gate("GitAdd", { cwd: "pkg", paths: ["src/a.ts"] }, rs)).toBe("allow");
   });
+
+  test("a git path is literal to git as it is to the rule: `secret*` reaches nothing under secrets/", async () => {
+    // Final review (0.7.1): git read `secret*` as a glob, the rule as the
+    // file `secret*`, so a deny on secrets/** allowed a diff of everything
+    // under it and staged every file there.
+    const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+    const repo = join(ws, "repo");
+    const sh = (...argv: string[]) => {
+      const run = Bun.spawnSync(["git", ...argv], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+      if (run.exitCode !== 0) throw new Error(`git ${argv.join(" ")}: ${run.stderr.toString()}`);
+      return run.stdout.toString();
+    };
+    mkdirSync(join(repo, "secrets"), { recursive: true });
+    sh("init", "-q", "-b", "main");
+    sh("config", "user.email", "a@b.c");
+    sh("config", "user.name", "t");
+    sh("config", "commit.gpgsign", "false");
+    writeFileSync(join(repo, "secrets", "key.txt"), "old\n");
+    sh("add", "-A");
+    sh("commit", "-q", "-m", "init");
+    writeFileSync(join(repo, "secrets", "key.txt"), `${SECRET}\n`);
+    writeFileSync(join(repo, "secrets", "new.txt"), "untracked\n");
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const deny: Array<[PermissionRule["type"], string]> = [
+        ["alwaysDeny", "GitDiff(repo/secrets/**)"],
+      ];
+      const rs = rules(
+        ...deny,
+        ...(mode === "default" ? [["alwaysAllow", "GitDiff"] as const] : []),
+      );
+      expect(
+        await gate("GitDiff", { cwd: "repo", mode: "patch", paths: ["secrets"] }, rs, mode),
+      ).toBe("deny");
+      for (const glob of ["secret*", "secret?/*", "[s]ecrets"]) {
+        const got = await gate("GitDiff", { cwd: "repo", mode: "patch", paths: [glob] }, rs, mode);
+        expect({ mode, glob, got, leaked: (lastResult ?? "").includes(SECRET) }).toEqual({
+          mode,
+          glob,
+          got: "allow",
+          leaked: false,
+        });
+      }
+    }
+    const add = rules(["alwaysDeny", "GitAdd(repo/secrets/**)"], ["alwaysAllow", "GitAdd"]);
+    expect(await gate("GitAdd", { cwd: "repo", paths: ["secrets/new.txt"] }, add)).toBe("deny");
+    for (const glob of ["secret*", "*", "[s]ecrets"]) {
+      expect(await gate("GitAdd", { cwd: "repo", paths: [glob] }, add)).toBe("allow");
+      expect({ glob, staged: sh("diff", "--cached", "--name-only") }).toEqual({ glob, staged: "" });
+    }
+  }, 60_000);
 
   test("a scoped allow on a repository covers that owner's repos and nothing else", async () => {
     const rs = rules(["alwaysAllow", "IssueCreate(crewhaus/*)"]);

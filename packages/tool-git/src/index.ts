@@ -85,7 +85,9 @@ const pathsField = z
   .array(z.string().min(1))
   .max(256)
   .optional()
-  .describe("limit to these paths, relative to `cwd`");
+  .describe(
+    "limit to these paths, relative to `cwd`: files, or directories with everything under them; literal, never wildcards",
+  );
 
 /**
  * Safety flags for a tool that only interrogates the repository. Reading still
@@ -221,7 +223,7 @@ export const gitDiff: RegisteredTool = buildTool({
       ...(input.staged === true ? ["--cached"] : []),
       ...(input.range !== undefined ? [input.range] : []),
       ...(input.ref !== undefined ? [input.ref] : []),
-      ...(paths.length > 0 ? ["--", ...paths] : []),
+      ...(paths.length > 0 ? ["--", ...checked.value] : []),
     ];
     const run = await repo.run(args, { readOnly: true });
     if (run.code !== 0) return failure("GitDiff", run);
@@ -287,7 +289,7 @@ export const gitLog: RegisteredTool = buildTool({
         ...(merges === "only" ? ["--merges"] : merges === "exclude" ? ["--no-merges"] : []),
         ...(input.author !== undefined ? [`--author=${input.author}`] : []),
         ...(input.range !== undefined ? [input.range] : []),
-        ...(paths.length > 0 ? ["--", ...paths] : []),
+        ...(paths.length > 0 ? ["--", ...checked.value] : []),
       ],
       { readOnly: true },
     );
@@ -645,7 +647,7 @@ export const gitFileHistory: RegisteredTool = buildTool({
         `--format=${COMMIT_FORMAT}`,
         `--max-count=${input.maxCount ?? 20}`,
         "--",
-        input.path,
+        ...checked.value,
       ],
       { readOnly: true },
     );
@@ -771,7 +773,7 @@ export const gitAdd: RegisteredTool = buildTool({
   name: "GitAdd",
   operativeArgs: [{ field: "paths", kind: "path", within: "cwd", default: "." }],
   description:
-    "Stage the named paths. Use it to build a commit deliberately, one path at a time; there is no way to stage the whole tree blindly, which is the point.",
+    "Stage the named paths, a directory with everything under it. Use it to build a commit deliberately, one path at a time; paths are literal, never wildcards, so a call stages exactly what it names.",
   inputSchema: z.object({
     cwd: cwdField,
     timeout: timeoutField,
@@ -779,7 +781,9 @@ export const gitAdd: RegisteredTool = buildTool({
       .array(z.string().min(1))
       .min(1)
       .max(256)
-      .describe("paths relative to `cwd`; directories are staged recursively"),
+      .describe(
+        "paths relative to `cwd`; directories are staged recursively; literal, never wildcards",
+      ),
     update: z.boolean().optional().describe("stage only paths git already tracks, never new files"),
   }),
   ...WRITE_FLAGS,
@@ -793,7 +797,7 @@ export const gitAdd: RegisteredTool = buildTool({
       "add",
       ...(input.update === true ? ["--update"] : []),
       "--",
-      ...input.paths,
+      ...checked.value,
     ]);
     if (run.code !== 0) return failure("GitAdd", run);
     const staged = await repo.run(["diff", "--cached", "--numstat", "-z"], { readOnly: true });
@@ -855,7 +859,7 @@ export const gitCommit: RegisteredTool = buildTool({
         ...(input.amend === true ? ["--amend", "--no-edit"] : []),
         ...(input.allowEmpty === true ? ["--allow-empty"] : []),
         ...(input.author !== undefined ? [`--author=${input.author}`] : []),
-        ...(paths.length > 0 ? ["--", ...paths] : []),
+        ...(paths.length > 0 ? ["--", ...checked.value] : []),
       ],
       { env },
     );
@@ -1016,7 +1020,7 @@ export const gitStashPush: RegisteredTool = buildTool({
       ...(input.includeUntracked === true ? ["--include-untracked"] : []),
       ...(input.keepIndex === true ? ["--keep-index"] : []),
       ...(input.message !== undefined ? ["-m", input.message] : []),
-      ...(paths.length > 0 ? ["--", ...paths] : []),
+      ...(paths.length > 0 ? ["--", ...checked.value] : []),
     ]);
     if (run.code !== 0) return failure("GitStashPush", run);
     const list = await repo.run(["stash", "list", `--format=${STASH_FORMAT}`, "--max-count=1"], {
@@ -1382,7 +1386,7 @@ export const gitResetPaths: RegisteredTool = buildTool({
     // rewrites index entries. `--hard` is not reachable from this schema at
     // all: there is no flag for it and no branch that could add it, which is
     // why unstaging here can never cost a caller their working-tree changes.
-    const run = await repo.run(["reset", "--quiet", input.ref ?? "HEAD", "--", ...input.paths]);
+    const run = await repo.run(["reset", "--quiet", input.ref ?? "HEAD", "--", ...checked.value]);
     if (run.code !== 0) return failure("GitResetPaths", run);
     return json({ unstaged: input.paths, from: input.ref ?? "HEAD", worktreeUntouched: true });
   },

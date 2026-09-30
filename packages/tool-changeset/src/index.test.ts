@@ -351,6 +351,40 @@ describe("DiffLint against a real repository", () => {
     expect(result.findings.map((f) => f.file)).toEqual(["src/other.ts"]);
   });
 
+  test("`paths` are literal: a glob does not widen the change set (final review, 0.7.1)", async () => {
+    // To git a pathspec is a glob, while a permission rule reads the same
+    // value as the literal path it spells: `secret*` met no rule on
+    // `secrets/**` and linted, and quoted, everything under secrets/.
+    const repo = join(workspace, "repo");
+    initRepo(repo);
+    mkdirSync(join(repo, "secrets"));
+    mkdirSync(join(repo, "app", "[id]"), { recursive: true });
+    writeFileSync(join(repo, "secrets/key.ts"), "debugger;\n");
+    writeFileSync(join(repo, "app/[id]/page.ts"), "debugger;\n");
+    git(["add", "-A"], repo);
+    for (const glob of ["secret*", "secret?/*", "[s]ecrets", "*"]) {
+      const result = await call<LintResponse>(diffLint, {
+        cwd: "repo",
+        staged: true,
+        paths: [glob],
+      });
+      expect({ glob, files: result.findings.map((f) => f.file) }).toEqual({ glob, files: [] });
+    }
+    // A literal directory still takes everything under it, and a name with
+    // brackets is reached by writing it.
+    for (const [path, file] of [
+      ["secrets", "secrets/key.ts"],
+      ["app/[id]/page.ts", "app/[id]/page.ts"],
+    ] as const) {
+      const result = await call<LintResponse>(diffLint, {
+        cwd: "repo",
+        staged: true,
+        paths: [path],
+      });
+      expect({ path, files: result.findings.map((f) => f.file) }).toEqual({ path, files: [file] });
+    }
+  });
+
   test("a binary file is skipped rather than scanned as text", async () => {
     const repo = join(workspace, "repo");
     initRepo(repo);

@@ -211,7 +211,13 @@ export const diffLint: RegisteredTool = buildTool({
     ref: z.string().min(1).optional().describe("diff against this single ref"),
     range: z.string().min(1).optional().describe("a commit range such as 'main...HEAD'"),
     staged: z.boolean().optional().describe("diff the index against HEAD instead of the worktree"),
-    paths: z.array(z.string().min(1)).max(256).optional().describe("limit to these paths"),
+    paths: z
+      .array(z.string().min(1))
+      .max(256)
+      .optional()
+      .describe(
+        "limit to these paths: files, or directories with everything under them; literal, never wildcards",
+      ),
     timeout: z.number().int().positive().max(MAX_TIMEOUT_MS).optional(),
     enable: z.array(ruleIdField).max(RULE_IDS.length).optional().describe("turn opt-in rules on"),
     disable: z.array(ruleIdField).max(RULE_IDS.length).optional(),

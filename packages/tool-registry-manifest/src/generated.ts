@@ -3044,7 +3044,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     key: "gitAdd",
     name: "GitAdd",
     description:
-      "Stage the named paths. Use it to build a commit deliberately, one path at a time; there is no way to stage the whole tree blindly, which is the point.",
+      "Stage the named paths, a directory with everything under it. Use it to build a commit deliberately, one path at a time; paths are literal, never wildcards, so a call stages exactly what it names.",
     readOnly: false,
     destructive: true,
     scope: "external",

@@ -29,6 +29,7 @@
 import { statSync } from "node:fs";
 import * as path from "node:path";
 import {
+  LITERAL_PATHSPEC,
   bareRefusal,
   inheritedIndexEnv,
   locateRepository,
@@ -194,7 +195,10 @@ export async function collectDiff(
     ...(request.staged === true ? ["--cached"] : []),
     ...(request.range !== undefined ? [request.range] : []),
     ...(request.ref !== undefined ? [request.ref] : []),
-    ...(paths.length > 0 ? ["--", ...paths] : []),
+    // Literal, as a permission rule reads them: to git a pathspec is
+    // otherwise a glob, so `secret*` diffed everything a rule on `secrets/**`
+    // denies (see tool-git's checkPathspecs).
+    ...(paths.length > 0 ? ["--", ...paths.map((p) => `${LITERAL_PATHSPEC}${p}`)] : []),
   ];
   const timeoutMs = Math.min(request.timeout ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
   // git works on the repository it discovers from `cwd`, which can enclose

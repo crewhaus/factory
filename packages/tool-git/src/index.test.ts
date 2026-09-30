@@ -2004,6 +2004,149 @@ describe("boundedness", () => {
  * `apps/cli/src/tool-registry.test.ts` skipped it and the unsafe probe
  * survived here after being fixed everywhere else.
  */
+/**
+ * Final review (0.7.1): a pathspec is a glob to git, where `*` crosses `/`,
+ * while a permission rule reads the same value as the literal path it
+ * spells. `secret*` met no `alwaysDeny GitDiff(secrets/**)` and diffed,
+ * staged or committed everything under secrets/. Every tool that hands a
+ * caller's path to git as a pathspec now hands it over literal.
+ */
+describe("a caller's pathspec is literal, never a glob", () => {
+  const SECRET = "sk-live-NOT-FOR-THE-MODEL";
+  /** The spellings a glob pathspec would widen to secrets/. */
+  const GLOBS = ["secret*", "secret?/*", "[s]ecrets", "*"];
+  const on = (args: string[]) => git(args, repo).stdout;
+  const staged = () => on(["diff", "--cached", "--name-only"]).split("\n").filter(Boolean);
+  beforeEach(() => {
+    mkdirSync(join(repo, "secrets"));
+    mkdirSync(join(repo, "app", "[id]"), { recursive: true });
+    writeFileSync(join(repo, "secrets", "key.txt"), "old\n");
+    writeFileSync(join(repo, "app", "[id]", "page.tsx"), "page\n");
+    commitAll(repo, "add secrets and a route", D3);
+    writeFileSync(join(repo, "secrets", "key.txt"), `${SECRET}\n`);
+    writeFileSync(join(repo, "secrets", "new.txt"), "untracked\n");
+    writeFileSync(join(repo, "app", "[id]", "page.tsx"), "page two\n");
+  });
+
+  /**
+   * Each tool that passes caller paths to git as pathspecs, with a call that
+   * would act on secrets/ were the path a glob, and what it must show
+   * instead. `hits` counts the tools the sweep ran, and the static count
+   * below ties it to the tools that check pathspecs at all.
+   */
+  const PATHSPEC_TOOLS = [
+    "GitDiff",
+    "GitLog",
+    "GitFileHistory",
+    "GitAdd",
+    "GitCommit",
+    "GitStashPush",
+    "GitResetPaths",
+  ];
+
+  test("no glob spelling reaches secrets/ through any tool that takes pathspecs", async () => {
+    const hits = new Set<string>();
+    for (const glob of GLOBS) {
+      // Reads: nothing under secrets/ comes back.
+      const diff = String(await gitDiff.execute({ cwd: "repo", mode: "patch", paths: [glob] }));
+      expect({ glob, diff: diff.includes(SECRET) }).toEqual({ glob, diff: false });
+      hits.add("GitDiff");
+      const log = await call(gitLog, { paths: [glob] });
+      expect({ glob, log: log.count ?? log }).toEqual({ glob, log: 0 });
+      hits.add("GitLog");
+      const history = await call(gitFileHistory, { path: glob });
+      expect({ glob, history: history.count ?? history }).toEqual({ glob, history: 0 });
+      hits.add("GitFileHistory");
+      // Writes: nothing under secrets/ is staged, committed or stashed.
+      await gitAdd.execute({ cwd: "repo", paths: [glob] });
+      expect({ glob, staged: staged() }).toEqual({ glob, staged: [] });
+      hits.add("GitAdd");
+      const head = on(["rev-parse", "HEAD"]);
+      await gitCommit.execute({ cwd: "repo", message: "sneak", paths: [glob] });
+      expect({ glob, head: on(["rev-parse", "HEAD"]) }).toEqual({ glob, head });
+      hits.add("GitCommit");
+      await gitStashPush.execute({ cwd: "repo", paths: [glob] });
+      expect({ glob, stashes: on(["stash", "list"]) }).toEqual({ glob, stashes: "" });
+      expect(readFileSync(join(repo, "secrets", "key.txt"), "utf8")).toContain(SECRET);
+      hits.add("GitStashPush");
+      git(["add", "--", "secrets/key.txt"], repo);
+      await gitResetPaths.execute({ cwd: "repo", paths: [glob] });
+      expect({ glob, staged: staged() }).toEqual({ glob, staged: ["secrets/key.txt"] });
+      git(["reset", "--quiet", "--", "secrets/key.txt"], repo);
+      hits.add("GitResetPaths");
+    }
+    expect([...hits].sort()).toEqual([...PATHSPEC_TOOLS].sort());
+  }, 60_000);
+
+  test("a literal path still works: a directory with everything under it, and a name with [ ]", async () => {
+    const diff = await call(gitDiff, { mode: "nameOnly", paths: ["secrets"] });
+    expect(diff.paths).toEqual(["secrets/key.txt"]);
+    const route = await call(gitDiff, { mode: "nameOnly", paths: ["app/[id]/page.tsx"] });
+    expect(route.paths).toEqual(["app/[id]/page.tsx"]);
+    expect((await call(gitLog, { paths: ["secrets"] })).count).toBe(1);
+    expect((await call(gitFileHistory, { path: "app/[id]/page.tsx" })).count).toBe(1);
+    const added = await call(gitAdd, { paths: ["app/[id]/page.tsx"] });
+    expect(added.staged).toEqual(["app/[id]/page.tsx"]);
+    expect(staged()).toEqual(["app/[id]/page.tsx"]);
+    await call(gitResetPaths, { paths: ["app/[id]/page.tsx"] });
+    expect(staged()).toEqual([]);
+    const pushed = await call(gitStashPush, { paths: ["app/[id]/page.tsx"] });
+    expect(pushed.pushed).toBe(true);
+    expect(readFileSync(join(repo, "app", "[id]", "page.tsx"), "utf8")).toBe("page\n");
+    const committed = await call(gitCommit, { message: "route", paths: ["secrets/key.txt"] });
+    expect(committed.committed).toBe(true);
+    expect(on(["show", "--name-only", "--format=", "HEAD"]).trim()).toBe("secrets/key.txt");
+  }, 30_000);
+
+  test("a pathspec that matches nothing reads as the caller wrote it", async () => {
+    const out = String(await gitAdd.execute({ cwd: "repo", paths: ["secret*"] }));
+    expect(out).toContain("GitAdd failed");
+    expect(out).toContain("'secret*' did not match any files");
+    expect(out).not.toContain(":(literal)");
+  });
+
+  test("an inherited GIT_ICASE_PATHSPECS or GIT_LITERAL_PATHSPECS changes nothing", async () => {
+    for (const [name, value] of [
+      ["GIT_ICASE_PATHSPECS", "1"],
+      ["GIT_GLOB_PATHSPECS", "1"],
+      ["GIT_LITERAL_PATHSPECS", "1"],
+    ] as const) {
+      const saved = process.env[name];
+      process.env[name] = value;
+      try {
+        // Folded case would reach secrets/ where a rule on `SECRETS` reads
+        // another directory (Linux); literal-mode magic would make every
+        // checked pathspec match nothing at all.
+        const upper = String(
+          await gitDiff.execute({ cwd: "repo", mode: "patch", paths: ["SECRETS"] }),
+        );
+        expect({ name, leaked: upper.includes(SECRET) }).toEqual({ name, leaked: false });
+        const glob = String(
+          await gitDiff.execute({ cwd: "repo", mode: "patch", paths: ["secret*"] }),
+        );
+        expect({ name, leaked: glob.includes(SECRET) }).toEqual({ name, leaked: false });
+        const exact = await call(gitDiff, { mode: "nameOnly", paths: ["secrets"] });
+        expect({ name, paths: exact.paths }).toEqual({ name, paths: ["secrets/key.txt"] });
+      } finally {
+        if (saved === undefined) Reflect.deleteProperty(process.env, name);
+        else process.env[name] = saved;
+      }
+    }
+  }, 30_000);
+
+  test("every call site that checks a pathspec is a pathspec tool above or reads one named file", () => {
+    // GitShow reads `<ref>:./<path>` and GitBlame one file: neither is a
+    // pathspec, and git reads both literally already. Every other caller of
+    // checkPathspecs is in PATHSPEC_TOOLS, so a new one fails here until it
+    // is added to the sweep above.
+    const source = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    const callers = [...source.matchAll(/checkPathspecs\("(\w+)"/g)].map((m) => m[1]).sort();
+    expect(callers).toEqual([...PATHSPEC_TOOLS, "GitShow", "GitBlame"].sort());
+    // And each pathspec tool hands git the checked value, not its input.
+    expect(source.match(/\.\.\.checked\.value/g)?.length).toBe(PATHSPEC_TOOLS.length);
+  });
+});
+
 describe("containment of a dangling symlink", () => {
   test("a worktree path that is a dangling symlink out of the workspace is refused", async () => {
     const outside = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-git-outside-")));
