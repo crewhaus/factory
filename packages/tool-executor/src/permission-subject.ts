@@ -528,7 +528,9 @@ function everyPathValues(dir: string, canonicalizePath: PathCanonicalizer): Oper
  */
 function withBeneath(value: OperativeValue, mode: "all" | "visible"): OperativeValue {
   if (value.outsideWorkspace === true || value.notDirectory === true) return value;
-  const under = (p: string): string => (p === "." ? "" : p.endsWith("/") ? p : `${p}/`);
+  // The root — `.`, or the empty path a call may write for it — is the empty
+  // prefix, never `/`, which would read as the filesystem root.
+  const under = (p: string): string => (p === "." || p === "" ? "" : p.endsWith("/") ? p : `${p}/`);
   return {
     ...value,
     beneath: [...new Set([...value.canonical, ...(value.spellings ?? [])].map(under))],

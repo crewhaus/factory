@@ -451,6 +451,20 @@ describe("url, command and id values", () => {
     ]);
     // Outside the workspace it already fires every deny; no prefix is added.
     expect(operativeValuesFor(grep, { path: "../x" })?.[0]?.beneath).toBe(undefined);
+    // An empty path is the root: the empty prefix, never `/`, which an
+    // absolute deny (`Search(/etc/**)`) would read as the filesystem root.
+    expect(operativeValuesFor(grep, { path: "" })?.[0]?.beneath).toEqual([""]);
+    expect(
+      matchesPattern(
+        compilePattern("Search(/etc/**)"),
+        "Search",
+        { path: "" },
+        {
+          polarity: "restrict",
+          operativeValues: operativeValuesFor(grep, { path: "" }) ?? [],
+        },
+      ),
+    ).toBe(false);
   });
 
   test("a default declared `defaultAtRoot` is the workspace root, wherever the call runs", () => {

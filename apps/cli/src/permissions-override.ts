@@ -83,7 +83,7 @@ function builtinWalk(toolName: string): "all" | "visible" | undefined {
  */
 function withWalk(value: OperativeValue, walk: "all" | "visible" | undefined): OperativeValue {
   if (walk === undefined || value.kind !== "path") return value;
-  const under = (p: string): string => (p === "." ? "" : p.endsWith("/") ? p : `${p}/`);
+  const under = (p: string): string => (p === "." || p === "" ? "" : p.endsWith("/") ? p : `${p}/`);
   return {
     ...value,
     beneath: value.canonical.map(under),

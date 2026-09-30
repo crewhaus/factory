@@ -298,6 +298,23 @@ function closureIn(automaton: Automaton, from: ReadonlyArray<number>): number[] 
   return out.sort((a, b) => a - b);
 }
 
+/** Each state's closure, worked out once per automaton. */
+const stateClosures = new WeakMap<Automaton, Array<number[] | undefined>>();
+
+function closureOfState(automaton: Automaton, state: number): number[] {
+  let cache = stateClosures.get(automaton);
+  if (cache === undefined) {
+    cache = [];
+    stateClosures.set(automaton, cache);
+  }
+  let closure = cache[state];
+  if (closure === undefined) {
+    closure = closureIn(automaton, [state]);
+    cache[state] = closure;
+  }
+  return closure;
+}
+
 /** Does a (non-split) state read the character `c`? */
 function reads(st: GlobState, c: number): boolean {
   return (
@@ -329,7 +346,8 @@ function automataIntersect(
   startsSegment = true,
 ): boolean {
   const width = b.states.length;
-  const seen = new Uint8Array(a.states.length * width * 2);
+  // Sparse: a long pattern against a long rule visits few of the pairs.
+  const seen = new Set<number>();
   const stack: Array<readonly [number, number, boolean]> = [];
   const pushPairs = (xs: ReadonlyArray<number>, ys: ReadonlyArray<number>, atStart: boolean) => {
     for (const x of xs) for (const y of ys) stack.push([x, y, atStart]);
@@ -338,8 +356,8 @@ function automataIntersect(
   while (stack.length > 0) {
     const [x, y, atStart] = stack.pop() as readonly [number, number, boolean];
     const key = (x * width + y) * 2 + (atStart ? 1 : 0);
-    if (seen[key] === 1) continue;
-    seen[key] = 1;
+    if (seen.has(key)) continue;
+    seen.add(key);
     const sx = a.states[x] as GlobState;
     const sy = b.states[y] as GlobState;
     if (sx.t === "accept" && sy.t === "accept") return true;
@@ -347,7 +365,7 @@ function automataIntersect(
     const c = sx.t === "lit" ? sx.c : sy.t === "lit" ? sy.c : OTHER;
     if (!reads(sx, c) || !reads(sy, c)) continue;
     if (visible && atStart && c === DOT) continue;
-    pushPairs(closureIn(a, [sx.out]), closureIn(b, [sy.out]), c === SLASH);
+    pushPairs(closureOfState(a, sx.out), closureOfState(b, sy.out), c === SLASH);
   }
   return false;
 }
