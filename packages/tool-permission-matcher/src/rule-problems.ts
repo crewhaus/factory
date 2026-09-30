@@ -81,7 +81,13 @@ export type PermissionRuleProblemCode =
    * it would: the first matching rule decides, so it never fires (except in
    * plan mode, which reads no allow). See {@link shadowedPermissionRules}.
    */
-  | "shadowed-by-allow";
+  | "shadowed-by-allow"
+  /**
+   * INFORMATIONAL: the same, in a spec whose `permissions.mode` is `plan`.
+   * Plan mode reads no allow, so the rule fires as the spec runs; it would
+   * stop firing if the spec were run in another mode (`--permission-mode`).
+   */
+  | "shadowed-outside-plan";
 
 export type PermissionRuleProblem = {
   readonly type: string;
@@ -666,6 +672,16 @@ export type ShadowedRuleProblem = PermissionRuleProblem & {
   readonly shadowedBy: string;
 };
 
+/** Options for {@link shadowedPermissionRules}. */
+export type ShadowedRuleOptions = {
+  /**
+   * The spec's `permissions.mode`. Under `plan`, which reads no allow, a
+   * shadowed rule still fires as the spec runs: it is reported as the note
+   * `shadowed-outside-plan`, never as `shadowed-by-allow`.
+   */
+  readonly mode?: string;
+};
+
 /**
  * The deny and ask rules that can never fire because an allow read before
  * them, in the same layer, matches every call they match: the engine takes
@@ -681,7 +697,10 @@ export type ShadowedRuleProblem = PermissionRuleProblem & {
  * none of which a scoped allow grants. So a scoped allow is never reported,
  * however wide.
  *
- * Plan mode reads no allow rule, so a shadowed deny still acts there.
+ * Plan mode reads no allow rule, so a shadowed deny still acts there. In a
+ * spec whose mode is `plan` (see {@link ShadowedRuleOptions}), every list
+ * runs in plan mode — a sub-agent inherits its parent's mode — so each hit
+ * is a note that the rule stops firing in any other mode, not a dead rule.
  *
  * Two orders are read. A list (`permissions.rules`) top to bottom. And a
  * sub-agent's `permissions.allow` then its `permissions.deny`, which is the
@@ -689,15 +708,23 @@ export type ShadowedRuleProblem = PermissionRuleProblem & {
  */
 export function shadowedPermissionRules(
   lists: ReadonlyArray<PermissionRuleList>,
+  opts: ShadowedRuleOptions = {},
 ): ShadowedRuleProblem[] {
+  const plan = opts.mode === "plan";
+  const code: PermissionRuleProblemCode = plan ? "shadowed-outside-plan" : "shadowed-by-allow";
+  // Under plan mode the rule is live: say when it would stop firing.
+  const lead = (rule: { readonly type: string; readonly pattern: string }): string =>
+    plan
+      ? `rule "${rule.type} ${rule.pattern}" fires in this spec's plan mode, which reads no allow, and in no other mode (\`--permission-mode\` sets one):`
+      : `rule "${rule.type} ${rule.pattern}" never fires outside plan mode:`;
   const out: ShadowedRuleProblem[] = [];
   for (const list of lists) {
     for (const hit of shadowsIn(list.rules)) {
       out.push({
         type: hit.rule.type,
         pattern: hit.rule.pattern,
-        code: "shadowed-by-allow",
-        message: `rule "${hit.rule.type} ${hit.rule.pattern}" never fires outside plan mode: "alwaysAllow ${hit.allow}", above it in the same list, matches every call it matches, and the first rule that matches a call decides it. Move it above "alwaysAllow ${hit.allow}".`,
+        code,
+        message: `${lead(hit.rule)} "alwaysAllow ${hit.allow}", above it in the same list, matches every call it matches, and the first rule that matches a call decides it. Move it above "alwaysAllow ${hit.allow}".`,
         list: list.path,
         shadowedBy: hit.allow,
       });
@@ -718,8 +745,8 @@ export function shadowedPermissionRules(
       out.push({
         type: hit.rule.type,
         pattern: hit.rule.pattern,
-        code: "shadowed-by-allow",
-        message: `rule "${hit.rule.type} ${hit.rule.pattern}" never fires outside plan mode: a sub-agent's allow list is read before its deny list, and "alwaysAllow ${hit.allow}" in ${allow.path} matches every call it matches. Narrow that allow to what the sub-agent should run, so the deny is reached.`,
+        code,
+        message: `${lead(hit.rule)} a sub-agent's allow list is read before its deny list, and "alwaysAllow ${hit.allow}" in ${allow.path} matches every call it matches. Narrow that allow to what the sub-agent should run, so the deny is reached.`,
         list: list.path,
         shadowedBy: hit.allow,
       });

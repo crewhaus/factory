@@ -318,8 +318,12 @@ export function permissionRuleProblemsOf(
       out.push({ ...p, list: list.path, path: `${list.path}[${p.type} ${p.pattern}]` });
     }
   }
-  // A deny or ask that an allow above it in the same layer always beats.
-  for (const p of shadowedPermissionRules(lists)) {
+  // A deny or ask that an allow above it in the same layer always beats —
+  // except in a plan-mode spec, which reads no allow, where it is a note.
+  const permissions = (spec as { readonly permissions?: { readonly mode?: unknown } } | null)
+    ?.permissions;
+  const mode = typeof permissions?.mode === "string" ? permissions.mode : undefined;
+  for (const p of shadowedPermissionRules(lists, mode !== undefined ? { mode } : {})) {
     const { shadowedBy: _allow, ...problem } = p;
     out.push({ ...problem, path: `${p.list}[${p.type} ${p.pattern}]` });
   }
@@ -330,6 +334,7 @@ export function permissionRuleProblemsOf(
 const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
   "builtin-not-reached",
   "tool-not-known",
+  "shadowed-outside-plan",
 ]);
 
 /**
@@ -359,8 +364,9 @@ export async function permissionRuleWarnings(
   const byRegisteredName: Record<string, RegisteredTool> = {};
   for (const tool of Object.values(toolMap)) byRegisteredName[tool.name] = tool;
   // A `builtin-not-reached` note is about a rule that still fires (on a
-  // declared MCP server's tools), and a `tool-not-known` one about a name a
-  // plugin or custom tool may still supply, so --strict escalates neither.
+  // declared MCP server's tools), a `tool-not-known` one about a name a
+  // plugin or custom tool may still supply, and a `shadowed-outside-plan` one
+  // about a rule a plan-mode spec still fires, so --strict escalates none.
   return permissionRuleProblemsOf(spec, ir, (name) => toolMap[name] ?? byRegisteredName[name]).map(
     (p) => ({
       code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",

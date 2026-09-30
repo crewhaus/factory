@@ -39,6 +39,34 @@ describe("shadowedPermissionRules", () => {
     );
   });
 
+  test("in a plan-mode spec the rule fires, so it is a note naming when it would not", () => {
+    const rules = [allow("Read"), deny("Read(secrets/**)")];
+    const lists = [{ path: "permissions.rules", rules }];
+    const found = shadowedPermissionRules(lists, { mode: "plan" });
+    expect(found.map((p) => [p.code, `${p.type} ${p.pattern}`, p.shadowedBy])).toEqual([
+      ["shadowed-outside-plan", "alwaysDeny Read(secrets/**)", "Read"],
+    ]);
+    expect(found[0]?.message).toBe(
+      'rule "alwaysDeny Read(secrets/**)" fires in this spec\'s plan mode, which reads no allow, and in no other mode (`--permission-mode` sets one): "alwaysAllow Read", above it in the same list, matches every call it matches, and the first rule that matches a call decides it. Move it above "alwaysAllow Read".',
+    );
+    // A sub-agent runs in its parent's mode: the same note.
+    const sub = shadowedPermissionRules(
+      [
+        { path: "agent.sub_agents.a.permissions.allow", rules: [allow("Read")] },
+        { path: "agent.sub_agents.a.permissions.deny", rules: [deny("Read(secrets/**)")] },
+      ],
+      { mode: "plan" },
+    );
+    expect(sub.map((p) => p.code)).toEqual(["shadowed-outside-plan"]);
+    // Any other mode: the rule is dead.
+    for (const mode of [undefined, "default", "auto"]) {
+      const codes = shadowedPermissionRules(lists, mode === undefined ? {} : { mode }).map(
+        (p) => p.code,
+      );
+      expect({ mode, codes }).toEqual({ mode, codes: ["shadowed-by-allow"] });
+    }
+  });
+
   test("the tool half is compared by automaton inclusion", () => {
     expect(shadowed([allow("mcp__github__*"), deny("mcp__github__delete_repo")])).toEqual([
       ["alwaysDeny mcp__github__delete_repo", "mcp__github__*"],

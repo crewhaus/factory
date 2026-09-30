@@ -461,6 +461,39 @@ permissions:
     ).toEqual([]);
   });
 
+  // 0.7.1 review: plan mode reads no allow, so in a plan-mode spec the deny
+  // fires. It is a note that it stops firing in another mode, which --strict
+  // does not escalate.
+  test("in a plan-mode spec a deny under an allow is a note, not a dead rule", async () => {
+    const yaml = `${validCli}tools: [read]
+permissions:
+  mode: plan
+  rules:
+    - { type: alwaysAllow, pattern: Read }
+    - { type: alwaysDeny, pattern: "Read(secrets/**)" }
+`;
+    const found = runLint(yaml, noTools).findings.filter((f) =>
+      f.rule.startsWith("permission-rule:"),
+    );
+    expect(found.map((f) => [f.rule, f.path])).toEqual([
+      ["permission-rule:shadowed-outside-plan", "permissions.rules[alwaysDeny Read(secrets/**)]"],
+    ]);
+    expect(found[0]?.message).toContain("fires in this spec's plan mode");
+    expect(found[0]?.message).not.toContain("never fires");
+    const warnings = await permissionRuleWarnings(yaml, async () => ({}));
+    expect(warnings.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule-note", "permissions.rules"],
+    ]);
+    // In default mode the same rules are a dead deny, and --strict fails on it.
+    const inDefault = await permissionRuleWarnings(
+      yaml.replace("  mode: plan\n", ""),
+      async () => ({}),
+    );
+    expect(inDefault.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule", "permissions.rules"],
+    ]);
+  });
+
   // wave III review: a pool candidate carries its own deny/ask inline, read
   // the same way as a profile's, and neither lint nor PermissionAudit read
   // it. The lists now come from one reader both use.

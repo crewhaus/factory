@@ -527,7 +527,9 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   `rm` run. The warning names both rules; move the deny above the allow.
   `compile --strict` fails on it. A sub-agent's `allow` list is read before
   its `deny` list, so there, narrow the allow. Only a case that can be proven
-  is reported, and plan mode, which reads no allow, is the exception.
+  is reported. In a spec whose mode is `plan`, which reads no allow, the deny
+  does fire: it is a note that it would stop in another mode, and `--strict`
+  does not fail on it.
 - **A bundle built with the optional IR passes decides as `crewhaus compile`'s
   does.** The passes (`applyIrPasses`, which the compiler worker's
   `POST /compile` accepts) re-sorted `permissions.rules` deny-first, so an
