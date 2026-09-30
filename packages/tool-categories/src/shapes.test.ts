@@ -171,7 +171,10 @@ describe("checkBuiltinTool", () => {
     const json = checkBuiltinTool("jsonQuery", "cf-worker");
     expect(json.kind === "refused" && json.message).toContain("does not wire it");
     expect(checkBuiltinTool("webFetch", "cf-worker").kind).toBe("ok");
-    expect(checkBuiltinTool("sendMessage", "cf-worker").kind).toBe("ok");
+    // 0.7.1 — SendMessage sends through a channel adapter only the channel
+    // daemon registers; a Worker has none, so the edge does not wire it.
+    const send = checkBuiltinTool("sendMessage", "cf-worker");
+    expect(send.kind === "refused" && send.message).toContain("does not wire it");
   });
 
   test("builtinToolsFor matches checkBuiltinTool on every shape", () => {

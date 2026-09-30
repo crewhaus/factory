@@ -2630,13 +2630,14 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
 
   // Shape-specific builtins. None of these is in a category or in the cli
   // shape's set; each names the shapes that carry it.
+  // Not `edge`: it sends through a channel adapter only the channel daemon
+  // registers at boot, and a Worker registers none (0.7.1).
   sendMessage: {
     package: "@crewhaus/tool-message-channel",
     export: "sendMessage",
     name: "SendMessage",
     io: "network",
     justify: true,
-    edge: true,
     shapes: ["channel"],
   },
   evmCall: {
