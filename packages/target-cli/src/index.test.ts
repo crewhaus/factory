@@ -582,6 +582,84 @@ describe("emitCli — egress matcher (Pillar 3 sink-side, FR-006)", () => {
   });
 });
 
+describe("emitCli — security.justification (0.7.1: the bundle wires the judge the spec names)", () => {
+  const agentOf = (ir: IrV0): string => emitCli(ir).files[0]?.content ?? "";
+
+  test("no justification block → the bundle is byte-identical to one with no security block", () => {
+    const bare = agentOf(baseIr());
+    expect(bare).not.toContain("justification");
+    expect(bare).not.toContain("audit");
+    // A security block that names only the egress matcher's default is still
+    // the bare bundle: only a justification block adds the gate's wiring.
+    expect(agentOf(baseIr({ security: { egressMatcher: "substring" } }))).toBe(bare);
+  });
+
+  test("judge: claude builds the named judge through the shared construction and threads it", () => {
+    const content = agentOf(
+      baseIr({
+        security: {
+          justification: {
+            judge: "claude",
+            model: "claude-sonnet-4-6",
+            modelProfile: "checker",
+            params: { maxTokens: 512, thinking: { effort: "low" } },
+          },
+        },
+      }),
+    );
+    expect(content).toContain(
+      'import { createJustificationJudgeFromSlot } from "@crewhaus/justification-judge-claude";',
+    );
+    // The lowered slot, as data: judge, model and the profile's params — not
+    // the provenance label, which the construction does not read.
+    expect(content).toContain(
+      'const __justificationJudge = await createJustificationJudgeFromSlot({"judge":"claude","model":"claude-sonnet-4-6","params":{"maxTokens":512,"thinking":{"effort":"low"}}}).catch(',
+    );
+    expect(content).toContain(
+      "...(__justificationJudge !== undefined ? { justificationJudge: __justificationJudge } : {}),",
+    );
+  });
+
+  test("any justification block opens the run path's audit log and hands it to both gates", () => {
+    for (const judge of ["claude", "rule-based"] as const) {
+      const content = agentOf(baseIr({ security: { justification: { judge } } }));
+      expect(content).toContain('import { openAuditLog } from "@crewhaus/audit-log";');
+      expect(content).toContain(
+        'await openAuditLog({ rootDir: __joinPath(__cwd, ".crewhaus", "audit") });',
+      );
+      expect(content).toContain('process.env["CREWHAUS_SECURITY_AUDIT"] === "0"');
+      expect(content).toContain(
+        "? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }",
+      );
+    }
+  });
+
+  test("judge: rule-based constructs no judge: runtime-core's default is that judge", () => {
+    const content = agentOf(baseIr({ security: { justification: { judge: "rule-based" } } }));
+    expect(content).not.toContain("@crewhaus/justification-judge-claude");
+    expect(content).not.toContain("justificationJudge:");
+  });
+
+  test("the judge and the log exist after __cwd and before runChatLoop, MCP wrapper or not", () => {
+    for (const mcp_servers of [
+      {},
+      { things: { transport: "stdio" as const, command: "node", args: ["server.js"] } },
+    ]) {
+      const content = agentOf(
+        baseIr({ security: { justification: { judge: "claude" } }, mcp_servers }),
+      );
+      const cwd = content.indexOf("const __cwd = process.cwd();");
+      const judge = content.indexOf("const __justificationJudge =");
+      const audit = content.indexOf("const __securityAudit =");
+      const loop = content.indexOf("await runChatLoop({");
+      expect(cwd).toBeGreaterThanOrEqual(0);
+      expect(judge).toBeGreaterThan(cwd);
+      expect(audit).toBeGreaterThan(judge);
+      expect(loop).toBeGreaterThan(audit);
+    }
+  });
+});
+
 describe("emitCli — agent.maxTokens (max output tokens)", () => {
   test("emits maxTokens in the runChatLoop call when the IR sets it", () => {
     const content =

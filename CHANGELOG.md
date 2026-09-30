@@ -351,6 +351,15 @@ built it.
   start.
 - **A compiled cli bundle starts when a plugin adds a tool named like a
   builtin**: the plugin's tool is skipped with a warning.
+- **A compiled cli bundle uses the justification judge its spec names.**
+  Only `crewhaus run` read `security.justification.judge`, so a bundle
+  checked every justification-gated call (HttpRequest, EmailSend,
+  DownloadFile and the rest) with the built-in rule check, which denies them
+  all outside tests. The bundle now builds the same judge `crewhaus run`
+  does and writes the same audit log. Recompile to pick it up.
+- **A model profile or pool candidate can narrow to a tool the shape grants
+  through a category**: `tools: [csvParse]` under a shape's
+  `tools: [all-data]` was refused as "not one of the shape's tools".
 - **Cloudflare Worker bundles install again**: their `package.json` pins the
   release that built them.
 
@@ -601,10 +610,20 @@ deny, warn or fail `--strict`; each says what to write instead.
   list refuses everyone. WaitForPort probes any host but this machine only
   when it is in `tool_config.proc.wait_for_port_hosts`.
 - **DownloadFile and OpenExternal need a justification judge.** Every call
-  now carries a justification, and outside tests it is denied without a
-  judge: set `security.justification.judge: claude`, or
-  `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` to accept the built-in rule
-  check. OpenExternal also asks in auto mode unless a rule allows it.
+  now carries a justification, and outside tests the built-in rule check
+  denies it, as it denies every justification-gated call. What to set:
+  - A cli spec: `security.justification.judge: claude`. `crewhaus run` and
+    the compiled bundle both use it. It runs on `claude-haiku-4-5` unless
+    `security.justification.model` names another model, and needs that
+    model's provider key (`ANTHROPIC_API_KEY` for Claude) wherever the agent
+    runs; without it the agent stops at start.
+  - Any other shape has no `security:` block: set
+    `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` where it runs to accept the
+    rule check.
+  - `crewhaus eval`, `crewhaus optimize` and sub-agents do not use the judge
+    yet: set the same variable for them.
+
+  OpenExternal also asks in auto mode unless a rule allows it.
 - **ImageGenerate pointed at another endpoint** needs `OPENAI_BASE_URL` set to
   the same origin as `tool_config.imageGenerate.openaiBaseUrl`, or it stops at
   start. Plain http is refused except on loopback.
@@ -674,6 +693,11 @@ deny, warn or fail `--strict`; each says what to write instead.
   goes to api.openai.com. When only a fallback, tier or pool model is over
   its limit, compile notes it and a pool never routes a turn to that model.
   Neither note fails `--strict`. On 0.7.0 every call of such a spec failed.
+- **`compile --emit-as cf-worker` refuses a builtin the spec's own shape
+  refuses**, with the same message `compile` gives: `sendMessage` on a cli,
+  workflow or graph spec (only the channel shape carries it; the worker
+  compiled it, and every call failed), and the `evm*` tools on a cli spec.
+  Remove them from `tools:`.
 - **`evmSendTransaction` warns `tool-unwired`** (an error under `--strict`):
   no custody provider that can sign ships in this release, so every call
   failed. Remove it; `evmSimulate` runs the same transaction without signing.
@@ -729,6 +753,12 @@ deny, warn or fail `--strict`; each says what to write instead.
 
 #### Other behaviour changes
 
+- **A compiled cli bundle whose spec declares `security.justification`
+  writes an audit log** to `.crewhaus/audit` in its working directory, as
+  `crewhaus run` does: every justification verdict, and every outbound call
+  the egress check warned about or blocked, hash chained.
+  `CREWHAUS_SECURITY_AUDIT=0` turns it off. A bundle whose spec declares no
+  judge is unchanged.
 - **Plan mode honours deny and ask rules.** It decided on the tool's
   read-only flag alone, so an `alwaysDeny` on a read-only network tool did
   nothing there. A matching deny or ask now denies; allow rules are still
@@ -824,6 +854,11 @@ deny, warn or fail `--strict`; each says what to write instead.
   by `scripts/gen-tool-registry.ts` and checked for staleness by a test. It is
   about 250 KB of description text in a module of about 490 KB, which is why
   it is its own package and `ToolRegistry` its own tool.
+- **`crewhaus tools show <tool>` says what a permission rule on it
+  checks**: each argument a scoped rule reads, in words (a path read from
+  `cwd`, a repository matched as `owner/repo`, what a left-out value stands
+  for), and an example rule to copy into `permissions.rules`. `--json`
+  carries the same answer.
 - **`all-vector`**, a category holding VectorDelete alone.
 - **New `tool_config` keys**: the credential and destination lists above;
   `codeExecution.max_timeout_ms`; `imageGenerate.timeoutMs` and

@@ -1260,6 +1260,16 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
  */
 export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWarning> {
   const sites = toolSitesOf(ir);
+  // The worker is the edge flavour of the spec's own shape, so it can only
+  // narrow what that shape runs: a builtin the shape itself refuses (a
+  // channel-only SendMessage on a cli spec) is refused here too, with the
+  // words `compile` uses for it. On 0.7.0 the edge wired SendMessage for a
+  // cli, workflow or graph spec, where no channel adapter is ever
+  // registered, so every call failed.
+  const offShape = shapeRefusals(ir, sites);
+  if (offShape.length > 0) {
+    throw new CompilerError(offShape.map((e) => `${e.path}: ${e.message}`).join("\n"));
+  }
   const { rejected, warned } = partitionEdgeTools(sites.flatMap((site) => site.tools));
   if (rejected.length > 0) {
     throw new CompilerError(
@@ -1285,6 +1295,28 @@ export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWa
     }
   }
   return warnings;
+}
+
+/**
+ * The builtins a cf-worker spec lists that its own shape refuses, each with
+ * the message {@link checkShapeTools} gives `compile` for it, word for word.
+ * A name that is no builtin at all is left to the edge gate, which has always
+ * let a custom name through with a warning.
+ */
+function shapeRefusals(
+  ir: IrNode,
+  sites: ReadonlyArray<IrToolSite>,
+): ReadonlyArray<{ readonly path: string; readonly message: string }> {
+  const shape: ToolShape = ir.target;
+  if (PROFILE_FOR_TARGET[ir.target].runtime !== "host") return [];
+  const out: Array<{ path: string; message: string }> = [];
+  for (const site of sites) {
+    for (const key of new Set(site.tools)) {
+      const verdict = checkBuiltinTool(key, shape);
+      if (verdict.kind === "refused") out.push({ path: site.path, message: verdict.message });
+    }
+  }
+  return out;
 }
 
 /**

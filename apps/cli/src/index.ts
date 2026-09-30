@@ -488,6 +488,7 @@ import {
   toolsInCategory,
 } from "@crewhaus/tool-categories";
 import { registerMcpServer, registerOptionalMcpServer } from "@crewhaus/tool-mcp";
+import { NON_CLI_TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
 import { createTaskTool } from "@crewhaus/tool-task";
 import { type CostAccrualEvent, type ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 // "Watch me" (design/watch-me.md §2) — the durable per-harness digest store,
@@ -1546,6 +1547,7 @@ import {
   exactToolKey,
   formatAuditLines,
   formatCategoryLines,
+  formatRuleScopeLines,
   formatSearchLines,
   formatSuggestLines,
   formatToolDetailLines,
@@ -1553,6 +1555,7 @@ import {
   literalToolKeys,
   nearestToolKeys,
   resolveToolKey,
+  ruleScopeFor,
   searchTools,
   suggestTools,
 } from "./tools-cli";
@@ -14431,8 +14434,10 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
         "\n" +
         "  categories               every tool category + what it turns on\n" +
         "  show <tool>              one tool in full: flags, categories, inputs,\n" +
-        "                           and the shapes that run it (by spec key or\n" +
-        "                           registered name, in any case)\n" +
+        "                           the shapes that run it, and the argument(s) a\n" +
+        "                           scoped permission rule is checked against, with\n" +
+        "                           an example rule (by spec key or registered name,\n" +
+        "                           in any case)\n" +
         "  search <query>           find a tool by name, description or category\n" +
         "  list [--category NAME]   print every builtin tool + its metadata\n" +
         "  suggest [spec.yaml]      rank the builtins the spec's shape runs against\n" +
@@ -14480,13 +14485,17 @@ async function runTools(action: string, args: ParsedArgs): Promise<void> {
       // sendMessage) is not in the cli set this command loads, but it is a
       // builtin: say which shapes carry it instead of "no builtin named".
       const shapes = shapeOnly.shapes?.join(", ") ?? "every shape";
+      // What a scoped rule on it reads, from the flags the manifest keeps for
+      // the builtins the cli shape does not carry.
+      const rules = ruleScopeFor(shapeOnly.name, NON_CLI_TOOL_FLAGS[key]?.operativeArgs);
       const lines = [
         `${key} (${shapeOnly.name}) — ${shapeOnly.package}`,
         `  carried by: ${shapes}`,
         ...(shapeOnly.inert !== undefined ? [`  note: ${shapeOnly.inert}`] : []),
+        ...formatRuleScopeLines(rules),
       ];
       if (jsonMode) {
-        process.stdout.write(`${JSON.stringify({ key, ...shapeOnly }, null, 2)}\n`);
+        process.stdout.write(`${JSON.stringify({ key, ...shapeOnly, rules }, null, 2)}\n`);
         return;
       }
       for (const line of lines) process.stdout.write(`${line}\n`);

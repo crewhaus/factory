@@ -16,6 +16,7 @@
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/model-plan": "workspace:*",
+    "@crewhaus/model-router": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "zod": "^3.23.8"
   },

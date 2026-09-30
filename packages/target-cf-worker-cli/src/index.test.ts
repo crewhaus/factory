@@ -342,12 +342,12 @@ describe("resolveEdgeTools — the cf-worker tool gate (G12/G83)", () => {
 
   test("every edge-safe builtin wires to a real tool factory", () => {
     const wiring = resolveEdgeTools(
-      ["fetch", "webFetch", "webSearch", "sendMessage", "imageGenerate", "todoWrite"],
+      ["fetch", "webFetch", "webSearch", "imageGenerate", "todoWrite"],
       {},
     );
     expect(wiring.unwired).toEqual([]);
     expect(wiring.toolsExpr).toBe(
-      "[__t_fetch, __t_webFetch, __t_webSearch, __t_sendMessage, __t_imageGenerate, __t_todoWrite]",
+      "[__t_fetch, __t_webFetch, __t_webSearch, __t_imageGenerate, __t_todoWrite]",
     );
     expect(wiring.imports).toContain("fetch as __t_fetch"); // never shadows global fetch
     expect(wiring.imports).toContain('from "@crewhaus/tool-fetch"');

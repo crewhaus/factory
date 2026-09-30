@@ -4,7 +4,10 @@
  */
 import { describe, expect, test } from "bun:test";
 import { parseSpec } from "@crewhaus/spec";
+import { BUILTIN_TOOLS, checkBuiltinTool } from "@crewhaus/tool-categories";
 import { assertCfWorkerToolsEdgeSafe, checkShapeTools, compile, lower, toolSitesOf } from "./index";
+
+const builtinKeys = Object.keys(BUILTIN_TOOLS);
 
 const graph = (tools: string): string =>
   [
@@ -115,6 +118,25 @@ describe("0.7.0 tools and categories compile on every host shape", () => {
       expect(message).toMatch(/tools: unknown tool "(constructor|__proto__)"/);
       expect(message).not.toContain("undefined");
     }
+  });
+});
+
+describe("a model profile narrows to a tool the shape grants through a category (0.7.1)", () => {
+  test("csvParse under all-data compiles, and the candidate is advertised only it", () => {
+    const yaml = cli(
+      "[all-data]",
+      [
+        "models:",
+        "  cheap: { model: claude-haiku-4-5, tags: [cheap], tools: [csvParse] }",
+        "",
+      ].join("\n"),
+    ).replace(
+      "  instructions: i\n",
+      "  instructions: i\n  model_pool:\n    candidates:\n      - { model: $cheap }\n      - { model: claude-sonnet-4-6, tags: [strong] }\n",
+    );
+    const agent = agentTs(yaml);
+    expect(agent).toContain('"profile":"cheap","tools":["csvParse"]');
+    expect(agent).toContain("defaultCatalog.register(csvParse);");
   });
 });
 
@@ -242,7 +264,71 @@ describe("assertCfWorkerToolsEdgeSafe", () => {
   });
 
   test("a builtin the edge cannot sign with is left out with a warning", () => {
-    const warnings = assertCfWorkerToolsEdgeSafe(cliIr("[evmSendTransaction]"));
+    // On a shape that carries it: the graph flavour of the worker.
+    const warnings = assertCfWorkerToolsEdgeSafe(lower(parseSpec(graph("[evmSendTransaction]"))));
     expect(warnings.map((w) => w.code)).toEqual(["edge-unsafe-tool"]);
   });
+});
+
+describe("the edge flavour of a shape refuses what that shape refuses, in the same words (0.7.1)", () => {
+  // The worker emits for these three shapes; the spec's own shape decides.
+  const flavours = {
+    cli: (tools: string) => cli(tools),
+    graph: (tools: string) => graph(tools),
+    workflow: (tools: string) =>
+      [
+        "name: w",
+        "target: workflow",
+        "model: claude-sonnet-4-6",
+        "steps:",
+        "  - name: draft",
+        "    instructions: draft it",
+        `    tools: ${tools}`,
+      ].join("\n"),
+  } as const;
+
+  /** The message `compile` stops with, or undefined when it compiles. */
+  const localError = (yaml: string): string | undefined => {
+    try {
+      compile(yaml);
+      return undefined;
+    } catch (err) {
+      return (err as Error).message;
+    }
+  };
+  const edgeError = (yaml: string): string | undefined => {
+    try {
+      assertCfWorkerToolsEdgeSafe(lower(parseSpec(yaml)));
+      return undefined;
+    } catch (err) {
+      return (err as Error).message;
+    }
+  };
+
+  test("sendMessage on a cli spec: both refuse it, word for word", () => {
+    const yaml = cli("[sendMessage]");
+    const expected =
+      'tools: tool "sendMessage" is a builtin, but the cli shape cannot run it: only the channel shape carries it. Use that shape, or remove it from tools.';
+    expect(localError(yaml)).toBe(expected);
+    expect(edgeError(yaml)).toBe(expected);
+  });
+
+  test("every builtin a flavour's shape refuses, the edge refuses with the same message", () => {
+    let refused = 0;
+    for (const [shape, spec] of Object.entries(flavours)) {
+      for (const key of builtinKeys) {
+        const verdict = checkBuiltinTool(key, shape as "cli" | "graph" | "workflow");
+        if (verdict.kind !== "refused") continue;
+        refused += 1;
+        const yaml = spec(`[${key}]`);
+        const local = localError(yaml);
+        expect(local).toContain(verdict.message);
+        expect(edgeError(yaml)).toBe(local);
+      }
+    }
+    // sendMessage on all three, and the evm family on cli.
+    expect(refused).toBe(
+      3 + Object.values(BUILTIN_TOOLS).filter((e) => e.shapes?.includes("graph") === true).length,
+    );
+  }, 60_000);
 });

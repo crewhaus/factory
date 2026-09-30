@@ -4047,6 +4047,29 @@ describe("crewhaus tools show / list — names and bad categories", () => {
     }
   }, 30_000);
 
+  test("show prints what a scoped rule is checked against, and one example rule (0.7.1)", async () => {
+    const http = await runCli(["tools", "show", "httpRequest"]);
+    expect(http.exitCode).toBe(0);
+    expect(http.stdout).toContain("  rule checks url: a URL\n");
+    expect(http.stdout).toContain(
+      '  example     - { type: alwaysAllow, pattern: "HttpRequest(https://api.example.com/**)" }',
+    );
+    // A tool only other shapes carry answers too, from the manifest.
+    const logs = await runCli(["tools", "show", "evmGetLogs"]);
+    expect(logs.exitCode).toBe(0);
+    expect(logs.stdout).toContain(
+      "  rule checks address: an id; matched as chainId/address; left out, it stands for every value",
+    );
+    expect(logs.stdout).toContain('pattern: "EvmGetLogs(1/*)"');
+    // --json carries the same answer as data.
+    const json = await runCli(["tools", "show", "issueCreate", "--json"]);
+    expect(JSON.parse(json.stdout).rules).toEqual({
+      kind: "args",
+      args: [{ field: "repo", words: "a recipient; matched as owner/repo" }],
+      example: { type: "alwaysAllow", pattern: "IssueCreate(acme/*)" },
+    });
+  }, 30_000);
+
   test("show refuses a prototype member instead of printing a fake tool", async () => {
     const r = await runCli(["tools", "show", "constructor"]);
     expect(r.exitCode).toBe(1);

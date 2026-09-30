@@ -641,6 +641,79 @@ describe("profile tools are subset-only (0.6.0 §5.2)", () => {
     ).toEqual([]);
   });
 
+  test("a tool the shape grants through a category is in its toolset (0.7.1)", () => {
+    // csvParse is in all-data: a profile may narrow to it.
+    expect(
+      issuePaths(cli("tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }")),
+    ).toEqual([]);
+    // ...and an exclusion in the shape's list is honoured: csvWrite is not granted.
+    const excluded = parseSpecIssues(
+      cli(
+        "tools: [all-data, -csvWrite]",
+        "models:",
+        "  fast: { model: m, tools: [csvParse, csvWrite] }",
+      ),
+    );
+    expect(excluded.map((i) => i.path.join("."))).toEqual(["models.fast.tools.1"]);
+    expect(excluded[0]?.message).toMatch(
+      /"csvWrite" is not one of the shape's tools \(all-data, -csvWrite\)/,
+    );
+    // A tool no category of the shape grants is still refused.
+    expect(
+      issuePaths(cli("tools: [all-data]", "models:", "  fast: { model: m, tools: [bash] }")),
+    ).toEqual(["models.fast.tools.0"]);
+  });
+
+  test("a profile's own category is judged by the tools it keeps", () => {
+    const shape = "tools: [all-data, gitStatus]";
+    expect(issuePaths(cli(shape, "models:", "  fast: { model: m, tools: [all-data] }"))).toEqual(
+      [],
+    );
+    // all-git reaches past what the shape grants: named, with the tools it adds.
+    const wider = parseSpecIssues(cli(shape, "models:", "  fast: { model: m, tools: [all-git] }"));
+    expect(wider.map((i) => i.path.join("."))).toEqual(["models.fast.tools.0"]);
+    expect(wider[0]?.message).toMatch(
+      /"all-git" includes tools the shape's tools \(all-data, gitStatus\) do not grant: git/,
+    );
+    // A profile exclusion narrows its own category, and is never itself refused.
+    expect(
+      issuePaths(
+        cli(
+          "tools: [all-data, -csvWrite]",
+          "models:",
+          "  fast: { model: m, tools: [all-data, -csvWrite] }",
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  test("a step's, node's or role's category grants to the shape's profiles and to its own pool", () => {
+    for (const yaml of [
+      workflow("    tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }"),
+      graph("    tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }"),
+      crew("    tools: [all-data]", "models:", "  fast: { model: m, tools: [csvParse] }"),
+      cliAgent(
+        [
+          "  model_pool:",
+          "    candidates:",
+          "      - {model: m1, tags: [cheap], tools: [csvParse]}",
+          "      - {model: m2, tags: [strong]}",
+        ],
+        "tools: [all-data]",
+      ),
+    ]) {
+      expect(issuePaths(yaml)).toEqual([]);
+    }
+  });
+
+  test("a shape list that does not expand leaves the subset question to the compiler's error", () => {
+    // all-nonsense is refused by the compiler with the category message; the
+    // parse does not add a second, wrong subset error on top of it.
+    expect(
+      issuePaths(cli("tools: [all-nonsense]", "models:", "  fast: { model: m, tools: [read] }")),
+    ).toEqual([]);
+  });
+
   test("when the shape declares no tools list the subset check waits for the ir-pass (no issue)", () => {
     expect(issuePaths(cli("models:", "  fast: { model: m, tools: [read] }"))).toEqual([]);
   });
