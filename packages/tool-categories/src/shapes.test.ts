@@ -62,6 +62,26 @@ describe("names and keys", () => {
     }
   });
 
+  // `__` belongs to tools from outside the core: an MCP tool is
+  // mcp__<server>__<tool>, and a tool list may still name it the pre-0.7.1
+  // way, <server>__<tool>. A builtin spelled `a__b` would therefore share its
+  // list entries (and rules) with the MCP tool mcp__a__b.
+  const reservedSpelling = (s: string) => s.includes("__") || s.toLowerCase().startsWith("mcp_");
+
+  test("no builtin key, name or export uses the spelling reserved for MCP tools", () => {
+    expect(["mcp__srv__tool", "srv__tool", "MCP_x", "httpRequest"].map(reservedSpelling)).toEqual([
+      true,
+      true,
+      true,
+      false,
+    ]);
+    const clash = KEYS.flatMap((k) => {
+      const e = BUILTIN_TOOLS[k];
+      return [k, e?.name ?? "", e?.export ?? ""].filter(reservedSpelling);
+    });
+    expect(clash).toEqual([]);
+  });
+
   test("every package is a @crewhaus/tool-* package", () => {
     expect(KEYS.filter((k) => !BUILTIN_TOOLS[k]?.package.startsWith("@crewhaus/tool-"))).toEqual(
       [],
