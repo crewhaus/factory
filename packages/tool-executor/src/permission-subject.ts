@@ -89,6 +89,8 @@
  *      unless the canonicaliser marked it `notDirectory`. One declared
  *      `defaultAtRoot` and left out is the workspace root, not its `within`
  *      directory: a git command given no path acts on the whole repository.
+ *    - a `path` declared `glob` (the Glob tool's pattern) is marked
+ *      `globPattern`: the matcher reads it as every path it can list.
  *    - a `relocates` field left out stands in with its default, which a
  *      deny or ask reads; when the call carries another operative value an
  *      allow skips it (`restrictOnly`), because the grant is about the
@@ -220,6 +222,14 @@ export function operativeValuesOf(
           }
           const read = canonicalizePath(raw);
           const { beneath } = arg;
+          if (arg.glob === true) {
+            // A pattern the tool lists the paths of: the matcher reads it as
+            // every path it can list.
+            values.push(
+              ...read.map((v) => (v.outsideWorkspace === true ? v : { ...v, globPattern: true })),
+            );
+            break;
+          }
           values.push(...(beneath !== undefined ? read.map((v) => withBeneath(v, beneath)) : read));
           break;
         }

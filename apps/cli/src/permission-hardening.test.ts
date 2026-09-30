@@ -564,6 +564,39 @@ describe("final review — a directory the tool walks is read with everything be
     expect(existsSync(join(ws, "vendor"))).toBe(true);
   }, 30_000);
 
+  test("Glob: a pattern stands for every path it can list", async () => {
+    // `**/*` lists everything under secrets/, and was read as the text
+    // `**/*`, which `alwaysDeny Glob(secrets/**)` never matched.
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.yml"), "x\n");
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const rs =
+        mode === "default"
+          ? rules(["alwaysDeny", "Glob(secrets/**)"], ["alwaysAllow", "Glob"])
+          : rules(["alwaysDeny", "Glob(secrets/**)"]);
+      for (const pattern of ["**/*", "*/prod.yml", "secret*/**", "{secrets,x}/*"]) {
+        const got = await gate("Glob", { pattern }, rs, mode);
+        expect({ mode, pattern, got, listed: (lastResult ?? "").includes("prod.yml") }).toEqual({
+          mode,
+          pattern,
+          got: "deny",
+          listed: false,
+        });
+      }
+      expect({ mode, got: await gate("Glob", { pattern: "src/**/*.ts" }, rs, mode) }).toEqual({
+        mode,
+        got: "allow",
+      });
+    }
+    // The tool never lists a hidden name, so a deny on one leaves it alone.
+    const env = rules(["alwaysDeny", "Glob(.env)"], ["alwaysAllow", "Glob"]);
+    expect(await gate("Glob", { pattern: "**/*" }, env)).toBe("allow");
+    // An allow must name every path the pattern can list.
+    const src = rules(["alwaysAllow", "Glob(src/*)"]);
+    expect(await gate("Glob", { pattern: "src/*.ts" }, src)).toBe("allow");
+    expect(await gate("Glob", { pattern: "src/**" }, src)).toBe("ask");
+  }, 60_000);
+
   test("a git command given no path is read as the whole repository, wherever it runs", async () => {
     // GitDiff with `cwd: "src"` and no paths diffs the whole repository,
     // secrets/ included; its left-out paths used to be read as `src`.

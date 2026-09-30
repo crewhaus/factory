@@ -322,6 +322,15 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * an existing file, or a link to one, stands for itself alone; one it
  * cannot ask about (the edge worker) stands for what could be beneath it.
  *
+ * `glob: true`, for a `path`, says the value is a pattern the tool lists
+ * the paths of (the Glob tool's `pattern`, which never lists a name that
+ * starts with `.`): it stands for every path it can list. A deny or ask
+ * fires when it can list a path the rule names — `alwaysDeny
+ * Glob(secrets/**)` on the pattern `**` + `/*`, not on `src/**` + `/*.ts` —
+ * and an allow grants it only when every path it can list is one the allow
+ * names (`Glob(src/**)` grants `src/**` + `/*.ts`; `Glob(src/*)` does not
+ * grant `src/**`).
+ *
  * `defaultAtRoot: true`, for a `path` declared `within` another field with
  * a `default`, says the default is read from the workspace root rather
  * than joined to the `within` directory. A git command given no path acts
@@ -344,6 +353,7 @@ export type OperativeArg = {
   readonly prefix?: true;
   readonly beneath?: "all" | "visible";
   readonly defaultAtRoot?: true;
+  readonly glob?: true;
 };
 
 /** The kinds that name where a tool sends: see {@link OperativeArgKind}. */

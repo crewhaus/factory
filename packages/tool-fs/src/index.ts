@@ -313,8 +313,10 @@ export const glob: RegisteredTool = buildTool({
   readOnly: true,
   concurrencySafe: true,
   // The pattern is a path with wildcards in it; resolving it as a path is
-  // what keeps `src/../**` from passing a `Glob(src/**)` rule.
-  operativeArgs: [{ field: "pattern", kind: "path" }],
+  // what keeps `src/../**` from passing a `Glob(src/**)` rule. It stands for
+  // every path it can list, so `alwaysDeny Glob(secrets/**)` fires on `**/*`,
+  // and `alwaysAllow Glob(src/*)` does not grant `src/**`.
+  operativeArgs: [{ field: "pattern", kind: "path", glob: true }],
   execute: async (input) => {
     rejectTraversalPattern("Glob", input.pattern);
     const cwd = process.cwd();

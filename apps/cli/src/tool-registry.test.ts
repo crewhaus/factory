@@ -850,6 +850,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "defaultAtRoot",
         "env",
         "field",
+        "glob",
         "kind",
         "prefix",
         "relocates",

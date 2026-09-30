@@ -488,6 +488,42 @@ describe("url, command and id values", () => {
     expect(fires({ cwd: "src", paths: ["a"] })).toBe(false);
   });
 
+  test("a path declared `glob` is a pattern that stands for every path it lists (final review)", () => {
+    const list = buildTool({
+      name: "List",
+      description: "d",
+      inputSchema: z.object({ pattern: z.string() }),
+      operativeArgs: [{ field: "pattern", kind: "path", glob: true }],
+      readOnly: true,
+      execute: async () => "ok",
+    });
+    expect(operativeValuesFor(list, { pattern: "src/../**/*" })).toEqual([
+      {
+        kind: "path",
+        canonical: ["**/*", "./**/*"],
+        spellings: ["src/../**/*"],
+        globPattern: true,
+      },
+    ]);
+    const on = (polarity: "allow" | "restrict", pattern: string) => (rule: string) =>
+      matchesPattern(
+        compilePattern(rule),
+        "List",
+        { pattern },
+        {
+          polarity,
+          operativeValues: operativeValuesFor(list, { pattern }) ?? [],
+        },
+      );
+    expect(on("restrict", "**/*")("List(secrets/**)")).toBe(true);
+    expect(on("restrict", "src/**/*.ts")("List(secrets/**)")).toBe(false);
+    expect(on("allow", "src/**/*.ts")("List(src/**)")).toBe(true);
+    expect(on("allow", "src/**")("List(src/*)")).toBe(false);
+    // A pattern that climbs out stays outside: every deny, no allow.
+    expect(operativeValuesFor(list, { pattern: "../*" })?.[0]?.globPattern).toBe(undefined);
+    expect(on("allow", "../*")("List(**)")).toBe(false);
+  });
+
   test("buildTool refuses beneath or defaultAtRoot where they mean nothing", () => {
     const make = (arg: Record<string, unknown>) => () =>
       buildTool({
@@ -508,6 +544,10 @@ describe("url, command and id values", () => {
     expect(
       make({ kind: "path", within: "cwd", default: ".", defaultAtRoot: true, beneath: "all" }),
     ).not.toThrow();
+    expect(make({ kind: "id", glob: true })).toThrow(/glob/);
+    expect(make({ kind: "path", glob: true, beneath: "all" })).toThrow(/glob/);
+    expect(make({ kind: "path", glob: true, within: "cwd" })).toThrow(/glob/);
+    expect(make({ kind: "path", glob: true })).not.toThrow();
   });
 
   test("a path within a directory field is resolved from that directory", () => {

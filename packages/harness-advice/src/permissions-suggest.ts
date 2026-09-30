@@ -55,7 +55,7 @@ import { type SessionEvents, payloadOf } from "./advise-rules";
  * - `not-representable` — a value cannot be written as a rule value: a path
  *   outside the workspace, text that is not a URL, or a parenthesis;
  * - `every-value` — a call acted on every value at once (a listing by prefix
- *   or with none, a query with no filter), which only a wildcard rule
+ *   or by pattern, a query with no filter), which only a wildcard rule
  *   covers, and a proposal never writes one;
  * - `varied` — the calls acted on different places.
  */
@@ -181,7 +181,10 @@ function readCall(toolName: string, input: unknown, lookup?: SuggestToolLookup):
   // `KvList {namespace: "scratch", prefix: "a"}` lists every key starting
   // with `a`: its canonical `scratch/a*` is not a literal, and the escaped
   // rule `KvList(scratch/a\*)` would never fire for the call it came from.
-  if (only.standsForAny !== undefined) return unscoped("every-value");
+  // A Glob pattern likewise stands for every path it lists.
+  if (only.standsForAny !== undefined || only.globPattern === true) {
+    return unscoped("every-value");
+  }
   return representable(value, only.kind);
 }
 
@@ -353,7 +356,7 @@ export function blanketGrantNote(agg: AskAggregate): string | undefined {
     "not-representable":
       "an approved call acted on a place a rule cannot name (outside the workspace, not a URL, or containing a parenthesis)",
     "every-value":
-      "an approved call acted on every value at once (a listing by prefix, a query with no filter), which only a wildcard rule covers, and a proposal never widens what was approved",
+      "an approved call acted on every value at once (a listing by prefix or by pattern, a query with no filter), which only a wildcard rule covers, and a proposal never widens what was approved",
     "several-places":
       "an approved call acted on more than one place (a source and a destination, several recipients), and one rule value cannot cover them",
     "no-value": "an approved call carried none of the arguments a rule is checked against",

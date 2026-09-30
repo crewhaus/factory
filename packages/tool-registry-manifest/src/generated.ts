@@ -3562,7 +3562,7 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "pattern", kind: "path" }],
+    operativeArgs: [{ field: "pattern", kind: "path", glob: true }],
     categories: ["fs", "code", "filesystem"],
     package: "@crewhaus/tool-fs",
     keywords: ["glob", "find files", "list files", "match files", "file pattern"],

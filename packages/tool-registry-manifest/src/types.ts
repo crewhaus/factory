@@ -29,6 +29,8 @@ export type RegistryOperativeArg = {
   readonly beneath?: string;
   /** For a `path` declared `within` a field: its default is read from the workspace root. */
   readonly defaultAtRoot?: true;
+  /** For a `path`: the value is a pattern that stands for every path it lists. */
+  readonly glob?: true;
 };
 
 export type RegistryEntry = {
@@ -126,6 +128,7 @@ function projectOperativeArg(arg: RegistryOperativeArg): RegistryOperativeArg {
     ...(arg.prefix === true ? { prefix: true as const } : {}),
     ...(arg.beneath !== undefined ? { beneath: arg.beneath } : {}),
     ...(arg.defaultAtRoot === true ? { defaultAtRoot: true as const } : {}),
+    ...(arg.glob === true ? { glob: true as const } : {}),
   };
 }
 

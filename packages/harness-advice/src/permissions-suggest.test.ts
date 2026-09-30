@@ -245,11 +245,20 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
       [{ field: "address", kind: "id", within: "chainId", default: "*" }],
       { chainId: z.string(), address: z.string().optional() },
     );
-    const withLists = suggestLookupFromTools({ ...TOOLS, kvList: list, evmGetLogs: logs });
+    const glob = declared("Glob", [{ field: "pattern", kind: "path", glob: true }], {
+      pattern: z.string(),
+    });
+    const withLists = suggestLookupFromTools({
+      ...TOOLS,
+      kvList: list,
+      evmGetLogs: logs,
+      glob,
+    });
     for (const [name, input] of [
       ["KvList", { namespace: "scratch", prefix: "a" }],
       ["KvList", { namespace: "scratch" }],
       ["EvmGetLogs", { chainId: "1" }],
+      ["Glob", { pattern: "src/*.ts" }],
     ] as const) {
       const agg = aggregateAsks([asked(name, input)], withLists).get(name) as AskAggregate;
       expect({ name, input, pattern: patternFor(agg) }).toEqual({ name, input, pattern: name });

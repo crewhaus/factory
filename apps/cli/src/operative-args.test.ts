@@ -497,9 +497,6 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
         "GitWorktreeList.cwd",
       ].map((k) => [k, "a repository"]),
     ),
-    // A glob pattern, matched as written; its directory part is not a
-    // directory argument (documented 0.7.1 limit).
-    "Glob.pattern": "a pattern",
   };
 
   /** Every declared path field that is not a relocating store or repository. */
@@ -515,7 +512,12 @@ describe("every path a builtin walks is read with what lies beneath it", () => {
     // The sweep's hit count, so an empty load cannot pass.
     expect(fields.length).toBeGreaterThanOrEqual(130);
     const walked = fields.filter((f) => f.arg.beneath !== undefined).map((f) => f.key);
-    const single = fields.filter((f) => f.arg.beneath === undefined).map((f) => f.key);
+    // A pattern stands for every path it lists (`glob`): Glob's, and only it.
+    const patterns = fields.filter((f) => f.arg.glob === true).map((f) => f.key);
+    expect(patterns).toEqual(["Glob.pattern"]);
+    const single = fields
+      .filter((f) => f.arg.beneath === undefined && f.arg.glob !== true)
+      .map((f) => f.key);
     expect(single.filter((k) => ONE_PLACE[k] === undefined).sort()).toEqual([]);
     // A reviewed entry that now declares beneath, or no longer exists, is stale.
     const known = new Set(fields.map((f) => f.key));

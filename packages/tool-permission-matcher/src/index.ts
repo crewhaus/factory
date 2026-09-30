@@ -230,34 +230,11 @@ export type AnyValueTail = "segment" | "run" | "visible";
  */
 const EVERY_AFTER_STATE_SETS = 4096;
 
-function compileGlob(glob: string): GlobMatcher {
-  const tokens = tokenizeGlob(glob);
-  // Fast path: a glob with no metacharacters is a string comparison. Most
-  // tool-name halves (`Read`, `Bash`) are this.
-  if (tokens.every((t) => t.k === "lit")) {
-    let literal = "";
-    for (const t of tokens) literal += String.fromCharCode((t as { c: number }).c);
-    const someAfter = (prefix: string, tail: AnyValueTail): boolean => {
-      if (!literal.startsWith(prefix)) return false;
-      const rest = literal.slice(prefix.length);
-      if (tail === "run") return true;
-      if (tail === "segment") return !rest.includes("/");
-      return !startsHiddenSegment(prefix, rest);
-    };
-    return {
-      test: (value: string, work?: { steps: number }) => {
-        if (work !== undefined) work.steps += value.length;
-        return value === literal;
-      },
-      matchesSegmentAfter: (prefix: string, segments = 1) =>
-        literal.startsWith(prefix) &&
-        literal.slice(prefix.length).split("/").length === Math.max(1, segments),
-      matchesSomeAfter: someAfter,
-      // One string: never both the prefix alone and the prefix plus more.
-      matchesEveryAfter: () => false,
-    };
-  }
+/** A glob's automaton: its states (index 0 accepts) and where it starts. */
+type Automaton = { readonly states: ReadonlyArray<GlobState>; readonly start: number };
 
+/** Thompson's construction over the tokens: see {@link GlobMatcher}. */
+function buildAutomaton(tokens: ReadonlyArray<GlobToken>): Automaton {
   const states: GlobState[] = [{ t: "accept" }];
   const push = (state: GlobState): number => states.push(state) - 1;
   const loop = (t: "notSlash" | "anyChar", exit: number): number => {
@@ -301,40 +278,191 @@ function compileGlob(glob: string): GlobMatcher {
       }
     }
   }
-  const start = next;
+  return { states, start: next };
+}
+
+/** The non-split states reachable from `from` without reading, sorted. */
+function closureIn(automaton: Automaton, from: ReadonlyArray<number>): number[] {
+  const { states } = automaton;
+  const seen = new Uint8Array(states.length);
+  const out: number[] = [];
+  const stack = [...from];
+  while (stack.length > 0) {
+    const s = stack.pop() as number;
+    if (seen[s] === 1) continue;
+    seen[s] = 1;
+    const st = states[s] as GlobState;
+    if (st.t === "split") stack.push(st.b, st.a);
+    else out.push(s);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/** Does a (non-split) state read the character `c`? */
+function reads(st: GlobState, c: number): boolean {
+  return (
+    (st.t === "lit" && st.c === c) || (st.t === "notSlash" && c !== SLASH) || st.t === "anyChar"
+  );
+}
+
+/** The states after reading `c` from the (closed) set `set`, closed again. */
+function stepIn(automaton: Automaton, set: ReadonlyArray<number>, c: number): number[] {
+  const next: number[] = [];
+  for (const s of set) {
+    const st = automaton.states[s] as GlobState;
+    if (reads(st, c)) next.push((st as { out: number }).out);
+  }
+  return next.length === 0 ? next : closureIn(automaton, next);
+}
+
+/**
+ * Is there a path both automata accept? With `visible`, only a path in which
+ * no segment starts with `.` counts (the Glob tool never lists one). The
+ * search runs over pairs of states, one from each, reading one character at
+ * a time: a literal on either side decides it, and two wildcards read a
+ * character that is neither `/` nor `.`, which leaves every choice open.
+ */
+function automataIntersect(
+  a: Automaton,
+  b: Automaton,
+  visible: boolean,
+  startsSegment = true,
+): boolean {
+  const width = b.states.length;
+  const seen = new Uint8Array(a.states.length * width * 2);
+  const stack: Array<readonly [number, number, boolean]> = [];
+  const pushPairs = (xs: ReadonlyArray<number>, ys: ReadonlyArray<number>, atStart: boolean) => {
+    for (const x of xs) for (const y of ys) stack.push([x, y, atStart]);
+  };
+  pushPairs(closureIn(a, [a.start]), closureIn(b, [b.start]), startsSegment);
+  while (stack.length > 0) {
+    const [x, y, atStart] = stack.pop() as readonly [number, number, boolean];
+    const key = (x * width + y) * 2 + (atStart ? 1 : 0);
+    if (seen[key] === 1) continue;
+    seen[key] = 1;
+    const sx = a.states[x] as GlobState;
+    const sy = b.states[y] as GlobState;
+    if (sx.t === "accept" && sy.t === "accept") return true;
+    if (sx.t === "accept" || sy.t === "accept" || sx.t === "split" || sy.t === "split") continue;
+    const c = sx.t === "lit" ? sx.c : sy.t === "lit" ? sy.c : OTHER;
+    if (!reads(sx, c) || !reads(sy, c)) continue;
+    if (visible && atStart && c === DOT) continue;
+    pushPairs(closureIn(a, [sx.out]), closureIn(b, [sy.out]), c === SLASH);
+  }
+  return false;
+}
+
+/** A character no glob here names specially: neither `/` nor `.`. */
+const OTHER = 0x61;
+
+/**
+ * Does `outer` accept every path `inner` accepts (with `visible`, every such
+ * path with no segment starting with `.`)? Both are determinised together,
+ * one character class at a time, and a set of `inner`'s states that accepts
+ * beside a set of `outer`'s that does not is a path `outer` misses. `false`
+ * when working that out would take more than a bounded amount of work: an
+ * allow that cannot be shown to cover every path grants nothing.
+ */
+function automatonIncludedIn(
+  inner: Automaton,
+  outer: Automaton,
+  visible: boolean,
+  startsSegment = true,
+): boolean {
+  const alphabet = new Set<number>([SLASH, DOT]);
+  for (const auto of [inner, outer]) {
+    for (const st of auto.states) if (st.t === "lit") alphabet.add(st.c);
+  }
+  let other = OTHER;
+  while (alphabet.has(other)) other++;
+  alphabet.add(other);
+  const first: readonly [number[], number[], boolean] = [
+    closureIn(inner, [inner.start]),
+    closureIn(outer, [outer.start]),
+    startsSegment,
+  ];
+  if (first[0].includes(0) && !first[1].includes(0)) return false;
+  const keyOf = (i: ReadonlyArray<number>, o: ReadonlyArray<number>, atStart: boolean) =>
+    `${atStart ? 1 : 0}|${i.join(",")}|${o.join(",")}`;
+  const seen = new Set<string>([keyOf(...first)]);
+  const queue: Array<readonly [number[], number[], boolean]> = [first];
+  while (queue.length > 0) {
+    const [i, o, atStart] = queue.pop() as readonly [number[], number[], boolean];
+    for (const c of alphabet) {
+      if (visible && atStart && c === DOT) continue;
+      const ni = stepIn(inner, i, c);
+      if (ni.length === 0) continue;
+      const no = stepIn(outer, o, c);
+      if (ni.includes(0) && !no.includes(0)) return false;
+      const key = keyOf(ni, no, c === SLASH);
+      if (seen.has(key)) continue;
+      if (seen.size >= EVERY_AFTER_STATE_SETS) return false;
+      seen.add(key);
+      queue.push([ni, no, c === SLASH]);
+    }
+  }
+  return true;
+}
+
+/**
+ * The longest Glob pattern a rule is checked against as a pattern. A longer
+ * one gets no allow and every deny: a person does not write one.
+ */
+export const MAX_GLOB_PATTERN_CHARS = 1024;
+
+/** Characters the Glob tool's matcher reads specially and this grammar does not. */
+const LISTING_ONLY = /[[\]{}!\\]/;
+
+/**
+ * A Glob pattern in this module's glob grammar, reading at least every path
+ * the Glob tool can list with it. `*`, `**` and `?` mean the same in both. A
+ * pattern with a bracket class, a brace list, a negation or an escape is
+ * read as everything under its literal directory part (`src/{a,b}/*.ts` as
+ * `src/**`), which only ever reads more.
+ */
+function listingGlob(pattern: string): string {
+  if (!LISTING_ONLY.test(pattern)) return pattern;
+  const literal: string[] = [];
+  for (const segment of pattern.split("/")) {
+    if (/[*?[\]{}!\\]/.test(segment)) break;
+    literal.push(segment);
+  }
+  return literal.length === 0 ? "**" : `${literal.join("/")}/**`;
+}
+
+function compileGlob(glob: string): GlobMatcher {
+  const tokens = tokenizeGlob(glob);
+  // Fast path: a glob with no metacharacters is a string comparison. Most
+  // tool-name halves (`Read`, `Bash`) are this.
+  if (tokens.every((t) => t.k === "lit")) {
+    let literal = "";
+    for (const t of tokens) literal += String.fromCharCode((t as { c: number }).c);
+    const someAfter = (prefix: string, tail: AnyValueTail): boolean => {
+      if (!literal.startsWith(prefix)) return false;
+      const rest = literal.slice(prefix.length);
+      if (tail === "run") return true;
+      if (tail === "segment") return !rest.includes("/");
+      return !startsHiddenSegment(prefix, rest);
+    };
+    return {
+      test: (value: string, work?: { steps: number }) => {
+        if (work !== undefined) work.steps += value.length;
+        return value === literal;
+      },
+      matchesSegmentAfter: (prefix: string, segments = 1) =>
+        literal.startsWith(prefix) &&
+        literal.slice(prefix.length).split("/").length === Math.max(1, segments),
+      matchesSomeAfter: someAfter,
+      // One string: never both the prefix alone and the prefix plus more.
+      matchesEveryAfter: () => false,
+    };
+  }
+
+  const automaton = buildAutomaton(tokens);
+  const { states, start } = automaton;
   const count = states.length;
-
-  /** The non-split states reachable from `from` without reading, sorted. */
-  function closureOf(from: ReadonlyArray<number>): number[] {
-    const seen = new Uint8Array(count);
-    const out: number[] = [];
-    const stack = [...from];
-    while (stack.length > 0) {
-      const s = stack.pop() as number;
-      if (seen[s] === 1) continue;
-      seen[s] = 1;
-      const st = states[s] as GlobState;
-      if (st.t === "split") stack.push(st.b, st.a);
-      else out.push(s);
-    }
-    return out.sort((a, b) => a - b);
-  }
-
-  /** The states after reading `c` from the (closed) set `set`, closed again. */
-  function stepOn(set: ReadonlyArray<number>, c: number): number[] {
-    const next: number[] = [];
-    for (const s of set) {
-      const st = states[s] as GlobState;
-      if (
-        (st.t === "lit" && st.c === c) ||
-        (st.t === "notSlash" && c !== SLASH) ||
-        st.t === "anyChar"
-      ) {
-        next.push(st.out);
-      }
-    }
-    return next.length === 0 ? next : closureOf(next);
-  }
+  const closureOf = (from: ReadonlyArray<number>): number[] => closureIn(automaton, from);
+  const stepOn = (set: ReadonlyArray<number>, c: number): number[] => stepIn(automaton, set, c);
 
   /** The states after reading `prefix` from the start, like `test` does. */
   function afterPrefix(prefix: string): number[] {
@@ -710,6 +838,15 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  * - `notDirectory` — the path names an existing entry that is not a
  *   directory (nor a link to one), so nothing lies beneath it: the runtime's
  *   canonicaliser sets it, and a `beneath` field then stands for itself.
+ * - `globPattern` — each spelling is a Glob tool pattern, relative to the
+ *   workspace root: the value stands for every path it can list, and the
+ *   Glob tool never lists a name that starts with `.`. A deny or ask fires
+ *   when the pattern can list a path its glob names (`alwaysDeny
+ *   Glob(secrets/**)` on `**` + `/*`), and an allow grants it only when every
+ *   path it can list is one the allow names (`Glob(src/**)` grants
+ *   `src/**` + `/*.ts`; `Glob(src/*)` does not grant `src/**`). A bracket, a
+ *   brace, a negation or an escape is read as everything under the
+ *   pattern's literal directory part.
  * - `restrictOnly` — a value only a deny or ask reads. The declared default
  *   of a field that only relocates the tool (a store directory, the
  *   repository a branch operation runs in), standing in for a field the
@@ -750,6 +887,7 @@ export type OperativeValue = {
   readonly beneath?: ReadonlyArray<string>;
   readonly beneathSkipsHidden?: boolean;
   readonly notDirectory?: boolean;
+  readonly globPattern?: boolean;
   readonly restrictOnly?: boolean;
 };
 
@@ -1152,6 +1290,8 @@ function valueMatches(
     return argRe.matchesEveryAfter("", anyValueTail(value));
   }
   if (value.outsideWorkspace === true) return polarity === "restrict";
+  if (value.globPattern === true)
+    return globPatternMatches(value, compiled, absoluteGlob, polarity);
   // A value that stands for every value (a field left out whose default is
   // `*`) is granted only by a glob that matches every value there: its
   // canonical spelling `<prefix>*` is not a literal `*`, so `EvmGetLogs(1/?)`
@@ -1312,6 +1452,52 @@ function standsForAnyFires(
   if (!foldsCase) return false;
   const folded = foldedArgMatcher(compiled, "lower");
   return prefixes.some((prefix) => someAfter(folded, prefix.normalize("NFC").toLowerCase()));
+}
+
+/**
+ * A Glob tool pattern (`OperativeValue.globPattern`) against a rule: an
+ * allow must name every path the pattern can list, a deny or ask fires when
+ * it names one. A path the tool lists never has a segment starting with
+ * `.` below the workspace root; an absolute spelling is read without that,
+ * since the root's own path may hold one. A deny or ask folds case as it
+ * does for any path.
+ */
+function globPatternMatches(
+  value: OperativeValue,
+  compiled: CompiledPattern,
+  absoluteGlob: boolean,
+  polarity: RulePolarity,
+): boolean {
+  const candidates = (
+    polarity === "allow" ? value.canonical : [...value.canonical, ...(value.spellings ?? [])]
+  ).filter((c) => isAbsoluteSpelling(c) === absoluteGlob);
+  if (candidates.some((c) => c.length > MAX_GLOB_PATTERN_CHARS)) return polarity === "restrict";
+  // Below the workspace root the tool lists no hidden name. A leading `./`
+  // is the root itself, not a hidden segment.
+  const visible = (c: string): boolean => !isAbsoluteSpelling(c);
+  const startsSegment = (c: string): boolean => !c.startsWith("./");
+  const argGlob = compiled.argGlob ?? "";
+  if (polarity === "allow") {
+    const outer = buildAutomaton(tokenizeGlob(argGlob));
+    return candidates.some((c) =>
+      automatonIncludedIn(
+        buildAutomaton(tokenizeGlob(listingGlob(c))),
+        outer,
+        visible(c),
+        startsSegment(c),
+      ),
+    );
+  }
+  const ignoreCase = value.caseInsensitive === true;
+  const rule = buildAutomaton(tokenizeGlob(foldPath(argGlob, ignoreCase)));
+  return candidates.some((c) =>
+    automataIntersect(
+      buildAutomaton(tokenizeGlob(foldPath(listingGlob(c), ignoreCase))),
+      rule,
+      visible(c),
+      startsSegment(c),
+    ),
+  );
 }
 
 /**

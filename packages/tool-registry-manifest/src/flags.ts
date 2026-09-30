@@ -2381,7 +2381,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "pattern", kind: "path" }],
+    operativeArgs: [{ field: "pattern", kind: "path", glob: true }],
   },
   glossaryReplace: {
     key: "glossaryReplace",

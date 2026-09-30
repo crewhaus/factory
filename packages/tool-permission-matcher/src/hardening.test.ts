@@ -1422,6 +1422,140 @@ describe("a directory the tool walks: a deny or ask naming anything beneath it f
   });
 });
 
+// Final review (0.7.1): the Glob tool's pattern was matched as its text, so
+// `alwaysDeny Glob(secrets/**)` missed `**` + `/*`, which lists everything
+// under secrets/, and `alwaysAllow Glob(src/*)` granted `src/**`. A pattern
+// now stands for every path it can list, and the Glob tool never lists a
+// name that starts with `.`.
+describe("a Glob pattern stands for every path it can list", () => {
+  const pattern = (p: string, extra: Partial<OperativeValue> = {}): OperativeValue => ({
+    kind: "path",
+    canonical: [p],
+    globPattern: true,
+    ...extra,
+  });
+  const fires = (rule: string, p: string, extra: Partial<OperativeValue> = {}) =>
+    matchesPattern(
+      compilePattern(`Glob(${rule})`),
+      "Glob",
+      {},
+      {
+        ...restrict,
+        operativeValues: [pattern(p, extra)],
+      },
+    );
+  const grants = (rule: string, p: string) =>
+    matchesPattern(
+      compilePattern(`Glob(${rule})`),
+      "Glob",
+      {},
+      {
+        ...allow,
+        operativeValues: [pattern(p)],
+      },
+    );
+
+  test("a deny fires when the pattern can list a path it names", () => {
+    for (const p of ["**/*", "*/key.txt", "secret*/**", "s?crets/*", "**/*.yml", "**"]) {
+      expect({ p, fires: fires("secrets/**", p) }).toEqual({ p, fires: true });
+    }
+    for (const p of ["src/**/*.ts", "*.md", "docs/*"]) {
+      expect({ p, fires: fires("secrets/**", p) }).toEqual({ p, fires: false });
+    }
+    // A rule written from `./` meets the pattern's `./` spelling.
+    expect(fires("./secrets/**", "./**/*")).toBe(true);
+    expect(fires("./.env", "./**/*")).toBe(false);
+    // An extension the pattern cannot list is not its business.
+    expect(fires("**/*.pem", "**/*.ts")).toBe(false);
+    expect(fires("**/*.pem", "**/*")).toBe(true);
+    // The tool never lists a hidden name, even one the pattern spells.
+    for (const p of ["**/*", "*", ".env", "**/.env", ".git/**"]) {
+      expect({ p, fires: fires(".env", p) }).toEqual({ p, fires: false });
+    }
+    // A brace list, a class or a negation is read as everything under the
+    // pattern's literal directory part.
+    expect(fires("secrets/**", "{secrets,x}/**")).toBe(true);
+    expect(fires("secrets/**", "[s]ecrets/*")).toBe(true);
+    expect(fires("secrets/**", "src/{a,b}/*.ts")).toBe(false);
+    // Letter case, where the filesystem ignores it.
+    expect(fires("secrets/**", "SECRETS/*")).toBe(false);
+    expect(fires("secrets/**", "SECRETS/*", { caseInsensitive: true })).toBe(true);
+  });
+
+  test("an allow grants a pattern only when it names every path the pattern can list", () => {
+    for (const [rule, p] of [
+      ["src/**", "src/**/*.ts"],
+      ["src/*", "src/*.ts"],
+      ["**", "**/*"],
+      ["src/**", "src/{a,b}/*.ts"],
+      // Hidden names are never listed, so the allow need not name them.
+      ["src/*", "src/*"],
+      // A pattern written from `./` lists what is under the root.
+      ["./src/**", "./src/*.ts"],
+    ] as const) {
+      expect({ rule, p, grants: grants(rule, p) }).toEqual({ rule, p, grants: true });
+    }
+    for (const [rule, p] of [
+      ["src/*", "src/**"],
+      ["src/**", "**/*.ts"],
+      ["src/*.ts", "src/*"],
+      ["src/**", "{src,secrets}/*"],
+    ] as const) {
+      expect({ rule, p, grants: grants(rule, p) }).toEqual({ rule, p, grants: false });
+    }
+  });
+
+  test("agrees with trying every short visible path against the 0.7.0 compiler", () => {
+    const paths = [""];
+    for (let len = 1; len <= 6; len++) {
+      for (const base of paths.filter((x) => x.length === len - 1)) {
+        // `b` is a character no glob here names: without it, `a` would seem
+        // to cover every character a `?` can read.
+        for (const c of ["a", "b", ".", "/"]) paths.push(base + c);
+      }
+    }
+    const hidden = (path: string) => path.split("/").some((seg) => seg.startsWith("."));
+    // A pattern written from `./` names the root with it, not a hidden
+    // directory: what it lists is read after it.
+    const listable = (pattern: string, path: string) =>
+      pattern.startsWith("./") ? path.startsWith("./") && !hidden(path.slice(2)) : !hidden(path);
+    const rand = prng(0x6106);
+    const alphabet = ["a", ".", "/", "*", "**", "?"];
+    const make = () => {
+      let glob = "";
+      const len = 1 + Math.floor(rand() * 4);
+      for (let i = 0; i < len; i++) glob += alphabet[Math.floor(rand() * alphabet.length)];
+      return glob;
+    };
+    const tally = { compared: 0, fires: 0, grants: 0 };
+    for (let n = 0; n < 500; n++) {
+      const p = make();
+      const rule = make();
+      if (p.startsWith("/") || rule.startsWith("/")) continue;
+      const lists = paths.filter((v) => listable(p, v) && oracleGlobToRegex(p).test(v));
+      const named = oracleGlobToRegex(rule);
+      const wantFires = lists.some((v) => named.test(v));
+      const wantGrants = lists.every((v) => named.test(v));
+      const got = { fires: fires(rule, p), grants: grants(rule, p) };
+      expect({ p, rule, ...got }).toEqual({ p, rule, fires: wantFires, grants: wantGrants });
+      tally.compared++;
+      if (wantFires) tally.fires++;
+      if (wantGrants) tally.grants++;
+    }
+    expect(tally.compared).toBeGreaterThan(300);
+    expect(tally.fires).toBeGreaterThan(30);
+    expect(tally.compared - tally.fires).toBeGreaterThan(30);
+    expect(tally.grants).toBeGreaterThan(30);
+    expect(tally.compared - tally.grants).toBeGreaterThan(30);
+  }, 60_000);
+
+  test("a pattern too long to read as a pattern gets no allow and every deny", () => {
+    const long = `${"a/".repeat(600)}*`;
+    expect(fires("nothing/here", long)).toBe(true);
+    expect(grants("**", long)).toBe(false);
+  });
+});
+
 describe("a relocating field's default is read by a deny or ask, and skipped by an allow", () => {
   // KvDelete {namespace: "ns", key: "k"} with stateDir left out: the key it
   // names, and the store it lives in standing in with its default.

@@ -395,6 +395,15 @@ function checkOperativeArgs(
         );
       }
     }
+    const { glob } = arg;
+    if (glob !== undefined) {
+      if (glob !== true) fail(`${at}.glob is either true or left out`);
+      if (kind !== "path" || within !== undefined || relocates === true || beneath !== undefined) {
+        fail(
+          `${at}.glob: only a plain "path" field can hold a pattern (no within, relocates or beneath)`,
+        );
+      }
+    }
     const { env } = arg;
     if (env !== undefined) {
       if (kind !== "command") {
@@ -418,6 +427,7 @@ function checkOperativeArgs(
         ...(prefix === true ? { prefix } : {}),
         ...(beneath !== undefined ? { beneath } : {}),
         ...(defaultAtRoot === true ? { defaultAtRoot } : {}),
+        ...(glob === true ? { glob } : {}),
       }),
     );
   }
