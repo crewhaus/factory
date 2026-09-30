@@ -210,7 +210,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     ioCapability: "process",
     requiresSandbox: false,
     requireJustification: false,
-    operativeArgs: [{ field: "command", kind: "command" }],
+    operativeArgs: [{ field: "command", kind: "command", shell: true }],
   },
   bashOutput: {
     key: "bashOutput",
@@ -4618,7 +4618,7 @@ export const TOOL_FLAGS: Readonly<Record<string, ToolFlags>> = {
     scope: "internal",
     requiresSandbox: true,
     requireJustification: false,
-    operativeArgs: [{ field: "code", kind: "command" }],
+    operativeArgs: [{ field: "code", kind: "command", shell: true }],
   },
   signPayload: {
     key: "signPayload",

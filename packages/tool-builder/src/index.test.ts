@@ -390,6 +390,26 @@ describe("buildTool — operativeArgs (0.7.1)", () => {
     );
   });
 
+  test("shell is carried on a command, and refused anywhere else", () => {
+    const build = (arg: Record<string, unknown>) => () =>
+      buildTool({
+        name: "Sh",
+        description: "d",
+        inputSchema: z.object({ command: z.string(), path: z.string() }),
+        execute: exec,
+        operativeArgs: [arg as unknown as OperativeArg],
+      });
+    expect(build({ field: "command", kind: "command", shell: true })().operativeArgs).toEqual([
+      { field: "command", kind: "command", shell: true },
+    ]);
+    expect(build({ field: "path", kind: "path", shell: true })).toThrow(
+      /only a "command" is a line a shell parses/,
+    );
+    expect(build({ field: "command", kind: "command", shell: "sh" })).toThrow(
+      /shell is either true or left out/,
+    );
+  });
+
   test("a field the schema does not have throws at build time, naming what is there", () => {
     expect(() =>
       buildTool({ ...echoDef, operativeArgs: [{ field: "file_path", kind: "path" }] }),

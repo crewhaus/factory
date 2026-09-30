@@ -34,7 +34,7 @@
  *
  * Pure: plain data in, findings out.
  */
-import { PatternParseError, compilePattern, matchesToolName } from "./index";
+import { PatternParseError, compilePattern, globIncludedIn, matchesToolName } from "./index";
 
 /** What the checker needs to know about one tool. */
 export type RuleToolDescriptor = {
@@ -75,7 +75,13 @@ export type PermissionRuleProblemCode =
    * offline — a plugin, a custom tool, an MCP server's pre-0.7.1
    * `<server>__<tool>` spelling — registers a tool by that name.
    */
-  | "tool-not-known";
+  | "tool-not-known"
+  /**
+   * A deny or ask below an allow, in the same layer, that matches every call
+   * it would: the first matching rule decides, so it never fires (except in
+   * plan mode, which reads no allow). See {@link shadowedPermissionRules}.
+   */
+  | "shadowed-by-allow";
 
 export type PermissionRuleProblem = {
   readonly type: string;
@@ -646,4 +652,112 @@ export function specPermissionRuleLists(spec: unknown): PermissionRuleList[] {
   };
   visit(spec, [], 0);
   return lists;
+}
+
+// ---------------------------------------------------------------------------
+// A deny or ask an allow above it always beats
+// ---------------------------------------------------------------------------
+
+/** A shadowed rule, and the list that holds it. */
+export type ShadowedRuleProblem = PermissionRuleProblem & {
+  /** Where the shadowed rule sits, e.g. `permissions.rules`. */
+  readonly list: string;
+  /** The allow that decides every call the rule would. */
+  readonly shadowedBy: string;
+};
+
+/**
+ * The deny and ask rules that can never fire because an allow read before
+ * them, in the same layer, matches every call they match: the engine takes
+ * the first matching rule, so the allow decides.
+ *
+ * Only what can be proven is reported. That is an allow with no argument
+ * pattern (`alwaysAllow Bash`) whose tool pattern matches every tool name
+ * the deny's does — shown with the matcher's own automaton inclusion
+ * ({@link globIncludedIn}), whatever the deny's argument. An allow scoped to
+ * an argument never covers every call a deny reads: a deny also fires on a
+ * path outside the workspace, on another letter case or spelling of a value,
+ * on a call with several values, and on a shell line of several commands,
+ * none of which a scoped allow grants. So a scoped allow is never reported,
+ * however wide.
+ *
+ * Plan mode reads no allow rule, so a shadowed deny still acts there.
+ *
+ * Two orders are read. A list (`permissions.rules`) top to bottom. And a
+ * sub-agent's `permissions.allow` then its `permissions.deny`, which is the
+ * order its rules are read in when they replace the parent's.
+ */
+export function shadowedPermissionRules(
+  lists: ReadonlyArray<PermissionRuleList>,
+): ShadowedRuleProblem[] {
+  const out: ShadowedRuleProblem[] = [];
+  for (const list of lists) {
+    for (const hit of shadowsIn(list.rules)) {
+      out.push({
+        type: hit.rule.type,
+        pattern: hit.rule.pattern,
+        code: "shadowed-by-allow",
+        message: `rule "${hit.rule.type} ${hit.rule.pattern}" never fires outside plan mode: "alwaysAllow ${hit.allow}", above it in the same list, matches every call it matches, and the first rule that matches a call decides it. Move it above "alwaysAllow ${hit.allow}".`,
+        list: list.path,
+        shadowedBy: hit.allow,
+      });
+    }
+  }
+  const allowLists = new Map<string, PermissionRuleList>();
+  for (const list of lists) {
+    if (list.path.endsWith(".permissions.allow")) {
+      allowLists.set(list.path.slice(0, -".allow".length), list);
+    }
+  }
+  for (const list of lists) {
+    if (!list.path.endsWith(".permissions.deny")) continue;
+    const allow = allowLists.get(list.path.slice(0, -".deny".length));
+    if (allow === undefined) continue;
+    const combined = [...allow.rules, ...list.rules];
+    for (const hit of shadowsIn(combined)) {
+      out.push({
+        type: hit.rule.type,
+        pattern: hit.rule.pattern,
+        code: "shadowed-by-allow",
+        message: `rule "${hit.rule.type} ${hit.rule.pattern}" never fires outside plan mode: a sub-agent's allow list is read before its deny list, and "alwaysAllow ${hit.allow}" in ${allow.path} matches every call it matches. Narrow that allow to what the sub-agent should run, so the deny is reached.`,
+        list: list.path,
+        shadowedBy: hit.allow,
+      });
+    }
+  }
+  return out;
+}
+
+/** The deny and ask rules an earlier bare allow shadows, with the first such allow. */
+function shadowsIn(
+  rules: ReadonlyArray<{ readonly type: string; readonly pattern: string }>,
+): Array<{
+  readonly rule: { readonly type: string; readonly pattern: string };
+  readonly allow: string;
+}> {
+  const out: Array<{
+    readonly rule: { readonly type: string; readonly pattern: string };
+    readonly allow: string;
+  }> = [];
+  const bareAllows: Array<{ readonly pattern: string; readonly toolGlob: string }> = [];
+  for (const rule of rules) {
+    let compiled: ReturnType<typeof compilePattern>;
+    try {
+      compiled = compilePattern(rule.pattern);
+    } catch {
+      // A malformed allow grants nothing; a malformed deny is reported as
+      // malformed elsewhere, and the engine treats it as matching everything.
+      continue;
+    }
+    if (rule.type === "alwaysAllow") {
+      if (compiled.argGlob === null) {
+        bareAllows.push({ pattern: rule.pattern, toolGlob: compiled.toolGlob });
+      }
+      continue;
+    }
+    if (rule.type !== "alwaysDeny" && rule.type !== "alwaysAsk") continue;
+    const cover = bareAllows.find((a) => globIncludedIn(compiled.toolGlob, a.toolGlob));
+    if (cover !== undefined) out.push({ rule, allow: cover.pattern });
+  }
+  return out;
 }

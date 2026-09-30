@@ -53,6 +53,14 @@
  *      `EvmCall(*)`, the way 0.7.0 matched every string in the call — still
  *      fires. An allow must name the qualified value, so it cannot be
  *      widened by leaving the qualifier out.
+ *    - a `command` declared `shell` and held as a string is a line a shell
+ *      parses: it is marked `shell`, and the matcher reads each simple
+ *      command in it (an allow must match every one, a deny or ask fires on
+ *      any). A `command` held as an argv is never split — no shell reads it
+ *      — but when the program it names is a shell given `-c`, an `eval` or
+ *      an `env -S` (after wrappers such as `env` or `sudo`), the line that
+ *      runs is added as a value only a deny or ask reads, marked `shell`:
+ *      `alwaysDeny RunCommand(rm **)` fires on `["sh", "-c", "a && rm x"]`.
  *    - a `command` declared with an `env` field — the variables the call
  *      sets in the child's environment — can run another program than its
  *      words say: PATH decides what a bare program name is, and BASH_ENV,
@@ -109,6 +117,7 @@ import type { OperativeArg, OperativeArgKind, RegisteredTool } from "@crewhaus/t
 import {
   type OperativeValue,
   type OperativeValueKind,
+  linesRunBy,
   normalizePathLexically,
 } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
@@ -246,6 +255,10 @@ export function operativeValuesOf(
             runsIn !== undefined && dirValues !== undefined && !namesWorkspaceRoot(dirValues);
           const setsEnv = env !== undefined && Object.keys(env).length > 0;
           const argv = words ?? raw.split(/\s+/).filter((w) => w !== "");
+          // A shell parses a string it is handed; an argv reaches one only
+          // when the program it names is a shell, an eval or an env -S.
+          const shell = arg.shell === true && words === undefined ? { shell: true } : {};
+          const shellLines = words !== undefined ? linesRunBy(words) : [];
           const read = commandSpellings(
             argv,
             elsewhere ? runDirSpellings(runsIn as string, dirValues as OperativeValue[]) : [],
@@ -262,9 +275,11 @@ export function operativeValuesOf(
               kind: "command",
               canonical: [],
               spellings: [...new Set([raw, ...(words ?? []), ...read.spellings])],
+              ...shell,
               ...(read.unreadable ? { outsideWorkspace: true } : {}),
               ...(every === true ? { standsForAny: [""] } : {}),
             });
+            values.push(...shellLineValues(shellLines));
             break;
           }
           const spellings = [...new Set([...(words ?? []), ...read.spellings])];
@@ -272,8 +287,10 @@ export function operativeValuesOf(
             kind: "command",
             canonical: [raw],
             ...(spellings.length > 0 ? { spellings } : {}),
+            ...shell,
             ...(anyAfter !== undefined ? { standsForAny: anyAfter } : {}),
           });
+          values.push(...shellLineValues(shellLines));
           break;
         }
         default: {
@@ -316,6 +333,18 @@ export function operativeValuesOf(
     values.push(...relocated);
   }
   return values;
+}
+
+/**
+ * The lines an argv hands to a shell (`["sh", "-c", "…"]`), as values only a
+ * deny or ask reads: no allow is widened or narrowed by them, and a deny
+ * reads each simple command in them.
+ */
+function shellLineValues(lines: ReadonlyArray<string>): OperativeValue[] {
+  if (lines.length === 0) return [];
+  return [
+    { kind: "command", canonical: [], spellings: [...lines], shell: true, restrictOnly: true },
+  ];
 }
 
 /** A value that ends in a `0x` (or `0X`) hex id, after any `<qualifier>/`. */

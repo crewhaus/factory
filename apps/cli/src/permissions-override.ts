@@ -76,6 +76,18 @@ function builtinWalk(toolName: string): "all" | "visible" | undefined {
 }
 
 /**
+ * Whether a builtin's `command` is a line a shell parses (`shell` in the
+ * manifest): the runtime then reads each simple command of it, so a guard
+ * naming any of them (`alwaysAsk Bash(rm**)` on `git status && rm -rf x`)
+ * fires on the value, and an allow of the value is read before it.
+ */
+function builtinShell(toolName: string): boolean {
+  return (TOOL_FLAGS_BY_NAME.get(toolName)?.operativeArgs ?? []).some(
+    (arg) => arg.kind === "command" && arg.shell === true,
+  );
+}
+
+/**
  * A path value the tool walks, read with what lies beneath it as the runtime
  * reads it: a scoped `alwaysAllow RemovePath(build)` covers `RemovePath build`
  * recursive, on which `alwaysDeny RemovePath(build/keep/**)` fires, so the
@@ -89,6 +101,11 @@ function withWalk(value: OperativeValue, walk: "all" | "visible" | undefined): O
     beneath: value.canonical.map(under),
     ...(walk === "visible" ? { beneathSkipsHidden: true } : {}),
   };
+}
+
+/** A command value marked as a shell line, when the tool's command is one. */
+function withShell(value: OperativeValue, shell: boolean): OperativeValue {
+  return shell && value.kind === "command" ? { ...value, shell: true } : value;
 }
 
 /**
@@ -126,7 +143,10 @@ export function guardsOverridden(
       allow.valueKind === undefined
         ? undefined
         : [
-            withWalk(valueAt(allow.valueKind, value, cwd), builtinWalk(allow.toolName)),
+            withShell(
+              withWalk(valueAt(allow.valueKind, value, cwd), builtinWalk(allow.toolName)),
+              builtinShell(allow.toolName),
+            ),
             ...(allow.relocatingDefaults ?? builtinRelocatingDefaults(allow.toolName)).map((d) =>
               valueAt(d.kind, d.value, cwd),
             ),

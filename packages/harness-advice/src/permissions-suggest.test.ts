@@ -272,6 +272,58 @@ describe("aggregateAsks with the tools' own declarations (permission-integration
     expect(patternFor(one)).toBe("EvmGetLogs(1/0xab)");
   });
 
+  it("a proposal for a shell line grants the calls it came from, and no other line", () => {
+    // Bash reads its command command by command (0.7.1): an allow must match
+    // each, or be the exact line. A proposal is that exact line, escaped.
+    const bash = declared("Bash", [{ field: "command", kind: "command", shell: true }], {
+      command: z.string(),
+    });
+    const shellLookup = suggestLookupFromTools({ bash });
+    const lines = [
+      "git status && git log",
+      "git status;",
+      "echo `date`",
+      "cat <<EOF\nx\nEOF",
+      "npm test 2>&1 | tail -5",
+    ];
+    for (const command of lines) {
+      const agg = aggregateAsks([asked("Bash", { command })], shellLookup).get(
+        "Bash",
+      ) as AskAggregate;
+      const pattern = patternFor(agg);
+      expect({ command, scoped: pattern !== "Bash" }).toEqual({ command, scoped: true });
+      const values = [{ kind: "command" as const, canonical: [command], shell: true }];
+      expect({
+        command,
+        grants: matchesPattern(
+          compilePattern(pattern),
+          "Bash",
+          { command },
+          { operativeValues: values },
+        ),
+      }).toEqual({ command, grants: true });
+      const longer = [
+        { kind: "command" as const, canonical: [`${command}\nrm -rf build`], shell: true },
+      ];
+      expect(matchesPattern(compilePattern(pattern), "Bash", {}, { operativeValues: longer })).toBe(
+        false,
+      );
+    }
+    // Without a declaration, the tool named Bash reads the same way.
+    const legacy = aggregateAsks([asked("Bash", { command: "git status && git log" })]).get(
+      "Bash",
+    ) as AskAggregate;
+    expect(patternFor(legacy)).toBe("Bash(git status && git log)");
+  });
+
+  it("a value its own rule would not match is proposed as a bare grant, and says why", () => {
+    // A declared url that does not parse keeps no canonical spelling an
+    // allow could read, so the rule `HttpRequest(<value>)` never fires.
+    const agg = aggFor("HttpRequest", { url: "https://u:p@example.com/x" });
+    expect(patternFor(agg)).toBe("HttpRequest");
+    expect(blanketGrantNote(agg)).toContain("its own rule would not match");
+  });
+
   it("rankSuggestions carries the BLANKET GRANT line into a bare allow's evidence", () => {
     const aggs = aggregateAsks([asked("ClipboardWrite", { text: "x" })], lookup);
     const [grant] = rankSuggestions(aggs, new Map());

@@ -854,6 +854,7 @@ describe("the generated tool manifest matches the tools it describes", () => {
         "kind",
         "prefix",
         "relocates",
+        "shell",
         "within",
       ].sort(),
     );

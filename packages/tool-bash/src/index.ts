@@ -230,7 +230,8 @@ export const bash: RegisteredTool = buildTool({
     "Run a shell command via `sh -c`. Captures stdout and stderr; default timeout 30s, max 10min. Pass `background: true` to detach a long-running command and get a bash_id to poll with BashOutput / stop with KillShell.",
   inputSchema: bashSchema,
   destructive: true,
-  operativeArgs: [{ field: "command", kind: "command" }],
+  // `sh -c` parses the command: a rule reads each simple command in it.
+  operativeArgs: [{ field: "command", kind: "command", shell: true }],
   // Pillar 3 sink-side: Bash spawns a host process and its command string is an
   // exfiltration channel (curl, nc, `base64 | sh`, …). Mark it external +
   // process so runtime-core runs classifyEgress on the command payload and the

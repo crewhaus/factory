@@ -75,6 +75,20 @@ built it.
   `scripts/release.sh` holds when the call runs `./release.sh` from
   `scripts/`. A scoped command allow does not follow the call into another
   directory.
+- **A Bash rule reads each command in the line.** `alwaysAllow Bash(git *)`
+  allowed `git status && rm -rf build`, and `alwaysDeny Bash(rm -rf **)`
+  missed an `rm` that came second. A line is now split into the commands it
+  runs, at `&&`, `||`, `;`, `|`, `&` and newlines, respecting quotes and
+  comments. An allow must match every command; a deny or ask fires on any of
+  them, or on the whole line as before. A deny also sees a command through
+  `env`, `sudo`, `xargs` and similar wrappers, inside `eval`, `sh -c` and
+  `$(…)`, without its quotes, and through variables the line sets. A line
+  whose commands cannot be read from its text — `$(…)`, backticks, a
+  here-document, an unterminated quote, a `for` or `case` block — is allowed
+  by no scoped rule, so it asks; one whose program the text does not name
+  (`read x; $x -rf build`) also sets off every deny and ask. The Shell tool is
+  read the same way, and a deny on RunCommand or another argv tool reads the
+  line it hands to `sh -c`.
 - **A permission pattern can no longer stall the daemon.** A rule with
   several `*`, matched against a long command, could block the event loop
   indefinitely. Patterns now match in time proportional to the input, and
@@ -495,6 +509,18 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   `compile --strict` fails on them. A rule naming a tool nothing knows (a
   plugin may register it) gets a note, never a fix, and an allow is never
   "corrected" into a tool that can change or delete things.
+- **`crewhaus lint` and `compile` say when a deny or ask can never fire
+  because an allow above it always matches first**: the first matching rule
+  decides, so `alwaysAllow Bash` above `alwaysDeny Bash(rm -rf **)` lets every
+  `rm` run. The warning names both rules; move the deny above the allow.
+  `compile --strict` fails on it. A sub-agent's `allow` list is read before
+  its `deny` list, so there, narrow the allow. Only a case that can be proven
+  is reported, and plan mode, which reads no allow, is the exception.
+- **A bundle built with the optional IR passes decides as `crewhaus compile`'s
+  does.** The passes (`applyIrPasses`, which the compiler worker's
+  `POST /compile` accepts) re-sorted `permissions.rules` deny-first, so an
+  allow written above a narrower deny was a deny there. Rules keep their
+  order; only an exact repeat is dropped.
 - **`crewhaus lint` agrees with `compile` about tools**, and knows the tools
   a `thredz:` block adds. It also reports a key the spec's shape accepts but
   does not wire (`accepted-but-unwired`), which it used to call clean. `lint --fix` edits only the fields it fixes, inside
@@ -504,7 +530,8 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   approved** — `RemovePath(build/cache)`, `RunCommand(git status)` — instead
   of a blanket grant. A proposal that can only cover the whole tool is marked
   `BLANKET GRANT` with the reason, and any deny or ask in your spec or the
-  builtin floor that a proposed allow would override is named. The
+  builtin floor that a proposed allow would override is named, and each
+  proposal is checked to allow the calls it came from. The
   `PermissionsSuggest` and `ApprovalStatus` tools do the same, and approval
   rows show the record a call acts on.
 - **`crewhaus tools`** reads the tools a spec really grants. `suggest` reads
@@ -599,6 +626,13 @@ deny, warn or fail `--strict`; each says what to write instead.
     RunPipeline, Retry, ProcessStart, RunBuild, RunTests, Format and
     HooksManage ask when the same command runs in a subdirectory or sets
     `envSet`. `RunCommand(**)` still covers every call.
+  - A Bash or Shell allow must match every command in the line.
+    `Bash(git *)` no longer allows `git pull && npm test` or
+    `git log | head`; they ask. Write one rule that covers each command, or
+    the exact line with no wildcard (`Bash(cd build && make)`). A line with
+    `$(…)`, backticks, a here-document or a `for` loop asks unless a bare
+    `Bash`, `Bash(*)` or `Bash(**)` allows it; those three allow what they
+    did before.
   - A pattern aimed at something that is not where the tool acts, such as a
     message body, no longer matches: deny the tool, or its destination.
   - A rule on a chain tool is written `Tool(<chainId>/<address>)`.
@@ -646,6 +680,8 @@ deny, warn or fail `--strict`; each says what to write instead.
 - **New warnings that fail `--strict`**:
   - A permission rule that can never fire (see CLI under Fixed): rewrite it as
     the warning suggests.
+  - A deny or ask below an allow that always matches first: move it above
+    the allow.
   - `sub-agent-tool-ungranted`: a sub-agent lists a builtin its parent never
     registers, so the sub-agent never had it. Add the tool to the parent, or
     remove it from the sub-agent.
@@ -699,8 +735,8 @@ deny, warn or fail `--strict`; each says what to write instead.
   ignored, so plan mode can only get stricter.
 - **Deny and ask rules fire in more places** — on defaults the call leaves
   out, on directories above a denied one, on every spelling of a destination,
-  and on a command reached through its directory or environment. Only denies
-  and asks got wider; no allow did.
+  on a command reached through its directory or environment, and on any
+  command in a Bash line. Only denies and asks got wider; no allow did.
 - **A call whose input the tool would reject is refused before any rule or
   approval.** It could not run anyway. It is not counted as a denial in eval
   safety violations or deny alerts.
@@ -769,12 +805,13 @@ deny, warn or fail `--strict`; each says what to write instead.
 - **`operativeArgs` on a tool definition**: the input field or fields a
   permission rule is about, and what kind each is — path, URL, command,
   recipient, id or text — with whether it is read `within` another field
-  (a repository as `owner/repo`, a path from the tool's `cwd`) and what a
-  left-out value stands for. Every builtin that changes something or reaches
-  outside declares them, and `buildTool` refuses a declaration that names a
-  field the input does not have. An empty list says no argument decides where
-  the tool acts. Tool packages outside this repo can check
-  `TOOL_CONTRACT_VERSION` in `@crewhaus/tool-catalog`.
+  (a repository as `owner/repo`, a path from the tool's `cwd`), what a
+  left-out value stands for, and whether a command is a line a shell parses
+  (`shell`, which Bash and Shell declare). Every builtin that changes
+  something or reaches outside declares them, and `buildTool` refuses a
+  declaration that names a field the input does not have. An empty list says
+  no argument decides where the tool acts. Tool packages outside this repo
+  can check `TOOL_CONTRACT_VERSION` in `@crewhaus/tool-catalog`.
 - **`ToolRegistry`** (`@crewhaus/tool-capability`): a harness can see the
   builtin tools it was not given — search by text, narrow by category, or ask
   for one tool's description, and each row says whether this harness runs it.
@@ -813,9 +850,13 @@ deny, warn or fail `--strict`; each says what to write instead.
   `{ type: alwaysAsk, pattern: Fetch }` and
   `{ type: alwaysAsk, pattern: ImageGenerate }` to `permissions.rules`, or
   leave the tools out of `tools:`.
-- **A deny cannot read inside a shell string or follow a link in an
-  argument.** `sh -c './release.sh'`, or a symlink to the script, gets past a
-  deny on `release.sh`; deny the interpreter instead.
+- **A deny on a command is a list, and a list has gaps.** It reads the
+  commands a Bash line runs, through wrappers, `eval`, `sh -c` and the line's
+  own variables, but not a program another program runs from its arguments
+  (`find -exec`, `git -c alias…`, `python -c`), what a script does, a
+  directory a line `cd`s into, or a link in an argument: a symlink to
+  `release.sh` gets past a deny on `release.sh`. For Bash, allow what may run
+  rather than deny what may not.
 - **Tools that declare no operative argument are matched on the text of the
   call, as in 0.7.0.** A deny on a directory does not stop a whole-tree
   FindFiles, Tree or DiskUsage.

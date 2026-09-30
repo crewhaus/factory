@@ -399,6 +399,68 @@ permissions:
     ]);
   });
 
+  // 0.7.1: a deny or ask below an allow that matches every call it would
+  // never fires — the first matching rule decides. Only a bare allow proves
+  // it; a scoped one never covers every call a deny reads.
+  test("a deny under an allow that always matches first is reported, naming both", async () => {
+    const yaml = `${validCli.replace(
+      "  instructions: hi\n",
+      `  instructions: hi
+  sub_agents:
+    fixer:
+      description: d
+      instructions: fix
+      tools: [Bash]
+      permissions:
+        allow: ['Bash']
+        deny: ['Bash(rm -rf **)']
+`,
+    )}tools: [bash, write]
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: Bash }
+    - { type: alwaysDeny, pattern: "Bash(rm -rf **)" }
+    - { type: alwaysAllow, pattern: "Write(src/**)" }
+    - { type: alwaysDeny, pattern: "Write(src/secret/**)" }
+    - { type: alwaysAsk, pattern: "Bash(sudo**)" }
+`;
+    const found = runLint(yaml, noTools).findings.filter((f) =>
+      f.rule.startsWith("permission-rule:"),
+    );
+    expect(found.map((f) => [f.rule, f.path, f.severity])).toEqual([
+      [
+        "permission-rule:shadowed-by-allow",
+        "permissions.rules[alwaysDeny Bash(rm -rf **)]",
+        "warning",
+      ],
+      ["permission-rule:shadowed-by-allow", "permissions.rules[alwaysAsk Bash(sudo**)]", "warning"],
+      [
+        "permission-rule:shadowed-by-allow",
+        "agent.sub_agents.fixer.permissions.deny[alwaysDeny Bash(rm -rf **)]",
+        "warning",
+      ],
+    ]);
+    expect(found[0]?.message).toContain('Move it above "alwaysAllow Bash"');
+    // compile prints the same finding, and --strict fails on it.
+    const warnings = await permissionRuleWarnings(yaml, async () => ({}));
+    expect(warnings.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule", "permissions.rules"],
+      ["permission-rule", "permissions.rules"],
+      ["permission-rule", "agent.sub_agents.fixer.permissions.deny"],
+    ]);
+    // Written first, the deny decides, and nothing is said.
+    const fixed = yaml
+      .replace("    - { type: alwaysAllow, pattern: Bash }\n", "")
+      .replace(
+        '    - { type: alwaysAsk, pattern: "Bash(sudo**)" }\n',
+        '    - { type: alwaysAsk, pattern: "Bash(sudo**)" }\n    - { type: alwaysAllow, pattern: Bash }\n',
+      )
+      .replace("allow: ['Bash']", "allow: ['Bash(git *)']");
+    expect(
+      runLint(fixed, noTools).findings.filter((f) => f.rule.startsWith("permission-rule:")),
+    ).toEqual([]);
+  });
+
   // wave III review: a pool candidate carries its own deny/ask inline, read
   // the same way as a profile's, and neither lint nor PermissionAudit read
   // it. The lists now come from one reader both use.
