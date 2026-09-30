@@ -323,8 +323,9 @@ export type OperativeArgKind = "path" | "url" | "command" | "recipient" | "text"
  * cannot ask about (the edge worker) stands for what could be beneath it.
  *
  * `glob: true`, for a `path`, says the value is a pattern the tool lists
- * the paths of (the Glob tool's `pattern`, which never lists a name that
- * starts with `.`): it stands for every path it can list. A deny or ask
+ * the paths of (the Glob tool's `pattern`, whose wildcards never list a
+ * name that starts with `.`, though a name it writes literally is listed):
+ * it stands for every path it can list. A deny or ask
  * fires when it can list a path the rule names — `alwaysDeny
  * Glob(secrets/**)` on the pattern `**` + `/*`, not on `src/**` + `/*.ts` —
  * and an allow grants it only when every path it can list is one the allow

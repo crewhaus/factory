@@ -588,13 +588,93 @@ describe("final review — a directory the tool walks is read with everything be
         got: "allow",
       });
     }
-    // The tool never lists a hidden name, so a deny on one leaves it alone.
+    // The tool's wildcards never list a hidden name, so a deny on one leaves
+    // `**/*` alone. (A hidden name the pattern writes is listed: see below.)
     const env = rules(["alwaysDeny", "Glob(.env)"], ["alwaysAllow", "Glob"]);
     expect(await gate("Glob", { pattern: "**/*" }, env)).toBe("allow");
     // An allow must name every path the pattern can list.
     const src = rules(["alwaysAllow", "Glob(src/*)"]);
     expect(await gate("Glob", { pattern: "src/*.ts" }, src)).toBe("allow");
     expect(await gate("Glob", { pattern: "src/**" }, src)).toBe("ask");
+  }, 60_000);
+
+  test("Glob: a hidden name the pattern writes is listed, so a rule reads it", async () => {
+    // Closeout review: Bun.Glob lists a literal hidden name in the last
+    // segment (`.env`, `*` + `/.deploy-key`), but the matcher read every
+    // hidden name as never listed. A subtree deny or ask did not fire on
+    // those patterns, a deny on the name itself did not either, and a
+    // scoped allow granted them vacuously.
+    mkdirSync(join(ws, "secrets"));
+    writeFileSync(join(ws, "secrets", "prod.yml"), "x\n");
+    writeFileSync(join(ws, "secrets", ".deploy-key"), "x\n");
+    const leaks = () => (lastResult ?? "").includes(".deploy-key");
+    const patterns = [
+      "secrets/.deploy-key",
+      "*/.deploy-key",
+      "se*/.deploy-key",
+      // Other spellings of the same listing.
+      "./secrets/.deploy-key",
+      "secrets//.deploy-key",
+      "*/./.deploy-key",
+      "secrets/.deploy-key/",
+    ];
+    let listedUnruled = 0;
+    for (const pattern of patterns) {
+      // Control: with no rule in the way the tool does list it.
+      await gate("Glob", { pattern }, rules(["alwaysAllow", "Glob"]));
+      if (leaks()) listedUnruled++;
+    }
+    expect(listedUnruled).toBe(patterns.length);
+    for (const mode of ["default", "auto", "plan"] as const) {
+      const rs =
+        mode === "default"
+          ? rules(["alwaysDeny", "Glob(secrets/**)"], ["alwaysAllow", "Glob"])
+          : rules(["alwaysDeny", "Glob(secrets/**)"]);
+      for (const pattern of patterns) {
+        const got = await gate("Glob", { pattern }, rs, mode);
+        expect({ mode, pattern, got, listed: leaks() }).toEqual({
+          mode,
+          pattern,
+          got: "deny",
+          listed: false,
+        });
+      }
+    }
+    const ask = rules(["alwaysAsk", "Glob(secrets/**)"], ["alwaysAllow", "Glob"]);
+    for (const pattern of ["*/.deploy-key", "*/prod.yml"]) {
+      expect({ pattern, got: await gate("Glob", { pattern }, ask) }).toEqual({
+        pattern,
+        got: "ask",
+      });
+    }
+    // A deny that names the hidden file itself. (Control: the tool lists it.)
+    await gate("Glob", { pattern: ".env" }, rules(["alwaysAllow", "Glob"]));
+    expect(lastResult).toBe(".env");
+    for (const deny of ["Glob(.env)", "Glob(**/.env)", "*(.env)"]) {
+      for (const pattern of [".env", "./.env", ".env/"]) {
+        const got = await gate(
+          "Glob",
+          { pattern },
+          rules(["alwaysDeny", deny], ["alwaysAllow", "Glob"]),
+        );
+        const listed = (lastResult ?? "").split("\n").includes(".env");
+        expect({ deny, pattern, got, listed }).toEqual({
+          deny,
+          pattern,
+          got: "deny",
+          listed: false,
+        });
+      }
+    }
+    // A scoped allow names none of these, so it grants none of them.
+    const src = rules(["alwaysAllow", "Glob(src/*)"]);
+    for (const pattern of [".env", "secrets/.deploy-key", "*/.deploy-key", "secrets/*"]) {
+      expect({ pattern, got: await gate("Glob", { pattern }, src) }).toEqual({
+        pattern,
+        got: "ask",
+      });
+    }
+    expect(await gate("Glob", { pattern: "src/*.ts" }, src)).toBe("allow");
   }, 60_000);
 
   test("a git command given no path is read as the whole repository, wherever it runs", async () => {

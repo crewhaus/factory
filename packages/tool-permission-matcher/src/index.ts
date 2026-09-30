@@ -153,7 +153,17 @@ function tokenizeGlob(glob: string): GlobToken[] {
 
 /** A state of the glob automaton. Index 0 is always the accepting state. */
 type GlobState =
-  | { readonly t: "lit"; readonly c: number; readonly out: number }
+  | {
+      readonly t: "lit";
+      readonly c: number;
+      readonly out: number;
+      /**
+       * The literal is the first thing its segment of the glob writes (or
+       * follows a bare `**`, which may end on a `/`): the only way a Glob
+       * tool pattern reads a name that starts with `.`.
+       */
+      readonly lead?: true;
+    }
   | { readonly t: "notSlash"; readonly out: number }
   | { readonly t: "anyChar"; readonly out: number }
   | { t: "split"; a: number; readonly b: number }
@@ -253,9 +263,14 @@ function buildAutomaton(tokens: ReadonlyArray<GlobToken>): Automaton {
   for (let i = tokens.length - 1; i >= 0; i--) {
     const token = tokens[i] as GlobToken;
     switch (token.k) {
-      case "lit":
-        next = push({ t: "lit", c: token.c, out: next });
+      case "lit": {
+        const before = tokens[i - 1];
+        const lead =
+          before === undefined ||
+          (before.k === "lit" ? before.c === SLASH : before.k !== "star" && before.k !== "qmark");
+        next = push({ t: "lit", c: token.c, out: next, ...(lead ? { lead: true as const } : {}) });
         break;
+      }
       case "qmark":
         next = push({ t: "notSlash", out: next });
         break;
@@ -333,11 +348,26 @@ function stepIn(automaton: Automaton, set: ReadonlyArray<number>, c: number): nu
 }
 
 /**
- * Is there a path both automata accept? With `visible`, only a path in which
- * no segment starts with `.` counts (the Glob tool never lists one). The
- * search runs over pairs of states, one from each, reading one character at
- * a time: a literal on either side decides it, and two wildcards read a
- * character that is neither `/` nor `.`, which leaves every choice open.
+ * Does `st`, a state of a Glob tool pattern, read a `.` that starts a name?
+ * Only a literal the pattern writes first in its segment does: the tool's
+ * wildcards never read one (Bun.Glob with `dot: false`).
+ */
+function readsLeadingDot(st: GlobState): boolean {
+  return st.t === "lit" && st.c === DOT && st.lead === true;
+}
+
+/**
+ * Is there a path both automata accept? With `visible`, `a` is a Glob tool
+ * pattern, and a path counts only when every `.` that starts one of its
+ * segments is one `a` writes literally ({@link readsLeadingDot}): the tool
+ * lists `.env` for the pattern `.env`, and `secrets/.key` for `*` + `/.key`,
+ * never a hidden name for `**` + `/*`. That reads at least every path the
+ * tool lists: Bun.Glob does not descend into a hidden directory a pattern
+ * names literally part-way (`.secrets/key.txt` lists nothing), and reading
+ * those as listed only fires more denies and asks. The search runs over
+ * pairs of states, one from each, reading one character at a time: a
+ * literal on either side decides it, and two wildcards read a character
+ * that is neither `/` nor `.`, which leaves every choice open.
  */
 function automataIntersect(
   a: Automaton,
@@ -364,7 +394,7 @@ function automataIntersect(
     if (sx.t === "accept" || sy.t === "accept" || sx.t === "split" || sy.t === "split") continue;
     const c = sx.t === "lit" ? sx.c : sy.t === "lit" ? sy.c : OTHER;
     if (!reads(sx, c) || !reads(sy, c)) continue;
-    if (visible && atStart && c === DOT) continue;
+    if (visible && atStart && c === DOT && !readsLeadingDot(sx)) continue;
     pushPairs(closureOfState(a, sx.out), closureOfState(b, sy.out), c === SLASH);
   }
   return false;
@@ -374,8 +404,9 @@ function automataIntersect(
 const OTHER = 0x61;
 
 /**
- * Does `outer` accept every path `inner` accepts (with `visible`, every such
- * path with no segment starting with `.`)? Both are determinised together,
+ * Does `outer` accept every path `inner` accepts (with `visible`, `inner` is
+ * a Glob tool pattern and every path it can list, as {@link
+ * automataIntersect} reads it)? Both are determinised together,
  * one character class at a time, and a set of `inner`'s states that accepts
  * beside a set of `outer`'s that does not is a path `outer` misses. `false`
  * when working that out would take more than a bounded amount of work: an
@@ -407,8 +438,13 @@ function automatonIncludedIn(
   while (queue.length > 0) {
     const [i, o, atStart] = queue.pop() as readonly [number[], number[], boolean];
     for (const c of alphabet) {
-      if (visible && atStart && c === DOT) continue;
-      const ni = stepIn(inner, i, c);
+      // A `.` that starts a name is read only by a literal the pattern
+      // writes there; its wildcards never list one.
+      const from =
+        visible && atStart && c === DOT
+          ? i.filter((s) => readsLeadingDot(inner.states[s] as GlobState))
+          : i;
+      const ni = stepIn(inner, from, c);
       if (ni.length === 0) continue;
       const no = stepIn(outer, o, c);
       if (ni.includes(0) && !no.includes(0)) return false;
@@ -857,8 +893,10 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   directory (nor a link to one), so nothing lies beneath it: the runtime's
  *   canonicaliser sets it, and a `beneath` field then stands for itself.
  * - `globPattern` — each spelling is a Glob tool pattern, relative to the
- *   workspace root: the value stands for every path it can list, and the
- *   Glob tool never lists a name that starts with `.`. A deny or ask fires
+ *   workspace root: the value stands for every path it can list. The Glob
+ *   tool's wildcards never read a name that starts with `.`, but a name the
+ *   pattern writes literally is listed (`.env`, `*` + `/.key`), so `alwaysDeny
+ *   Glob(.env)` fires on `.env` and not on `**` + `/*`. A deny or ask fires
  *   when the pattern can list a path its glob names (`alwaysDeny
  *   Glob(secrets/**)` on `**` + `/*`), and an allow grants it only when every
  *   path it can list is one the allow names (`Glob(src/**)` grants
@@ -1475,10 +1513,10 @@ function standsForAnyFires(
 /**
  * A Glob tool pattern (`OperativeValue.globPattern`) against a rule: an
  * allow must name every path the pattern can list, a deny or ask fires when
- * it names one. A path the tool lists never has a segment starting with
- * `.` below the workspace root; an absolute spelling is read without that,
- * since the root's own path may hold one. A deny or ask folds case as it
- * does for any path.
+ * it names one. Below the workspace root, a path the tool lists has a
+ * segment starting with `.` only where the pattern writes that `.`
+ * literally; an absolute spelling is read without that, since the root's
+ * own path may hold one. A deny or ask folds case as it does for any path.
  */
 function globPatternMatches(
   value: OperativeValue,
@@ -1490,8 +1528,9 @@ function globPatternMatches(
     polarity === "allow" ? value.canonical : [...value.canonical, ...(value.spellings ?? [])]
   ).filter((c) => isAbsoluteSpelling(c) === absoluteGlob);
   if (candidates.some((c) => c.length > MAX_GLOB_PATTERN_CHARS)) return polarity === "restrict";
-  // Below the workspace root the tool lists no hidden name. A leading `./`
-  // is the root itself, not a hidden segment.
+  // Below the workspace root the tool lists a hidden name only where the
+  // pattern writes it. A leading `./` is the root itself, not a hidden
+  // segment.
   const visible = (c: string): boolean => !isAbsoluteSpelling(c);
   const startsSegment = (c: string): boolean => !c.startsWith("./");
   const argGlob = compiled.argGlob ?? "";

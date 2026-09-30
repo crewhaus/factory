@@ -14,12 +14,16 @@
  *     matcher reads the values the runtime hands it.)
  */
 import { describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
   type OperativeValue,
   compilePattern,
   legacyMcpToolName,
   matchesPattern,
   matchesToolName,
+  normalizePathLexically,
 } from "./index";
 
 // ---------------------------------------------------------------------------
@@ -1426,8 +1430,73 @@ describe("a directory the tool walks: a deny or ask naming anything beneath it f
 // Final review (0.7.1): the Glob tool's pattern was matched as its text, so
 // `alwaysDeny Glob(secrets/**)` missed `**` + `/*`, which lists everything
 // under secrets/, and `alwaysAllow Glob(src/*)` granted `src/**`. A pattern
-// now stands for every path it can list, and the Glob tool never lists a
-// name that starts with `.`.
+// now stands for every path it can list. The Glob tool's wildcards never
+// read a name that starts with `.`, but a name the pattern writes literally
+// is listed (`.env`, `*` + `/.key`): the closeout review found the first
+// version treating those as never listed, so `alwaysDeny Glob(secrets/**)`
+// let `*` + `/.deploy-key` list secrets/.deploy-key.
+
+/**
+ * What the Glob tool can list with `glob`, in the 0.7.0 grammar: a path the
+ * 0.7.0 compiler matches in which every `.` that starts a segment is one the
+ * pattern writes first in its segment (or after a bare `**`). Bun.Glob's
+ * wildcards never read one. Handles the characters the brute-force tests
+ * generate: letters, `.`, `/`, `*`, `**` and `?`.
+ */
+function oracleListingRegex(glob: string): RegExp {
+  // Any run in which no segment starts with `.`.
+  const run = "(?:(?<![^/])[^.]|(?<=[^/]).)*";
+  let re = "";
+  let i = 0;
+  let pos: GlobPos = "start";
+  let afterStar = false;
+  while (i < glob.length) {
+    const ch = glob.charAt(i);
+    const wasStar = afterStar;
+    afterStar = false;
+    if (ch === "*" && glob[i + 1] === "*") {
+      const afterTwo = glob[i + 2];
+      if (afterTwo === "/" && pos === "start") {
+        re += `(?:${run}/)?`;
+        pos = "start";
+        i += 3;
+      } else if (afterTwo === "/" && pos === "sep") {
+        re = `${re.slice(0, -1)}(?:/${run}/|/)`;
+        pos = "start";
+        i += 3;
+      } else if (afterTwo === undefined && pos === "sep") {
+        re = `${re.slice(0, -1)}(?:/${run})?`;
+        pos = "other";
+        i += 2;
+      } else {
+        re += run;
+        pos = "other";
+        i += 2;
+      }
+    } else if (ch === "*") {
+      // At a segment's start its first character is not `.`.
+      re += "(?:(?<=[^/])[^/]*|[^/.][^/]*)?";
+      afterStar = true;
+      pos = "other";
+      i++;
+    } else if (ch === "?") {
+      re += "(?:(?<=[^/])[^/]|[^/.])";
+      pos = "other";
+      i++;
+    } else if (ch === ".") {
+      // `*.env` does not list `.env`: the `*` wrote the segment's start.
+      re += wasStar ? "(?<=[^/])\\." : "\\.";
+      pos = "other";
+      i++;
+    } else {
+      if (!/^[a-z/]$/.test(ch)) throw new Error(`oracleListingRegex: ${JSON.stringify(ch)}`);
+      re += ch;
+      pos = ch === "/" ? "sep" : "other";
+      i++;
+    }
+  }
+  return new RegExp(`^${re}$`, "s");
+}
 describe("a Glob pattern stands for every path it can list", () => {
   const pattern = (p: string, extra: Partial<OperativeValue> = {}): OperativeValue => ({
     kind: "path",
@@ -1469,10 +1538,24 @@ describe("a Glob pattern stands for every path it can list", () => {
     // An extension the pattern cannot list is not its business.
     expect(fires("**/*.pem", "**/*.ts")).toBe(false);
     expect(fires("**/*.pem", "**/*")).toBe(true);
-    // The tool never lists a hidden name, even one the pattern spells.
-    for (const p of ["**/*", "*", ".env", "**/.env", ".git/**"]) {
+    // The tool's wildcards never read a hidden name...
+    for (const p of ["**/*", "*", "*.env", "?env", ".git/**", "{.env,x}", "[.]env"]) {
       expect({ p, fires: fires(".env", p) }).toEqual({ p, fires: false });
     }
+    // ...but it lists one the pattern writes (closeout review).
+    for (const p of [".env", "**/.env", ".e*"]) {
+      expect({ p, fires: fires(".env", p) }).toEqual({ p, fires: true });
+    }
+    // The runtime hands the matcher `./.env` as `.env` too; as written, it
+    // meets a rule written from `./`.
+    expect(fires("./.env", "./.env")).toBe(true);
+    expect(fires("./.env", "./*")).toBe(false);
+    for (const p of ["secrets/.deploy-key", "*/.deploy-key", "se*/.deploy-key", "*/.*"]) {
+      expect({ p, fires: fires("secrets/**", p) }).toEqual({ p, fires: true });
+    }
+    // A hidden directory the pattern writes is read as listed too.
+    expect(fires("**/key.txt", ".secrets/key.txt")).toBe(true);
+    expect(fires("**/key.txt", "*/key.txt")).toBe(true);
     // A brace list, a class or a negation is read as everything under the
     // pattern's literal directory part.
     expect(fires("secrets/**", "{secrets,x}/**")).toBe(true);
@@ -1489,8 +1572,13 @@ describe("a Glob pattern stands for every path it can list", () => {
       ["src/*", "src/*.ts"],
       ["**", "**/*"],
       ["src/**", "src/{a,b}/*.ts"],
-      // Hidden names are never listed, so the allow need not name them.
+      // A wildcard lists no hidden name, so the allow need not name one.
       ["src/*", "src/*"],
+      ["src/**", "src/**/*"],
+      // A name the pattern writes is one the allow names.
+      [".env", ".env"],
+      ["**", "*/.deploy-key"],
+      ["secrets/**", "secrets/.deploy-key"],
       // A pattern written from `./` lists what is under the root.
       ["./src/**", "./src/*.ts"],
     ] as const) {
@@ -1501,12 +1589,19 @@ describe("a Glob pattern stands for every path it can list", () => {
       ["src/**", "**/*.ts"],
       ["src/*.ts", "src/*"],
       ["src/**", "{src,secrets}/*"],
+      // A pattern that lists only a hidden name is not granted by an allow
+      // that names none of it (closeout review): it was, vacuously.
+      ["src/*", ".env"],
+      ["src/*", "secrets/.deploy-key"],
+      ["src/*", "*/.deploy-key"],
+      ["src/**", "*/.deploy-key"],
+      ["**/*.ts", ".env"],
     ] as const) {
       expect({ rule, p, grants: grants(rule, p) }).toEqual({ rule, p, grants: false });
     }
   });
 
-  test("agrees with trying every short visible path against the 0.7.0 compiler", () => {
+  test("agrees with trying every short path the tool can list against the 0.7.0 compiler", () => {
     const paths = [""];
     for (let len = 1; len <= 6; len++) {
       for (const base of paths.filter((x) => x.length === len - 1)) {
@@ -1516,10 +1611,8 @@ describe("a Glob pattern stands for every path it can list", () => {
       }
     }
     const hidden = (path: string) => path.split("/").some((seg) => seg.startsWith("."));
-    // A pattern written from `./` names the root with it, not a hidden
-    // directory: what it lists is read after it.
     const listable = (pattern: string, path: string) =>
-      pattern.startsWith("./") ? path.startsWith("./") && !hidden(path.slice(2)) : !hidden(path);
+      oracleListingRegex(pattern).test(path) && oracleGlobToRegex(pattern).test(path);
     const rand = prng(0x6106);
     const alphabet = ["a", ".", "/", "*", "**", "?"];
     const make = () => {
@@ -1528,12 +1621,13 @@ describe("a Glob pattern stands for every path it can list", () => {
       for (let i = 0; i < len; i++) glob += alphabet[Math.floor(rand() * alphabet.length)];
       return glob;
     };
-    const tally = { compared: 0, fires: 0, grants: 0 };
+    const tally = { compared: 0, fires: 0, grants: 0, hiddenListed: 0 };
     for (let n = 0; n < 500; n++) {
       const p = make();
       const rule = make();
       if (p.startsWith("/") || rule.startsWith("/")) continue;
-      const lists = paths.filter((v) => listable(p, v) && oracleGlobToRegex(p).test(v));
+      const lists = paths.filter((v) => listable(p, v));
+      if (lists.some(hidden)) tally.hiddenListed++;
       const named = oracleGlobToRegex(rule);
       const wantFires = lists.some((v) => named.test(v));
       const wantGrants = lists.every((v) => named.test(v));
@@ -1548,6 +1642,118 @@ describe("a Glob pattern stands for every path it can list", () => {
     expect(tally.compared - tally.fires).toBeGreaterThan(30);
     expect(tally.grants).toBeGreaterThan(30);
     expect(tally.compared - tally.grants).toBeGreaterThan(30);
+    // Patterns that list a hidden name the pattern writes are in the sample.
+    expect(tally.hiddenListed).toBeGreaterThan(20);
+  }, 60_000);
+
+  test("reads at least every path the real Bun.Glob lists, hidden names included", async () => {
+    // The model above is only as good as its premise about Bun.Glob, which
+    // the closeout review found false. This lists a real tree with the Glob
+    // tool's own options, so a Bun that lists more than the matcher reads
+    // fails here rather than in a permission gate.
+    const valid = (path: string) =>
+      !path.startsWith("/") &&
+      !path.includes("..") &&
+      // Windows drops a trailing `.` from a name.
+      path
+        .split("/")
+        .every((seg) => seg !== "" && !seg.endsWith("."));
+    // Every such path of five or six characters over `a`, `b`, `.` and `/`
+    // is a file, and each shorter prefix a directory: hidden files at the
+    // root and below, hidden directories, and `.` inside visible names.
+    const files: string[] = [];
+    let level = [""];
+    for (let len = 1; len <= 6; len++) {
+      level = level.flatMap((base) => ["a", "b", ".", "/"].map((c) => base + c));
+      if (len >= 5) files.push(...level.filter(valid));
+    }
+    const root = mkdtempSync(join(tmpdir(), "glob-listing-"));
+    try {
+      for (const file of files) {
+        mkdirSync(join(root, dirname(file)), { recursive: true });
+        writeFileSync(join(root, file), "");
+      }
+      const hidden = (path: string) => path.split("/").some((seg) => seg.startsWith("."));
+      const lexical = (path: string) => normalizePathLexically(path.split("\\").join("/")).path;
+      const rand = prng(0x0d07);
+      const alphabet = ["a", "b", ".", "/", "*", "**", "?"];
+      const make = () => {
+        let glob = "";
+        const len = 1 + Math.floor(rand() * 5);
+        for (let i = 0; i < len; i++) glob += alphabet[Math.floor(rand() * alphabet.length)];
+        return glob;
+      };
+      const patterns = [
+        // The closeout review's shapes: a literal hidden name last, after
+        // literals, after `*`, after `**`, and a hidden directory part-way.
+        ".aaaa",
+        "a/.aa",
+        "*/.aa",
+        "a*/.aa",
+        "*/*/.a",
+        "?/b/.a",
+        "**/.aa",
+        ".a/b/a",
+        ".a/*",
+        "*/.a*",
+        "a/.aa/",
+        "a//.aa",
+        "a/./.aa",
+        "./.aaaa",
+        "**/*",
+        ...Array.from({ length: 400 }, make),
+      ];
+      const tally = { patterns: 0, listing: 0, listed: 0, hiddenListed: 0, granted: 0 };
+      for (const raw of patterns) {
+        // The Glob tool refuses these before it lists anything.
+        if (raw.includes("..") || raw.startsWith("/")) continue;
+        // The runtime hands the matcher the pattern resolved lexically.
+        const p = lexical(raw);
+        if (p === ".") continue;
+        const listed: string[] = [];
+        for await (const rel of new Bun.Glob(raw).scan({ cwd: root, onlyFiles: true })) {
+          listed.push(lexical(rel));
+        }
+        tally.patterns++;
+        if (listed.length > 0) tally.listing++;
+        for (const v of listed) {
+          // The model reads it, and a deny naming exactly that file fires.
+          expect({ raw, p, v, model: oracleListingRegex(p).test(v), fires: fires(v, p) }).toEqual({
+            raw,
+            p,
+            v,
+            model: true,
+            fires: true,
+          });
+          tally.listed++;
+          if (hidden(v)) tally.hiddenListed++;
+        }
+        const rule = make();
+        if (rule.startsWith("/")) continue;
+        const named = oracleGlobToRegex(rule);
+        // A rule that names a listed path fires; an allow that grants the
+        // pattern names every path it lists.
+        if (listed.some((v) => named.test(v)))
+          expect({ raw, rule, fires: fires(rule, p) }).toEqual({ raw, rule, fires: true });
+        if (grants(rule, p)) {
+          tally.granted++;
+          expect({ raw, rule, unnamed: listed.filter((v) => !named.test(v)) }).toEqual({
+            raw,
+            rule,
+            unnamed: [],
+          });
+        }
+      }
+      expect(files.length).toBeGreaterThan(900);
+      expect(tally.patterns).toBeGreaterThan(250);
+      expect(tally.listing).toBeGreaterThan(100);
+      expect(tally.listed).toBeGreaterThan(1000);
+      // Hidden names the tool really lists are in the sample.
+      expect(tally.hiddenListed).toBeGreaterThan(10);
+      expect(tally.granted).toBeGreaterThan(20);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }, 60_000);
 
   test("a pattern too long to read as a pattern gets no allow and every deny", () => {
