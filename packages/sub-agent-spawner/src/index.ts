@@ -418,6 +418,18 @@ export async function spawnSubAgent(
       //     parent does. Only the fact is inherited: the child's tools and
       //     rules are still the narrowed ones above.
       ...(parent.sandboxAvailable === true ? { sandboxAvailable: true } : {}),
+      //   - justificationJudge + the audit sinks: 0.7.1. A child's
+      //     justification-gated call is judged by the judge the spec names,
+      //     as the parent's are, and its verdicts and egress warnings land on
+      //     the parent's hash-chained audit log. Without them the child fell
+      //     back to the rule-based default, which denies every such call.
+      ...(parent.justificationJudge !== undefined
+        ? { justificationJudge: parent.justificationJudge }
+        : {}),
+      ...(parent.justificationAuditSink !== undefined
+        ? { justificationAuditSink: parent.justificationAuditSink }
+        : {}),
+      ...(parent.egressAuditSink !== undefined ? { egressAuditSink: parent.egressAuditSink } : {}),
       ...(opts._client !== undefined ? { _adapter: opts._client as ProviderAdapter } : {}),
     });
   } catch (err) {

@@ -6539,6 +6539,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       // 0.7.1 — a Task child runs against this process's sandbox backend, so
       // it passes the sandbox floor exactly when this loop does.
       ...(opts.sandboxAvailable === true ? { sandboxAvailable: true as const } : {}),
+      // 0.7.1 — and judges a justification-gated call with this loop's judge,
+      // writing its verdicts and egress warnings to this loop's audit log.
+      ...(opts.justificationJudge !== undefined
+        ? { justificationJudge: opts.justificationJudge }
+        : {}),
+      ...(opts.justificationAuditSink !== undefined
+        ? { justificationAuditSink: opts.justificationAuditSink }
+        : {}),
+      ...(opts.egressAuditSink !== undefined ? { egressAuditSink: opts.egressAuditSink } : {}),
       specModels: bridgeSpecModels,
     };
     // Spin "running <tool>…" for exactly the execution window — started after

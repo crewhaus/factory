@@ -359,7 +359,9 @@ built it.
   checked every justification-gated call (HttpRequest, EmailSend,
   DownloadFile and the rest) with the built-in rule check, which denies them
   all outside tests. The bundle now builds the same judge `crewhaus run`
-  does and writes the same audit log. Recompile to pick it up.
+  does and writes the same audit log. Recompile to pick it up. A sub-agent
+  now judges its gated calls with that judge too, in the bundle and in
+  `crewhaus run`, and logs them on the same audit log.
 - **A model profile or pool candidate can narrow to a tool the shape grants
   through a category**: `tools: [csvParse]` under a shape's
   `tools: [all-data]` was refused as "not one of the shape's tools".
@@ -627,8 +629,8 @@ deny, warn or fail `--strict`; each says what to write instead.
   - Any other shape has no `security:` block: set
     `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` where it runs to accept the
     rule check.
-  - `crewhaus eval`, `crewhaus optimize` and sub-agents do not use the judge
-    yet: set the same variable for them.
+  - `crewhaus eval` and `crewhaus optimize` do not use the judge yet: set
+    the same variable for them.
 
   OpenExternal also asks in auto mode unless a rule allows it.
 - **ImageGenerate pointed at another endpoint** needs `OPENAI_BASE_URL` set to

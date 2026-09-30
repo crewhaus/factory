@@ -1376,3 +1376,150 @@ describe("spawnSubAgent — the sandbox floor sees the parent's backend (0.7.1)"
     }
   });
 });
+
+/**
+ * 0.7.1 review — a sub-agent judges a justification-gated call with the judge
+ * its parent was given (`security.justification.judge`), and writes the
+ * verdict to the parent's audit log. Before, the child loop was never handed
+ * the judge, so it fell back to runtime-core's rule-based default: outside
+ * tests that denies every gated call (HttpRequest, EmailSend, DownloadFile),
+ * so a sub-agent could make none, whatever the spec named.
+ */
+describe("spawnSubAgent — the parent's justification judge and audit log (0.7.1)", () => {
+  const GATED = "Gated";
+  const makeGatedTool = (ran: string[]): RegisteredTool =>
+    buildTool({
+      name: GATED,
+      description: "stands in for HttpRequest: every call carries a justification",
+      inputSchema: z.object({ url: z.string(), justification: z.string() }),
+      requireJustification: true,
+      execute: async (input) => {
+        ran.push(input.url);
+        return "sent";
+      },
+    });
+  const allowGated: RuleSet = {
+    ...emptyRuleSet,
+    yaml: [{ type: "alwaysAllow", pattern: GATED, source: "yaml" }],
+  };
+  const childScript = (): ProviderAdapter =>
+    makeScriptedClient([
+      [
+        {
+          type: "tool_use",
+          id: "tu_gated",
+          name: GATED,
+          input: { url: "https://api.example.com/status", justification: "check the status" },
+        } as Anthropic.ToolUseBlock,
+      ],
+      [{ type: "text", text: "child done", citations: null } as Anthropic.TextBlock],
+    ]);
+  /** A judge that says who it is, and a log that keeps what it is handed. */
+  const seams = () => {
+    const judged: string[] = [];
+    const logged: Array<{ kind: string; payload: unknown }> = [];
+    return {
+      judged,
+      logged,
+      justificationJudge: (input: { toolName: string }) => {
+        judged.push(input.toolName);
+        return { allow: true, reason: "the goal names it", judgeModel: "spec-judge" };
+      },
+      justificationAuditSink: {
+        append: async (record: {
+          kind: "permission_justification_evaluated";
+          payload: unknown;
+        }) => {
+          logged.push(record);
+        },
+      },
+    };
+  };
+
+  test("a child's gated call is judged by the parent's judge and logged on the parent's sink", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog } = await makeParent(root);
+      const s = seams();
+      const ran: string[] = [];
+      await spawnSubAgent(
+        {
+          ...parent,
+          justificationJudge: s.justificationJudge,
+          justificationAuditSink: s.justificationAuditSink,
+        },
+        {
+          def: { ...DEF_NO_TOOLS, tools: [GATED] },
+          prompt: "check it",
+          permissionMode: "auto",
+          permissionRules: allowGated,
+          childTools: [makeGatedTool(ran)],
+          sessionRootDir: root,
+          _client: childScript(),
+        },
+      );
+      expect(s.judged).toEqual([GATED]);
+      expect(ran).toEqual(["https://api.example.com/status"]);
+      expect(s.logged).toHaveLength(1);
+      expect(s.logged[0]).toMatchObject({
+        kind: "permission_justification_evaluated",
+        payload: { toolName: GATED, verdict: "allow", judgeModel: "spec-judge" },
+      });
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("end to end: a parent loop's judge reaches the child through the Task tool", async () => {
+    const root = newTempRoot();
+    try {
+      const s = seams();
+      const ran: string[] = [];
+      const checker: SubAgentDefinition = {
+        name: "checker",
+        description: "checks the status",
+        instructions: "Check the status API.",
+        tools: [GATED],
+      };
+      const subAgents = new Map([[checker.name, checker]]);
+      await runChatLoop({
+        model: "test-model",
+        instructions: "delegate to the checker",
+        _adapter: makeScriptedClient([
+          [
+            {
+              type: "tool_use",
+              id: "tu_task",
+              name: "Task",
+              input: { description: "c", prompt: "check it", subagent_type: "checker" },
+            } as Anthropic.ToolUseBlock,
+          ],
+          [{ type: "text", text: "parent done", citations: null } as Anthropic.TextBlock],
+        ]),
+        sessionRootDir: root,
+        singleTurn: true,
+        seedMessages: [{ role: "user", content: "go" }],
+        tools: [makeGatedTool(ran), createTaskTool({ subAgents })],
+        permissionMode: "auto",
+        permissionRules: {
+          ...allowGated,
+          yaml: [...allowGated.yaml, { type: "alwaysAllow", pattern: "Task", source: "yaml" }],
+        },
+        justificationJudge: s.justificationJudge,
+        justificationAuditSink: s.justificationAuditSink,
+        installSigintHandler: false,
+        subAgents,
+        spawnSubAgent: async (parent, opts: SpawnSubAgentOptions) =>
+          spawnSubAgent(parent, { ...opts, _client: childScript() }),
+      });
+      expect(s.judged).toEqual([GATED]);
+      expect(ran).toEqual(["https://api.example.com/status"]);
+      expect(s.logged.map((r) => (r.payload as { judgeModel: string }).judgeModel)).toEqual([
+        "spec-judge",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
