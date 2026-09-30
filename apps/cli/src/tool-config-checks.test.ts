@@ -16,7 +16,10 @@
  * Registrars set process-wide state, so the probes run in a child process.
  */
 import { describe, expect, test } from "bun:test";
-import { TOOL_BOOT_REGISTRARS } from "@crewhaus/tool-categories";
+import { compile, lower } from "@crewhaus/compiler";
+import { parseSpec } from "@crewhaus/spec";
+import { BUILTIN_TOOLS, TOOL_BOOT_REGISTRARS, checkBuiltinTool } from "@crewhaus/tool-categories";
+import { emitCfWorkerBundle } from "./cf-worker-emit";
 
 const PROBE = `
 const { TOOL_BOOT_REGISTRARS, toolConfigProblems } = await import("@crewhaus/tool-categories");
@@ -77,4 +80,63 @@ describe("tool_config checks agree with the registrars they stand in for", () =>
     expect(declared.length).toBeGreaterThanOrEqual(8);
     expect(results.filter((r) => r.mismatches.length > 0)).toEqual([]);
   }, 30_000);
+});
+
+describe("a cf-worker bundle registers only blocks its registrars accept", () => {
+  // Closeout review: `--emit-as cf-worker` (and the compiler-worker) skip
+  // compile(), so `fetch.allowed_origins: ["api.example.com"]` emitted a
+  // worker whose registerFetchConfig threw as the module loaded.
+  test("every checked registrar the edge wires is refused at emit as compile refuses it", () => {
+    const cases: Array<{ key: string; symbol: string; bad: object; good: object }> = [];
+    for (const [key, entry] of Object.entries(BUILTIN_TOOLS)) {
+      const symbol = entry.initSymbol;
+      if (symbol === undefined || cases.some((c) => c.symbol === symbol)) continue;
+      const checks = TOOL_BOOT_REGISTRARS[symbol]?.checks;
+      if (TOOL_BOOT_REGISTRARS[symbol]?.source !== "tool_config" || checks === undefined) continue;
+      const verdict = checkBuiltinTool(key, "cf-worker");
+      if (verdict.kind !== "ok" && verdict.kind !== "inert") continue;
+      const list = checks.origins?.keys[0];
+      const refused = checks.refused?.keys[0];
+      if (list !== undefined) {
+        cases.push({
+          key,
+          symbol,
+          bad: { [list]: ["api.example.com"] },
+          good: { [list]: ["https://api.example.com"] },
+        });
+      } else if (refused !== undefined) {
+        cases.push({ key, symbol, bad: { [refused]: true }, good: {} });
+      }
+    }
+    // Derived from the tables, and asserted, so a sweep that reached nothing fails.
+    expect(cases.map((c) => c.key)).toContain("fetch");
+    const spec = (key: string, block: object) =>
+      `name: t\ntarget: cli\nagent:\n  model: claude-haiku-4-5\n  instructions: hi\ntools: [${key}]\ntool_config:\n  ${key}: ${JSON.stringify(block)}\n`;
+    const refusal = (run: () => unknown): string | undefined => {
+      try {
+        run();
+      } catch (err) {
+        return (err as Error).message;
+      }
+      return undefined;
+    };
+    for (const c of cases) {
+      const host = refusal(() => compile(spec(c.key, c.bad)));
+      const edge = refusal(() => emitCfWorkerBundle(lower(parseSpec(spec(c.key, c.bad)))));
+      expect({ key: c.key, refused: host !== undefined, edge }).toEqual({
+        key: c.key,
+        refused: true,
+        edge: host,
+      });
+      // The same block, well formed, is registered by the worker.
+      const worker =
+        emitCfWorkerBundle(lower(parseSpec(spec(c.key, c.good)))).files.find(
+          (f) => f.path === "worker.js",
+        )?.content ?? "";
+      expect({ key: c.key, registers: worker.includes(`${c.symbol}(`) }).toEqual({
+        key: c.key,
+        registers: true,
+      });
+    }
+  });
 });

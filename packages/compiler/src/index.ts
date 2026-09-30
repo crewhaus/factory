@@ -1250,6 +1250,11 @@ function ungrantedSubAgentTools(ir: IrNode): ReadonlyArray<CompileWarning> {
  *   - WARNS (`edge-unsafe-tool`) for a custom name whose edge-safety cannot
  *     be verified offline.
  *
+ *   - THROWS `CompilerError` for a `tool_config` block the worker registers
+ *     at load and its registrar refuses (an allow-list entry that is not an
+ *     origin, a refused key), or two blocks for one registrar, as compile
+ *     does for a host bundle: the worker would throw as its module loads.
+ *
  * Called by the cf-worker emit paths over their already-lowered IR, so the
  * edge rule has one home and cannot drift per emitter.
  */
@@ -1260,6 +1265,10 @@ export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWa
     throw new CompilerError(
       `cf-worker target cannot run ${rejected.length} host tool(s): ${rejected.map((r) => r.reason).join("; ")}. These need a host (process/filesystem/sandbox/device) the edge does not provide — use the cli target for them, or remove them.`,
     );
+  }
+  const refused = edgeToolConfigProblems(sites);
+  if (refused.length > 0) {
+    throw new CompilerError(refused.map((p) => `${p.path}: ${p.message}`).join("\n"));
   }
   const warnings: CompileWarning[] = [];
   const reported = new Set<string>();
@@ -1276,6 +1285,33 @@ export function assertCfWorkerToolsEdgeSafe(ir: IrNode): ReadonlyArray<CompileWa
     }
   }
   return warnings;
+}
+
+/**
+ * The `tool_config` blocks a cf-worker bundle registers when its module loads
+ * — those of the builtins the edge wires, as `resolveBuiltinTools` plans them
+ * — checked as {@link checkToolConfigDelivery} checks a host bundle's.
+ * `--emit-as cf-worker` and the compiler-worker skip `compile()`, so without
+ * this a block such as `fetch.allowed_origins: ["api.example.com"]` emitted
+ * a worker that threw at load.
+ */
+function edgeToolConfigProblems(
+  sites: ReadonlyArray<IrToolSite>,
+): ReadonlyArray<{ readonly path: string; readonly message: string }> {
+  const check = checkToolConfigs(
+    sites.map((site) => ({
+      tools: site.tools.filter((key) => {
+        const verdict = checkBuiltinTool(key, "cf-worker");
+        return verdict.kind === "ok" || verdict.kind === "inert";
+      }),
+      ...(site.toolConfigs !== undefined ? { toolConfigs: site.toolConfigs } : {}),
+      path: toolConfigPathOf(site),
+    })),
+  );
+  return [
+    ...check.conflicts.map((c) => ({ path: c.path, message: c.message })),
+    ...check.inits.flatMap((init) => toolConfigProblems(init)),
+  ];
 }
 
 type SpecWithPermissions = Exclude<Spec, { target: "eval" }>;
