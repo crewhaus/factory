@@ -721,77 +721,122 @@ describe("Grep searches every file, whatever its size (0.7.1 review)", () => {
 });
 
 describe("Grep keeps 0.7.0's pace with no literal to pre-filter on (0.7.1 review)", () => {
-  /**
-   * About 12 MB of source-like lines in 300 files, a few holding a 40-digit
-   * hex id. `[0-9a-f]{40}` names no plain character, so every line goes to
-   * the regex worker.
+  /*
+   * 0.7.1 before its review fix took 3-4x 0.7.0's time on a 58 MB source
+   * tree (5-7x on a tree of short lines), for two reasons: it waited for
+   * each batch's answer before reading the next, and it sent each batch as
+   * an array of strings, copied one string at a time. This used to be proved
+   * by timing Grep against an in-thread loop, best of up to twelve rounds,
+   * within 4x. That is a race between two clocks under whatever else the
+   * machine is doing: on CI's loaded ubuntu runner it measured 4.2x and
+   * failed (run 36662602185), and it failed the local full suite too. So
+   * each cause is now pinned by counting what Grep does instead.
    */
-  async function sourceTree(dir: string): Promise<number> {
+
+  /** `files` files of `lines` source-like lines; returns the lines written. */
+  async function sourceTree(dir: string, files: number, lines: number): Promise<number> {
     await mkdir(dir);
-    let ids = 0;
-    for (let f = 0; f < 300; f++) {
-      const lines: string[] = [];
-      for (let i = 0; i < 900; i++) {
-        const n = f * 900 + i;
-        if (n % 997 === 0) {
-          lines.push(
-            `  const id = "${(n * 2_654_435_761).toString(16).padStart(8, "0").repeat(5)}";`,
-          );
-          ids++;
-        } else {
-          lines.push(
-            `    const value${n % 89} = someFunction(argumentNumber${n % 97}, "text ${n}"); // note`,
-          );
-        }
+    for (let f = 0; f < files; f++) {
+      const body: string[] = [];
+      for (let i = 0; i < lines; i++) {
+        const n = f * lines + i;
+        body.push(
+          `    const value${n % 89} = someFunction(argumentNumber${n % 97}, "text ${n}"); // note`,
+        );
       }
-      await writeFile(path.join(dir, `f${f}.ts`), `${lines.join("\n")}\n`);
+      await writeFile(path.join(dir, `f${f}.ts`), `${body.join("\n")}\n`);
     }
-    return ids;
+    return files * lines;
   }
 
-  /** 0.7.0's Grep, on the caller's thread: read, split, test each line. */
-  function inThread(dir: string, pattern: RegExp): { ms: number; hits: number } {
-    const started = performance.now();
-    let hits = 0;
-    for (const name of readdirSync(dir)) {
-      for (const line of readFileSync(path.join(dir, name), "utf8").split("\n")) {
-        if (line.length <= 10_000 && pattern.test(line)) hits++;
-      }
-    }
-    return { ms: performance.now() - started, hits };
+  /** A session that runs the real worker and hands each testEach request to `seen` first. */
+  function recordingSession(
+    seen: (request: RegexRequest) => void,
+    hold?: () => Promise<void>,
+  ): RegexSession {
+    const real = openRegexSession();
+    return {
+      async run<R extends RegexRequest>(request: R): Promise<RegexOutcome<ResultOf<R>>> {
+        if (request.op === "testEach") seen(request);
+        const outcome = await real.run(request);
+        if (request.op === "testEach" && hold !== undefined) await hold();
+        return outcome;
+      },
+      close: () => real.close(),
+    };
   }
 
-  test("a search every line of which goes to the worker stays close to an in-thread loop", async () => {
-    // 0.7.1 before this waited for each batch in turn and sent it as an
-    // array of strings: 3-4x 0.7.0's time on a 58 MB source tree, which
-    // under load then stopped at the deadline with most of its hits
-    // unfound; now it matches 0.7.0 there. On this tree of short lines the
-    // loop below takes what 0.7.0's Grep took; 0.7.1 before this took 5-7
-    // times as long, and now 2-3 times (the worker's fixed cost per line).
-    // Both runs are timed on the same files, interleaved, and the best of
-    // each is compared, so the machine's load falls on both alike; a round
-    // a load spike spoiled is outweighed by the next, up to twelve.
+  test("every line goes to the worker as one string per batch, and each batch is filled", async () => {
     const dir = path.join(tmp, "src");
-    const ids = await sourceTree(dir);
-    _setGrepLimitsForTest({ deadlineMs: 120_000 });
-    const pattern = "[0-9a-f]{40}";
-    let best = { grep: Number.POSITIVE_INFINITY, inThread: Number.POSITIVE_INFINITY };
-    for (let round = 0; round < 12; round++) {
-      const base = inThread(dir, new RegExp(pattern));
-      expect(base.hits).toBe(ids);
-      const started = performance.now();
-      const result = String(await grep.execute({ pattern, path: "src" }));
-      const ms = performance.now() - started;
-      expect(result.split("\n")).toHaveLength(ids);
-      expect(result).not.toContain("[grep:");
-      // Round 0 warms the worker, the JIT and the page cache for both.
-      if (round > 0) {
-        best = { grep: Math.min(best.grep, ms), inThread: Math.min(best.inThread, base.ms) };
-      }
-      if (round >= 5 && best.grep < 4 * best.inThread) break;
-    }
-    expect(best.grep).toBeLessThan(4 * best.inThread);
-  }, 120_000);
+    const total = await sourceTree(dir, 12, 400);
+    const batchChars = 50_000;
+    const sent: { lines: unknown; chars: number; count: number }[] = [];
+    _setGrepLimitsForTest({
+      batchChars,
+      workerInputChars: batchChars,
+      openSession: () =>
+        recordingSession((request) => {
+          const inputs = (request as { inputs: { lines?: unknown } }).inputs;
+          const text = typeof inputs.lines === "string" ? inputs.lines : "";
+          sent.push({ lines: inputs.lines, chars: text.length, count: text.split("\n").length });
+        }),
+    });
+    const result = String(await grep.execute({ pattern: "[0-9a-f]{40}", path: "src" }));
+    expect(result).toBe("no matches");
+    // One string crosses to the worker per batch, never an array of lines.
+    expect(sent.map((b) => typeof b.lines)).toEqual(sent.map(() => "string"));
+    // Every line was sent, once (each file's text ends in a newline, and
+    // the empty line after it is sent too, as 0.7.0's split sent it).
+    expect(sent.reduce((n, b) => n + b.count, 0)).toBe(total + 12);
+    // Batches are filled to the limit, not cut per file: all but the last
+    // hold within one line of batchChars (the files are ~34 KB each).
+    const longest = 90;
+    expect(sent.length).toBeGreaterThanOrEqual(5);
+    for (const b of sent.slice(0, -1)) expect(b.chars).toBeGreaterThan(batchChars - 2 * longest);
+  }, 20_000);
+
+  test("the next batch is read while the one before it is in the worker", async () => {
+    // A batch holds more than a file, so between sending batch k and needing
+    // its answer (when batch k+1 is full) the scan crosses into another
+    // file, and asks the clock there, as it does before each file. The
+    // session holds each answer until the scan has done that, or until
+    // 10 000 event-loop turns have passed without it — which is what
+    // happens if the scan waits for each answer before reading on.
+    const dir = path.join(tmp, "src");
+    await sourceTree(dir, 6, 400);
+    let clockReads = 0;
+    let readsAtSend = 0;
+    const overlapped: boolean[] = [];
+    _setGrepLimitsForTest({
+      deadlineMs: 120_000,
+      now: () => {
+        clockReads++;
+        return Date.now();
+      },
+      batchChars: 40_000,
+      workerInputChars: 40_000,
+      openSession: () =>
+        recordingSession(
+          () => {
+            readsAtSend = clockReads;
+          },
+          async () => {
+            const at = readsAtSend;
+            for (let turn = 0; turn < 10_000 && clockReads === at; turn++) {
+              await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+            overlapped.push(clockReads > at);
+          },
+        ),
+    });
+    const result = String(await grep.execute({ pattern: "[0-9a-f]{40}", path: "src" }));
+    expect(result).toBe("no matches");
+    // Five batches of 40 000 over six files of about 32 000.
+    expect(overlapped.length).toBeGreaterThanOrEqual(5);
+    // The last two have no file after them to read (the scan has ended by
+    // then); every batch before them overlapped the next file's read.
+    expect(overlapped.slice(0, -2)).toEqual(overlapped.slice(0, -2).map(() => true));
+  }, 20_000);
 });
 
 describe("Grep bounds the work an abandoned regex worker is left with (0.7.1 review)", () => {
