@@ -765,8 +765,9 @@ deny, warn or fail `--strict`; each says what to write instead.
   writes an audit log** to `.crewhaus/audit` in its working directory, as
   `crewhaus run` does: every justification verdict, and every outbound call
   the egress check warned about or blocked, hash chained.
-  `CREWHAUS_SECURITY_AUDIT=0` turns it off. A bundle whose spec declares no
-  judge is unchanged.
+  `CREWHAUS_SECURITY_AUDIT=0` turns it off. One that cannot create the log (a
+  read-only working directory) says so in one line and runs without it. A
+  bundle whose spec declares no judge is unchanged.
 - **Plan mode honours deny and ask rules.** It decided on the tool's
   read-only flag alone, so an `alwaysDeny` on a read-only network tool did
   nothing there. A matching deny or ask now denies; allow rules are still

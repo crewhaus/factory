@@ -267,7 +267,14 @@ async function drain(
  */
 async function runBundle(
   yaml: string,
-  opts: { readonly withoutAnthropicKey?: boolean; readonly expectFailure?: boolean } = {},
+  opts: {
+    readonly withoutAnthropicKey?: boolean;
+    readonly expectFailure?: boolean;
+    /** Extra variables for the bundle's own run (not its compile). */
+    readonly runEnv?: Readonly<Record<string, string>>;
+    /** Prepare the working directory before the bundle runs. */
+    readonly prepare?: (sandbox: string) => void;
+  } = {},
 ): Promise<{
   readonly sandbox: string;
   readonly agentTs: string;
@@ -288,12 +295,13 @@ async function runBundle(
   if (compiled.exitCode !== 0) throw new Error(compiled.stderr.toString());
   rmSync(join(out, "package.json"), { force: true });
   linkWorkspacePackages(out);
+  opts.prepare?.(sandbox);
   requests.length = 0;
   const proc = Bun.spawn(
     [process.execPath, "--no-install", "--preload", liftLoopback(sandbox), join(out, "agent.ts")],
     {
       cwd: sandbox,
-      env,
+      env: { ...env, ...opts.runEnv },
       stdin: new TextEncoder().encode("check the status API\n"),
       stdout: "ignore",
       stderr: "pipe",
@@ -404,6 +412,24 @@ describe("a compiled cli bundle judges with the judge its spec names (0.7.1)", (
     expect(results).toHaveLength(1);
     expect(results[0]).toContain("justification denied (fail-closed)");
     expect(existsSync(join(run.sandbox, ".crewhaus", "audit"))).toBe(false);
+  }, 120_000);
+
+  test("an audit log it cannot create is reported in one line, and the judged call still runs", async () => {
+    // `.crewhaus/audit` is a file, so the log's directory cannot be made — on
+    // every platform and as any user, as on a read-only root filesystem.
+    const run = await runBundle(spec(JUDGED), {
+      prepare: (sandbox) => {
+        mkdirSync(join(sandbox, ".crewhaus"), { recursive: true });
+        writeFileSync(join(sandbox, ".crewhaus", "audit"), "not a directory");
+      },
+    });
+    expect(run.stderr).toContain("crewhaus: running without the security audit log:");
+    expect(run.stderr).toContain("CREWHAUS_SECURITY_AUDIT=0");
+    expect(run.stderr).not.toMatch(/\n\s+at /);
+    expect(judgeRequests(run.requests)).toHaveLength(1);
+    const results = agentResults(run.requests);
+    expect(results).toHaveLength(1);
+    expect((JSON.parse(results[0] as string) as { status: number }).status).toBe(200);
   }, 120_000);
 
   test("a named judge whose provider has no key stops the bundle at start, with the reason", async () => {

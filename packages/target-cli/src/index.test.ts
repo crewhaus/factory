@@ -625,8 +625,13 @@ describe("emitCli — security.justification (0.7.1: the bundle wires the judge 
       const content = agentOf(baseIr({ security: { justification: { judge } } }));
       expect(content).toContain('import { openAuditLog } from "@crewhaus/audit-log";');
       expect(content).toContain(
-        'await openAuditLog({ rootDir: __joinPath(__cwd, ".crewhaus", "audit") });',
+        'const __securityAuditDir = __joinPath(__cwd, ".crewhaus", "audit");',
       );
+      // One that cannot be opened is reported and skipped, never a raw stack.
+      expect(content).toContain(
+        "await openAuditLog({ rootDir: __securityAuditDir }).catch((__err: unknown) => {",
+      );
+      expect(content).toContain("crewhaus: running without the security audit log:");
       expect(content).toContain('process.env["CREWHAUS_SECURITY_AUDIT"] === "0"');
       expect(content).toContain(
         "? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }",

@@ -446,11 +446,18 @@ function renderJustificationGate(ir: IrV0): {
       : []),
     "// The durable, hash-chained audit log `crewhaus run` writes at <cwd>/.crewhaus/audit:",
     "// every justification verdict, and every egress warning or block.",
-    "// CREWHAUS_SECURITY_AUDIT=0 turns it off.",
+    "// CREWHAUS_SECURITY_AUDIT=0 turns it off. A bundle before 0.7.1 kept none, so one",
+    "// that cannot create it (a read-only working directory) says so and runs without it.",
+    `const __securityAuditDir = __joinPath(__cwd, ".crewhaus", "audit");`,
     "const __securityAudit =",
     `  process.env["CREWHAUS_SECURITY_AUDIT"] === "0"`,
     "    ? undefined",
-    `    : await openAuditLog({ rootDir: __joinPath(__cwd, ".crewhaus", "audit") });`,
+    "    : await openAuditLog({ rootDir: __securityAuditDir }).catch((__err: unknown) => {",
+    "        process.stderr.write(",
+    "          `crewhaus: running without the security audit log: ${__securityAuditDir} could not be opened (${__err instanceof Error ? __err.message : String(__err)}). Set CREWHAUS_SECURITY_AUDIT=0 to run without it and not see this.\\n`,",
+    "        );",
+    "        return undefined;",
+    "      });",
   ].join("\n");
   const judgeField = claude
     ? "\n  ...(__justificationJudge !== undefined ? { justificationJudge: __justificationJudge } : {}),"
