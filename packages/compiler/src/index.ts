@@ -152,6 +152,10 @@ import {
   toolConfigBlockFor,
   toolConfigProblems,
 } from "@crewhaus/tool-categories";
+import {
+  shadowedPermissionRules,
+  specPermissionRuleLists,
+} from "@crewhaus/tool-permission-matcher";
 // Loop contract 0.4 (Batch F, G12/G83) — the cf-worker edge-safety tool policy
 // lives in `@crewhaus/worker-runtime` (the runtime that would execute the
 // tools on the edge). Imported via the `/tool-policy` SUBPATH so this offline
@@ -324,8 +328,40 @@ export function compile(yamlText: string, opts: CompileOptions = {}): CompileRes
       : emit(ir, { readme: opts.readme !== false });
   return {
     files: bundle.files,
-    warnings: [...collectCompileWarnings(spec), ...lowered.warnings, ...shapeTools.warnings],
+    warnings: [
+      ...collectCompileWarnings(spec),
+      ...lowered.warnings,
+      ...shapeTools.warnings,
+      ...(opts.applyIrPasses === true ? ruleOrderWarnings(spec) : []),
+    ],
   };
+}
+
+/**
+ * 0.7.1 — the deny and ask rules an allow above them always beats (see
+ * `shadowedPermissionRules`), as compile warnings, in the codes `crewhaus
+ * compile` prints them with: `permission-rule`, or `permission-rule-note` in
+ * a plan-mode spec, where the rule still fires.
+ *
+ * Returned for `applyIrPasses` only. Those passes used to sort
+ * `permissions.rules` deny-first, so an allow written above a narrower deny
+ * was a deny in such a bundle; the rules now keep their order, as every other
+ * compile path always did, and that allow decides. The CLI runs this check
+ * itself on every compile; a library caller that asks for the passes (the
+ * compiler worker's `POST /compile`) is the one whose bundles changed, so it
+ * is told here.
+ */
+function ruleOrderWarnings(spec: Spec): CompileWarning[] {
+  // Not every shape carries `permissions:`; read the mode where one does.
+  const mode = (spec as { readonly permissions?: { readonly mode?: string } }).permissions?.mode;
+  return shadowedPermissionRules(
+    specPermissionRuleLists(spec),
+    mode !== undefined ? { mode } : {},
+  ).map((p) => ({
+    code: p.code === "shadowed-outside-plan" ? "permission-rule-note" : "permission-rule",
+    path: p.list,
+    message: p.message,
+  }));
 }
 
 /**

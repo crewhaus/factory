@@ -534,7 +534,9 @@ says "unknown", `null`, "undetermined" or "refused", with the reason.
   does.** The passes (`applyIrPasses`, which the compiler worker's
   `POST /compile` accepts) re-sorted `permissions.rules` deny-first, so an
   allow written above a narrower deny was a deny there. Rules keep their
-  order; only an exact repeat is dropped.
+  order; only an exact repeat is dropped. Such a bundle now lets that allow
+  decide, so the compile returns the warning `crewhaus compile` prints for
+  it: move the deny above the allow.
 - **`crewhaus lint` agrees with `compile` about tools**, and knows the tools
   a `thredz:` block adds. It also reports a key the spec's shape accepts but
   does not wire (`accepted-but-unwired`), which it used to call clean. `lint --fix` edits only the fields it fixes, inside

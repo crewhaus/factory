@@ -50,6 +50,63 @@ agent:
     expect(body.bundle.files.some((f) => f.path === "agent.ts")).toBe(true);
   });
 
+  // 0.7.1 review: the IR passes keep the rules in order now, so an allow
+  // above a narrower deny decides in this path as it does in the CLI's. The
+  // CLI warns about it; this path is told too.
+  test("POST /compile with applyIrPasses warns about a deny an allow above it always beats", async () => {
+    const yaml = `
+name: shadowed
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [bash]
+permissions:
+  rules:
+    - { type: alwaysAllow, pattern: Bash }
+    - { type: alwaysDeny, pattern: "Bash(rm -rf **)" }
+`;
+    const post = async (applyIrPasses: boolean) => {
+      const res = await worker.fetch(
+        request("/compile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ yaml, applyIrPasses }),
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        bundle: { warnings: ReadonlyArray<{ code: string; path: string; message: string }> };
+      };
+      return body.bundle.warnings.filter((w) => w.code.startsWith("permission-rule"));
+    };
+    const warned = await post(true);
+    expect(warned.map((w) => [w.code, w.path])).toEqual([["permission-rule", "permissions.rules"]]);
+    expect(warned[0]?.message).toContain('Move it above "alwaysAllow Bash"');
+    // Without the passes the rules were always kept in order: nothing changed there.
+    expect(await post(false)).toEqual([]);
+    // In plan mode, which reads no allow, the deny fires: a note.
+    const plan = await (async () => {
+      const res = await worker.fetch(
+        request("/compile", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            yaml: yaml.replace("permissions:\n", "permissions:\n  mode: plan\n"),
+            applyIrPasses: true,
+          }),
+        }),
+        env,
+      );
+      const body = (await res.json()) as {
+        bundle: { warnings: ReadonlyArray<{ code: string }> };
+      };
+      return body.bundle.warnings.map((w) => w.code).filter((c) => c.startsWith("permission-rule"));
+    })();
+    expect(plan).toEqual(["permission-rule-note"]);
+  });
+
   test("POST /compile emitAs:cf-worker with a CLI spec returns a worker.js bundle", async () => {
     const yaml = `
 name: hello-cli

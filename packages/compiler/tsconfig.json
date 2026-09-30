@@ -14,6 +14,7 @@
     { "path": "../ir-passes" },
     { "path": "../tool-builder" },
     { "path": "../tool-categories" },
+    { "path": "../tool-permission-matcher" },
     { "path": "../target-batch-worker" },
     { "path": "../target-browser-driver" },
     { "path": "../target-channel-bot" },

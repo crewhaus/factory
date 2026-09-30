@@ -550,6 +550,7 @@
         "@crewhaus/target-workflow": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
+        "@crewhaus/tool-permission-matcher": "workspace:*",
         "@crewhaus/worker-runtime": "workspace:*",
       },
       "devDependencies": {
