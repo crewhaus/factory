@@ -515,13 +515,36 @@ export function __resetRuleBasedJudgeWarningForTests(): void {
  */
 function warnRuleBasedJudgeOnce(toolName: string): void {
   if (warnedAboutRuleBasedJudge) return;
-  // `bun test`/`NODE_ENV=test` exercises the rule-based judge constantly; only
-  // surface the warning for real runs so test output stays clean.
-  if (process.env.NODE_ENV === "test") return;
+  // `bun test` exercises the rule-based judge constantly; only surface the
+  // warning for real runs so test output stays clean.
+  if (underTestRunner()) return;
   warnedAboutRuleBasedJudge = true;
   console.warn(
     `[permission-engine] SECURITY: the rule-based justification judge is gating a justification-required tool (first seen: \`${toolName}\`). It only checks token overlap between the justification and the spec instructions, so the SAME (potentially prompt-injected) model that chose the tool can also write a passing justification — this offers NO protection against an injected justification. Production MUST set \`security.justification.judge: claude\` in the spec (or pass an LLM-backed \`justificationJudge\` to the runtime). This warning fires once per process.`,
   );
+}
+
+/** A file `bun test` runs: `*.test.*`, `*_test.*`, `*.spec.*`, `*_spec.*`. */
+const TEST_FILE = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
+
+/**
+ * Whether this process is the test runner: `bun test` sets `NODE_ENV=test`
+ * AND its entry is a test file.
+ *
+ * `NODE_ENV=test` alone used to be enough. It is an ambient variable — a
+ * staging host or a CI job may export it — and a compiled bundle is a
+ * distributed artifact that runs wherever it is copied, so a bundle started
+ * under it accepted the rule-based judge's gameable `allow` on every
+ * justification-gated call (0.7.1 review). A bundle's entry is its
+ * `agent.ts`, and `crewhaus run`'s is the CLI, so neither is ever the test
+ * runner whatever NODE_ENV says; an operator who wants the rule-based judge
+ * sets CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1.
+ */
+function underTestRunner(): boolean {
+  if (process.env.NODE_ENV !== "test") return false;
+  const bun = (globalThis as { readonly Bun?: { readonly main?: unknown } }).Bun;
+  const entry = typeof bun?.main === "string" ? bun.main : process.argv?.[1];
+  return typeof entry === "string" && TEST_FILE.test(entry);
 }
 
 /**
@@ -541,13 +564,13 @@ function warnRuleBasedJudgeOnce(toolName: string): void {
  * fail CLOSED in production: a justification-required tool is denied unless an
  * LLM-backed judge is configured (it reports a different judgeModel and is
  * never overridden). Two escape hatches keep this from being a hard break:
- *   - `NODE_ENV=test` (Bun sets it for `bun test`) keeps the judge deterministic
- *     for the test suite;
+ *   - the test runner (see {@link underTestRunner}) keeps the judge
+ *     deterministic for the test suite;
  *   - `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` lets an operator explicitly
  *     accept the rule-based judge's weakness in production.
  */
 function ruleBasedShouldFailClosed(): boolean {
-  if (process.env.NODE_ENV === "test") return false;
+  if (underTestRunner()) return false;
   if (process.env["CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION"] === "1") return false;
   return true;
 }

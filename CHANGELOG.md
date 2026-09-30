@@ -117,6 +117,14 @@ built it.
   CLI's version from its `package.json` instead of running it.
 - **Plan mode keeps the sandbox floor**: a read-only tool that needs a
   sandbox is refused when none is available, as auto mode already did.
+- **`NODE_ENV=test` no longer switches off the justification check.** The
+  built-in rule check, which the same model that picks a tool can talk past,
+  was accepted on every justification-gated call whenever `NODE_ENV=test`
+  was set, so a compiled bundle or `crewhaus run` started on a host that
+  exports it (a staging box, a CI job) let those calls through. Only the
+  test runner itself is exempt now; set
+  `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` to accept the rule check
+  anywhere else.
 - **OpenExternal asks in auto mode**, and every call carries a justification:
   an app it opens keeps running, and a page opens with your cookies. It also
   refuses more files a desktop runs or follows on open (`.fileloc`, `.jnlp`,
@@ -619,8 +627,9 @@ deny, warn or fail `--strict`; each says what to write instead.
   list refuses everyone. WaitForPort probes any host but this machine only
   when it is in `tool_config.proc.wait_for_port_hosts`.
 - **DownloadFile and OpenExternal need a justification judge.** Every call
-  now carries a justification, and outside tests the built-in rule check
-  denies it, as it denies every justification-gated call. What to set:
+  now carries a justification, and outside the test runner the built-in rule
+  check denies it, as it denies every justification-gated call, whatever
+  `NODE_ENV` says. What to set:
   - A cli spec: `security.justification.judge: claude`. `crewhaus run` and
     the compiled bundle both use it. It runs on `claude-haiku-4-5` unless
     `security.justification.model` names another model, and needs that

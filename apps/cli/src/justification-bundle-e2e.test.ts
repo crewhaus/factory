@@ -404,7 +404,9 @@ describe("a compiled cli bundle judges with the judge its spec names (0.7.1)", (
   }, 180_000);
 
   test("without security:, the bundle is the 0.7.0 bundle: no judge is asked and the call is refused", async () => {
-    const run = await runBundle(spec(""));
+    // NODE_ENV=test where the bundle runs opens nothing: a distributed bundle
+    // is never the test runner (0.7.1 review).
+    const run = await runBundle(spec(""), { runEnv: { NODE_ENV: "test" } });
     expect(run.agentTs).not.toContain("justification");
     expect(run.agentTs).not.toContain("audit");
     expect(judgeRequests(run.requests)).toHaveLength(0);
