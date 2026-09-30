@@ -128,6 +128,7 @@ describe("the linear-time glob accepts exactly the old regex's language", () => 
 });
 
 describe("matchesSegmentAfter: a glob against a prefix and ANY one segment", () => {
+  // Slow by construction (an exhaustive sweep of short segments; 2.8 s on CI's loaded runner).
   test("agrees with trying every short segment against the 0.7.0 compiler", () => {
     // For a glob this short, when some segment after the prefix matches, a
     // segment of at most five characters from {a, b, c} does: each literal
@@ -167,7 +168,7 @@ describe("matchesSegmentAfter: a glob against a prefix and ANY one segment", () 
     expect(compared).toBe(600 * 6);
     expect(matched).toBeGreaterThan(300);
     expect(compared - matched).toBeGreaterThan(300);
-  });
+  }, 20_000);
 
   test("with two segments, agrees with trying every short <segment>/<segment>", () => {
     // A value that stands for every `<owner>/<repo>` (a code search that

@@ -51,13 +51,14 @@ const corrupt = gz(new Uint8Array([0x1f, 0x8b, 8, 0, 9, 9, 9, 9, 9, 9, 9, 9]));
 describe("registry replies are bounded", () => {
   const url = new URL("https://registry.example.test/v2/library/app/manifests/1.0");
 
+  // Slow by construction (inflating a bomb up to the cap; 2.0 s on CI's loaded runner).
   test("a gzip bomb is refused at the cap, and the body was asked for raw", async () => {
     answer = gz(bomb);
     await expect(httpGet(url, { maxBytes: 4 * 1024 * 1024 })).rejects.toThrow(
       /exceeded 4194304 bytes/,
     );
     expect(inits[0]?.["decompress"]).toBe(false);
-  });
+  }, 20_000);
 
   test("a compressed body comes back as exactly the decoded bytes", async () => {
     answer = gz(gzipSync('{"schemaVersion":2}'));

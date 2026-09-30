@@ -461,6 +461,7 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     );
   });
 
+  // Slow by construction (compressing 64 MB and inflating 16 MB of it; 0.2 s here, 2.5 s to past 5 s on CI's loaded runner).
   test("a gzip bomb from a real node is cut at the cap while still compressed", async () => {
     // 64 MB of zeros, about 64 KB on the wire.
     const bomb = Bun.gzipSync(new Uint8Array(64 * 1024 * 1024));
@@ -481,7 +482,7 @@ describe("a read is bounded in time and in bytes (C041)", () => {
     } finally {
       server.stop(true);
     }
-  });
+  }, 20_000);
 
   test("a deadline that is not a duration is refused before anything is sent", async () => {
     const fetchImpl = mockFetch(() => {

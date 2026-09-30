@@ -131,6 +131,7 @@ describe("a phrase rule's search", () => {
     });
   });
 
+  // Slow by construction (every cased code unit against the whole code-unit range; 2.8 s on CI's loaded runner).
   test("folds every cased code unit as the regex `i` flag does, on this engine", () => {
     // Every code unit with a case mapping, and every one sharing a class
     // with one, against the whole code-unit range: the regex's matches are
@@ -157,7 +158,7 @@ describe("a phrase rule's search", () => {
     }
     // Over two thousand cased units on any engine this runs on.
     expect(checked).toBeGreaterThan(2_000);
-  });
+  }, 20_000);
 });
 
 describe("ContentPolicyCheck's phrase rules are linear in the text (C073 residual)", () => {

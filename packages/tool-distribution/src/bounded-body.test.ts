@@ -51,13 +51,15 @@ const corrupt = gz(new Uint8Array([0x1f, 0x8b, 8, 0, 9, 9, 9, 9, 9, 9, 9, 9]));
 describe("asset downloads are bounded", () => {
   const url = "https://dl.example.test/tool-1.2.3.tar.gz";
 
+  // Slow by construction (inflating a bomb up to the cap; 1.9 s on CI's loaded runner).
   test("a gzip bomb past the cap is 'could not check', and the body was asked for raw", async () => {
     answer = gz(bomb);
     const probe = await probeAsset(url, { maxBytes: 8 * 1024 * 1024, timeoutMs: 20_000 });
     expect(probe).toMatchObject({ kind: "unknown", reason: "cap" });
     expect(inits[0]?.["decompress"]).toBe(false);
-  });
+  }, 20_000);
 
+  // Slow by construction (inflating and hashing 64 MiB; 2.7 s on CI's loaded runner).
   test("an encoded asset under the cap is hashed as the decoded bytes, never held whole", async () => {
     answer = gz(bomb);
     const probe = await probeAsset(url, { maxBytes: 128 * 1024 * 1024, timeoutMs: 20_000 });
@@ -67,7 +69,7 @@ describe("asset downloads are bounded", () => {
       bytes: 64 * 1024 * 1024,
       sha256: "3b6a07d0d404fab4e23b6d34bc6696a6a312dd92821332385e5af7c01c421351",
     });
-  });
+  }, 20_000);
 
   test("a body that is not the gzip it claims to be is 'unreadable', not a mismatch", async () => {
     answer = corrupt;

@@ -202,6 +202,7 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     expect(out.undeterminedFrom.row).toBe(0);
   }, 30_000);
 
+  // Slow by construction (it spends the call's whole evaluation budget; 2.6 s on CI's loaded runner).
   test("the rows of one call share one budget", () => {
     const report = validateRecordsFn(Array(1_000).fill("x"), chain(12, "allOf"));
     // 2^12 evaluations a row: the first rows pass, then the budget is spent.
@@ -209,7 +210,7 @@ describe("the validator's work is bounded, and running out is not a verdict", ()
     expect(report.undetermined).toBeGreaterThan(0);
     expect(report.passed + report.undetermined).toBe(1_000);
     expect(report.ok).toBe(false);
-  });
+  }, 20_000);
 
   test("a large value gets a budget in proportion to its size", () => {
     const branches = Array.from({ length: 30 }, (_, k) => ({ const: k }));

@@ -411,6 +411,7 @@ describe("ABI decoding cannot be made to inflate (C085)", () => {
     expect(decodeData(["uint256[1][][]"], hex)).toEqual([...honest]);
   });
 
+  // Slow by construction (it decodes the largest honest encodings; 2.3 s on CI's loaded runner).
   test("honest encodings, however large, still decode exactly", () => {
     const square = Array.from({ length: 200 }, (_, i) =>
       Array.from({ length: 200 }, (_, j) => String(i * 200 + j)),
@@ -421,7 +422,7 @@ describe("ABI decoding cannot be made to inflate (C085)", () => {
     const strings = Array.from({ length: 300 }, (_, i) => "x".repeat(i));
     const packed = `0x${encodeCall("f(string[],bytes[2])", [strings, ["0xabcd", "0x"]]).slice(10)}`;
     expect(decodeData(["string[]", "bytes[2]"], packed)).toEqual([strings, ["0xabcd", "0x"]]);
-  });
+  }, 20_000);
 });
 
 describe("type strings are parsed in linear time (C085)", () => {
