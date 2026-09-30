@@ -22,6 +22,7 @@ import {
   type PermissionRuleProblem,
   type RuleToolDescriptor,
   permissionRuleProblems,
+  shadowedPermissionRules,
   specPermissionRuleLists,
 } from "@crewhaus/tool-permission-matcher";
 import {
@@ -215,7 +216,8 @@ export function runLint(
   // Stage 7 — 0.7.1 (permission-integration#12): permission rules that can
   // never do what they say — a spec key where the tool's name belongs, a
   // near-miss tool name, an MCP server the spec does not declare, an
-  // argument pattern that cannot match the field the tool declares. Shared
+  // argument pattern that cannot match the field the tool declares, a deny
+  // or ask below an allow that always matches first. Shared
   // with `compile` (which fails on them under --strict) and PermissionAudit.
   for (const p of permissionRuleProblemsOf(spec, ir, resolveTool)) {
     findings.push({
@@ -277,7 +279,8 @@ export type LocatedRuleProblem = PermissionRuleProblem & {
 
 /**
  * The permission rules of a spec that can never do what they say (see
- * `permissionRuleProblems`), in every list the spec carries (see
+ * `permissionRuleProblems`, and `shadowedPermissionRules` for a deny or ask
+ * an allow above it always beats), in every list the spec carries (see
  * `specPermissionRuleLists`: the shape's rules, each model profile's and
  * pool candidate's deny/ask, each sub-agent's allow/deny). A granted tool is
  * one the lowered spec lists, described by the live tool `resolveTool`
@@ -314,6 +317,11 @@ export function permissionRuleProblemsOf(
     for (const p of permissionRuleProblems({ rules: list.rules, granted, known, mcpServers })) {
       out.push({ ...p, list: list.path, path: `${list.path}[${p.type} ${p.pattern}]` });
     }
+  }
+  // A deny or ask that an allow above it in the same layer always beats.
+  for (const p of shadowedPermissionRules(lists)) {
+    const { shadowedBy: _allow, ...problem } = p;
+    out.push({ ...problem, path: `${p.list}[${p.type} ${p.pattern}]` });
   }
   return out;
 }

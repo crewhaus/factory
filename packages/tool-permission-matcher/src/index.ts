@@ -462,6 +462,19 @@ function automatonIncludedIn(
 }
 
 /**
+ * Does `outer` match every string `inner` matches? Both are globs in this
+ * module's grammar. `false` when that cannot be shown within a bounded
+ * amount of work, so a caller that acts on `true` acts only on a proof.
+ */
+export function globIncludedIn(inner: string, outer: string): boolean {
+  return automatonIncludedIn(
+    buildAutomaton(tokenizeGlob(inner)),
+    buildAutomaton(tokenizeGlob(outer)),
+    false,
+  );
+}
+
+/**
  * The longest Glob pattern a rule is checked against as a pattern. A longer
  * one gets no allow and every deny: a person does not write one.
  */
@@ -1750,8 +1763,10 @@ export {
   type PermissionRuleProblemCode,
   type PermissionRuleProblemsInput,
   type RuleToolDescriptor,
+  type ShadowedRuleProblem,
   argGlobCanMatchUrl,
   mcpServersReachedBy,
   permissionRuleProblems,
+  shadowedPermissionRules,
   specPermissionRuleLists,
 } from "./rule-problems";
