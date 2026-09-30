@@ -475,6 +475,31 @@ describe("C004 — a search that reaches a denied repository", () => {
   });
 });
 
+describe("final review — an allow of `*` does not grant the read of every qualifier", () => {
+  test("SearchIssues, SearchCode and DeployInspect: `*` asks for the unscoped read, `**` grants it", async () => {
+    // Leaving owner and repo out searches every repository; leaving the spec
+    // and the environment out inspects every spec in every environment. The
+    // deny side has read that call as covering acme/app since 0.7.1; an allow
+    // of `*` (one segment) covers no acme/app, so it no longer grants the
+    // wider call while the narrower one asks.
+    const cases: Array<[string, unknown, unknown]> = [
+      ["SearchIssues", { query: "password" }, { query: "password", owner: "acme", repo: "app" }],
+      ["SearchCode", { query: "password" }, { query: "password", owner: "acme", repo: "app" }],
+      ["DeployInspect", {}, { name: "prod-agent", env: "production" }],
+    ];
+    for (const [name, broad, narrow] of cases) {
+      const star = rules(["alwaysAllow", `${name}(*)`]);
+      expect({ name, broad: await gate(name, broad, star) }).toEqual({ name, broad: "ask" });
+      expect({ name, narrow: await gate(name, narrow, star) }).toEqual({ name, narrow: "ask" });
+      for (const wide of [`${name}(**)`, `${name}(*/**)`]) {
+        const rs = rules(["alwaysAllow", wide]);
+        expect({ wide, broad: await gate(name, broad, rs) }).toEqual({ wide, broad: "allow" });
+        expect({ wide, narrow: await gate(name, narrow, rs) }).toEqual({ wide, narrow: "allow" });
+      }
+    }
+  }, 30_000);
+});
+
 describe("p2/p15 — decoys, `..` and symlinked directories on the file tools (permission-integration#1, #2)", () => {
   test("Write(src/**) does not reach .crewhaus/settings.json by a decoy or by `..`", async () => {
     const rs = rules(["alwaysAllow", "Write(src/**)"]);

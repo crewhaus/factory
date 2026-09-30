@@ -185,11 +185,14 @@ export type GlobMatcher = {
   /**
    * Whether the glob matches `prefix` followed by EVERY continuation of the
    * `tail` kind — what an allow must satisfy to grant a value that stands for
-   * every value. `false` when working that out would take more than a
-   * bounded amount of work: an allow that cannot be shown to cover every
-   * value grants nothing.
+   * every value. With `segments` above 1 and a `"segment"` tail, every
+   * continuation of up to that many segments joined by `/`: a value that
+   * stands for every `<qualifier>/<value>` as well as every value (see
+   * `OperativeValue.anyQualifier`). `false` when working that out would take
+   * more than a bounded amount of work: an allow that cannot be shown to
+   * cover every value grants nothing.
    */
-  readonly matchesEveryAfter: (prefix: string, tail: AnyValueTail) => boolean;
+  readonly matchesEveryAfter: (prefix: string, tail: AnyValueTail, segments?: number) => boolean;
 };
 
 /**
@@ -422,7 +425,7 @@ function compileGlob(glob: string): GlobMatcher {
       return false;
     },
     matchesSomeAfter: someAfter,
-    matchesEveryAfter(prefix: string, tail: AnyValueTail): boolean {
+    matchesEveryAfter(prefix: string, tail: AnyValueTail, segments = 1): boolean {
       // The sets of states the automaton can be in after the prefix and any
       // continuation, built one character class at a time (the subset
       // construction). Every continuation is accepted exactly when every such
@@ -430,27 +433,40 @@ function compileGlob(glob: string): GlobMatcher {
       // alike, so one stands for all of them.
       const first = afterPrefix(prefix);
       if (first.length === 0) return false;
+      // How many `/` a continuation may hold: any number in a run; in a
+      // segment tail, one fewer than the segments it may have. Each set is
+      // explored once per count of `/` read so far, so a glob that covers
+      // `acme` but not `acme/app` is caught at the second segment.
+      const slashes = tail === "run" ? 0 : Math.max(1, segments) - 1;
+      const readsSlash = tail === "run" || slashes > 0;
       const alphabet = new Set<number>();
       for (const st of states) {
-        if (st.t === "lit" && (tail === "run" || st.c !== SLASH)) alphabet.add(st.c);
+        if (st.t === "lit" && (readsSlash || st.c !== SLASH)) alphabet.add(st.c);
       }
-      if (tail === "run") alphabet.add(SLASH);
+      if (readsSlash) alphabet.add(SLASH);
       let other = 0x61;
       while (alphabet.has(other) || other === SLASH) other++;
       alphabet.add(other);
-      const seenSets = new Set<string>([first.join(",")]);
-      const queue: number[][] = [first];
+      const keyOf = (level: number, set: ReadonlyArray<number>): string =>
+        `${level}:${set.join(",")}`;
+      const seenSets = new Set<string>([keyOf(0, first)]);
+      const queue: Array<readonly [number, number[]]> = [[0, first]];
       while (queue.length > 0) {
-        const set = queue.pop() as number[];
+        const [level, set] = queue.pop() as readonly [number, number[]];
         if (!set.includes(0)) return false;
         for (const c of alphabet) {
+          let nextLevel = level;
+          if (c === SLASH && tail === "segment") {
+            if (level >= slashes) continue;
+            nextLevel = level + 1;
+          }
           const next = stepOn(set, c);
           if (next.length === 0) return false;
-          const key = next.join(",");
+          const key = keyOf(nextLevel, next);
           if (seenSets.has(key)) continue;
           if (seenSets.size >= EVERY_AFTER_STATE_SETS) return false;
           seenSets.add(key);
-          queue.push(next);
+          queue.push([nextLevel, next]);
         }
       }
       return true;
@@ -615,7 +631,10 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   another that the call left out as well, so the value also stands for
  *   every `<qualifier>/<value>`. A code search that names no owner reaches
  *   every repository the token can read, and `alwaysDeny
- *   SearchCode(acme/secret)` fires on it.
+ *   SearchCode(acme/secret)` fires on it. An allow grants it only when its
+ *   glob covers every value AND every `<qualifier>/<value>`:
+ *   `SearchCode(**)` does, `SearchCode(*)` does not (it covers no
+ *   `acme/app`, which a search of one repository would need).
  * - `restrictOnly` — the declared default of a field that only relocates
  *   the tool (a store directory, the repository a branch operation runs
  *   in), standing in for a field the call left out while it carries another
@@ -1058,10 +1077,15 @@ function valueMatches(
   // cannot stand in for `EvmGetLogs(1/*)`.
   if (polarity === "allow" && value.standsForAny !== undefined) {
     const tail = anyValueTail(value.kind);
+    // A value whose qualifier was left out too stands for every
+    // `<qualifier>/<value>` as well (a search naming no owner reaches every
+    // repository), so an allow must cover both widths: `SearchIssues(*)`
+    // covers no `acme/app`, and so grants no search of every repository.
+    const segments = value.anyQualifier === true ? 2 : 1;
     return value.canonical.some((candidate) => {
       if (value.kind === "path" && isAbsoluteSpelling(candidate) !== absoluteGlob) return false;
       return candidate.endsWith(ANY_VALUE)
-        ? argRe.matchesEveryAfter(candidate.slice(0, -ANY_VALUE.length), tail)
+        ? argRe.matchesEveryAfter(candidate.slice(0, -ANY_VALUE.length), tail, segments)
         : argRe.test(candidate);
     });
   }

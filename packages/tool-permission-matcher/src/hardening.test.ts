@@ -765,6 +765,29 @@ describe("declared operative values", () => {
     expect(fires("SearchCode(acme/secret)", { ...ownerWide, kind: "path" })).toBe(true);
   });
 
+  test("an ordinary path is folded for a deny only where its filesystem ignores case", () => {
+    // The twin of the prefix case above, for a path that names one place. On
+    // Linux `ACME/x` and `acme/x` are two files: a deny on one must not fire
+    // on the other. Where the filesystem folds case (the runtime marks the
+    // value), they are one file and the deny must fire.
+    const upper: OperativeValue = { kind: "path", canonical: ["ACME/x"] };
+    const fires = (pattern: string, value: OperativeValue) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "Read",
+        {},
+        { ...restrict, operativeValues: [value] },
+      );
+    expect(fires("Read(acme/x)", upper)).toBe(false);
+    expect(fires("Read(acme/**)", upper)).toBe(false);
+    expect(fires("Read(ACME/x)", upper)).toBe(true);
+    const folded: OperativeValue = { ...upper, caseInsensitive: true };
+    expect(fires("Read(acme/x)", folded)).toBe(true);
+    expect(fires("Read(acme/**)", folded)).toBe(true);
+    // Folding widens only what a deny catches, never which file it names.
+    expect(fires("Read(acme/y)", folded)).toBe(false);
+  });
+
   test("a value whose qualifier was left out too stands for every <qualifier>/<value>", () => {
     // SearchIssues {query: "password"}: no owner and no repo, so every
     // repository the token can read is searched.
@@ -808,9 +831,50 @@ describe("declared operative values", () => {
     // Without the mark, only one segment stands for any value.
     const oneSegment: OperativeValue = { kind: "id", canonical: ["*"], standsForAny: [""] };
     expect(fires("SearchIssues(acme/secret)", oneSegment)).toBe(false);
-    // An allow still reads only the canonical value.
+    // An allow grants the every-repository search only when it covers every
+    // value there, `<owner>/<repo>` included. It used to take `*` (one
+    // segment) as enough, so `alwaysAllow SearchIssues(*)` granted the
+    // search of every repository while the search of acme/app asked — the
+    // broader call granted, the narrower one not (final review, 0.7.1).
     expect(grants("SearchIssues(acme/secret)")).toBe(false);
-    expect(grants("SearchIssues(*)")).toBe(true);
+    expect(grants("SearchIssues(*)")).toBe(false);
+    expect(grants("SearchIssues(*/*)")).toBe(false);
+    expect(grants("SearchIssues(acme/*)")).toBe(false);
+    for (const wide of ["SearchIssues(**)", "SearchIssues(*/**)"]) {
+      expect({ wide, granted: grants(wide) }).toEqual({ wide, granted: true });
+    }
+    // Monotone: every allow that grants the every-repository search also
+    // grants one repository in it, and one owner's every repository.
+    const oneRepo: OperativeValue = { kind: "id", canonical: ["acme/app"] };
+    const oneOwner: OperativeValue = {
+      kind: "id",
+      canonical: ["acme/*"],
+      standsForAny: ["acme/", ""],
+    };
+    const grantsValue = (pattern: string, value: OperativeValue) =>
+      matchesPattern(
+        compilePattern(pattern),
+        "SearchIssues",
+        {},
+        {
+          ...allow,
+          operativeValues: [value],
+        },
+      );
+    const candidates = [
+      "SearchIssues(*)",
+      "SearchIssues(**)",
+      "SearchIssues(*/*)",
+      "SearchIssues(*/**)",
+      "SearchIssues(acme/*)",
+      "SearchIssues(?*)",
+      "SearchIssues(*/?*)",
+    ];
+    for (const pattern of candidates.filter(grants)) {
+      expect({ pattern, repo: grantsValue(pattern, oneRepo) }).toEqual({ pattern, repo: true });
+      expect({ pattern, owner: grantsValue(pattern, oneOwner) }).toEqual({ pattern, owner: true });
+    }
+    expect(candidates.filter(grants)).toEqual(["SearchIssues(**)", "SearchIssues(*/**)"]);
   });
 
   // merge-seams (wave III): the every-contract query on `base` was caught by
