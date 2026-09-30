@@ -251,26 +251,36 @@ function childEnv(sandbox: string): Record<string, string> {
   };
 }
 
-async function drain(proc: ReturnType<typeof Bun.spawn>): Promise<number> {
+async function drain(
+  proc: ReturnType<typeof Bun.spawn>,
+): Promise<{ readonly code: number; readonly stderr: string }> {
   const [stderr, code] = await Promise.all([
     new Response(proc.stderr as ReadableStream).text(),
     proc.exited,
   ]);
-  if (code !== 0) throw new Error(`exited ${code}: ${stderr}`);
-  return code;
+  return { code, stderr };
 }
 
-/** Compile `yaml` with the CLI and run the bundle once, one line on stdin. */
-async function runBundle(yaml: string): Promise<{
+/**
+ * Compile `yaml` with the CLI and run the bundle once, one line on stdin.
+ * Throws when it fails, unless `expectFailure` — then its stderr is returned.
+ */
+async function runBundle(
+  yaml: string,
+  opts: { readonly withoutAnthropicKey?: boolean; readonly expectFailure?: boolean } = {},
+): Promise<{
   readonly sandbox: string;
   readonly agentTs: string;
   readonly requests: ReadonlyArray<Record<string, unknown>>;
+  readonly code: number;
+  readonly stderr: string;
 }> {
   const sandbox = newTmp("crewhaus-judged-bundle-");
   const specPath = join(sandbox, "crewhaus.yaml");
   writeFileSync(specPath, yaml);
   const out = join(sandbox, "dist");
   const env = childEnv(sandbox);
+  if (opts.withoutAnthropicKey === true) Reflect.deleteProperty(env, "ANTHROPIC_API_KEY");
   const compiled = Bun.spawnSync(
     [process.execPath, CLI_PATH, "compile", specPath, "--no-register", "-o", out],
     { cwd: sandbox, env },
@@ -289,11 +299,14 @@ async function runBundle(yaml: string): Promise<{
       stderr: "pipe",
     },
   );
-  await drain(proc);
+  const { code, stderr } = await drain(proc);
+  if (code !== 0 && opts.expectFailure !== true) throw new Error(`exited ${code}: ${stderr}`);
   return {
     sandbox,
     agentTs: readFileSync(join(out, "agent.ts"), "utf8"),
     requests: [...requests],
+    code,
+    stderr,
   };
 }
 
@@ -315,7 +328,8 @@ async function runInterpreter(yaml: string): Promise<ReadonlyArray<Record<string
     ],
     { cwd: sandbox, env: childEnv(sandbox), stdin: "ignore", stdout: "ignore", stderr: "pipe" },
   );
-  await drain(proc);
+  const { code, stderr } = await drain(proc);
+  if (code !== 0) throw new Error(`exited ${code}: ${stderr}`);
   return [...requests];
 }
 
@@ -343,7 +357,7 @@ describe("a compiled cli bundle judges with the judge its spec names (0.7.1)", (
   test("a gated HttpRequest to an allow-listed origin is judged by the named judge, and runs", async () => {
     const run = await runBundle(spec(JUDGED));
     expect(run.agentTs).toContain(
-      'const __justificationJudge = await createJustificationJudgeFromSlot({"judge":"claude"});',
+      'const __justificationJudge = await createJustificationJudgeFromSlot({"judge":"claude"}).catch(',
     );
 
     // The judge the spec names was asked, about this call, on its default model.
@@ -390,5 +404,21 @@ describe("a compiled cli bundle judges with the judge its spec names (0.7.1)", (
     expect(results).toHaveLength(1);
     expect(results[0]).toContain("justification denied (fail-closed)");
     expect(existsSync(join(run.sandbox, ".crewhaus", "audit"))).toBe(false);
+  }, 120_000);
+
+  test("a named judge whose provider has no key stops the bundle at start, with the reason", async () => {
+    // The agent's own model needs no Anthropic key, so only the judge can stop it.
+    const yaml = spec(JUDGED).replace(
+      `  model: ${AGENT_MODEL}`,
+      "  model: 'local/stub@http://127.0.0.1:1/v1'",
+    );
+    expect(yaml).toContain("local/stub");
+    const run = await runBundle(yaml, { withoutAnthropicKey: true, expectFailure: true });
+    expect(run.code).not.toBe(0);
+    expect(run.stderr).toContain("no Anthropic credentials found");
+    // Reported like a failed run, not as a stack trace, and before any turn.
+    expect(run.stderr).toContain("run stopped");
+    expect(run.stderr).not.toMatch(/\n\s+at /);
+    expect(run.requests).toHaveLength(0);
   }, 120_000);
 });

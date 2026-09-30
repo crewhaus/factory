@@ -613,7 +613,7 @@ describe("emitCli — security.justification (0.7.1: the bundle wires the judge 
     // The lowered slot, as data: judge, model and the profile's params — not
     // the provenance label, which the construction does not read.
     expect(content).toContain(
-      'const __justificationJudge = await createJustificationJudgeFromSlot({"judge":"claude","model":"claude-sonnet-4-6","params":{"maxTokens":512,"thinking":{"effort":"low"}}});',
+      'const __justificationJudge = await createJustificationJudgeFromSlot({"judge":"claude","model":"claude-sonnet-4-6","params":{"maxTokens":512,"thinking":{"effort":"low"}}}).catch(',
     );
     expect(content).toContain(
       "...(__justificationJudge !== undefined ? { justificationJudge: __justificationJudge } : {}),",
