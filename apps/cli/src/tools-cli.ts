@@ -1590,6 +1590,7 @@ export type OperativeArgLike = {
   readonly beneath?: string;
   readonly defaultAtRoot?: true;
   readonly glob?: true;
+  readonly shell?: true;
 };
 
 /** One permission rule, in the shape `permissions.rules` takes it. */
@@ -1658,6 +1659,12 @@ export function operativeArgWords(arg: OperativeArgLike): string {
         `run in the directory in ${arg.within}; a scoped allow covers it only in the workspace root`,
       );
     } else parts.push(`matched as ${arg.within}/${arg.field.split(".").pop() ?? arg.field}`);
+  }
+  if (arg.shell === true) {
+    parts.push(
+      "a shell line: an allow must match each command it runs (joined by &&, ||, ;, |, & or a newline), or be written as the same chain (cd ** && make *), and a deny or ask fires on any of them",
+      "a line with $(…), backticks or a here-document is allowed only by the bare tool, (*) or (**)",
+    );
   }
   if (arg.env !== undefined) {
     parts.push(`a call that sets ${arg.env} is covered only by an allow on every command (**)`);

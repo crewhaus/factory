@@ -869,7 +869,8 @@ deny, warn or fail `--strict`; each says what to write instead.
 - **`crewhaus tools show <tool>` says what a permission rule on it
   checks**: each argument a scoped rule reads, in words (a path read from
   `cwd`, a repository matched as `owner/repo`, what a left-out value stands
-  for), and an example rule to copy into `permissions.rules`. `--json`
+  for, and for Bash and Shell that an allow must match every command in the
+  line), and an example rule to copy into `permissions.rules`. `--json`
   carries the same answer.
 - **`all-vector`**, a category holding VectorDelete alone.
 - **New `tool_config` keys**: the credential and destination lists above;

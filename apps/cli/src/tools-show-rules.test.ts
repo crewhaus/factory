@@ -69,6 +69,22 @@ describe("operativeArgWords — a declaration in words", () => {
     ];
     for (const [arg, words] of cases) expect(operativeArgWords(arg)).toBe(words);
   });
+
+  test("a shell line says an allow reads each command, and which lines only a bare allow grants", async () => {
+    // Bash's own declaration, from the tool the runtime loads.
+    const bash = await builtin("bash");
+    expect(bash.operativeArgs).toEqual([{ field: "command", kind: "command", shell: true }]);
+    const lines = formatRuleScopeLines(ruleScopeFor(bash.name, bash.operativeArgs)).join(" ");
+    const text = lines.replace(/\s+/g, " ");
+    expect(text).toContain(
+      "a shell line: an allow must match each command it runs (joined by &&, ||, ;, |, & or a newline), or be written as the same chain (cd ** && make *), and a deny or ask fires on any of them",
+    );
+    expect(text).toContain(
+      "a line with $(…), backticks or a here-document is allowed only by the bare tool, (*) or (**)",
+    );
+    // A command that is not a shell line says none of it.
+    expect(operativeArgWords({ field: "argv", kind: "command" })).toBe("a command");
+  });
 });
 
 describe("ruleScopeFor — the three answers", () => {
