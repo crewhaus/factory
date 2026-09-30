@@ -1,4 +1,4 @@
-import { type IrNode, checkShapeTools, lower } from "@crewhaus/compiler";
+import { type IrNode, checkShapeTools, collectCompileWarnings, lower } from "@crewhaus/compiler";
 import { CrewhausError } from "@crewhaus/errors";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
 import {
@@ -145,6 +145,13 @@ export function runLint(
     findings.push({ message: e.message, path: e.path, severity: "error", rule: "tool" });
   }
   for (const w of shapeTools.warnings) {
+    findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
+  }
+  // Stage 3c — the spec-key warnings compile prints: a key the shape accepts
+  // but does not wire (`tools:` on onchain, `tool_config:` on voice) is
+  // `accepted-but-unwired`, which fails `compile --strict`. Lint said "clean"
+  // for those specs.
+  for (const w of collectCompileWarnings(spec)) {
     findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
   }
   // A typo in a list that narrows a site's tools (a sub-agent's, a model

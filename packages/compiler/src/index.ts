@@ -480,7 +480,13 @@ function specDeclares(spec: Spec, path: string): boolean {
   return true;
 }
 
-function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
+/**
+ * The spec-key warnings `compile()` prints before it lowers anything: a key
+ * the shape accepts but does not wire (`accepted-but-unwired`) and the other
+ * notices that depend on the spec alone. Exported so `crewhaus lint` reports
+ * them too, rather than saying "clean" for a spec `compile --strict` refuses.
+ */
+export function collectCompileWarnings(spec: Spec): ReadonlyArray<CompileWarning> {
   const rows = ACCEPTED_BUT_UNWIRED[spec.target] ?? [];
   const out: CompileWarning[] = [];
   for (const row of rows) {

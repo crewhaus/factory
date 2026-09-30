@@ -54,6 +54,30 @@ mcp_servers:
     expect(result.findings.filter((f) => f.rule === "thredz-override")).toEqual([]);
   });
 
+  test("a key the shape accepts but does not wire is reported, as compile --strict refuses it", async () => {
+    // Closeout review: lint said "clean" for these while `compile --strict`
+    // failed them with accepted-but-unwired.
+    const { compile } = await import("@crewhaus/compiler");
+    const voice =
+      "name: v\ntarget: voice\nagent:\n  model: claude-sonnet-4-6\n  instructions: hi\nvoice:\n  provider: openai\n";
+    const specs = {
+      "voice tool_config": `${voice}tool_config:\n  webFetch:\n    allowed_domains: [example.com]\n`,
+      "voice tools": `${voice}tools: [read]\n`,
+    };
+    for (const [name, text] of Object.entries(specs)) {
+      const want = compile(text).warnings.filter((w) => w.code === "accepted-but-unwired");
+      const got = runLint(text, noTools).findings.filter((f) => f.rule === "accepted-but-unwired");
+      expect({ name, got: got.map((f) => [f.path, f.severity, f.message]) }).toEqual({
+        name,
+        got: want.map((w) => [w.path, "warning", w.message]),
+      });
+      expect({ name, hits: got.length }).toEqual({ name, hits: 1 });
+    }
+    // A shape that wires the key says nothing.
+    const cli = runLint(`${validCli}tools: [read]\n`, noTools);
+    expect(cli.findings.filter((f) => f.rule === "accepted-but-unwired")).toEqual([]);
+  });
+
   test("parse failure is a single terminal finding (rule: parse)", () => {
     const result = runLint("name: t\ntarget: cli\n", noTools); // no agent block
     expect(result.ok).toBe(false);
@@ -665,9 +689,10 @@ tools: [read]
   });
 
   // wave III review: on a shape whose runtime carries no tools, compile
-  // accepts a tools: list and ignores it, and lint says clean — while --fix
-  // rewrote `raed` to `read` from the cli set, the C025 lint/--fix
-  // disagreement at a new site.
+  // accepts a tools: list and ignores it — while --fix rewrote `raed` to
+  // `read` from the cli set, the C025 lint/--fix disagreement at a new site.
+  // Lint names no tool in the list; it says, as compile does, that the list
+  // is not wired (closeout review).
   test("a tools: list on a shape with no tool runtime is left alone, as lint leaves it", () => {
     const voice = `name: hello-voice
 target: voice
@@ -680,7 +705,11 @@ voice:
   vad: server
 tools: [raed, gitStaus]
 `;
-    expect(runLint(voice, noTools).findings.filter((f) => f.path.includes("tools"))).toEqual([]);
+    expect(
+      runLint(voice, noTools)
+        .findings.filter((f) => f.path.includes("tools"))
+        .map((f) => [f.rule, f.path]),
+    ).toEqual([["accepted-but-unwired", "tools"]]);
     expect(applyLintFixes(voice, readOnly)).toEqual({ text: voice, applied: [], suggested: [] });
     for (const target of ["onchain", "onchain-game"]) {
       const yaml = voice.replace("target: voice", `target: ${target}`);
