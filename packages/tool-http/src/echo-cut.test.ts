@@ -11,7 +11,16 @@
  * its maxBytes cut). DownloadFile wrote the echo into the workspace, where a
  * later Read returns it whole.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -38,6 +47,8 @@ function leakedPrefixes(text: string, min = 8): number {
 }
 
 let server: ReturnType<typeof Bun.serve>;
+/** Called as the echo server answers each request. */
+const served: { onRequest: (() => void) | undefined } = { onRequest: undefined };
 let origin = "";
 let workspace = "";
 const originalCwd = process.cwd();
@@ -51,6 +62,7 @@ beforeAll(() => {
     port: 0,
     fetch: (req) => {
       const u = new URL(req.url);
+      served.onRequest?.();
       return new Response(
         `GET ${u.pathname}${u.search}\nAuthorization: ${req.headers.get("authorization")}\n`,
         { headers: { "content-type": "text/plain" } },
@@ -94,24 +106,47 @@ describe("a cut through an echoed credential leaves none of it (C050)", () => {
   });
 
   test("HttpWaitFor's non-JSON preview, cut inside the secret, carries none of it", async () => {
+    // The poll only ends at its deadline (a non-JSON body never meets the
+    // condition), and a real 300 ms one raced the first answer: on a loaded
+    // CI runner the request was still open when it passed, and the result
+    // said "deadline elapsed" instead of carrying the preview. So the
+    // deadline here is long, and the test owns the clock the poll schedules
+    // by: once the server has answered, Date.now reads an hour later, so the
+    // poll finishes reading that answer (its abort timer is real and far
+    // off) and then finds its time up instead of polling again.
     let checked = 0;
-    for (const missing of [1, 5, 20]) {
-      const out = String(
-        await httpWaitFor.execute({
-          url: `${origin}${pathCutAt(200, missing)}`,
-          auth,
-          expectJson: { path: "x", op: "exists" },
-          timeoutMs: 300,
-          intervalMs: 1000,
-        }),
-      );
-      expect(out).toContain("first 200 characters");
-      expect({ missing, leaked: leakedPrefixes(out) }).toEqual({ missing, leaked: 0 });
-      // The cut part is trimmed where the cut is made, not left for the
-      // scrubber's backstop to find: the preview ends where the secret began.
-      const lastError = (JSON.parse(out) as { lastError: string }).lastError;
-      expect(lastError.endsWith("Authorization: Bearer ")).toBe(true);
-      checked += 1;
+    const realNow = Date.now.bind(Date);
+    let answered = false;
+    served.onRequest = () => {
+      answered = true;
+    };
+    const clock = spyOn(Date, "now").mockImplementation(() =>
+      answered ? realNow() + 3_600_000 : realNow(),
+    );
+    try {
+      for (const missing of [1, 5, 20]) {
+        answered = false;
+        const out = String(
+          await httpWaitFor.execute({
+            url: `${origin}${pathCutAt(200, missing)}`,
+            auth,
+            expectJson: { path: "x", op: "exists" },
+            timeoutMs: 60_000,
+            intervalMs: 60_000,
+          }),
+        );
+        const result = JSON.parse(out) as { attempts: number; lastError: string };
+        expect({ missing, attempts: result.attempts }).toEqual({ missing, attempts: 1 });
+        expect(out).toContain("first 200 characters");
+        expect({ missing, leaked: leakedPrefixes(out) }).toEqual({ missing, leaked: 0 });
+        // The cut part is trimmed where the cut is made, not left for the
+        // scrubber's backstop to find: the preview ends where the secret began.
+        expect(result.lastError.endsWith("Authorization: Bearer ")).toBe(true);
+        checked += 1;
+      }
+    } finally {
+      clock.mockRestore();
+      served.onRequest = undefined;
     }
     expect(checked).toBe(3);
   });
