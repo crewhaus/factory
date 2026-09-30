@@ -79,14 +79,17 @@ built it.
   allowed `git status && rm -rf build`, and `alwaysDeny Bash(rm -rf **)`
   missed an `rm` that came second. A line is now split into the commands it
   runs, at `&&`, `||`, `;`, `|`, `&` and newlines, respecting quotes and
-  comments. An allow must match every command; a deny or ask fires on any of
-  them, or on the whole line as before. A deny also sees a command through
+  comments. An allow must match every command, or be written as the same
+  chain (`Bash(cd ** && make *)` matches `cd build && make all`, each part
+  against the command in its place); a deny or ask fires on any of them, or
+  on the whole line as before. A deny also sees a command through
   `env`, `sudo`, `xargs` and similar wrappers, inside `eval`, `sh -c` and
   `$(…)`, without its quotes, and through variables the line sets. A line
-  whose commands cannot be read from its text — `$(…)`, backticks, a
-  here-document, an unterminated quote, a `for` or `case` block — is allowed
-  by no scoped rule, so it asks; one whose program the text does not name
-  (`read x; $x -rf build`) also sets off every deny and ask. The Shell tool is
+  whose commands cannot be read from its text — `$(…)`, `$((…))`, backticks,
+  a `$'…'` string, a here-document, an unterminated quote, a `for` or `case`
+  block — is allowed by no scoped rule, so it asks; one whose program the
+  text does not name (`read x; $x -rf build`) also sets off every deny and
+  ask. The Shell tool is
   read the same way, and a deny on RunCommand or another argv tool reads the
   line it hands to `sh -c`.
 - **A permission pattern can no longer stall the daemon.** A rule with
@@ -648,10 +651,11 @@ deny, warn or fail `--strict`; each says what to write instead.
   - A Bash or Shell allow must match every command in the line.
     `Bash(git *)` no longer allows `git pull && npm test` or
     `git log | head`; they ask. Write one rule that covers each command, or
-    the exact line with no wildcard (`Bash(cd build && make)`). A line with
-    `$(…)`, backticks, a here-document or a `for` loop asks unless a bare
-    `Bash`, `Bash(*)` or `Bash(**)` allows it; those three allow what they
-    did before.
+    write the rule as the same chain: `Bash(cd ** && make *)` allows
+    `cd build && make all` but not `cd build && rm -rf ~`. A line with
+    `$(…)`, `$((…))`, backticks, a `$'…'` string, a here-document or a `for`
+    loop asks unless a bare `Bash`, `Bash(*)` or `Bash(**)` allows it; those
+    three allow what they did before.
   - A pattern aimed at something that is not where the tool acts, such as a
     message body, no longer matches: deny the tool, or its destination.
   - A rule on a chain tool is written `Tool(<chainId>/<address>)`.
@@ -766,7 +770,10 @@ deny, warn or fail `--strict`; each says what to write instead.
 - **Deny and ask rules fire in more places** — on defaults the call leaves
   out, on directories above a denied one, on every spelling of a destination,
   on a command reached through its directory or environment, and on any
-  command in a Bash line. Only denies and asks got wider; no allow did.
+  command in a Bash line. Only denies and asks got wider, with one harmless
+  exception: a scoped Bash allow now also matches a line that differs from
+  it only by blanks around it or a trailing comment (`git status # check`
+  under `Bash(git status)`).
 - **A call whose input the tool would reject is refused before any rule or
   approval.** It could not run anyway. It is not counted as a denial in eval
   safety violations or deny alerts.

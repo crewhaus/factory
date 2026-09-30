@@ -8,7 +8,10 @@
  * joined by `&&`, `||`, `;`, `|`, `&`, a newline or a pair of parentheses,
  * and each one runs a program. So an allow must match every simple command
  * of the line, and a deny or ask fires on any one of them — as well as on
- * the whole line, as before.
+ * the whole line, as before. An allow whose own pattern reads as a chain
+ * (`cd ** && make *`) is matched against a line joined the same way piece
+ * by piece, each piece against the command in its place
+ * ({@link readShellChain}).
  *
  * This is a reader, not a shell. It splits a line only where it can say
  * exactly what runs. Anything whose commands it cannot read out of the text
@@ -588,6 +591,58 @@ export function readShellLine(line: string, work: ShellWork = { steps: 0 }): She
   return scanned.opaque !== undefined ? { commands, opaque: scanned.opaque } : { commands };
 }
 
+/**
+ * A line read as a chain: its simple commands, and what joins them.
+ * `joins` has one more entry than `commands`: the text before the first
+ * command, between each two, and after the last — the operators, the
+ * reserved words that frame a compound command (`if`, `then`, `{`, …),
+ * parentheses and comments — with the blanks beside an operator dropped and
+ * any other run of blanks read as one space. Two lines with the same joins
+ * run their commands in the same arrangement.
+ */
+export type ShellChain = {
+  readonly commands: ReadonlyArray<string>;
+  readonly joins: ReadonlyArray<string>;
+};
+
+/**
+ * Read a line as a chain (see {@link ShellChain}), or `undefined` when its
+ * commands cannot be read out of its text (see {@link readShellLine}).
+ *
+ * An allow whose own pattern reads as a chain is matched against a line
+ * with the same joins command by command: `Bash(cd ** && make *)` grants
+ * `cd build && make all`, each piece against its own command.
+ */
+export function readShellChain(
+  line: string,
+  work: ShellWork = { steps: 0 },
+): ShellChain | undefined {
+  const scanned = scan(line, false, work);
+  if (scanned.opaque !== undefined) return undefined;
+  const commands: string[] = [];
+  const joins: string[] = [];
+  let from = 0;
+  for (const { tokens } of scanned.commands) {
+    const start = (tokens[0] as Token).start;
+    const end = (tokens[tokens.length - 1] as Token).end;
+    joins.push(normalizeJoin(line.slice(from, start)));
+    commands.push(line.slice(start, end).trim());
+    from = end;
+  }
+  joins.push(normalizeJoin(line.slice(from)));
+  work.steps += line.length;
+  return { commands, joins };
+}
+
+/** See {@link ShellChain}: blanks beside an operator dropped, other runs read as one space. */
+function normalizeJoin(text: string): string {
+  return text
+    .replace(/\\\n/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/ ?([;&|()\n]) ?/g, "$1")
+    .trim();
+}
+
 // ---------------------------------------------------------------------------
 // What a deny or ask reads
 // ---------------------------------------------------------------------------
@@ -1095,10 +1150,21 @@ function unknownProgram(
   if (known.has("IFS") && source.includes("$")) {
     return "a program named by a variable split on an IFS the line sets";
   }
-  if (value !== "[" && /[*?[]/.test(unquotedParts(source))) {
-    return "a program named by a pathname pattern";
-  }
+  if (namesPathnamePattern(source)) return "a program named by a pathname pattern";
   return undefined;
+}
+
+/**
+ * Whether a word is a pathname pattern the shell expands: an unquoted `*`
+ * or `?`, or an unquoted `[` that a `]` closes. A `[` with nothing to close
+ * it is a plain character, so `[` (test) and `[[` (bash's reserved word)
+ * name themselves. Any `]` in the word counts as the close, quoted or not:
+ * reading a word as a pattern when it is not only makes a deny fire.
+ */
+function namesPathnamePattern(source: string): boolean {
+  const unquoted = unquotedParts(source);
+  if (unquoted.includes("*") || unquoted.includes("?")) return true;
+  return unquoted.includes("[") && source.includes("]");
 }
 
 function collectRestrictSpellings(

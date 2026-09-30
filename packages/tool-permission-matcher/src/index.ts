@@ -1,5 +1,5 @@
 import { CrewhausError } from "@crewhaus/errors";
-import { readShellLine, shellRestrictReading } from "./shell";
+import { type ShellChain, readShellChain, shellRestrictReading } from "./shell";
 
 export class PatternParseError extends CrewhausError {
   override readonly name = "PatternParseError";
@@ -939,9 +939,12 @@ export type OperativeValueKind = "path" | "url" | "command" | "recipient" | "tex
  *   rm -rf build`), or be the exact line itself (a glob with no wildcard);
  *   a line whose commands cannot be read out of its text — a `$(…)`,
  *   backticks, a here-document, an unterminated quote and the like (see
- *   `readShellLine`) — is granted by no scoped allow. A glob that matches
- *   every command without a `/` (`Bash(*)`, `Bash(**)`) still grants the
- *   whole line as before. A deny or ask fires on the whole line and on any
+ *   `readShellLine`) — is granted by no scoped allow. A glob that itself
+ *   reads as a chain of commands joined the way the line's are is matched
+ *   piece by piece: `Bash(cd ** && make *)` grants `cd build && make all`
+ *   and not `cd build && rm -rf ~`. A glob that matches every command
+ *   without a `/` (`Bash(*)`, `Bash(**)`) still grants the whole line as
+ *   before. A deny or ask fires on the whole line and on any
  *   simple command, also read from its program on, unquoted, with the
  *   variables the line sets put in, through wrappers (`env`, `sudo`,
  *   `xargs`, …) and inside an `eval`, a `sh -c` or a substitution; and
@@ -1402,7 +1405,7 @@ function valueMatches(
     if (polarity === "restrict")
       return valueMatches(shellRestrictValue(value), compiled, argRe, absoluteGlob, polarity);
     if (value.standsForAny === undefined) {
-      return value.canonical.some((line) => shellAllowMatches(value, line, argRe));
+      return value.canonical.some((line) => shellAllowMatches(value, line, argRe, compiled));
     }
   }
   if (value.globPattern === true)
@@ -1503,12 +1506,12 @@ function coversEveryCommand(argRe: GlobMatcher): boolean {
 }
 
 /**
- * A shell line as an allow reads it: its simple commands, or `blocked` when
- * no scoped allow may grant it — it cannot be split honestly, or a program
- * it runs is not named in its text (a substitution, a pathname pattern, a
- * variable the line sets).
+ * A shell line as an allow reads it: its chain of simple commands, or
+ * `undefined` when no scoped allow may grant it — it cannot be split
+ * honestly, or a program it runs is not named in its text (a substitution,
+ * a pathname pattern, a variable the line sets).
  */
-type ShellAllowReading = { readonly commands: ReadonlyArray<string>; readonly blocked: boolean };
+type ShellAllowReading = ShellChain | undefined;
 
 /** Each value's readings, worked out once however many allows read them. */
 const shellAllowCache = new WeakMap<OperativeValue, Map<string, ShellAllowReading>>();
@@ -1519,18 +1522,37 @@ function shellAllowReading(value: OperativeValue, line: string): ShellAllowReadi
     byLine = new Map();
     shellAllowCache.set(value, byLine);
   }
-  let reading = byLine.get(line);
-  if (reading === undefined) {
-    const split = readShellLine(line);
-    let blocked = split.opaque !== undefined;
-    if (!blocked) {
-      const programs = shellRestrictReading(line);
-      blocked = programs.unknownProgram !== undefined || programs.programSetByLine !== undefined;
+  if (byLine.has(line)) return byLine.get(line);
+  let reading = readShellChain(line);
+  if (reading !== undefined) {
+    const programs = shellRestrictReading(line);
+    if (programs.unknownProgram !== undefined || programs.programSetByLine !== undefined) {
+      reading = undefined;
     }
-    reading = { commands: split.commands, blocked };
-    byLine.set(line, reading);
   }
+  byLine.set(line, reading);
   return reading;
+}
+
+/**
+ * An allow's argument glob read as a chain of two or more commands, each
+ * piece compiled on its own, or `null` when it does not read as one.
+ */
+type GlobChain = { readonly joins: ReadonlyArray<string>; readonly pieces: GlobMatcher[] };
+
+const globChainCache = new WeakMap<CompiledPattern, GlobChain | null>();
+
+function globChainOf(compiled: CompiledPattern): GlobChain | null {
+  let chain = globChainCache.get(compiled);
+  if (chain === undefined) {
+    const read = compiled.argGlob === null ? undefined : readShellChain(compiled.argGlob);
+    chain =
+      read === undefined || read.commands.length < 2
+        ? null
+        : { joins: read.joins, pieces: read.commands.map(compileGlob) };
+    globChainCache.set(compiled, chain);
+  }
+  return chain;
 }
 
 /**
@@ -1538,18 +1560,29 @@ function shellAllowReading(value: OperativeValue, line: string): ShellAllowReadi
  * without a `/` (`*`, `**`) is read against the whole line, as it always
  * was: every simple command of a line it matches is one it matches too. A
  * glob with no wildcard grants the exact line it spells. Otherwise the line
- * is split into its simple commands and the glob must match each; a line
- * that cannot be split honestly, or runs a program its text does not name,
- * is granted by none.
+ * is split into its simple commands and the glob must match each — or, when
+ * the glob itself reads as a chain of commands joined the same way as the
+ * line's (`cd ** && make *` for `cd build && make all`), each piece must
+ * match the command in its place. A line that cannot be split honestly, or
+ * runs a program its text does not name, is granted by none.
  */
-function shellAllowMatches(value: OperativeValue, line: string, argRe: GlobMatcher): boolean {
+function shellAllowMatches(
+  value: OperativeValue,
+  line: string,
+  argRe: GlobMatcher,
+  compiled: CompiledPattern,
+): boolean {
   if (coversEveryCommand(argRe)) return argRe.test(line);
   if (argRe.isLiteral && argRe.test(line)) return true;
   const reading = shellAllowReading(value, line);
-  if (reading.blocked) return false;
+  if (reading === undefined) return false;
   // A line that runs nothing (blank, or a comment) is matched as written.
   if (reading.commands.length === 0) return argRe.test(line);
-  return reading.commands.every((command) => argRe.test(command));
+  if (reading.commands.every((command) => argRe.test(command))) return true;
+  const chain = globChainOf(compiled);
+  if (chain === null || chain.pieces.length !== reading.commands.length) return false;
+  if (chain.joins.some((join, i) => join !== reading.joins[i])) return false;
+  return chain.pieces.every((piece, i) => piece.test(reading.commands[i] as string));
 }
 
 /** A shell value as a deny or ask reads it, worked out once per value. */
@@ -1793,10 +1826,12 @@ export function matchesPattern(
 
 export {
   MAX_SHELL_NESTING,
+  type ShellChain,
   type ShellReading,
   type ShellRestrictReading,
   type ShellWork,
   linesRunBy,
+  readShellChain,
   readShellLine,
   shellRestrictReading,
   shellRestrictSpellings,

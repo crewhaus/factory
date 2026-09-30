@@ -1510,6 +1510,50 @@ describe("0.7.1 — a Bash line is read as the commands it runs", () => {
     expect(existsSync(join(ws, "build"))).toBe(true);
   }, 60_000);
 
+  test("a `[[ … ]]` test reaches the rule it did on 0.7.0: an unrelated deny stays quiet", async () => {
+    // Deny-first with a catch-all ask, as the procode starter writes it.
+    const asks = rules(["alwaysDeny", "Bash(**rm -rf **)"], ["alwaysAsk", "Bash"]);
+    // Deny-first above a bare allow.
+    const allows = rules(["alwaysDeny", "Bash(**sudo **)"], ["alwaysAllow", "Bash"]);
+    for (const command of [
+      "[[ -f x ]]",
+      "[[ -d build ]] || echo missing",
+      "if [[ -f crewhaus.yaml ]]; then echo found; fi",
+    ]) {
+      for (const mode of ["default", "auto"] as const) {
+        expect({ command, mode, got: await gate("Bash", { command }, asks, mode) }).toEqual({
+          command,
+          mode,
+          got: "ask",
+        });
+        expect({ command, mode, got: await gate("Bash", { command }, allows, mode) }).toEqual({
+          command,
+          mode,
+          got: "allow",
+        });
+      }
+    }
+  }, 60_000);
+
+  test("an allow written as a chain grants the same chain, piece by piece; build/ survives", async () => {
+    const rs = rules(["alwaysAllow", "Bash(cd ** && echo *)"], ["alwaysAsk", "Bash"]);
+    for (const mode of ["default", "auto"] as const) {
+      expect(await gate("Bash", { command: "cd src && echo ok" }, rs, mode)).toBe("allow");
+      for (const command of [
+        "cd src && rm -rf ../build",
+        "cd src && echo ok && rm -rf ../build",
+        "cd src; echo ok",
+      ]) {
+        expect({ command, mode, got: await gate("Bash", { command }, rs, mode) }).toEqual({
+          command,
+          mode,
+          got: "ask",
+        });
+      }
+    }
+    expect(existsSync(join(ws, "build"))).toBe(true);
+  }, 60_000);
+
   test("RunCommand: a deny reads the line an argv hands to sh -c; build/ survives", async () => {
     const rs = rules(["alwaysDeny", "RunCommand(rm -rf **)"], ["alwaysAllow", "RunCommand"]);
     const argv = ["sh", "-c", "echo ok && rm -rf build"];

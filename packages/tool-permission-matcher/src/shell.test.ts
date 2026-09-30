@@ -157,12 +157,13 @@ describe("shellRestrictSpellings: what a deny or ask also reads", () => {
       ],
       ["IFS=,; x=rm,-rf,build; $x", "a program named by a variable split on an IFS the line sets"],
       ["/bin/r? -rf build", "a program named by a pathname pattern"],
+      ["/bin/[r]m -rf build", "a program named by a pathname pattern"],
       ["eval '$(echo rm) -rf build'", "a program named by a command substitution"],
     ];
     for (const [line, why] of UNKNOWN) {
       expect({ line, why: shellRestrictReading(line).unknownProgram }).toEqual({ line, why });
     }
-    expect(UNKNOWN.length).toBe(11);
+    expect(UNKNOWN.length).toBe(12);
     // Expanded, the line would be far longer than written: read no further.
     expect(shellRestrictReading(`x=${"a".repeat(1000)}; ${"$x ".repeat(300)}`).unknownProgram).toBe(
       "a line whose variables expand past what is read",
@@ -172,6 +173,10 @@ describe("shellRestrictSpellings: what a deny or ask also reads", () => {
       "$HOME/bin/tool x",
       '"$PYTHON" script.py',
       "[ -f x ] && rm x",
+      // A `[` nothing closes is no pattern: bash's `[[` names itself.
+      "[[ -f x ]]",
+      "[[ -d node_modules ]] || npm install",
+      "if [[ -f crewhaus.yaml ]]; then bunx crewhaus compile crewhaus.yaml; fi",
       "echo *.ts",
       "'/bin/r?' x",
       "x=$(pwd); unset x; git status",
@@ -471,7 +476,53 @@ describe("a shell value: an allow covers every command, a deny fires on any", ()
     expect(allowed("Bash(cd build && make)", "cd build && make && rm -rf ~")).toBe(false);
     expect(allowed("Bash(echo $\\(date\\))", "echo $(date)")).toBe(true);
     // A wildcard makes it a pattern again, read command by command.
-    expect(allowed("Bash(cd build && make *)", "cd build && make all")).toBe(false);
+    expect(allowed("Bash(cd build && make *)", "cd build && make all")).toBe(true);
+    expect(allowed("Bash(cd build && make *)", "cd build && rm -rf ~")).toBe(false);
+  });
+
+  test("an allow written as a chain grants a line joined the same way, piece by piece", () => {
+    // The harness-designer starter's rule: validate from inside the
+    // generated directory, which varies.
+    const cd = "Bash(cd ** && bunx crewhaus compile**)";
+    for (const line of [
+      "cd gen/foo && bunx crewhaus compile crewhaus.yaml",
+      "cd gen/foo && bunx crewhaus compile crewhaus.yaml --emit-ir",
+      "cd gen/foo&&bunx crewhaus compile crewhaus.yaml --strict",
+    ]) {
+      expect({ line, allowed: allowed(cd, line) }).toEqual({ line, allowed: true });
+    }
+    for (const line of [
+      // Each piece reads only the command in its place.
+      "cd gen/foo && rm -rf ~",
+      "rm -rf ~ && bunx crewhaus compile x",
+      // Another arrangement is another chain: a `**` cannot reach past an
+      // operator the line has and the rule does not.
+      "cd gen/foo && bunx crewhaus compile x && rm -rf ~",
+      "cd a; rm -rf ~; cd b && bunx crewhaus compile x",
+      "cd gen/foo; bunx crewhaus compile x",
+      "cd gen/foo || bunx crewhaus compile x",
+      "cd gen/foo & bunx crewhaus compile x",
+      // A line it cannot split, or whose program it cannot name, still asks.
+      "cd $(rm -rf ~) && bunx crewhaus compile x",
+      "cd x && bunx crewhaus compile `rm -rf ~`",
+      "cd x && $y crewhaus compile x",
+    ]) {
+      expect({ line, allowed: allowed(cd, line) }).toEqual({ line, allowed: false });
+    }
+    // The other chained lines that starter runs, each written as a chain.
+    expect(
+      allowed("Bash(git fetch** && git pull --ff-only**)", "git fetch && git pull --ff-only"),
+    ).toBe(true);
+    expect(allowed("Bash(mkdir -p ** && cp **)", "mkdir -p a && cp b a/")).toBe(true);
+    expect(allowed("Bash(test -f ** || echo missing)", "test -f x || echo missing")).toBe(true);
+    expect(allowed("Bash(test -f ** || echo missing)", "test -f x || echo gone")).toBe(false);
+    // The words that frame a compound command are part of the arrangement.
+    const framed = "Bash(if test -f **; then make *; fi)";
+    expect(allowed(framed, "if test -f x; then make all; fi")).toBe(true);
+    expect(allowed(framed, "if test -f x; then make all; rm -rf ~; fi")).toBe(false);
+    expect(allowed(framed, "while test -f x; do make all; done")).toBe(false);
+    // Quoting still hides an operator, in the line as in the rule.
+    expect(allowed(cd, 'cd "a && b" && bunx crewhaus compile x')).toBe(true);
   });
 
   test("a deny or ask fires on the whole line and on any command in it", () => {
@@ -500,6 +551,23 @@ describe("a shell value: an allow covers every command, a deny fires on any", ()
     expect(fires("Bash(curl **)", '"$PYTHON" script.py')).toBe(false);
     expect(fires("Bash(rm -rf **)", "git rm -rf build")).toBe(false);
     expect(fires("Bash(rm -rf **)", 'echo "rm -rf build"')).toBe(false);
+  });
+
+  test("a `[[ … ]]` test sets off only the denies it matches, as on 0.7.0", () => {
+    // `[[` is bash's reserved word, not a pattern: an unrelated deny stays
+    // quiet, so a deny-first spec reaches its catch-all ask or bare allow.
+    for (const line of [
+      "[[ -f x ]]",
+      "[[ -d node_modules ]] || npm install",
+      "if [[ -f crewhaus.yaml ]]; then bunx crewhaus compile crewhaus.yaml; fi",
+    ]) {
+      expect({ line, fires: fires("Bash(**rm -rf **)", line) }).toEqual({ line, fires: false });
+      expect({ line, fires: fires("Bash(**sudo **)", line) }).toEqual({ line, fires: false });
+    }
+    // A deny that names a command in it still fires.
+    expect(fires("Bash(npm install)", "[[ -d node_modules ]] || npm install")).toBe(true);
+    // A pattern that a `]` closes still names an unknown program.
+    expect(fires("Bash(**sudo **)", "/bin/[r]m -rf build")).toBe(true);
   });
 
   test("a value only a deny reads never widens or narrows an allow", () => {
