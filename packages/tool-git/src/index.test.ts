@@ -88,9 +88,33 @@ function git(args: string[], cwd: string, env: Record<string, string> = {}): Ran
   };
 }
 
+/**
+ * The identity every fixture commit is made under. The suite points git's
+ * global and system config at /dev/null, so a repository made with a bare
+ * `git init` has no user.name/user.email, and git then guesses one from the
+ * host. macOS hostnames (`name.local`) pass its check; a CI runner's does not
+ * ("unable to auto-detect email address"), so the commit failed there and
+ * the test went on against a repository with no commits.
+ */
+const FIXTURE_IDENTITY = {
+  GIT_AUTHOR_NAME: "A U Thor",
+  GIT_AUTHOR_EMAIL: "author@example.com",
+  GIT_COMMITTER_NAME: "A U Thor",
+  GIT_COMMITTER_EMAIL: "author@example.com",
+};
+
 function commitAll(dir: string, message: string, date: string): void {
   git(["add", "-A"], dir);
-  git(["commit", "-m", message], dir, { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date });
+  const committed = git(["commit", "-m", message], dir, {
+    ...FIXTURE_IDENTITY,
+    GIT_AUTHOR_DATE: date,
+    GIT_COMMITTER_DATE: date,
+  });
+  // A fixture that silently failed to commit is not the repository the test
+  // describes: say so here, not as a confusing failure further down.
+  if (committed.code !== 0) {
+    throw new Error(`fixture commit in ${dir} failed: ${committed.stderr.trim()}`);
+  }
 }
 
 function initRepo(dir: string): void {
