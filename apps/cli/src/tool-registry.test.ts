@@ -27,6 +27,7 @@ import {
 } from "@crewhaus/tool-categories";
 import { isPrivateIp } from "@crewhaus/tool-fetch";
 import { TOOL_REGISTRY, projectRegistryEntry } from "@crewhaus/tool-registry-manifest";
+import { TOOL_FLAGS } from "@crewhaus/tool-registry-manifest/flags";
 import { loadAllBuiltinTools } from "./builtin-tools-for-tests";
 import { TOOL_PACKAGE_LOADERS, loadBuiltinTools } from "./tool-packages";
 import {
@@ -804,6 +805,53 @@ describe("the generated tool manifest matches the tools it describes", () => {
     ).toEqual([]);
   }, 60_000);
 
+  /**
+   * The projection test above compares a row with a fresh PROJECTION, and the
+   * projection drops every `OperativeArg` key it does not know on both sides,
+   * so a key the projection forgets passes it. Removing `env` from
+   * `projectOperativeArg` and regenerating once passed every test (final
+   * review, mutation MU08r): ApprovalStatus and `permissions suggest`, which
+   * read the manifest offline, silently lost the environment spellings the
+   * runtime deny reads. So each row's operativeArgs are compared with the
+   * live tool's own declaration, key for key.
+   */
+  test("every row carries its tool's operativeArgs whole, every key of every field", async () => {
+    let compared = 0;
+    let keysSeen = new Set<string>();
+    const lost: Array<{ key: string; live: unknown; manifest: unknown; flags: unknown }> = [];
+    for (const key of emitterKeys) {
+      const entry = BUILTIN_TOOL_MAP[key];
+      if (entry === undefined) throw new Error(`no BUILTIN_TOOL_MAP entry for ${key}`);
+      const mod = (await import(entry.package)) as Record<string, unknown>;
+      const tool = mod[entry.export] as { operativeArgs?: ReadonlyArray<object> } | undefined;
+      if (tool === undefined) throw new Error(`${entry.package} has no export ${entry.export}`);
+      const live = tool.operativeArgs?.map((arg) => ({ ...arg }));
+      const manifest = TOOL_REGISTRY[key]?.operativeArgs;
+      const flags = TOOL_FLAGS[key]?.operativeArgs;
+      compared += 1;
+      for (const arg of live ?? []) keysSeen = new Set([...keysSeen, ...Object.keys(arg)]);
+      if (JSON.stringify(sortKeys(live)) !== JSON.stringify(sortKeys(manifest))) {
+        lost.push({ key, live, manifest, flags });
+      } else if (JSON.stringify(sortKeys(live)) !== JSON.stringify(sortKeys(flags))) {
+        lost.push({ key, live, manifest, flags });
+      }
+    }
+    expect(compared).toBe(emitterKeys.length);
+    expect(
+      lost.map((l) => l.key),
+      "re-run `bun run scripts/gen-tool-registry.ts`, and carry every OperativeArg key in projectOperativeArg",
+    ).toEqual([]);
+    // Every key an OperativeArg can have is in use by some builtin, so the
+    // comparison above has really looked at each of them.
+    expect([...keysSeen].sort()).toEqual(
+      ["default", "env", "field", "kind", "relocates", "within"].sort(),
+    );
+    // The environment a command's call sets, by name.
+    expect(TOOL_FLAGS["runCommand"]?.operativeArgs).toEqual([
+      { field: "argv", kind: "command", within: "cwd", env: "envSet" },
+    ]);
+  }, 60_000);
+
   test("no row describes an MCP tool", () => {
     // A spec declares an MCP SERVER and the server's tool list only exists
     // once it is connected, so this manifest can never cover MCP. One
@@ -959,3 +1007,14 @@ describe("the tool manifest's descriptions are loaded only by bundles that asked
     expect(closure("@crewhaus/tool-capability").has(MANIFEST)).toBe(true);
   });
 });
+
+/** The value with every object's keys in one order, so two JSON spellings compare. */
+function sortKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeys);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => [k, sortKeys(v)]),
+  );
+}
