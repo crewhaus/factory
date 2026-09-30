@@ -4,7 +4,9 @@ import { CrewhausError } from "@crewhaus/errors";
 import {
   ClaudeJustificationJudge,
   ClaudeJustificationJudgeError,
+  DEFAULT_JUSTIFICATION_JUDGE_MODEL,
   createClaudeJustificationJudge,
+  createJustificationJudgeFromSlot,
 } from "./index";
 
 /**
@@ -312,4 +314,35 @@ describe("security judge profile params (0.6.0 §4.2)", () => {
     })(INPUT);
     expect(t.last().temperature).toBe(0.2);
   });
+});
+
+describe("createJustificationJudgeFromSlot — the one construction `crewhaus run` and a bundle share", () => {
+  test("no judge, or rule-based, builds nothing: runtime-core's default is the rule-based judge", async () => {
+    expect(await createJustificationJudgeFromSlot(undefined)).toBeUndefined();
+    expect(await createJustificationJudgeFromSlot({})).toBeUndefined();
+    expect(await createJustificationJudgeFromSlot({ judge: "rule-based" })).toBeUndefined();
+  });
+
+  test("the default judge model is the one the run path documents", () => {
+    expect(DEFAULT_JUSTIFICATION_JUDGE_MODEL).toBe("claude-haiku-4-5");
+  });
+
+  test("claude resolves its model through the router and judges on the stripped wire id", async () => {
+    // local/<m>@<url> resolves the OpenAI-compatible adapter with no key; the
+    // endpoint refuses the connection, so the judge fails closed — and names
+    // the wire id, not the router string.
+    const judge = await createJustificationJudgeFromSlot({
+      judge: "claude",
+      model: "local/slot-judge@http://127.0.0.1:1/v1",
+    });
+    if (judge === undefined) throw new Error("expected a judge");
+    const verdict = await judge({
+      toolName: "HttpRequest",
+      justification: "check the status API",
+      sessionGoal: "check the status API",
+      input: { url: "https://status.example.com" },
+    });
+    expect(verdict.allow).toBe(false);
+    expect(verdict.judgeModel).toBe("slot-judge (error)");
+  }, 20_000);
 });

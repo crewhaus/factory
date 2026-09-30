@@ -591,12 +591,13 @@ const compactionBlock = z
  * `spec-patch`'s `OPTIMIZABLE_PATHS`, so this block MUST be named
  * `security` with a `justification` sub-field to honour it.
  *
- * `justification.judge` selects which `JustificationJudge` the cli run
- * path wires: `"rule-based"` (the deterministic default for tests/offline
- * runs) or `"claude"` (the model-backed `@crewhaus/justification-judge-claude`,
- * the documented production recommendation). `model` is the judge model
- * id for the claude judge; the consumer defaults it to a haiku-class
- * model when omitted.
+ * `justification.judge` selects which `JustificationJudge` the cli shape
+ * wires — `crewhaus run` and, since 0.7.1, the compiled bundle, through the
+ * same construction: `"rule-based"` (the deterministic default for
+ * tests/offline runs) or `"claude"` (the model-backed
+ * `@crewhaus/justification-judge-claude`, the documented production
+ * recommendation). `model` is the judge model id for the claude judge; the
+ * consumer defaults it to a haiku-class model when omitted.
  *
  * NOTE: `egressPolicy` is reserved — `OPTIMIZABLE_PATHS` also lists
  * `["security", "egressPolicy"]`, owned by the egress-fabric FRs

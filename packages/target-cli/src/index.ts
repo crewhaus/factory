@@ -385,6 +385,76 @@ function renderEgressMatcher(ir: IrV0): {
 }
 
 /**
+ * 0.7.1 — the `security.justification` block, wired into the bundle the way
+ * `crewhaus run` wires it. Before, only the run path read it: a compiled
+ * bundle always judged with runtime-core's rule-based default, which outside
+ * tests denies every justification-gated call (HttpRequest, EmailSend,
+ * DownloadFile, …) unless `CREWHAUS_ALLOW_RULE_BASED_JUSTIFICATION=1` is set,
+ * so `judge: claude` was a setting a bundle never honoured.
+ *
+ *   - The judge: `judge: claude` calls `createJustificationJudgeFromSlot`
+ *     with the lowered slot — the one construction the run path calls too
+ *     (same default model, same model-router resolution, same pinned
+ *     params). `judge: rule-based` needs no construction: runtime-core's
+ *     default IS that judge, as on the run path.
+ *   - The audit: one durable, hash-chained `@crewhaus/audit-log` rooted at
+ *     `<cwd>/.crewhaus/audit`, handed to both Pillar 3 gates
+ *     (`permission_justification_evaluated` and `egress_decision` on one
+ *     chain), as `crewhaus run` opens it. The run path's
+ *     `--no-justification-audit` has no bundle flag; the daemon shapes'
+ *     `CREWHAUS_SECURITY_AUDIT=0` turns it off here too.
+ *
+ * Empty pieces when the spec declares no `security.justification`, so every
+ * such bundle keeps its bytes.
+ */
+function renderJustificationGate(ir: IrV0): {
+  imports: string[];
+  bootBlock: string;
+  field: string;
+} {
+  const slot = ir.security?.justification;
+  if (slot === undefined) return { imports: [], bootBlock: "", field: "" };
+  const claude = slot.judge === "claude";
+  const imports = [
+    `import { join as __joinPath } from "node:path";`,
+    `import { openAuditLog } from "@crewhaus/audit-log";`,
+    ...(claude
+      ? [`import { createJustificationJudgeFromSlot } from "@crewhaus/justification-judge-claude";`]
+      : []),
+  ];
+  // The lowered slot as data: a closed judge literal, a model string and a
+  // numbers-and-literals params object, so JSON.stringify is the escaping.
+  const judgeSlot = {
+    judge: slot.judge,
+    ...(slot.model !== undefined ? { model: slot.model } : {}),
+    ...(slot.params !== undefined ? { params: slot.params } : {}),
+  };
+  const bootBlock = [
+    ...(claude
+      ? [
+          "// security.justification — the judge the spec names, built as `crewhaus run`",
+          "// builds it. Its model resolves now, so missing credentials stop the start.",
+          `const __justificationJudge = await createJustificationJudgeFromSlot(${JSON.stringify(judgeSlot)});`,
+        ]
+      : []),
+    "// The durable, hash-chained audit log `crewhaus run` writes: every justification",
+    "// verdict and egress decision, at <cwd>/.crewhaus/audit. CREWHAUS_SECURITY_AUDIT=0",
+    "// turns it off.",
+    "const __securityAudit =",
+    `  process.env["CREWHAUS_SECURITY_AUDIT"] === "0"`,
+    "    ? undefined",
+    `    : await openAuditLog({ rootDir: __joinPath(__cwd, ".crewhaus", "audit") });`,
+  ].join("\n");
+  const judgeField = claude
+    ? "\n  ...(__justificationJudge !== undefined ? { justificationJudge: __justificationJudge } : {}),"
+    : "";
+  const auditField =
+    "\n  ...(__securityAudit !== undefined\n    ? { justificationAuditSink: __securityAudit, egressAuditSink: __securityAudit }\n    : {}),";
+  const field = `${judgeField}${auditField}`;
+  return { imports, bootBlock, field };
+}
+
+/**
  * Loop contract 0.4 (Batch B, G02) — render the in-loop `evaluation:` wiring.
  * The bundle constructs the evaluate fn from the RESOLVED IR grader and
  * threads it — together with the resolved gate knobs — into runChatLoop's
@@ -610,6 +680,10 @@ function renderAgent(ir: IrV0): string {
   // for "semantic" it constructs `@crewhaus/egress-matcher-semantic` with an
   // injected embedder, mirroring the `crewhaus run` path.
   const egress = renderEgressMatcher(ir);
+  // 0.7.1 — the `security.justification` judge and the durable audit log
+  // both Pillar 3 gates append to, as `crewhaus run` wires them. Empty pieces
+  // when the spec declares no justification block.
+  const justification = renderJustificationGate(ir);
   // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation. Empty
   // pieces when the spec omits the block.
   const evaluation = renderEvaluation(ir);
@@ -701,6 +775,9 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   // runChatLoop call so it can be threaded into the options. Empty for the
   // substring default.
   const egressBoot = egress.bootBlock ? `${egress.bootBlock}\n\n` : "";
+  // The judge and the audit log exist before runChatLoop is called; `__cwd`
+  // (the extension boot's) roots the log, as the run path roots it at its cwd.
+  const justificationBoot = justification.bootBlock ? `${justification.bootBlock}\n\n` : "";
 
   // Phase 3 §3.3 — CLI banner with optional tagline rotation. Emitted
   // ahead of runChatLoop so users see the brand on cold start. Suppressed
@@ -820,7 +897,7 @@ if (__skills.length > 0) defaultCatalog.register(createSkillTool(__skills));`;
   sessionTarget: "cli",${maxTokensField}${thinkingField}${temperatureField}${streamingField}${rateLimitsField}${compactionModelField}${compactionParamsField}${compactionTuningFields}${limitsFields}${failoverFields}${hybridFields}${failureTaxonomyField}${budgetField}${evaluation.field}${sloField}${toolsField}${permField}${sandboxField}
   hooks: ${specHooks.hooksExpr},
   skills: __skills,
-  slashCommands: __slashCommands,${feedbackField}${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${memory.field}
+  slashCommands: __slashCommands,${feedbackField}${subAgents.subAgentsField}${subAgents.spawnField}${egress.field}${justification.field}${memory.field}
 });`;
   // v0.3.0 Goal 6 — the exact "agent exited" fix. The top-level
   // `await runChatLoop(...)` used to be bare, so a terminal failure
@@ -846,6 +923,8 @@ ${catchBlock}${finallyBlock}`;
   const subAgentImportBlock =
     subAgents.imports.length > 0 ? `${subAgents.imports.join("\n")}\n` : "";
   const egressImportBlock = egress.imports.length > 0 ? `${egress.imports.join("\n")}\n` : "";
+  const justificationImportBlock =
+    justification.imports.length > 0 ? `${justification.imports.join("\n")}\n` : "";
   const evaluationImportBlock =
     evaluation.imports.length > 0 ? `${evaluation.imports.join("\n")}\n` : "";
   const evaluationBoot = evaluation.bootBlock ? `${evaluation.bootBlock}\n\n` : "";
@@ -879,11 +958,11 @@ ${catchBlock}${finallyBlock}`;
 // Source spec: ${escapeJsonString(ir.name)} (target: cli, ir version: ${ir.version})
 import { formatRunFailure, toFailureReport } from "@crewhaus/errors";
 import { runChatLoop } from "@crewhaus/runtime-core";
-${hybridImport}${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
+${hybridImport}${permImport}${importBlock}${catalogImport}${mcpImportBlock}${subAgentImportBlock}${egressImportBlock}${justificationImportBlock}${evaluationImportBlock}${memoryImportBlock}${knowledgeImportBlock}${pluginsImportBlock}${extensionImport}
 ${watchmeEnvStamp}${registerBlock}
 ${pluginsActivateBoot}${extensionBoot}${specHooks.bootBlock}
 
-${bannerBoot}${subAgentsBoot}${egressBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${pluginsRegisterBoot}${wrapped}
+${bannerBoot}${subAgentsBoot}${egressBoot}${justificationBoot}${evaluationBoot}${bootBlocks}${knowledgeBoot}${pluginsRegisterBoot}${wrapped}
 `;
 }
 

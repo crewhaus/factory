@@ -17,14 +17,19 @@
     "@crewhaus/tool-categories": "workspace:*"
   },
   "peerDependencies": {
+    "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/egress-matcher-semantic": "workspace:*",
     "@crewhaus/embedder": "workspace:*",
     "@crewhaus/eval-judge": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",
+    "@crewhaus/justification-judge-claude": "workspace:*",
     "@crewhaus/skills-registry": "workspace:*",
     "@crewhaus/slash-commands": "workspace:*"
   },
   "peerDependenciesMeta": {
+    "@crewhaus/audit-log": {
+      "optional": true
+    },
     "@crewhaus/egress-matcher-semantic": {
       "optional": true
     },
@@ -32,6 +37,9 @@
       "optional": true
     },
     "@crewhaus/eval-judge": {
+      "optional": true
+    },
+    "@crewhaus/justification-judge-claude": {
       "optional": true
     }
   },

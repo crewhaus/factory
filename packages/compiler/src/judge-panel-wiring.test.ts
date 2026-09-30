@@ -84,6 +84,11 @@ describe("PR 13b — nothing this PR wires is dropped any more", () => {
     expect(agent).toContain('compactionParams: {"thinking":{"effort":"low"},"maxTokens":512},');
     // …and the degrade rung's, inside the budget literal.
     expect(agent).toContain('"params":{"maxTokens":4096}');
+    // 0.7.1 — and the security judge's: the bundle builds the judge the spec
+    // names, on the profile's model with its params (0.7.0 dropped the slot).
+    expect(agent).toContain(
+      'createJustificationJudgeFromSlot({"judge":"claude","model":"claude-sonnet-4-6","params":{"thinking":{"effort":"low"},"maxTokens":512}});',
+    );
   });
 
   test("a spec declaring NONE of them emits no panel field beyond the judge model", () => {
