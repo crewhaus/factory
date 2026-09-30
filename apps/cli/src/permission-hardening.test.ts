@@ -1464,3 +1464,58 @@ describe("EVM ids: rules read <chainId>/<address>, and case cannot dodge a deny"
     ).toBe("allow");
   });
 });
+
+describe("0.7.1 — a Bash line is read as the commands it runs", () => {
+  test("a scoped allow covers every command in the line, or the call asks; build/ survives", async () => {
+    const rs = rules(["alwaysAllow", "Bash(echo *)"]);
+    for (const command of [
+      "echo ok && rm -rf build",
+      "echo ok; rm -rf build",
+      "echo ok | rm -rf build",
+      "echo ok\nrm -rf build",
+      "echo $(rm -rf build)",
+      "echo `rm -rf build`",
+    ]) {
+      for (const mode of ["default", "auto"] as const) {
+        expect({ command, mode, got: await gate("Bash", { command }, rs, mode) }).toEqual({
+          command,
+          mode,
+          got: "ask",
+        });
+      }
+    }
+    expect(existsSync(join(ws, "build"))).toBe(true);
+    // Every command matches: allowed, and only echo ran.
+    expect(await gate("Bash", { command: "echo ok; echo two" }, rs, "default")).toBe("allow");
+  }, 60_000);
+
+  test("a deny fires on any command in the line, in every mode; build/ survives", async () => {
+    const rs = rules(["alwaysDeny", "Bash(rm -rf **)"], ["alwaysAllow", "Bash"]);
+    for (const command of [
+      "echo ok && rm -rf build",
+      "echo ok; FOO=1 rm -rf build",
+      'echo ok; "r"m -rf build',
+      "x=rm; $x -rf build",
+      "sh -c 'echo ok; rm -rf build'",
+      "read x <<< rm; $x -rf build",
+    ]) {
+      for (const mode of ["default", "auto", "plan"] as const) {
+        expect({ command, mode, got: await gate("Bash", { command }, rs, mode) }).toEqual({
+          command,
+          mode,
+          got: "deny",
+        });
+      }
+    }
+    expect(existsSync(join(ws, "build"))).toBe(true);
+  }, 60_000);
+
+  test("RunCommand: a deny reads the line an argv hands to sh -c; build/ survives", async () => {
+    const rs = rules(["alwaysDeny", "RunCommand(rm -rf **)"], ["alwaysAllow", "RunCommand"]);
+    const argv = ["sh", "-c", "echo ok && rm -rf build"];
+    for (const mode of ["default", "auto", "plan"] as const) {
+      expect(await gate("RunCommand", { argv }, rs, mode)).toBe("deny");
+    }
+    expect(existsSync(join(ws, "build"))).toBe(true);
+  }, 60_000);
+});
