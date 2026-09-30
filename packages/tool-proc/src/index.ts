@@ -39,6 +39,7 @@ import { hostPlatform, searchPath } from "./lib/which";
 import {
   type BgProc,
   __resetRegistryForTest,
+  __stopAllForTest,
   getProc,
   listProcs,
   markKilled,
@@ -48,7 +49,7 @@ import {
 import { recheckContainment, resolveSafe, resolveSafeDir } from "./safe-path";
 import { runOnce, sleep } from "./spawn";
 
-export { __resetRegistryForTest };
+export { __resetRegistryForTest, __stopAllForTest };
 export { _resetProcConfig, registerProcConfig } from "./lib/config";
 export { _setDnsLookup } from "./lib/addr";
 

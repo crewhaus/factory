@@ -209,3 +209,25 @@ export function __resetRegistryForTest(): void {
   procs.clear();
   nextId = 1;
 }
+
+/**
+ * Test-only: {@link __resetRegistryForTest}, then wait (at most `timeoutMs`)
+ * until every process it knew of has exited. A test removes its workspace
+ * after this, and on Windows a directory that is a live process's cwd cannot
+ * be removed (EBUSY), while a kill there returns before the process is gone.
+ */
+export async function __stopAllForTest(timeoutMs = 5_000): Promise<void> {
+  const exits = [...procs.values()].map((bg) => bg.proc.exited);
+  __resetRegistryForTest();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.all(exits),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
