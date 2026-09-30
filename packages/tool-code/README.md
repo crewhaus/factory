@@ -11,8 +11,8 @@ the file and line for each — not three thousand lines of terminal.
 
 ```yaml
 tools:
-  - all-code          # every tool below
-  - -Format           # ...except the one that rewrites files
+  - all-toolchain     # every tool below
+  - -format           # ...except the one that rewrites source files
 ```
 
 | Tool | What it does |

@@ -13,7 +13,7 @@ tools say so rather than hiding it.
 ```yaml
 tools:
   - all-sql        # every tool below
-  - -SqlExec       # ...except this one
+  - -sqlExec       # ...except this one
 ```
 
 | Tool | What it does |

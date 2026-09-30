@@ -32,7 +32,7 @@ exists, or that it belongs to anyone in particular.
 ```yaml
 tools:
   - all-secure        # every tool below
-  - -Depseudonymize   # ...except this one
+  - -depseudonymize   # ...except this one
 ```
 
 | Tool | What it does |

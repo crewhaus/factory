@@ -12,7 +12,7 @@ answer twice — and say exactly which field, at which path, was wrong.
 ```yaml
 tools:
   - all-schema        # every tool below
-  - -JsonSchemaInfer  # ...except this one
+  - -jsonSchemaInfer  # ...except this one
 ```
 
 | Tool | What it does |

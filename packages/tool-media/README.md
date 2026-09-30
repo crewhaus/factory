@@ -14,8 +14,9 @@ not.
 
 ```yaml
 tools:
-  - all-media       # every tool below
-  - -MediaProbe     # ...except the one that shells out
+  - all-media       # every tool below, plus ReadImage and ImageGenerate
+  - -mediaProbe     # ...except the one that shells out
+  - -imageGenerate  # ...and the one that bills a remote model
 ```
 
 | Tool | What it does |
