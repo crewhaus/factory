@@ -12,6 +12,7 @@ import {
 import {
   type RegexOutcome,
   type RegexRejectCode,
+  type RegexSession,
   type TestEachResult,
   describeRegexOutcome,
   openRegexSession,
@@ -395,6 +396,8 @@ type GrepLimits = {
   readonly batchChars: number;
   /** The input limit the worker is told; equal to `batchChars` except in a test. */
   readonly workerInputChars: number;
+  /** Where the matching runs; a test replaces it to script the worker's answers. */
+  readonly openSession: () => RegexSession;
 };
 const GREP_DEFAULT_LIMITS: GrepLimits = {
   deadlineMs: GREP_DEADLINE_MS,
@@ -402,15 +405,18 @@ const GREP_DEFAULT_LIMITS: GrepLimits = {
   now: () => Date.now(),
   batchChars: GREP_BATCH_CHARS,
   workerInputChars: GREP_BATCH_CHARS,
+  openSession: openRegexSession,
 };
 let grepLimits: GrepLimits = GREP_DEFAULT_LIMITS;
 
 /**
  * Test seam: the deadline, the regex worker's give-up threshold (a no-match
  * slower than this is undetermined; 0 makes every no-match undetermined, to
- * exercise that path without a pathological pattern), the clock, and the
+ * exercise that path without a pathological pattern), the clock, the
  * batch size and worker input limit (set apart only to exercise a refusal
- * that cannot otherwise happen). Pass `undefined` to restore.
+ * that cannot otherwise happen), and the regex session (so a test can hand
+ * back a worker's timeout at a chosen line instead of racing a real deadline).
+ * Pass `undefined` to restore.
  */
 export function _setGrepLimitsForTest(limits: Partial<GrepLimits> | undefined): void {
   grepLimits = { ...GREP_DEFAULT_LIMITS, ...limits };
@@ -686,7 +692,7 @@ export const grep: RegisteredTool = buildTool({
     const hits: string[] = [];
     const hiddenDirs = new Set<string>();
     let hidden = 0;
-    const session = openRegexSession();
+    const session = limits.openSession();
     let batch = emptyBatch();
     const where = lineRef;
 

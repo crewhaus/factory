@@ -15,7 +15,15 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { CrewhausError } from "@crewhaus/errors";
-import { regexWorkerCounts } from "@crewhaus/tool-safety/regex";
+import {
+  type RegexOutcome,
+  type RegexRequest,
+  type RegexSession,
+  type ResultOf,
+  type TestEachResult,
+  openRegexSession,
+  regexWorkerCounts,
+} from "@crewhaus/tool-safety/regex";
 import {
   DEFAULT_IGNORED_DIRS,
   READ_MAX_BYTES,
@@ -566,20 +574,49 @@ describe("Grep never reports what it did not search as a miss (C089)", () => {
   });
 
   test("a deadline reached inside a file keeps the hits found and names the rest as unsearched", async () => {
-    // Quartic in the digit run: about 20 ms a line here, so forty of them
-    // outlast a 100 ms deadline many times over, and the worker abandoned
-    // at the deadline finishes its line within milliseconds. Line 1 is a
-    // hit found before the deadline, and it must survive it.
-    const slow = `${"1".repeat(100)} x`;
-    await writeFile(path.join(tmp, "a.txt"), `111x\n${Array(40).fill(slow).join("\n")}\n`);
-    _setGrepLimitsForTest({ deadlineMs: 100 });
-    const result = String(await grep.execute({ pattern: "\\d+\\d+\\d+x" }));
-    expect(result.split("\n")[0]).toBe("a.txt:1:111x");
+    // The worker's deadline is wall-clock time, and a real one raced the
+    // worker's first progress report: on a loaded CI runner the hit on line 1
+    // was found but not yet reported when 100 ms passed, and the result was
+    // "no matches". So this session answers every line with the real worker,
+    // then hands back what a worker stopped by the deadline after its third
+    // line reports: how far it got, and the hits among the lines it answered.
+    // What is under test is what Grep does with that answer.
+    await writeFile(path.join(tmp, "a.txt"), "111x\nabx\n333x\ncdx\n555x\n");
+    const real = openRegexSession();
+    let testEachRuns = 0;
+    const stoppedAfterThree: RegexSession = {
+      async run<R extends RegexRequest>(request: R): Promise<RegexOutcome<ResultOf<R>>> {
+        const outcome = await real.run(request);
+        if (request.op !== "testEach" || outcome.status !== "ok") return outcome;
+        testEachRuns++;
+        const answered = outcome.result as TestEachResult;
+        const completed = 3;
+        const partial: TestEachResult = {
+          ...answered,
+          matched: answered.matched.filter((i) => i < completed),
+          undetermined: answered.undetermined.filter((i) => i < completed),
+          scanned: completed,
+        };
+        return {
+          status: "timeout",
+          reason: "the deadline passed",
+          deadlineMs: 100,
+          completed,
+          partial: partial as ResultOf<R>,
+        };
+      },
+      close: () => real.close(),
+    };
+    _setGrepLimitsForTest({ deadlineMs: 100, openSession: () => stoppedAfterThree });
+    const result = String(await grep.execute({ pattern: "\\d+x" }));
+    expect(testEachRuns).toBe(1);
+    expect(result.split("\n").slice(0, 2)).toEqual(["a.txt:1:111x", "a.txt:3:333x"]);
+    // Line 5 matches, but the worker never answered it: not a hit, not a miss.
+    expect(result).not.toContain("555x");
     expect(result).toContain(
-      "scan stopped early — the 100 ms deadline passed while searching a.txt:",
+      "scan stopped early — the 100 ms deadline passed while searching a.txt:4; it and everything after it were not searched",
     );
-    expect(result).toContain("it and everything after it were not searched");
-  }, 20_000);
+  });
 
   test("a line too long to search is named, not silently skipped", async () => {
     await writeFile(path.join(tmp, "min.js"), `short needle\n${"x".repeat(20_000)}needle\n`);
